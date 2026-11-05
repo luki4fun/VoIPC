@@ -8,6 +8,8 @@
   import { adminOp } from "../stores/admin-ui.js";
   import { serverAddress } from "../stores/connection.js";
   import { confirmAction } from "../stores/confirm.js";
+  import { olderRelay } from "../stores/relay.js";
+  import { moves } from "../relay-rules.js";
   import { movedBy, movedInCategory } from "../channel-groups.js";
   import Icon from "./Icons.svelte";
   import type { ChannelPlace } from "../types.js";
@@ -54,7 +56,9 @@
     const server = $serverAddress;
     const yes = await confirmAction({
       title: `Delete #${name}?`,
-      body: "It goes for everyone, with every message kept in it. This cannot be undone.",
+      body: moves($olderRelay?.protocol ?? null)
+        ? "It goes for everyone, with every message kept in it and anything imported into it from Discord. This cannot be undone."
+        : "It goes for everyone, with every message kept in it. This cannot be undone.",
       confirm: "Delete it",
       danger: true,
     });

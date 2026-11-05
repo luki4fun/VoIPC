@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { adminOps, community, moderation } from "../relay-rules.js";
+  import { adminOps, community, moderation, moves } from "../relay-rules.js";
   import { removalHint, removalReachesAccount, removalWindows } from "../modlog-rules.js";
   import { backdrop, dialog } from "../actions/dialog.js";
   import { roving } from "../actions/roving.js";
@@ -22,7 +22,11 @@
     clearShown,
     banAccount,
     bans,
+    banSearch,
+    banTotal,
     expiry,
+    moreBans,
+    searchBans,
     showAdminLogin,
     showAdminPanel,
     stepUp,
@@ -42,10 +46,11 @@
   import AdminServer from "./AdminServer.svelte";
   import AdminChannels from "./AdminChannels.svelte";
   import AdminModLog from "./AdminModLog.svelte";
+  import AdminMove from "./AdminMove.svelte";
   import Icon from "./Icons.svelte";
   import type { BanInfo } from "../types.js";
 
-  type Tab = "bans" | "emotes" | "users" | "groups" | "channels" | "modlog" | "server";
+  type Tab = "bans" | "emotes" | "users" | "groups" | "channels" | "modlog" | "server" | "move";
   let tab = $state<Tab>("bans");
   // A chat picture's "Make an emote or sticker…": straight to the importer
   $effect(() => {
@@ -63,6 +68,8 @@
     if ($relayAccounts && community($olderRelay?.protocol ?? null) && $can("voipc:channels")) t.push(["channels", "Channels"]);
     if ($relayAccounts && moderation($olderRelay?.protocol ?? null) && $can("voipc:modlog")) t.push(["modlog", "Moderation log"]);
     if ($relayAccounts && community($olderRelay?.protocol ?? null) && $can("*")) t.push(["server", "Server"]);
+    // Asked as the account: a token admin has none to ask as
+    if ($relayAccounts && $account && moves($olderRelay?.protocol ?? null) && $can("*")) t.push(["move", "Discord move"]);
     return t;
   });
   /** What was picked, or the first tab still open to us. */
@@ -88,6 +95,11 @@
   }
   let accountBans = $derived($bans.filter((b) => b.account));
   let addressBans = $derived($bans.filter((b) => !b.account));
+  // The box holds what is typed until it is asked for, and follows what the list is of
+  let banQuery = $state("");
+  $effect(() => {
+    banQuery = $banSearch;
+  });
   // Banning an account that is not here (admins only, as the list is)
   let banName = $state("");
   let banReason = $state("");
@@ -194,6 +206,8 @@
           <AdminModLog />
         {:else if shown === "server"}
           <AdminServer />
+        {:else if shown === "move"}
+          <AdminMove />
         {:else}
           {#if $relayAccounts}
             <section class="section">
@@ -218,7 +232,7 @@
                 <button type="submit" class="btn btn-danger admin-ok" disabled={!banName.trim()}>Ban account</button>
               </form>
               {#if mayRemove && banRemoval !== null}
-                <p class="admin-hint">{removalHint(true)}</p>
+                <p class="admin-hint">{removalHint(true, moves($olderRelay?.protocol ?? null))}</p>
               {/if}
             </section>
           {/if}
@@ -227,7 +241,7 @@
             {#if removing}
               <form class="callout ban-removal" onsubmit={(e) => { e.preventDefault(); submitRemoval(); }}>
                 <div class="section-title">Remove the posts of {removing.label}</div>
-                <p class="admin-hint">{removalHint(removalReachesAccount(removing, $bans))}</p>
+                <p class="admin-hint">{removalHint(removalReachesAccount(removing, $bans), moves($olderRelay?.protocol ?? null))}</p>
                 <div class="inline-form">
                   <select class="admin-select" aria-label="How far back" bind:value={removingWindow}>
                     {#each removalWindows($can("*")) as [secs, label] (secs)}
@@ -239,8 +253,18 @@
                 </div>
               </form>
             {/if}
+            {#if moves($olderRelay?.protocol ?? null) && ($banTotal > 0 || $banSearch)}
+              <form class="inline-form ban-search" role="search" onsubmit={(e) => { e.preventDefault(); searchBans(banQuery.trim()); }}>
+                <input class="admin-input grow" type="search" placeholder="Search by name" aria-label="Search bans" maxlength="64" bind:value={banQuery} />
+                <button type="submit" class="btn btn-secondary"><Icon name="search" size={16} /> Search</button>
+              </form>
+            {/if}
             {#if $bans.length === 0}
-              <p class="admin-hint empty">No active bans. Right-click someone in the member list to kick or ban them.</p>
+              {#if $banSearch}
+                <p class="admin-hint empty">No active ban matches “{$banSearch}”.</p>
+              {:else}
+                <p class="admin-hint empty">No active bans. Right-click someone in the member list to kick or ban them.</p>
+              {/if}
             {:else}
               {#if accountBans.length}
                 <div class="sub-title">Accounts</div>
@@ -253,6 +277,9 @@
                 <ul class="ban-list list">
                   {#each addressBans as ban (ban.id)}{@render banRow(ban)}{/each}
                 </ul>
+              {/if}
+              {#if $bans.length < $banTotal}
+                <button type="button" class="btn btn-secondary ban-more" onclick={moreBans}>Show more ({$banTotal - $bans.length} left)</button>
               {/if}
             {/if}
           </section>

@@ -43,6 +43,13 @@ function needAccount(server: unknown): { s: session.Session; account: NonNullabl
   return { s, account: s.account ?? fail("Not signed in to an account on that server") };
 }
 
+/** `fail` for a release: it knows no fixture, and says where the importer is. */
+function importer(cmd: string, args: Args): Promise<unknown> {
+  return __SELFTEST__
+    ? import("./import-selftest").then((m) => m.answer(cmd, args, need(args.server)))
+    : fail("Reading a Discord server runs in the desktop app.");
+}
+
 /** A voice-scoped command's connection: the one whose voice channel we are in. */
 function voice(): session.Session {
   return session.voiceSession() ?? fail("Not in a voice channel");
@@ -226,6 +233,15 @@ const handlers: Record<string, Handler> = {
     return account.providerUnlink(s, str(provider, "provider"), str(password, "password"), opt(totp, "totp"), opt(recovery, "recovery"));
   },
   account_request: ({ server, request }) => needAccount(server).s.sendControl({ Account: request }),
+  // Reading a Discord server is the desktop app's (import.rs): a page would hand the bot's
+  // token to whatever served it. A test build answers from a fixture, so that the wizard's
+  // own screens get clicked. In a release the import below is gone with its branch.
+  import_open: (a) => importer("import_open", a),
+  import_plan: (a) => importer("import_plan", a),
+  import_run: (a) => importer("import_run", a),
+  import_stop: (a) => importer("import_stop", a),
+  import_forget: (a) => importer("import_forget", a),
+  import_move_post: (a) => importer("import_move_post", a),
   account_password_change: ({ server, old, new: next, totp, recovery }) => {
     const { s, account } = needAccount(server);
     const opt = (v: unknown, name: string) => (v == null ? null : str(v, name));
@@ -581,6 +597,8 @@ const handlers: Record<string, Handler> = {
     return need(server).sendControl({ AdminUnban: { id } });
   },
   admin_list_bans: ({ server }) => need(server).sendControl("AdminListBans"),
+  admin_bans_page: ({ server, search, offset }) =>
+    need(server).sendControl({ AdminBansPage: { search: str(search, "search"), offset: u32(offset, "offset") } }),
 
   // ── voice ──
   start_transmit: async () => {

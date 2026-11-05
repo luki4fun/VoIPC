@@ -185,6 +185,9 @@ pub struct Files {
     pub(crate) emotes: Option<EmoteAccess>,
     /// Emote adds waiting for the relay's answer: by name and file.
     emote_waits: Mutex<Vec<EmoteWait>>,
+    /// The relay's last list, for a move from Discord: each name and its picture's hash.
+    #[cfg(not(target_os = "android"))]
+    emote_list: Mutex<Vec<(String, [u8; 32])>>,
 }
 
 /// An `EmoteAdd` waiting: a ticket to upload with, `None` when the relay had
@@ -286,7 +289,26 @@ impl Files {
             closed: AtomicBool::new(false),
             emotes,
             emote_waits: Mutex::new(Vec::new()),
+            #[cfg(not(target_os = "android"))]
+            emote_list: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The names of the emotes and stickers the relay last listed.
+    #[cfg(not(target_os = "android"))]
+    pub(crate) fn emote_names(&self) -> Vec<String> {
+        lock(&self.emote_list)
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    /// Whether the relay last listed this name with this picture.
+    #[cfg(not(target_os = "android"))]
+    pub(crate) fn emote_listed(&self, name: &str, hash: &[u8; 32]) -> bool {
+        lock(&self.emote_list)
+            .iter()
+            .any(|(n, h)| n == name && h == hash)
     }
 
     /// For a command: a message the relay's protocol lacks is its error.
@@ -353,6 +375,11 @@ impl Files {
                     );
                 }
                 drop(waits);
+                #[cfg(not(target_os = "android"))]
+                {
+                    *lock(&self.emote_list) =
+                        emotes.iter().map(|e| (e.name.clone(), e.hash)).collect();
+                }
                 let list: Vec<_> = emotes.iter().map(emote_json).collect();
                 (self.emit)(
                     "emote-list",

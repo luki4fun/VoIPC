@@ -30,7 +30,9 @@
 # each lane brings its own relay and browsers. CI sets it itself on its 4 cores.
 #
 # Prerequisites: VOIPC_SELFTEST=1 npm run web (a release bundle has no self-test),
-# openssl, curl with HTTP/2, and either chromium (CHROME=/path/to/chrome) or,
+# cargo build --release --locked -p voipc-server --example import_replay (the move
+# lane's importer; not with UI_TEST=0), openssl, curl with HTTP/2, and either
+# chromium (CHROME=/path/to/chrome) or,
 # for the Firefox lane, firefox (FIREFOX=...) plus certutil to trust the test
 # certificate (Arch: nss, Debian/Ubuntu: libnss3-tools).
 set -euo pipefail
@@ -122,6 +124,8 @@ SERVER="${SERVER:-target/release/voipc-server}"
 [ -x "$SERVER" ] || die "$SERVER missing — run VOIPC_SELFTEST=1 npm run web first"
 grep -qs SELFTEST client/dist-web/assets/*.js ||
   die "client/dist-web has no self-test — rebuild with VOIPC_SELFTEST=1 npm run web"
+[ "${UI_TEST:-1}" = 0 ] || [ -x target/release/examples/import_replay ] ||
+  die "import_replay missing — cargo build --release --locked -p voipc-server --example import_replay"
 
 TCP_PORT="${TCP_PORT:-19987}"
 DURATION="${DURATION:-15000}"
@@ -403,6 +407,8 @@ elif [ "$BROWSER_ALICE" = chromium ] || [ "$BROWSER_BOB" = chromium ]; then
     "community basics, in real browsers" "the community lane"
   add_lane moderation "test-moderation.mjs $((TCP_PORT + 600))" "Moderation and safety (test-moderation.mjs)" \
     "moderation and safety, in real browsers" "the moderation lane"
+  add_lane move "test-move.mjs $((TCP_PORT + 800))" "The move from Discord (test-move.mjs)" \
+    "the move from Discord, in real browsers" "the move lane"
   # exec: the job's pid has to be node itself, which the EXIT trap can stop.
   # TMPDIR: profiles and downloads go with $WORK.
   # shellcheck disable=SC2086

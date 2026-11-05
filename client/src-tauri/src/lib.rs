@@ -12,6 +12,7 @@ mod emote_sources;
 mod emotes;
 mod files;
 mod global_keys;
+mod import;
 mod media;
 mod mumblelink;
 mod network;
@@ -409,6 +410,12 @@ pub fn run() {
             emotes::emote_missing,
             emotes::emote_cache_clear,
             emote_sources::fetch_emote_source,
+            import::import_open,
+            import::import_plan,
+            import::import_run,
+            import::import_stop,
+            import::import_forget,
+            import::import_move_post,
             emotes::emote_stickers,
             files::cancel_file,
             files::file_stage,
@@ -503,6 +510,7 @@ pub fn run() {
             commands::admin_unban,
             commands::admin_ban_account,
             commands::admin_list_bans,
+            commands::admin_bans_page,
             // Persistent config
             commands::load_config,
             commands::save_connection_info,

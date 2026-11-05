@@ -1038,6 +1038,11 @@ async fn main() -> Result<()> {
                     Ok(_) => {}
                     Err(e) => warn!("moderation log sweep: {e}"),
                 }
+                match accounts::placeholder::sweep(&sweeper).await {
+                    Ok(n) if n > 0 => info!(dropped = n, "accounts nobody opened in time"),
+                    Ok(_) => {}
+                    Err(e) => warn!("unopened accounts sweep: {e}"),
+                }
             }
         });
         Some(relay)
@@ -1159,6 +1164,11 @@ async fn main() -> Result<()> {
             .context("reading the channel gates")?;
         gates::prune_logs(&state).await;
         accounts::refresh_chat_mods(&state).await;
+    }
+    // What came from Discord that is to go: deleting a channel, or what someone said
+    // about their posts, needs no more than to wake this.
+    if state.accounts.is_some() {
+        tokio::spawn(accounts::archive::worker(state.clone()));
     }
     // What the server's shell changes (roles, codes, bans) reaches
     // connections already open.

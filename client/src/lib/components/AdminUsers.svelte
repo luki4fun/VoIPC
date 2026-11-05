@@ -4,13 +4,14 @@
   // `AccountRequest::Admin`; the relay checks the privilege behind it.
   // Its look (sections, fields, lists, check lists) is AdminDialogs.svelte's.
 
-  import { onMount } from "svelte";
+  import { onMount, untrack } from "svelte";
   import {
     adminGroups,
     adminInvites,
     adminInviteLinks,
     inviteLinkCode,
     adminOp,
+    adminRead,
     adminUser,
     adminUsers,
     banAccount,
@@ -22,14 +23,17 @@
   import { confirmAction } from "../stores/confirm.js";
   import { olderRelay } from "../stores/relay.js";
   import { serverAddress } from "../stores/scoped.js";
-  import { community } from "../relay-rules.js";
+  import { community, moves } from "../relay-rules.js";
+  import { canLiftBan, expiryText, moveAccountKey, moveAccounts as cleanAccounts, moveChip, MOVE_FILTERS, ownPage } from "../move-rules.js";
+  import { excludeOne, importerAsking, moveAccountsPage, moveWizard } from "../stores/move.js";
   import { buildJoinLink, splitAddress } from "../invite.js";
   import { addNotification } from "../stores/notifications.js";
   import Icon from "./Icons.svelte";
-  import type { AdminUser } from "../types.js";
+  import type { AdminUser, MoveAccount, MoveFilter } from "../types.js";
 
   const PAGE = 50;
   let search = $state("");
+  let filter = $state<MoveFilter>("All");
   let inviteFor = $state("");
   let inviteDays = $state(7);
 
@@ -52,14 +56,56 @@
     disable: "Suspended",
     enable: "Unsuspended",
     account_delete: "Account deleted",
+    rename: "Name changed",
   };
 
+  /** With what the move knows of each account; on an older relay, and while the importer
+   *  asks for the same list of its own, the plain one. */
+  const paged = $derived(moves($olderRelay?.protocol ?? null) && !importerAsking($moveWizard.step));
+
+  const own = ownPage<{ search: string; offset: number; filter: MoveFilter }>();
+
   function list(offset = 0) {
-    void adminOp({ Users: { search: search.trim(), offset } });
+    const ask = { search: search.trim(), offset, filter };
+    own.asking(paged ? ask : null);
+    void adminOp(paged ? { MoveAccounts: ask } : { Users: { search: ask.search, offset } });
+  }
+
+  /** What is listed, whichever way it was asked for. */
+  const page = $derived.by<{ search: string; offset: number; total: number; rows: MoveAccount[] } | null>(() => {
+    if (paged) return $moveAccountsPage?.filter === filter ? $moveAccountsPage : null;
+    const u = $adminUsers;
+    if (!u) return null;
+    return {
+      ...u,
+      rows: cleanAccounts(u.users.map((user) => ({ user, state: "NotImported" as const, dc_id: "", expires_at: 0 }))),
+    };
+  });
+
+  // On mount, and when a run begins or ends: what was asked for before is not what `page` reads now
+  $effect(() => {
+    void paged;
+    untrack(() => list());
+  });
+
+  // The dashboard's refresh answers in the same store, with its own filter: a ban lifted, a run
+  // or an undo ended. A read, so a code being asked for and a refusal shown stay as they are
+  $effect(() => {
+    const again = $moveAccountsPage && own.page($moveAccountsPage.filter);
+    if (again) adminRead({ MoveAccounts: again });
+  });
+
+  async function liftBan(r: MoveAccount) {
+    const ok = await confirmAction({
+      title: `Lift the ban on ${r.user.name}?`,
+      body: "That Discord id is no longer shut out: they can come in the way anyone new can, and what they wrote stays. No later import bans them again or makes them an account, until you let them back in under Discord move, Left out.",
+      confirm: "Lift ban",
+    });
+    if (!ok) return;
+    excludeOne($serverAddress, r.dc_id, true, false);
   }
 
   onMount(() => {
-    list();
     if (!$adminGroups) void adminOp("Groups");
     if ($can("users:admin")) void adminOp("Invites");
   });
@@ -212,25 +258,39 @@
   <section class="section">
     <form class="inline-form" role="search" onsubmit={(e) => { e.preventDefault(); list(); }}>
       <input class="admin-input grow" type="search" placeholder="Search by name" aria-label="Search accounts" bind:value={search} />
+      {#if paged}
+        <select class="admin-select move-filter" aria-label="Which accounts" bind:value={filter} onchange={() => list()}>
+          {#each MOVE_FILTERS as [value, label] (value)}
+            <option {value}>{label}</option>
+          {/each}
+        </select>
+      {/if}
       <button type="submit" class="btn btn-secondary">
         <Icon name="search" size={16} /> Search
       </button>
     </form>
-    {#if $adminUsers}
-      {@const page = $adminUsers}
-      {#if page.users.length === 0}
+    {#if page}
+      {#if page.rows.length === 0}
         <p class="admin-hint">No accounts{page.search ? ` match “${page.search}”` : ""}.</p>
       {:else}
         <ul class="list">
-          {#each page.users as u (u.name)}
-            <li>
+          {#each page.rows as r (moveAccountKey(r))}
+            {@const u = r.user}
+            {@const chip = moveChip(r.state)}
+            {@const liftable = canLiftBan(r)}
+            <li class:liftable>
               <button type="button" class="list-row" onclick={() => open(u)}>
                 <span class="row-text">
-                  <span class="row-name">{u.name}</span>
-                  <span class="row-meta">since {day(u.created_at)}{u.totp ? " · codes on" : ""}</span>
+                  <span class="row-name">{u.name}{#if chip}<span class="pill move-chip" data-state={r.state}>{chip}</span>{/if}</span>
+                  <span class="row-meta">
+                    since {day(u.created_at)}{u.totp ? " · codes on" : ""}{r.state === "Waiting" ? ` · ${expiryText(r.expires_at)}` : ""}{r.dc_id ? ` · Discord ${r.dc_id}` : ""}
+                  </span>
                 </span>
                 <span class="row-chevron"><Icon name="chevron-down" size={16} /></span>
               </button>
+              {#if liftable}
+                <button type="button" class="btn btn-secondary move-lift" onclick={() => liftBan(r)}>Lift ban</button>
+              {/if}
             </li>
           {/each}
         </ul>
@@ -238,7 +298,7 @@
           <span class="admin-hint push-left">
             {page.total <= PAGE
               ? `${page.total} account${page.total === 1 ? "" : "s"}`
-              : `${page.offset + 1}–${page.offset + page.users.length} of ${page.total} accounts`}
+              : `${page.offset + 1}–${page.offset + page.rows.length} of ${page.total} accounts`}
           </span>
           {#if page.total > PAGE}
             <button type="button" class="btn btn-secondary" disabled={page.offset === 0} onclick={() => list(Math.max(0, page.offset - PAGE))}>Newer</button>
@@ -364,6 +424,21 @@
 {/if}
 
 <style>
+  .liftable {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2, 8px);
+  }
+
+  .liftable .list-row {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .move-lift {
+    flex: none;
+  }
+
   .code-box {
     display: flex;
     flex-direction: column;

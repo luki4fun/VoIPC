@@ -14,12 +14,13 @@ import { serverAddress } from "./connection.js";
 import { can } from "./powers.js";
 import { relayAccounts } from "./account.js";
 import { olderRelay } from "./relay.js";
-import { community, moderation } from "../relay-rules.js";
+import { community, moderation, moves } from "../relay-rules.js";
+import { mergeBanPage, type BanPage } from "../move-rules.js";
 import { mergeModRows, removalDone } from "../modlog-rules.js";
 import { addNotification } from "./notifications.js";
 import { scoped } from "./scoped.js";
 import { PANEL_SCOPES } from "../scopes.js";
-import type { AdminOp, AdminReply, BanInfo } from "../types.js";
+import type { AdminReply, BanInfo } from "../types.js";
 import {
   adminError,
   adminGate,
@@ -35,6 +36,7 @@ import {
   adminUsers,
   inviteCode,
   lastOp,
+  removalWithCode,
   stepUp,
 } from "./admin-ops.js";
 
@@ -43,6 +45,10 @@ export const showAdminPanel = writable(false);
 export const adminToken = writable("");
 /** Each server's ban list; the dialogs show the one on screen. */
 export const bans = scoped<BanInfo[]>(() => []);
+/** How many bans the search on screen finds, here or not. */
+export const banTotal = scoped<number>(() => 0);
+/** What the list on screen was asked for. */
+export const banSearch = scoped<string>(() => "");
 
 /** Whoever holds one of the panel's privileges (or is admin) opens it. */
 export const panelAllowed = derived(
@@ -71,7 +77,42 @@ serverAddress.subscribe(() => {
   adminToken.set("");
 });
 
-listenServer<{ bans: BanInfo[] }>("admin-bans", (server, data) => bans.of(server).set(data.bans));
+// A relay before protocol 20 sends the whole list, and nothing at all past a frame's worth
+listenServer<{ bans: BanInfo[] }>("admin-bans", (server, data) => {
+  bans.of(server).set(data.bans);
+  banTotal.of(server).set(data.bans.length);
+});
+listenServer<BanPage>("admin-bans-page", (server, data) => {
+  const wanted = get(banSearch.of(server));
+  if (data.search !== wanted) {
+    // A change answers with the first page of no search, and the box still says what it says.
+    // Any other is an old answer, with the one wanted on its way
+    if (data.search === "" && data.offset === 0) askBans(server, wanted, 0);
+    return;
+  }
+  bans.of(server).update((held) => mergeBanPage(held, data));
+  banTotal.of(server).set(data.total);
+});
+
+/** Ask a relay at protocol 20 for a page of the list. */
+function askBans(server: string, search: string, offset: number): void {
+  invoke("admin_bans_page", { server, search, offset }).catch((e: unknown) =>
+    addNotification(`Could not load bans: ${e}`, "error"),
+  );
+}
+
+/** The first page of what a search finds; "" is all of them. */
+export function searchBans(search: string): void {
+  const server = get(serverAddress);
+  banSearch.of(server).set(search);
+  askBans(server, search, 0);
+}
+
+/** The next page, from however many rows are here. */
+export function moreBans(): void {
+  const server = get(serverAddress);
+  askBans(server, get(banSearch.of(server)), get(bans.of(server)).length);
+}
 
 export async function submitAdminLogin(): Promise<void> {
   const server = get(serverAddress);
@@ -88,7 +129,12 @@ export async function submitAdminLogin(): Promise<void> {
 export function openAdminPanel(): void {
   showAdminPanel.set(true);
   if (!get(can)("voipc:bans")) return;
-  invoke("admin_list_bans", { server: get(serverAddress) }).catch((e: unknown) =>
+  const server = get(serverAddress);
+  if (moves(get(olderRelay.of(server))?.protocol ?? null)) {
+    searchBans("");
+    return;
+  }
+  invoke("admin_list_bans", { server }).catch((e: unknown) =>
     addNotification(`Could not load bans: ${e}`, "error"),
   );
 }
@@ -133,13 +179,6 @@ export function expiry(ban: BanInfo): string {
 // too (a channel's gate) without the import cycle through connect.ts.
 
 export * from "./admin-ops.js";
-
-/**
- * The removal a code was just sent for, per server. Its checks came before the code
- * was asked for, so a refusal now is that code: from the ban dialog there is no button
- * to press again, and a moderator may have no ban list to do it from.
- */
-const removalWithCode = new Map<string, AdminOp>();
 
 /** The step that asked for a code, sent again with it. */
 export function submitStepUp(code: string): void {
@@ -186,6 +225,8 @@ listenServer<unknown>("account-reply", (server, raw) => {
     stepUp.of(server).set(null);
     addNotification(`${fromServer(server)}${removalDone(a.PostsRemoved.entries)}`, "info");
   }
+  // The code was good: what comes next is not about it (stores/move.ts, stores/imported.ts)
+  else if ("ImportUndone" in a || "MoveExcluded" in a || "ArchiveDeleted" in a) removalWithCode.delete(server);
   else if ("ModLog" in a) {
     const { before, rows, more, keep_days } = a.ModLog;
     adminModLog.of(server).update((had) => ({

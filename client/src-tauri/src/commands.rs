@@ -77,6 +77,10 @@ pub async fn disconnect(
     // The user's own leave: a game may not bring them back with a hello after
     // a reconnect (S-030)
     state.user_moved.fetch_add(1, Ordering::Relaxed);
+    // A cut comes this way too, on every reconnect try, and a run goes on after one with the
+    // token it has. Only what is going stops: the page forgets when the person disconnects
+    #[cfg(not(target_os = "android"))]
+    state.import.stop(&server);
     // Out of the map under the lock, torn down outside it (see `teardown`).
     // Its Signal state goes with it: it lived on the connection.
     let connection = state.connections.write().await.remove(&server);
@@ -99,6 +103,10 @@ pub async fn disconnect_all(
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
+    // Of every server, connected or not: a cut has taken its own out of the map, and the page
+    // that could go on with its token is gone
+    #[cfg(not(target_os = "android"))]
+    state.import.forget_all();
     let all: Vec<_> = state.connections.write().await.drain().collect();
     for (server, connection) in all {
         network::teardown(&state, &app_handle, &server, connection).await;
@@ -3521,7 +3529,8 @@ pub async fn admin_ban_account(
     .await
 }
 
-/// Lift a ban by its id (admin only). The updated list arrives as `admin-bans`.
+/// Lift a ban by its id (admin only). The updated list arrives as `admin-bans-page`, or
+/// `admin-bans` from a relay before protocol 20.
 #[tauri::command]
 pub async fn admin_unban(
     state: State<'_, AppState>,
@@ -3537,10 +3546,27 @@ pub async fn report_takers_get(state: State<'_, AppState>, server: String) -> Re
     send_admin_message(&state, &server, ClientMessage::ReportTakersGet).await
 }
 
-/// Request the ban list (admin only); delivered as the `admin-bans` event.
+/// Request the ban list (admin only) of a relay before protocol 20; delivered as the
+/// `admin-bans` event.
 #[tauri::command]
 pub async fn admin_list_bans(state: State<'_, AppState>, server: String) -> Result<(), String> {
     send_admin_message(&state, &server, ClientMessage::AdminListBans).await
+}
+
+/// A page of the ban list (admin only), protocol 20; delivered as the `admin-bans-page` event.
+#[tauri::command]
+pub async fn admin_bans_page(
+    state: State<'_, AppState>,
+    server: String,
+    search: String,
+    offset: u32,
+) -> Result<(), String> {
+    send_admin_message(
+        &state,
+        &server,
+        ClientMessage::AdminBansPage { search, offset },
+    )
+    .await
 }
 
 /// Forget the TOFU-pinned certificate of a server (after a legitimate

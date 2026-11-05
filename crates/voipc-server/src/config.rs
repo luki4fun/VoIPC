@@ -153,6 +153,12 @@ pub struct AccountsConfig {
     pub public_url: String,
     /// New accounts an hour at most. A move from another service can want more.
     pub signups_per_hour: u32,
+    /// How long an account a move from Discord made waits for someone to open it. 0: for
+    /// good, so a mistyped 0 cannot wipe an import.
+    pub unclaimed_days: u32,
+    /// How long what came from Discord is kept, by when it was written. 0: until someone
+    /// removes it, since an owner moved for the history and an expiry cannot be undone.
+    pub archive_days: u32,
 }
 
 impl Default for AccountsConfig {
@@ -168,6 +174,8 @@ impl Default for AccountsConfig {
             key_file: "voipc-accounts.key".into(),
             public_url: String::new(),
             signups_per_hour: 60,
+            unclaimed_days: 90,
+            archive_days: 0,
         }
     }
 }
@@ -577,6 +585,34 @@ mod tests {
         assert!(off.validate().is_ok(), "no accounts, no quota to mind");
         assert!(parse("max_users = 0").validate().is_err());
         assert!(parse("max_connections_per_ip = 1").validate().is_err());
+    }
+
+    #[test]
+    fn unclaimed_days_defaults_to_90_and_an_old_config_parses() {
+        let parse = |extra: &str| {
+            toml::from_str::<ServerConfig>(&format!("cert_path = \"c\"\nkey_path = \"k\"\n{extra}"))
+                .unwrap()
+        };
+        let old = parse("[accounts]\nmode = \"optional\"\ndatabase = \"sqlite://voipc.db\"");
+        assert_eq!(old.accounts.unclaimed_days, 90);
+        old.validate().unwrap();
+        let never = parse("[accounts]\nmode = \"optional\"\nunclaimed_days = 0");
+        assert_eq!(never.accounts.unclaimed_days, 0);
+        never.validate().unwrap();
+    }
+
+    #[test]
+    fn archive_days_defaults_to_keeping_and_a_mistyped_key_is_refused() {
+        let parse = |extra: &str| {
+            toml::from_str::<ServerConfig>(&format!("cert_path = \"c\"\nkey_path = \"k\"\n{extra}"))
+        };
+        let old = parse("[accounts]\nmode = \"optional\"").unwrap();
+        assert_eq!(old.accounts.archive_days, 0);
+        old.validate().unwrap();
+        let days = parse("[accounts]\nmode = \"optional\"\narchive_days = 400").unwrap();
+        assert_eq!(days.accounts.archive_days, 400);
+        days.validate().unwrap();
+        assert!(parse("[accounts]\nmode = \"optional\"\narchive_day = 400").is_err());
     }
 
     #[test]

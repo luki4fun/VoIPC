@@ -1,0 +1,20 @@
+{
+  "user": {
+    "id": "1190000000000000002",
+    "username": "voipc-importer",
+    "discriminator": "0",
+    "global_name": null,
+    "avatar": null,
+    "bot": true
+  },
+  "nick": null,
+  "avatar": null,
+  "roles": [
+    "1190000000000000106"
+  ],
+  "joined_at": "2024-01-02T03:04:05.000000+00:00",
+  "deaf": false,
+  "mute": false,
+  "flags": 0,
+  "pending": false
+}

@@ -5,8 +5,9 @@ use std::collections::HashMap;
 use anyhow::Result;
 use l4f_accounts::model::{AccountId, Role};
 use l4f_accounts::store::Store;
-use voipc_protocol::types::{ChannelCategory, GroupStyle};
+use voipc_protocol::types::{ChannelCategory, ChannelGate, GroupStyle};
 
+use super::import::{KIND_CATEGORY, KIND_CHANNEL};
 use super::Relay;
 use crate::channels::ChannelEntry;
 
@@ -250,6 +251,101 @@ impl Relay {
         Ok(())
     }
 
+    /// A channel the importer made: its gate, its row and the ledger's, all or none. Nothing
+    /// half made is left for the next run to trip over, nor a channel with no gate on it.
+    /// `archive_private` goes one way: an import never clears it.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn import_channel_put(
+        &self,
+        run: i64,
+        dc_id: u64,
+        entry: &ChannelEntry,
+        gate: &ChannelGate,
+        position: i64,
+        category: Option<u32>,
+        private: bool,
+    ) -> Result<()> {
+        let conv = entry.log_conv();
+        let text = serde_json::to_string(entry)?;
+        let (join, speak) = (gate.groups.join(" "), gate.speakers.join(" "));
+        db!(self.store(), pool => {
+            let mut tx = pool.begin().await?;
+            if join.is_empty() && speak.is_empty() {
+                sqlx::query("DELETE FROM voipc_gates WHERE conv = $1").bind(&conv).execute(&mut *tx).await?;
+            } else {
+                sqlx::query(
+                    "INSERT INTO voipc_gates (conv, may_join, may_speak) VALUES ($1, $2, $3)
+                     ON CONFLICT (conv) DO UPDATE SET may_join = excluded.may_join, may_speak = excluded.may_speak",
+                )
+                .bind(&conv)
+                .bind(&join)
+                .bind(&speak)
+                .execute(&mut *tx)
+                .await?;
+            }
+            sqlx::query(
+                "INSERT INTO voipc_channels (conv, entry, position, category, archive_private)
+                 VALUES ($1, $2, $3, $4, $5)
+                 ON CONFLICT (conv) DO UPDATE SET entry = excluded.entry, position = excluded.position,
+                   category = excluded.category,
+                   archive_private = voipc_channels.archive_private OR excluded.archive_private",
+            )
+            .bind(&conv)
+            .bind(&text)
+            .bind(position as i32)
+            .bind(category.map(|c| c as i32))
+            .bind(private)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO voipc_import_items (kind, dc_id, import_id, local) VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (kind, dc_id) DO NOTHING",
+            )
+            .bind(KIND_CHANNEL)
+            .bind(dc_id as i64)
+            .bind(run)
+            .bind(&conv)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+        });
+        Ok(())
+    }
+
+    /// Categories the importer made, each with its Discord id and place, in one write.
+    pub async fn import_categories_put(
+        &self,
+        run: i64,
+        rows: &[(u64, ChannelCategory, i64)],
+    ) -> Result<()> {
+        db!(self.store(), pool => {
+            let mut tx = pool.begin().await?;
+            for (dc_id, c, position) in rows {
+                sqlx::query(
+                    "INSERT INTO voipc_categories (id, name, position) VALUES ($1, $2, $3)
+                     ON CONFLICT (id) DO UPDATE SET name = excluded.name, position = excluded.position",
+                )
+                .bind(c.id as i32)
+                .bind(&c.name)
+                .bind(*position as i32)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "INSERT INTO voipc_import_items (kind, dc_id, import_id, local) VALUES ($1, $2, $3, $4)
+                     ON CONFLICT (kind, dc_id) DO NOTHING",
+                )
+                .bind(KIND_CATEGORY)
+                .bind(*dc_id as i64)
+                .bind(run)
+                .bind(c.id.to_string())
+                .execute(&mut *tx)
+                .await?;
+            }
+            tx.commit().await?;
+        });
+        Ok(())
+    }
+
     pub async fn category_put(&self, c: &ChannelCategory, position: i64) -> Result<()> {
         db!(self.store(), pool => {
             sqlx::query(
@@ -265,11 +361,18 @@ impl Relay {
         Ok(())
     }
 
-    /// The category goes; its channels stay, outside any.
+    /// The category goes; its channels stay, outside any. An import's row stays too, so that
+    /// a delta does not make it again, but names nothing now: the next category made may
+    /// get this id, and is nobody's import.
     pub async fn category_delete(&self, id: u32) -> Result<()> {
         db!(self.store(), pool => {
             sqlx::query("UPDATE voipc_channels SET category = NULL WHERE category = $1").bind(id as i32).execute(pool).await?;
             sqlx::query("DELETE FROM voipc_categories WHERE id = $1").bind(id as i32).execute(pool).await?;
+            sqlx::query("UPDATE voipc_import_items SET local = '' WHERE kind = $1 AND local = $2")
+                .bind(KIND_CATEGORY)
+                .bind(id.to_string())
+                .execute(pool)
+                .await?;
         });
         Ok(())
     }

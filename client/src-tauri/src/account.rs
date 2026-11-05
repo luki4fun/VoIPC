@@ -710,6 +710,11 @@ pub async fn on_reply(
             warn!(server, "could not remember this device: {reason}");
         }
     }
+    // A run's frames are answered 8 times a second, in numbers a page cannot hold
+    #[cfg(not(target_os = "android"))]
+    let Some(reply) = app.state::<AppState>().import.on_reply(server, reply) else {
+        return;
+    };
     let a = link.session().on_reply(&reply);
     run(app, server, tcp_tx, a).await;
 }
@@ -1098,7 +1103,13 @@ pub async fn account_request(
 ) -> Result<(), String> {
     let connections = state.connections.read().await;
     let (connection, _) = signed_in(&connections, &server)?;
-    crate::network::send_tcp_message_sync(&connection.tcp_tx, &ClientMessage::Account(request));
+    let message = ClientMessage::Account(request);
+    #[cfg(not(target_os = "android"))]
+    state
+        .import
+        .send_for_page(&server, &connection.tcp_tx, &message);
+    #[cfg(target_os = "android")]
+    crate::network::send_tcp_message_sync(&connection.tcp_tx, &message);
     Ok(())
 }
 

@@ -20,7 +20,7 @@
 
 ---
 
-**VoIPC** is an encrypted, self-hosted voice/video/chat application. Think Discord or TeamSpeak, but with end-to-end encryption, zero data collection, and a server that keeps nothing it can read: only, for a day by default, the encrypted copies of files posted in chat, unless its operator also turns on accounts.
+**VoIPC** is an encrypted, self-hosted voice/video/chat application. Think Discord or TeamSpeak, but with end-to-end encryption, zero data collection, and a server that keeps nothing it can read: only, for a day by default, the encrypted copies of files posted in chat, unless its operator also turns on accounts. The one exception: an operator who moves a Discord server here can import its old messages. Those were never encrypted, this server can read them, and the app labels them so.
 
 No accounts required. No telemetry. No compromises.
 
@@ -337,6 +337,7 @@ VoIPC/
 │   ├── voipc-video/        # H.264/H.265 encoding, H.264/H.265/VP8/VP9 decoding, fragment assembly
 │   ├── voipc-crypto/       # Signal Protocol, AES-256-GCM, key management
 │   ├── voipc-media/        # Sanitizes pictures from others (chat photos, emotes, stickers)
+│   ├── voipc-import/       # Reads a Discord server for the desktop importer; no HTTP client, no disk
 │   ├── voipc-web/          # wasm build of protocol + crypto for the browser client
 │   ├── voipc-opus-wasm/    # The browser's Opus decoder, run in the mixer's AudioWorklet
 │   └── voipc-media-wasm/   # voipc-media for the browser's file worker
@@ -363,6 +364,7 @@ VoIPC/
 ├── setup.sh / setup.ps1    # One-command dependency installer (Rust, Node, system libs)
 ├── test-web.sh             # Headless two-browser end-to-end test of the web client
 ├── test-ui.mjs             # UI end-to-end test, driven by test-web.sh
+├── test-move.mjs           # The move from Discord, in real browsers, driven by test-web.sh
 └── Cargo.toml              # Workspace root
 ```
 
@@ -472,6 +474,7 @@ To build it yourself:
 ```bash
 npm run web        # wasm + Vite bundle, then a server binary that embeds it
 VOIPC_SELFTEST=1 npm run web   # the same with the in-page self-test, which test:web needs
+cargo build --release --locked -p voipc-server --example import_replay   # and the importer its move lane runs
 npm run test:web   # headless two-browser end-to-end check (voice, chat, DMs, screen share,
                    # proximity, and a run through the real UI in the Chromium lanes)
 npm --prefix client test   # browser-side unit tests (spatial maths, room presets)
@@ -492,7 +495,7 @@ The server never holds a media key: it relays the encrypted blobs members hand e
 
 ### What the server never sees
 
-- Message contents — encrypted with Signal Protocol before leaving your device
+- Message contents — encrypted with Signal Protocol before leaving your device (apart from a Discord import, below)
 - Voice/video content — encrypted with AES-256-GCM before transmission
 - Chat history — stored on your device, encrypted; on a server with accounts also as end-to-end-encrypted
   copies for members who choose them, which the server cannot read
@@ -533,6 +536,7 @@ should hear it instead of to everybody:
 Off unless the operator sets `[accounts] mode`. Then the server keeps a database — and every member is told what is in it:
 
 - **For every account:** its name; an Argon2id hash of a secret the app derives from your password (the password itself never leaves your device); your identity's public key; the public key of each device you sign in on with your password, which lets that device sign in without the password (*Forget* under *Your account* ends that; the server deletes a key unused for 90 days); your two-factor secret, sealed with a key file kept outside the database; your roles; and sign-in records with hashed IP addresses (the server's log holds plain addresses only at its `debug` level). Bans: a keyed hash of a banned address, never the address, and banned accounts
+- **If its operator moved a Discord server here:** the messages it could read there, with names, Discord ids, reactions and the names of files, in a table the server can read and whoever holds its database can change. It also learns who opens that archive and what they search for, and keeps neither. Live messages, kept copies and direct messages are not touched by this. Link your Discord account to hide or delete your posts. For the operator: [docs/MOVING.md](docs/MOVING.md).
 - **If you report a message:** the server sees that you asked who takes reports, and then direct messages to them, like any others. For someone away it holds a sealed copy, if you choose that in the dialog. Never the text or your reason. Nor who wrote it or where, unless you send the message's file along, which the dialog offers and lets you untick: the server holds that same file in the conversation it came from, so it can then see which one that was. The people you report to see your name.
 - **If a moderator removes your posts with a ban:** everyone's app is told your account or name, who did it and the time span, while the moderation log keeps the row, and collapses its copies. What the server kept of your channel messages is gone; direct messages stay.
 - **If a moderator acts on you, or you moderate:** a row in the moderation log, which holders of that privilege read: who did what to whom and why (a restriction's reason, only if they can restrict too), by name, for 180 days unless the operator chooses otherwise, also after the account is deleted. Never an address, and someone behind a pseudonym stays behind it

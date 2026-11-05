@@ -985,6 +985,12 @@ impl ControlTx {
         self.tx.is_closed()
     }
 
+    /// Done when the connection's writer has gone.
+    #[cfg(not(target_os = "android"))]
+    pub async fn closed(&self) {
+        self.tx.closed().await
+    }
+
     /// Queues `msg`, one entry per frame so the pacer counts what the relay
     /// does. A message the relay's protocol lacks is refused here.
     pub fn send(&self, msg: &ClientMessage) -> Result<(), String> {
@@ -2569,6 +2575,19 @@ async fn handle_server_message(
                 server,
                 "admin-bans",
                 serde_json::json!({"bans": bans}),
+            );
+        }
+        ServerMessage::AdminBansPaged {
+            search,
+            offset,
+            total,
+            bans,
+        } => {
+            emit_server(
+                app_handle,
+                server,
+                "admin-bans-page",
+                serde_json::json!({"search": search, "offset": offset, "total": total, "bans": bans}),
             );
         }
         ServerMessage::Disconnected { reason } => {

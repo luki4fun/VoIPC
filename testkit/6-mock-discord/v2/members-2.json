@@ -1,0 +1,129 @@
+[
+  {
+    "user": {
+      "id": "1190000000000001006",
+      "username": "gina",
+      "discriminator": "0",
+      "global_name": "Gina",
+      "avatar": null
+    },
+    "nick": null,
+    "avatar": null,
+    "roles": [],
+    "joined_at": "2024-01-02T03:04:05.000000+00:00",
+    "deaf": false,
+    "mute": false,
+    "flags": 0,
+    "pending": true
+  },
+  {
+    "user": {
+      "id": "1190000000000001007",
+      "username": "helperbot",
+      "discriminator": "0",
+      "global_name": "Helper",
+      "avatar": null,
+      "bot": true
+    },
+    "nick": null,
+    "avatar": null,
+    "roles": [],
+    "joined_at": "2024-01-02T03:04:05.000000+00:00",
+    "deaf": false,
+    "mute": false,
+    "flags": 0,
+    "pending": false
+  },
+  {
+    "user": {
+      "id": "1190000000000001008",
+      "username": "hugo",
+      "discriminator": "0",
+      "global_name": "Hugo",
+      "avatar": null
+    },
+    "nick": null,
+    "avatar": null,
+    "roles": [
+      "1190000000000000104"
+    ],
+    "joined_at": "2024-01-02T03:04:05.000000+00:00",
+    "deaf": false,
+    "mute": false,
+    "flags": 0,
+    "pending": false
+  },
+  {
+    "user": {
+      "id": "1190000000000001009",
+      "username": "olga",
+      "discriminator": "0",
+      "global_name": "Olga",
+      "avatar": null
+    },
+    "nick": null,
+    "avatar": null,
+    "roles": [],
+    "joined_at": "2024-01-02T03:04:05.000000+00:00",
+    "deaf": false,
+    "mute": false,
+    "flags": 0,
+    "pending": false
+  },
+  {
+    "user": {
+      "id": "1190000000000001010",
+      "username": "nell",
+      "discriminator": "0",
+      "global_name": null,
+      "avatar": null
+    },
+    "nick": null,
+    "avatar": null,
+    "roles": [],
+    "joined_at": null,
+    "deaf": false,
+    "mute": false,
+    "flags": 0,
+    "pending": false
+  },
+  {
+    "user": {
+      "id": "1190000000000000002",
+      "username": "voipc-importer",
+      "discriminator": "0",
+      "global_name": null,
+      "avatar": null,
+      "bot": true
+    },
+    "nick": null,
+    "avatar": null,
+    "roles": [
+      "1190000000000000106"
+    ],
+    "joined_at": "2024-01-02T03:04:05.000000+00:00",
+    "deaf": false,
+    "mute": false,
+    "flags": 0,
+    "pending": false
+  },
+  {
+    "user": {
+      "id": "1190000000000001004",
+      "username": "cal",
+      "discriminator": "0",
+      "global_name": "Cal",
+      "avatar": null
+    },
+    "nick": null,
+    "avatar": null,
+    "roles": [
+      "3310000000000000101"
+    ],
+    "joined_at": "2024-01-02T03:04:05.000000+00:00",
+    "deaf": false,
+    "mute": false,
+    "flags": 0,
+    "pending": false
+  }
+]

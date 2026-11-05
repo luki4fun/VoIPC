@@ -25,6 +25,15 @@ const ACTIONS = new Map<string, [string, string]>([
   ["remove_posts", ["removed the posts of", ""]],
   ["hide", ["hid a message of", ""]],
   ["unhide", ["showed again a message of", ""]],
+  ["import", ["began a move from Discord", ""]],
+  ["import_done", ["finished a move from Discord", ""]],
+  ["import_undo", ["undid a move from Discord", ""]],
+  ["import_exclude", ["left someone out of the move from Discord", ""]],
+  ["import_include", ["let someone back into the move from Discord", ""]],
+  ["power_grant", ["gave", "what they could do on Discord"]],
+  ["power_drop", ["said no to", "keeping what they could do on Discord"]],
+  ["unclaimed_expired", ["removed accounts nobody signed in to", ""]],
+  ["archive_delete", ["deleted posts imported from Discord", ""]],
 ]);
 
 /** An action in words, around its target. One this app does not know yet shows as
@@ -53,15 +62,19 @@ export function removalWindows(admin: boolean): [number, string][] {
   return admin ? [...each, [0, "Everything kept"]] : each;
 }
 
-/** What removing does, said before it is done. `account`: the person has one here. */
-export function removalHint(account: boolean): string {
-  return account
-    ? "Deletes what this server keeps of their channel messages, not direct messages. It cannot delete copies on people's devices: those are hidden with your name on them, and anyone can still show them. A limited window can bring back an older message they deleted or edited, for devices reading the log anew: their delete or edit goes, and the older text stays. It does not undo when the ban ends."
-    : "A guest has nothing kept here: this only asks devices to hide what they hold.";
+/** What removing does, said before it is done. `account`: the person has one here.
+ *  `imported`: the relay can hold posts brought from Discord (protocol 20). */
+export function removalHint(account: boolean, imported = false): string {
+  if (!account) return "A guest has nothing kept here: this only asks devices to hide what they hold.";
+  const kept =
+    "Deletes what this server keeps of their channel messages, not direct messages. It cannot delete copies on people's devices: those are hidden with your name on them, and anyone can still show them. A limited window can bring back an older message they deleted or edited, for devices reading the log anew: their delete or edit goes, and the older text stays. It does not undo when the ban ends.";
+  return imported ? `${kept} This also takes their posts imported from Discord in that time span, counted by when they were written.` : kept;
 }
 
 /** Whether removing from this row of Active bans reaches an account. The relay goes
- *  by the name, so an address row counts too when that name also has an account row. */
+ *  by the name, so an address row counts too when that name also has an account row.
+ *  The list can be a part: account rows come first, and a search finds both by that
+ *  name, so that row is here by the time this one is. */
 export function removalReachesAccount(
   row: Pick<BanInfo, "account" | "label">,
   bans: readonly Pick<BanInfo, "account" | "label">[],

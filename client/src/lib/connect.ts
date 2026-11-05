@@ -42,7 +42,8 @@ import { splitName, withTag } from "./username.js";
 import { clearRosters } from "./stores/rosters.js";
 import { clearProfiles } from "./stores/profiles.js";
 import { dropEmotes } from "./stores/emotes.js";
-import { dropServer, scoped } from "./stores/scoped.js";
+import { dropKept, dropServer, scoped } from "./stores/scoped.js";
+import { lastOp, removalWithCode } from "./stores/admin-ops.js";
 import {
   buildEntries,
   openServers,
@@ -450,7 +451,8 @@ export async function saveOpenServers(): Promise<void> {
 
 /**
  * Forget what a connection held, keeping the server open: everything in a
- * scoped store, its unread counts, and the call if it was this server's.
+ * scoped store but one made `kept`, its unread counts, and the call if it was
+ * this server's.
  *
  * A channel id or a user id is a slot in one server's run — a reconnect may
  * land on a restarted server where the numbers have been handed out again — so
@@ -461,6 +463,10 @@ export function resetServer(server: string): void {
   clearProfiles(server);
   dropEmotes(server);
   dropServer(server);
+  // Not scoped, and as much the connection's: what they name gets no answer now, and a later
+  // refusal must not bring it back
+  lastOp.delete(server);
+  removalWithCode.delete(server);
   dropPrompts(server);
   clearServerUnread(server);
   if (get(voice)?.server === server) voice.set(null);
@@ -473,6 +479,9 @@ function removeServer(server: string): void {
   reconnectRuns.delete(server);
   releaseBrowserMarks(server);
   resetServer(server);
+  dropKept(server);
+  // The bot's token goes with the wizard that holds it. A cut keeps both, for a run to go on
+  invoke("import_forget", { server }).catch(() => {});
   details.delete(server);
   // What it sent can no longer be answered: its connection is gone
   pendingInvites.update((list) => list.filter((i) => i.server !== server));

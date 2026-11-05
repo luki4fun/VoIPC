@@ -127,6 +127,9 @@ pub struct UserSession {
     /// Asking who takes a report: each ask reads the groups of a relay with
     /// accounts, and nobody reports twice a minute for long.
     pub report_rate: RateLimiter,
+    /// Searching what came from Discord: each request reads rows for up to a fifth of a
+    /// second, so it has its own small budget.
+    pub archive_search_rate: RateLimiter,
     /// Rate limiter for keyframe requests relayed *to* this user as a sharer
     /// (each one forces an IDR); per share, so many viewers losing the same
     /// frames cannot storm the sharer.
@@ -221,6 +224,10 @@ pub struct AccountSession {
     /// A device-key enrolment challenge waiting for its signature, and the
     /// nonce it was issued against (kept here, never sent).
     pub device_challenge: Option<(String, [u8; 16])>,
+    /// When the new-member wait starts for an account the move from Discord knows, 0 if
+    /// it was served there (`placeholder::wait_start`). None: from `created_at`, as for
+    /// anyone else, and always while no wait is set.
+    pub wait_from: Option<i64>,
     /// Its groups and badges, read with the scopes.
     pub standing: crate::accounts::Standing,
     /// When a code last passed an admin step-up (`AdminReply::StepUp`).
@@ -331,6 +338,7 @@ impl UserSession {
             log_read_rate: RateLimiter::new(60.0, 20.0),
             profile_rate: RateLimiter::new(40.0, 10.0),
             report_rate: RateLimiter::new(4.0, 1.0 / 30.0),
+            archive_search_rate: RateLimiter::new(10.0, 1.0),
             keyframe_relay_rate: RateLimiter::new(2.0, 1.0),
             loss_report_rate: RateLimiter::new(2.0, 1.0),
             // Everything a client says about itself — muted, deafened, sharing
@@ -755,6 +763,8 @@ pub struct ServerState {
     pub routing: crate::routing::Routing,
     /// Opt-in accounts; `None` when `[accounts] mode = "off"`.
     pub accounts: Option<Arc<crate::accounts::Relay>>,
+    /// The importer's run in progress (`accounts::import`).
+    pub import: tokio::sync::Mutex<Option<crate::accounts::import::ActiveRun>>,
     /// The live session of each signed-in account: a new sign-in replaces it.
     pub account_sessions: DashMap<[u8; 16], SessionId>,
     /// When each member last wrote in each slow-mode channel (`post_rules`).
@@ -901,6 +911,7 @@ impl ServerState {
             next_channel_id: AtomicU32::new(next_id),
             routing: crate::routing::Routing::default(),
             accounts: None,
+            import: tokio::sync::Mutex::new(None),
             account_sessions: DashMap::new(),
             post_marks: DashMap::new(),
             tcp_fallback: config.tcp_fallback,

@@ -1,0 +1,74 @@
+[
+  {
+    "id": "1200000000000005101",
+    "type": 21,
+    "channel_id": "1200000000000005005",
+    "author": {
+      "id": "1190000000000001001",
+      "username": "dan_d",
+      "discriminator": "0",
+      "global_name": "Dan D",
+      "avatar": null
+    },
+    "content": "",
+    "timestamp": "2024-02-01T10:00:00.000000+00:00",
+    "edited_timestamp": null,
+    "tts": false,
+    "mention_everyone": false,
+    "mentions": [],
+    "mention_roles": [],
+    "attachments": [],
+    "embeds": [],
+    "pinned": false,
+    "message_reference": {
+      "type": 0,
+      "message_id": "1200000000000005005",
+      "channel_id": "1190000000000000211",
+      "guild_id": "1190000000000000001"
+    }
+  },
+  {
+    "id": "1200000000000005102",
+    "type": 0,
+    "channel_id": "1200000000000005005",
+    "author": {
+      "id": "1190000000000001001",
+      "username": "dan_d",
+      "discriminator": "0",
+      "global_name": "Dan D",
+      "avatar": null
+    },
+    "content": "Friday at eight?",
+    "timestamp": "2024-02-01T10:00:00.000000+00:00",
+    "edited_timestamp": null,
+    "tts": false,
+    "mention_everyone": false,
+    "mentions": [],
+    "mention_roles": [],
+    "attachments": [],
+    "embeds": [],
+    "pinned": false
+  },
+  {
+    "id": "1200000000000005103",
+    "type": 0,
+    "channel_id": "1200000000000005005",
+    "author": {
+      "id": "1190000000000001002",
+      "username": "eva.e",
+      "discriminator": "0",
+      "global_name": null,
+      "avatar": null
+    },
+    "content": "I will bring snacks.",
+    "timestamp": "2024-02-01T10:00:00.000000+00:00",
+    "edited_timestamp": null,
+    "tts": false,
+    "mention_everyone": false,
+    "mentions": [],
+    "mention_roles": [],
+    "attachments": [],
+    "embeds": [],
+    "pinned": false
+  }
+]

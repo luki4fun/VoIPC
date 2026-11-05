@@ -22,6 +22,8 @@ registration = "invite"           # open | invite | closed
 cloud = true                      # let members keep copies of their messages here
 retention_days = 365              # copies go after this, or sooner by their own timer
 modlog_days = 180                 # rows of the moderation log go after this
+archive_days = 0                  # what came from Discord goes at this age; 0: until removed
+unclaimed_days = 90               # an account the move made goes if unopened; 0: never
 quota_mb = 50                     # per account
 key_file = "voipc-accounts.key"   # made on first start; VOIPC_ACCOUNTS_KEY overrides it
 ```
@@ -77,6 +79,9 @@ and at each use: give that group power later and the link stops handing it out. 
 `closed` there are none. A link works for sign-up with a password or through a provider,
 and an invite code from an admin works through a provider too, also where sign-up is
 otherwise by invite only.
+
+**An account the move from Discord made** can be opened on `invite` and `closed` too: it
+was made already, and needs no code ([An account the move made for you](#an-account-the-move-made-for-you)).
 
 ## Groups, privileges and two-factor codes
 
@@ -198,6 +203,8 @@ taken away afterwards stays away.
   is lifted, and someone back from a ban can write again as before. Files they attached
   are not deleted at once: the server does not know who posted a file, and it goes when it
   ages out. A device away for longer than `modlog_days` is not told.
+- **Active bans** come a hundred at a time, with *Show more* and a search by the name a row
+  shows. Who stands behind a pseudonym stays there: a search finds the name you can see.
 - **What a limited window can bring back.** A delete or an edit is a message of its writer's,
   kept like any other. When the window takes their delete or edit but not the older message
   it applied to, a device reading the log anew, a browser after a reload or a new device,
@@ -255,6 +262,14 @@ recolour only groups you could have made,
 and a group you could not stays exactly where it is in the order, with nothing moving
 past it. **A badge is public**: everyone on the server is told every badge, guests too,
 whoever holds it. What the group behind it is called is not.
+
+**Groups the move from Discord made** ([MOVING.md](MOVING.md)) come in two kinds. A role's
+plain group has its badge, colour and order, and hands out nothing, so nobody gains a privilege
+by what Discord said. If that role could do something on Discord, a second group,
+`<role>-power`, holds the matching privileges and is given to nobody until an admin presses OK
+for that person, with a code. The first is what the claim gives; the second waits. A later
+import follows Discord for a plain group's badge, colour and order, and leaves its name, since
+gates go by the name.
 
 ### The moderation log
 
@@ -366,6 +381,20 @@ counts at once.
   read, since it is a direct message. It is closed during the wait for new members, like every direct message. From behind a
   pseudonym it goes to those online only, and they see that pseudonym. A guest reaches
   those online only. If nobody takes reports, the dialog says so and nothing is sent.
+- **What came from Discord.** On a server moved from Discord, a channel with old messages
+  offers them in a pane of its own, beside the conversation, labelled *Imported from Discord,
+  unverified. This server can read it.* They were never encrypted, and nobody signed them:
+  whoever runs the server could have changed them. Anyone standing in the channel can read and
+  search them, and the server sees what you search. It is not kept, nor who opened what. Your
+  device keeps none of it, and a reload forgets it. Sign in with that Discord, or link it, and
+  your own posts offer *Hide* and *Delete*, one by one or all at once under *Settings → Privacy
+  & data*. Hidden, only you see them, and whoever runs the server still has them; *Show* brings
+  them back. Deleted, they are gone from this server, and no later import brings them back, also if
+  you have left Discord by then, though a backup holds them until it ages out. A post of yours that
+  opened a thread stays for the replies in it, for others with no author and no words, and named
+  "Thread". Deleting your account takes them too. A moderator's
+  *Hide*, your block list and *Report* do not reach these rows; removing a banned member's posts
+  does, by when they were written. Only an admin deletes someone else's, and it takes a code.
 - **A new password.** *Your account → Password: Change* asks for the current one,
   and for a code when two-factor codes are on. *Forgot your password?* in the
   connect dialog sets a new one with the recovery key instead, again with a code
@@ -517,6 +546,30 @@ sign-up is open, a provider nobody here knows gets to choose a name first; elsew
 uses that sign-in. A server can claim an account was never opened, to hide its vault and the pins in it, so a
 device that remembers the account refuses, and the dialog asks you to stop if you have used it before.
 
+### An account the move made for you
+
+A server moved from Discord ([MOVING.md](MOVING.md)) holds an account for each of its members,
+which nobody has opened. It has a name and groups, no password, and no vault. Choose *Continue
+with Discord*: the name screen starts with the name you had, or with the end of your Discord id
+after it if someone holds that or cleaning it took more than a dot away. You can change it this
+once, and you get a recovery key. From then on it is yours, as if you had made it. Someone already here should
+link Discord before the import, or their Discord lands on the new account and linking is refused.
+
+- **A claim gives** your name, your badges and what they open: the channels your roles passed on
+  Discord. The hide and delete buttons on your old posts too.
+- **It does not give power.** What your role could do on Discord waits for an admin's OK, and then
+  for two-factor codes on your account. With no password, you confirm with your provider first: the
+  question about codes has the button.
+- **The wait for new members** does not hold you if you were on the Discord server for the whole
+  wait when the import ran. Otherwise it counts from when you opened the account. A plain imported
+  group does not lift it.
+- **An account nobody opens** goes after `unclaimed_days` (90 by default), and frees its name. A
+  later import makes it anew for someone still on Discord, unless an admin left them out.
+- **Banned on Discord:** an account named `dc-<their Discord id>`, disabled, which anyone who may
+  read the account list can see, with four more characters if that name is taken. No name and no
+  reason come with it, unless an account of theirs was waiting and both those names are taken. It
+  covers that Discord id only: on an open server the person can come back another way.
+
 **Linking** an existing account: account panel → *Link*, with your password (and code). You can then sign in
 through the provider, and your password or recovery key still unlocks a new device. *Unlink* refuses the last way in.
 
@@ -559,6 +612,9 @@ From accounts:
   Nor the writer or the channel, unless the report carries the message's file, which it does
   until you untick it in the dialog: that same file is then listed under this conversation
   and the one it came from, so the server can see which that was, and who posted it there
+- for an account the move from Discord made: that person's Discord id, when they joined that
+  server, the name they had, and whether they have come
+- the Discord ids it remembers not to import, with no name beside them
 - the moderation log: who did what to whom and why, by name, for `modlog_days`, also
   after those accounts are deleted. Whose posts were removed goes out to everyone who
   connects for that long, guests too, by account where it has one and by name, with who
@@ -571,7 +627,17 @@ From kept messages:
   direct message, the timer you chose)
 - which channels each account keeps
 
-It never learns the text or a key. The full list is in the README under
+From a Discord import:
+
+- the old messages, in the clear: text, names, Discord ids, reactions, pins and the names of files.
+  A row of someone anonymised as a former member has no name or id, though its text still says what
+  it says. Rows stay until someone removes them, or `archive_days` if it is set
+- who opens which archive and what they search for, at that moment. It keeps neither
+- whose hide or delete of their posts stands, with their Discord id, so that a re-run obeys it. A wish
+  has no end date, and an admin's app can read them all, as a run does to keep such posts out if
+  their author has left Discord by then
+
+Of everything but that import, it never learns the text or a key. The full list is in the README under
 *Data Transparency*.
 
 Sign-in lines in the server's own log name the address an account signed in
@@ -639,6 +705,8 @@ in [THREAT-MODEL.md](THREAT-MODEL.md)):
 
 ## Not in this version
 
+- Files from a Discord server: their names come, not the files. New posts into an imported
+  thread: old threads are read-only in the pane. Report and hide on imported rows.
 - A shared queue of reports. They are direct messages to each moderator, because someone
   outside a gated staff channel can neither post in it nor be handed its keys, and an open
   one would show every report to its members.

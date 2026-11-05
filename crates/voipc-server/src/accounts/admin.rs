@@ -12,7 +12,10 @@ use l4f_accounts::model::{AccountId, User};
 use l4f_accounts::scope;
 use l4f_accounts::service::{Actor, Ctx, Error, RoleForm, SecondFactor};
 use voipc_protocol::messages::{AccountReply, AdminOp, AdminReply};
-use voipc_protocol::types::{AdminUser, AuditRow, GroupInfo, InviteInfo};
+use voipc_protocol::types::{
+    valid_emote_name, AdminUser, AuditRow, GroupInfo, InviteInfo, IMPORT_CHANNEL_ROWS,
+    IMPORT_FRAME_ROWS,
+};
 
 use super::{refused, Powers, Relay};
 use crate::config::RegistrationMode;
@@ -39,12 +42,18 @@ const AUDIT_EVENTS: &[&str] = &[
     "profile_reset",
     "recovery_new",
     "register",
+    "rename",
     "role_grant",
     "role_revoke",
     "totp_off",
     "totp_on",
     "totp_reset",
 ];
+
+const NOT_STAR: &str = "Only an admin may import.";
+const NOT_STAR_POWER: &str = "Only an admin may answer for what waits.";
+const NOT_OPENED: &str = "Nobody has opened this account yet.";
+const NOT_A_DISCORD_ID: &str = "That is not a Discord id.";
 
 fn no(e: Error) -> AccountReply {
     refused("Admin", e.message())
@@ -87,6 +96,16 @@ pub(super) async fn handle(
             }
         };
     }
+    // A frame of a run: `*`, and the run is this session's. Gives the run's guild
+    macro_rules! frame {
+        ($run:expr) => {
+            match super::import::frame(state, relay, session_id, &scopes, $run).await {
+                Ok(Ok(guild)) => guild,
+                Ok(Err(r)) => return Ok(r),
+                Err(e) => return Ok(super::import::frame_failed(e)),
+            }
+        };
+    }
     match op {
         AdminOp::Users { search, offset } => {
             let q = Some(search.trim()).filter(|s| !s.is_empty());
@@ -103,13 +122,21 @@ pub(super) async fn handle(
         AdminOp::User { id } => Ok(user_reply(relay, actor, AccountId(id)).await),
         AdminOp::Grant { id, group } => {
             if holds_power(relay, &group).await {
+                // It would go to whoever opens the account next
+                if relay.power_would_wait(AccountId(id)).await? {
+                    return Ok(refused("Admin", NOT_OPENED));
+                }
                 step_up!();
             }
             if let Err(e) = a.grant_role(ctx, actor, AccountId(id), &group).await {
                 return Ok(no(e));
             }
+            // Given by hand, it no longer waits for the owner's OK
+            if let Some((role, _)) = relay.waiting_row(AccountId(id), &group).await? {
+                relay.waiting_drop(AccountId(id), role).await?;
+            }
             if let Some(sid) = online(state, &id) {
-                super::refresh(state, relay, sid, AccountId(id)).await?;
+                told(state, relay, sid, AccountId(id)).await;
             }
             // They may be away, where no session's scopes change
             super::refresh_chat_mods(state).await;
@@ -134,7 +161,7 @@ pub(super) async fn handle(
                     )
                     .await;
                 } else {
-                    super::refresh(state, relay, sid, AccountId(id)).await?;
+                    told(state, relay, sid, AccountId(id)).await;
                 }
             }
             super::refresh_chat_mods(state).await;
@@ -158,6 +185,23 @@ pub(super) async fn handle(
         }
         AdminOp::Groups => Ok(groups_reply(relay, actor).await),
         AdminOp::GroupSave { create, group } => {
+            if !create
+                && !group.scopes.is_empty()
+                && relay
+                    .imported_groups
+                    .contains_key(&group.name.trim().to_ascii_lowercase())
+            {
+                return Ok(refused(
+                    "Admin",
+                    "This group came from Discord and reaches people who have not signed in yet. Use its -power group.",
+                ));
+            }
+            if !relay.group_save_fits(create, &group).await? {
+                return Ok(refused(
+                    "Admin",
+                    "One group list cannot hold that: shorten a description.",
+                ));
+            }
             step_up!();
             let form = RoleForm {
                 name: &group.name,
@@ -181,6 +225,8 @@ pub(super) async fn handle(
         }
         AdminOp::GroupDelete { name } => {
             step_up!();
+            // As `delete_role` reads it, or " CREW " would pass this and delete what a gate names
+            let name = name.trim().to_ascii_lowercase();
             if let Some(channel) = crate::gates::uses(state, &name).await {
                 return Ok(refused(
                     "Admin",
@@ -189,9 +235,14 @@ pub(super) async fn handle(
                     ),
                 ));
             }
+            let from_a_role = relay.group_ledger_row(&name).await?;
             if let Err(e) = a.delete_role(ctx, actor, &name).await {
                 return Ok(no(e));
             }
+            if let Some(row) = from_a_role {
+                relay.group_deleted_here(row).await?;
+            }
+            super::placeholder::load(relay).await?;
             super::revalidate(state).await;
             crate::layout::send_styles_all(state).await;
             Ok(groups_reply(relay, actor).await)
@@ -609,7 +660,300 @@ pub(super) async fn handle(
             step_up!();
             Ok(super::modlog::remove_posts(state, relay, session_id, who).await)
         }
+        AdminOp::ImportFacts => {
+            if !super::is_star(&scopes) {
+                return Ok(refused("Admin", NOT_STAR));
+            }
+            super::import::facts(state, relay, session_id).await
+        }
+        AdminOp::ImportBegin {
+            guild_id,
+            options,
+            backup_taken,
+        } => {
+            if !super::is_star(&scopes) {
+                return Ok(refused("Admin", NOT_STAR));
+            }
+            let active = state.import.lock().await;
+            let begin = match super::import::before_the_code(
+                state,
+                relay,
+                session_id,
+                &active,
+                &guild_id,
+                &options,
+                backup_taken,
+            )
+            .await?
+            {
+                Ok(begin) => begin,
+                Err(reason) => return Ok(refused("Admin", &reason)),
+            };
+            step_up!();
+            super::import::begin(
+                state,
+                relay,
+                session_id,
+                &user.username,
+                active,
+                begin,
+                &options,
+            )
+            .await
+        }
+        AdminOp::ImportEnd { run, report } => {
+            frame!(run);
+            Ok(super::import::end(state, relay, session_id, run, &report)
+                .await
+                .unwrap_or_else(super::import::frame_failed))
+        }
+        AdminOp::ImportReport { run } => {
+            if !super::is_star(&scopes) {
+                return Ok(refused("Admin", NOT_STAR));
+            }
+            super::import::report(relay, run).await
+        }
+        AdminOp::ImportRoles { run, roles } => {
+            let guild = frame!(run);
+            if roles.len() > voipc_protocol::types::IMPORT_FRAME_ROWS {
+                return Ok(super::import::no_frame("Too many roles in one frame."));
+            }
+            Ok(
+                super::placeholder::roles(relay, ctx, actor, run, guild, roles)
+                    .await
+                    .map(AccountReply::Admin)
+                    .unwrap_or_else(super::import::frame_failed),
+            )
+        }
+        AdminOp::ImportMembers { run, members } => {
+            let guild = frame!(run);
+            if !super::placeholder::members_ok(&members) {
+                return Ok(super::import::no_frame("That frame cannot be right."));
+            }
+            Ok(
+                super::placeholder::members(relay, user.id, run, guild, &members)
+                    .await
+                    .map(AccountReply::Admin)
+                    .unwrap_or_else(super::import::frame_failed),
+            )
+        }
+        AdminOp::ImportBans { run, bans } => {
+            frame!(run);
+            if !super::placeholder::bans_ok(&bans) {
+                return Ok(super::import::no_frame("That frame cannot be right."));
+            }
+            Ok(super::placeholder::bans(relay, ctx, run, &bans)
+                .await
+                .map(AccountReply::Admin)
+                .unwrap_or_else(super::import::frame_failed))
+        }
+        AdminOp::PowerWaiting { offset } => {
+            if !super::is_star(&scopes) {
+                return Ok(refused("Admin", NOT_STAR_POWER));
+            }
+            super::placeholder::waiting_page(relay, offset).await
+        }
+        AdminOp::PowerAnswer { id, group, grant } => {
+            if !super::is_star(&scopes) {
+                return Ok(refused("Admin", NOT_STAR_POWER));
+            }
+            let who = AccountId(id);
+            let Some((role, name)) = relay.waiting_row(who, &group).await? else {
+                return Ok(refused("Admin", "That is not waiting any more."));
+            };
+            if grant {
+                if relay.power_would_wait(who).await? {
+                    return Ok(refused("Admin", NOT_OPENED));
+                }
+                step_up!();
+            }
+            let row = super::modlog::Entry {
+                action: if grant { "power_grant" } else { "power_drop" },
+                target: Some(id),
+                target_name: &name,
+                detail: &group,
+                ..Default::default()
+            };
+            if let Err(e) = super::modlog::put(state, session_id, row).await {
+                tracing::warn!("keeping an answer on held-back power: {e:#}");
+                return Ok(refused("Admin", "That could not be kept."));
+            }
+            if grant {
+                if let Err(e) = a.grant_role(ctx, actor, who, &group).await {
+                    return Ok(no(e));
+                }
+            }
+            relay.waiting_drop(who, role).await?;
+            if grant {
+                if let Some(sid) = online(state, &id) {
+                    told(state, relay, sid, who).await;
+                }
+                super::refresh_chat_mods(state).await;
+                crate::gates::prune_logs(state).await;
+            }
+            super::placeholder::waiting_page(relay, 0).await
+        }
+        AdminOp::ImportCategories { run, rows } => {
+            frame!(run);
+            if rows.len() > IMPORT_FRAME_ROWS {
+                return Ok(super::import::no_frame("Too many categories in one frame."));
+            }
+            Ok(crate::layout::import_categories(state, relay, run, &rows)
+                .await
+                .map(|refused| AccountReply::Admin(AdminReply::ImportChannelsDone { refused }))
+                .unwrap_or_else(super::import::frame_failed))
+        }
+        AdminOp::ImportChannels { run, rows } => {
+            frame!(run);
+            if rows.len() > IMPORT_CHANNEL_ROWS {
+                return Ok(super::import::no_frame("Too many channels in one frame."));
+            }
+            Ok(crate::layout::import_channels(state, relay, run, &rows)
+                .await
+                .map(|refused| AccountReply::Admin(AdminReply::ImportChannelsDone { refused }))
+                .unwrap_or_else(super::import::frame_failed))
+        }
+        AdminOp::ImportEmote { run, dc_id, name } => {
+            frame!(run);
+            if !super::placeholder::id_ok(dc_id) || !valid_emote_name(&name) {
+                return Ok(super::import::no_frame("That frame cannot be right."));
+            }
+            Ok(super::import::emote(relay, run, dc_id, &name)
+                .await
+                .unwrap_or_else(super::import::frame_failed))
+        }
+        AdminOp::ImportThreads { run, rows } => {
+            frame!(run);
+            Ok(super::archive::threads(state, relay, run, &rows)
+                .await
+                .unwrap_or_else(super::import::frame_failed))
+        }
+        AdminOp::ImportMessages {
+            run,
+            channel,
+            thread,
+            high,
+            rows,
+        } => {
+            frame!(run);
+            Ok(
+                super::archive::messages(state, relay, run, channel, thread, high, &rows)
+                    .await
+                    .unwrap_or_else(super::import::frame_failed),
+            )
+        }
+        AdminOp::ImportCursors { after } => {
+            if !super::is_star(&scopes) {
+                return Ok(refused("Admin", NOT_STAR));
+            }
+            super::import::cursors(relay, after).await
+        }
+        AdminOp::MoveAccounts {
+            search,
+            offset,
+            filter,
+        } => {
+            if !scope::allowed(&scopes, "users:read") {
+                return Ok(refused("Admin", "You may not read the list of accounts."));
+            }
+            let star = super::is_star(&scopes);
+            Ok(answered(
+                super::placeholder::move_accounts(relay, star, search, offset, filter).await,
+            ))
+        }
+        AdminOp::MoveStatus => {
+            if !super::is_star(&scopes) {
+                return Ok(refused("Admin", NOT_STAR));
+            }
+            Ok(answered(super::placeholder::move_status(relay).await))
+        }
+        AdminOp::MoveExcluded { after } => {
+            if !super::is_star(&scopes) {
+                return Ok(refused("Admin", NOT_STAR));
+            }
+            let after = if after.is_empty() {
+                Some(0)
+            } else {
+                super::archive::id_of(&after)
+            };
+            let Some(after) = after else {
+                return Ok(refused("Admin", NOT_A_DISCORD_ID));
+            };
+            Ok(answered(
+                super::placeholder::excluded_page(relay, after).await,
+            ))
+        }
+        AdminOp::MoveExclude { dc_id, on, erase } => {
+            if !super::is_star(&scopes) {
+                return Ok(refused("Admin", NOT_STAR));
+            }
+            let Some(dc_id) = super::archive::id_of(&dc_id) else {
+                return Ok(refused("Admin", NOT_A_DISCORD_ID));
+            };
+            if let Some(reason) = super::placeholder::exclude_refusal(relay, dc_id, on).await? {
+                return Ok(refused("Admin", reason));
+            }
+            // It removes for good, as `RemovePosts` does
+            step_up!();
+            Ok(answered(
+                super::placeholder::exclude(state, relay, session_id, dc_id, on, erase).await,
+            ))
+        }
+        AdminOp::ImportUndoPreview { run } => {
+            if !super::is_star(&scopes) {
+                return Ok(refused("Admin", NOT_STAR));
+            }
+            Ok(answered(super::import::undo_preview(relay, run).await))
+        }
+        AdminOp::ImportUndo { run } => {
+            if !super::is_star(&scopes) {
+                return Ok(refused("Admin", NOT_STAR));
+            }
+            let active = state.import.lock().await;
+            if let Some(reason) =
+                super::import::undo_refusal(state, relay, session_id, &active, run).await?
+            {
+                return Ok(refused("Admin", reason));
+            }
+            // On each call: past ten minutes the panel asks again
+            step_up!();
+            Ok(answered(
+                super::import::undo(state, relay, session_id, ctx, actor, active, run).await,
+            ))
+        }
+        AdminOp::ArchiveDelete { target } => {
+            if !super::is_star(&scopes) {
+                return Ok(refused(
+                    "Admin",
+                    "Only an admin may delete what came from Discord.",
+                ));
+            }
+            let (author, wish) = match super::archive::delete_target(state, &target).await {
+                Ok(what) => what,
+                Err(reason) => return Ok(refused("Admin", reason)),
+            };
+            // Gone for good: not a step for one stolen session
+            step_up!();
+            Ok(answered(
+                super::archive::delete(state, relay, session_id, author, &wish).await,
+            ))
+        }
+        AdminOp::ArchiveWishes { after } => {
+            if !super::is_star(&scopes) {
+                return Ok(refused("Admin", NOT_STAR));
+            }
+            Ok(answered(super::archive::wishes_page(relay, after).await))
+        }
     }
+}
+
+/// An answer whatever came of it: an `Err` from here is only logged by the read loop, and the
+/// panel would wait on, or never ask for the rest of an undo.
+fn answered(r: Result<AccountReply>) -> AccountReply {
+    r.unwrap_or_else(|e| {
+        tracing::warn!("a step of the move: {e:#}");
+        refused("Admin", "That did not go through. Try it again.")
+    })
 }
 
 async fn links_reply(relay: &Relay) -> Result<AccountReply> {
@@ -666,6 +1010,15 @@ async fn step_up(
 /// Whether the group hands out privileges (an unknown one is checked by l4f).
 async fn holds_power(relay: &Relay, group: &str) -> bool {
     !matches!(relay.store().role_by_name(group.trim()).await, Ok(Some(r)) if r.scopes.is_empty())
+}
+
+/// Someone online hears of a change made to them. Their connection may be ending just now,
+/// and that must not leave the admin who made it without an answer: an `Err` from here is
+/// only logged by the read loop, and the admin's panel would wait on.
+async fn told(state: &Arc<ServerState>, relay: &Relay, session_id: u32, id: AccountId) {
+    if let Err(e) = super::refresh(state, relay, session_id, id).await {
+        tracing::warn!("telling an account of a change: {e:#}");
+    }
 }
 
 fn online(state: &ServerState, account: &[u8; 16]) -> Option<u32> {

@@ -48,6 +48,12 @@ fn traced_format() -> String {
         FileConv,
         Emote,
         EmoteAccess,
+        MoveFilter,
+        MoveState,
+        ImportGate,
+        ArchiveAction,
+        ArchiveScope,
+        ArchiveTarget,
     );
     let registry = tracer
         .registry()
@@ -201,6 +207,88 @@ fn emote_names_and_pack_labels() {
         assert!(!valid_emote_pack(bad), "{bad:?}");
     }
     assert_eq!(format!("{:?}", Secret("hunter2".into())), "Secret(…)");
+}
+
+/// A frame of an import seals before it passes `IMPORT_FRAME_BYTES`, which only works if the
+/// longest row there can be leaves room, and a reader's page holds the longest row. The
+/// limits are the relay's (`archive_put`), which clips the rest away.
+#[test]
+fn the_longest_imported_row_fits_a_frame_and_a_page() {
+    let wide = |chars: usize| "\u{1F600}".repeat(chars);
+    let row = ImportMessage {
+        id: u64::MAX,
+        author: Some(u64::MAX),
+        author_name: wide(64),
+        body: "x".repeat(IMPORT_BODY_BYTES),
+        reply_to: Some(u64::MAX),
+        pinned: true,
+        reactions: vec![
+            ImportReaction {
+                emoji: wide(64),
+                count: u32::MAX,
+            };
+            20
+        ],
+        attachments: vec![
+            ImportAttachment {
+                id: u64::MAX,
+                name: wide(128),
+                bytes: u64::MAX,
+                mime: wide(64),
+            };
+            20
+        ],
+    };
+    let frame = |rows: Vec<ImportMessage>| {
+        encode_client_msg(&ClientMessage::Account(AccountRequest::Admin {
+            op: AdminOp::ImportMessages {
+                run: i64::MAX,
+                channel: u64::MAX,
+                thread: Some(u64::MAX),
+                high: u64::MAX,
+                rows,
+            },
+            code: None,
+        }))
+        .unwrap()
+        .len()
+    };
+    assert!(frame(vec![row.clone()]) < IMPORT_FRAME_BYTES);
+    assert!(IMPORT_FRAME_BYTES < MAX_MSG_SIZE as usize);
+    // ... and the check can fail: rows do not all fit one frame
+    assert!(frame(vec![row; IMPORT_MESSAGE_ROWS]) > IMPORT_FRAME_BYTES);
+
+    let reader = ArchiveRow {
+        id: u64::MAX.to_string(),
+        author: wide(64),
+        author_id: u64::MAX.to_string(),
+        at_ms: u64::MAX,
+        body: "x".repeat(IMPORT_BODY_BYTES),
+        thread: u64::MAX.to_string(),
+        reply_to: u64::MAX.to_string(),
+        reactions: vec![
+            ArchiveReaction {
+                emoji: wide(64),
+                count: u32::MAX,
+            };
+            20
+        ],
+        pinned: true,
+        thread_name: wide(100),
+        replies: u32::MAX,
+        mine: true,
+        hidden: true,
+    };
+    let page = encode_server_msg(&ServerMessage::Account(AccountReply::ArchivePage {
+        channel_id: u32::MAX,
+        thread: u64::MAX.to_string(),
+        before: u64::MAX.to_string(),
+        pinned: true,
+        rows: vec![reader],
+        next: u64::MAX.to_string(),
+    }))
+    .unwrap();
+    assert!(page.len() < 44 * 1024);
 }
 
 /// What the desktop emits as `posts-hidden`, which the browser's backend makes the

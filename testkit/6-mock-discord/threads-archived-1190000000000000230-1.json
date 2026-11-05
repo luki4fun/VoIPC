@@ -1,0 +1,25 @@
+{
+  "threads": [
+    {
+      "id": "1190000000000000305",
+      "type": 11,
+      "guild_id": "1190000000000000001",
+      "parent_id": "1190000000000000230",
+      "name": "How do I share my screen?",
+      "owner_id": "1190000000000001001",
+      "last_message_id": "1200000000000006101",
+      "message_count": 1,
+      "member_count": 2,
+      "rate_limit_per_user": 0,
+      "total_message_sent": 1,
+      "thread_metadata": {
+        "archived": true,
+        "archive_timestamp": "2024-02-04T10:00:00.000000+00:00",
+        "auto_archive_duration": 1440,
+        "locked": false
+      }
+    }
+  ],
+  "members": [],
+  "has_more": false
+}

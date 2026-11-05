@@ -12,7 +12,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import type { UnlistenFn } from "@tauri-apps/api/event";
   import { listenServer, fromServer } from "../connect.js";
-  import { account, accountHex, accountPrompt, closePrompt, relayAccounts, showPrompt } from "../stores/account.js";
+  import { account, accountHex, accountPrompt, closePrompt, relayAccounts, showPrompt, type AccountPrompt } from "../stores/account.js";
   import { privilegeLabel } from "../scopes.js";
   import {
     applyChannelEvent,
@@ -34,7 +34,7 @@
   import { dmMessageTtl, hideCheck, managesChannel } from "../stores/channel-ui.js";
   import { userId } from "../stores/connection.js";
   import { addNotification } from "../stores/notifications.js";
-  import { community, newRecoveryKey } from "../relay-rules.js";
+  import { PROVE_FIRST, community, moves, newRecoveryKey } from "../relay-rules.js";
   import { makeProfilePicture } from "../image-prep.js";
   import { askProfile, profiles, setDisplayName, setProfilePicture } from "../stores/profiles.js";
   import { shortName } from "../username.js";
@@ -58,6 +58,10 @@
   let claimAsked = $state(false);
   /** What the relay offers and this account has linked (`ProviderList`). */
   let providers = $state<{ offered: string[]; linked: { kind: string; name: string }[]; hasPassword: boolean } | null>(null);
+  /** A linked provider can prove it's them, once the relay asks that before it turns codes on. */
+  const provable = $derived(error === PROVE_FIRST ? [...new Set<string>(providers?.linked.map((l) => l.kind))] : []);
+  /** The setup a proof took off the screen. It comes back after: the key is in their app by then. */
+  let setupToProve: Extract<AccountPrompt, { kind: "totp-setup" }> | null = null;
   let qr = $state("");
   let copied = $state(false);
   /** A new recovery key on its way: shown once the relay says it is in
@@ -325,8 +329,7 @@
         if (prompt?.kind === "cloud" && !cloudNext.includes(prompt.server)) cloudNext.unshift(prompt.server);
         reset();
         const why = get(account.peek(server))?.info.needs_2fa ? "required" : "chosen";
-        showPrompt({ kind: "totp-setup", server, secret: body.secret, uri: body.uri, sealed: body.sealed, why });
-        invoke<string>("qr_svg", { text: body.uri }).then((svg) => (qr = svg), () => (qr = ""));
+        showSetup({ kind: "totp-setup", server, secret: body.secret, uri: body.uri, sealed: body.sealed, why });
         break;
       }
       case "TotpEnabled":
@@ -350,6 +353,7 @@
           "info",
         );
         listProviders(server);
+        if (setupToProve?.server === server) backToSetup();
         break;
       }
       case "ProviderUnlinked":
@@ -448,12 +452,12 @@
     invoke("account_request", { server, request: "ProviderList" }).catch(() => {});
   }
 
-  // What the account panel, and the steps that ask for a password, go by.
-  // An older relay never answers, and `null` then means a password.
+  // What the account panel, the steps that ask for a password, and a setup that needs a proof
+  // go by. An older relay never answers, and `null` then means a password.
   let providersOf = "";
   $effect(() => {
     const p = $accountPrompt;
-    if (p?.kind !== "account" || p.server === providersOf) return;
+    if ((p?.kind !== "account" && p?.kind !== "totp-setup") || p.server === providersOf) return;
     providersOf = p.server;
     providers = null;
     listProviders(p.server);
@@ -544,6 +548,28 @@
     const p = get(accountPrompt);
     if (p) invoke("account_cancel", { server: p.server }).catch(() => {});
     closePrompt();
+  }
+
+  function showSetup(p: Extract<AccountPrompt, { kind: "totp-setup" }>) {
+    showPrompt(p);
+    invoke<string>("qr_svg", { text: p.uri }).then((svg) => (qr = svg), () => (qr = ""));
+  }
+
+  function proveForSetup(p: Extract<AccountPrompt, { kind: "totp-setup" }>, provider: string) {
+    setupToProve = p;
+    void runProvider(p.server, provider, "prove");
+  }
+
+  function backToSetup() {
+    const p = setupToProve;
+    setupToProve = null;
+    if (p) showSetup(p);
+  }
+
+  /** The provider's page, given up on: a setup it took the place of is still there. */
+  function closeProviderPage() {
+    closePrompt();
+    backToSetup();
   }
 
   async function submitSetup() {
@@ -675,7 +701,8 @@
     if (busy) return undefined;
     if (kind === "totp") return cancelTotp;
     if (["provider-name", "provider-choice"].includes(kind)) return cancelProvider;
-    if (["totp-setup", "safety", "account", "delete", "password", "recovery-new", "provider-confirm", "provider-page"].includes(kind)) return () => closePrompt();
+    if (kind === "provider-page") return closeProviderPage;
+    if (["totp-setup", "safety", "account", "delete", "password", "recovery-new", "provider-confirm"].includes(kind)) return () => closePrompt();
     return undefined;
   }
 
@@ -814,7 +841,7 @@
         <h2>Your code: {p.code}</h2>
         <p class="hint">Open the provider's page. When it comes back, tap this code there.</p>
         <div class="buttons">
-          <button type="button" class="secondary" onclick={() => closePrompt()}>Cancel</button>
+          <button type="button" class="secondary" onclick={closeProviderPage}>Cancel</button>
           <button
             type="button"
             class="submit-btn btn btn-primary"
@@ -887,6 +914,9 @@
           />
         </div>
         {#if error}<div class="error" role="alert">{error}</div>{/if}
+        {#each provable as provider (provider)}
+          <button type="button" class="secondary setup-prove" onclick={() => proveForSetup(p, provider)} disabled={busy}>Confirm it's you with {provider}</button>
+        {/each}
         <div class="buttons">
           <button type="button" class="secondary" onclick={() => closePrompt()} disabled={busy}>Later</button>
           <button type="button" class="submit-btn btn btn-primary" onclick={submitSetup} disabled={busy}>Turn on</button>
@@ -1034,6 +1064,7 @@
           people you verified), the messages it kept, its remembered devices and its sessions. The name is free for
           someone else afterwards. What other people wrote to you, and copies of your messages their devices already
           have, stay theirs.
+          {#if moves(get(olderRelay.peek(p.server))?.protocol ?? null)}Your posts imported from Discord go too.{/if}
         </p>
         <div class="field">
           <label for="acct-delete-name">Type the account's name</label>

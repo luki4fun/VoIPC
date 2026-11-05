@@ -47,6 +47,33 @@ fn plain_id(s: &str) -> bool {
     !s.is_empty() && s.len() <= 40 && s.bytes().all(|c| c.is_ascii_alphanumeric())
 }
 
+/// Where one of a Discord server's emoji is, under the file name it imports as.
+pub(crate) fn discord_emoji(id: impl std::fmt::Display, name: &str, animated: bool) -> Item {
+    let ext = if animated { "gif" } else { "png" };
+    Item {
+        name: format!("{name}.{ext}"),
+        url: format!("https://cdn.discordapp.com/emojis/{id}.{ext}?size=128"),
+    }
+}
+
+/// Where one of its stickers is; `None`: a kind that is not read here.
+pub(crate) fn discord_sticker(
+    id: impl std::fmt::Display,
+    name: &str,
+    format_type: Option<u64>,
+) -> Option<Item> {
+    // 1 PNG, 2 APNG, 3 Lottie, 4 GIF
+    let ext = match format_type {
+        Some(1) | Some(2) => "png",
+        Some(4) => "gif",
+        _ => return None,
+    };
+    Some(Item {
+        name: format!("{name}.{ext}"),
+        url: format!("https://media.discordapp.net/stickers/{id}.{ext}?size=320"),
+    })
+}
+
 /// A Discord server's `/emojis` (or with `stickers`, `/stickers`) answer.
 pub(crate) fn discord_listing(json: &Value, stickers: bool) -> Listing {
     let mut out = Listing::default();
@@ -63,30 +90,18 @@ pub(crate) fn discord_listing(json: &Value, stickers: bool) -> Listing {
             continue;
         }
         if stickers {
-            // 1 PNG, 2 APNG, 3 Lottie, 4 GIF
-            let ext = match v["format_type"].as_u64() {
-                Some(1) | Some(2) => "png",
-                Some(4) => "gif",
-                _ => {
-                    out.skipped
-                        .push((name.to_owned(), "a Lottie sticker is not supported".into()));
-                    continue;
-                }
-            };
-            out.items.push(Item {
-                name: format!("{name}.{ext}"),
-                url: format!("https://media.discordapp.net/stickers/{id}.{ext}?size=320"),
-            });
+            match discord_sticker(id, name, v["format_type"].as_u64()) {
+                Some(item) => out.items.push(item),
+                None => out
+                    .skipped
+                    .push((name.to_owned(), "a Lottie sticker is not supported".into())),
+            }
         } else {
-            let ext = if v["animated"].as_bool() == Some(true) {
-                "gif"
-            } else {
-                "png"
-            };
-            out.items.push(Item {
-                name: format!("{name}.{ext}"),
-                url: format!("https://cdn.discordapp.com/emojis/{id}.{ext}?size=128"),
-            });
+            out.items.push(discord_emoji(
+                id,
+                name,
+                v["animated"].as_bool() == Some(true),
+            ));
         }
     }
     out
@@ -230,54 +245,46 @@ pub async fn fetch_emote_source(
 }
 
 #[cfg(not(target_os = "android"))]
-mod desktop {
+pub(crate) mod desktop {
     use std::time::Duration;
 
     use super::*;
 
     const MAX_JSON: usize = 2 << 20;
-    const MAX_IMAGE: usize = 8 << 20;
+    pub(crate) const MAX_IMAGE: usize = 8 << 20;
     const TIMEOUT: Duration = Duration::from_secs(10);
+    pub(crate) const NOT_A_HOST: &str = "not a host this import asks";
 
-    fn client() -> Result<reqwest::Client, String> {
+    pub(crate) fn client(timeout: Duration) -> Result<reqwest::Client, String> {
         let _ = rustls::crypto::ring::default_provider().install_default();
         reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .https_only(true)
-            .timeout(TIMEOUT)
+            .timeout(timeout)
             .user_agent(concat!("VoIPC/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|e| e.to_string())
     }
 
-    async fn get(
-        c: &reqwest::Client,
-        url: &str,
-        auth: Option<&str>,
+    /// An address these imports may ask: HTTPS, on one of `HOSTS`.
+    pub(crate) fn host_ok(url: &reqwest::Url) -> bool {
+        url.scheme() == "https" && url.host_str().is_some_and(|h| HOSTS.contains(&h))
+    }
+
+    /// A bot's token as a header: sensitive, so never printed by reqwest's or
+    /// hyper's own logging.
+    pub(crate) fn bearer(auth: &str) -> Result<reqwest::header::HeaderValue, String> {
+        let mut value = reqwest::header::HeaderValue::from_str(auth)
+            .map_err(|_| "a token is one line of plain characters".to_string())?;
+        value.set_sensitive(true);
+        Ok(value)
+    }
+
+    /// An answer's body, up to `cap`.
+    pub(crate) async fn body_up_to(
+        res: &mut reqwest::Response,
         cap: usize,
     ) -> Result<Vec<u8>, String> {
-        let u = reqwest::Url::parse(url).map_err(|_| "not an address".to_string())?;
-        if u.scheme() != "https" || !u.host_str().is_some_and(|h| HOSTS.contains(&h)) {
-            return Err("not a host this import asks".into());
-        }
-        let mut req = c.get(u);
-        if let Some(a) = auth {
-            // Sensitive: never printed by reqwest's or hyper's own logging
-            let mut value = reqwest::header::HeaderValue::from_str(a)
-                .map_err(|_| "a token is one line of plain characters".to_string())?;
-            value.set_sensitive(true);
-            req = req.header(reqwest::header::AUTHORIZATION, value);
-        }
-        let mut res = req.send().await.map_err(|e| e.without_url().to_string())?;
-        let status = res.status();
-        if !status.is_success() {
-            return Err(match status.as_u16() {
-                401 | 403 => "refused: check the token, and that the bot is in that server".into(),
-                404 => "not found: check the id".into(),
-                429 => "asked too often: try again in a minute".into(),
-                n => format!("answered {n}"),
-            });
-        }
         if res.content_length().is_some_and(|n| n > cap as u64) {
             return Err("too big".into());
         }
@@ -291,13 +298,40 @@ mod desktop {
         Ok(out)
     }
 
+    pub(crate) async fn get(
+        c: &reqwest::Client,
+        url: &str,
+        auth: Option<&str>,
+        cap: usize,
+    ) -> Result<Vec<u8>, String> {
+        let u = reqwest::Url::parse(url).map_err(|_| "not an address".to_string())?;
+        if !host_ok(&u) {
+            return Err(NOT_A_HOST.into());
+        }
+        let mut req = c.get(u);
+        if let Some(a) = auth {
+            req = req.header(reqwest::header::AUTHORIZATION, bearer(a)?);
+        }
+        let mut res = req.send().await.map_err(|e| e.without_url().to_string())?;
+        let status = res.status();
+        if !status.is_success() {
+            return Err(match status.as_u16() {
+                401 | 403 => "refused: check the token, and that the bot is in that server".into(),
+                404 => "not found: check the id".into(),
+                429 => "asked too often: try again in a minute".into(),
+                n => format!("answered {n}"),
+            });
+        }
+        body_up_to(&mut res, cap).await
+    }
+
     pub(super) async fn fetch(
         source: &str,
         id: &str,
         token: Option<String>,
         stickers: bool,
     ) -> Result<Vec<u8>, String> {
-        let c = client()?;
+        let c = client(TIMEOUT)?;
         let json = |b: Vec<u8>| {
             serde_json::from_slice::<Value>(&b)
                 .map_err(|_| "an answer that is not JSON".to_string())

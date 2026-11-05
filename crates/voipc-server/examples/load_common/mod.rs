@@ -52,24 +52,11 @@ pub async fn connect(index: usize, server: &str) -> Result<Connected, Error> {
         (index / 4 / 250) as u8,
         2 + (index / 4 % 250) as u8,
     ));
-    let mut tls = rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoCertVerifier))
-        .with_no_client_auth();
-    tls.alpn_protocols = vec![b"h3".to_vec()];
-    let config = ClientConfig::builder()
-        .with_bind_address(SocketAddr::new(local_ip, 0))
-        .with_custom_tls(tls)
-        .keep_alive_interval(Some(Duration::from_secs(10)))
-        .dns_resolver(Fixed(server_addr))
-        .build();
-    let endpoint = Endpoint::client(config)?;
+    let endpoint = client_endpoint(server_addr, local_ip)?;
     // At our protocol first; a relay of an older one names its own
     let mut proto = PROTOCOL_VERSION;
     'attempt: loop {
-        let connection = endpoint
-            .connect(format!("https://{NATIVE_SNI}:{}/voipc", server_addr.port()))
-            .await?;
+        let connection = endpoint.connect(native_url(server_addr)).await?;
         let (mut send, mut recv) = connection.open_bi().await?.await?;
         let auth = ClientMessage::Authenticate {
             // With a tag: a relay with accounts wants one on a guest's name
@@ -122,6 +109,31 @@ pub async fn connect(index: usize, server: &str) -> Result<Connected, Error> {
             }
         }
     }
+}
+
+/// A native client's endpoint from `local_ip`, trusting whatever the server shows: these only
+/// ever talk to a relay on this machine.
+pub fn client_endpoint(
+    server_addr: SocketAddr,
+    local_ip: std::net::IpAddr,
+) -> Result<Endpoint<wtransport::endpoint::endpoint_side::Client>, Error> {
+    let mut tls = rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoCertVerifier))
+        .with_no_client_auth();
+    tls.alpn_protocols = vec![b"h3".to_vec()];
+    let config = ClientConfig::builder()
+        .with_bind_address(SocketAddr::new(local_ip, 0))
+        .with_custom_tls(tls)
+        .keep_alive_interval(Some(Duration::from_secs(10)))
+        .dns_resolver(Fixed(server_addr))
+        .build();
+    Ok(Endpoint::client(config)?)
+}
+
+/// Where a native client asks to be let in.
+pub fn native_url(server_addr: SocketAddr) -> String {
+    format!("https://{NATIVE_SNI}:{}/voipc", server_addr.port())
 }
 
 /// A message as a relay of protocol `proto` reads it, its frames together.

@@ -123,6 +123,11 @@ export interface UiPrefs {
    */
   nsfw_ok: string[];
   /**
+   * Servers whose Discord bot this person says they removed, so the dashboard stops
+   * reminding them (`"host:port"`). A later run takes the server off again.
+   */
+  discord_bot_gone: string[];
+  /**
    * Whether a loaded video or sound plays inside VoIPC, through the system's
    * own decoders; null is this platform's default (media.ts `playsMedia`).
    */
@@ -200,6 +205,7 @@ export function defaultUiPrefs(): UiPrefs {
     folded_categories: {},
     welcomed: [],
     nsfw_ok: [],
+    discord_bot_gone: [],
     play_media: null,
     show_stickers: true,
     animate_emotes: "always",
@@ -410,6 +416,7 @@ export function sanitizeUiPrefs(raw: unknown): UiPrefs {
     folded_categories: foldedCategories(r.folded_categories),
     welcomed: nsfwOk(r.welcomed),
     nsfw_ok: nsfwOk(r.nsfw_ok),
+    discord_bot_gone: nsfwOk(r.discord_bot_gone),
     play_media: typeof r.play_media === "boolean" ? r.play_media : null,
     show_stickers: bool(r.show_stickers, d.show_stickers),
     animate_emotes: r.animate_emotes === "hover" || r.animate_emotes === "never" ? r.animate_emotes : "always",

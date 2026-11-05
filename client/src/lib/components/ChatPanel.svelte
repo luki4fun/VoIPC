@@ -39,7 +39,7 @@
   import { fetchFile, fileLimits, sendFile } from "../files.js";
   import { linkFacts, mentionNames as mentionNamesOf, plainText } from "../markdown.js";
   import { powerTokens } from "../mention-rules.js";
-  import { community, moderation } from "../relay-rules.js";
+  import { community, moderation, moves } from "../relay-rules.js";
   import { groupStyles } from "../stores/channels.js";
   import { rosterOf } from "../roster-rules.js";
   import { awayHint, liveIdOf, reach, writeToId } from "../dm-rules.js";
@@ -98,6 +98,8 @@
   import MessageList, { HIDE_ONLINE_ONLY, type MessageActions } from "./chat/MessageList.svelte";
   import ThreadPane from "./chat/ThreadPane.svelte";
   import SearchPane from "./chat/SearchPane.svelte";
+  import ArchivePane from "./chat/ArchivePane.svelte";
+  import { importedHas, importedRound, probeImported } from "../stores/imported.js";
   import type { Hit } from "../search-rules.js";
   import { shortName } from "../username.js";
   import { MAX_REPORT_WHY, passedOn, reportMark, takersFor, type NotATaker } from "../report-rules.js";
@@ -272,6 +274,29 @@
     void dmName;
     replyingTo = null;
     threadRoot = null;
+    archiving = false;
+  });
+
+  // ── What came from Discord ───────────────────────────────────────────────
+  //
+  // Beside the conversation and never in it (ArchivePane). `canSendChannelMessage` is the
+  // client's copy of what lets someone read it: they stand in the channel. So a preview
+  // asks nothing, and nothing goes before an 18+ channel's consent.
+  let archiving = $state(false);
+  const archiveReadable = $derived(moves($olderRelay?.protocol ?? null) && !!$account && canSendChannelMessage && !gated);
+  $effect(() => {
+    void $importedRound;
+    if (archiveReadable) probeImported($serverAddress, $displayChannelId);
+  });
+  const archiveHere = $derived(archiveReadable && $importedHas.has($displayChannelId));
+  function openArchive() {
+    searching = false;
+    threadRoot = null;
+    archiving = true;
+  }
+  // One pane at a time, whichever way the other opened
+  $effect(() => {
+    if (searching || threadRoot) archiving = false;
   });
 
   // An open thread's answers count as read, new ones included
@@ -1227,6 +1252,15 @@
         </div>
       {/if}
     {/if}
+    {#if archiveHere}
+      <button
+        class="clear-chat-btn archive-btn"
+        onclick={() => (archiving ? (archiving = false) : openArchive())}
+        title="History from Discord"
+        aria-label="History from Discord"
+        aria-expanded={archiving}
+      ><Icon name="archive" size={16} /></button>
+    {/if}
     {#if isDmMode || !isLobby}
       <button
         class="clear-chat-btn search-btn"
@@ -1307,6 +1341,9 @@
           No messages yet. Say hi!
         {:else}
           No messages yet.{#if $isPreviewing}&nbsp;Messages will appear here in real-time.{:else}&nbsp;Start the conversation!{/if}
+        {/if}
+        {#if archiveHere}
+          <p class="archive-empty"><button class="join-text-btn archive-open" onclick={openArchive}>History from Discord is here</button></p>
         {/if}
       </div>
     {:else}
@@ -1412,7 +1449,14 @@
     </div>
   {/if}
   </div>
-  {#if searching}
+  {#if archiving && archiveHere}
+    <ArchivePane
+      server={$serverAddress}
+      channelId={$displayChannelId}
+      onlink={(url) => (linkPopupUrl = url)}
+      onclose={() => (archiving = false)}
+    />
+  {:else if searching}
     <SearchPane
       here={gated ? [] : displayMessages.filter((m) => !foldedHere(m))}
       {everywhere}
@@ -1796,14 +1840,16 @@
   }
 
   .chat-body > :global(.thread-pane),
-  .chat-body > :global(.search-pane) {
+  .chat-body > :global(.search-pane),
+  .chat-body > :global(.archive-pane) {
     width: min(380px, 45%);
     border-left: 1px solid var(--border);
   }
 
   @container (max-width: 700px) {
     .chat-body > :global(.thread-pane),
-    .chat-body > :global(.search-pane) {
+    .chat-body > :global(.search-pane),
+    .chat-body > :global(.archive-pane) {
       position: absolute;
       inset: 0;
       width: auto;
@@ -1838,6 +1884,10 @@
 
   .jump-latest:hover {
     background: var(--bg-hover);
+  }
+
+  .archive-empty {
+    margin: 12px 0 0;
   }
 
   .empty-state {
@@ -1932,7 +1982,8 @@
     font-size: var(--fs-sm);
   }
 
-  .pins-btn:hover {
+  .pins-btn:hover,
+  .archive-btn:hover {
     color: var(--text-primary);
   }
 

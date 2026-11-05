@@ -71,6 +71,29 @@ const utf8Decoder = new TextDecoder();
 
 const toBytes = (v: number[] | Uint8Array): Uint8Array => (v instanceof Uint8Array ? v : Uint8Array.from(v));
 
+/** A list of bans: u64s may arrive as BigInt, plain numbers for the UI (types.ts BanInfo). */
+function banRows(bans: unknown): unknown[] {
+  return (
+    bans as {
+      id: bigint | number;
+      account: boolean;
+      label: string;
+      reason: string;
+      by: string;
+      created_at: bigint | number;
+      expires_in_secs?: bigint | number | null;
+    }[]
+  ).map((x) => ({
+    id: Number(x.id),
+    account: x.account,
+    label: x.label,
+    reason: x.reason,
+    by: x.by,
+    created_at: Number(x.created_at),
+    expires_in_secs: x.expires_in_secs == null ? null : Number(x.expires_in_secs),
+  }));
+}
+
 /** Milliseconds since the Unix epoch truncated to u32: the ping sequence. */
 const nowU32 = () => Date.now() >>> 0;
 /** How long an ask for a voice seat stays good (network.rs VOICE_ASK_TTL_MS). */
@@ -1009,28 +1032,10 @@ export class Session implements SessionContext, AccountHost {
         this.emit("admin-error", { reason: b.reason });
         break;
       case "AdminBans":
-        // u64s may arrive as BigInt: plain numbers for the UI (types.ts BanInfo)
-        this.emit("admin-bans", {
-          bans: (
-            b.bans as {
-              id: bigint | number;
-              account: boolean;
-              label: string;
-              reason: string;
-              by: string;
-              created_at: bigint | number;
-              expires_in_secs?: bigint | number | null;
-            }[]
-          ).map((x) => ({
-            id: Number(x.id),
-            account: x.account,
-            label: x.label,
-            reason: x.reason,
-            by: x.by,
-            created_at: Number(x.created_at),
-            expires_in_secs: x.expires_in_secs == null ? null : Number(x.expires_in_secs),
-          })),
-        });
+        this.emit("admin-bans", { bans: banRows(b.bans) });
+        break;
+      case "AdminBansPaged":
+        this.emit("admin-bans-page", { search: b.search, offset: b.offset, total: b.total, bans: banRows(b.bans) });
         break;
       case "Disconnected":
         // The server closes the session right after; the UI must not auto-reconnect

@@ -228,12 +228,15 @@ macro_rules! db {
 }
 
 mod admin;
+pub mod archive;
 pub mod bans;
 pub mod gates;
+pub mod import;
 pub mod layout;
 pub mod links;
 pub mod log;
 pub mod modlog;
+pub mod placeholder;
 pub mod profile;
 pub mod provider;
 pub mod restrict;
@@ -251,19 +254,73 @@ impl Host for RelayHost {
 
     async fn export(&self, user: AccountId) -> Vec<(String, serde_json::Value)> {
         let identity = identity_of(&self.store, user).await.ok().flatten();
-        vec![(
+        let mut entries = vec![(
             "identity_key".into(),
             serde_json::json!(identity.map(hex::encode)),
-        )]
+        )];
+        // What the move holds on them. The archive's rows have a way of their own, `ArchiveMine`
+        match placeholder::discord_member(&self.store, user).await {
+            Ok(Some(member)) => entries.push(("discord_member".into(), member)),
+            Ok(None) => {}
+            // Not left out without a word: that would read as nothing being held
+            Err(e) => {
+                tracing::warn!("reading what the move holds for an export: {e:#}");
+                entries.push((
+                    "discord_member".into(),
+                    serde_json::json!("could not be read"),
+                ));
+            }
+        }
+        entries
     }
 
-    /// The relay's rows go with the account through their foreign keys.
+    /// The relay's rows go with the account through their foreign keys. What outlives it
+    /// is that no import makes them again, nor brings back what they wrote: someone who
+    /// deleted their account stays gone, whether they are in the move's table, or linked
+    /// Discord only later, or unlinked it first and are only in the other.
     async fn delete_user(
         &self,
-        _tx: StoreConn<'_>,
-        _user: AccountId,
+        tx: StoreConn<'_>,
+        user: AccountId,
         _delete_owned: bool,
     ) -> sqlx::Result<()> {
+        macro_rules! keep_them_out {
+            ($c:expr) => {{
+                let c = $c;
+                let mut ids: Vec<i64> = sqlx::query_scalar(
+                    "SELECT CAST(dc_id AS BIGINT) FROM voipc_placeholders WHERE account = $1",
+                )
+                .bind(&user.0[..])
+                .fetch_all(&mut *c)
+                .await?;
+                let linked: Vec<Vec<u8>> = sqlx::query_scalar(
+                    "SELECT ext_id FROM acct_credentials WHERE user_id = $1 AND kind = $2",
+                )
+                .bind(&user.0[..])
+                .bind(l4f_accounts::oauth::Kind::Discord.credential_kind())
+                .fetch_all(&mut *c)
+                .await?;
+                ids.extend(linked.iter().filter_map(|s| {
+                    std::str::from_utf8(s).ok()?.parse::<i64>().ok()
+                }));
+                for id in ids {
+                    sqlx::query(
+                        "INSERT INTO voipc_import_excluded (dc_id, own, erase, at) VALUES ($1, $2, $3, $4)
+                         ON CONFLICT (dc_id) DO UPDATE SET own = excluded.own, erase = excluded.erase",
+                    )
+                    .bind(id)
+                    .bind(true)
+                    .bind(true)
+                    .bind(util::now())
+                    .execute(&mut *c)
+                    .await?;
+                }
+            }};
+        }
+        match tx {
+            StoreConn::Pg(c) => keep_them_out!(c),
+            StoreConn::Lite(c) => keep_them_out!(c),
+        }
         Ok(())
     }
 }
@@ -280,6 +337,19 @@ pub struct Relay {
     pub retention_ms: i64,
     /// How long the moderation log keeps a row.
     pub modlog_days: u32,
+    /// How long an account the move made waits for someone to open it. 0: for good.
+    pub unclaimed_days: u32,
+    /// The groups the move made that hold no privileges (`placeholder::load`). In memory,
+    /// so the new-member wait costs no query.
+    pub imported_groups: DashMap<String, ()>,
+    /// How long what came from Discord is kept, by when it was written. 0: until removed.
+    pub archive_days: u32,
+    /// What people said about the archive's rows (`archive::load`).
+    archive_wishes: std::sync::RwLock<Arc<archive::Wishes>>,
+    /// Something in the archive is to go: `archive::tidy` looks now.
+    pub(crate) archive_kick: tokio::sync::Notify,
+    /// Searches of the archive at once, whatever the number of members.
+    pub(crate) archive_searches: Semaphore,
     pending: Arc<Semaphore>,
     pending_by_address: Arc<DashMap<String, usize>>,
     pow_key: Vec<u8>,
@@ -287,6 +357,8 @@ pub struct Relay {
     link_lock: tokio::sync::Mutex<()>,
     /// What address bans are hashed with (`crate::bans`).
     ban_key: Vec<u8>,
+    /// What an account the move made gets its id from, and what `Reset` shows for it.
+    placeholder_key: Vec<u8>,
     /// Recovery-key resets per address (`ConnLimits` key): each fetches a
     /// vault's recovery slot, so they are few (5, then one per 3 minutes).
     resets: DashMap<IpAddr, crate::state::RateLimiter>,
@@ -305,6 +377,8 @@ const SLOT_LEN: usize = 1 + 32 + 8 + 12 + 48;
 /// `slot.reset`: the reset key's public half (Ed25519).
 const SLOT_RESET: &str = voipc_crypto::account::SLOT_RESET;
 const RESET_KEY_LEN: usize = 32;
+/// What a recovery key that does not open the account hears, on a real one and a decoy.
+const NOT_THIS_KEY: &str = "That recovery key is not this account's.";
 
 /// One sign-in in progress: a share of the relay's slots and of its
 /// address's, both given back when it ends.
@@ -363,6 +437,7 @@ impl Relay {
         check_key(&store, &keys).await?;
         let pow_key = keys.subkey("voipc-pow").to_vec();
         let ban_key = keys.subkey("voipc-ban").to_vec();
+        let placeholder_key = keys.subkey("voipc-placeholder").to_vec();
         let ip_salt = keys.subkey("voipc-ip").to_vec();
         let host = RelayHost {
             cfg: Arc::new(l4f_config(cfg, relay_id)),
@@ -379,7 +454,7 @@ impl Relay {
         )
         .await?;
         ensure_moderator(&store).await?;
-        Ok(Relay {
+        let relay = Relay {
             accounts,
             relay_id,
             required: cfg.mode == AccountsMode::Required,
@@ -388,17 +463,27 @@ impl Relay {
             quota: i64::from(cfg.quota_mb) * 1024 * 1024,
             retention_ms: i64::from(cfg.retention_days) * 86_400_000,
             modlog_days: cfg.modlog_days,
+            unclaimed_days: cfg.unclaimed_days,
+            imported_groups: DashMap::new(),
+            archive_days: cfg.archive_days,
+            archive_wishes: std::sync::RwLock::default(),
+            archive_kick: tokio::sync::Notify::new(),
+            archive_searches: Semaphore::new(archive::SEARCHES),
             pending: Arc::new(Semaphore::new(PENDING_SIGN_INS)),
             pending_by_address: Arc::default(),
             pow_key,
             link_lock: tokio::sync::Mutex::new(()),
             ban_key,
+            placeholder_key,
             resets: DashMap::new(),
             providers: provider::Flows::default(),
             pairs: DashMap::new(),
             pair_asks: DashMap::new(),
             claiming: tokio::sync::Mutex::new(()),
-        })
+        };
+        placeholder::load(&relay).await?;
+        archive::load(&relay).await?;
+        Ok(relay)
     }
 
     pub fn store(&self) -> &Store {
@@ -1237,13 +1322,15 @@ async fn reset<S: AsyncRead + AsyncWrite + Unpin>(
             .await
             .map_err(|_| gone())?
             .ok_or("No account of that name.")?;
-        let identity = relay
-            .identity(user.id)
-            .await
-            .map_err(|_| gone())?
-            .ok_or("This account cannot be reset.")?;
+        let identity = relay.identity(user.id).await.map_err(|_| gone())?;
         let vault = relay.vault(user.id).await.map_err(|_| gone())?;
         (user, identity, vault)
+    };
+    // Nobody has opened it: this answers as if someone had, since anyone can find out the
+    // name exists (a guest asking for it hears so), and the two together would say that
+    // nobody holds it yet.
+    let Some(identity) = identity else {
+        return decoy_reset(relay, stream, buf, user.id, answers).await;
     };
     // Never the password slot: with it anyone could guess the password offline
     let blobs: Vec<VaultBlob> = vault
@@ -1296,7 +1383,7 @@ async fn reset<S: AsyncRead + AsyncWrite + Unpin>(
         ),
     };
     if !proved {
-        return Err("That recovery key is not this account's.".into());
+        return Err(NOT_THIS_KEY.into());
     }
     if pass_slot.len() != SLOT_LEN {
         return Err(unexpected());
@@ -1328,6 +1415,32 @@ async fn reset<S: AsyncRead + AsyncWrite + Unpin>(
     sign_out_account(state, user.id).await;
     step(stream, AuthStep::ResetDone).await?;
     Err("Your password was reset. Sign in with the new one.".into())
+}
+
+/// What `reset` does for an account with no identity: the same steps as a real one, with
+/// blobs no key opens, ending as a wrong key ends.
+async fn decoy_reset<S: AsyncRead + AsyncWrite + Unpin>(
+    relay: &Relay,
+    stream: &mut S,
+    buf: &mut BytesMut,
+    user: AccountId,
+    answers: &mut u32,
+) -> Result<SignedIn, String> {
+    let challenge: [u8; 32] = rand::random();
+    step(
+        stream,
+        AuthStep::ResetChallenge {
+            relay_id: relay.relay_id,
+            challenge: challenge.to_vec(),
+            blobs: relay.decoy_blobs(user),
+            second_factor: false,
+        },
+    )
+    .await?;
+    match next(stream, buf, TOTP_WAIT, answers).await? {
+        AuthContinue::Reset { .. } => Err(NOT_THIS_KEY.into()),
+        _ => Err(unexpected()),
+    }
 }
 
 /// `slot.pass` and the password change together: the slot first
@@ -1702,6 +1815,12 @@ async fn delete_account(
             }
             e => e.message().to_string(),
         })?;
+    // `Host::delete_user` left them out for good: a frame coming now must know, and no
+    // reader gets what they wrote from here on
+    if let Err(e) = archive::load(relay).await {
+        warn!("reading the archive's wishes: {e:#}");
+    }
+    relay.archive_kick.notify_one();
     info!(user = %user.id.hex(), "account deleted by its owner");
     Ok(())
 }
@@ -1842,9 +1961,13 @@ pub async fn handle_request(
             | AccountRequest::LogFetch { .. }
             | AccountRequest::LogKeys { .. }
             | AccountRequest::LogIndex
+            | AccountRequest::ArchiveFetch { .. }
     );
+    let searches = matches!(req, AccountRequest::ArchiveSearch { .. });
     let allowed = state.sessions.get_mut(&session_id).is_some_and(|mut s| {
-        if reads_log {
+        if searches {
+            s.archive_search_rate.try_consume()
+        } else if reads_log {
             s.log_read_rate.try_consume()
         } else {
             s.account_rate.try_consume()
@@ -1920,7 +2043,11 @@ pub async fn handle_request(
             if !relay.accounts.fresh(&info, now) && !vault_proven {
                 refused(
                     "TotpEnable",
-                    "Sign in with your password again to turn codes on.",
+                    if user.has_password {
+                        "Sign in with your password again to turn codes on."
+                    } else {
+                        "Confirm it's you with a provider you have linked first."
+                    },
                 )
             } else {
                 match relay
@@ -2201,6 +2328,29 @@ pub async fn handle_request(
         }
         AccountRequest::ProfilePictureSet { image } => {
             profile::set_picture(state, &relay, session_id, &user, image).await?
+        }
+        // Who reads what here, and what they look for, goes in no log and no counter
+        AccountRequest::ArchiveFetch {
+            channel_id,
+            thread,
+            before,
+            pinned,
+        } => archive::fetch(
+            state, &relay, session_id, user.id, channel_id, thread, before, pinned,
+        )
+        .await
+        .unwrap_or_else(|e| read_failed("ArchiveFetch", e)),
+        AccountRequest::ArchiveSearch {
+            channel_id,
+            query,
+            from,
+        } => archive::search(state, &relay, session_id, user.id, channel_id, query, from)
+            .await
+            .unwrap_or_else(|e| read_failed("ArchiveSearch", e)),
+        AccountRequest::ArchiveMine { action, scope } => {
+            archive::mine(state, &relay, session_id, user.id, action, scope)
+                .await
+                .unwrap_or_else(|e| read_failed("ArchiveMine", e))
         }
     };
     crate::session::send_msg(tx, &reply(out))
@@ -2864,6 +3014,40 @@ mod tests {
         }
     }
 
+    /// `discord::FINE_SCOPES` is what ADMINISTRATOR comes to: all of them, one by one, and
+    /// never `*`. A privilege added here and forgotten there fails this.
+    #[test]
+    fn the_fine_scopes_are_exactly_the_registered_privileges() {
+        use std::collections::BTreeSet;
+        use voipc_protocol::discord::FINE_SCOPES;
+        let fine: BTreeSet<&str> = FINE_SCOPES.iter().copied().collect();
+        let registered: BTreeSet<&str> = APP_SCOPES
+            .iter()
+            .map(|s| s.name)
+            .chain(["users:read", "users:admin", "roles:admin"])
+            .collect();
+        assert_eq!(fine, registered);
+        assert_eq!(fine.len(), FINE_SCOPES.len(), "each once");
+        let held: Vec<String> = FINE_SCOPES.iter().map(|s| s.to_string()).collect();
+        assert!(!is_star(&held), "all of them together are not `*`");
+        assert!(is_star(&["*".to_string()]));
+        // ... and every privilege a session can hold is in it
+        let p = Powers::of(&held);
+        for one in [
+            Powers::KICK,
+            Powers::BAN,
+            Powers::BANS,
+            Powers::CHANNELS,
+            Powers::EMOTES,
+            Powers::USERS_READ,
+            Powers::USERS_ADMIN,
+            Powers::ROLES_ADMIN,
+            Powers::RESTRICT,
+        ] {
+            assert!(p.has(one));
+        }
+    }
+
     #[test]
     fn powers_follow_wildcards_and_nothing_else() {
         let p = |s: &[&str]| Powers::of(&s.iter().map(|s| s.to_string()).collect::<Vec<_>>());
@@ -3410,9 +3594,30 @@ mod tests {
                     ..Default::default()
                 };
                 let window = "last hour";
+                // What came from Discord: a wish, and the row counts what it covers
+                db!(store, pool => {
+                    for (channel, dc_id, author) in [(5i64, 10i64, 77i64), (6, 11, 77), (5, 90, 77), (5, 12, 78)] {
+                        sqlx::query(
+                            "INSERT INTO voipc_archive (channel, dc_id, author_dc_id, author_name, body, import_id)
+                             VALUES ($1, $2, $3, 'x', 'y', 1)",
+                        )
+                        .bind(channel)
+                        .bind(dc_id)
+                        .bind(author)
+                        .execute(pool)
+                        .await
+                        .unwrap();
+                    }
+                });
+                let imported = modlog::Imported {
+                    ids: &[77],
+                    low: 10,
+                    high: 50,
+                    say_how_many: true,
+                };
                 assert_eq!(
                     relay
-                        .posts_remove(Some(id.0), 1000, 4000, window, &row)
+                        .posts_remove(Some(id.0), imported, 1000, 4000, window, &row)
                         .await
                         .unwrap(),
                     2,
@@ -3432,9 +3637,15 @@ mod tests {
                     target_name: "gus#0001",
                     ..Default::default()
                 };
+                let imported = modlog::Imported {
+                    ids: &[],
+                    low: 0,
+                    high: 0,
+                    say_how_many: true,
+                };
                 assert_eq!(
                     relay
-                        .posts_remove(None, 0, 4000, window, &guest)
+                        .posts_remove(None, imported, 0, 4000, window, &guest)
                         .await
                         .unwrap(),
                     0
@@ -3458,7 +3669,13 @@ mod tests {
                 assert_eq!(marks[1].name.chars().count(), 64);
                 assert_eq!(marks[1].by.chars().count(), 64);
                 let rows = relay.modlog_rows(0, 200).await.unwrap();
-                assert_eq!(rows[1].8, "2 kept messages, last hour");
+                assert_eq!(rows[1].8, "2 kept messages, last hour, 2 imported");
+                archive::load(&relay).await.unwrap();
+                let wishes = relay.wishes();
+                use archive::{verdict, Verdict};
+                assert_eq!(verdict(&wishes, Some(77), 6, 11), Verdict::Erased);
+                assert_eq!(verdict(&wishes, Some(77), 5, 90), Verdict::Shown);
+                assert_eq!(verdict(&wishes, Some(78), 5, 12), Verdict::Shown);
                 // Others' rows are no removals
                 relay
                     .modlog_put(&modlog::Entry {
@@ -3487,6 +3704,437 @@ mod tests {
                 set(store, fewer).await;
                 boot(store).await;
                 assert_eq!(group(store).await.scopes, fewer);
+            }
+        }
+
+        /// The move's tables on each database: the longest text, ids past what a JS number
+        /// holds, the statements the steps after this rest on (Postgres has no two-argument
+        /// `max`, and no CI job runs it), and what goes with an account or a group.
+        #[tokio::test]
+        async fn the_move_tables_round_trip_on_both_backends() {
+            macro_rules! run {
+                ($store:expr, $sql:expr $(, $bind:expr)* $(,)?) => {
+                    db!($store, pool => {
+                        sqlx::query($sql)$(.bind($bind))*.execute(pool).await.map(|r| r.rows_affected())
+                    })
+                };
+            }
+            macro_rules! row {
+                ($store:expr, $ty:ty, $sql:expr $(, $bind:expr)* $(,)?) => {
+                    db!($store, pool => {
+                        sqlx::query_as::<_, $ty>($sql)$(.bind($bind))*.fetch_one(pool).await.unwrap()
+                    })
+                };
+            }
+            const SNOWFLAKE: i64 = 1_454_987_148_113_234_751;
+            const CURSOR: &str = "INSERT INTO voipc_import_cursors (uid, import_id, high) \
+                VALUES ($1, $2, $3) ON CONFLICT (uid, import_id) DO UPDATE \
+                SET high = excluded.high WHERE excluded.high > voipc_import_cursors.high";
+            const CURSORS: &str = "SELECT CAST(MAX(c.high) AS BIGINT) FROM voipc_import_cursors c \
+                JOIN voipc_imports i ON i.id = c.import_id WHERE c.uid = $1 AND i.undone_at IS NULL";
+            const WISH: &str = "INSERT INTO voipc_archive_wishes \
+                (author_dc_id, channel, low, high, erase, at) VALUES ($1, $2, $3, $4, $5, $6) \
+                ON CONFLICT (author_dc_id, channel, low, high) DO UPDATE \
+                SET erase = voipc_archive_wishes.erase OR excluded.erase";
+            const MESSAGE: &str = "INSERT INTO voipc_archive (channel, thread, dc_id, author_dc_id, \
+                author_name, body, reply_to, reactions, attachments, pinned, import_id) \
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+                ON CONFLICT (channel, thread, dc_id) DO UPDATE SET \
+                author_dc_id = excluded.author_dc_id, author_name = excluded.author_name, \
+                body = excluded.body, reply_to = excluded.reply_to, reactions = excluded.reactions, \
+                attachments = excluded.attachments, pinned = excluded.pinned";
+            const THREAD: &str = "INSERT INTO voipc_archive (channel, thread, dc_id, author_name, \
+                body, thread_name, replies, import_id) VALUES ($1, 0, $2, '', '', $3, $4, $5) \
+                ON CONFLICT (channel, thread, dc_id) DO UPDATE \
+                SET thread_name = excluded.thread_name, replies = excluded.replies";
+            type Page = (
+                i64,
+                Option<i64>,
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+                i32,
+                bool,
+                i64,
+            );
+            const PAGE: &str = "SELECT dc_id, author_dc_id, author_name, body, reactions, \
+                thread_name, replies, pinned, import_id FROM voipc_archive \
+                WHERE channel = $1 AND thread = $2 AND dc_id < $3 ORDER BY dc_id DESC LIMIT $4";
+
+            let dbs = databases().await;
+            for store in &dbs.stores {
+                boot(store).await;
+                let wide = "\u{1F600}";
+
+                // A run: ids go up, and marking one undone happens once
+                let (first, second) = {
+                    let mut ids = Vec::new();
+                    for _ in 0..2 {
+                        ids.push(row!(
+                            store,
+                            (i64,),
+                            "INSERT INTO voipc_imports (guild_id, by_name, started_at, options) \
+                             VALUES ($1, $2, $3, $4) RETURNING CAST(id AS BIGINT)",
+                            SNOWFLAKE,
+                            wide.repeat(64),
+                            100i64,
+                            "{\"messages\":true}",
+                        ));
+                    }
+                    (ids[0].0, ids[1].0)
+                };
+                assert!(second > first);
+                run!(
+                    store,
+                    "UPDATE voipc_imports SET archive_rows = archive_rows + $1 WHERE id = $2",
+                    5i64,
+                    first
+                )
+                .unwrap();
+                let (guild, by, options, report, backup, rows, undone, done) = row!(
+                    store,
+                    (
+                        i64,
+                        String,
+                        String,
+                        Option<String>,
+                        Option<String>,
+                        i64,
+                        Option<i64>,
+                        Option<i64>
+                    ),
+                    "SELECT guild_id, by_name, options, report, backup, archive_rows, undone_at, \
+                     archive_done_at FROM voipc_imports WHERE id = $1",
+                    first
+                );
+                assert_eq!(
+                    (guild, by, options.as_str(), rows),
+                    (SNOWFLAKE, wide.repeat(64), "{\"messages\":true}", 5)
+                );
+                assert_eq!((report, backup, undone, done), (None, None, None, None));
+
+                // What a run made: a row stays as the run that made it left it
+                for (run, local) in [(first, "c:dc-1"), (second, "changed")] {
+                    run!(
+                        store,
+                        "INSERT INTO voipc_import_items (kind, dc_id, import_id, local) \
+                         VALUES ($1, $2, $3, $4) ON CONFLICT (kind, dc_id) DO NOTHING",
+                        2i16,
+                        SNOWFLAKE,
+                        run,
+                        local
+                    )
+                    .unwrap();
+                }
+                let (import_id, local) = row!(
+                    store,
+                    (i64, String),
+                    "SELECT import_id, local FROM voipc_import_items WHERE kind = $1 AND dc_id = $2",
+                    2i16,
+                    SNOWFLAKE
+                );
+                assert_eq!((import_id, local.as_str()), (first, "c:dc-1"));
+
+                // A cursor only rises, and undoing a delta falls back to the run before
+                for high in [50i64, 40, 60] {
+                    run!(store, CURSOR, SNOWFLAKE, first, high).unwrap();
+                }
+                run!(store, CURSOR, SNOWFLAKE, second, SNOWFLAKE).unwrap();
+                let reached = row!(store, (i64,), CURSORS, SNOWFLAKE).0;
+                assert_eq!(reached, SNOWFLAKE);
+                let undo =
+                    "UPDATE voipc_imports SET undone_at = $1 WHERE id = $2 AND undone_at IS NULL";
+                let once = run!(store, undo, 200i64, second).unwrap();
+                let twice = run!(store, undo, 300i64, second).unwrap();
+                assert_eq!((once, twice), (1, 0));
+                let reached = row!(store, (i64,), CURSORS, SNOWFLAKE).0;
+                assert_eq!(reached, 60, "40 did not lower it");
+
+                // An account the move knows, and its group and twin
+                let id = AccountId([7; 16]);
+                store
+                    .create_user(
+                        &l4f_accounts::model::NewUser {
+                            id,
+                            username: "kim".into(),
+                            display_name: "kim".into(),
+                            email_pending: None,
+                            password_hash: None,
+                            created_at: 1,
+                        },
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let placeholder = "INSERT INTO voipc_placeholders \
+                    (account, dc_id, import_id, banned, joined_at, imported_at) \
+                    VALUES ($1, $2, $3, $4, $5, $6)";
+                let unknown_run = run!(
+                    store,
+                    placeholder,
+                    &id.0[..],
+                    SNOWFLAKE,
+                    i64::MAX,
+                    false,
+                    None::<i64>,
+                    100i64
+                );
+                assert!(unknown_run.is_err(), "a row names a run that exists");
+                run!(
+                    store,
+                    placeholder,
+                    &id.0[..],
+                    SNOWFLAKE,
+                    first,
+                    false,
+                    Some(50i64),
+                    100i64
+                )
+                .unwrap();
+                let (dc_id, banned, joined, imported, claimed) = row!(
+                    store,
+                    (i64, bool, Option<i64>, i64, Option<i64>),
+                    "SELECT p.dc_id, p.banned, p.joined_at, p.imported_at, p.claimed_at \
+                     FROM voipc_placeholders p \
+                     WHERE NOT p.banned AND p.claimed_at IS NULL AND p.imported_at <= $1 \
+                     ORDER BY p.imported_at LIMIT 200",
+                    100i64
+                );
+                assert_eq!(
+                    (dc_id, banned, joined, imported, claimed),
+                    (SNOWFLAKE, false, Some(50), 100, None)
+                );
+                let role = store.create_role("crew", "", None).await.unwrap().unwrap();
+                let twin = store
+                    .create_role("crew-power", "", None)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let group = "INSERT INTO voipc_import_groups (role, dc_role_id, power, import_id) \
+                    VALUES ($1, $2, $3, $4)";
+                run!(store, group, &role.0[..], SNOWFLAKE, false, first).unwrap();
+                run!(store, group, &twin.0[..], SNOWFLAKE, true, first).unwrap();
+                let another = store.create_role("crew2", "", None).await.unwrap().unwrap();
+                let same_role = run!(store, group, &another.0[..], SNOWFLAKE, false, first);
+                assert!(same_role.is_err(), "one zero-scope group for a role");
+                let waiting = "INSERT INTO voipc_power_waiting (account, role) VALUES ($1, $2)";
+                run!(store, waiting, &id.0[..], &twin.0[..]).unwrap();
+
+                // Who is left out: `erase` is always said, since it destroys posts
+                let excluded = "INSERT INTO voipc_import_excluded (dc_id, own, erase, at) \
+                    VALUES ($1, $2, $3, $4) ON CONFLICT (dc_id) DO UPDATE \
+                    SET own = excluded.own, erase = excluded.erase";
+                let unsaid = run!(
+                    store,
+                    "INSERT INTO voipc_import_excluded (dc_id, own, at) VALUES ($1, $2, $3)",
+                    1i64,
+                    false,
+                    1i64
+                );
+                assert!(unsaid.is_err(), "no default for `erase`");
+                run!(store, excluded, SNOWFLAKE, false, false, 1i64).unwrap();
+                run!(store, excluded, SNOWFLAKE, true, true, 2i64).unwrap();
+                let (own, erase) = row!(
+                    store,
+                    (bool, bool),
+                    "SELECT own, erase FROM voipc_import_excluded WHERE dc_id = $1",
+                    SNOWFLAKE
+                );
+                assert_eq!((own, erase), (true, true));
+
+                // A row of the archive: an upsert leaves its first run, a thread's name and
+                // count, and a thread's upsert leaves its text
+                let channel = SNOWFLAKE - 1;
+                let body = format!("first line\nsecond\t{}", "x".repeat(16_000));
+                let reactions = Some("[{\"emoji\":\"x\",\"count\":1}]");
+                run!(
+                    store,
+                    MESSAGE,
+                    channel,
+                    0i64,
+                    SNOWFLAKE,
+                    Some(SNOWFLAKE),
+                    wide.repeat(64),
+                    "soon replaced",
+                    None::<i64>,
+                    None::<&str>,
+                    None::<&str>,
+                    false,
+                    first
+                )
+                .unwrap();
+                run!(
+                    store,
+                    THREAD,
+                    channel,
+                    SNOWFLAKE,
+                    wide.repeat(100),
+                    12i32,
+                    second
+                )
+                .unwrap();
+                run!(
+                    store,
+                    MESSAGE,
+                    channel,
+                    0i64,
+                    SNOWFLAKE,
+                    Some(SNOWFLAKE),
+                    wide.repeat(64),
+                    body.clone(),
+                    Some(SNOWFLAKE - 5),
+                    reactions,
+                    None::<&str>,
+                    true,
+                    second
+                )
+                .unwrap();
+                // An anonymised row in a thread, and a thread with no such message
+                run!(
+                    store,
+                    MESSAGE,
+                    channel,
+                    SNOWFLAKE,
+                    SNOWFLAKE - 3,
+                    None::<i64>,
+                    "Former member",
+                    "older",
+                    None::<i64>,
+                    None::<&str>,
+                    None::<&str>,
+                    false,
+                    second
+                )
+                .unwrap();
+                run!(store, THREAD, channel, SNOWFLAKE - 9, "lone", 0i32, first).unwrap();
+                let page = db!(store, pool => {
+                    sqlx::query_as::<_, Page>(PAGE)
+                        .bind(channel)
+                        .bind(0i64)
+                        .bind(i64::MAX)
+                        .bind(200i64)
+                        .fetch_all(pool)
+                        .await
+                        .unwrap()
+                });
+                assert_eq!(page.len(), 2, "newest first: {page:?}");
+                assert_eq!(page[1].0, SNOWFLAKE - 9);
+                assert_eq!((page[1].2.as_str(), page[1].3.as_str()), ("", ""));
+                let top = &page[0];
+                assert_eq!((top.0, top.1), (SNOWFLAKE, Some(SNOWFLAKE)));
+                assert_eq!(top.2, wide.repeat(64));
+                assert_eq!(top.3, body, "its newlines kept");
+                assert_eq!(top.5.as_deref(), Some(wide.repeat(100).as_str()));
+                assert_eq!(top.4.as_deref(), reactions);
+                assert_eq!((top.6, top.7), (12, true));
+                assert_eq!(
+                    top.8, first,
+                    "a row belongs to the run that first brought it"
+                );
+
+                // The queries reading depends on, each on both
+                let pin = row!(
+                    store,
+                    (i64,),
+                    "SELECT dc_id FROM voipc_archive WHERE channel = $1 AND pinned = TRUE \
+                     AND dc_id < $2 ORDER BY dc_id DESC LIMIT $3",
+                    channel,
+                    i64::MAX,
+                    200i64
+                );
+                assert_eq!(pin.0, SNOWFLAKE);
+                let thread_row = row!(
+                    store,
+                    (i64, Option<i64>),
+                    "SELECT dc_id, author_dc_id FROM voipc_archive WHERE channel = $1 AND thread > 0 \
+                     AND (thread, dc_id) < ($2, $3) ORDER BY thread DESC, dc_id DESC LIMIT 2000",
+                    channel,
+                    i64::MAX,
+                    i64::MAX
+                );
+                assert_eq!(thread_row, (SNOWFLAKE - 3, None));
+
+                // A wish outlives its rows: a hide never softens a delete, and the widest fits
+                let wish = |erase: bool| (SNOWFLAKE, 0i64, 0i64, i64::MAX, erase, 1i64);
+                for (a, c, l, h, e, at) in [wish(false), wish(true), wish(false)] {
+                    run!(store, WISH, a, c, l, h, e, at).unwrap();
+                }
+                let (high, erase) = row!(
+                    store,
+                    (i64, bool),
+                    "SELECT high, erase FROM voipc_archive_wishes WHERE author_dc_id = $1",
+                    SNOWFLAKE
+                );
+                assert_eq!((high, erase), (i64::MAX, true));
+
+                // The worker's one statement: at most a batch, and only what it names
+                let taken = run!(
+                    store,
+                    "DELETE FROM voipc_archive WHERE (channel, thread, dc_id) IN \
+                     (SELECT channel, thread, dc_id FROM voipc_archive \
+                      WHERE author_dc_id = $1 LIMIT 5000)",
+                    SNOWFLAKE
+                )
+                .unwrap();
+                assert_eq!(taken, 1);
+                let left = row!(
+                    store,
+                    (i64,),
+                    "SELECT CAST(COUNT(*) AS BIGINT) FROM voipc_archive"
+                );
+                assert_eq!(left.0, 2, "the anonymised row and the lone root stay");
+
+                // A channel keeps its place and starts as not private; its reader still works
+                run!(
+                    store,
+                    "INSERT INTO voipc_channels (conv, position) VALUES ($1, $2)",
+                    "c:dc-1454987148113234751",
+                    0i32
+                )
+                .unwrap();
+                let private = "SELECT archive_private FROM voipc_channels WHERE conv = $1";
+                let conv = "c:dc-1454987148113234751";
+                assert!(!row!(store, (bool,), private, conv).0);
+                run!(
+                    store,
+                    "UPDATE voipc_channels SET archive_private = $1 WHERE conv = $2",
+                    true,
+                    conv
+                )
+                .unwrap();
+                assert!(row!(store, (bool,), private, conv).0);
+
+                // What goes with a group, and with an account. Nothing here is theirs to take
+                // but the marker: runs, cursors, what was left out and the archive stay
+                let count = |table: &'static str| {
+                    let store = store.clone();
+                    async move {
+                        let sql = format!("SELECT CAST(COUNT(*) AS BIGINT) FROM {table}");
+                        let (n,): (i64,) = db!(&store, pool => {
+                            sqlx::query_as(sqlx::AssertSqlSafe(sql)).fetch_one(pool).await.unwrap()
+                        });
+                        n
+                    }
+                };
+                assert!(store.delete_role(role).await.unwrap());
+                assert_eq!(count("voipc_import_groups").await, 1, "the twin stays");
+                assert_eq!(count("voipc_power_waiting").await, 1);
+                assert!(store.delete_role(twin).await.unwrap());
+                assert_eq!(count("voipc_import_groups").await, 0);
+                assert_eq!(count("voipc_power_waiting").await, 0, "with the twin");
+                run!(store, waiting, &id.0[..], &another.0[..]).unwrap();
+                let mut tx = store.begin().await.unwrap();
+                assert!(Store::delete_user(tx.conn(), id).await.unwrap());
+                tx.commit().await.unwrap();
+                assert_eq!(count("voipc_placeholders").await, 0);
+                assert_eq!(count("voipc_power_waiting").await, 0, "with the account");
+                assert_eq!(count("voipc_imports").await, 2);
+                assert_eq!(count("voipc_import_items").await, 1);
+                assert_eq!(count("voipc_import_cursors").await, 2);
+                assert_eq!(count("voipc_import_excluded").await, 1);
+                assert_eq!(count("voipc_archive_wishes").await, 1);
+                assert_eq!(count("voipc_archive").await, 2);
             }
         }
     }

@@ -223,6 +223,18 @@ pub const RESHAPED: &[(u32, Side, u32, &str)] = &[
         46,
         "AccountReply: AdminReply::ModLog and PostsRemoved never come from it",
     ),
+    (
+        19,
+        Side::Client,
+        41,
+        "AdminOp and AccountRequest: the import and archive steps are refused",
+    ),
+    (
+        19,
+        Side::Server,
+        46,
+        "AccountReply and AdminReply: the import and archive replies never come from it",
+    ),
 ];
 
 /// How many messages each side had at a protocol: an index at or past it is
@@ -234,6 +246,7 @@ fn client_messages(proto: u32) -> u32 {
         14 => 49,
         15..=17 => 50,
         18 => 52,
+        19 => 54,
         _ => u32::MAX,
     }
 }
@@ -343,6 +356,38 @@ pub fn encode_client_msg_for(
             op: AdminOp::ModLog { .. } | AdminOp::ModNote { .. } | AdminOp::RemovePosts { .. },
             ..
         }) if proto < 19 => Err(ProtocolError::NotOnThisRelay(proto)),
+        ClientMessage::Account(AccountRequest::Admin {
+            op:
+                AdminOp::ImportFacts
+                | AdminOp::ImportBegin { .. }
+                | AdminOp::ImportCategories { .. }
+                | AdminOp::ImportChannels { .. }
+                | AdminOp::ImportEmote { .. }
+                | AdminOp::ImportThreads { .. }
+                | AdminOp::ImportMessages { .. }
+                | AdminOp::ImportCursors { .. }
+                | AdminOp::ImportEnd { .. }
+                | AdminOp::ImportReport { .. }
+                | AdminOp::ImportUndoPreview { .. }
+                | AdminOp::ImportRoles { .. }
+                | AdminOp::ImportMembers { .. }
+                | AdminOp::ImportBans { .. }
+                | AdminOp::MoveAccounts { .. }
+                | AdminOp::MoveStatus
+                | AdminOp::PowerWaiting { .. }
+                | AdminOp::PowerAnswer { .. }
+                | AdminOp::MoveExclude { .. }
+                | AdminOp::MoveExcluded { .. }
+                | AdminOp::ImportUndo { .. }
+                | AdminOp::ArchiveDelete { .. }
+                | AdminOp::ArchiveWishes { .. },
+            ..
+        })
+        | ClientMessage::Account(
+            AccountRequest::ArchiveFetch { .. }
+            | AccountRequest::ArchiveSearch { .. }
+            | AccountRequest::ArchiveMine { .. },
+        ) if proto < 20 => Err(ProtocolError::NotOnThisRelay(proto)),
         ClientMessage::EmoteAdd { emote } if proto == 14 => old(postcard::to_allocvec(&(
             EMOTE_ADD,
             EmoteAdd14 {
@@ -958,6 +1003,13 @@ mod tests {
             ),
             (restrict(), 18),
             (ClientMessage::ReportTakersGet, 18),
+            (
+                ClientMessage::AdminBansPage {
+                    search: String::new(),
+                    offset: 0,
+                },
+                19,
+            ),
         ];
         for (msg, v) in cases {
             assert!(
@@ -991,6 +1043,171 @@ mod tests {
             encode_client_msg_for(&restrict(), PROTOCOL_VERSION).unwrap(),
             vec![encode_client_msg(&restrict()).unwrap()]
         );
+    }
+
+    /// One of everything the move added, in the order of the enums.
+    fn the_moves_requests() -> Vec<AccountRequest> {
+        let ops = [
+            AdminOp::ImportFacts,
+            AdminOp::ImportBegin {
+                guild_id: "1".into(),
+                options: ImportOptions {
+                    channels: true,
+                    roles: true,
+                    permissions: true,
+                    members: true,
+                    bans: true,
+                    emotes: true,
+                    messages: true,
+                    threads: true,
+                    pins: true,
+                    reactions: true,
+                    anonymise: true,
+                    acknowledged: true,
+                },
+                backup_taken: false,
+            },
+            AdminOp::ImportCategories {
+                run: 1,
+                rows: vec![],
+            },
+            AdminOp::ImportChannels {
+                run: 1,
+                rows: vec![],
+            },
+            AdminOp::ImportEmote {
+                run: 1,
+                dc_id: 1,
+                name: "ab".into(),
+            },
+            AdminOp::ImportThreads {
+                run: 1,
+                rows: vec![],
+            },
+            AdminOp::ImportMessages {
+                run: 1,
+                channel: 1,
+                thread: None,
+                high: 1,
+                rows: vec![],
+            },
+            AdminOp::ImportCursors { after: 0 },
+            AdminOp::ImportEnd {
+                run: 1,
+                report: String::new(),
+            },
+            AdminOp::ImportReport { run: 1 },
+            AdminOp::ImportUndoPreview { run: 1 },
+            AdminOp::ImportRoles {
+                run: 1,
+                roles: vec![],
+            },
+            AdminOp::ImportMembers {
+                run: 1,
+                members: vec![],
+            },
+            AdminOp::ImportBans {
+                run: 1,
+                bans: vec![],
+            },
+            AdminOp::MoveAccounts {
+                search: String::new(),
+                offset: 0,
+                filter: MoveFilter::All,
+            },
+            AdminOp::MoveStatus,
+            AdminOp::PowerWaiting { offset: 0 },
+            AdminOp::PowerAnswer {
+                id: [0; 16],
+                group: String::new(),
+                grant: false,
+            },
+            AdminOp::MoveExclude {
+                dc_id: "1".into(),
+                on: true,
+                erase: false,
+            },
+            AdminOp::MoveExcluded {
+                after: String::new(),
+            },
+            AdminOp::ImportUndo { run: 1 },
+            AdminOp::ArchiveDelete {
+                target: ArchiveTarget::Author { id: "1".into() },
+            },
+            AdminOp::ArchiveWishes { after: None },
+        ];
+        ops.into_iter()
+            .map(|op| AccountRequest::Admin { op, code: None })
+            .chain([
+                AccountRequest::ArchiveFetch {
+                    channel_id: 1,
+                    thread: String::new(),
+                    before: String::new(),
+                    pinned: false,
+                },
+                AccountRequest::ArchiveSearch {
+                    channel_id: 1,
+                    query: "a".into(),
+                    from: String::new(),
+                },
+                AccountRequest::ArchiveMine {
+                    action: ArchiveAction::Count,
+                    scope: ArchiveScope::Everything,
+                },
+            ])
+            .collect()
+    }
+
+    /// The arm that names them is the only thing between them and a relay that reads
+    /// another step at that index, or none: `Account` is a message every relay knows.
+    #[test]
+    fn the_move_is_refused_below_20_and_goes_at_20() {
+        for req in the_moves_requests() {
+            let msg = ClientMessage::Account(req);
+            for v in OLDEST_RELAY_PROTOCOL..20 {
+                assert!(
+                    matches!(encode_client_msg_for(&msg, v), Err(ProtocolError::NotOnThisRelay(p)) if p == v),
+                    "{msg:?} at {v}"
+                );
+            }
+            assert_eq!(
+                encode_client_msg_for(&msg, 20).unwrap(),
+                vec![encode_client_msg(&msg).unwrap()]
+            );
+        }
+        // Moderation's are not touched by the arm: fine at 19
+        assert!(encode_client_msg_for(
+            &ClientMessage::Account(AccountRequest::Admin {
+                op: AdminOp::ModLog { before: 0 },
+                code: None,
+            }),
+            19,
+        )
+        .is_ok());
+    }
+
+    /// A step added later and left out of that list fails here, not on someone's relay.
+    #[test]
+    fn the_list_of_the_moves_requests_is_whole() {
+        // The index of what a request carries: the outer one, or the op's inside `Admin`
+        let (mut ops, mut requests) = (BTreeSet::new(), BTreeSet::new());
+        for req in the_moves_requests() {
+            let bytes = postcard::to_allocvec(&req).unwrap();
+            let (outer, rest) = postcard::take_from_bytes::<u32>(&bytes).unwrap();
+            if matches!(req, AccountRequest::Admin { .. }) {
+                ops.insert(postcard::take_from_bytes::<u32>(rest).unwrap().0);
+            } else {
+                requests.insert(outer);
+            }
+        }
+        let added = |name: &str| -> BTreeSet<u32> {
+            let was = golden(19)[name]["ENUM"].as_object().unwrap().len() as u32;
+            let now = golden(20)[name]["ENUM"].as_object().unwrap().len() as u32;
+            (was..now).collect()
+        };
+        assert_eq!(ops, added("AdminOp"));
+        assert_eq!(requests, added("AccountRequest"));
+        assert_eq!((ops.len(), requests.len()), (23, 3));
     }
 
     #[test]

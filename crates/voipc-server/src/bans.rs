@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use voipc_protocol::messages::ServerMessage;
 use voipc_protocol::types::BanInfo;
 
 use crate::state::ServerState;
@@ -257,7 +258,8 @@ pub fn list(state: &ServerState) -> Vec<BanInfo> {
     list_for(state, true)
 }
 
-/// The same for one reader (`Ban::name_for`).
+/// The same for one reader (`Ban::name_for`). In a fixed order: a page is an offset into it,
+/// and many bans can share a second.
 pub fn list_for(state: &ServerState, admin: bool) -> Vec<BanInfo> {
     let now = now_secs();
     let mut bans: Vec<BanInfo> = state
@@ -281,8 +283,47 @@ pub fn list_for(state: &ServerState, admin: bool) -> Vec<BanInfo> {
         b.account
             .cmp(&a.account)
             .then(b.created_at.cmp(&a.created_at))
+            .then(b.id.cmp(&a.id))
     });
     bans
+}
+
+/// Rows a page of the list holds at most. `PAGE_BYTES` usually comes first only for long
+/// reasons.
+const PAGE_ROWS: usize = 100;
+/// Well under a frame, as the logs' pages are, with room for the rest of the message.
+const PAGE_BYTES: usize = 44 * 1024;
+/// A search no name is longer than. It comes back in the answer, which has to fit a frame.
+const SEARCH_CHARS: usize = 128;
+
+/// The answer to `AdminBansPage`: what this reader's list shows under `search`, by the name a
+/// row shows and never the one behind it, from `offset`. `search` is not kept or logged.
+pub fn page(state: &ServerState, admin: bool, search: &str, offset: u32) -> ServerMessage {
+    let search: String = search.chars().take(SEARCH_CHARS).collect();
+    let needle = search.to_lowercase();
+    let found: Vec<BanInfo> = list_for(state, admin)
+        .into_iter()
+        .filter(|b| b.label.to_lowercase().contains(&needle))
+        .collect();
+    let total = found.len() as u32;
+    let mut bytes = 0;
+    let bans = found
+        .into_iter()
+        .skip(offset as usize)
+        .take(PAGE_ROWS)
+        .enumerate()
+        .take_while(|(i, ban)| {
+            bytes += postcard::to_allocvec(ban).map_or(PAGE_BYTES, |row| row.len());
+            *i == 0 || bytes <= PAGE_BYTES
+        })
+        .map(|(_, ban)| ban)
+        .collect();
+    ServerMessage::AdminBansPaged {
+        search,
+        offset,
+        total,
+        bans,
+    }
 }
 
 /// Reads the list again (at start, and every `REVALIDATE_MINUTES`): what the

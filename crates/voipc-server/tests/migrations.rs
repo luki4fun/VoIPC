@@ -77,6 +77,14 @@ const SHIPPED: &[(&str, &str)] = &[
         "postgres/0008_moderation.sql",
         "9d315baf10d2bee5b7b32adff2f8325497747509b5cc660f8e165432235880ec",
     ),
+    (
+        "sqlite/0009_move.sql",
+        "c5f52636c862bf33e3c0508c04b0314e4a01df45246d8f98a01ce35060defd1f",
+    ),
+    (
+        "postgres/0009_move.sql",
+        "94de0cecb0c6dd1f502209f7688a0c27a047e487eb03d7b996a7067904397e0b",
+    ),
 ];
 
 #[test]

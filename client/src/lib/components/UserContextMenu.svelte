@@ -45,11 +45,11 @@
   } from "../stores/user-menu.js";
   import Icon from "./Icons.svelte";
   import MemberName from "./MemberName.svelte";
-  import { adminError, adminOp, isRemoval, stepUp, stepUpSays } from "../stores/admin-ops.js";
+  import { adminError, adminOp, stepUp, stepUpCancelled, stepUpSays } from "../stores/admin-ops.js";
   import { showAdminPanel, submitStepUp } from "../stores/admin-ui.js";
   import { account, relayAccounts } from "../stores/account.js";
   import { olderRelay } from "../stores/relay.js";
-  import { community, moderation } from "../relay-rules.js";
+  import { community, moderation, moves } from "../relay-rules.js";
   import { removalHint, removalWindows } from "../modlog-rules.js";
   import { restrictions } from "../stores/restrictions.js";
   import { confirmAction } from "../stores/confirm.js";
@@ -143,7 +143,7 @@
   }
   function cancelStep() {
     const server = $serverAddress;
-    const said = isRemoval($stepUp) ? "The ban stands. Their posts stay: removing them takes a code." : "Not done: that takes a code.";
+    const said = stepUpCancelled($stepUp);
     stepUp.of(server).set(null);
     adminError.of(server).set(null);
     stepCode = "";
@@ -348,7 +348,7 @@
             </select>
           </label>
           {#if $adminRemovePosts !== null}
-            <div class="admin-hint remove-posts-hint">{removalHint($adminAction.hasAccount)}</div>
+            <div class="admin-hint remove-posts-hint">{removalHint($adminAction.hasAccount, moves($olderRelay?.protocol ?? null))}</div>
           {/if}
         {/if}
       {/if}

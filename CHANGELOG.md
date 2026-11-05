@@ -2,6 +2,60 @@
 
 All notable changes to VoIPC are documented here.
 
+## [1.11.0] - release candidate
+
+Protocol 20. This app still talks to relays back to 1.0 (protocol 12), and on an older relay holds back what its
+other apps could not read.
+
+### Added
+- **What someone deleted, and what closed on Discord, stay that way through a move.** Every run and *Go on* read Discord's
+  channels and roles again first, and the relay refuses a channel closed there while its gate here is open. A hide or a
+  delete holds through a later run and an undo with a new run, for someone who has left Discord too, and a thread's title
+  goes with it.
+- **Move a Discord server here**, from *Server admin → Discord move* in the desktop app: channels and categories in
+  their order, roles and channel permissions, members, bans, emotes and stickers, and old messages with their threads,
+  pins and reactions. A dry-run says what it will do first and writes nothing. A later run takes what is new, Stop
+  loses nothing, and Undo takes back what a run made. A network cut keeps the wizard where it stood, with Go on. The
+  bot's token stays in memory, goes to discord.com only, and never
+  reaches the server. The browser and Android show a card saying why, and everything below it. Read
+  [docs/MOVING.md](docs/MOVING.md) first: it has what Discord's rules say and who answers for what.
+- **Old messages are not end to end encrypted, and say so.** They were never encrypted, so this server can read them.
+  They stay out of the conversation, in a pane labelled "Imported from Discord, unverified. This server can read it.",
+  with its own search, threads and pins, for whoever stands in the channel. Nothing of it stays on a device. A private
+  channel's history comes only if the owner ticks it, and then only someone with `*` can open its gate. One closed on
+  Discord after a run is refused until it has a gate here.
+- **People come in with Discord.** The move holds an account for each member. *Continue with Discord* opens it, with the
+  name they choose and their badges and gates, on `invite` and `closed` servers too. An account nobody opens goes after
+  `unclaimed_days` (`[accounts]`, 90 by default, 0 is never), and frees its name.
+- **Power waits for an OK.** Whatever a role could do on Discord goes into a group of its own that nobody holds until the
+  owner says OK for that person, with a code. The dashboard counts who has come and lists who waits. A delta never
+  widens anything, and an `admin reclaim` of such an account sends it back to waiting. An undo and a new run never link
+  Discord back to someone who took it off, nor disable them.
+- **Your posts are yours to take back.** Sign in with that Discord and hide or delete your own imported posts, one by
+  one or all at once under *Settings → Privacy & data*. What you delete stays gone through a later run, or an undo and a new
+  one, also if you have left Discord by then, and a thread you opened then keeps nothing of yours, only a way in to the
+  replies. An owner can delete by Discord id on request, or leave someone out before the first run. A ban with removal takes
+  imported posts in its span too, by when they were written, and the delete and ban dialogs say so.
+- **The Users tab filters** by who signed in, waits or was banned on Discord, with a chip on each row. *Lift ban* on a
+  banned row ends that ban here, and no later import brings it back.
+- **`archive_days`** in `[accounts]` (0 by default) says how long what came from Discord is kept, by when it was
+  written. 0 keeps it until someone removes it.
+
+### Changed
+- **Active bans come in pages,** with a search by name and *Show more*. Past some hundreds of rows the list used to be
+  too long for one message, and silently never arrived.
+- **Password reset** answers the same for an account nobody has opened as for one somebody has.
+
+### Fixed
+- A text channel called `general` can be made and edited in the app, as one from `channels.json` always could. A voice
+  channel still cannot take the lobby's name.
+- Saving a group is refused when the groups' list would no longer fit one message, and says so. It used to succeed,
+  and the panel then silently stopped getting the list.
+- A group a channel's gate names cannot be deleted by writing its name another way, such as ` CREW `, which only a
+  modified app could send.
+- Someone with no password, back on a remembered device, can turn two-factor codes on: the question now offers to
+  confirm with their provider. It used to tell them to sign in with a password they did not have.
+
 ## [1.10.0] - release candidate
 
 Protocol 19. This app still talks to relays back to 1.0 (protocol 12), and on an older relay holds back what its

@@ -236,7 +236,8 @@ pub enum ClientMessage {
     /// Lift a ban, by its `BanInfo.id` (admin only).
     AdminUnban { id: u64 },
 
-    /// Request the list of active bans (admin only).
+    /// Request the list of active bans (admin only). A relay before protocol 20 answers
+    /// all of it, or nothing past a frame's worth; one at 20 answers the first page.
     AdminListBans,
 
     /// Ban an account by name, online or not (admin only). `duration_secs` 0
@@ -346,6 +347,10 @@ pub enum ClientMessage {
     },
     /// Who takes a report now (protocol v19). `ServerMessage::ReportTakers` answers.
     ReportTakersGet,
+
+    /// A page of the active bans, by the name a row shows (protocol v20), for the
+    /// same privilege as `AdminListBans`. `ServerMessage::AdminBansPaged` answers.
+    AdminBansPage { search: String, offset: u32 },
 }
 
 /// The client's side of an account sign-in, between `Authenticate` and
@@ -592,6 +597,26 @@ pub enum AccountRequest {
     ProfilePictureSet {
         image: Option<Vec<u8>>,
     },
+    /// A page of what came from Discord, newest first (protocol v20): rows older than
+    /// `before` ("" from the newest), in the channel's flow or a thread (""), or only its
+    /// pins. Only from inside the channel.
+    ArchiveFetch {
+        channel_id: ChannelId,
+        thread: String,
+        before: String,
+        pinned: bool,
+    },
+    /// Words to find in it; the relay sees them. `from`: an answer's `next`, "" to start.
+    ArchiveSearch {
+        channel_id: ChannelId,
+        query: String,
+        from: String,
+    },
+    /// What this account's linked Discord id wrote.
+    ArchiveMine {
+        action: ArchiveAction,
+        scope: ArchiveScope,
+    },
 }
 
 /// What an admin asks for (`AccountRequest::Admin`). A step that changes
@@ -742,6 +767,122 @@ pub enum AdminOp {
     RemovePosts {
         name: String,
         window_secs: u32,
+    },
+    // ── The move from Discord (protocol v20), every step `*`'s but `MoveAccounts` ──
+    /// What the dry-run needs of this relay.
+    ImportFacts,
+    /// Takes a fresh code. A new run, or the unfinished one of this guild. From the page,
+    /// so the guild is a string. `backup_taken`: on Postgres, the operator says so.
+    ImportBegin {
+        guild_id: String,
+        options: ImportOptions,
+        backup_taken: bool,
+    },
+    /// At most `IMPORT_FRAME_ROWS`.
+    ImportCategories {
+        run: i64,
+        rows: Vec<ImportCategory>,
+    },
+    /// At most `IMPORT_CHANNEL_ROWS`.
+    ImportChannels {
+        run: i64,
+        rows: Vec<ImportChannel>,
+    },
+    ImportEmote {
+        run: i64,
+        dc_id: u64,
+        name: String,
+    },
+    /// At most `IMPORT_FRAME_ROWS`. Only of a channel whose messages come.
+    ImportThreads {
+        run: i64,
+        rows: Vec<ImportThread>,
+    },
+    /// All of a channel or thread up to `high` is stored once this is answered. At most
+    /// `IMPORT_MESSAGE_ROWS`, and none is normal: system messages advance `high` too, and
+    /// `high` 1 on an empty frame says a channel was walked and found empty.
+    ImportMessages {
+        run: i64,
+        channel: u64,
+        thread: Option<u64>,
+        high: u64,
+        rows: Vec<ImportMessage>,
+    },
+    /// Where each channel, thread and emote stands over the runs not undone: rows past
+    /// this uid. Needs no run, so the dry-run can read it.
+    ImportCursors {
+        after: u64,
+    },
+    /// `report`: JSON, at most 40 KiB, counts and notes about what was imported and nothing
+    /// about what was left out.
+    ImportEnd {
+        run: i64,
+        report: String,
+    },
+    ImportReport {
+        run: i64,
+    },
+    /// What `ImportUndo` of this run would take, with no code asked.
+    ImportUndoPreview {
+        run: i64,
+    },
+    /// Raw `permissions`: the relay alone maps them.
+    ImportRoles {
+        run: i64,
+        roles: Vec<ImportRole>,
+    },
+    /// At most `IMPORT_FRAME_ROWS`.
+    ImportMembers {
+        run: i64,
+        members: Vec<ImportMember>,
+    },
+    /// At most `IMPORT_FRAME_ROWS`.
+    ImportBans {
+        run: i64,
+        bans: Vec<ImportBan>,
+    },
+    /// Accounts with what the move knows of them, a page at a time. Needs `users:read`.
+    MoveAccounts {
+        search: String,
+        offset: u32,
+        filter: MoveFilter,
+    },
+    /// What the move's dashboard shows.
+    MoveStatus,
+    /// Who waits for the owner's OK on what they could do on Discord.
+    PowerWaiting {
+        offset: u32,
+    },
+    /// Says yes (`grant`, with a fresh code) or no to one row of `PowerWaiting`.
+    PowerAnswer {
+        id: [u8; 16],
+        group: String,
+        grant: bool,
+    },
+    /// A decimal Discord id no import touches. `erase`: they asked to be out, so their
+    /// posts go for good. Otherwise held: no account, and their posts stay. `on: false`
+    /// lets them back in, and posts already gone do not come back.
+    MoveExclude {
+        dc_id: String,
+        on: bool,
+        erase: bool,
+    },
+    /// Rows past this decimal id, "" from the start.
+    MoveExcluded {
+        after: String,
+    },
+    /// In pieces: send it again while `ImportUndone.more`. Takes a fresh code.
+    ImportUndo {
+        run: i64,
+    },
+    /// Gone for good. Takes a fresh code.
+    ArchiveDelete {
+        target: ArchiveTarget,
+    },
+    /// What people said about their rows, by author, past the row given. A driver about to
+    /// anonymise has to know: once a row names nobody, no wish can find it. Needs no run.
+    ArchiveWishes {
+        after: Option<ArchiveWish>,
     },
 }
 
@@ -961,6 +1102,31 @@ pub enum AccountReply {
     },
     /// `ProfileSet`, `ProfilePictureSet`, or an admin's `ProfileReset`.
     ProfileDone,
+    /// What `ArchiveFetch` asked (protocol v20). `next`: the `before` of the next page, ""
+    /// when nothing older is left; it moves on past rows nobody may see.
+    ArchivePage {
+        channel_id: ChannelId,
+        thread: String,
+        before: String,
+        pinned: bool,
+        rows: Vec<ArchiveRow>,
+        next: String,
+    },
+    /// What `ArchiveSearch` found so far. `next`: carry on from here, "" at the channel's
+    /// end. `scanned`: rows this answer looked at.
+    ArchiveHits {
+        channel_id: ChannelId,
+        query: String,
+        from: String,
+        rows: Vec<ArchiveRow>,
+        next: String,
+        scanned: u32,
+    },
+    /// `ArchiveMine` is done: `rows` of theirs it came to.
+    ArchiveMineDone {
+        action: ArchiveAction,
+        rows: u64,
+    },
 }
 
 /// Answers to `AdminOp`.
@@ -979,7 +1145,9 @@ pub enum AdminReply {
         audit: Vec<AuditRow>,
     },
     /// Also after `GroupSave` and `GroupDelete`.
-    Groups { groups: Vec<GroupInfo> },
+    Groups {
+        groups: Vec<GroupInfo>,
+    },
     Members {
         name: String,
         offset: u32,
@@ -987,9 +1155,13 @@ pub enum AdminReply {
         users: Vec<AdminUser>,
     },
     /// Also after `InviteRevoke`.
-    Invites { invites: Vec<InviteInfo> },
+    Invites {
+        invites: Vec<InviteInfo>,
+    },
     /// The new code, shown once.
-    InviteCode { code: String },
+    InviteCode {
+        code: String,
+    },
     /// Also after `GateSet`. `groups`: every group's name, to pick from.
     Gate {
         channel_id: ChannelId,
@@ -999,11 +1171,17 @@ pub enum AdminReply {
     /// This step hands out power: send it again with a code.
     StepUp,
     /// A channel or layout step went through. `channel_id`: the channel it made.
-    ChannelDone { channel_id: Option<ChannelId> },
+    ChannelDone {
+        channel_id: Option<ChannelId>,
+    },
     /// Also after `InviteLinkRevoke`.
-    InviteLinks { links: Vec<InviteLinkInfo> },
+    InviteLinks {
+        links: Vec<InviteLinkInfo>,
+    },
     /// Shown once: only its hash is kept.
-    InviteLinkCode { code: String },
+    InviteLinkCode {
+        code: String,
+    },
     /// A page of the moderation log, under the `before` it answers. `keep_days`:
     /// how long this server keeps a row.
     ModLog {
@@ -1013,7 +1191,134 @@ pub enum AdminReply {
         keep_days: u32,
     },
     /// `RemovePosts` is done: `entries` stored messages went.
-    PostsRemoved { name: String, entries: u64 },
+    PostsRemoved {
+        name: String,
+        entries: u64,
+    },
+    // ── The move from Discord (protocol v20) ──
+    ImportFacts {
+        facts: ImportFacts,
+    },
+    /// The copy of the database is being made: `ImportBegun` follows.
+    ImportBackingUp {
+        run: i64,
+    },
+    /// `resumed`: this guild's unfinished run. `backup`: where the copy is.
+    ImportBegun {
+        run: i64,
+        resumed: bool,
+        backup: Option<String>,
+    },
+    /// `refused`: what was not made (no room, or categories past the cap), channels removed
+    /// here by hand, and channels closed on Discord that are open here, each with why. Do not
+    /// walk those.
+    ImportChannelsDone {
+        refused: Vec<(u64, String)>,
+    },
+    /// The frame is stored. `skipped`: rows someone wished away, or left out.
+    ImportAcked {
+        stored: u32,
+        skipped: u32,
+    },
+    /// (uid, how far it is read), at most 2,000 a reply. `high` 0: a channel in the ledger
+    /// whose messages were never walked. `more`: ask again past the last uid.
+    ImportCursors {
+        rows: Vec<(u64, u64)>,
+        more: bool,
+    },
+    ImportEnded {
+        run: i64,
+    },
+    ImportReport {
+        run: i64,
+        report: String,
+    },
+    /// A frame of a run was refused. `channel`: skip that channel and go on. None: stop.
+    ImportRefused {
+        reason: String,
+        channel: Option<u64>,
+    },
+    ImportUndoPreview {
+        run: i64,
+        counts: ImportUndoCounts,
+    },
+    /// `skipped`: roles that did not fit one group list, or whose group someone deleted here.
+    /// `power_changed`: roles whose power differs from their held-back group, which only the
+    /// owner changes.
+    ImportRolesDone {
+        made: u32,
+        updated: u32,
+        skipped: Vec<String>,
+        power_changed: Vec<String>,
+    },
+    /// `left_out`: they are excluded. `unlinked`: they took their Discord off on purpose.
+    /// `kept_power`: privileges they lost on Discord and keep here, for the owner to judge.
+    ImportMembersDone {
+        made: u32,
+        updated: u32,
+        left_out: u32,
+        nicknames_dropped: u32,
+        unlinked: u32,
+        kept_power: u32,
+        failed: Vec<String>,
+    },
+    /// `claimed`: accounts someone has opened, left alone and named for the owner.
+    /// `names_kept`: rows now banned that still go by their old name, every other being taken.
+    ImportBansDone {
+        made: u32,
+        converted: u32,
+        claimed: Vec<String>,
+        names_kept: Vec<String>,
+    },
+    MoveAccounts {
+        search: String,
+        offset: u32,
+        filter: MoveFilter,
+        total: u32,
+        rows: Vec<MoveAccount>,
+    },
+    MoveStatus {
+        claimed: u32,
+        waiting: u32,
+        banned: u32,
+        power_waiting: u32,
+        excluded: u32,
+        unclaimed_days: u32,
+        runs: Vec<MoveRun>,
+    },
+    PowerWaiting {
+        offset: u32,
+        total: u32,
+        rows: Vec<PowerRow>,
+    },
+    /// (decimal id, they asked for it themselves, their posts go, when), by id.
+    MoveExcluded {
+        ids: Vec<(String, bool, bool, i64)>,
+        more: bool,
+    },
+    /// `more`: send `ImportUndo` again. The counts are what this call did, for the panel to
+    /// add up. `archive_rows`: the stored count of the whole run, so "about"; a worker takes
+    /// them after this.
+    ImportUndone {
+        run: i64,
+        more: bool,
+        accounts: u32,
+        kept_claimed: u32,
+        groups: u32,
+        groups_kept: Vec<String>,
+        channels: u32,
+        emotes: u32,
+        archive_rows: u64,
+    },
+    ArchiveDeleted {
+        rows: u64,
+    },
+    /// Whoever wrote it (`author` 0) is not listed: the relay holds every row to those itself.
+    /// `more`: ask again past the last row.
+    ArchiveWishes {
+        rows: Vec<ArchiveWish>,
+        more: bool,
+    },
 }
 
 /// A wrapped epoch key for one member (`AccountRequest::EpochPut`).
@@ -1264,7 +1569,8 @@ pub enum ServerMessage {
     /// An admin command was refused.
     AdminError { reason: String },
 
-    /// Active IP bans (admin only; reply to AdminListBans and after changes).
+    /// Active bans, all in one frame: how a relay before protocol 20 answers. One at 20
+    /// sends `AdminBansPaged`.
     AdminBans { bans: Vec<BanInfo> },
 
     /// The server is closing this connection (kick or ban). Clients must not
@@ -1455,6 +1761,17 @@ pub enum ServerMessage {
     /// What `ReportTakersGet` asked (protocol v19): online first, at most
     /// `MAX_REPORT_TAKERS`.
     ReportTakers { takers: Vec<ReportTaker> },
+
+    /// A page of the active bans (protocol v20): the answer to `AdminBansPage`, to
+    /// `AdminListBans`, and to a change, which is offset 0 of no search. Never over a
+    /// frame, as `AdminBans` is past some hundreds of rows. `total` counts what the search
+    /// finds; a client asks on from however many rows it holds.
+    AdminBansPaged {
+        search: String,
+        offset: u32,
+        total: u32,
+        bans: Vec<BanInfo>,
+    },
 }
 
 /// `FileRefused.code`, final for this hash: not in a conversation of the

@@ -271,6 +271,11 @@ impl EmoteStore {
         self.lock().list()
     }
 
+    /// Emotes and stickers there are.
+    pub fn count(&self) -> usize {
+        self.lock().emotes.len()
+    }
+
     /// A connection's end: its bearer and its open uploads go.
     pub fn forget(&self, session: SessionId) {
         let mut inner = self.lock();
@@ -556,7 +561,7 @@ impl EmoteStore {
     /// A change: a moment later the manifest is written and the new list goes
     /// out, with any other change made meanwhile (an import of hundreds is one
     /// write and one list).
-    fn changed(self: &Arc<Self>, state: &Arc<ServerState>) {
+    pub(crate) fn changed(self: &Arc<Self>, state: &Arc<ServerState>) {
         let due = std::mem::replace(&mut self.lock().broadcast_due, true);
         if due {
             return;
@@ -639,6 +644,9 @@ pub(crate) async fn handle_remove(
     if unknown.len() < names.len() {
         store.changed(state);
     }
+    for name in names.iter().filter(|n| !unknown.contains(n)) {
+        ledger_follows(state, name, "").await;
+    }
     if let Some(first) = unknown.first() {
         let list = unknown
             .iter()
@@ -668,8 +676,21 @@ pub(crate) async fn handle_rename(
         return;
     };
     match store.rename(&from, &to) {
-        Ok(()) => store.changed(state),
+        Ok(()) => {
+            store.changed(state);
+            ledger_follows(state, &from, &to).await;
+        }
         Err(reason) => refuse(tx, from, reason),
+    }
+}
+
+/// An emote an import brought was renamed or removed here: an undo goes by the name, and the
+/// next one added under it is nobody's import.
+async fn ledger_follows(state: &ServerState, from: &str, to: &str) {
+    if let Some(relay) = &state.accounts {
+        if let Err(e) = relay.emote_item_moved(from, to).await {
+            warn!("keeping an emote's place in the import's ledger: {e:#}");
+        }
     }
 }
 

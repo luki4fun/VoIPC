@@ -306,6 +306,11 @@ jobs:
       - run: npm run web
         env: { VOIPC_SELFTEST: '1' }
 
+      # What test-move.mjs imports with: the importer's real driver against the
+      # stand-in Discord. An example, which `npm run web` does not build.
+      - run: cargo build --release --locked -p voipc-server --example import_replay
+        env: { VOIPC_SELFTEST: '1' }
+
       # Both engines, and both mixed pairings: a Chromium sharer feeds a Firefox
       # viewer H.264, a Firefox sharer feeds a Chromium viewer VP9.
       # `!cancelled()` so one red lane does not hide the others: knowing
@@ -413,6 +418,11 @@ jobs:
         timeout-minutes: 15
         run: bash tools/ci-run.sh "moderation lane on Postgres" node test-moderation.mjs 29600
         env: { MODERATION_DATABASE: 'postgres://voipc:voipc@127.0.0.1:5432/moderation' }
+      - name: Move lane on Postgres
+        if: ${{ !cancelled() && matrix.part == 'postgres' }}
+        timeout-minutes: 15
+        run: bash tools/ci-run.sh "move lane on Postgres" node test-move.mjs 29800
+        env: { MOVE_DATABASE: 'postgres://voipc:voipc@127.0.0.1:5432/move' }
 
   # The Windows and Android builds compile on every pull request, not first
   # in a release run. cargo check only, with the caches release.yml uses.

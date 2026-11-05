@@ -82,7 +82,7 @@ pub async fn set(
         };
         (c.gate.clone(), c.gate_key.clone())
     };
-    let gate = checked(state, session_id, &old.groups, gate).await?;
+    let gate = checked(state, session_id, &key, &old.groups, gate).await?;
     if old == gate {
         return Ok(gate);
     }
@@ -104,11 +104,20 @@ pub async fn set(
     Ok(gate)
 }
 
-/// A gate as an editor may set it, in place of one with `old` as its groups: its
-/// lists tidied and short enough, its groups real, and the editor passing both.
+/// Whether `new` lets in no one `old` kept out: open was everyone, and any list is narrower.
+/// Empty is open, and every account holds `user`, so "empty" alone is not the test.
+fn only_narrows(old: &[String], new: &[String]) -> bool {
+    old.is_empty() || (!new.is_empty() && new.iter().all(|g| old.contains(g)))
+}
+
+/// A gate as an editor may set it, in place of one with `old` as its groups, on the channel
+/// under `key`: its lists tidied and short enough, its groups real, and the editor passing
+/// both. What the channel kept from Discord was private, if it says so: past `*`, whoever
+/// edits it may only narrow who reads that.
 pub async fn checked(
     state: &ServerState,
     session_id: SessionId,
+    key: &str,
     old: &[String],
     gate: ChannelGate,
 ) -> Result<ChannelGate, String> {
@@ -151,6 +160,17 @@ pub async fn checked(
     if !state.passes(session_id, &gate.groups) {
         return Err(
             "This would shut you out of the channel. Keep one of your groups in it.".into(),
+        );
+    }
+    if !only_narrows(old, &gate.groups)
+        && !state.is_admin(session_id)
+        && relay
+            .archive_private(key)
+            .await
+            .map_err(|_| "Something went wrong. Please try again.".to_string())?
+    {
+        return Err(
+            "What this channel kept from Discord was private: only an admin can open it.".into(),
         );
     }
     Ok(gate)

@@ -556,7 +556,8 @@ BROWSER_ALICE=firefox BROWSER_BOB=chromium ./test-web.sh   # Firefox shares VP9,
 ```
 
 The Firefox lane needs `certutil` (Arch: `nss`, Debian/Ubuntu: `libnss3-tools`) to trust the
-test certificate.
+test certificate. The move lane (`test-move.mjs`) imports with an example, which `npm run web` does
+not build: `cargo build --release --locked -p voipc-server --example import_replay`.
 
 ## Server
 

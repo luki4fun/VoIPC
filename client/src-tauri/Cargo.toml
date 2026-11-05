@@ -62,6 +62,8 @@ tauri-plugin-updater = { version = "2.14", default-features = false, features = 
 # The one-click emote imports (emote_sources.rs): the updater's own client,
 # with its TLS (ring, the system's roots), so no second stack comes in
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+# Reading a Discord server for the move (import.rs): no HTTP client and no disk of its own
+voipc-import = { path = "../../crates/voipc-import" }
 
 # TCP_NOTSENT_LOWAT for the TCP fallback, which only Linux and Android have
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
@@ -102,3 +104,6 @@ windows = { version = "0.58", features = [
 
 [dev-dependencies]
 rcgen = "0.14"
+# A whole run through the hub, with no call to Discord and on a paused clock
+tokio = { version = "1", features = ["test-util"] }
+voipc-import = { path = "../../crates/voipc-import", features = ["mock"] }

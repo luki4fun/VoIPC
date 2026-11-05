@@ -171,7 +171,11 @@ impl Relay {
     }
 
     /// The name to keep, `None` to clear it, or why not.
-    async fn display_name_ok(&self, user: &User, name: &str) -> Result<Option<String>, String> {
+    pub(super) async fn display_name_ok(
+        &self,
+        user: &User,
+        name: &str,
+    ) -> Result<Option<String>, String> {
         let name = name.trim();
         if name.is_empty() {
             return Ok(None);

@@ -512,6 +512,11 @@ pub async fn confirm(state: &Arc<ServerState>, body: &[u8], ip: IpAddr) -> Respo
                 Ok((SocialOutcome::Signup { cookie }, _)) => Outcome::Signup { cookie },
                 Ok((SocialOutcome::NoAccount { cookie }, _)) => Outcome::NoAccount { cookie },
                 Ok(_) => Outcome::Failed("unexpected sign-in step".into()),
+                // Not "wrong password", on a page that asked for none. An imported ban, or
+                // a disabled account
+                Err(l4f_accounts::service::Error::BadLogin) => {
+                    Outcome::Failed("That account cannot sign in here.".into())
+                }
                 Err(e) => Outcome::Failed(e.message().to_string()),
             };
             let failed = match &outcome {
@@ -696,7 +701,7 @@ pub(super) async fn resume<S: AsyncRead + AsyncWrite + Unpin>(
         _ => return Err(ENDED.into()),
     };
     let token = session.token.clone();
-    let r = finish(state, relay, stream, buf, session, answers, ip).await;
+    let r = finish(state, relay, stream, buf, ctx, session, answers, ip).await;
     if r.is_err() {
         let _ = relay.accounts.logout(&token).await;
     }
@@ -798,6 +803,7 @@ async fn signup<S: AsyncRead + AsyncWrite + Unpin>(
 pub(crate) async fn claim(
     relay: &Relay,
     user: AccountId,
+    name: &str,
     identity_key: &[u8],
     vault: &[VaultBlob],
 ) -> Result<(), String> {
@@ -823,6 +829,18 @@ pub(crate) async fn claim(
     if relay.identity(user).await.map_err(|_| gone())?.is_some() {
         return Err("This account was opened just now, somewhere else.".into());
     }
+    // A vault is bound to the name it was made under, which the relay cannot read: one
+    // made for a name since changed would look fine and never open. A sweep may also have
+    // taken the account.
+    let now = relay
+        .store()
+        .user_by_id(user)
+        .await
+        .map_err(|_| gone())?
+        .ok_or_else(gone)?;
+    if now.username != name {
+        return Err("This account's name changed just now. Sign in again.".into());
+    }
     // What a claim that died halfway left, which nobody could open
     relay
         .store()
@@ -844,26 +862,79 @@ pub(crate) async fn claim(
         }
     }
     relay
-        .set_identity(user, identity_key)
+        .claim_done(user, identity_key)
         .await
         .map_err(|_| gone())
+}
+
+/// The first sign-in to an account the move made: the name it came with is Discord's, and
+/// the person may take another. `ProviderSignup` asks, as for a new account: the machine
+/// takes it before `ProviderSigned`. Its puzzle is the smallest there is and is never
+/// checked, since this spends no sign-up. Within what the connection's answers allow:
+/// past that, a new sign-in starts over.
+async fn pick_name<S: AsyncRead + AsyncWrite + Unpin>(
+    relay: &Relay,
+    stream: &mut S,
+    buf: &mut BytesMut,
+    ctx: &l4f_accounts::service::Ctx,
+    user: &mut User,
+    answers: &mut u32,
+    ip: IpAddr,
+) -> Result<(), String> {
+    let mut problem = String::new();
+    loop {
+        let ttl = relay.accounts.host.config().signup.pow_ttl_minutes;
+        let ch = pow::issue(&relay.pow_key, 1, ttl.saturating_mul(60));
+        let challenge = PowChallenge {
+            altcha: serde_json::to_string(&ch).map_err(|e| e.to_string())?,
+            ts: pow::stamp(&relay.pow_key, util::now_secs()),
+        };
+        step(
+            stream,
+            AuthStep::ProviderSignup {
+                relay_id: relay.relay_id,
+                suggestion: user.username.clone(),
+                problem,
+                pow: challenge,
+            },
+        )
+        .await?;
+        let AuthContinue::ProviderSignup { name, .. } =
+            next(stream, buf, CHOICE_WAIT, answers).await?
+        else {
+            return Err(unexpected());
+        };
+        if name.trim().eq_ignore_ascii_case(&user.username) {
+            return Ok(());
+        }
+        let _work = relay.pending_slot(ip).ok_or_else(|| BUSY.to_string())?;
+        match relay.placeholder_rename(ctx, user.id, &name).await? {
+            Ok(new) => {
+                user.username = new;
+                return Ok(());
+            }
+            Err(text) => problem = text,
+        }
+    }
 }
 
 /// From a provider's sign-in to the keys: the same end as `super::finish`, except
 /// that the vault has to be opened before anything else happens, and an identity
 /// is never replaced here.
+#[allow(clippy::too_many_arguments)]
 async fn finish<S: AsyncRead + AsyncWrite + Unpin>(
     state: &ServerState,
     relay: &Relay,
     stream: &mut S,
     buf: &mut BytesMut,
+    ctx: &l4f_accounts::service::Ctx,
     session: NewSession,
     answers: &mut u32,
     ip: IpAddr,
 ) -> Result<SignedIn, String> {
     let gone = || "Something went wrong. Please try again.".to_string();
     let work = || relay.pending_slot(ip).ok_or_else(|| BUSY.to_string());
-    let (user, info, scopes, blobs, known) = {
+    let (mut user, info, scopes, blobs, known) = {
         let _work = work()?;
         let (user, info, scopes) = relay
             .accounts
@@ -876,6 +947,9 @@ async fn finish<S: AsyncRead + AsyncWrite + Unpin>(
         (user, info, scopes, blobs, known)
     };
     let claim_it = known.is_none();
+    if claim_it && relay.placeholder_open(user.id).await.map_err(|_| gone())? {
+        pick_name(relay, stream, buf, ctx, &mut user, answers, ip).await?;
+    }
     let challenge: [u8; 32] = rand::random();
     step(
         stream,
@@ -898,7 +972,7 @@ async fn finish<S: AsyncRead + AsyncWrite + Unpin>(
                 vault,
             } if claim_it => {
                 let _work = work()?;
-                claim(relay, user.id, &identity_key, &vault).await?;
+                claim(relay, user.id, &user.username, &identity_key, &vault).await?;
                 info!(user = %user.id.hex(), "account claimed through a provider");
                 break identity_key;
             }
@@ -1066,6 +1140,9 @@ impl Relay {
                 user.username
             ));
         }
+        self.power_back_to_waiting(user.id)
+            .await
+            .map_err(|e| e.to_string())?;
         self.accounts
             .reset_2fa_as_host(ctx, user.id)
             .await

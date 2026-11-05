@@ -15,9 +15,11 @@ use l4f_accounts::store::Store;
 use l4f_accounts::util;
 use tracing::warn;
 use voipc_protocol::codec::encode_server_msg;
+use voipc_protocol::discord::snowflake_floor;
 use voipc_protocol::messages::{AccountReply, AdminReply, ServerMessage};
 use voipc_protocol::types::{ChannelId, ModRow, PostsMark, UserId};
 
+use super::archive::{self, counted};
 use super::{holds_power, is_star, refused, Relay};
 use crate::bans::Ban;
 use crate::control::ControlTx;
@@ -104,10 +106,23 @@ fn window_words(window_secs: u32) -> String {
     format!("last {}", span.strip_prefix("1 ").unwrap_or(&span))
 }
 
+/// What a removal takes of what came from Discord, by when it was written.
+pub(super) struct Imported<'a> {
+    /// The Discord ids the account has linked.
+    pub ids: &'a [i64],
+    pub low: i64,
+    pub high: i64,
+    /// Whether the log's row may say how many. Next to a pseudonym, a count says something
+    /// about who it is.
+    pub say_how_many: bool,
+}
+
 impl Relay {
     /// What `account` wrote to channels' stored logs from `since_ms` to `before_ms`
     /// goes, and its row is written, or neither happens. `None` deletes nothing: a
-    /// guest has nothing here. `window`: the row's words for how far back.
+    /// guest has nothing here. `window`: the row's words for how far back. What came from
+    /// Discord is a wish in the same transaction: it stops being served at once, and a
+    /// worker takes the rows, since a large channel would hold everyone's writes here.
     ///
     /// Not direct conversations: one is the other party's too, and may be the record
     /// of what got them banned. Not the wraps, unlike `log::purge`: the writer is told
@@ -115,6 +130,7 @@ impl Relay {
     pub(super) async fn posts_remove(
         &self,
         account: Option<[u8; 16]>,
+        imported: Imported<'_>,
         since_ms: i64,
         before_ms: i64,
         window: &str,
@@ -138,6 +154,31 @@ impl Relay {
                 .rows_affected();
             }
             let plural = if entries == 1 { "" } else { "s" };
+            let mut rows = 0i64;
+            for id in imported.ids {
+                sqlx::query(archive::WISH_UP)
+                    .bind(*id)
+                    .bind(0i64)
+                    .bind(imported.low)
+                    .bind(imported.high)
+                    .bind(true)
+                    .bind(util::now())
+                    .execute(&mut *tx)
+                    .await?;
+                rows += sqlx::query_scalar::<_, i64>(archive::ROWS_BY)
+                    .bind(*id)
+                    .bind(1i64)
+                    .bind(i64::MAX)
+                    .bind(imported.low)
+                    .bind(imported.high)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            }
+            let from_discord = if rows > 0 && imported.say_how_many {
+                format!(", {} imported", counted(rows as u64))
+            } else {
+                String::new()
+            };
             sqlx::query(
                 "INSERT INTO voipc_modlog (at, action, actor, actor_name, target, target_name, reason, detail, since_ms, before_ms)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
@@ -149,7 +190,7 @@ impl Relay {
             .bind(e.target.map(|a| a.to_vec()))
             .bind(&target_name)
             .bind(&reason)
-            .bind(format!("{entries} kept message{plural}, {window}"))
+            .bind(format!("{entries} kept message{plural}, {window}{from_discord}"))
             .bind(since_ms)
             .bind(before_ms)
             .execute(&mut *tx)
@@ -419,6 +460,8 @@ pub async fn note(
 pub struct Removal {
     /// Whose stored messages go. None: a guest, or a pseudonym, with none to go.
     account: Option<[u8; 16]>,
+    /// The Discord ids that account has linked, for what came from there.
+    discord: Vec<i64>,
     /// What the one asking knows them by, and is answered with.
     name: String,
     ban: Ban,
@@ -448,7 +491,7 @@ pub async fn removal_of(
         Ok(clean) if !is_pseudonym(name) => relay.store().user_by_username(&clean).await?,
         _ => None,
     };
-    let (account, name, ban) = match user {
+    let (account, discord, name, ban) = match user {
         Some(user) => {
             let ban = crate::bans::account_ban(state, user.id.0)
                 .filter(|ban| admin || ban.log_name() == user.username);
@@ -460,13 +503,19 @@ pub async fn removal_of(
                     "Only an admin can remove the posts of someone with privileges.",
                 ));
             }
-            (Some(user.id.0), user.username, ban)
+            // Whoever took Discord off first is still who those rows are filed under. Not in
+            // `discord_ids`, which also says what is theirs to hide
+            let mut discord = archive::discord_ids(relay, user.id).await?;
+            discord.extend(relay.placeholder_dc_id(user.id).await?);
+            discord.sort_unstable();
+            discord.dedup();
+            (Some(user.id.0), discord, user.username, ban)
         }
         None => {
             let Some(ban) = crate::bans::address_ban_as(state, name, admin) else {
                 return Ok(Err("Nobody is banned under that name."));
             };
-            (None, ban.name_for(admin).to_string(), ban)
+            (None, Vec::new(), ban.name_for(admin).to_string(), ban)
         }
     };
     if (window_secs == 0 || window_secs > REMOVAL_MAX_SECS) && !is_star(scopes) {
@@ -476,6 +525,7 @@ pub async fn removal_of(
     }
     Ok(Ok(Removal {
         account,
+        discord,
         name,
         ban,
         window_secs,
@@ -496,6 +546,7 @@ pub async fn remove_posts(
 ) -> AccountReply {
     let Removal {
         account,
+        discord,
         name,
         ban,
         window_secs,
@@ -520,8 +571,19 @@ pub async fn remove_posts(
         ..Default::default()
     };
     let window = window_words(window_secs);
+    // By when it was written, as the dialog says. Everything is all of it
+    let (low, high) = match window_secs {
+        0 => (0, i64::MAX),
+        _ => (snowflake_floor(since_ms), snowflake_floor(before_ms)),
+    };
+    let imported = Imported {
+        ids: &discord,
+        low,
+        high,
+        say_how_many: ban.log_name() == name,
+    };
     let entries = match relay
-        .posts_remove(account, since_ms, before_ms, &window, &row)
+        .posts_remove(account, imported, since_ms, before_ms, &window, &row)
         .await
     {
         Ok(entries) => entries,
@@ -530,6 +592,11 @@ pub async fn remove_posts(
             return refused("Admin", "That could not be kept, so nothing was removed.");
         }
     };
+    if !discord.is_empty() {
+        if let Err(e) = relay.archive_changed().await {
+            warn!("reading the archive's wishes: {e:#}");
+        }
+    }
     let told = ServerMessage::PostsHidden {
         marks: vec![PostsMark {
             account: target,

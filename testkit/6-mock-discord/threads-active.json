@@ -1,0 +1,81 @@
+{
+  "threads": [
+    {
+      "id": "1200000000000005005",
+      "type": 11,
+      "guild_id": "1190000000000000001",
+      "parent_id": "1190000000000000211",
+      "name": "movie night",
+      "owner_id": "1190000000000001001",
+      "last_message_id": "1200000000000005103",
+      "message_count": 3,
+      "member_count": 2,
+      "rate_limit_per_user": 0,
+      "total_message_sent": 3,
+      "thread_metadata": {
+        "archived": false,
+        "archive_timestamp": "2024-02-05T10:00:00.000000+00:00",
+        "auto_archive_duration": 1440,
+        "locked": false
+      }
+    },
+    {
+      "id": "1200000000000006001",
+      "type": 11,
+      "guild_id": "1190000000000000001",
+      "parent_id": "1190000000000000230",
+      "name": "How do I join voice?",
+      "owner_id": "1190000000000001001",
+      "last_message_id": "1200000000000006002",
+      "message_count": 2,
+      "member_count": 2,
+      "rate_limit_per_user": 0,
+      "total_message_sent": 2,
+      "thread_metadata": {
+        "archived": false,
+        "archive_timestamp": "2024-02-06T10:00:00.000000+00:00",
+        "auto_archive_duration": 1440,
+        "locked": false
+      }
+    },
+    {
+      "id": "1190000000000000302",
+      "type": 12,
+      "guild_id": "1190000000000000001",
+      "parent_id": "1190000000000000211",
+      "name": "surprise party",
+      "owner_id": "1190000000000001001",
+      "last_message_id": "1200000000000005999",
+      "message_count": 9,
+      "member_count": 2,
+      "rate_limit_per_user": 0,
+      "total_message_sent": 9,
+      "thread_metadata": {
+        "archived": false,
+        "archive_timestamp": "2024-02-07T10:00:00.000000+00:00",
+        "auto_archive_duration": 1440,
+        "locked": false
+      }
+    },
+    {
+      "id": "1190000000000000306",
+      "type": 11,
+      "guild_id": "1190000000000000001",
+      "parent_id": "1190000000000000212",
+      "name": "the rota",
+      "owner_id": "1190000000000001001",
+      "last_message_id": "1200000000000007051",
+      "message_count": 1,
+      "member_count": 2,
+      "rate_limit_per_user": 0,
+      "total_message_sent": 1,
+      "thread_metadata": {
+        "archived": false,
+        "archive_timestamp": "2024-02-08T10:00:00.000000+00:00",
+        "auto_archive_duration": 1440,
+        "locked": false
+      }
+    }
+  ],
+  "members": []
+}

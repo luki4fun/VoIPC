@@ -6,6 +6,7 @@ members = [
     "crates/voipc-video",
     "crates/voipc-crypto",
     "crates/voipc-media",
+    "crates/voipc-import",
     "crates/voipc-server",
     "client/src-tauri",
 ]
@@ -14,7 +15,7 @@ members = [
 exclude = ["crates/voipc-web", "crates/voipc-opus-wasm", "crates/voipc-media-wasm", "fuzz"]
 
 [workspace.package]
-version = "1.10.0-rc.1"
+version = "1.11.0-rc.1"
 edition = "2021"
 license = "MIT"
 # The toolchain CI tests with (rust-toolchain.toml)

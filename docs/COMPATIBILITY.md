@@ -12,15 +12,16 @@ nobody checks, so a new one comes with its test.
 
 **1.x keeps:**
 - A relay admits a client exactly when their `PROTOCOL_VERSION` is equal (12 in 1.0, 13 in
-  1.3, 14 in 1.4, 15 in 1.5, 16 in 1.7, 17 in 1.8, 18 in 1.9, 19 in 1.10). The app version is informational only.
+  1.3, 14 in 1.4, 15 in 1.5, 16 in 1.7, 17 in 1.8, 18 in 1.9, 19 in 1.10, 20 in 1.11). The app version is informational only.
 - **Since 1.6, an app talks to relays from its own protocol down to `OLDEST_RELAY_PROTOCOL`**
-  (`crates/voipc-protocol/src/compat.rs`; 12 in 1.6 to 1.10), never fewer than three protocols back.
+  (`crates/voipc-protocol/src/compat.rs`; 12 in 1.6 to 1.11), never fewer than three protocols back.
   It asks with its own; a relay of an older protocol refuses with its own (below), and the app
   connects again speaking that one. It shows a banner there, and holds back what that relay's
   other apps could not read:
 
-  | Relay | What a 1.10 app does not offer there |
+  | Relay | What a 1.11 app does not offer there |
   |---|---|
+  | 1.10 (19) | the move from Discord and its archive |
   | 1.9 (18) | mute and timeouts, a wait for new members, hiding messages, removing a banned member's posts, summons, the moderation log, reports |
   | 1.8 (17) | channels made in the app, categories, a welcome channel, group colours and order, display names, profile pictures, a server's name and icon, invite links, `@everyone`, `@here` and `@&badge` |
   | 1.7 (16) | sign-in with a provider, linking one, and approving a new device from another |
@@ -122,6 +123,11 @@ cannot replace its own binary.
 **What changed in 1.10:** `modlog_days` in `[accounts]` (180), and `new_member_wait_mins` in
 `server_settings.json` (0, off). A `modlog_days` of 0 stops the start: it would throw the log
 away at once. An older relay refuses the first and ignores the second.
+
+**What changed with the move from Discord (protocol 20):** `archive_days` (0, kept until someone
+removes it) and `unclaimed_days` (90, 0 is never) in `[accounts]`. An older relay refuses both.
+`AdminBans` and `AdminListBans` stay in the enums for relays before protocol 20: an app at 20 sends
+`AdminBansPage` to a relay at 20 and `AdminListBans` below it.
 
 **An older relay on a newer config:** it refuses the unknown key, never ignores it, so a relay
 cannot silently run without a setting it was given. The JSON files stay lenient: a rewrite of

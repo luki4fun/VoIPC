@@ -139,10 +139,11 @@ fn key_of(state: &ServerState, s: &UserSession) -> Key {
 }
 
 /// When the new-member wait ends for this session, if it still holds them. Admins,
-/// holders of a privilege and anyone in a group but the built-in `user`, which every
-/// account is in, do not wait. A guest's clock goes by address, so a reload does not
-/// restart it. No clock is no wait, unless `admit` found no room for one and set an
-/// end itself.
+/// holders of a privilege and anyone in a group given here do not wait: not the built-in
+/// `user`, which every account is in, nor a group the move made, since a Discord bot may
+/// give one to every joiner. Someone the move knows has their own start (`wait_from`). A
+/// guest's clock goes by address, so a reload does not restart it. No clock is no wait,
+/// unless `admit` found no room for one and set an end itself.
 fn wait_ends(state: &ServerState, s: &UserSession, now: i64) -> Option<i64> {
     let mins = state.settings.new_member_wait_mins;
     if mins == 0 || s.is_admin || s.is_moderator {
@@ -150,14 +151,31 @@ fn wait_ends(state: &ServerState, s: &UserSession, now: i64) -> Option<i64> {
     }
     let wait = i64::from(mins) * 60;
     let end = match &s.account {
-        Some(a) if a.standing.groups.iter().any(|g| g != "user") => return None,
-        Some(a) => a.user.created_at.saturating_add(wait),
+        Some(a)
+            if a.standing
+                .groups
+                .iter()
+                .any(|g| g != "user" && !from_the_move(state, g)) =>
+        {
+            return None
+        }
+        Some(a) => a
+            .wait_from
+            .unwrap_or(a.user.created_at)
+            .saturating_add(wait),
         None => state
             .guest_clocks
             .get(&crate::limit_key(s.peer_ip))
             .map_or(s.silence.direct_until, |c| c.first.saturating_add(wait)),
     };
     (end > now).then_some(end)
+}
+
+fn from_the_move(state: &ServerState, group: &str) -> bool {
+    state
+        .accounts
+        .as_ref()
+        .is_some_and(|r| r.imported_groups.contains_key(group))
 }
 
 /// What holds this session at `now`. A row on an address is for the guests there, and

@@ -5,7 +5,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { get, writable } from "svelte/store";
-import { dropServer, scoped, serverAddress } from "./scoped.ts";
+import { dropKept, dropServer, scoped, serverAddress } from "./scoped.ts";
 
 test("the bare store follows the server on screen", () => {
   const names = scoped<string[]>(() => []);
@@ -102,6 +102,20 @@ test("dropServer forgets a server in every scoped store at once", () => {
   assert.equal(get(a.all()).has("x:1"), false);
   assert.equal(get(b.all()).has("x:1"), false);
   assert.equal(get(b.of("y:2")), "two", "other servers are untouched");
+});
+
+test("a kept store outlives a connection, and goes with the server", () => {
+  const plain = scoped(() => 0);
+  const kept = scoped(() => 0, { kept: true });
+  plain.of("k:1").set(1);
+  kept.of("k:1").set(1);
+  kept.of("k:2").set(2);
+  dropServer("k:1");
+  assert.equal(get(plain.peek("k:1")), 0, "the control: a connection's own goes");
+  assert.equal(get(kept.peek("k:1")), 1);
+  dropKept("k:1");
+  assert.equal(get(kept.peek("k:1")), 0);
+  assert.equal(get(kept.peek("k:2")), 2, "other servers are untouched");
 });
 
 test("of() for a new server writes nothing any view is subscribed to, there and then", async () => {

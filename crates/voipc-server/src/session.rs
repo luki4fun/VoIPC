@@ -714,6 +714,18 @@ where
         b.prekeys.truncate(MAX_PREKEYS);
         b
     });
+    // Someone the move knows has their own start for the wait. Only read where there is a
+    // wait, and a failed read refuses the sign-in: counting from `created_at` would be the
+    // wrong answer without saying so.
+    let wait_mins = i64::from(state.settings.new_member_wait_mins);
+    let wait_from = match (&signed_in, &state.accounts) {
+        (Some(s), Some(relay)) if wait_mins > 0 => relay.wait_from(s.user.id, wait_mins * 60).await,
+        _ => Ok(None),
+    };
+    if let Err(e) = &wait_from {
+        warn!("reading when an account's wait starts: {e:#}");
+    }
+    let wait_unread = wait_from.is_err();
     let account = signed_in.map(|s| {
         session.account = Some(crate::state::AccountSession {
             user: s.user.clone(),
@@ -722,6 +734,7 @@ where
             scopes: Vec::new(),
             needs_2fa: s.account.needs_2fa,
             device_challenge: None,
+            wait_from: wait_from.ok().flatten(),
             standing: s.standing,
             step_up_at: None,
             vault_proven: s.vault_proven,
@@ -739,6 +752,8 @@ where
         // arriving can be told to try again, the one already here
         // cannot be told anything.
         Some("session id already in use, please reconnect")
+    } else if wait_unread {
+        Some("Something went wrong. Please try again.")
     } else if state.user_count() >= state.max_users as usize {
         Some("server is full")
     } else {
@@ -1488,12 +1503,16 @@ async fn handle_message(
         }
         ClientMessage::AdminListBans => {
             if state.can(session_id, Powers::BANS) {
-                let _ = send_msg(
-                    tx,
-                    &ServerMessage::AdminBans {
-                        bans: crate::bans::list_for(state, state.is_admin(session_id)),
-                    },
-                );
+                let admin = state.is_admin(session_id);
+                let _ = send_msg(tx, &crate::bans::page(state, admin, "", 0));
+            } else {
+                admin_error(tx, "not an admin").await;
+            }
+        }
+        ClientMessage::AdminBansPage { search, offset } => {
+            if state.can(session_id, Powers::BANS) {
+                let admin = state.is_admin(session_id);
+                let _ = send_msg(tx, &crate::bans::page(state, admin, &search, offset));
             } else {
                 admin_error(tx, "not an admin").await;
             }
@@ -2866,12 +2885,7 @@ async fn handle_admin_kick(
     .await;
     crate::bans::enforce(state, Some(target_sid)).await;
     if by_admin {
-        let _ = send_msg(
-            tx,
-            &ServerMessage::AdminBans {
-                bans: crate::bans::list(state),
-            },
-        );
+        let _ = send_msg(tx, &crate::bans::page(state, true, "", 0));
     }
 }
 
@@ -2955,12 +2969,8 @@ async fn handle_admin_ban_account(
     }
     info!(admin = session_id, duration_secs, "admin account ban");
     crate::bans::enforce(state, None).await;
-    let _ = send_msg(
-        tx,
-        &ServerMessage::AdminBans {
-            bans: crate::bans::list_for(state, state.is_admin(session_id)),
-        },
-    );
+    let admin = state.is_admin(session_id);
+    let _ = send_msg(tx, &crate::bans::page(state, admin, "", 0));
 }
 
 /// Lifts ban `id`. Only a ban the list shows, so that its row can say whose: one
@@ -2996,12 +3006,8 @@ async fn handle_admin_unban(
             Err(e) => warn!("lifting a ban: {e:#}"),
         }
     }
-    let _ = send_msg(
-        tx,
-        &ServerMessage::AdminBans {
-            bans: crate::bans::list_for(state, state.is_admin(session_id)),
-        },
-    );
+    let admin = state.is_admin(session_id);
+    let _ = send_msg(tx, &crate::bans::page(state, admin, "", 0));
 }
 
 // ── Channel history hand-off (relay only, payload opaque) ──────────────
