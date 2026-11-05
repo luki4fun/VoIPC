@@ -1,0 +1,808 @@
+{
+  "guild": {
+    "id": "1190000000000000001",
+    "name": "The Fixture Club",
+    "members": 11,
+    "online": 5,
+    "mfa": true,
+    "post_channel": "1190000000000000215"
+  },
+  "bot": {
+    "admin": true,
+    "member_intent": true,
+    "content_intent": true
+  },
+  "options": {
+    "channels": true,
+    "roles": true,
+    "permissions": true,
+    "members": true,
+    "bans": true,
+    "emotes": true,
+    "messages": true,
+    "threads": true,
+    "pins": true,
+    "reactions": true,
+    "anonymise": true,
+    "acknowledged": false
+  },
+  "delta": false,
+  "channels": [
+    {
+      "id": "1190000000000000210",
+      "name": "general",
+      "final_name": "general",
+      "type": 0,
+      "category": "1190000000000000200",
+      "private": false,
+      "private_why": "",
+      "bot_can_read": true,
+      "messages": 5,
+      "in_ledger": false,
+      "see": {
+        "open": true,
+        "roles": []
+      },
+      "speak": {
+        "open": true,
+        "roles": []
+      },
+      "lossy": [
+        "#general: @Muted could not write on Discord, and can here until a moderator acts."
+      ],
+      "left_out": false,
+      "left_out_why": "",
+      "messages_on": true,
+      "messages_why": ""
+    },
+    {
+      "id": "1190000000000000211",
+      "name": "lounge",
+      "final_name": "lounge",
+      "type": 0,
+      "category": "1190000000000000200",
+      "private": false,
+      "private_why": "",
+      "bot_can_read": true,
+      "messages": 19,
+      "in_ledger": false,
+      "see": {
+        "open": true,
+        "roles": []
+      },
+      "speak": {
+        "open": true,
+        "roles": []
+      },
+      "lossy": [],
+      "left_out": false,
+      "left_out_why": "",
+      "messages_on": true,
+      "messages_why": ""
+    },
+    {
+      "id": "1190000000000000212",
+      "name": "staff",
+      "final_name": "staff",
+      "type": 0,
+      "category": "1190000000000000200",
+      "private": true,
+      "private_why": "Hidden from @everyone on Discord.",
+      "bot_can_read": true,
+      "messages": 2,
+      "in_ledger": false,
+      "see": {
+        "open": false,
+        "roles": [
+          "1190000000000000102",
+          "1190000000000000105",
+          "1190000000000000101"
+        ]
+      },
+      "speak": {
+        "open": false,
+        "roles": [
+          "1190000000000000102",
+          "1190000000000000105",
+          "1190000000000000101"
+        ]
+      },
+      "lossy": [
+        "#staff: Discord account 1190000000000001002 had a rule of their own, which does not come."
+      ],
+      "left_out": false,
+      "left_out_why": "",
+      "messages_on": false,
+      "messages_why": "Hidden from @everyone on Discord."
+    },
+    {
+      "id": "1190000000000000213",
+      "name": "vault",
+      "final_name": "vault",
+      "type": 0,
+      "category": "1190000000000000200",
+      "private": true,
+      "private_why": "Hidden from @everyone on Discord.",
+      "bot_can_read": true,
+      "messages": 1,
+      "in_ledger": false,
+      "see": {
+        "open": false,
+        "roles": []
+      },
+      "speak": {
+        "open": false,
+        "roles": []
+      },
+      "lossy": [],
+      "left_out": false,
+      "left_out_why": "",
+      "messages_on": false,
+      "messages_why": "Hidden from @everyone on Discord."
+    },
+    {
+      "id": "1190000000000000214",
+      "name": "teams",
+      "final_name": "teams",
+      "type": 0,
+      "category": "1190000000000000200",
+      "private": true,
+      "private_why": "Hidden from @everyone on Discord.",
+      "bot_can_read": true,
+      "messages": 1,
+      "in_ledger": false,
+      "see": {
+        "open": false,
+        "roles": [
+          "1190000000000000110",
+          "1190000000000000111",
+          "1190000000000000112",
+          "1190000000000000113",
+          "1190000000000000114",
+          "1190000000000000115",
+          "1190000000000000116",
+          "1190000000000000117",
+          "1190000000000000118",
+          "1190000000000000119",
+          "1190000000000000120",
+          "1190000000000000121",
+          "1190000000000000122",
+          "1190000000000000123",
+          "1190000000000000124",
+          "1190000000000000125"
+        ]
+      },
+      "speak": {
+        "open": false,
+        "roles": [
+          "1190000000000000110",
+          "1190000000000000111",
+          "1190000000000000112",
+          "1190000000000000113",
+          "1190000000000000114",
+          "1190000000000000115",
+          "1190000000000000116",
+          "1190000000000000117",
+          "1190000000000000118",
+          "1190000000000000119",
+          "1190000000000000120",
+          "1190000000000000121",
+          "1190000000000000122",
+          "1190000000000000123",
+          "1190000000000000124",
+          "1190000000000000125"
+        ]
+      },
+      "lossy": [
+        "#teams: one gate holds 16 groups. These lose it here: @Team 17, @Team 18, @Team 19, @Team 20",
+        "#teams: one gate holds 16 groups. These lose writing here: @Team 17, @Team 18, @Team 19, @Team 20"
+      ],
+      "left_out": false,
+      "left_out_why": "",
+      "messages_on": false,
+      "messages_why": "Hidden from @everyone on Discord."
+    },
+    {
+      "id": "1190000000000000215",
+      "name": "news",
+      "final_name": "news",
+      "type": 5,
+      "category": "1190000000000000200",
+      "private": false,
+      "private_why": "",
+      "bot_can_read": true,
+      "messages": 40,
+      "in_ledger": false,
+      "see": {
+        "open": true,
+        "roles": []
+      },
+      "speak": {
+        "open": false,
+        "roles": [
+          "1190000000000000102"
+        ]
+      },
+      "lossy": [],
+      "left_out": false,
+      "left_out_why": "",
+      "messages_on": true,
+      "messages_why": ""
+    },
+    {
+      "id": "1190000000000000216",
+      "name": "old-logs",
+      "final_name": "old-logs",
+      "type": 0,
+      "category": "1190000000000000200",
+      "private": false,
+      "private_why": "",
+      "bot_can_read": true,
+      "messages": 1,
+      "in_ledger": false,
+      "see": {
+        "open": true,
+        "roles": []
+      },
+      "speak": {
+        "open": true,
+        "roles": []
+      },
+      "lossy": [
+        "#old-logs: some could see it without reading its history, so its messages start off."
+      ],
+      "left_out": false,
+      "left_out_why": "",
+      "messages_on": false,
+      "messages_why": "Some could see it without reading its history."
+    },
+    {
+      "id": "1190000000000000217",
+      "name": "after-dark",
+      "final_name": "after-dark",
+      "type": 0,
+      "category": "1190000000000000200",
+      "private": true,
+      "private_why": "Hidden from @Muted on Discord.",
+      "bot_can_read": true,
+      "messages": 1,
+      "in_ledger": false,
+      "see": {
+        "open": false,
+        "roles": [
+          "1190000000000000110",
+          "1190000000000000111",
+          "1190000000000000112",
+          "1190000000000000113",
+          "1190000000000000114",
+          "1190000000000000115",
+          "1190000000000000116",
+          "1190000000000000117",
+          "1190000000000000118",
+          "1190000000000000119",
+          "1190000000000000120",
+          "1190000000000000121",
+          "1190000000000000122",
+          "1190000000000000123",
+          "1190000000000000124",
+          "1190000000000000125"
+        ]
+      },
+      "speak": {
+        "open": true,
+        "roles": []
+      },
+      "lossy": [
+        "#after-dark: @Muted could not see it on Discord, so it is closed here, and people with no role lose it. Someone holding that role and another passes here.",
+        "#after-dark: one gate holds 16 groups. These lose it here: @Team 17, @Team 18, @Team 19, @Team 20, @Regulars, @Moderators, @Staff, @Admin, @-",
+        "#after-dark: rules on other things (reactions, files and the like) do not come."
+      ],
+      "left_out": false,
+      "left_out_why": "",
+      "messages_on": false,
+      "messages_why": "Hidden from @Muted on Discord."
+    },
+    {
+      "id": "1190000000000000220",
+      "name": "General",
+      "final_name": "General voice",
+      "type": 2,
+      "category": "1190000000000000201",
+      "private": false,
+      "private_why": "",
+      "bot_can_read": true,
+      "messages": 1,
+      "in_ledger": false,
+      "see": {
+        "open": true,
+        "roles": []
+      },
+      "speak": {
+        "open": true,
+        "roles": []
+      },
+      "lossy": [],
+      "left_out": false,
+      "left_out_why": "",
+      "messages_on": true,
+      "messages_why": ""
+    },
+    {
+      "id": "1190000000000000221",
+      "name": "lounge",
+      "final_name": "lounge-2",
+      "type": 2,
+      "category": "1190000000000000201",
+      "private": false,
+      "private_why": "",
+      "bot_can_read": true,
+      "messages": 0,
+      "in_ledger": false,
+      "see": {
+        "open": true,
+        "roles": []
+      },
+      "speak": {
+        "open": true,
+        "roles": []
+      },
+      "lossy": [],
+      "left_out": false,
+      "left_out_why": "",
+      "messages_on": true,
+      "messages_why": ""
+    },
+    {
+      "id": "1190000000000000222",
+      "name": "townhall",
+      "final_name": "townhall",
+      "type": 13,
+      "category": "1190000000000000201",
+      "private": false,
+      "private_why": "",
+      "bot_can_read": true,
+      "messages": 0,
+      "in_ledger": false,
+      "see": {
+        "open": true,
+        "roles": []
+      },
+      "speak": {
+        "open": false,
+        "roles": []
+      },
+      "lossy": [],
+      "left_out": false,
+      "left_out_why": "",
+      "messages_on": true,
+      "messages_why": ""
+    },
+    {
+      "id": "1190000000000000223",
+      "name": "music",
+      "final_name": "music",
+      "type": 2,
+      "category": "1190000000000000201",
+      "private": false,
+      "private_why": "",
+      "bot_can_read": true,
+      "messages": 0,
+      "in_ledger": false,
+      "see": {
+        "open": true,
+        "roles": []
+      },
+      "speak": {
+        "open": true,
+        "roles": []
+      },
+      "lossy": [
+        "#music: only some could share a screen on Discord. Here it is on or off for all."
+      ],
+      "left_out": false,
+      "left_out_why": "",
+      "messages_on": true,
+      "messages_why": ""
+    },
+    {
+      "id": "1190000000000000230",
+      "name": "help",
+      "final_name": "help",
+      "type": 15,
+      "category": "1190000000000000202",
+      "private": false,
+      "private_why": "",
+      "bot_can_read": true,
+      "messages": 3,
+      "in_ledger": false,
+      "see": {
+        "open": true,
+        "roles": []
+      },
+      "speak": {
+        "open": true,
+        "roles": []
+      },
+      "lossy": [],
+      "left_out": false,
+      "left_out_why": "",
+      "messages_on": true,
+      "messages_why": ""
+    },
+    {
+      "id": "1190000000000000231",
+      "name": "gallery",
+      "final_name": "gallery",
+      "type": 16,
+      "category": "1190000000000000202",
+      "private": false,
+      "private_why": "",
+      "bot_can_read": true,
+      "messages": 0,
+      "in_ledger": false,
+      "see": {
+        "open": true,
+        "roles": []
+      },
+      "speak": {
+        "open": true,
+        "roles": []
+      },
+      "lossy": [],
+      "left_out": false,
+      "left_out_why": "",
+      "messages_on": true,
+      "messages_why": ""
+    }
+  ],
+  "categories": [
+    {
+      "id": "1190000000000000200",
+      "name": "Talk"
+    },
+    {
+      "id": "1190000000000000201",
+      "name": "Voice rooms"
+    },
+    {
+      "id": "1190000000000000202",
+      "name": "Help"
+    }
+  ],
+  "roles": [
+    {
+      "id": "1190000000000000107",
+      "name": "Founder",
+      "members": 0,
+      "power": [
+        "roles:admin",
+        "users:admin",
+        "users:read",
+        "voipc:ban",
+        "voipc:bans",
+        "voipc:channels",
+        "voipc:emotes",
+        "voipc:hide",
+        "voipc:kick",
+        "voipc:mention_all",
+        "voipc:modlog",
+        "voipc:profiles",
+        "voipc:reports",
+        "voipc:restrict"
+      ],
+      "unmapped": [],
+      "managed": false
+    },
+    {
+      "id": "1190000000000000106",
+      "name": "VoIPC Importer",
+      "members": 1,
+      "power": [
+        "roles:admin",
+        "users:admin",
+        "users:read",
+        "voipc:ban",
+        "voipc:bans",
+        "voipc:channels",
+        "voipc:emotes",
+        "voipc:hide",
+        "voipc:kick",
+        "voipc:mention_all",
+        "voipc:modlog",
+        "voipc:profiles",
+        "voipc:reports",
+        "voipc:restrict"
+      ],
+      "unmapped": [],
+      "managed": true
+    },
+    {
+      "id": "1190000000000000101",
+      "name": "Admin",
+      "members": 1,
+      "power": [
+        "roles:admin",
+        "users:admin",
+        "users:read",
+        "voipc:ban",
+        "voipc:bans",
+        "voipc:channels",
+        "voipc:kick"
+      ],
+      "unmapped": [
+        "MANAGE_GUILD"
+      ],
+      "managed": false
+    },
+    {
+      "id": "1190000000000000102",
+      "name": "Moderators",
+      "members": 2,
+      "power": [
+        "voipc:hide",
+        "voipc:kick",
+        "voipc:reports",
+        "voipc:restrict"
+      ],
+      "unmapped": [
+        "MOVE_MEMBERS"
+      ],
+      "managed": false
+    },
+    {
+      "id": "1190000000000000103",
+      "name": "-",
+      "members": 1,
+      "power": [],
+      "unmapped": [],
+      "managed": false
+    },
+    {
+      "id": "1190000000000000104",
+      "name": "Muted",
+      "members": 1,
+      "power": [],
+      "unmapped": [],
+      "managed": false
+    },
+    {
+      "id": "1190000000000000105",
+      "name": "Staff",
+      "members": 2,
+      "power": [],
+      "unmapped": [],
+      "managed": false
+    },
+    {
+      "id": "1190000000000000110",
+      "name": "Team 01",
+      "members": 40,
+      "power": [],
+      "unmapped": [],
+      "managed": false
+    },
+    {
+      "id": "1190000000000000111",
+      "name": "Team 02",
+      "members": 39,
+      "power": [],
+      "unmapped": [],
+      "managed": false
+    },
+    {
+      "id": "1190000000000000112",
+      "name": "Team 03",
+      "members": 38,
+      "power": [],
+      "unmapped": [],
+      "managed": false
+    },
+    {
+      "id": "1190000000000000113",
+      "name": "Team 04",
+      "members": 37,
+      "power": [],
+      "unmapped": [],
+      "managed": false
+    },
+    {
+      "id": "1190000000000000114",
+      "name": "Team 05",
+      "members": 36,
+      "power": [],
+      "unmapped": [],
+      "managed": false
+    },
+    {
+      "id": "1190000000000000115",
+      "name": "Team 06",
+      "members": 35,
+      "power": [],
+      "unmapped": [],
+      "managed": false
+    },
+    {
+      "id": "1190000000000000116",
+      "name": "Team 07",
+      "members": 34,
+      "power": [],
+      "unmapped": [],
+      "managed": false
+    },
+    {
+      "id": "1190000000000000117",
+      "name": "Team 08",
+      "members": 33,
+      "power": [],
+      "unmapped": [],
+      "managed": false
+    },
+    {
+      "id": "1190000000000000118",
+      "name": "Team 09",
+      "members": 32,
+      "power": [],
+      "unmapped": [],
+      "managed": false
+    },
+    {
+      "id": "1190000000000000119",
+      "name": "Team 10",
+      "members": 31,
+      "power": [],
+      "unmapped": [],
+      "managed": false
+    },
+    {
+      "id": "1190000000000000120",
+      "name": "Team 11",
+      "members": 30,
+      "power": [],
+      "unmapped": [],
+      "managed": false
+    },
+    {
+      "id": "1190000000000000121",
+      "name": "Team 12",
+      "members": 29,
+      "power": [],
+      "unmapped": [],
+      "managed": false
+    },
+    {
+      "id": "1190000000000000122",
+      "name": "Team 13",
+      "members": 28,
+      "power": [],
+      "unmapped": [],
+      "managed": false
+    },
+    {
+      "id": "1190000000000000123",
+      "name": "Team 14",
+      "members": 27,
+      "power": [],
+      "unmapped": [],
+      "managed": false
+    },
+    {
+      "id": "1190000000000000124",
+      "name": "Team 15",
+      "members": 26,
+      "power": [],
+      "unmapped": [],
+      "managed": false
+    },
+    {
+      "id": "1190000000000000125",
+      "name": "Team 16",
+      "members": 25,
+      "power": [],
+      "unmapped": [],
+      "managed": false
+    },
+    {
+      "id": "1190000000000000126",
+      "name": "Team 17",
+      "members": 24,
+      "power": [],
+      "unmapped": [],
+      "managed": false
+    },
+    {
+      "id": "1190000000000000127",
+      "name": "Team 18",
+      "members": 23,
+      "power": [],
+      "unmapped": [],
+      "managed": false
+    },
+    {
+      "id": "1190000000000000128",
+      "name": "Team 19",
+      "members": 22,
+      "power": [],
+      "unmapped": [],
+      "managed": false
+    },
+    {
+      "id": "1190000000000000129",
+      "name": "Team 20",
+      "members": 21,
+      "power": [],
+      "unmapped": [],
+      "managed": false
+    },
+    {
+      "id": "1190000000000000108",
+      "name": "Regulars",
+      "members": 3,
+      "power": [],
+      "unmapped": [],
+      "managed": false
+    }
+  ],
+  "emojis": 4,
+  "stickers": 3,
+  "emote_room": 400,
+  "bans": 3,
+  "threads": {
+    "active": 3,
+    "archived": 3,
+    "private_skipped": 1
+  },
+  "estimate": {
+    "messages": 73,
+    "at_least": false,
+    "requests": 23,
+    "secs_low": 2,
+    "secs_high": 4,
+    "bytes": 9782
+  },
+  "warnings": [
+    {
+      "level": "warn",
+      "code": "topics_clipped",
+      "text": "One channel list holds all of this only with 5 topics clipped."
+    },
+    {
+      "level": "info",
+      "code": "registration",
+      "text": "Moved members sign in with Discord whatever this is; newcomers need an invite."
+    },
+    {
+      "level": "info",
+      "code": "lossy",
+      "text": "2 roles could do things with no match here: the list is below."
+    },
+    {
+      "level": "info",
+      "code": "disk",
+      "text": "The database is 1.0 MiB now. Needs about 9.6 KiB on the relay's disk: check it. A copy of the database for a backup needs as much again."
+    }
+  ],
+  "blocks": [],
+  "report_preview": [
+    "#directory: this kind of channel does not come.",
+    "#general: @Muted could not write on Discord, and can here until a moderator acts.",
+    "#staff: Discord account 1190000000000001002 had a rule of their own, which does not come.",
+    "#teams: one gate holds 16 groups. These lose it here: @Team 17, @Team 18, @Team 19, @Team 20",
+    "#teams: one gate holds 16 groups. These lose writing here: @Team 17, @Team 18, @Team 19, @Team 20",
+    "#old-logs: some could see it without reading its history, so its messages start off.",
+    "#after-dark: @Muted could not see it on Discord, so it is closed here, and people with no role lose it. Someone holding that role and another passes here.",
+    "#after-dark: one gate holds 16 groups. These lose it here: @Team 17, @Team 18, @Team 19, @Team 20, @Regulars, @Moderators, @Staff, @Admin, @-",
+    "#after-dark: rules on other things (reactions, files and the like) do not come.",
+    "#townhall: a voice channel here, where a stage's moderators may speak.",
+    "#music: only some could share a screen on Discord. Here it is on or off for all.",
+    "#help: a text channel here, its posts threads in its archive. Tags do not come.",
+    "#gallery: a text channel here, its posts threads in its archive. Tags do not come.",
+    "@VoIPC Importer: a bot's own role, which does not come.",
+    "@Admin: nothing here for MANAGE_GUILD.",
+    "@Moderators: nothing here for MOVE_MEMBERS.",
+    "The Discord server's owner had power by owning it, not by a role: nothing waits for them.",
+    "Private threads do not come, 1 of them: no gate here can say who was in one.",
+    ":party_blob: only some roles had it. Here every member has it.",
+    ":old_one: Discord had it switched off. Here it works.",
+    "vector: a Lottie sticker cannot come."
+  ]
+}

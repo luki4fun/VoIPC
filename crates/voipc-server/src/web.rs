@@ -42,7 +42,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_rustls::server::TlsStream;
 use tracing::{debug, info, warn};
 use voipc_protocol::types::UserId;
-use wtransport::config::{Ipv6DualStackConfig, QuicTransportConfig};
+use wtransport::config::QuicTransportConfig;
 use wtransport::endpoint::endpoint_side::Server;
 use wtransport::error::SendDatagramError;
 use wtransport::tls::Sha256Digest;
@@ -55,6 +55,7 @@ use voipc_protocol::video::{
     FrameGrouper, RecordReader, MAX_FRAGMENTS_PER_FRAME, VIDEO_HEADER_SIZE,
 };
 
+use crate::accounts::provider;
 use crate::config::ServerConfig;
 use crate::media;
 use crate::state::ServerState;
@@ -155,8 +156,13 @@ async fn handle_request(
     peer_ip: std::net::IpAddr,
 ) -> Response<Full<Bytes>> {
     let head_only = req.method() == Method::HEAD;
-    let mut resp = if crate::files::is_file_path(req.uri().path()) {
+    let path = req.uri().path();
+    let mut resp = if crate::files::is_file_path(path) {
         files(req, state, peer_ip).await
+    } else if req.method() == Method::POST && path == provider::CONFIRM_PATH {
+        provider_confirm(req, state, peer_ip).await
+    } else if req.method() == Method::GET && path.starts_with(provider::CALLBACK_PREFIX) {
+        provider::callback(state, path, req.uri().query().unwrap_or_default())
     } else if req.method() == Method::GET || head_only {
         route(req.uri().path(), wt)
     } else if req.method() == Method::POST && req.uri().path() == GAME_ROUTES_PATH {
@@ -168,10 +174,10 @@ async fn handle_request(
         resp
     };
     let headers = resp.headers_mut();
-    headers.insert(
-        header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(CSP),
-    );
+    // A provider's page sets its own: a form, where this one forbids any
+    headers
+        .entry(header::CONTENT_SECURITY_POLICY)
+        .or_insert(HeaderValue::from_static(CSP));
     headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
@@ -180,6 +186,23 @@ async fn handle_request(
         *resp.body_mut() = Full::new(Bytes::new());
     }
     resp
+}
+
+/// The person tapped a code on a provider's page: a state and a three-digit pick.
+const MAX_CONFIRM_BODY: usize = 1024;
+
+async fn provider_confirm(
+    req: Request<Incoming>,
+    state: &Arc<ServerState>,
+    peer_ip: IpAddr,
+) -> Response<Full<Bytes>> {
+    match http_body_util::Limited::new(req.into_body(), MAX_CONFIRM_BODY)
+        .collect()
+        .await
+    {
+        Ok(b) => provider::confirm(state, &b.to_bytes(), peer_ip).await,
+        Err(_) => plain(StatusCode::PAYLOAD_TOO_LARGE, "body too large"),
+    }
 }
 
 // ── Files ───────────────────────────────────────────────────────────────
@@ -645,7 +668,9 @@ impl WebTransport {
             native,
             browser: RwLock::new(browser),
         });
-        let endpoint = Endpoint::server(server_config(bind_addr, picker.clone()))
+        let socket =
+            udp_socket(bind_addr).with_context(|| format!("failed to bind QUIC on {bind_addr}"))?;
+        let endpoint = Endpoint::server(server_config(socket, picker.clone()))
             .with_context(|| format!("failed to bind QUIC on {bind_addr}"))?;
 
         Ok(Self {
@@ -775,7 +800,38 @@ impl WebTransport {
 /// stream (see `server_config`).
 const RECEIVE_WINDOW: u32 = 2 * 1024 * 1024;
 
-fn server_config(bind_addr: SocketAddr, picker: Arc<CertPicker>) -> WtServerConfig {
+/// What the kernel may hold for the relay's one UDP socket, each way. Every client's QUIC
+/// packets wait here while the endpoint is busy, and what does not fit is dropped without a
+/// word. At Linux's usual 212 KiB, one soak of 2000 clients dropped 340,000 packets, and
+/// clients lost their handshakes to it. Linux caps this at `net.core.rmem_max` and
+/// `wmem_max`, so a relay on the usual limit gets about twice the old size and says so.
+const UDP_BUFFER: usize = 8 * 1024 * 1024;
+
+fn udp_socket(addr: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(addr),
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    if addr.is_ipv6() {
+        socket.set_only_v6(false)?;
+    }
+    socket.bind(&addr.into())?;
+    // Not fatal: a smaller buffer is what every relay had before
+    let _ = socket.set_recv_buffer_size(UDP_BUFFER);
+    let _ = socket.set_send_buffer_size(UDP_BUFFER);
+    let got = socket.recv_buffer_size()?.min(socket.send_buffer_size()?);
+    if got < UDP_BUFFER {
+        warn!(
+            bytes = got,
+            "small UDP buffers: a busy relay drops packets. \
+             Set net.core.rmem_max and net.core.wmem_max to 4194304 (OPERATING.md)"
+        );
+    }
+    Ok(socket.into())
+}
+
+fn server_config(socket: std::net::UdpSocket, picker: Arc<CertPicker>) -> WtServerConfig {
     let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
@@ -820,13 +876,8 @@ fn server_config(bind_addr: SocketAddr, picker: Arc<CertPicker>) -> WtServerConf
         .send_window(512 * 1024)
         .send_fairness(false);
 
-    let builder = match bind_addr {
-        SocketAddr::V4(_) => WtServerConfig::builder().with_bind_address(bind_addr),
-        SocketAddr::V6(addr) => {
-            WtServerConfig::builder().with_bind_address_v6(addr, Ipv6DualStackConfig::Allow)
-        }
-    };
-    builder
+    WtServerConfig::builder()
+        .with_bind_socket(socket)
         .with_custom_tls_and_transport(tls, transport)
         // An idle client must not hit its own idle timeout; a vanished peer
         // still trips ours (30 s default) because it never acks.
@@ -925,7 +976,14 @@ async fn run_session(connection: Connection, state: Arc<ServerState>, peer: Sock
     // handler sees EOF and runs its normal session cleanup.
     control.abort();
     pumps.shutdown().await;
-    connection.close(VarInt::from_u32(0), b"");
+    // A lingering close, as the tunnel has. The ack above says the peer's QUIC has the last
+    // message, not that anything has read it, and closing throws away what is unread: on a
+    // busy machine the page lost its answer in 1 of 5 tries. Whoever got it closes this
+    // themselves. Not on this task: it would hold a pre-authentication slot.
+    tokio::spawn(async move {
+        let _ = tokio::time::timeout(LINGER, connection.closed()).await;
+        connection.close(VarInt::from_u32(0), b"");
+    });
     if !handler.is_finished()
         && tokio::time::timeout(Duration::from_secs(10), &mut handler)
             .await
@@ -936,6 +994,9 @@ async fn run_session(connection: Connection, state: Arc<ServerState>, peer: Sock
     }
     debug!(peer = %label, "session ended");
 }
+
+/// How long a finished session's connection waits for its peer to close it.
+const LINGER: Duration = Duration::from_secs(5);
 
 /// Control leg: the client's single bidirectional stream carries the native
 /// control framing byte for byte.
@@ -1532,6 +1593,65 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(4), connection.closed())
             .await
             .expect("the relay closes the connection");
+    }
+
+    /// Linux doubles what it reports and caps it at twice `rmem_max`, which is 212,992 on a
+    /// stock system: any socket that asked gets more than one that did not.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_udp_socket_asks_for_more_room_than_the_default() {
+        let asked = udp_socket("127.0.0.1:0".parse().unwrap()).unwrap();
+        let default = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let room = |s: &std::net::UdpSocket| socket2::SockRef::from(s).recv_buffer_size().unwrap();
+        assert!(
+            room(&asked) > room(&default),
+            "{} {}",
+            room(&asked),
+            room(&default)
+        );
+    }
+
+    /// What a session ends with waits for its reader. Closing as soon as the peer's QUIC had
+    /// acked it threw it away unread, and a busy page showed "Connection lost" instead.
+    #[tokio::test]
+    async fn a_sessions_last_word_waits_for_a_slow_reader() {
+        let (web, state, _) = test_server();
+        let addr = web.local_addr().unwrap();
+        tokio::spawn(web.run(
+            state.clone(),
+            Arc::new(ConnLimits::from_config(&ServerConfig::default())),
+        ));
+        let (_endpoint, connection) = connect(addr, NATIVE_SNI, Arc::default()).await;
+        let (mut send, mut recv) = connection.open_bi().await.unwrap().await.unwrap();
+        let auth = ClientMessage::Authenticate {
+            username: "native".into(),
+            protocol_version: PROTOCOL_VERSION + 1,
+            app_version: APP_VERSION.to_string(),
+            identity_key: None,
+            prekey_bundle: None,
+            account: None,
+        };
+        send.write_all(&encode_client_msg(&auth).unwrap())
+            .await
+            .unwrap();
+
+        // Well past the relay's refusal and the ack for it, and nobody has read anything
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let closed = tokio::time::timeout(Duration::from_millis(100), connection.closed()).await;
+        assert!(closed.is_err(), "the relay did not wait: {closed:?}");
+        let mut buf = BytesMut::new();
+        let last = loop {
+            if let Some(payload) = try_decode_frame(&mut buf).unwrap() {
+                break decode_server_msg(&payload).unwrap();
+            }
+            assert!(recv.read_buf(&mut buf).await.unwrap() > 0, "nothing came");
+        };
+        assert!(matches!(last, ServerMessage::Refused { .. }), "{last:?}");
+
+        // Someone who never hangs up does not hold it for long
+        tokio::time::timeout(LINGER + Duration::from_secs(3), connection.closed())
+            .await
+            .expect("the relay closes in the end");
     }
 
     #[tokio::test]

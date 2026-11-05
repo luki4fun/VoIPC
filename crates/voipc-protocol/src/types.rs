@@ -55,6 +55,16 @@ pub struct UserInfo {
     pub badges: Vec<String>,
 }
 
+/// An account holding a privilege (`ServerMessage::ChatMods`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatMod {
+    pub account: [u8; 16],
+    /// Holds `voipc:hide`.
+    pub hide: bool,
+    /// Holds `*`: alone acts on other holders.
+    pub admin: bool,
+}
+
 /// Badges a member shows at most (`UserInfo::badges`).
 pub const MAX_BADGES: usize = 3;
 
@@ -228,6 +238,102 @@ pub enum AccountStart {
     /// account proves itself with its identity key, which only the vault's
     /// recovery slot opens. It ends in `AuthStep::ResetDone`, not a sign-in.
     Reset,
+    /// Which providers this relay signs in with (protocol v17). Answered with
+    /// `AuthStep::Providers`; the connection ends there, no account involved.
+    Providers,
+    /// Sign in with a provider (protocol v17). Answered with
+    /// `AuthStep::OpenBrowser`; the connection ends there, so that an app the
+    /// system suspends while the browser is open loses nothing. No name yet:
+    /// the provider's answer decides the account.
+    Provider { kind: ProviderKind },
+    /// Back from the browser with `AuthStep::OpenBrowser`'s ticket.
+    ProviderResume { ticket: Vec<u8> },
+    /// Whether the browser is through (`AuthStep::ProviderReady`, or
+    /// `ProviderPending`), without spending the ticket; the connection ends there.
+    ProviderStatus { ticket: Vec<u8> },
+    /// `ProviderResume` from someone holding an invite code or link (protocol v18): a
+    /// person nobody knows may then make an account, where sign-up alone would not let them.
+    ProviderResumeInvited { ticket: Vec<u8>, invite: String },
+}
+
+/// Who can vouch for an account at sign-in. Never for its vault: the relay sees
+/// all a provider says, so nothing of that may open anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProviderKind {
+    Discord,
+    Google,
+    Facebook,
+}
+
+/// How a member chose to be shown (`ServerMessage::Profiles`; protocol v18).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileInfo {
+    pub account: [u8; 16],
+    /// Shown beside the `@name`, never instead of it.
+    pub name: Option<String>,
+    /// `ClientMessage::ProfilePictureGet` fetches it.
+    pub picture: Option<[u8; 32]>,
+}
+
+/// A reusable invite link (protocol v18). Its code was shown once and is not here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InviteLinkInfo {
+    /// Names it for `AdminOp::InviteLinkRevoke`; not the code.
+    pub id: String,
+    pub max_uses: u32,
+    pub uses: u32,
+    /// Unix seconds; `None`: it does not run out by time.
+    pub expires_at: Option<i64>,
+    /// The group a new account starts in.
+    pub group: Option<String>,
+}
+
+/// Characters of a server's name (`ServerMessage::ServerProfile`).
+pub const MAX_SERVER_NAME_CHARS: usize = 32;
+/// Characters of a server's description.
+pub const MAX_SERVER_DESCRIPTION_CHARS: usize = 256;
+
+/// Characters of a display name.
+pub const MAX_DISPLAY_NAME_CHARS: usize = 32;
+/// Bytes of a profile picture, as it is stored.
+pub const MAX_PROFILE_PICTURE: usize = 32 * 1024;
+/// Accounts asked about in one `ClientMessage::ProfilesGet`.
+pub const MAX_PROFILES_ASKED: usize = 64;
+
+/// How a badged group shows (`ServerMessage::GroupStyles`; protocol v18).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupStyle {
+    pub badge: String,
+    /// `0xRRGGBB`. A number, so no client ever has a relay's string in its CSS.
+    pub color: Option<u32>,
+    /// Its people stand under it in the member list. Off, the badge is only a badge.
+    pub section: bool,
+}
+
+/// A category of channels (protocol v18).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelCategory {
+    pub id: u32,
+    pub name: String,
+}
+
+/// Where a channel sits (`ServerMessage::ChannelLayout`; protocol v18).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelPlace {
+    pub channel_id: ChannelId,
+    pub category: Option<u32>,
+    /// Made in the app, so it can be renamed and deleted there.
+    pub kept: bool,
+    /// Opened the first time someone comes to this server.
+    pub welcome: bool,
+}
+
+/// A provider linked to an account, as the account panel lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkedProvider {
+    pub kind: ProviderKind,
+    /// What the provider calls the person.
+    pub name: String,
 }
 
 /// The sign-up proof of work: an ALTCHA challenge (JSON) and the relay's
@@ -297,6 +403,396 @@ pub struct AuditRow {
     pub actor: Option<String>,
     pub detail: String,
     pub at: i64,
+}
+
+/// One line of the moderation log. Names are as they were then, and as anyone
+/// but an admin saw them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModRow {
+    pub id: i64,
+    /// Unix seconds.
+    pub at: i64,
+    /// `kick`, `ban`, `unban`, `channel_kick`, `remove_posts`, `hide`, ...
+    pub action: String,
+    pub actor: String,
+    pub target: String,
+    /// None: server-wide, or a channel this reader cannot see.
+    pub channel: Option<String>,
+    pub reason: String,
+    pub detail: String,
+    /// The actor's app said so; the relay could not see it.
+    pub advisory: bool,
+}
+
+/// Whose posts this server says it removed (`ServerMessage::PostsHidden`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PostsMark {
+    /// None: a guest, or someone known here only by a pseudonym.
+    pub account: Option<[u8; 16]>,
+    pub name: String,
+    /// Message timestamps in Unix ms, not seconds.
+    pub since_ms: u64,
+    pub before_ms: u64,
+    pub by: String,
+}
+
+/// People one `ServerMessage::ReportTakers` names at most.
+pub const MAX_REPORT_TAKERS: usize = 5;
+
+/// Someone who takes a report of a message (protocol v19). Never someone standing
+/// under a pseudonym: this ties a user id to a name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReportTaker {
+    /// Here now: a report goes to this id. None: away, a sealed copy waits for `account`.
+    pub user_id: Option<UserId>,
+    /// None: the admin token, with no account.
+    pub account: Option<[u8; 16]>,
+    pub name: String,
+}
+
+/// Who may not speak for now (protocol v19). No name and no channel: an id says
+/// nothing a roster did not, under a pseudonym too.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Restriction {
+    pub user_id: UserId,
+    /// No voice, no screen share.
+    pub voice: bool,
+    /// No posts (reactions, pins, edits, deletes included), pokes, invites, new
+    /// channels, display name or picture.
+    pub text: bool,
+    /// No direct messages. The new-member wait sets this; a moderator's
+    /// restriction does not.
+    pub direct: bool,
+    /// Seconds until this row next changes, by the relay's clock. None: until
+    /// someone lifts it.
+    pub expires_in_secs: Option<u32>,
+    /// An account's name or "admin token". Empty: only the new-member wait applies.
+    pub by: String,
+    /// Told to the member and to holders of `voipc:restrict`; empty for everyone else.
+    pub reason: String,
+}
+
+// ── The move from Discord (protocol v20) ────────────────────────────────
+
+/// A frame of an import is built under this, and checked: nothing else guards a client's
+/// frame (`encode_client_msg` has no limit; `try_decode_frame` ends the connection).
+pub const IMPORT_FRAME_BYTES: usize = 48 * 1024;
+/// The most a message's text may be: Discord's 4,000 characters at four bytes each.
+pub const IMPORT_BODY_BYTES: usize = 16 * 1024;
+/// Categories, threads, members or bans one frame may carry.
+pub const IMPORT_FRAME_ROWS: usize = 200;
+/// Channels one frame may carry: each makes the relay write and tell people.
+pub const IMPORT_CHANNEL_ROWS: usize = 32;
+/// Messages one frame may carry: one page of Discord's.
+pub const IMPORT_MESSAGE_ROWS: usize = 100;
+
+/// What a run of the importer takes. A channel's own choices stay on the importer's
+/// machine: nothing about one left out reaches the relay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportOptions {
+    pub channels: bool,
+    pub roles: bool,
+    pub permissions: bool,
+    pub members: bool,
+    pub bans: bool,
+    pub emotes: bool,
+    pub messages: bool,
+    pub threads: bool,
+    pub pins: bool,
+    pub reactions: bool,
+    pub anonymise: bool,
+    /// The operator ticked what copying members' messages means.
+    pub acknowledged: bool,
+}
+
+/// What the dry-run needs of this relay (`AdminReply::ImportFacts`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportFacts {
+    /// SQLite: the relay copies the database itself before a run.
+    pub backup_here: bool,
+    pub db_bytes: Option<u64>,
+    pub max_users: u32,
+    pub online: u32,
+    pub registration: Registration,
+    pub discord_sign_in: bool,
+    pub public_url: String,
+    pub takes_guests: bool,
+    pub accounts: u32,
+    pub channel_list_bytes: u32,
+    pub channel_list_limit: u32,
+    pub categories: u32,
+    pub max_categories: u32,
+    pub emotes: u32,
+    /// A run some other live session is on.
+    pub running: Option<i64>,
+    /// A run no one finished: its id and guild, in decimal.
+    pub unfinished: Option<(i64, String)>,
+    /// `cloud = true`: this relay may keep messages at all.
+    pub cloud: bool,
+    /// Of the newest run not undone: what a delta starts from.
+    pub last_options: Option<ImportOptions>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportCategory {
+    pub dc_id: u64,
+    pub name: String,
+}
+
+/// Who a channel takes, as the importer worked it out. No way to say "empty means
+/// open": `Roles` of nothing the relay knows reads as `Closed`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ImportGate {
+    Open,
+    Closed,
+    /// By Discord's role ids: the relay finds its own groups, so a client cannot name one.
+    Roles(Vec<u64>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportChannel {
+    pub dc_id: u64,
+    pub name: String,
+    pub description: String,
+    pub text: bool,
+    pub category: Option<u64>,
+    pub max_users: u32,
+    pub slow_mode_secs: u32,
+    pub nsfw: bool,
+    pub announce: bool,
+    pub screen_share: bool,
+    pub see: ImportGate,
+    pub speak: ImportGate,
+}
+
+/// What a thread's opening row says once someone took it back: there is a thread here, and
+/// the others' replies are in it. Never the title.
+pub const THREAD_TAKEN_BACK: &str = "Thread";
+
+/// A thread: its name and count on a root row of its parent, in the archive. Private
+/// threads never come.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportThread {
+    pub id: u64,
+    pub parent: u64,
+    /// Who named it, which is whose wish reaches its name. None: anonymised on the importer,
+    /// or Discord does not say.
+    pub owner: Option<u64>,
+    pub name: String,
+    pub replies: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportReaction {
+    pub emoji: String,
+    pub count: u32,
+}
+
+/// The name of a file a message had, for a later backfill. Never its address: a signed
+/// URL runs out. Never served to readers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportAttachment {
+    pub id: u64,
+    pub name: String,
+    pub bytes: u64,
+    pub mime: String,
+}
+
+/// One message read from Discord. No time: the relay takes it from the id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportMessage {
+    pub id: u64,
+    /// None: anonymised on the importer, or a webhook's.
+    pub author: Option<u64>,
+    pub author_name: String,
+    /// At most `IMPORT_BODY_BYTES`.
+    pub body: String,
+    pub reply_to: Option<u64>,
+    pub pinned: bool,
+    pub reactions: Vec<ImportReaction>,
+    pub attachments: Vec<ImportAttachment>,
+}
+
+/// What someone said about their rows (`AdminOp::ArchiveWishes`). `channel` 0: every channel.
+/// `low..=high`: Discord ids. Without `erase`, hidden from all but its author.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveWish {
+    pub author: u64,
+    pub channel: u64,
+    pub low: u64,
+    pub high: u64,
+    pub erase: bool,
+}
+
+/// What `ImportUndo` of a run would take.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportUndoCounts {
+    pub channels: u32,
+    /// Written live in those channels since, which go with them.
+    pub live_posts: u64,
+    pub groups: u32,
+    pub placeholders: u32,
+    pub claimed_kept: u32,
+    /// The stored count, so "about".
+    pub archive_rows: u64,
+    pub emotes: u32,
+    /// Runs of this guild after it that are not undone: those go first.
+    pub later_runs: u32,
+}
+
+/// A role on Discord. The relay derives the group's name and badge, and alone maps
+/// `permissions` to privileges (`discord::scopes_of`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportRole {
+    pub dc_id: u64,
+    /// Discord's, up to 100 characters.
+    pub name: String,
+    /// `colors.primary_color`, else the deprecated `color`; 0 none.
+    pub color: u32,
+    /// Higher is higher.
+    pub position: u32,
+    pub hoist: bool,
+    pub permissions: u64,
+}
+
+/// A member of the Discord server. Bots and members still in screening are never sent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportMember {
+    pub dc_id: u64,
+    /// Discord's; the relay cleans it.
+    pub username: String,
+    /// The guild nickname, else `global_name`; "" none.
+    pub shown_as: String,
+    /// Unix seconds; 0: Discord gave null.
+    pub joined_at: i64,
+    /// At most 250.
+    pub roles: Vec<u64>,
+}
+
+/// Someone banned on Discord: only the id. Their name and the reason stay on the
+/// importer's screen, not on the relay for good.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportBan {
+    pub dc_id: u64,
+}
+
+/// Which accounts `AdminOp::MoveAccounts` lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MoveFilter {
+    All,
+    Waiting,
+    Claimed,
+    Banned,
+}
+
+/// What the move knows of an account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MoveState {
+    NotImported,
+    /// Made by an import, and nobody has opened it.
+    Waiting,
+    Claimed,
+    /// Holds a banned Discord id, so its owner cannot sign up with it.
+    Banned,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MoveAccount {
+    pub user: AdminUser,
+    pub state: MoveState,
+    /// In decimal; "" unless the reader holds `*`.
+    pub dc_id: String,
+    /// Waiting with a limit, Unix seconds; else 0.
+    pub expires_at: i64,
+}
+
+/// Someone who could do `scopes` on Discord, and waits for the owner's OK.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PowerRow {
+    pub account: [u8; 16],
+    pub name: String,
+    /// Someone has opened the account: the only ones the owner can answer.
+    pub claimed: bool,
+    pub group: String,
+    pub badge: String,
+    pub scopes: Vec<String>,
+}
+
+/// One run of the importer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MoveRun {
+    pub id: i64,
+    /// In decimal.
+    pub guild_id: String,
+    pub by: String,
+    pub started_at: i64,
+    pub finished_at: Option<i64>,
+    pub undone_at: Option<i64>,
+    pub accounts: u32,
+    pub groups: u32,
+    /// Undone, and not all of it has gone yet: an undo left halfway, or its archive rows
+    /// with the worker. A new run waits.
+    pub clearing: bool,
+}
+
+/// One message imported from Discord, as a reader gets it. The relay can read it and
+/// nobody signed it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveRow {
+    /// The Discord message's id, in decimal: a JS number cannot hold it.
+    pub id: String,
+    /// "" for a root with no message of its own.
+    pub author: String,
+    /// In decimal, to `*` only; "" otherwise, and for an anonymised row or a webhook's.
+    pub author_id: String,
+    pub at_ms: u64,
+    pub body: String,
+    /// The thread it was written in, in decimal; "" in the channel's own flow. Pins and
+    /// search reach into threads, and "show it where it stands" needs to know which.
+    pub thread: String,
+    /// What it answers, in decimal; "" for nothing.
+    pub reply_to: String,
+    pub reactions: Vec<ArchiveReaction>,
+    pub pinned: bool,
+    /// This row opens a thread when not "".
+    pub thread_name: String,
+    pub replies: u32,
+    /// Written by a Discord account this account has linked.
+    pub mine: bool,
+    /// Hidden by its author: only they get such a row.
+    pub hidden: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveReaction {
+    pub emoji: String,
+    pub count: u32,
+}
+
+/// What `AccountRequest::ArchiveMine` does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ArchiveAction {
+    Count,
+    Hide,
+    Show,
+    Delete,
+}
+
+/// How much of someone's own rows `AccountRequest::ArchiveMine` covers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ArchiveScope {
+    Message { channel_id: ChannelId, id: String },
+    Channel { channel_id: ChannelId },
+    Everything,
+}
+
+/// What `AdminOp::ArchiveDelete` takes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ArchiveTarget {
+    /// A decimal Discord id. Their account stays.
+    Author { id: String },
+    /// The way to reach an anonymised row, which has no author to match.
+    Message { channel_id: ChannelId, id: String },
 }
 
 /// A sign-up code that is still open or was used.

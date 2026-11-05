@@ -21,6 +21,9 @@ database = "sqlite://voipc.db"    # or postgres://user:pass@host/db
 registration = "invite"           # open | invite | closed
 cloud = true                      # let members keep copies of their messages here
 retention_days = 365              # copies go after this, or sooner by their own timer
+modlog_days = 180                 # rows of the moderation log go after this
+archive_days = 0                  # what came from Discord goes at this age; 0: until removed
+unclaimed_days = 90               # an account the move made goes if unopened; 0: never
 quota_mb = 50                     # per account
 key_file = "voipc-accounts.key"   # made on first start; VOIPC_ACCOUNTS_KEY overrides it
 ```
@@ -67,6 +70,19 @@ token.
   mode `admin invite` refuses to print a code without `--for`. Codes printed
   before the switch to `closed` stay valid until they expire.
 
+**Invite links** (*Server admin → Users → Invite links*, for `users:admin`) let many
+people in with one link, for a post or a website: with a limit of people, an expiry
+if you want one, and optionally a group they start in. A link is public by nature,
+so each sign-up still solves the proof of work and counts against the sign-up limits,
+and it is shown once and revocable. Its starting group must hold no privileges, then
+and at each use: give that group power later and the link stops handing it out. On
+`closed` there are none. A link works for sign-up with a password or through a provider,
+and an invite code from an admin works through a provider too, also where sign-up is
+otherwise by invite only.
+
+**An account the move from Discord made** can be opened on `invite` and `closed` too: it
+was made already, and needs no code ([An account the move made for you](#an-account-the-move-made-for-you)).
+
 ## Groups, privileges and two-factor codes
 
 A **group** is a set of accounts with a name, an optional badge shown next to their
@@ -78,18 +94,27 @@ server menu → *Server admin* → *Users* and *Groups*.
 |---|---|
 | Everything (`*`) | do all of the below, and see the real names behind an anonymous channel |
 | Kick (`voipc:kick`) | kick people from the server and from any channel |
-| Ban (`voipc:ban`) | ban people they can see, by address and account |
-| Ban list (`voipc:bans`) | see the ban list, lift bans, ban an account by name |
-| Channels (`voipc:channels`) | change the settings and gates of the channels they can see; post in announcement channels and past slow mode; see hidden channels |
+| Ban (`voipc:ban`) | ban people they can see, by address and account, and remove the posts of someone banned |
+| Ban list (`voipc:bans`) | see the ban list, lift bans, ban an account by name, and remove the posts of someone banned |
+| Restrict (`voipc:restrict`) | mute someone's voice or time them out, for a while, if they hold no more than the one doing it |
+| Hide messages (`voipc:hide`) | hide a message from its readers, who can still open it; not held back by slow mode |
+| Take reports (`voipc:reports`) | receive what people report, and be named to whoever reports. Spares nobody from a kick |
+| Moderation log (`voipc:modlog`) | read who did what to whom. Spares nobody from a kick |
+| Channels (`voipc:channels`) | change the settings and gates of the channels they can see; post in announcement channels and past slow mode; see hidden channels; invite people to a room they stand in |
 | Emotes (`voipc:emotes`) | add, rename and remove the server's emotes and stickers |
 | See accounts (`users:read`) | see the account list, an account's groups and its history, and who is in a group |
 | Manage accounts (`users:admin`) | give and take groups, reset two-factor codes, make and revoke invites |
-| Manage groups (`roles:admin`) | make, change and delete groups |
+| Manage groups (`roles:admin`) | make, change and delete groups; a group's colour and its place in the order |
+| Profiles (`voipc:profiles`) | clear the display name and picture of someone holding no more than they do |
+| Call on everybody (`voipc:mention_all`) | use `@everyone`, `@here` and a group's `@&badge`. Spares nobody from a kick |
 
 Two groups are built in: **admin** (everything) and **user** (every account, no
 privileges). The server also makes a **moderator** group (badge *mod*: kick, ban,
-channels) on its first start. A moderator group from before 1.7 keeps what it
-granted.
+restrict, hide messages, moderation log, take reports, channels) on its first start.
+A moderator group from before 1.7 keeps what it granted. One still holding exactly
+kick, ban and channels gains the other four once, on the first start of 1.10, and the
+server's log says so. A group someone has edited is left as it is, and a privilege
+taken away afterwards stays away.
 
 - **Privileges need two-factor codes.** A group's privileges, and its badge, apply
   once the account has set up codes. A group without privileges counts at once.
@@ -99,15 +124,190 @@ granted.
   one, needs every privilege it hands out, and the account it is done to may hold
   nothing the one doing it lacks. The last admin cannot lose *admin*.
 - **A fresh code for steps that hand out power.** Giving or taking a group with
-  privileges, making, changing or deleting a group, and resetting someone's codes
-  ask for a code from your authenticator app. It holds for ten minutes.
+  privileges, making, changing or deleting a group, resetting someone's codes, and
+  removing a banned member's posts ask for a code from your authenticator app. It
+  holds for ten minutes.
 - **Taking a group with privileges away signs the account out**, so the loss
   counts at once; a remembered device signs it in again. Taking away a group
   without privileges does not.
 - **Holders of a privilege are spared.** Only an admin kicks or bans an account
-  that holds any privilege; in a channel they made, a creator still kicks.
+  that holds a privilege; in a channel they made, a creator still kicks. Holders of only
+  calling on everybody, taking reports or reading the log are not spared, here or wherever
+  else this page spares a privilege.
+- **Mute and timeout** (`voipc:restrict`, from someone's menu). A mute stops their voice
+  and screen share. A timeout stops those and their posts too, reactions, pins, edits and
+  deletes included, as well as pokes, invites, new channels, and setting a display name or
+  picture; clearing their own stays open. Neither reaches direct messages, so someone timed
+  out can still write to a moderator. Neither takes reading, joining or keys, nor files
+  they upload or a privilege they hold: a restriction limits speech, and a privilege
+  stays until the group is taken. It outlasts a reconnect and a restart, and ends when it
+  runs out or someone lifts it from the same menu. Everyone sees that the person is held, by
+  whom and until when; only they and holders of `voipc:restrict` see why. Setting one and
+  lifting one each write a row in the moderation log; running out does not.
+- **Who a restriction binds.** Whoever holds `voipc:restrict` acts on anyone holding no
+  more than they do, an admin on anyone. Nobody else acts on themselves, so a moderator who
+  is held cannot lift it. An account's goes with the account. A guest has none, so theirs goes
+  by address: it binds every guest at that address or IPv6 /64, under any name, and no
+  account there, nor an admin there by the server's token. Everyone connected sees a mark on
+  each of those guests, so anyone can see that they share an address, though not which, also
+  when one of them goes by a pseudonym; a moderator could do it to find that out. It ends
+  within a day, because addresses change hands. A guest off posts who connects again goes
+  by `guest` and their tag, not the name they asked for, since a name is public text.
+- **The wait for new members**, `new_member_wait_mins` in `server_settings.json` and off by
+  default ([OPERATING.md](OPERATING.md)), holds voice, posts and direct messages for that
+  long from when an account was made, or a guest first came from an address. A guest
+  counts as new again once the wait and one more day have gone by since their last visit.
+  An admin, the holder of a privilege, and anyone in a group other than the built-in `user`
+  do not wait, so giving a group ends it at once. It writes nothing in the log, and only
+  giving a group ends it early: a moderator's lift does not. An invite link that hands out a
+  group skips it.
+- **Hiding a message** (`voipc:hide`, from a message's menu). It collapses to "Removed by
+  whoever did it", with *Show anyway*, for everyone reading that channel; *Restore* takes it
+  back, and the latest of the two wins. Nothing is deleted: the message stays in every
+  copy, and anyone can open it. It stays out of search, pins and Files while hidden,
+  cannot be forwarded or copied from the menu, and an honest app hands it to nobody
+  asking for the channel's past. Only an admin hides what someone holding a privilege wrote,
+  as with a kick. It does nothing in a direct conversation, and is neither offered nor
+  obeyed in an anonymous channel, where it would unmask the moderator as staff: kick and
+  ban do the work there.
+- **How far a hide reaches.** It is an end-to-end message like any other: the server cannot
+  read it, so each app decides whether it counts, against who the server says holds
+  what. The server tells everyone, guests too, every account holding a privilege, by id
+  and without names. So a hide still counts when the moderator has gone offline, and stops
+  counting for an app that reads it again after the moderator lost the privilege: a browser
+  shows such a message again, while a desktop's archive keeps what it decided. Word of a
+  change to someone offline can take up to five minutes to arrive. People away read it
+  from the channel's stored log, as they do any message, which takes a channel that
+  keeps messages and a moderator with copies kept here. Otherwise it reaches only whoever is
+  online, and the action says so before and after. A guest, or a reader without copies
+  kept here, has only what happens while they are online. A stored hide sits under the
+  moderator's own key, so someone who joins the channel after it reads the message unhidden
+  until that moderator's app is next running, and for good if that moderator has *Share
+  recent channel chat with newcomers* off.
+- **Removing a banned member's posts** (`voipc:ban` or `voipc:bans`), in the ban dialog as
+  *Also remove their posts*, under *Ban an account*, and on each row of *Active bans*. It
+  only works on someone banned now, so nobody in good standing is wiped quietly: an account
+  needs its own ban, so the dialog bans the account too. It goes back an hour, a day or
+  seven days, and only an admin goes further or takes everything kept. Only an admin
+  removes the posts of someone holding a privilege, an admin having banned them. It takes a
+  fresh code, asked for where you are, whether the admin panel is open or not. A moderator
+  cannot delete their own row of it, and it looks to them like it does to everyone.
+- **What a removal does and does not do.** It deletes for good what this server keeps of
+  their channel messages, and writes one row of the moderation log saying how many went, or
+  does neither. It does not delete a direct message, which is the other party's too and may
+  be the record of what got them banned. It cannot delete copies on people's devices: every
+  connected app is told, and every app connecting later for as long as the log keeps the
+  row, and collapses its copies to "This server says *whoever* removed this with a ban",
+  with *Show anyway*. Those copies stay out of search, pins and Files, and an honest app
+  hands them to nobody. *Restore* does not lift it. It does not undo when the ban ends or
+  is lifted, and someone back from a ban can write again as before. Files they attached
+  are not deleted at once: the server does not know who posted a file, and it goes when it
+  ages out. A device away for longer than `modlog_days` is not told.
+- **Active bans** come a hundred at a time, with *Show more* and a search by the name a row
+  shows. Who stands behind a pseudonym stays there: a search finds the name you can see.
+- **What a limited window can bring back.** A delete or an edit is a message of its writer's,
+  kept like any other. When the window takes their delete or edit but not the older message
+  it applied to, a device reading the log anew, a browser after a reload or a new device,
+  shows the older text again, not collapsed, since the removal does not reach back that far.
+  Their request that devices drop what they wrote can go the same way, and a device that had
+  not read it yet keeps those copies as they are. Taking everything kept has no such gap.
+- **A guest has nothing kept here**, so removing a guest's posts only asks devices to hide
+  what they hold under that name. So does removing by a pseudonym, the only name a moderator
+  has for someone in an anonymous channel, also when an admin made the ban: asking by any
+  other name answers as for someone not banned, so a moderator cannot try names against it.
+  An admin asks by the account, which does delete. Its row keeps to the pseudonym with no
+  account, and so does what every app is told, then and later, so no device hides that
+  account's copies. Only that admin's own answer has the real name.
+- **Where the line comes from.** The server says it, not the moderator's app: that is how
+  it reaches every channel, also those the moderator cannot see, and people offline. So the
+  name on it is the server's word, which nobody signs, and a hostile server could put anyone's
+  name on any channel message. That costs a false line and one extra click, never a message.
 - An account's history in the app lists what was done to its access, by whom and
   when: groups, codes, passwords, devices, invites. It never shows an address.
+- **Inviting someone to your room** (`voipc:channels`, *Invite to Channel* in their menu)
+  works in any room you stand in, made by anyone or from `channels.json`. They get the
+  popup anyone's invite raises, naming you, and nothing happens until they accept, so
+  nobody is ever moved. Accepting passes the room's password, which holding this privilege
+  lets you change anyway; a gate still holds, and someone outside it is not asked and hears
+  no name, and neither is a full room or an 18+ question skipped. It cannot be done from
+  behind a pseudonym, in an anonymous room or beside one, since the invite would say who
+  that is. You hear the answer, not the room's creator. Each invite writes a row in the
+  moderation log; asking again before an answer does not. An invite stays good until it is
+  answered or they disconnect, also after you have left the room.
+- **Reports** (`voipc:reports`, or everything). What someone reports comes to you as a
+  direct message from them, under a line: "Report from carla. They say dan wrote this in
+  #lobby at 14:02", with their reason beside it as plain text. That line is their word, and
+  so is the message: nothing signs what was said. The one check there is, is your own
+  copy of that channel, and the line says what it found: *matches your copy*, *your copy
+  says otherwise*, *your copy was edited since*, or *you have no copy, nothing proves it*.
+  A copy a member handed over counts as none, and so does anything said in a direct
+  message. There is no shared queue: each of you has a row per reporter, and answering is
+  writing back. To work one as a team, forward it into a staff channel, where it stays a
+  report and says who passed it on. A flood of reports is a flood of direct messages:
+  block them, restrict or kick them. Who a report is from is who sent it, however it is
+  labelled, and one that a member hands over with a channel's history is a plain forward.
+  Taking the privilege away, or going behind a pseudonym, takes you off the list at the
+  next ask.
+- **Who is named.** Whoever reports sees the names of those who take reports, up to five,
+  those online first and in no fixed order. Someone away is named only to an account, on a
+  server that keeps messages, and only with a log key and no ban. So holding this
+  privilege is not a secret from members. Nobody behind a pseudonym is named, here or
+  away, since the list pairs a user id with a real name.
+
+**A group's colour and order** decide how its badge looks and where its people stand
+in the member list: under their top group, top groups first. A row shows its top
+three badges. A group's *Own section in the member list* can be turned off: its people
+then stay with everybody else and only wear the badge. Holding `roles:admin`, you can
+recolour only groups you could have made,
+and a group you could not stays exactly where it is in the order, with nothing moving
+past it. **A badge is public**: everyone on the server is told every badge, guests too,
+whoever holds it. What the group behind it is called is not.
+
+**Groups the move from Discord made** ([MOVING.md](MOVING.md)) come in two kinds. A role's
+plain group has its badge, colour and order, and hands out nothing, so nobody gains a privilege
+by what Discord said. If that role could do something on Discord, a second group,
+`<role>-power`, holds the matching privileges and is given to nobody until an admin presses OK
+for that person, with a code. The first is what the claim gives; the second waits. A later
+import follows Discord for a plain group's badge, colour and order, and leaves its name, since
+gates go by the name.
+
+### The moderation log
+
+*Server admin → Moderation log* shows who did what to whom, to holders of
+`voipc:modlog`. A row is written for a kick from the server, a ban (one row, also when
+it covers both an address and an account) and a lifted ban, in the app or from the
+server's shell, a moderator's kick from a channel, a cleared profile, a deleted
+channel, a banned member's posts removed, and a moderator's invite to a room. A channel's creator kicking or inviting someone takes no privilege and writes
+no row. Each step writes its row first: if the row cannot be kept, the step does not
+happen. A hide and a restore are different: the server cannot see them, so the row is
+the moderator's own app saying so, marked as such. It can be left out by a changed app,
+and at most 120 of one moderator's stay per hour.
+
+- **Nobody can change or delete a row from the app**, and the relay has no step that
+  would. This protects against moderators, not the owner: whoever holds the database
+  can change it.
+- **Rows go after `modlog_days`** (180 by default), by time alone. That is also how long
+  the names in them stay: a row keeps the names of the accounts it mentions after those
+  accounts are deleted, so that a ban can still be explained. A device's address is
+  never in it.
+- **It keeps what was masked masked.** Someone behind a pseudonym is written down by the
+  pseudonym with no account, whoever acted on them, an admin too. An admin's ban shows
+  the real name in the ban list to admins only; anyone else with the list sees the
+  pseudonym there too. An admin's removal of their posts deletes by the account too, and
+  still says only the pseudonym to everyone else.
+- **The reason for a restriction** shows only to a reader who also holds `voipc:restrict`,
+  as it does on the person's mark. Every other row's reason shows to every reader.
+- **A channel shows by name only to someone who can see it**: an admin, or someone its
+  gate lets in, and for a channel that hides its members only an admin. To everyone
+  else the row says "a channel you cannot see". A temporary or deleted channel shows to
+  admins only. The row itself is there for every reader.
+- **Hiding a message is the moderator's own word.** The relay cannot see inside
+  messages, so its row only says what the moderator's app reported, and is marked so. It
+  always names the account that sent it, so it cannot accuse anyone else, but a modified
+  app could leave it out or make it up. There are at most 120 such notes an hour for
+  each account, and they never push another row out.
+
+Giving someone `voipc:modlog` alone spares them nothing: they can still be kicked.
 
 ## Channel gates
 
@@ -132,12 +332,15 @@ empty means everyone, guests too.
 
 A ban covers the address someone connects from (an IPv4 address, or the IPv6
 /64), and with *Ban the account too* their account, from any address. Everyone
-behind a banned address is kept out, except accounts that hold a role here: they
-are let in after they sign in. The database keeps a keyed hash of a banned
+behind a banned address is kept out, except accounts that hold a privilege here
+(the spared kind, above): they are let in after they sign in. The database keeps
+a keyed hash of a banned
 address, never the address, so the list shows the name the person used. An
 admin can also ban an account by name from *Active bans*, and the shell can:
 `voipc-server ban add --account NAME` (or `--ip ADDR`, `--reason`, `--days`),
-`ban list`, `ban remove ID`.
+`ban list`, `ban remove ID`. By name, as in a kick, only an admin can ban someone
+who holds privileges. A banned account leaves every channel's stored log, so it gets
+no key written after that; it joins again like anyone else if the ban is lifted.
 
 From the server's shell. Each command reads `[accounts]` from the server's own
 config, given before the command — `voipc-server -c server.toml admin invite` —
@@ -165,6 +368,33 @@ counts at once.
 - **One password, one recovery key.** The app derives everything from your password:
   the secret the server checks, and the key to your vault. The password itself never
   leaves your device. A new account is shown a recovery key once; write it down.
+- **Reporting a message** (from its menu, not on your own). The dialog names who takes
+  reports here and who of them is away, and you can untick anyone you would rather not
+  tell, and say why. They see your name and the message as you have it; the server sees
+  that you wrote to them, not what. If the message has a file, the file goes too, and the
+  server can then see which conversation it came from, because it holds that same file
+  there: the dialog says so, and unticking the file sends the words only. The one who wrote
+  it is never told, and if they take reports themselves they are not offered. Someone away
+  gets it only if you keep it on the server, sealed, until they are back: you are asked in
+  the dialog, for this one report, also with your copies off, and it counts against your
+  quota as a kept message does. It stays open while you are muted, timed out or may only
+  read, since it is a direct message. It is closed during the wait for new members, like every direct message. From behind a
+  pseudonym it goes to those online only, and they see that pseudonym. A guest reaches
+  those online only. If nobody takes reports, the dialog says so and nothing is sent.
+- **What came from Discord.** On a server moved from Discord, a channel with old messages
+  offers them in a pane of its own, beside the conversation, labelled *Imported from Discord,
+  unverified. This server can read it.* They were never encrypted, and nobody signed them:
+  whoever runs the server could have changed them. Anyone standing in the channel can read and
+  search them, and the server sees what you search. It is not kept, nor who opened what. Your
+  device keeps none of it, and a reload forgets it. Sign in with that Discord, or link it, and
+  your own posts offer *Hide* and *Delete*, one by one or all at once under *Settings → Privacy
+  & data*. Hidden, only you see them, and whoever runs the server still has them; *Show* brings
+  them back. Deleted, they are gone from this server, and no later import brings them back, also if
+  you have left Discord by then, though a backup holds them until it ages out. A post of yours that
+  opened a thread stays for the replies in it, for others with no author and no words, and named
+  "Thread". Deleting your account takes them too. A moderator's
+  *Hide*, your block list and *Report* do not reach these rows; removing a banned member's posts
+  does, by when they were written. Only an admin deletes someone else's, and it takes a code.
 - **A new password.** *Your account → Password: Change* asks for the current one,
   and for a code when two-factor codes are on. *Forgot your password?* in the
   connect dialog sets a new one with the recovery key instead, again with a code
@@ -228,17 +458,35 @@ counts at once.
   drop their copies too. *Your account → Messages you kept here: Delete* removes
   them from every conversation (without tombstones). Either way, copies people's
   devices already have may stay, and a server can hold a tombstone back, though
-  it cannot make one up.
+  it cannot make one up. While you cannot write in that conversation (a timeout in a
+  channel, the wait for new members in a direct one) the bin does not offer the first,
+  and says why: a tombstone is a message, so the server would refuse it after your
+  rows had gone. It is back when that ends.
 - **Deleting your account.** *Your account → Delete account…* asks for the name,
   the password and, with codes on, a code. The vault, the messages the account
   kept, its keys, its memberships, sessions and remembered devices go from the
   server; the name is free for someone else, and people who pinned the old
   account are told the new one is another account. What others wrote to you
-  stays theirs until it expires, and so do their copies of what you wrote. The
+  stays theirs until it expires, and so do their copies of what you wrote. A row
+  of the moderation log naming the account stays until `modlog_days` are up. The
   last admin cannot delete itself: make another admin first.
 - **Kept copies follow the channel's rules.** In an announcement channel only its
   managers' copies are kept, slow mode paces copies as it paces posts, and a copy
   is only kept from inside the channel.
+- **Block** in a member's menu is yours alone. Their messages fold to one line that
+  *Show* opens, their direct messages, pokes and invites make no sound and raise
+  nothing, their conversation leaves your list, what they share of a channel's past
+  is not taken, and they are silenced in your call. Everything still arrives and is
+  kept, so unblocking brings it back, and a moderator's actions apply as before.
+  They are not told: an invite is left unanswered rather than declined, and a
+  message of theirs is delivered as usual. *Settings → Privacy & data* lists who you
+  blocked on the server on screen. Your list follows your account, sealed in the
+  vault, at most 200 people. As a guest it stays on this device and goes with a
+  browser's site data, and a guest you block is only a name: the block falls on
+  whoever uses that name next, and a guest can get past it with another. Nothing
+  changes in a channel where people go by pseudonyms, since going quiet for one
+  would say who it is. Someone blocked can still be heard for a moment as they join
+  a call, and still lights up as speaking.
 - **Verify identity** in a member's menu shows a safety number for the two of you.
   Compare it in person or on a call. If it matches, nobody stands between you,
   including the server. When somebody's identity changes, you are told — also when
@@ -247,11 +495,104 @@ counts at once.
   While the conversation runs on another key than the one pinned, there is no
   number to compare: reconnect to them first.
 
+### Display names and pictures
+
+In the account panel you can set a display name and a picture. People see
+`Robert Example @bobby`: the chosen name beside the account's, never instead of it.
+A display name cannot hold an `@`, end in a `#tag`, or be (or look like) another
+account's name. In an anonymous channel, or one hiding its members, people see
+neither. Holders of `voipc:profiles` who hold no less than you can clear them, and you can pick others.
+
+## Signing in with Discord, Google or Facebook
+
+Optional, and only where the relay has a web address with a certificate browsers accept, because the
+provider sends the browser back there. Without one, nothing changes and no buttons show. Instagram is not
+possible: its API serves professional accounts only. Facebook is there because the library has it, and is
+untested.
+
+**Setting it up.** Each relay registers its own application at each provider: no central service is
+involved. The redirect address is `https://<your host:port>/account/oauth/<discord|google|facebook>/cb`.
+
+```toml
+[accounts]
+public_url = "https://voice.example.org:9987"
+```
+
+```sh
+VOIPC_OAUTH_DISCORD_ID=…     VOIPC_OAUTH_DISCORD_SECRET=…
+VOIPC_OAUTH_GOOGLE_ID=…      VOIPC_OAUTH_GOOGLE_SECRET=…
+```
+
+**Signing in.** Account tab → *Continue with Discord*. The app shows a three-digit code and opens the
+provider; back on the relay's page, the person taps that code. Only then is the provider asked who it is. The
+code is against somebody sending you their link. It is not perfect (they can send the code along), which is
+why getting this far opens nothing yet:
+
+**A provider says who you are. It cannot unlock your messages.** The relay sees all a provider says, so no key
+may come from it. So a device that signs in this way needs one of these before it gets in at all:
+
+- on a device already remembered, nothing: its device key signs in, and the provider is not asked;
+- the **recovery key**, shown once when the account is opened;
+- **another of your devices**, online: it asks you to compare a six-digit code, then hands over the key.
+  Approving signs that device out here, as any sign-in on another device does;
+- **your password**, on an account that has one.
+
+Someone who has only your provider account therefore joins no channel, reads nothing, and does not take your
+connection over. They can ask your other device for the key, at most three times and then once per ten minutes:
+say no, and change that provider's password.
+
+**The first time** (an account nobody opened) the device makes the vault and shows the recovery key. Where
+sign-up is open, a provider nobody here knows gets to choose a name first; elsewhere it is told that no account
+uses that sign-in. A server can claim an account was never opened, to hide its vault and the pins in it, so a
+device that remembers the account refuses, and the dialog asks you to stop if you have used it before.
+
+### An account the move made for you
+
+A server moved from Discord ([MOVING.md](MOVING.md)) holds an account for each of its members,
+which nobody has opened. It has a name and groups, no password, and no vault. Choose *Continue
+with Discord*: the name screen starts with the name you had, or with the end of your Discord id
+after it if someone holds that or cleaning it took more than a dot away. You can change it this
+once, and you get a recovery key. From then on it is yours, as if you had made it. Someone already here should
+link Discord before the import, or their Discord lands on the new account and linking is refused.
+
+- **A claim gives** your name, your badges and what they open: the channels your roles passed on
+  Discord. The hide and delete buttons on your old posts too.
+- **It does not give power.** What your role could do on Discord waits for an admin's OK, and then
+  for two-factor codes on your account. With no password, you confirm with your provider first: the
+  question about codes has the button.
+- **The wait for new members** does not hold you if you were on the Discord server for the whole
+  wait when the import ran. Otherwise it counts from when you opened the account. A plain imported
+  group does not lift it.
+- **An account nobody opens** goes after `unclaimed_days` (90 by default), and frees its name. A
+  later import makes it anew for someone still on Discord, unless an admin left them out.
+- **Banned on Discord:** an account named `dc-<their Discord id>`, disabled, which anyone who may
+  read the account list can see, with four more characters if that name is taken. No name and no
+  reason come with it, unless an account of theirs was waiting and both those names are taken. It
+  covers that Discord id only: on an open server the person can come back another way.
+
+**Linking** an existing account: account panel → *Link*, with your password (and code). You can then sign in
+through the provider, and your password or recovery key still unlocks a new device. *Unlink* refuses the last way in.
+
+**Without a password**, what would ask for one asks for your two-factor code, or, without codes, for the
+provider again (*Confirm it's you* in the account panel, good for a few minutes). To add a password, use *Forgot
+your password?* with the recovery key.
+
+**Lost every device and the recovery key?** `voipc-server admin reclaim <name>` wipes the vault and identity so
+that the provider's sign-in opens the account anew. What it kept is gone, and everyone who knew it is warned.
+Accounts with a password are refused: this would lock them out.
+
+**A provider sign-in never replaces an identity**, not even with a two-factor code. Signing in with the password
+is what can.
+
 ## What the server learns
 
 From accounts:
 
 - account names
+- your display name and profile picture, which it can read and hands to anyone who
+  asks, guests too. It also sees whose picture each person fetches
+- for a linked provider, the provider's id for you and the name it gives. Never your email, and no provider
+  token is kept
 - an Argon2id hash of a secret derived from each password
 - identity public keys
 - the public keys of remembered devices
@@ -260,9 +601,24 @@ From accounts:
 - sign-in records with hashed IP addresses
 - each account's vault, which it cannot open without guessing the password: each
   guess costs 600,000 PBKDF2-SHA256 rounds, so a long password used nowhere else
-  is what protects it
+  is what protects it. Each item's name, write times and size are plain: it can see
+  that a list of blocked people (`item.blocks`) exists and changed, and how long it
+  is to the nearest kilobyte, never who is on it
 - bans: a keyed hash of each banned address (never the address), and banned
   accounts
+- that a connection asked who takes reports, and when. A report itself is a direct message:
+  it learns what it learns of any, so an ask followed by a burst of messages to the staff
+  says a report went. Never the text or the reason, and there is no row of a report anywhere.
+  Nor the writer or the channel, unless the report carries the message's file, which it does
+  until you untick it in the dialog: that same file is then listed under this conversation
+  and the one it came from, so the server can see which that was, and who posted it there
+- for an account the move from Discord made: that person's Discord id, when they joined that
+  server, the name they had, and whether they have come
+- the Discord ids it remembers not to import, with no name beside them
+- the moderation log: who did what to whom and why, by name, for `modlog_days`, also
+  after those accounts are deleted. Whose posts were removed goes out to everyone who
+  connects for that long, guests too, by account where it has one and by name, with who
+  did it and the time span, never the channel or the reason
 
 From kept messages:
 
@@ -271,7 +627,17 @@ From kept messages:
   direct message, the timer you chose)
 - which channels each account keeps
 
-It never learns the text or a key. The full list is in the README under
+From a Discord import:
+
+- the old messages, in the clear: text, names, Discord ids, reactions, pins and the names of files.
+  A row of someone anonymised as a former member has no name or id, though its text still says what
+  it says. Rows stay until someone removes them, or `archive_days` if it is set
+- who opens which archive and what they search for, at that moment. It keeps neither
+- whose hide or delete of their posts stands, with their Discord id, so that a re-run obeys it. A wish
+  has no end date, and an admin's app can read them all, as a run does to keep such posts out if
+  their author has left Discord by then
+
+Of everything but that import, it never learns the text or a key. The full list is in the README under
 *Data Transparency*.
 
 Sign-in lines in the server's own log name the address an account signed in
@@ -307,6 +673,15 @@ in [THREAT-MODEL.md](THREAT-MODEL.md)):
   the key over;
 - **keep a writer on an older key of their own** that still reaches somebody who
   left, which helps it only together with that person;
+- **show display names, pictures and a server name as it likes**: they are its word,
+  so they are no proof of who someone is. That is why your app always shows the
+  `@name` and the address beside them. Pictures are sanitized on your device first;
+- **say who takes reports**: it can name itself, which you see before anything goes and the
+  pins check, or say nobody does. On a report that reaches someone live, the reporter's name
+  is its word, as on any direct message, unless that moderator has met them. A kept one is
+  signed;
+- **hand out `@everyone`**: it says who may use it, and the text is hidden from it,
+  so it can make your app ring for a named member's message, not write that message;
 - **name accounts as it likes**: names are bound to people only through what
   your app pinned when it first met them, which is why a known name under a new
   account is reported;
@@ -330,6 +705,11 @@ in [THREAT-MODEL.md](THREAT-MODEL.md)):
 
 ## Not in this version
 
+- Files from a Discord server: their names come, not the files. New posts into an imported
+  thread: old threads are read-only in the pane. Report and hide on imported rows.
+- A shared queue of reports. They are direct messages to each moderator, because someone
+  outside a gated staff channel can neither post in it nor be handed its keys, and an open
+  one would show every report to its members.
 - Starting a direct conversation with an account that has not been online since
   you connected.
 - Keeping chat in the browser between visits. The browser keeps the server's copies

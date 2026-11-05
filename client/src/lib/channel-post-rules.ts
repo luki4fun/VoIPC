@@ -54,22 +54,44 @@ export type PostBlock = { kind: "announce" } | { kind: "slow"; remainingSecs: nu
  *
  * `lastSentAt` is when this client last sent there (ms), counted locally: the
  * server counts from when that post arrived, and gives half a second of grace
- * for the difference.
+ * for the difference. `unhurried`: slow mode does not hold them back (a holder
+ * of `voipc:hide`, whose hide is a post), though an announcement channel still does.
  */
 export function postBlock(
   channel: Pick<ChannelInfo, "text" | "announce" | "slow_mode_secs">,
   manager: boolean,
   lastSentAt: number | undefined,
   now: number,
+  unhurried = false,
 ): PostBlock | null {
   if (manager) return null;
   if (channel.text && channel.announce) return { kind: "announce" };
+  if (unhurried) return null;
   const secs = channel.slow_mode_secs ?? 0;
   if (secs > 0 && lastSentAt !== undefined) {
     const remainingSecs = Math.ceil((lastSentAt + secs * 1000 - now) / 1000);
     if (remainingSecs > 0) return { kind: "slow", remainingSecs };
   }
   return null;
+}
+
+/** What a hide's sender holds, as the relay says or the roster shows. */
+export interface Hider {
+  hide: boolean;
+  /** Holds `*`: alone acts on other holders. */
+  admin: boolean;
+}
+
+/**
+ * Whether a hide from `hider` counts on a message in `channel`. `writerIsMod`: the
+ * message is first-hand from someone holding a privilege, whom only an admin acts
+ * on, as with a kick; a member's copy naming them is hearsay and spares nobody.
+ *
+ * Nothing in an anonymous channel, where a hide would unmask its sender as staff.
+ */
+export function hideRight(channel: Pick<ChannelInfo, "anonymous">, hider: Hider, writerIsMod: boolean): boolean {
+  if (channel.anonymous || !(hider.hide || hider.admin)) return false;
+  return !writerIsMod || hider.admin;
 }
 
 /** A channel marked 18+ on a server the user has not confirmed their age for. */

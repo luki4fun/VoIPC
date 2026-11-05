@@ -12,23 +12,28 @@
   // .ctx-item and .ctx-vol-slider by hand. They came across unchanged.
 
   import { openDm } from "../stores/chat.js";
-  import { viewingVoice } from "../stores/channels.js";
+  import { channels, viewingVoice } from "../stores/channels.js";
+  import { blockedMember, toggleBlock } from "../stores/blocks.js";
   import { isAdmin, serverAddress } from "../stores/connection.js";
   import { showChatPane } from "../stores/platform.js";
   import { centreView } from "../stores/room.js";
-  import { canInvite, canKick, isCurrentChannelCreator, isPreviewing } from "../stores/roster.js";
+  import { canInvite, canKick, canSummon, isCurrentChannelCreator, isPreviewing } from "../stores/roster.js";
+  import { users } from "../stores/users.js";
   import { can } from "../stores/powers.js";
   import { selectedStrip, setUserVolume, toggleUserMute, userVolumes } from "../stores/mixer.js";
   import {
     adminAction,
     adminBanAccount,
+    adminDuration,
     adminReason,
+    adminRemovePosts,
     cancelAdminAction,
     cancelPoke,
     closeUserMenu,
     confirmAdminAction,
     inviteUser,
     kickUser,
+    liftRestriction,
     openAdminAction,
     openPokeDialog,
     pokeMessage,
@@ -39,6 +44,15 @@
     watchUser,
   } from "../stores/user-menu.js";
   import Icon from "./Icons.svelte";
+  import MemberName from "./MemberName.svelte";
+  import { adminError, adminOp, stepUp, stepUpCancelled, stepUpSays } from "../stores/admin-ops.js";
+  import { showAdminPanel, submitStepUp } from "../stores/admin-ui.js";
+  import { account, relayAccounts } from "../stores/account.js";
+  import { olderRelay } from "../stores/relay.js";
+  import { community, moderation, moves } from "../relay-rules.js";
+  import { removalHint, removalWindows } from "../modlog-rules.js";
+  import { restrictions } from "../stores/restrictions.js";
+  import { confirmAction } from "../stores/confirm.js";
   import { splitName, shortName } from "../username.js";
   import { invoke } from "@tauri-apps/api/core";
   import { account as ownAccount, showPrompt } from "../stores/account.js";
@@ -61,6 +75,13 @@
   // holds to that, for any privilege; the roster shows `voipc:channels`); in
   // their own channel a creator still kicks.
   const spared = $derived(!!menu && !$isAdmin && !!(menu.user.is_admin || menu.user.is_moderator));
+  // Only an admin here: the roster shows `voipc:channels` only, and a holder of that
+  // may well hold no more than we do (restrict.rs). The relay answers the rest with an error
+  const canRestrict = $derived(!!menu && ($isAdmin || !menu.user.is_admin) && $can("voipc:restrict") && moderation($olderRelay?.protocol ?? null));
+  // Not behind a pseudonym: a block there would say who it is
+  const canBlock = $derived(!!menu && !$channels.find((c) => c.channel_id === menu.user.channel_id)?.anonymous);
+  // Whoever stands in the room with us needs no invite; `users` is that room's roster
+  const summonable = $derived(!!menu && $canSummon && !$users.some((u) => u.user_id === menu.user.user_id));
 
   // Per-user volume lives in one store, shared with the mixer: this used to be
   // a component-local record, so the same person had two different volumes
@@ -99,6 +120,35 @@
       confirmAdminAction();
     }
   }
+
+  /** Cleared, the person may pick another: there is nothing to take back. */
+  async function clearProfile(id: number[]) {
+    // The server on screen now: the view may move while the question is up
+    const server = $serverAddress;
+    const yes = await confirmAction({
+      title: "Clear this person's display name and picture?",
+      body: "They can pick others.",
+      confirm: "Clear them",
+      danger: true,
+    });
+    if (yes) void adminOp({ ProfileReset: { id, name: true, picture: true } }, null, server);
+  }
+
+  // The panel asks for itself; from the ban dialog it may be shut, and for a moderator
+  // with no panel to open, the step would otherwise silently never happen.
+  let stepCode = $state("");
+  function confirmStep() {
+    submitStepUp(stepCode);
+    stepCode = "";
+  }
+  function cancelStep() {
+    const server = $serverAddress;
+    const said = stepUpCancelled($stepUp);
+    stepUp.of(server).set(null);
+    adminError.of(server).set(null);
+    stepCode = "";
+    addNotification(said, "warning");
+  }
 </script>
 
 <svelte:window onkeydown={menu ? handleContextMenuKeydown : undefined} />
@@ -114,7 +164,7 @@
       use:menuAction={{ onclose: closeUserMenu, label: shortName(menu.user.username) }}
     >
       <!-- Who exactly: the one place a name's tag is spelled out -->
-      <div class="ctx-title">{who.name}{#if who.tag}<span class="ctx-tag">#{who.tag}</span>{/if}</div>
+      <div class="ctx-title"><MemberName username={menu.user.username} account={menu.user.account} />{#if who.tag}<span class="ctx-tag">#{who.tag}</span>{/if}</div>
       <div class="ctx-separator"></div>
       <!-- Watching, the mixer and the volume are the call's, so only for
            somebody on the server carrying it: an id on another server is a
@@ -154,10 +204,16 @@
           <span>Mixer…</span>
         </button>
       {/if}
-      {#if $canInvite || (menu.idle && $isCurrentChannelCreator)}
+      {#if $canInvite || (menu.idle && $isCurrentChannelCreator) || summonable}
         <button class="ctx-item" onclick={() => { inviteUser(menu.user.user_id); closeUserMenu(); }}>
           <Icon name="invite" size={16} />
           <span>Invite to Channel</span>
+        </button>
+      {/if}
+      {#if canBlock}
+        <button class="ctx-item" onclick={() => { void toggleBlock($serverAddress, menu.user); closeUserMenu(); }}>
+          <Icon name="ban" size={16} />
+          <span>{$blockedMember(menu.user) ? "Unblock" : "Block"}</span>
         </button>
       {/if}
       {#if $canKick && !menu.idle && !(spared && !$isCurrentChannelCreator)}
@@ -167,8 +223,30 @@
           <span>Kick from channel</span>
         </button>
       {/if}
-      {#if ($can("voipc:kick") || $can("voipc:ban")) && !spared}
+      {#if $can("voipc:profiles") && $account && community($olderRelay?.protocol ?? null) && menu.user.account && !spared}
+        <button class="ctx-item danger" onclick={() => { const id = menu.user.account!; closeUserMenu(); void clearProfile(id); }}>
+          <Icon name="close" size={16} />
+          <span>Clear display name and picture</span>
+        </button>
+      {/if}
+      {#if canRestrict || (($can("voipc:kick") || $can("voipc:ban")) && !spared)}
         <div class="ctx-separator"></div>
+      {/if}
+      {#if canRestrict}
+        <button class="ctx-item danger" onclick={() => { openAdminAction(menu.user, "mute", 3600, "Mute voice"); closeUserMenu(); }}>
+          <Icon name="mic-off" size={16} />
+          <span>Mute voice…</span>
+        </button>
+        <button class="ctx-item danger" onclick={() => { openAdminAction(menu.user, "timeout", 3600, "Time out"); closeUserMenu(); }}>
+          <Icon name="hourglass" size={16} />
+          <span>Time out…</span>
+        </button>
+        {#if $restrictions.get(menu.user.user_id)?.by}
+          <button class="ctx-item" onclick={() => { void liftRestriction(menu.user.user_id); closeUserMenu(); }}>
+            <Icon name="mic-on" size={16} />
+            <span>Lift mute or timeout</span>
+          </button>
+        {/if}
       {/if}
       {#if $can("voipc:kick") && !spared}
         <button class="ctx-item danger" onclick={() => { openAdminAction(menu.user, "kick", 0, "Kick from server"); closeUserMenu(); }}>
@@ -251,10 +329,51 @@
         </div>
         {#if $adminAction.hasAccount}
           <label class="admin-check">
-            <input type="checkbox" bind:checked={$adminBanAccount} />
+            <input type="checkbox" bind:checked={$adminBanAccount} disabled={$adminRemovePosts !== null} />
             <span>Ban the account too, from any address</span>
           </label>
         {/if}
+        {#if $account && $relayAccounts && moderation($olderRelay?.protocol ?? null)}
+          <label class="admin-check">
+            <span>Also remove their posts</span>
+            <select
+              class="remove-posts"
+              bind:value={$adminRemovePosts}
+              onchange={() => { if ($adminRemovePosts !== null) adminBanAccount.set(true); }}
+            >
+              <option value={null}>No</option>
+              {#each removalWindows($can("*")) as [secs, label] (secs)}
+                <option value={secs}>{label}</option>
+              {/each}
+            </select>
+          </label>
+          {#if $adminRemovePosts !== null}
+            <div class="admin-hint remove-posts-hint">{removalHint($adminAction.hasAccount, moves($olderRelay?.protocol ?? null))}</div>
+          {/if}
+        {/if}
+      {/if}
+      {#if $adminAction.kind === "mute" || $adminAction.kind === "timeout"}
+        <div class="admin-hint">
+          {$adminAction.kind === "mute"
+            ? "They can read and write, and nobody hears them."
+            : "They can read, and cannot speak, post, poke, invite or set a name or picture."} They can still write
+          direct messages. Everyone sees that they are held, by whom and until when; only they and moderators see why.
+          {#if !$adminAction.hasAccount}
+            Someone with no account goes by address, for every guest there, for a day at most.
+          {/if}
+        </div>
+        <label class="admin-check">
+          <span>For</span>
+          <select class="restrict-duration" bind:value={$adminDuration} aria-label="How long">
+            <option value={600}>10 minutes</option>
+            <option value={3600}>1 hour</option>
+            <option value={86400}>24 hours</option>
+            {#if $adminAction.hasAccount}
+              <option value={604800}>7 days</option>
+              <option value={0}>Until someone lifts it</option>
+            {/if}
+          </select>
+        </label>
       {/if}
       <!-- svelte-ignore a11y_autofocus -->
       <input
@@ -269,9 +388,24 @@
       />
       <div class="poke-dialog-actions">
         <button class="poke-cancel-btn" onclick={cancelAdminAction}>Cancel</button>
-        <button class="poke-send-btn btn btn-danger" onclick={confirmAdminAction}>{$adminAction.kind === "kick" ? "Kick" : "Ban"}</button>
+        <button class="poke-send-btn btn btn-danger" onclick={confirmAdminAction}>{{ kick: "Kick", ban: "Ban", mute: "Mute", timeout: "Time out" }[$adminAction.kind]}</button>
       </div>
     </div>
+  </div>
+{/if}
+
+{#if $stepUp && !$showAdminPanel}
+  <div class="poke-overlay" onclick={backdrop(cancelStep)} role="presentation">
+    <form class="poke-dialog step-up-dialog" onsubmit={(e) => { e.preventDefault(); confirmStep(); }} use:dialog={{ onclose: cancelStep }}>
+      <div class="poke-dialog-header dialog-title">Confirm with a code</div>
+      <div class="admin-hint">{stepUpSays($stepUp)} Enter a code from your authenticator app; it holds for ten minutes.</div>
+      <!-- svelte-ignore a11y_autofocus -->
+      <input class="poke-input" inputmode="numeric" autocomplete="one-time-code" placeholder="123456" aria-label="Two-factor code" bind:value={stepCode} autofocus />
+      <div class="poke-dialog-actions">
+        <button type="button" class="poke-cancel-btn" onclick={cancelStep}>Cancel</button>
+        <button type="submit" class="poke-send-btn btn btn-primary" disabled={!stepCode.trim()}>Confirm</button>
+      </div>
+    </form>
   </div>
 {/if}
 

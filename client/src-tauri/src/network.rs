@@ -501,6 +501,10 @@ pub async fn connect_to_server(
 
     // Store the active connection
     let tcp = tcp_tx.clone();
+    // A provider's sign-in only knows now who it is
+    let username = account
+        .as_ref()
+        .map_or(username, |link| link.session().name().to_string());
     let connection = ActiveConnection {
         account: account.clone(),
         files,
@@ -702,6 +706,21 @@ fn end_screen_share(c: &mut ActiveConnection) -> bool {
     std::mem::replace(&mut c.is_screen_sharing, false)
 }
 
+/// How we hear each person, on a connection leaving voice: a user id is somebody
+/// else next time. The mixer's stores forget them at this point too (`clearMixer`),
+/// so someone left silent here would stay so with the UI at 100%. Not on a move
+/// between this server's rooms. `audio.attach` does the same in the browser.
+fn forget_people(c: &ActiveConnection) {
+    c.user_volumes
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
+    c.user_fx
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
+}
+
 /// This connection's server confirmed a voice channel: voice is here now.
 ///
 /// The latest confirmation wins. If another server held voice, it is left
@@ -739,6 +758,7 @@ async fn claim_voice(app: &tauri::AppHandle, server: &str, is_voice: &Arc<Atomic
         if other.watching_user_id_shared.swap(0, Ordering::Relaxed) != 0 {
             let _ = send_tcp_message(&other.tcp_tx, &ClientMessage::StopWatchingScreenShare).await;
         }
+        forget_people(other);
         // A game driving the old room is detached now, before this claim
         // lets a `hello` waiting on this server return and subscribe afresh.
         // Left for the old server's leave to do, the Detached would land on
@@ -790,6 +810,7 @@ async fn leave_voice(
         .filter(|c| Arc::ptr_eq(&c.is_voice, is_voice))
     {
         end_screen_share(c);
+        forget_people(c);
     }
     if clear_voice(&state, server) {
         release_holds(app);
@@ -964,6 +985,12 @@ impl ControlTx {
         self.tx.is_closed()
     }
 
+    /// Done when the connection's writer has gone.
+    #[cfg(not(target_os = "android"))]
+    pub async fn closed(&self) {
+        self.tx.closed().await
+    }
+
     /// Queues `msg`, one entry per frame so the pacer counts what the relay
     /// does. A message the relay's protocol lacks is refused here.
     pub fn send(&self, msg: &ClientMessage) -> Result<(), String> {
@@ -993,7 +1020,7 @@ pub async fn send_tcp_message(tcp_tx: &ControlTx, msg: &ClientMessage) -> Result
     tcp_tx.send(msg)
 }
 
-fn parse_address(address: &str) -> Result<(String, u16), String> {
+pub(crate) fn parse_address(address: &str) -> Result<(String, u16), String> {
     let (host, port_str) = if address.starts_with('[') {
         // IPv6: [::1]:9987
         let bracket_end = address
@@ -1529,6 +1556,89 @@ async fn handle_server_message(
                     "viewer reported frame loss"
                 );
             }
+        }
+        ServerMessage::ChannelLayout {
+            categories,
+            channels,
+        } => {
+            emit_server(
+                app_handle,
+                server,
+                "channel-layout",
+                serde_json::json!({ "categories": categories, "channels": channels }),
+            );
+        }
+        ServerMessage::Profiles { profiles } => {
+            emit_server(app_handle, server, "profiles", &profiles);
+        }
+        ServerMessage::ProfilePicture { hash, image } => {
+            emit_server(
+                app_handle,
+                server,
+                "profile-picture",
+                serde_json::json!({ "hash": hash, "image": image }),
+            );
+        }
+        ServerMessage::ServerProfile {
+            name,
+            description,
+            icon,
+        } => {
+            emit_server(
+                app_handle,
+                server,
+                "server-profile",
+                serde_json::json!({ "name": name, "description": description, "icon": icon }),
+            );
+        }
+        ServerMessage::MentionPower { user_ids, on } => {
+            emit_server(
+                app_handle,
+                server,
+                "mention-power",
+                serde_json::json!({ "user_ids": user_ids, "on": on }),
+            );
+        }
+        ServerMessage::Restrictions { list } => {
+            emit_server(
+                app_handle,
+                server,
+                "restrictions",
+                serde_json::json!({ "list": list }),
+            );
+        }
+        ServerMessage::ChatMods { mods } => {
+            emit_server(
+                app_handle,
+                server,
+                "chat-mods",
+                serde_json::json!({ "mods": mods }),
+            );
+        }
+        ServerMessage::PostsHidden { marks } => {
+            emit_server(
+                app_handle,
+                server,
+                "posts-hidden",
+                serde_json::json!({ "marks": marks }),
+            );
+        }
+        ServerMessage::ReportTakers { takers } => {
+            if let Some(link) = account {
+                link.session().note_takers(&takers);
+            }
+            emit_server(
+                app_handle,
+                server,
+                "report-takers",
+                serde_json::json!({ "takers": takers }),
+            );
+        }
+        ServerMessage::MyBadges { badges } => {
+            emit_server(app_handle, server, "my-badges", &badges);
+        }
+        ServerMessage::GroupStyles { groups } => {
+            emit_server(app_handle, server, "group-styles", &groups);
         }
         ServerMessage::ChannelList { channels } => {
             set_channels(channels_snapshot, channels.clone());
@@ -2465,6 +2575,19 @@ async fn handle_server_message(
                 server,
                 "admin-bans",
                 serde_json::json!({"bans": bans}),
+            );
+        }
+        ServerMessage::AdminBansPaged {
+            search,
+            offset,
+            total,
+            bans,
+        } => {
+            emit_server(
+                app_handle,
+                server,
+                "admin-bans-page",
+                serde_json::json!({"search": search, "offset": offset, "total": total, "bans": bans}),
             );
         }
         ServerMessage::Disconnected { reason } => {

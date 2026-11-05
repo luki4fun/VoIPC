@@ -25,8 +25,14 @@
 # bob fetches and checks byte for byte; FILE_KIB=0 sends none, for comparing
 # voice with and without a transfer.
 #
+# SIDE_BY_SIDE=1 runs test-ui.mjs and the other browser lanes at the same time,
+# SIDE_BY_SIDE=0 one after another. Unset, it is 1 with 8 or more cores (nproc):
+# each lane brings its own relay and browsers. CI sets it itself on its 4 cores.
+#
 # Prerequisites: VOIPC_SELFTEST=1 npm run web (a release bundle has no self-test),
-# openssl, curl with HTTP/2, and either chromium (CHROME=/path/to/chrome) or,
+# cargo build --release --locked -p voipc-server --example import_replay (the move
+# lane's importer; not with UI_TEST=0), openssl, curl with HTTP/2, and either
+# chromium (CHROME=/path/to/chrome) or,
 # for the Firefox lane, firefox (FIREFOX=...) plus certutil to trust the test
 # certificate (Arch: nss, Debian/Ubuntu: libnss3-tools).
 set -euo pipefail
@@ -48,6 +54,11 @@ annotate() { # title detail
 }
 die() { echo "$*" >&2; annotate "test-web" "$*"; exit 1; }
 failed_at=""
+lanes_running=()
+# UDP packets the kernel dropped for a full socket buffer, machine-wide. A relay's socket
+# overflowing is silent, and what it looks like is a connection that fails under load.
+udp_drops() { awk '/^Udp:/ { if (!c) { for (i = 1; i <= NF; i++) if ($i == "RcvbufErrors") c = i } else print $c }' /proc/net/snmp 2>/dev/null || echo 0; }
+udp_drops_before=$(udp_drops)
 # `wait` before rm: Chromium is still writing its profile when SIGTERM lands,
 # and under `set -e` a failing rm inside the trap would turn a green run red.
 # (Run by the EXIT trap; $(jobs -p) splits into pids on purpose.)
@@ -56,6 +67,12 @@ on_exit() {
   local status=$?
   kill $(jobs -p) 2>/dev/null || true
   wait 2>/dev/null || true
+  # Side by side a lane's output waits for its end: killed first (a CI step's
+  # timeout), this is the only place a hang can be read from.
+  for lane in "${lanes_running[@]}"; do
+    echo "--- $lane did not finish; its output so far:"
+    cat "$WORK/$lane.txt" 2>/dev/null || true
+  done
   if [ "$status" -ne 0 ] && [ "$annotated" = 0 ]; then
     echo "test-web: exit $status${failed_at:+ at line $failed_at}" >&2
     annotate "test-web ${BROWSER_ALICE:-} -> ${BROWSER_BOB:-}" "$(
@@ -111,6 +128,8 @@ SERVER="${SERVER:-target/release/voipc-server}"
 [ -x "$SERVER" ] || die "$SERVER missing — run VOIPC_SELFTEST=1 npm run web first"
 grep -qs SELFTEST client/dist-web/assets/*.js ||
   die "client/dist-web has no self-test — rebuild with VOIPC_SELFTEST=1 npm run web"
+[ "${UI_TEST:-1}" = 0 ] || [ -x target/release/examples/import_replay ] ||
+  die "import_replay missing — cargo build --release --locked -p voipc-server --example import_replay"
 
 TCP_PORT="${TCP_PORT:-19987}"
 DURATION="${DURATION:-15000}"
@@ -245,8 +264,9 @@ run_browser alice talker "&channel=e2e&textchannel=e2e-text&dm=bob&admin=e2e-adm
 # the channel, alice is the late joiner who gets the empty history, and the only
 # check that fails is the one that names neither cause ("bob joined via the
 # invite link" passes on a channel he created himself).
-# alice logs early-chat-sent once her message is in her own history.
-for _ in $(seq 1 300); do
+# alice logs early-chat-sent once her message is in her own history. With UDP blocked she
+# gives up on QUIC first, which took a cold runner over 30 s.
+for _ in $(seq 1 900); do
   if grep -q 'SELFTEST early-chat-sent' "$WORK/alice.log"; then break; fi
   sleep 0.1
 done
@@ -358,30 +378,104 @@ fi
 if [ "${UI_TEST:-1}" = 0 ]; then
   echo "--- UI regression skipped (UI_TEST=0)"
 elif [ "$BROWSER_ALICE" = chromium ] || [ "$BROWSER_BOB" = chromium ]; then
-  echo "--- UI regression (test-ui.mjs)"
   UI_CDP="${UI_CDP:-9229}"
-  "$CHROME" --headless=new --no-sandbox --disable-gpu --ignore-certificate-errors \
-    --use-fake-ui-for-media-stream --use-fake-device-for-media-stream \
-    --autoplay-policy=no-user-gesture-required --remote-debugging-port="$UI_CDP" \
-    --user-data-dir="$WORK/profile-ui" about:blank > "$WORK/ui-browser.log" 2>&1 &
-  ui_browser=$!
-  for _ in $(seq 1 50); do
-    curl -s "http://127.0.0.1:$UI_CDP/json/version" > /dev/null 2>&1 && break
-    sleep 0.2
+  # Two browsers: the accounts lane in test-ui.mjs runs beside its others.
+  # Timers on time in the tabs behind (they still get no frames): which tab is in
+  # front follows the last real input, and a debounce there must not take a second.
+  # No check is about a throttled timer.
+  ui_browsers=()
+  for cdp in "$UI_CDP" "$((UI_CDP + 1))"; do
+    "$CHROME" --headless=new --no-sandbox --disable-gpu --ignore-certificate-errors \
+      --use-fake-ui-for-media-stream --use-fake-device-for-media-stream \
+      --autoplay-policy=no-user-gesture-required --disable-background-timer-throttling \
+      --remote-debugging-port="$cdp" --user-data-dir="$WORK/profile-ui-$cdp" about:blank > "$WORK/ui-browser-$cdp.log" 2>&1 &
+    ui_browsers+=($!)
+    for _ in $(seq 1 50); do
+      curl -s "http://127.0.0.1:$cdp/json/version" > /dev/null 2>&1 && break
+      sleep 0.2
+    done
   done
-  # 2>&1: a crash's stack trace goes to stderr, and it is the whole story
-  if node "$SCRIPT_DIR/test-ui.mjs" "$TCP_PORT" "$UI_CDP" "$TCP_PORT2" "$TCP_PORT3" 2>&1 | tee "$WORK/ui.txt"; then
-    echo "PASS the UI survives creating and configuring a proximity channel"
-  else
-    echo "FAIL the UI regression test" | tee -a "$WORK/fails.txt"
-    { grep '^FAIL' "$WORK/ui.txt"; grep -v '^PASS\|^FAIL' "$WORK/ui.txt" | tail -n 15; } >> "$WORK/fails.txt" || true
-    fail=1
+
+  # A new lane is one add_lane. Base ports are 200 apart: a lane's relays take its
+  # base and the next one, its browsers +100 and up (moderation has reached +110),
+  # and side by side they must not meet. The next lane takes the next multiple.
+  lanes=()
+  declare -A lane_args lane_heading lane_passed lane_failed lane_pid
+  add_lane() { # name "script args" heading says-when-passed says-when-failed
+    lanes+=("$1"); lane_args[$1]=$2; lane_heading[$1]=$3; lane_passed[$1]=$4; lane_failed[$1]=$5
+  }
+  add_lane ui "test-ui.mjs $TCP_PORT $UI_CDP $TCP_PORT2 $TCP_PORT3 $((UI_CDP + 1))" "UI regression (test-ui.mjs)" \
+    "the UI survives creating and configuring a proximity channel" "the UI regression test"
+  add_lane provider "test-provider.mjs $((TCP_PORT + 200))" "Sign-in with a provider (test-provider.mjs)" \
+    "sign-in with a provider, in real browsers" "the provider sign-in lane"
+  add_lane community "test-community.mjs $((TCP_PORT + 400))" "Community basics (test-community.mjs)" \
+    "community basics, in real browsers" "the community lane"
+  add_lane moderation "test-moderation.mjs $((TCP_PORT + 600))" "Moderation and safety (test-moderation.mjs)" \
+    "moderation and safety, in real browsers" "the moderation lane"
+  add_lane move "test-move.mjs $((TCP_PORT + 800))" "The move from Discord (test-move.mjs)" \
+    "the move from Discord, in real browsers" "the move lane"
+  # exec: the job's pid has to be node itself, which the EXIT trap can stop.
+  # TMPDIR: profiles and downloads go with $WORK.
+  # shellcheck disable=SC2086
+  run_lane() { CHROME="$CHROME" TMPDIR="$WORK" exec node "$SCRIPT_DIR/"${lane_args[$1]}; }
+  # A lane has ended: its verdict, and on a failure what it said goes to fails.txt
+  lane_verdict() { # name exit-status
+    if [ "$2" = 0 ]; then
+      echo "PASS ${lane_passed[$1]}"
+    else
+      echo "FAIL ${lane_failed[$1]}" | tee -a "$WORK/fails.txt"
+      { grep '^FAIL' "$WORK/$1.txt"; grep -v '^PASS\|^FAIL' "$WORK/$1.txt" | tail -n 15; } >> "$WORK/fails.txt" || true
+      fail=1
+    fi
+    if [ "$1" = ui ]; then kill "${ui_browsers[@]}" 2>/dev/null || true; fi
+    echo "--- $1 ended at ${SECONDS}s"
+  }
+
+  # test-ui.mjs starts with the others, not after them: it reads what the self-test
+  # left behind, and an empty channel goes after empty_channel_timeout_secs (5
+  # minutes). 2>&1 everywhere: a crash's stack trace goes to stderr, and it is the
+  # whole story.
+  side_by_side="${SIDE_BY_SIDE:-}"
+  if [ -z "$side_by_side" ]; then
+    if [ "$(nproc)" -ge 8 ]; then side_by_side=1; else side_by_side=0; fi
   fi
-  kill "$ui_browser" 2>/dev/null || true
+  if [ "$side_by_side" = 1 ]; then
+    echo "--- ${#lanes[@]} lanes side by side on $(nproc) cores; each prints whole when it ends"
+    for lane in "${lanes[@]}"; do
+      run_lane "$lane" > "$WORK/$lane.txt" 2>&1 &
+      lane_pid[$lane]=$!
+      # Their relays and browsers come up hardest: all at once on 4 cores, one lost its
+      # first connection. A lane takes minutes, so this costs next to nothing.
+      sleep 5
+    done
+    lanes_running=("${lanes[@]}")
+    while [ "${#lanes_running[@]}" -gt 0 ]; do
+      sleep 1
+      still=()
+      for lane in "${lanes_running[@]}"; do
+        if kill -0 "${lane_pid[$lane]}" 2>/dev/null; then still+=("$lane"); continue; fi
+        echo "--- ${lane_heading[$lane]}"
+        cat "$WORK/$lane.txt"
+        if wait "${lane_pid[$lane]}"; then status=0; else status=$?; fi
+        lane_verdict "$lane" "$status"
+      done
+      lanes_running=("${still[@]}")
+    done
+  else
+    for lane in "${lanes[@]}"; do
+      echo "--- ${lane_heading[$lane]}"
+      # tee: here a hang still shows how far it got
+      if run_lane "$lane" 2>&1 | tee "$WORK/$lane.txt"; then status=0; else status=$?; fi
+      lane_verdict "$lane" "$status"
+    done
+  fi
 else
   echo "--- UI regression skipped (needs Chromium for the DevTools protocol)"
 fi
 
+udp_drops_after=$(udp_drops)
+udp_dropped=$(( ${udp_drops_after:-0} - ${udp_drops_before:-0} ))
+echo "--- UDP packets dropped for a full socket buffer during this run: $udp_dropped"
 echo "--- server log tail"; tail -20 "$WORK/server.log"
 
 # Everything above is in the job log; the failure goes into an annotation too
@@ -389,6 +483,7 @@ echo "--- server log tail"; tail -20 "$WORK/server.log"
 if [ "$fail" -ne 0 ]; then
   annotate "test-web $BROWSER_ALICE -> $BROWSER_BOB" "$(
     cat "$WORK/fails.txt"
+    echo "--- UDP packets dropped for a full socket buffer during this run: $udp_dropped"
     echo "--- alice"; tail -20 "$WORK/alice.txt"
     echo "--- bob";   tail -20 "$WORK/bob.txt")"
 fi

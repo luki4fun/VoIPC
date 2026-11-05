@@ -1,0 +1,40 @@
+[
+  {
+    "id": "1190000000000003000",
+    "name": "pog",
+    "roles": [],
+    "require_colons": true,
+    "managed": false,
+    "animated": false,
+    "available": true
+  },
+  {
+    "id": "1190000000000003001",
+    "name": "party_blob",
+    "roles": [
+      "1190000000000000108"
+    ],
+    "require_colons": true,
+    "managed": false,
+    "animated": true,
+    "available": true
+  },
+  {
+    "id": "1190000000000003002",
+    "name": "Cool Emote",
+    "roles": [],
+    "require_colons": true,
+    "managed": false,
+    "animated": false,
+    "available": true
+  },
+  {
+    "id": "1190000000000003003",
+    "name": "old_one",
+    "roles": [],
+    "require_colons": true,
+    "managed": false,
+    "animated": false,
+    "available": false
+  }
+]

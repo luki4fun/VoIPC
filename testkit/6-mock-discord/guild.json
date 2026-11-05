@@ -1,0 +1,15 @@
+{
+  "id": "1190000000000000001",
+  "name": "The Fixture Club",
+  "icon": null,
+  "owner_id": "1190000000000001009",
+  "mfa_level": 1,
+  "rules_channel_id": "1190000000000000215",
+  "system_channel_id": "1190000000000000210",
+  "premium_tier": 2,
+  "approximate_member_count": 11,
+  "approximate_presence_count": 5,
+  "roles": [],
+  "emojis": [],
+  "features": []
+}

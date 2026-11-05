@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { ago, archivedPeers, closeMarkKey, lastSaid, listRows, liveIdOf, reach, writeToId } from "./dm-rules.ts";
+import { ago, archivedPeers, closeMarkKey, dmCountsUnread, lastSaid, listRows, liveIdOf, reach, writeToId } from "./dm-rules.ts";
 import type { ChatMessage, UserInfo } from "./types.ts";
 
 const S = "h.example:9987";
@@ -116,4 +116,36 @@ test("ago is short at every boundary", () => {
   assert.equal(ago(now - 365 * 86_400_000, now), "1y");
   // A clock behind the message's own is "now", not a negative time
   assert.equal(ago(now + 5_000, now), "now");
+});
+
+test("our own forward into a closed conversation is not unread", () => {
+  const closed = { onScreen: false, notice: false };
+  assert.equal(dmCountsUnread({ ...closed, echo: true }), false);
+  assert.equal(dmCountsUnread({ ...closed, echo: false }), true);
+  assert.equal(dmCountsUnread({ echo: false, onScreen: true, notice: false }), false);
+  assert.equal(dmCountsUnread({ echo: false, onScreen: false, notice: true }), false);
+});
+
+test("someone blocked stays off the list, unless theirs is the conversation open", () => {
+  const dms = new Map<string, ChatMessage[]>([
+    [`${S}/bob`, [msg("bob", 5)]],
+    [`${S}/eve`, [msg("eve", 6)]],
+  ]);
+  const rows = [
+    { username: "bob", unread: 2 },
+    { username: "eve", unread: 0 },
+  ];
+  const names = (active: string | null, blocked?: (r: { username: string }) => boolean) =>
+    listRows(rows, dms, S, new Map(), active, blocked).map((r) => r.convo.username);
+  const bob = (r: { username: string }) => r.username === "bob";
+  assert.deepEqual(names(null, bob), ["eve"], "even with unread messages");
+  assert.deepEqual(names("bob", bob), ["eve", "bob"], "the one open is listed");
+  assert.deepEqual(names(null), ["eve", "bob"], "the control: unblocked, it is back");
+});
+
+test("what someone blocked writes never makes a conversation unread", () => {
+  const m = { echo: false, onScreen: false, notice: false };
+  assert.equal(dmCountsUnread(m), true);
+  assert.equal(dmCountsUnread({ ...m, blocked: true }), false);
+  assert.equal(dmCountsUnread({ ...m, blocked: false }), true);
 });

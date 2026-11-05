@@ -1,0 +1,32 @@
+[
+  {
+    "id": "1190000000000003100",
+    "name": "wave",
+    "tags": "wave",
+    "type": 2,
+    "format_type": 1,
+    "description": null,
+    "available": true,
+    "guild_id": "1190000000000000001"
+  },
+  {
+    "id": "1190000000000003101",
+    "name": "dance",
+    "tags": "dance",
+    "type": 2,
+    "format_type": 4,
+    "description": null,
+    "available": true,
+    "guild_id": "1190000000000000001"
+  },
+  {
+    "id": "1190000000000003102",
+    "name": "vector",
+    "tags": "vector",
+    "type": 2,
+    "format_type": 3,
+    "description": null,
+    "available": true,
+    "guild_id": "1190000000000000001"
+  }
+]

@@ -1,0 +1,439 @@
+[
+  {
+    "id": "1190000000000000200",
+    "type": 4,
+    "guild_id": "1190000000000000001",
+    "name": "Talk",
+    "position": 0,
+    "parent_id": null,
+    "permission_overwrites": []
+  },
+  {
+    "id": "1190000000000000201",
+    "type": 4,
+    "guild_id": "1190000000000000001",
+    "name": "Voice rooms",
+    "position": 1,
+    "parent_id": null,
+    "permission_overwrites": []
+  },
+  {
+    "id": "1190000000000000202",
+    "type": 4,
+    "guild_id": "1190000000000000001",
+    "name": "Help",
+    "position": 2,
+    "parent_id": null,
+    "permission_overwrites": []
+  },
+  {
+    "id": "1190000000000000210",
+    "type": 0,
+    "guild_id": "1190000000000000001",
+    "name": "general",
+    "position": 0,
+    "parent_id": "1190000000000000200",
+    "permission_overwrites": [
+      {
+        "id": "1190000000000000104",
+        "type": 0,
+        "allow": "0",
+        "deny": "2048"
+      }
+    ],
+    "topic": "Say hello. A place for everything that does not fit anywhere else: films, food, what you did at the weekend, and the odd question nobody has an answer to yet. A place for everything that does not fit anywhere else: films, food, what you did at the weekend, and the odd question nobody has an answer to yet. A place for everything that does not fit anywhere else: films, food, what you did at the weekend, and the odd question nobody has an answer to yet. ",
+    "nsfw": false,
+    "last_message_id": "1200000000000001005",
+    "rate_limit_per_user": 0
+  },
+  {
+    "id": "1190000000000000211",
+    "type": 0,
+    "guild_id": "1190000000000000001",
+    "name": "lounge",
+    "position": 1,
+    "parent_id": "1190000000000000200",
+    "permission_overwrites": [],
+    "topic": "A place for everything that does not fit anywhere else: films, food, what you did at the weekend, and the odd question nobody has an answer to yet. A place for everything that does not fit anywhere else: films, food, what you did at the weekend, and the odd question nobody has an answer to yet. A place for everything that does not fit anywhere else: films, food, what you did at the weekend, and the odd question nobody has an answer to yet. ",
+    "nsfw": false,
+    "last_message_id": "1200000000000005019",
+    "rate_limit_per_user": 5
+  },
+  {
+    "id": "1190000000000000212",
+    "type": 0,
+    "guild_id": "1190000000000000001",
+    "name": "staff",
+    "position": 2,
+    "parent_id": "1190000000000000200",
+    "permission_overwrites": [
+      {
+        "id": "1190000000000000001",
+        "type": 0,
+        "allow": "0",
+        "deny": "1024"
+      },
+      {
+        "id": "1190000000000000105",
+        "type": 0,
+        "allow": "1024",
+        "deny": "0"
+      },
+      {
+        "id": "1190000000000000101",
+        "type": 0,
+        "allow": "1024",
+        "deny": "0"
+      },
+      {
+        "id": "1190000000000000102",
+        "type": 0,
+        "allow": "1024",
+        "deny": "0"
+      },
+      {
+        "id": "1190000000000001002",
+        "type": 1,
+        "allow": "1024",
+        "deny": "0"
+      }
+    ],
+    "topic": "Staff only.",
+    "nsfw": false,
+    "last_message_id": "1200000000000007002",
+    "rate_limit_per_user": 0
+  },
+  {
+    "id": "1190000000000000213",
+    "type": 0,
+    "guild_id": "1190000000000000001",
+    "name": "vault",
+    "position": 3,
+    "parent_id": "1190000000000000200",
+    "permission_overwrites": [
+      {
+        "id": "1190000000000000001",
+        "type": 0,
+        "allow": "0",
+        "deny": "1024"
+      }
+    ],
+    "topic": "Nobody passes this.",
+    "nsfw": false,
+    "last_message_id": "1200000000000007101",
+    "rate_limit_per_user": 0
+  },
+  {
+    "id": "1190000000000000214",
+    "type": 0,
+    "guild_id": "1190000000000000001",
+    "name": "teams",
+    "position": 4,
+    "parent_id": "1190000000000000200",
+    "permission_overwrites": [
+      {
+        "id": "1190000000000000001",
+        "type": 0,
+        "allow": "0",
+        "deny": "1024"
+      },
+      {
+        "id": "1190000000000000110",
+        "type": 0,
+        "allow": "1024",
+        "deny": "0"
+      },
+      {
+        "id": "1190000000000000111",
+        "type": 0,
+        "allow": "1024",
+        "deny": "0"
+      },
+      {
+        "id": "1190000000000000112",
+        "type": 0,
+        "allow": "1024",
+        "deny": "0"
+      },
+      {
+        "id": "1190000000000000113",
+        "type": 0,
+        "allow": "1024",
+        "deny": "0"
+      },
+      {
+        "id": "1190000000000000114",
+        "type": 0,
+        "allow": "1024",
+        "deny": "0"
+      },
+      {
+        "id": "1190000000000000115",
+        "type": 0,
+        "allow": "1024",
+        "deny": "0"
+      },
+      {
+        "id": "1190000000000000116",
+        "type": 0,
+        "allow": "1024",
+        "deny": "0"
+      },
+      {
+        "id": "1190000000000000117",
+        "type": 0,
+        "allow": "1024",
+        "deny": "0"
+      },
+      {
+        "id": "1190000000000000118",
+        "type": 0,
+        "allow": "1024",
+        "deny": "0"
+      },
+      {
+        "id": "1190000000000000119",
+        "type": 0,
+        "allow": "1024",
+        "deny": "0"
+      },
+      {
+        "id": "1190000000000000120",
+        "type": 0,
+        "allow": "1024",
+        "deny": "0"
+      },
+      {
+        "id": "1190000000000000121",
+        "type": 0,
+        "allow": "1024",
+        "deny": "0"
+      },
+      {
+        "id": "1190000000000000122",
+        "type": 0,
+        "allow": "1024",
+        "deny": "0"
+      },
+      {
+        "id": "1190000000000000123",
+        "type": 0,
+        "allow": "1024",
+        "deny": "0"
+      },
+      {
+        "id": "1190000000000000124",
+        "type": 0,
+        "allow": "1024",
+        "deny": "0"
+      },
+      {
+        "id": "1190000000000000125",
+        "type": 0,
+        "allow": "1024",
+        "deny": "0"
+      },
+      {
+        "id": "1190000000000000126",
+        "type": 0,
+        "allow": "1024",
+        "deny": "0"
+      },
+      {
+        "id": "1190000000000000127",
+        "type": 0,
+        "allow": "1024",
+        "deny": "0"
+      },
+      {
+        "id": "1190000000000000128",
+        "type": 0,
+        "allow": "1024",
+        "deny": "0"
+      },
+      {
+        "id": "1190000000000000129",
+        "type": 0,
+        "allow": "1024",
+        "deny": "0"
+      }
+    ],
+    "topic": "Twenty roles are let in here.",
+    "nsfw": false,
+    "last_message_id": "1200000000000007201",
+    "rate_limit_per_user": 0
+  },
+  {
+    "id": "1190000000000000215",
+    "type": 5,
+    "guild_id": "1190000000000000001",
+    "name": "news",
+    "position": 5,
+    "parent_id": "1190000000000000200",
+    "permission_overwrites": [
+      {
+        "id": "1190000000000000001",
+        "type": 0,
+        "allow": "0",
+        "deny": "2048"
+      },
+      {
+        "id": "1190000000000000102",
+        "type": 0,
+        "allow": "2048",
+        "deny": "0"
+      }
+    ],
+    "topic": "Announcements. A place for everything that does not fit anywhere else: films, food, what you did at the weekend, and the odd question nobody has an answer to yet. A place for everything that does not fit anywhere else: films, food, what you did at the weekend, and the odd question nobody has an answer to yet. A place for everything that does not fit anywhere else: films, food, what you did at the weekend, and the odd question nobody has an answer to yet. ",
+    "nsfw": false,
+    "last_message_id": "1200000000000007301",
+    "rate_limit_per_user": 0
+  },
+  {
+    "id": "1190000000000000216",
+    "type": 0,
+    "guild_id": "1190000000000000001",
+    "name": "old-logs",
+    "position": 6,
+    "parent_id": "1190000000000000200",
+    "permission_overwrites": [
+      {
+        "id": "1190000000000000001",
+        "type": 0,
+        "allow": "0",
+        "deny": "65536"
+      }
+    ],
+    "topic": "People could see this, not read back.",
+    "nsfw": false,
+    "last_message_id": "1200000000000007401",
+    "rate_limit_per_user": 0
+  },
+  {
+    "id": "1190000000000000217",
+    "type": 0,
+    "guild_id": "1190000000000000001",
+    "name": "after-dark",
+    "position": 7,
+    "parent_id": "1190000000000000200",
+    "permission_overwrites": [
+      {
+        "id": "1190000000000000104",
+        "type": 0,
+        "allow": "0",
+        "deny": "1088"
+      }
+    ],
+    "topic": "Not for the muted.",
+    "nsfw": true,
+    "last_message_id": "1200000000000007501",
+    "rate_limit_per_user": 0
+  },
+  {
+    "id": "1190000000000000220",
+    "type": 2,
+    "guild_id": "1190000000000000001",
+    "name": "General",
+    "position": 0,
+    "parent_id": "1190000000000000201",
+    "permission_overwrites": [],
+    "bitrate": 64000,
+    "user_limit": 10,
+    "rtc_region": null,
+    "last_message_id": "1200000000000007601"
+  },
+  {
+    "id": "1190000000000000221",
+    "type": 2,
+    "guild_id": "1190000000000000001",
+    "name": "lounge",
+    "position": 1,
+    "parent_id": "1190000000000000201",
+    "permission_overwrites": [],
+    "bitrate": 64000,
+    "user_limit": 0,
+    "rtc_region": null,
+    "last_message_id": null
+  },
+  {
+    "id": "1190000000000000222",
+    "type": 13,
+    "guild_id": "1190000000000000001",
+    "name": "townhall",
+    "position": 2,
+    "parent_id": "1190000000000000201",
+    "permission_overwrites": [],
+    "bitrate": 64000,
+    "user_limit": 0,
+    "rtc_region": null,
+    "last_message_id": null
+  },
+  {
+    "id": "1190000000000000223",
+    "type": 2,
+    "guild_id": "1190000000000000001",
+    "name": "music",
+    "position": 3,
+    "parent_id": "1190000000000000201",
+    "permission_overwrites": [
+      {
+        "id": "1190000000000000001",
+        "type": 0,
+        "allow": "0",
+        "deny": "512"
+      },
+      {
+        "id": "1190000000000000108",
+        "type": 0,
+        "allow": "512",
+        "deny": "0"
+      }
+    ],
+    "bitrate": 64000,
+    "user_limit": 0,
+    "rtc_region": null,
+    "last_message_id": null
+  },
+  {
+    "id": "1190000000000000230",
+    "type": 15,
+    "guild_id": "1190000000000000001",
+    "name": "help",
+    "position": 0,
+    "parent_id": "1190000000000000202",
+    "permission_overwrites": [],
+    "topic": "Ask here. A place for everything that does not fit anywhere else: films, food, what you did at the weekend, and the odd question nobody has an answer to yet. A place for everything that does not fit anywhere else: films, food, what you did at the weekend, and the odd question nobody has an answer to yet. A place for everything that does not fit anywhere else: films, food, what you did at the weekend, and the odd question nobody has an answer to yet. ",
+    "nsfw": false,
+    "last_message_id": "1200000000000006001",
+    "rate_limit_per_user": 0,
+    "available_tags": [
+      {
+        "id": "1190000000000004000",
+        "name": "solved",
+        "moderated": false
+      }
+    ]
+  },
+  {
+    "id": "1190000000000000231",
+    "type": 16,
+    "guild_id": "1190000000000000001",
+    "name": "gallery",
+    "position": 1,
+    "parent_id": "1190000000000000202",
+    "permission_overwrites": [],
+    "topic": "Pictures. A place for everything that does not fit anywhere else: films, food, what you did at the weekend, and the odd question nobody has an answer to yet. A place for everything that does not fit anywhere else: films, food, what you did at the weekend, and the odd question nobody has an answer to yet. A place for everything that does not fit anywhere else: films, food, what you did at the weekend, and the odd question nobody has an answer to yet. ",
+    "nsfw": false,
+    "last_message_id": null,
+    "rate_limit_per_user": 0
+  },
+  {
+    "id": "1190000000000000240",
+    "type": 14,
+    "guild_id": "1190000000000000001",
+    "name": "directory",
+    "position": 3,
+    "parent_id": null,
+    "permission_overwrites": []
+  }
+]

@@ -74,10 +74,27 @@ pub const CONTROL_MSGS_PER_SEC: u32 = 50;
 /// v16: groups — UserInfo.badges, AccountRequest::Admin/AdminOp,
 ///      AccountReply::Admin/AdminReply (users, groups and their privileges,
 ///      invites, channel gates), UserUpdated, ListenOnly
+/// v17: sign-in with a provider — AccountStart::Providers/Provider/ProviderResume,
+///      AccountStart::ProviderStatus, AuthStep::Providers/OpenBrowser/
+///      ProviderPending/ProviderReady/ProviderSignup/ProviderSigned/PairNonce/
+///      PairWrapped/PairRefused,
+///      AuthContinue::ProviderSignup/Claim/ProviderProof/PairStart/PairReveal,
+///      AccountRequest::ProviderList/ProviderStart/ProviderUnlink/PairNonce/
+///      PairApprove/PairDecline, AccountReply::Providers/ProviderBrowser/
+///      ProviderDone/ProviderUnlinked/PairAsked/PairRevealed/PairEnded
+/// v18: community basics — AdminOp::ChannelSave/ChannelDelete/CategorySave/
+///      CategoryDelete/LayoutSet/WelcomeSet, AdminReply::ChannelDone, ChannelLayout
+/// v19: moderation and safety — AdminOp::ModLog/ModNote/RemovePosts,
+///      AdminReply::ModLog/PostsRemoved, AdminRestrict, Restrictions, ChatMods,
+///      PostsHidden, ReportTakersGet, ReportTakers
+/// v20: the move from Discord — AdminOp::Import*/Move*/Power*/ArchiveDelete and their
+///      AdminReply answers, AccountRequest::ArchiveFetch/ArchiveSearch/ArchiveMine,
+///      AccountReply::ArchivePage/ArchiveHits/ArchiveMineDone, AdminBansPage,
+///      AdminBansPaged
 ///
 /// A relay admits only its own protocol; an app speaks its own down to
 /// `compat::OLDEST_RELAY_PROTOCOL` (1.6).
-pub const PROTOCOL_VERSION: u32 = 16;
+pub const PROTOCOL_VERSION: u32 = 20;
 
 /// Application version, read from Cargo.toml at compile time.
 /// Single source of truth: workspace root `Cargo.toml` `[workspace.package] version`.

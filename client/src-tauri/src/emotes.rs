@@ -4,7 +4,8 @@
 //! file is fetched once, checked against its hash, and kept here only as the
 //! PNG this app's sanitizer wrote for it (`media::sanitize`): the relay's
 //! bytes, or an admin's, never reach the page. An admin's import goes through
-//! `prepare_emote` (what to upload, and what to preview) and `emote_add`.
+//! `prepare_emote` (what to upload, and what to preview) and `emote_add`, and
+//! a move from Discord through the same `prepare` and `add` under them.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -18,7 +19,7 @@ use voipc_protocol::messages::ClientMessage;
 use voipc_protocol::types::Emote;
 
 use crate::app_state::AppState;
-use crate::files::{body_bytes, files_of};
+use crate::files::{body_bytes, files_of, Files};
 
 /// How long the relay has to answer an add.
 const ANSWER_TIME: Duration = Duration::from_secs(30);
@@ -224,14 +225,68 @@ struct Prepare {
     max_bytes: usize,
 }
 
+/// A picture made ready to add.
+pub(crate) struct Prepared {
+    /// What to upload.
+    pub upload: Vec<u8>,
+    /// The sanitized preview, and its still (empty if it does not move).
+    pub preview: Vec<u8>,
+    pub still: Vec<u8>,
+    pub w: u32,
+    pub h: u32,
+    pub frames: usize,
+    pub how: &'static str,
+    pub stilled: Option<&'static str>,
+}
+
+/// What goes up is this app's own re-encoding when it fits (no metadata of
+/// the file goes to the server), else the file as it is when that fits, else
+/// the re-encoding with frames dropped until it fits.
+pub(crate) async fn prepare(
+    src: Vec<u8>,
+    sticker: bool,
+    max_bytes: usize,
+) -> Result<Prepared, String> {
+    let p = profile(sticker);
+    let full = crate::media::sanitize(src.clone(), p, p.max_output(), Motion::default()).await?;
+    // The file as it is goes without its metadata: emotes are readable by
+    // every member. Where that cannot be (a turned JPEG), it is made again
+    let bare = voipc_media::strip(&src)
+        .ok()
+        .filter(|b| b.len() <= max_bytes);
+    // Too long to move (shown as its first frame, `Clean::stilled`): that
+    // frame goes up, never the whole animation every member would stop too
+    let (upload, how) = if full.stilled.is_some() {
+        if full.png.len() <= max_bytes {
+            (full.png.clone(), "still")
+        } else {
+            let fit = crate::media::sanitize(src, p, max_bytes, Motion::default()).await?;
+            (fit.png, "still")
+        }
+    } else if full.png.len() <= max_bytes && !full.trimmed {
+        (full.png.clone(), "clean")
+    } else if let Some(bare) = bare {
+        (bare, "original")
+    } else {
+        let fit = crate::media::sanitize(src, p, max_bytes, Motion::default()).await?;
+        (fit.png, if fit.frames > 1 { "trimmed" } else { "still" })
+    };
+    Ok(Prepared {
+        upload,
+        still: full.still.unwrap_or_default(),
+        preview: full.png,
+        w: full.w,
+        h: full.h,
+        frames: full.frames,
+        how,
+        stilled: full.stilled,
+    })
+}
+
 /// A picture an admin picked, made ready to add: what to upload, and the
 /// sanitized preview to show for it. Answered as a JSON head (its length in
 /// the first four bytes, little-endian) and then the upload, the preview and
 /// the preview's still, back to back.
-///
-/// What goes up is this app's own re-encoding when it fits (no metadata of
-/// the file goes to the server), else the file as it is when that fits, else
-/// the re-encoding with frames dropped until it fits.
 #[tauri::command]
 pub async fn prepare_emote(
     request: tauri::ipc::Request<'_>,
@@ -243,42 +298,18 @@ pub async fn prepare_emote(
         .and_then(|v| serde_json::from_str(v).ok())
         .ok_or("prepare_emote needs its x-voipc-prepare header")?;
     let src = body_bytes(&request, "prepare_emote")?;
-    let p = profile(args.sticker);
-    let full = crate::media::sanitize(src.clone(), p, p.max_output(), Motion::default()).await?;
-    // The file as it is goes without its metadata: emotes are readable by
-    // every member. Where that cannot be (a turned JPEG), it is made again
-    let bare = voipc_media::strip(&src)
-        .ok()
-        .filter(|b| b.len() <= args.max_bytes);
-    // Too long to move (shown as its first frame, `Clean::stilled`): that
-    // frame goes up, never the whole animation every member would stop too
-    let (upload, how) = if full.stilled.is_some() {
-        if full.png.len() <= args.max_bytes {
-            (full.png.clone(), "still")
-        } else {
-            let fit = crate::media::sanitize(src, p, args.max_bytes, Motion::default()).await?;
-            (fit.png, "still")
-        }
-    } else if full.png.len() <= args.max_bytes && !full.trimmed {
-        (full.png.clone(), "clean")
-    } else if let Some(bare) = bare {
-        (bare, "original")
-    } else {
-        let fit = crate::media::sanitize(src, p, args.max_bytes, Motion::default()).await?;
-        (fit.png, if fit.frames > 1 { "trimmed" } else { "still" })
-    };
-    let still = full.still.clone().unwrap_or_default();
+    let made = prepare(src, args.sticker, args.max_bytes).await?;
     let head = serde_json::json!({
-        "w": full.w, "h": full.h, "frames": full.frames, "how": how,
-        "upload": upload.len(), "preview": full.png.len(), "still": still.len(),
-        "stilled": full.stilled,
+        "w": made.w, "h": made.h, "frames": made.frames, "how": made.how,
+        "upload": made.upload.len(), "preview": made.preview.len(), "still": made.still.len(),
+        "stilled": made.stilled,
     })
     .to_string();
     let mut out = (head.len() as u32).to_le_bytes().to_vec();
     out.extend_from_slice(head.as_bytes());
-    out.extend_from_slice(&upload);
-    out.extend_from_slice(&full.png);
-    out.extend_from_slice(&still);
+    out.extend_from_slice(&made.upload);
+    out.extend_from_slice(&made.preview);
+    out.extend_from_slice(&made.still);
     Ok(tauri::ipc::Response::new(out))
 }
 
@@ -417,8 +448,43 @@ struct Add {
     h: u16,
 }
 
-/// Add an emote (admins): the bytes are what `prepare_emote` said to upload.
-/// Done when the relay has it; its list follows as an `emote-list` event.
+/// Add an emote: the bytes are what `prepare` said to upload. Done when the
+/// relay has it; its list follows as an `emote-list` event.
+pub(crate) async fn add(
+    files: &Files,
+    name: String,
+    sticker: bool,
+    pack: String,
+    (w, h): (u16, u16),
+    bytes: &[u8],
+) -> Result<(), String> {
+    let hash = sha256(bytes);
+    let answer = files.wait_emote(&name, hash);
+    files.send_msg(&ClientMessage::EmoteAdd {
+        emote: Emote {
+            name,
+            hash,
+            sticker,
+            pack,
+            len: bytes.len() as u32,
+            w,
+            h,
+        },
+    })?;
+    let ticket = match tokio::time::timeout(ANSWER_TIME, answer).await {
+        Ok(Ok(answer)) => answer?,
+        _ => return Err("the server did not answer".into()),
+    };
+    let Some(ticket) = ticket else { return Ok(()) };
+    let (status, body) = files.emote_request("PUT", &hash, &ticket, bytes).await?;
+    if status == 201 {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&body).into_owned())
+    }
+}
+
+/// Add an emote (admins), as `add` does.
 #[tauri::command]
 pub async fn emote_add(
     state: State<'_, AppState>,
@@ -432,30 +498,15 @@ pub async fn emote_add(
         .ok_or("emote_add needs its x-voipc-emote header")?;
     let bytes = body_bytes(&request, "emote_add")?;
     let files = files_of(&state, &args.server).await?;
-    let hash = sha256(&bytes);
-    let answer = files.wait_emote(&args.name, hash);
-    files.send_msg(&ClientMessage::EmoteAdd {
-        emote: Emote {
-            name: args.name,
-            hash,
-            sticker: args.sticker,
-            pack: args.pack,
-            len: bytes.len() as u32,
-            w: args.w,
-            h: args.h,
-        },
-    })?;
-    let ticket = match tokio::time::timeout(ANSWER_TIME, answer).await {
-        Ok(Ok(answer)) => answer?,
-        _ => return Err("the server did not answer".into()),
-    };
-    let Some(ticket) = ticket else { return Ok(()) };
-    let (status, body) = files.emote_request("PUT", &hash, &ticket, &bytes).await?;
-    if status == 201 {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&body).into_owned())
-    }
+    add(
+        &files,
+        args.name,
+        args.sticker,
+        args.pack,
+        (args.w, args.h),
+        &bytes,
+    )
+    .await
 }
 
 /// Remove emotes (admins), any number in one message; what the server does

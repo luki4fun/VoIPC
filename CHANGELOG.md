@@ -2,6 +2,245 @@
 
 All notable changes to VoIPC are documented here.
 
+## [1.11.0] - release candidate
+
+Protocol 20. This app still talks to relays back to 1.0 (protocol 12), and on an older relay holds back what its
+other apps could not read.
+
+### Fixed
+- **A slow or busy device no longer loses the relay's last word.** The relay closed a connection the moment the far end's
+  network layer had its last message, which threw it away if the app had not read it yet, and a sign-in answer, a refusal or
+  a kick reason became "Connection lost". It now waits for the app to hang up, for up to 5 seconds.
+- **A busy relay no longer drops packets for want of room.** Its UDP socket sat at the system's default of 212 KiB, and what
+  did not fit was lost without a word: 340,000 packets in one soak at 2000 clients, which slowed every join and could lose
+  a connection. It now asks for 8 MiB, and warns at start if the system gives less: see *How big one relay goes* in
+  OPERATING.md for the one setting.
+
+### Added
+- **What someone deleted, and what closed on Discord, stay that way through a move.** Every run and *Go on* read Discord's
+  channels and roles again first, and the relay refuses a channel closed there while its gate here is open. A hide or a
+  delete holds through a later run and an undo with a new run, for someone who has left Discord too, and a thread's title
+  goes with it.
+- **Move a Discord server here**, from *Server admin → Discord move* in the desktop app: channels and categories in
+  their order, roles and channel permissions, members, bans, emotes and stickers, and old messages with their threads,
+  pins and reactions. A dry-run says what it will do first and writes nothing. A later run takes what is new, Stop
+  loses nothing, and Undo takes back what a run made. A network cut keeps the wizard where it stood, with Go on. The
+  bot's token stays in memory, goes to discord.com only, and never
+  reaches the server. The browser and Android show a card saying why, and everything below it. Read
+  [docs/MOVING.md](docs/MOVING.md) first: it has what Discord's rules say and who answers for what.
+- **Old messages are not end to end encrypted, and say so.** They were never encrypted, so this server can read them.
+  They stay out of the conversation, in a pane labelled "Imported from Discord, unverified. This server can read it.",
+  with its own search, threads and pins, for whoever stands in the channel. Nothing of it stays on a device. A private
+  channel's history comes only if the owner ticks it, and then only someone with `*` can open its gate. One closed on
+  Discord after a run is refused until it has a gate here.
+- **People come in with Discord.** The move holds an account for each member. *Continue with Discord* opens it, with the
+  name they choose and their badges and gates, on `invite` and `closed` servers too. An account nobody opens goes after
+  `unclaimed_days` (`[accounts]`, 90 by default, 0 is never), and frees its name.
+- **Power waits for an OK.** Whatever a role could do on Discord goes into a group of its own that nobody holds until the
+  owner says OK for that person, with a code. The dashboard counts who has come and lists who waits. A delta never
+  widens anything, and an `admin reclaim` of such an account sends it back to waiting. An undo and a new run never link
+  Discord back to someone who took it off, nor disable them.
+- **Your posts are yours to take back.** Sign in with that Discord and hide or delete your own imported posts, one by
+  one or all at once under *Settings → Privacy & data*. What you delete stays gone through a later run, or an undo and a new
+  one, also if you have left Discord by then, and a thread you opened then keeps nothing of yours, only a way in to the
+  replies. An owner can delete by Discord id on request, or leave someone out before the first run. A ban with removal takes
+  imported posts in its span too, by when they were written, and the delete and ban dialogs say so.
+- **The Users tab filters** by who signed in, waits or was banned on Discord, with a chip on each row. *Lift ban* on a
+  banned row ends that ban here, and no later import brings it back.
+- **`archive_days`** in `[accounts]` (0 by default) says how long what came from Discord is kept, by when it was
+  written. 0 keeps it until someone removes it.
+
+### Changed
+- **Active bans come in pages,** with a search by name and *Show more*. Past some hundreds of rows the list used to be
+  too long for one message, and silently never arrived.
+- **Password reset** answers the same for an account nobody has opened as for one somebody has.
+
+### Fixed
+- A text channel called `general` can be made and edited in the app, as one from `channels.json` always could. A voice
+  channel still cannot take the lobby's name.
+- Saving a group is refused when the groups' list would no longer fit one message, and says so. It used to succeed,
+  and the panel then silently stopped getting the list.
+- A group a channel's gate names cannot be deleted by writing its name another way, such as ` CREW `, which only a
+  modified app could send.
+- Someone with no password, back on a remembered device, can turn two-factor codes on: the question now offers to
+  confirm with their provider. It used to tell them to sign in with a password they did not have.
+
+## [1.10.0] - release candidate
+
+Protocol 19. This app still talks to relays back to 1.0 (protocol 12), and on an older relay holds back what its
+other apps could not read.
+
+### Added
+- **Four new privileges** in the group editor, for the moderation tools: `voipc:restrict`, `voipc:hide`,
+  `voipc:reports` and `voipc:modlog`.
+- **A moderation log** for holders of `voipc:modlog`, under *Server admin*: who kicked, banned or lifted a ban, in the
+  app or from the shell, kicked someone from a channel, cleared a profile, deleted a channel or invited someone to a
+  room, when and why. Nobody can
+  change or delete a row from the app, and a step whose row cannot be kept does not happen. Rows go after `modlog_days`
+  (`[accounts]`, 180 by default), and until then keep the names of accounts since deleted. Someone behind a pseudonym
+  stays behind it, whoever acted, and a channel the reader cannot see is not named.
+- **Block someone**, from their menu. Their messages fold to one line you can open and light no dot on a stream's chat
+  button, their direct messages, pokes, invites and shared history stay quiet, and you do not hear them in a call.
+  Nothing is deleted, so unblocking brings it all back. *Settings → Privacy & data* lists who you blocked on that
+  server. They are not told, and the server is told nothing: an account keeps the list sealed in its vault, where the server sees only that it changed and about how
+  long it is; a guest keeps it on the device. A block does nothing where people go by pseudonyms, and it stops no
+  moderator's action.
+- **Mute and timeout**, for holders of `voipc:restrict`, from someone's menu, for ten minutes up to until someone lifts
+  it. A mute stops their voice and screen share, and a running share stops. A timeout stops those and their posts,
+  reactions, pins, edits and deletes included, as well as pokes, invites, new channels, and setting a display name or
+  picture. Direct messages stay open, so someone held can still appeal. While you cannot write in a conversation, the
+  bin there does not offer to delete what you wrote from the server's copy, and says why: other people's devices could
+  not be asked to drop theirs. The server enforces it from the first packet after a reconnect, and it outlasts a
+  restart on a relay with accounts. Everyone sees a mark with who and until when; only the person and holders of the
+  privilege see why. Setting and lifting one write a row in the moderation log, whose reason shows only to a reader who
+  holds that privilege too. You act on anyone holding no more than you do, and never on yourself; a guest goes by
+  address, for at most a day, and never binds an account there, nor an admin there by the server's token. A guest off
+  posts who connects again goes by `guest` and their tag, since a name is public text.
+- **Hide a message**, for holders of `voipc:hide`, from its menu. It collapses to "Removed by" whoever did it with
+  *Show anyway* for everyone reading the channel, and *Restore* takes it back. Nothing is deleted: anyone can still open
+  it, though it stays out of search, pins and Files, and an honest app hands it to nobody asking for the channel's past.
+  It still counts after a reload with the moderator offline, read from the channel's stored log; without a log, or with
+  the moderator's copies off, it reaches only those online, and the action says so. Only an admin hides what someone
+  holding a privilege wrote. There is no hide in a direct message or an anonymous channel. Slow mode does not hold a
+  holder back, since a hide is a post. Each hide and restore writes a row in the moderation log, marked as the
+  moderator's own word. For this, the server now tells everyone, guests too, every account holding a privilege, by id
+  without names: a server could use that to name a fake moderator, whose worst is a false line and one extra click.
+- **Ban and remove their posts**, with *Also remove their posts* in the ban dialog, under *Ban an account*, and as
+  *Remove posts* on each row of *Active bans*: the last hour, day or seven days, and for an admin everything kept. It
+  takes a fresh code, asked for right there even with the admin panel shut, and only works on someone banned now. What
+  the server keeps of their channel messages is deleted for good and stays deleted when the ban ends; their direct
+  messages are not touched, being the other party's too. Copies on devices cannot be deleted: everyone is told, also on
+  their next connect for as long as the moderation log keeps the row, and those copies collapse to "This server says"
+  whoever "removed this with a ban", with *Show anyway*. That line is the server's word, which no moderator signs, so a
+  hostile server could use it to hide a message behind one extra click, never to erase one. Only an admin removes the
+  posts of someone holding a privilege. Each removal writes a row in the moderation log saying how many went, or
+  neither happens. A guest has nothing kept: their removal only hides by name. So does a moderator's removal by a
+  pseudonym, where a real name tried against that ban answers as for someone not banned; an admin's deletes by the
+  account, and everyone is still told only the pseudonym. A ban's address row reaches the account's posts too when that
+  account is banned, and its hint says so. A limited window can bring back an older message they deleted or edited,
+  for devices reading the log anew. Files they attached leave the server when they age out.
+- **Invite someone to the room you stand in**, for holders of `voipc:channels`, from their menu, in any room, also one
+  from `channels.json`, which had no one who could. Accepting passes the room's password, which that privilege could
+  change anyway; a gate still holds, and someone outside it is neither asked nor told the room's name. It is an invite,
+  so nobody is moved without saying yes, and you hear the answer, not the room's creator. It cannot be sent from behind
+  a pseudonym. Each one writes a row in the moderation log.
+- **Report a message**, from its menu, to whoever holds `voipc:reports`, a moderator in a hidden channel too. The dialog
+  names who would get it and who of them is away, and you can untick anyone and say why. Each gets a direct message with
+  the message as you have it, under a line saying who it is from and that the rest is that person's word, and what their
+  own copy says: it matches, it says otherwise, it was edited since, or they have none. Someone away gets it when you
+  keep it on the server, sealed, until they are back, which you are asked for that one report, also with your copies off.
+  There is no queue: a moderator can forward a report into a staff channel, and it stays a report, though a member
+  handing over that channel's history passes it on as a plain forward. The dialog closes if you move to another server,
+  whose takers are not this report's. The writer is never told, never offered as someone to report to, and someone
+  muted, timed out or only reading can still report. The text stays out of system notifications. The server answers who takes reports and passes a direct message like any other: it
+  keeps no report, and sees neither the text, your reason, the writer nor the channel. The exception is a message with a
+  file: the file goes too by default, and since the server holds that same file in the conversation it came from, it can
+  then see which one that was. The dialog says so, and unticking the file sends the words only. Admins take reports, and
+  so does the moderator group.
+- **A wait for new members**, off by default: `new_member_wait_mins` in `server_settings.json` holds voice, posts and
+  direct messages for that long after an account is made or a guest first comes from an address, and a guest counts as
+  new again once the wait and one more day have gone by since their last visit. Admins, holders of a privilege and
+  anyone in a group other than `user` do not wait, so giving a group ends it at once.
+
+### Changed
+- **A pseudonym has eight digits now**, `Guest-48213907`, so that removing someone's posts by theirs does not also hide
+  what somebody else wrote under the same name.
+- **The moderator group** of a new server hands those four out too. On an existing server it gains them once, on the
+  first start of this version, and only if it still holds exactly the old default (`voipc:ban`, `voipc:channels`,
+  `voipc:kick`); the server's log says so, and relay self-update can make this happen unattended. A group someone
+  has edited is left as it is, and a privilege taken away afterwards is never given back. Giving the group out now
+  takes those four as well, as giving any group takes what it hands out.
+- **Holding only `voipc:reports` or `voipc:modlog` spares nobody** from a kick or an address ban, as with
+  `voipc:mention_all`: they act on nobody.
+
+### Fixed
+- **The group editor on an older relay** offers only the privileges that relay has heard of. Ticking `voipc:profiles`
+  or `voipc:mention_all` on a relay before 1.9 had the whole group refused.
+- **Someone's volume on the desktop** no longer outlasts the call. Leaving voice on a server, or moving it to another
+  server, now clears each person's volume and voice effect in the audio engine, as the browser always did. Someone you
+  had muted, or unblocked while out of the call, stayed silent when you rejoined while their slider said 100%.
+- **A ban from the server's shell** could leave the account in a channel's stored log if it came back before the running
+  server had read the ban, so writers went on wrapping new keys to it. It is taken out again when the server reads the
+  ban.
+
+## [1.9.0] - release candidate
+
+Protocol 18. A 1.9 app still talks to relays back to 1.0 (protocol 12), and on an older relay holds back what its
+other apps could not read. Needs l4f-accounts v0.13.0.
+
+### Added
+- **Channels made in the app** that stay until someone deletes them, with **categories** and an order, by anyone
+  holding `voipc:channels`, on a relay with accounts. Those from `channels.json` stay the file's, and can be placed
+  and ordered too. A **welcome channel** opens the first time someone comes to a server.
+- **A group's colour and place**: its badge in that colour, and the member list sections people by their top group.
+  Nobody climbs over a group they could not have made. A group's section can be turned off.
+- **Display names and profile pictures**, shown beside the `@name` and never instead of it. A name cannot pass for
+  another account's. Other people's pictures reach the screen only through the picture sanitizer, like any file.
+  `voipc:profiles` clears those of someone holding no more than its holder.
+- **What a server calls itself**: a name, description and icon, set by an admin (or `server_name` and
+  `server_description` in `server_settings.json`, without accounts). Always shown above the address, and never kept
+  in a bookmark.
+- **Invite links**: one link for many people, with a limit, an expiry and a starting group, on a relay of any sign-up
+  mode but `closed`. Each sign-up still solves the proof of work. It works with a password or through a provider, and
+  an admin's invite code now works through a provider too, also on an invite-only relay.
+- **`@everyone`, `@here` and `@&badge`**, from members holding `voipc:mention_all`. Every client decides for itself
+  and only for a message arriving live: nothing rings later for what happened while away, and a stored copy or
+  history handed over never has that power.
+- **Channel notifications**: all, mentions or nothing, per channel. Channels over 50 people start on mentions.
+
+### Fixed
+- `signups_per_hour` raised one of l4f's two sign-up limits, so a move could still be refused at the lower one.
+- A pin from a moderator outside your voice room was dropped: their rights were looked up among the people in that
+  room rather than in the channel.
+- Someone holding `voipc:channels` but outside a channel's gate could change that channel's password and options by
+  its id, though it was hidden from them.
+- A privilege given at the moment another check of that account was under way could be undone by the older answer,
+  until the next periodic check.
+- Two groups with the same badge stopped the member list for everyone showing someone in both.
+- A 1.8 app asked a 1.5 or 1.6 relay for a channel's gate, which it could not answer.
+- On Postgres, a channel with a very long uid could not have its gate kept.
+- In an anonymous channel, a stale roster could tag someone's message with their account, and your own header showed
+  your display name beside your pseudonym.
+- Whoever held the ban list without being an admin could ban an admin or a moderator by name.
+- A moderator's ban kept the real name of someone standing behind a pseudonym, for whoever read the ban list next.
+- A banned account stayed in the channels' stored logs, so the writers went on wrapping new keys to it.
+- Someone who lost the right to speak while sharing their screen was not told, and their app went on capturing.
+- After a relay restart, whoever got the old id of someone allowed to call on everybody could do so until they signed in again.
+- The group editor offered Profiles and Call on everybody on relays that refuse a group holding them.
+- Forwarding a message into a closed direct conversation marked it unread.
+- The nightly check of older relays named releases that do not exist yet.
+
+## [1.8.0] - release candidate
+
+Protocol 17. A 1.8 app still talks to relays back to 1.0 (protocol 12); there it offers no sign-in with a
+provider. Needs l4f-accounts v0.12.0.
+
+### Added
+- **Sign in with Discord, Google or Facebook**, on a relay with a web address and a public certificate
+  (`[accounts] public_url`, each provider's application in the environment). A provider says who you are and
+  cannot unlock your messages: a new device also needs the recovery key, another of your devices, or your
+  password, and without one of them it gets in nowhere ([docs/ACCOUNTS.md](docs/ACCOUNTS.md)).
+- **Accounts without a password**: the first sign-in through a provider opens the account and shows its recovery
+  key. `voipc-server admin reclaim <name>` is the way back for someone who lost everything.
+- **Linking** a provider to an account, and unlinking it, in the account panel.
+- **Approving a new device from another one**, comparing a six-digit code.
+- `[accounts] signups_per_hour`.
+- `community_load`, which measures how big a relay goes; the results are in docs/OPERATING.md §10a.
+
+### Changed
+- An app that pinned a relay's self-signed certificate accepts a new one the public CAs accept, so moving a
+  relay to a real certificate does not trip the pin at every renewal.
+
+### Fixed
+- **People missing from member lists after many joined at once.** A connection's queue held 256 messages and
+  dropped the rest without a word, and every join is told to everyone, so a burst (everybody reconnecting after a
+  relay restart) lost members from rosters, or a whole list. Someone missing a member never hands them their keys,
+  so that member cannot read them. At 1000 people on two cores, 3858 messages went; none go now. The queue is
+  bounded by bytes instead, as much memory as before, and a client that has really stopped reading is disconnected
+  rather than left behind.
+- An app speaking a newer protocol than a 1.7 relay could not read that relay's member lists. Nothing released
+  had hit it yet: it needed this protocol bump.
+
 ## [1.7.0] - release candidate
 
 Protocol 16. A 1.7 app still talks to relays back to 1.0 (protocol 12); there the admin

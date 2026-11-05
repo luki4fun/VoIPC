@@ -75,6 +75,55 @@ pub async fn set(
     if channel_id == 0 {
         return Err("The General channel is open to everyone.".into());
     }
+    let (old, key) = {
+        let channels = state.channels.read().await;
+        let Some(c) = channels.get(&channel_id) else {
+            return Err("channel does not exist".into());
+        };
+        (c.gate.clone(), c.gate_key.clone())
+    };
+    let gate = checked(state, session_id, &key, &old.groups, gate).await?;
+    if old == gate {
+        return Ok(gate);
+    }
+    if !key.is_empty() {
+        relay
+            .gate_put(&key, &gate)
+            .await
+            .map_err(|_| "Something went wrong. Please try again.".to_string())?;
+    }
+    {
+        let mut channels = state.channels.write().await;
+        match channels.get_mut(&channel_id) {
+            Some(c) => c.gate = gate.clone(),
+            None => return Err("channel does not exist".into()),
+        }
+    }
+    gate_changed(state, channel_id, &old).await;
+    prune_logs(state).await;
+    Ok(gate)
+}
+
+/// Whether `new` lets in no one `old` kept out: open was everyone, and any list is narrower.
+/// Empty is open, and every account holds `user`, so "empty" alone is not the test.
+fn only_narrows(old: &[String], new: &[String]) -> bool {
+    old.is_empty() || (!new.is_empty() && new.iter().all(|g| old.contains(g)))
+}
+
+/// A gate as an editor may set it, in place of one with `old` as its groups, on the channel
+/// under `key`: its lists tidied and short enough, its groups real, and the editor passing
+/// both. What the channel kept from Discord was private, if it says so: past `*`, whoever
+/// edits it may only narrow who reads that.
+pub async fn checked(
+    state: &ServerState,
+    session_id: SessionId,
+    key: &str,
+    old: &[String],
+    gate: ChannelGate,
+) -> Result<ChannelGate, String> {
+    let Some(relay) = state.accounts.clone() else {
+        return Err("This relay has no accounts, so no groups.".into());
+    };
     let clean = |list: Vec<String>| -> Vec<String> {
         let mut l: Vec<String> = list.into_iter().map(|g| g.trim().to_string()).collect();
         l.retain(|g| !g.is_empty());
@@ -105,14 +154,7 @@ pub async fn set(
     {
         return Err(format!("There is no group named {g}."));
     }
-    let (old, key) = {
-        let channels = state.channels.read().await;
-        let Some(c) = channels.get(&channel_id) else {
-            return Err("channel does not exist".into());
-        };
-        (c.gate.clone(), c.gate_key.clone())
-    };
-    if !state.passes(session_id, &old.groups) {
+    if !state.passes(session_id, old) {
         return Err("channel does not exist".into());
     }
     if !state.passes(session_id, &gate.groups) {
@@ -120,24 +162,17 @@ pub async fn set(
             "This would shut you out of the channel. Keep one of your groups in it.".into(),
         );
     }
-    if old == gate {
-        return Ok(gate);
-    }
-    if !key.is_empty() {
-        relay
-            .gate_put(&key, &gate)
+    if !only_narrows(old, &gate.groups)
+        && !state.is_admin(session_id)
+        && relay
+            .archive_private(key)
             .await
-            .map_err(|_| "Something went wrong. Please try again.".to_string())?;
-    }
+            .map_err(|_| "Something went wrong. Please try again.".to_string())?
     {
-        let mut channels = state.channels.write().await;
-        match channels.get_mut(&channel_id) {
-            Some(c) => c.gate = gate.clone(),
-            None => return Err("channel does not exist".into()),
-        }
+        return Err(
+            "What this channel kept from Discord was private: only an admin can open it.".into(),
+        );
     }
-    gate_changed(state, channel_id, &old).await;
-    prune_logs(state).await;
     Ok(gate)
 }
 
@@ -180,6 +215,8 @@ async fn gate_changed(state: &Arc<ServerState>, channel_id: ChannelId, old: &Cha
             } else if let Some(s) = state.sessions.get(&uid) {
                 let _ = send_msg(&s.control_tx, &ServerMessage::ChannelDeleted { channel_id });
             }
+            // A category holding only that channel is not theirs to see any more
+            crate::layout::send(state, uid).await;
             continue;
         }
         if !was && now {
@@ -191,6 +228,9 @@ async fn gate_changed(state: &Arc<ServerState>, channel_id: ChannelId, old: &Cha
                     },
                 );
             }
+        }
+        if was != now {
+            crate::layout::send(state, uid).await;
         }
         if now && members.contains(&uid) {
             speech(state, uid, channel_id).await;
@@ -205,6 +245,7 @@ pub async fn standing_changed(state: &Arc<ServerState>, session_id: SessionId) {
     if let Some(s) = state.sessions.get(&session_id) {
         let _ = send_msg(&s.control_tx, &ServerMessage::ChannelList { channels });
     }
+    crate::layout::send(state, session_id).await;
     let theirs: Vec<(ChannelId, Vec<String>)> = state
         .channels
         .read()
@@ -254,7 +295,15 @@ async fn speech(state: &Arc<ServerState>, uid: UserId, channel_id: ChannelId) {
         },
     );
     if listen && sharing {
-        crate::session::cleanup_and_notify_screen_shares(state, uid, uid, channel_id).await;
+        // Their share only: what they watch goes on, since they may still listen
+        let _ = crate::session::handle_stop_screen_share(state, uid, uid, &tx).await;
+        // Tell the sharer's own client to stop capturing
+        let _ = send_msg(
+            &tx,
+            &ServerMessage::ScreenShareError {
+                reason: "you can only listen in this channel now".into(),
+            },
+        );
     }
 }
 

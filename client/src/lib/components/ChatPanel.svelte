@@ -22,7 +22,11 @@
   import { confirmAction } from "../stores/confirm.js";
   import { get } from "svelte/store";
   import { account, accountHex } from "../stores/account.js";
-  import { can } from "../stores/powers.js";
+  import { can, chatMods, noteReported, reportTakers, wasReported } from "../stores/powers.js";
+  import { myRestriction } from "../stores/restrictions.js";
+  import { heldLine } from "../restrict-rules.js";
+  import { blocked, foldedAt, revealedRows } from "../stores/blocks.js";
+  import { foldedLine, isBlocked } from "../block-rules.js";
   import { users } from "../stores/users.js";
   import { emoteLimits, emoteSets, noteEmotes, pendingImport } from "../stores/emotes.js";
   import { showAdminPanel } from "../stores/admin-ui.js";
@@ -34,6 +38,9 @@
   import type { ChatEvent, ChatMessage, FileConv, FileRef, Forwarded } from "../types.js";
   import { fetchFile, fileLimits, sendFile } from "../files.js";
   import { linkFacts, mentionNames as mentionNamesOf, plainText } from "../markdown.js";
+  import { powerTokens } from "../mention-rules.js";
+  import { community, moderation, moves } from "../relay-rules.js";
+  import { groupStyles } from "../stores/channels.js";
   import { rosterOf } from "../roster-rules.js";
   import { awayHint, liveIdOf, reach, writeToId } from "../dm-rules.js";
   import { prepare } from "../image-prep.js";
@@ -57,12 +64,15 @@
     newMessagesAt,
     channelMessages,
     dmMessages,
+    ensureAwayDm,
+    receivedNow,
   } from "../stores/chat.js";
   import {
     channelMessageTtl,
     dmMessageTtl,
     endPreview,
     giveNsfwConsent,
+    hideCheck,
     joinChannel,
     joinTextChannel,
     lastPostAt,
@@ -75,18 +85,24 @@
     nsfwConsented,
     setDmMessageTtl,
     listenOnly,
+    unhurriedOn,
   } from "../stores/channel-ui.js";
   import { canManage, needsNsfwConsent, postBlock, slowModeLabel } from "../channel-post-rules.js";
+  import { modNote } from "../stores/admin-ops.js";
+  import { allowed } from "../scopes.js";
   import { currentChannelId } from "../stores/channels.js";
   import { displayChannelId, isPreviewing, shownMessages } from "../stores/roster.js";
   import { channelRosters } from "../stores/rosters.js";
   import Icon from "./Icons.svelte";
   import Composer from "./chat/Composer.svelte";
-  import MessageList, { type MessageActions } from "./chat/MessageList.svelte";
+  import MessageList, { HIDE_ONLINE_ONLY, type MessageActions } from "./chat/MessageList.svelte";
   import ThreadPane from "./chat/ThreadPane.svelte";
   import SearchPane from "./chat/SearchPane.svelte";
+  import ArchivePane from "./chat/ArchivePane.svelte";
+  import { importedHas, importedRound, probeImported } from "../stores/imported.js";
   import type { Hit } from "../search-rules.js";
   import { shortName } from "../username.js";
+  import { MAX_REPORT_WHY, passedOn, reportMark, takersFor, type NotATaker } from "../report-rules.js";
 
   let messagesContainer = $state<HTMLDivElement | null>(null);
 
@@ -178,13 +194,22 @@
   let sentCount = $state(0);
   /** The channel's gate lets us only read here (`ListenOnly`). */
   let listening = $derived(!isDmMode && !!effectiveChannel && $listenOnly.has(effectiveChannel.channel_id));
+  /** A moderator or the new-member wait holds us back here: said in the composer's
+   *  place, at a fixed time, so nothing ticks. */
+  let silenced = $derived.by(() => {
+    const h = $myRestriction;
+    if (!h || !(isDmMode ? h.direct : h.text)) return "";
+    return heldLine(h, isDmMode ? "direct" : "text", Date.now());
+  });
+  /** Slow mode does not hold us back here: a hide is a post, and must not wait. */
+  let unhurried = $derived($can("voipc:hide") && moderation($olderRelay?.protocol ?? null));
   let block = $derived.by(() => {
     void sentCount;
     if (isDmMode || !effectiveChannel) return null;
-    return postBlock(effectiveChannel, isManager, lastPostAt($serverAddress, $displayChannelId), now);
+    return postBlock(effectiveChannel, isManager, lastPostAt($serverAddress, $displayChannelId), now, unhurried);
   });
   $effect(() => {
-    if (slowModeSecs === 0 || isManager || isDmMode) return;
+    if (slowModeSecs === 0 || isManager || unhurried || isDmMode) return;
     const timer = setInterval(() => (now = Date.now()), 1000);
     return () => clearInterval(timer);
   });
@@ -222,7 +247,8 @@
   );
   /** Whether this conversation can be written in, answers included. */
   let canAnswer = $derived(
-    isDmMode ? dmReach !== "readonly" : canSendChannelMessage && !listening && block?.kind !== "announce",
+    !silenced &&
+      (isDmMode ? dmReach !== "readonly" : canSendChannelMessage && !listening && block?.kind !== "announce"),
   );
   // Raw: a $state proxy of a message is never === the message itself, and
   // these are looked up in the conversation by identity
@@ -248,6 +274,29 @@
     void dmName;
     replyingTo = null;
     threadRoot = null;
+    archiving = false;
+  });
+
+  // ── What came from Discord ───────────────────────────────────────────────
+  //
+  // Beside the conversation and never in it (ArchivePane). `canSendChannelMessage` is the
+  // client's copy of what lets someone read it: they stand in the channel. So a preview
+  // asks nothing, and nothing goes before an 18+ channel's consent.
+  let archiving = $state(false);
+  const archiveReadable = $derived(moves($olderRelay?.protocol ?? null) && !!$account && canSendChannelMessage && !gated);
+  $effect(() => {
+    void $importedRound;
+    if (archiveReadable) probeImported($serverAddress, $displayChannelId);
+  });
+  const archiveHere = $derived(archiveReadable && $importedHas.has($displayChannelId));
+  function openArchive() {
+    searching = false;
+    threadRoot = null;
+    archiving = true;
+  }
+  // One pane at a time, whichever way the other opened
+  $effect(() => {
+    if (searching || threadRoot) archiving = false;
   });
 
   // An open thread's answers count as read, new ones included
@@ -315,7 +364,16 @@
       : mentionNamesOf([...mentionable, $username]).filter((n) => n === $username || n === shortName($username)),
   );
   /** Who the message box offers after an `@`: everybody but us. */
-  const mentionOthers = $derived(mentionable.filter((n) => n !== $username));
+  // Once each: an account from before `here` was reserved would otherwise be offered
+  // twice, and a keyed list stops the page at a repeat
+  const mentionOthers = $derived([
+    ...new Set([
+      ...mentionable.filter((n) => n !== $username),
+      ...(!isDmMode && !anonymousHere && $can("voipc:mention_all") && community($olderRelay?.protocol ?? null)
+        ? powerTokens($groupStyles)
+        : []),
+    ]),
+  ]);
 
   // ── Search ───────────────────────────────────────────────────────────────
 
@@ -328,7 +386,8 @@
       for (const [key, messages] of map) {
         const at = splitChatKey(key);
         if (!at || (kind === "channel" && behindNsfwGate(at.server, at.name))) continue;
-        out.push({ conv: { kind, key, ...at }, messages });
+        const conv = { kind, key, ...at };
+        out.push({ conv, messages: messages.filter((m) => !$foldedAt(conv, m)) });
       }
     }
     return out;
@@ -634,7 +693,7 @@
         // The countdown of the channel written in, which a forward may not
         // be the one on screen
         const slow = get(channels.peek(server)).find((c) => c.channel_id === channelId)?.slow_mode_secs ?? 0;
-        if (slow > 0) {
+        if (slow > 0 && !unhurriedOn(server)) {
           notePost(server, channelId);
           now = Date.now();
           sentCount++;
@@ -693,19 +752,47 @@
   //
   // Each is an event sent into this conversation like a message (an envelope
   // kind, protocol 13), so whatever stops a post stops it too: the relay
-  // counts it against slow mode and refuses it in an announcement channel.
-  // Who may do what is every reader's to check (chat-rules.ts `applyEvent`).
+  // counts it against slow mode, but for a hide's holder, and refuses it in an
+  // announcement channel. Who may do what is every reader's to check
+  // (chat-rules.ts `applyEvent`).
 
   /**
    * Send `event` about `m` into `t`, the conversation `m` is in. It lives no
    * longer than `m` does: in a stored log an edit's new text must not outlive
    * the message it changes (R3-06), so it takes what is left of `m`'s timer,
-   * and goes not at all once that has run out.
+   * and goes not at all once that has run out. Returns whether it went.
    */
-  function sendEvent(t: Target, event: ChatEvent, m: ChatMessage, content = "") {
+  async function sendEvent(t: Target, event: ChatEvent, m: ChatMessage, content = ""): Promise<boolean> {
     const left = m.expires_at === undefined ? undefined : Math.floor((m.expires_at - Date.now()) / 1000);
-    if (left !== undefined && left < 1) return;
-    void sendTo(t, content, null, null, undefined, { event, ttlCap: left });
+    if (left !== undefined && left < 1) return false;
+    return sendTo(t, content, null, null, undefined, { event, ttlCap: left });
+  }
+
+  /**
+   * What a moderator may do here, or nothing. Not in a direct conversation, nor in
+   * an anonymous channel, where it would unmask them as staff. Kept only where
+   * this channel keeps messages and they keep copies: otherwise it reaches only
+   * whoever is online, which the action says.
+   */
+  function hideActions(t: Target): MessageActions["hide"] {
+    void $chatMods;
+    if (!("channelId" in t) || isDmMode || anonymousHere || !$can("voipc:hide") || !moderation($olderRelay?.protocol ?? null)) return undefined;
+    const by = { user_id: $userId, username: "", account: $account ? accountHex($account.info.id) : undefined };
+    const may = hideCheck(t.server, t.channelId, by);
+    if (!may) return undefined;
+    const onlineOnly = !effectiveChannel?.log || !$account?.cloud;
+    // Their own word for the log. A token admin has no account for it to name.
+    const noted = !!$account && allowed($account.info.scopes, "voipc:hide");
+    return {
+      // A ban's is the server's word: a restore would only last until the next connect
+      may: (m) => !m.hide?.ban && may(m),
+      onlineOnly,
+      send: async (m, on) => {
+        if (!(await sendEvent(t, { kind: "hide", target: m.id!, on }, m))) return;
+        if (noted) modNote(t.server, t.channelId, m.username, m.id!, on);
+        if (on && onlineOnly) addNotification(HIDE_ONLINE_ONLY, "warning");
+      },
+    };
   }
 
   /** What the message tools offer here. Forward is not a post here, and
@@ -731,14 +818,17 @@
             }
           }
         : undefined;
+    // Whatever stops a post here: someone muted or read-only can still report
+    const report = moderation($olderRelay?.protocol ?? null) ? openReport : undefined;
     // A relay of 1.0's protocol: its apps show none of these (relay-rules.ts)
     if (!chatEvents($olderRelay?.protocol ?? null)) return { makeEmote };
-    if (!canAnswer || held) return { forward, makeEmote };
+    if (!canAnswer || held) return { forward, report, makeEmote };
     // The conversation these messages are in, read now: a delete is sent
     // after its question is answered, by when another one may be on screen
     const t = targetNow();
     return {
       forward,
+      report,
       react: (m, emoji, on) => {
         if (on && isEmoteReaction(emoji)) noteEmotes(t.server, [emoji.slice(1, -1)]);
         return sendEvent(t, { kind: "react", target: m.id!, emoji, on }, m);
@@ -747,6 +837,7 @@
       remove: (m) => sendEvent(t, { kind: "delete", target: m.id! }, m),
       // A pin counts only from a manager, which every reader checks
       pin: !isDmMode && isManager ? (m, on) => sendEvent(t, { kind: "pin", target: m.id!, on }, m) : undefined,
+      hide: hideActions(t),
       makeEmote,
     };
   });
@@ -771,12 +862,14 @@
     for (const ch of $channels) {
       const here = ch.text ? $joinedTextChannelIds.has(ch.channel_id) : ch.channel_id !== 0 && ch.channel_id === $currentChannelId;
       if (!here) continue;
-      const b = postBlock(ch, canManage(ch, $me), lastPostAt(server, ch.channel_id), Date.now());
+      const b = postBlock(ch, canManage(ch, $me), lastPostAt(server, ch.channel_id), Date.now(), unhurried);
       out.push({
         key: `c${ch.channel_id}`,
         label: ch.text ? `#${ch.name}` : ch.name,
         target: { server, channelId: ch.channel_id },
-        blocked: $listenOnly.has(ch.channel_id)
+        blocked: $myRestriction?.text
+          ? "You cannot write on this server for now"
+          : $listenOnly.has(ch.channel_id)
           ? "You can only read here"
           : b?.kind === "announce"
             ? "Only moderators post here"
@@ -786,51 +879,169 @@
       });
     }
     for (const c of $dmConversations) {
-      // Keyed by name, as the sidebar's rows (dm-rules `listRows`)
-      if (out.some((d) => d.key === `d${c.username}`)) continue;
+      // Keyed by name, as the sidebar's rows (dm-rules `listRows`), and like them
+      // without someone blocked
+      if (out.some((d) => d.key === `d${c.username}`) || isBlocked($blocked, c, false)) continue;
       const seen = writeToId(c.user_id, liveIdOf(c.username, $users, $channelRosters));
       const r = reach(c.user_id, seen, c.account, !!$account?.cloud);
       if (r === "readonly") continue;
       const dm = { peer: seen ?? c.user_id, name: c.username, away: r === "kept" ? c.account : undefined };
-      out.push({ key: `d${c.username}`, label: `@${shortName(c.username)}`, target: { server, dm } });
+      out.push({
+        key: `d${c.username}`,
+        label: `@${shortName(c.username)}`,
+        target: { server, dm },
+        blocked: $myRestriction?.direct ? "You cannot write direct messages yet" : undefined,
+      });
     }
     return out;
   });
 
+  /** What is left of a message's timer, in whole seconds; undefined with none. */
+  function timeLeft(m: ChatMessage): number | undefined {
+    return m.expires_at === undefined ? undefined : Math.floor((m.expires_at - Date.now()) / 1000);
+  }
+
   /**
-   * Forward the message as a new one of ours in `d`, labelled with who wrote it
-   * first and when. Its file goes as it is: the same blob and key, posted
-   * there too (`forward_file`), after loading it here if it is not.
+   * `f`'s message as a new one of ours in `t`, under the label `fwd`. Its file goes as
+   * it is: the same blob and key, posted there too (`forward_file`), after loading it
+   * here if it is not. A failed file stops it unless `textAnyway`, when the words still
+   * go. A copy only ever dies sooner: no later than the message it copies, whatever
+   * timer its new conversation has.
    */
+  async function copyTo(f: { m: ChatMessage; from: FileConv | null; server: string }, t: Target, fwd: Forwarded, textAnyway: boolean): Promise<boolean> {
+    const { m } = f;
+    const left = timeLeft(m);
+    if (left !== undefined && left < 1) {
+      addNotification("That message's timer has run out", "warning");
+      return false;
+    }
+    let file = m.file;
+    if (file) {
+      try {
+        const to = fileConvOf(t);
+        if (!to) throw new Error("files cannot be sent to them now");
+        if (f.from) await fetchFile(f.server, f.from, file);
+        await invoke("forward_file", { server: t.server, conv: to, hash: file.hash });
+      } catch (e) {
+        addNotification(`Could not forward the file: ${e}`, "error");
+        if (!textAnyway) return false;
+        file = undefined;
+      }
+    }
+    return sendTo(t, m.content, null, null, file, { fwd, ttlCap: left });
+  }
+
+  /** Forward the message as a new one of ours in `d`, labelled with who wrote it first and when. */
   async function forwardTo(d: Dest) {
     const f = forwarding;
     forwarding = null;
     if (!f) return;
     const { m } = f;
-    const fwd = m.fwd ?? { name: m.username, at: m.timestamp };
-    // A copy only ever dies sooner: a forward goes no later than the message
-    // it copies, whatever timer its new conversation has
-    const left = m.expires_at === undefined ? undefined : Math.floor((m.expires_at - Date.now()) / 1000);
-    if (left !== undefined && left < 1) {
-      addNotification("That message's timer has run out", "warning");
+    const fwd = passedOn(m.fwd ?? { name: m.username, at: m.timestamp }, m.username);
+    if (await copyTo(f, d.target, fwd, false)) addNotification(`Forwarded to ${d.label}`, "info", 2500);
+  }
+
+  // ── Reports ──────────────────────────────────────────────────────────────
+  //
+  // One direct message per person who takes them, carrying a marked forward
+  // (report-rules.ts). The relay answers who; it never sees that this is a report.
+
+  /** The message being reported, and what it was read as when the item was pressed. */
+  let reporting = $state.raw<{ m: ChatMessage; from: FileConv | null; server: string; channel: string; writer: NotATaker } | null>(null);
+  /** Unticked, by name. */
+  let reportOff = $state.raw<readonly string[]>([]);
+  let reportWhy = $state("");
+  /** Keep a sealed copy for those away. Cloud copies on have said yes already. */
+  let reportKeep = $state(false);
+  /** Its file goes too, which shows the relay where it came from (`forward_file`). */
+  let reportFile = $state(true);
+  let reportNoAnswer = $state(false);
+  let reportWaiting: ReturnType<typeof setTimeout> | undefined;
+
+  /** chat_rate is 5 at once and 5 a second, and a report comes right after reading. */
+  const REPORT_GAP_MS = 250;
+  const REPORT_NO_ANSWER_MS = 6000;
+
+  function openReport(m: ChatMessage) {
+    const server = $serverAddress;
+    if (m.kind === "shared") return;
+    if (m.id && wasReported(server, m.username, m.id)) {
+      addNotification("You reported that message already", "info");
       return;
     }
-    if (m.file) {
-      try {
-        const to = fileConvOf(d.target);
-        if (!to) throw new Error("files cannot be sent to them now");
-        if (f.from) await fetchFile(f.server, f.from, m.file);
-        await invoke("forward_file", { server: d.target.server, conv: to, hash: m.file.hash });
-      } catch (e) {
-        addNotification(`Could not forward the file: ${e}`, "error");
-        return;
-      }
+    reporting = {
+      m,
+      from: fileConv,
+      server,
+      channel: isDmMode ? "" : channelName,
+      // An id says who wrote it only on the connection it arrived on
+      writer: { name: m.username, account: m.account, user_id: receivedNow(server, m) ? m.user_id : undefined },
+    };
+    reportOff = [];
+    reportWhy = "";
+    reportKeep = !!$account?.cloud;
+    reportFile = true;
+    reportNoAnswer = false;
+    reportTakers.of(server).set(null);
+    clearTimeout(reportWaiting);
+    reportWaiting = setTimeout(() => (reportNoAnswer = true), REPORT_NO_ANSWER_MS);
+    invoke("report_takers_get", { server }).catch((e) => addNotification(`Could not ask who takes reports: ${e}`, "error"));
+  }
+
+  function closeReport() {
+    clearTimeout(reportWaiting);
+    reporting = null;
+  }
+
+  // The list below follows the server on screen, a report goes on the message's, and
+  // an id there is a stranger here
+  $effect(() => {
+    if (reporting && $serverAddress !== reporting.server) untrack(closeReport);
+  });
+
+  /** Who may get this report: the writer never. */
+  const reportList = $derived(reporting ? takersFor($reportTakers ?? [], reporting.writer) : []);
+  /** Who it goes to as the dialog stands. */
+  const reportTo = $derived(reportList.filter((t) => !reportOff.includes(t.name) && (t.user_id !== null || reportKeep)));
+  /** A room's pseudonym is what they would see, and nothing can be kept under one. */
+  const underPseudonym = $derived($channels.some((c) => c.anonymous && c.channel_id === $currentChannelId));
+
+  function toggleTaker(name: string, on: boolean) {
+    reportOff = on ? reportOff.filter((n) => n !== name) : [...reportOff, name];
+  }
+
+  async function sendReport() {
+    const r = reporting;
+    if (!r) return;
+    const to = reportTo;
+    const fwd = reportMark(r.m, r.channel, reportWhy);
+    // Words only: no `forward_file`, so the relay files nothing under this conversation
+    const what = reportFile ? r : { ...r, m: { ...r.m, file: undefined } };
+    closeReport();
+    // Before it goes, since going takes a while, and taken back if none of it went
+    const { username: writer, id } = r.m;
+    if (id) noteReported(r.server, writer, id, true);
+    const sent: string[] = [];
+    for (const [i, t] of to.entries()) {
+      if (i > 0) await new Promise((done) => setTimeout(done, REPORT_GAP_MS));
+      // Someone in a hidden channel is on no list here, so this is the only place
+      // that says who they are. The row comes first: it is where the copy is filed.
+      const dm = t.user_id !== null ? { peer: t.user_id, name: t.name } : { peer: ensureAwayDm(r.server, t.name, t.account!), name: t.name, away: t.account! };
+      if (await copyTo(what, { server: r.server, dm }, fwd, true)) sent.push(shortName(t.name));
     }
-    if (await sendTo(d.target, m.content, null, null, m.file, { fwd, ttlCap: left })) addNotification(`Forwarded to ${d.label}`, "info", 2500);
+    if (sent.length > 0) addNotification(`Report sent to ${sent.join(", ")}`, "info", 4000);
+    else if (id) noteReported(r.server, writer, id, false);
+  }
+
+  /** What a message of the conversation on screen says instead of itself, if it does. */
+  function foldedHere(m: ChatMessage): string | null {
+    return foldedLine($blocked, m, anonymousHere, $revealedRows);
   }
 
   /** A message as one line: a pin's or a forward's. */
   function oneLine(m: ChatMessage): string {
+    const line = foldedHere(m);
+    if (line) return line;
     const text = plainText(m.content);
     return (text.length > 80 ? `${text.slice(0, 80)}…` : text) || m.file?.name || "…";
   }
@@ -1041,6 +1252,15 @@
         </div>
       {/if}
     {/if}
+    {#if archiveHere}
+      <button
+        class="clear-chat-btn archive-btn"
+        onclick={() => (archiving ? (archiving = false) : openArchive())}
+        title="History from Discord"
+        aria-label="History from Discord"
+        aria-expanded={archiving}
+      ><Icon name="archive" size={16} /></button>
+    {/if}
     {#if isDmMode || !isLobby}
       <button
         class="clear-chat-btn search-btn"
@@ -1069,16 +1289,25 @@
       {#if showClearMenu && keptConv}
         <div class="ttl-picker clear-menu" role="presentation" onclick={(e) => e.stopPropagation()}>
           <button class="ttl-choice" onclick={() => { showClearMenu = false; clearCurrentChat(); }}>Clear here</button>
-          <button class="ttl-choice" onclick={() => { showClearMenu = false; clearAndPurge(); }}>
-            Clear here, and delete what I wrote from the server's copy
-          </button>
+          {#if !silenced}
+            <button class="ttl-choice" onclick={() => { showClearMenu = false; clearAndPurge(); }}>
+              Clear here, and delete what I wrote from the server's copy
+            </button>
+          {/if}
           {#if !isDmMode && !effectiveChannel?.text}
             <button class="ttl-choice" onclick={() => { showClearMenu = false; stopKeeping(); }}>Stop keeping this channel's messages for me</button>
           {/if}
-          <p class="ttl-note">
-            Other people's devices are asked to drop their copies of what you wrote; one that already read them
-            may keep them.
-          </p>
+          {#if silenced}
+            <p class="ttl-note clear-held">
+              Deleting what you wrote from the server's copy waits until you can write here again: other people's
+              devices could not be asked to drop their copies until then.
+            </p>
+          {:else}
+            <p class="ttl-note">
+              Other people's devices are asked to drop their copies of what you wrote; one that already read them
+              may keep them.
+            </p>
+          {/if}
         </div>
       {/if}
     {/if}
@@ -1113,6 +1342,9 @@
         {:else}
           No messages yet.{#if $isPreviewing}&nbsp;Messages will appear here in real-time.{:else}&nbsp;Start the conversation!{/if}
         {/if}
+        {#if archiveHere}
+          <p class="archive-empty"><button class="join-text-btn archive-open" onclick={openArchive}>History from Discord is here</button></p>
+        {/if}
       </div>
     {:else}
       <div class="message-rows" use:followEnd>
@@ -1130,6 +1362,7 @@
         onjumpelsewhere={showElsewhere}
         names={mentionNames}
         me={myNames}
+        anonymous={anonymousHere}
         {newSince}
         server={$serverAddress}
         {fileConv}
@@ -1148,6 +1381,10 @@
     <div class="preview-footer post-block">
       <Icon name="lock" size={14} /> {readOnlyWhy}
     </div>
+  {:else if isDmMode && silenced}
+    <div class="preview-footer post-block held-back" role="status">
+      <Icon name="hourglass" size={14} /> {silenced}
+    </div>
   {:else if isDmMode}
     <Composer
       bind:this={composer}
@@ -1163,6 +1400,10 @@
       replying={replyingTo?.username ?? null}
       oncancelreply={() => (replyingTo = null)}
     />
+  {:else if canSendChannelMessage && silenced}
+    <div class="preview-footer post-block held-back" role="status">
+      <Icon name="hourglass" size={14} /> {silenced}
+    </div>
   {:else if canSendChannelMessage && listening}
     <div class="preview-footer post-block" role="status">
       <Icon name="lock" size={14} /> You can only read and listen in {channelLabel}: its groups say who speaks
@@ -1208,9 +1449,16 @@
     </div>
   {/if}
   </div>
-  {#if searching}
+  {#if archiving && archiveHere}
+    <ArchivePane
+      server={$serverAddress}
+      channelId={$displayChannelId}
+      onlink={(url) => (linkPopupUrl = url)}
+      onclose={() => (archiving = false)}
+    />
+  {:else if searching}
     <SearchPane
-      here={gated ? [] : displayMessages}
+      here={gated ? [] : displayMessages.filter((m) => !foldedHere(m))}
       {everywhere}
       labelOf={convLabel}
       onpick={pickResult}
@@ -1230,6 +1478,7 @@
       onjumpelsewhere={showInMain}
       names={mentionNames}
       me={myNames}
+      anonymous={anonymousHere}
       mentionables={mentionOthers}
       server={$serverAddress}
       {fileConv}
@@ -1260,6 +1509,70 @@
       </ul>
       <div class="link-actions">
         <button class="link-close-btn" onclick={() => (forwarding = null)}>Cancel</button>
+      </div>
+    </div>
+  </div>
+{/if}
+
+{#if reporting}
+  {@const m = reporting.m}
+  <div class="link-overlay" role="presentation" onclick={backdrop(closeReport)}>
+    <div class="link-dialog report-dialog" aria-label="Report message" use:dialog={{ onclose: closeReport }}>
+      <span class="link-title">Report this message</span>
+      <p class="forward-quote"><strong>{shortName(m.username)}</strong> {oneLine(m)}</p>
+      {#if $reportTakers === null}
+        <p class="ttl-note report-asking">
+          {reportNoAnswer ? "The server did not answer. Try again in a minute." : "Asking who takes reports…"}
+        </p>
+      {:else if reportList.length === 0}
+        <p class="ttl-note report-none">Nobody takes reports on this server right now</p>
+      {:else}
+        <ul class="forward-list report-takers">
+          {#each reportList as t (t.name)}
+            <li>
+              <label class="report-taker">
+                <input type="checkbox" checked={!reportOff.includes(t.name)} onchange={(e) => toggleTaker(t.name, e.currentTarget.checked)} />
+                <span>{shortName(t.name)}</span>
+                {#if t.user_id === null}<span class="forward-why report-away">away</span>{/if}
+              </label>
+            </li>
+          {/each}
+        </ul>
+        <textarea
+          class="link-input report-why"
+          aria-label="Why you report this (optional)"
+          placeholder="Why (optional)"
+          maxlength={MAX_REPORT_WHY}
+          rows="2"
+          bind:value={reportWhy}
+        ></textarea>
+        {#if reportList.some((t) => t.user_id === null)}
+          <label class="report-taker report-keep">
+            <input type="checkbox" bind:checked={reportKeep} />
+            <span>Keep it on the server, sealed, until they are back</span>
+          </label>
+        {/if}
+        {#if m.file}
+          <label class="report-taker report-file">
+            <input type="checkbox" bind:checked={reportFile} />
+            <span>Send the file too. The server can then see which conversation it came from. Untick this to send the words only.</span>
+          </label>
+        {/if}
+        {#if underPseudonym}
+          <p class="ttl-note report-pseudonym">You stand under a pseudonym here. It goes only to those online, and they see that name.</p>
+        {/if}
+        <p class="ttl-note report-note">
+          They will see {underPseudonym ? "your pseudonym" : "your name"} and this message as you have it. The server sees that you wrote to them, not what.
+        </p>
+        {#if $myRestriction?.direct}
+          <p class="ttl-note report-held">New members cannot send direct messages on this server yet, and a report is one.</p>
+        {/if}
+      {/if}
+      <div class="link-actions">
+        {#if reportList.length > 0 && $reportTakers !== null}
+          <button class="link-copy-btn report-send" disabled={reportTo.length === 0 || !!$myRestriction?.direct} onclick={sendReport}>Send report</button>
+        {/if}
+        <button class="link-close-btn" onclick={closeReport}>Cancel</button>
       </div>
     </div>
   </div>
@@ -1527,14 +1840,16 @@
   }
 
   .chat-body > :global(.thread-pane),
-  .chat-body > :global(.search-pane) {
+  .chat-body > :global(.search-pane),
+  .chat-body > :global(.archive-pane) {
     width: min(380px, 45%);
     border-left: 1px solid var(--border);
   }
 
   @container (max-width: 700px) {
     .chat-body > :global(.thread-pane),
-    .chat-body > :global(.search-pane) {
+    .chat-body > :global(.search-pane),
+    .chat-body > :global(.archive-pane) {
       position: absolute;
       inset: 0;
       width: auto;
@@ -1569,6 +1884,10 @@
 
   .jump-latest:hover {
     background: var(--bg-hover);
+  }
+
+  .archive-empty {
+    margin: 12px 0 0;
   }
 
   .empty-state {
@@ -1663,7 +1982,8 @@
     font-size: var(--fs-sm);
   }
 
-  .pins-btn:hover {
+  .pins-btn:hover,
+  .archive-btn:hover {
     color: var(--text-primary);
   }
 
@@ -1742,6 +2062,27 @@
   .forward-why {
     font-size: var(--fs-micro);
     color: var(--text-secondary);
+  }
+
+  .report-taker {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: var(--hit);
+    padding: 0 10px;
+    font-size: var(--fs-body);
+    color: var(--text-primary);
+    cursor: pointer;
+  }
+
+  .report-why {
+    resize: vertical;
+    font-family: inherit;
+  }
+
+  .report-send:disabled {
+    opacity: 0.5;
+    cursor: default;
   }
 
   .preview-label {

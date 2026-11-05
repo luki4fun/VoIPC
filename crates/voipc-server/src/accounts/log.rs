@@ -55,7 +55,7 @@ type KeyRow = (String, Vec<u8>, Vec<u8>, Vec<u8>);
 type EntryRow = (i64, Vec<u8>, i64, i64, Vec<u8>);
 type MemberRow = (Vec<u8>, String, Vec<u8>, Vec<u8>, Vec<u8>);
 
-fn now_ms() -> i64 {
+pub(super) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -108,6 +108,17 @@ pub(super) async fn publish(
         .await?;
     });
     Ok(AccountReply::LogKeyStored)
+}
+
+/// Whether a sealed message can be kept for `account`: it has published a log key.
+pub(super) async fn has_key(relay: &Relay, account: &[u8; 16]) -> Result<bool> {
+    let row: Option<(i64,)> = db!(relay.store(), pool => {
+        sqlx::query_as("SELECT CAST(1 AS BIGINT) FROM voipc_logkeys WHERE account = $1")
+            .bind(&account[..])
+            .fetch_optional(pool)
+            .await?
+    });
+    Ok(row.is_some())
 }
 
 pub(super) async fn keys(relay: &Relay, accounts: &[[u8; 16]]) -> Result<AccountReply> {

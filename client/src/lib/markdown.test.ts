@@ -206,11 +206,12 @@ test("a mention is found where it stands, whatever came before it", () => {
     t: "p",
     c: [{ t: "text", v: "hi " }, { t: "mention", name: "ülla" }, { t: "text", v: " and " }, { t: "mention", name: "_X" }],
   });
-  // A text of nothing but @ is quick, with many names
+  // A text of nothing but @ is quick, with many names. 30 ms at a desk, over 100 on a busy
+  // runner; going through the text once per @ would take many seconds.
   const many = Array.from({ length: 50 }, (_, i) => `member${i}#${1000 + i}`);
   const start = performance.now();
   parse("@".repeat(60000), { names: many });
-  assert.ok(performance.now() - start < 100);
+  assert.ok(performance.now() - start < 1000);
 });
 
 test("where a link goes is shown without what hides or turns it", () => {

@@ -7,7 +7,11 @@
   import { adminError, adminGroups, adminMembers, adminOp } from "../stores/admin-ui.js";
   import { can } from "../stores/powers.js";
   import { confirmAction } from "../stores/confirm.js";
-  import { PRIVILEGES, privilegeLabel } from "../scopes.js";
+  import { groupStyles } from "../stores/channels.js";
+  import { olderRelay } from "../stores/relay.js";
+  import { badgeStyle, colorOf, hexOf, pillStyle } from "../member-sections.js";
+  import { community } from "../relay-rules.js";
+  import { privilegeLabel, privilegesOn } from "../scopes.js";
   import Icon from "./Icons.svelte";
   import type { GroupInfo } from "../types.js";
 
@@ -19,8 +23,21 @@
 
   const blank = (): GroupInfo => ({ name: "", description: "", badge: "", scopes: [], builtin: false });
 
+  /** The form's colour and section, and what they were when opened: sent only if
+   *  one changed. */
+  let color = $state<number | null>(null);
+  let section = $state(true);
+  let colorBefore: number | null = null;
+  let sectionBefore = true;
+  /** Sent once the group is saved, not with it: a code may be asked for between,
+   *  and what a code is asked for is the step sent last. */
+  let colorToSend: { name: string; color: number | null; section: boolean } | null = null;
+
   function edit(g: GroupInfo) {
     editing = { create: false, group: { ...g, scopes: [...g.scopes] } };
+    const style = $groupStyles.find((s) => s.badge === g.badge);
+    colorBefore = color = style?.color ?? null;
+    sectionBefore = section = style?.section ?? true;
     void adminOp({ GroupMembers: { name: g.name, offset: 0 } });
   }
 
@@ -36,7 +53,36 @@
   function save() {
     if (!editing) return;
     saving = true;
+    // As the relay will keep the name: `Crew` is stored as `crew`
+    colorToSend =
+      color !== colorBefore || section !== sectionBefore
+        ? { name: editing.group.name.trim().toLowerCase(), color, section }
+        : null;
     void adminOp({ GroupSave: { create: editing.create, group: editing.group } });
+  }
+
+  /** Out of the form. A save it was waiting on is no longer what the next answer is
+   *  about: the list answers an arrow too, and that must not send this colour. */
+  function leave() {
+    saving = false;
+    colorToSend = null;
+    editing = null;
+  }
+
+  function startNew() {
+    colorBefore = color = null;
+    sectionBefore = section = true;
+    editing = { create: true, group: blank() };
+  }
+
+  /** A group one place up or down; whoever holds less than it is refused there. */
+  function move(g: GroupInfo, by: number) {
+    const names = ($adminGroups ?? []).map((x) => x.name);
+    const from = names.indexOf(g.name);
+    const to = from + by;
+    if (from < 0 || to < 0 || to >= names.length) return;
+    [names[from], names[to]] = [names[to], names[from]];
+    void adminOp({ GroupOrder: { names } });
   }
 
   async function remove() {
@@ -60,26 +106,35 @@
       if (saving) {
         saving = false;
         editing = null;
+        if (colorToSend) void adminOp({ GroupStyle: colorToSend });
+        colorToSend = null;
       }
     });
   });
   // Refused: the form stays, with the reason above it
   $effect(() => {
-    if ($adminError) untrack(() => (saving = false));
+    if ($adminError) {
+      untrack(() => {
+        saving = false;
+        colorToSend = null;
+      });
+    }
   });
 
-  /** The privileges to tick: the known ones, then any other the group holds. */
+  const offered = $derived(privilegesOn($olderRelay?.protocol ?? null));
+  /** The privileges to tick: what this relay knows, then any other the group holds. */
   const choices = $derived(
     editing
       ? [
-          ...PRIVILEGES,
+          ...offered,
           ...editing.group.scopes
-            .filter((s) => !PRIVILEGES.some((p) => p.scope === s))
+            .filter((s) => !offered.some((p) => p.scope === s))
             .map((s) => ({ scope: s, label: s, hint: "Set from the server's shell" })),
         ]
       : [],
   );
   const mayEdit = $derived($can("roles:admin"));
+  const keepsColor = $derived(community($olderRelay?.protocol ?? null));
   /** "Everything" covers the rest: they show ticked and cannot be unticked. */
   const everything = $derived(!!editing?.group.scopes.includes("*"));
   const summary = (g: GroupInfo) =>
@@ -88,7 +143,7 @@
 
 {#if editing}
   {@const g = editing.group}
-  <button type="button" class="btn btn-ghost btn-back" onclick={() => (editing = null)}>
+  <button type="button" class="btn btn-ghost btn-back" onclick={leave}>
     <Icon name="arrow-left" size={16} /> All groups
   </button>
   <form class="group-form" onsubmit={(e) => { e.preventDefault(); save(); }}>
@@ -108,13 +163,41 @@
       <label class="field">
         Badge
         <input class="admin-input" aria-label="Badge" bind:value={g.badge} maxlength="32" disabled={!mayEdit} placeholder="None" />
-        <span class="admin-hint">Next to members' names.</span>
+        <span class="admin-hint">Next to members' names. Anyone on this server can read it, guests too.</span>
       </label>
       <label class="field">
         Description
         <input class="admin-input" aria-label="Description" bind:value={g.description} maxlength="255" disabled={!mayEdit} placeholder="What the group is for" />
       </label>
     </div>
+    {#if keepsColor && g.badge.trim()}
+      <div class="colour-row">
+        <label class="colour-label">
+          Badge colour
+          <input
+            type="color"
+            disabled={!mayEdit}
+            value={hexOf(color ?? 0x8a8f98)}
+            oninput={(e) => (color = colorOf(e.currentTarget.value))}
+          />
+        </label>
+        {#if color !== null}
+          <span class="pill" style={pillStyle(color)}>{g.badge}</span>
+          {#if mayEdit}
+            <button type="button" class="btn btn-ghost" onclick={() => (color = null)}>No colour</button>
+          {/if}
+        {:else}
+          <span class="admin-hint">None: the theme's own</span>
+        {/if}
+      </div>
+      <label class="check-row">
+        <input type="checkbox" aria-label="Own section in the member list" disabled={!mayEdit} bind:checked={section} />
+        <span class="check-text">
+          <span>Own section in the member list</span>
+          <span class="check-hint">Off, its people stay with everybody else, and only wear the badge.</span>
+        </span>
+      </label>
+    {/if}
     <div class="section">
       <div class="section-title">Privileges</div>
       <p class="admin-hint">They apply once a member has set up two-factor codes. A group without any is still a group: for its badge, and for the channels that let it in.</p>
@@ -144,7 +227,7 @@
         {#if !editing.create && !g.builtin}
           <button type="button" class="btn btn-danger-outline push-left" onclick={remove}>Delete group</button>
         {/if}
-        <button type="button" class="btn btn-secondary" onclick={() => (editing = null)}>Cancel</button>
+        <button type="button" class="btn btn-secondary" onclick={leave}>Cancel</button>
         <button type="submit" class="btn btn-primary" disabled={saving || (editing.create && !g.name.trim())}>
           {editing.create ? "Create group" : "Save changes"}
         </button>
@@ -178,25 +261,41 @@
     <div class="section-head">
       <p class="admin-hint">Groups hand out privileges and badges, and channels can let in or give a voice to a group. Give them to accounts on the Users tab.</p>
       {#if mayEdit}
-        <button type="button" class="btn btn-primary" onclick={() => (editing = { create: true, group: blank() })}>
+        <button type="button" class="btn btn-primary" onclick={startNew}>
           <Icon name="plus" size={16} /> New group
         </button>
       {/if}
     </div>
     {#if $adminGroups}
       <ul class="list">
-        {#each $adminGroups as g (g.name)}
-          <li>
+        {#each $adminGroups as g, i (g.name)}
+          <li class="group-row">
             <button type="button" class="list-row" onclick={() => edit(g)}>
               <span class="row-text">
                 <span class="row-name">
                   {g.name}
-                  {#if g.badge}<span class="pill">{g.badge}</span>{/if}
+                  {#if g.badge}<span class="pill" style={badgeStyle(g.badge, $groupStyles)}>{g.badge}</span>{/if}
                 </span>
                 <span class="row-meta">{summary(g)}{g.builtin ? " · built in" : ""}</span>
               </span>
               <span class="row-chevron"><Icon name="chevron-down" size={16} /></span>
             </button>
+            {#if mayEdit && keepsColor}
+              <button
+                type="button"
+                class="btn btn-ghost move"
+                aria-label="Move {g.name} up"
+                disabled={i === 0}
+                onclick={() => move(g, -1)}>↑</button
+              >
+              <button
+                type="button"
+                class="btn btn-ghost move"
+                aria-label="Move {g.name} down"
+                disabled={i === $adminGroups.length - 1}
+                onclick={() => move(g, 1)}>↓</button
+              >
+            {/if}
           </li>
         {/each}
       </ul>
@@ -207,6 +306,41 @@
 {/if}
 
 <style>
+  .group-row {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-1, 4px);
+  }
+
+  .group-row .list-row {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .move {
+    padding: 4px 8px;
+  }
+
+  .colour-row {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2, 8px);
+  }
+
+  .colour-label {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2, 8px);
+  }
+
+  .colour-row input[type="color"] {
+    width: 36px;
+    height: 24px;
+    padding: 0;
+    border: 1px solid var(--border);
+    background: none;
+  }
+
   .group-form {
     display: flex;
     flex-direction: column;

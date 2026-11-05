@@ -5,3 +5,8 @@
 export function toHex(bytes: ArrayLike<number>): string {
   return Array.from(bytes, (x) => x.toString(16).padStart(2, "0")).join("");
 }
+
+/** Lowercase hex as bytes. */
+export function fromHex(hex: string): number[] {
+  return Array.from({ length: hex.length >> 1 }, (_, i) => parseInt(hex.slice(i * 2, i * 2 + 2), 16));
+}

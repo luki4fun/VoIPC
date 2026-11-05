@@ -17,16 +17,17 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::oneshot;
 use tracing::{info, warn};
 use voipc_crypto::account::{
-    normalize_name, password_ok, recovery_parse, stretch_salted, DeviceKey, Method, SignIn, Step,
-    Zeroizing,
+    normalize_name, password_ok, provider_ask, provider_page_ok, recovery_parse, stretch_salted,
+    DeviceKey, Method, SignIn, Step, Zeroizing,
 };
 use voipc_crypto::account_session::{memory_key, AccountSession, Actions};
 use voipc_crypto::sync::Prefs;
 use voipc_protocol::codec::{try_decode_frame, APP_VERSION};
 use voipc_protocol::compat::{decode_server_msg_from, encode_client_msg_for};
 use voipc_protocol::conv::{hex, unhex16};
+use voipc_protocol::messages::AuthStep;
 use voipc_protocol::messages::{AccountReply, AccountRequest, ClientMessage, ServerMessage};
-use voipc_protocol::types::{EmoteAccess, FileLimits};
+use voipc_protocol::types::{AccountStart, EmoteAccess, FileLimits, ProviderKind};
 
 use crate::app_state::{AppState, SignalState};
 use crate::crypto::DeviceRecord;
@@ -52,6 +53,168 @@ pub enum AccountArgs {
     /// A forgotten password: the recovery key (as shown) and the new one.
     /// Ends with the error `RESET_DONE`, never signed in.
     Reset { recovery: String, password: String },
+    /// Back from a provider's page, with the relay's ticket.
+    Provider {
+        ticket: Vec<u8>,
+        #[serde(default)]
+        invite: Option<String>,
+    },
+}
+
+/// What a sign-in through a provider asks the person.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum ProviderAnswer {
+    /// The name to take here (a first sign-in on an open relay).
+    Name { name: String },
+    /// "First time here": open this account.
+    Claim,
+    /// The recovery key, as it was shown.
+    Recovery { key: String },
+    /// Ask another device of this account.
+    Pair,
+    /// Sign in with the password instead.
+    Password,
+}
+
+/// What this ends with when the person chose their password; the name follows.
+pub const USE_PASSWORD: &str = "Sign in with your password: ";
+
+/// A question for a relay that ends with its answer.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum ProviderAsk {
+    Providers,
+    Open { provider: ProviderKind },
+    Status { ticket: Vec<u8> },
+}
+
+/// The provider's page a question opens is checked: the relay names it.
+#[tauri::command]
+pub async fn account_open_page(app: tauri::AppHandle, url: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    if !provider_page_ok(&url) {
+        return Err("This server named a page that is no provider's: not opening it.".into());
+    }
+    app.opener()
+        .open_url(url, None::<&str>)
+        .map_err(|e| format!("Could not open the browser: {e}"))
+}
+
+/// Asks the relay at `address` something about provider sign-in, on a connection
+/// of its own: which ones it offers, a page to open, whether a ticket is ready.
+#[tauri::command]
+pub async fn account_provider_ask(
+    address: String,
+    accept_invalid_certs: Option<bool>,
+    ask: ProviderAsk,
+) -> Result<serde_json::Value, String> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let (host, port) = crate::network::parse_address(&address)?;
+    let (mut link, _) =
+        crate::transport::connect(&host, port, accept_invalid_certs.unwrap_or(false)).await?;
+    let start = match ask {
+        ProviderAsk::Providers => AccountStart::Providers,
+        ProviderAsk::Open { provider } => AccountStart::Provider { kind: provider },
+        ProviderAsk::Status { ticket } => AccountStart::ProviderStatus { ticket },
+    };
+    let proto = voipc_protocol::codec::PROTOCOL_VERSION;
+    write(
+        &mut link.control_send,
+        &provider_ask(start, proto, APP_VERSION),
+        proto,
+    )
+    .await?;
+    let mut buf = BytesMut::with_capacity(1024);
+    loop {
+        let msg = read(&mut link.control_recv, &mut buf, proto).await?;
+        // An older relay has no providers
+        if crate::network::older_relay(&msg, proto).is_some() {
+            return Ok(serde_json::json!({ "providers": [] }));
+        }
+        match msg {
+            ServerMessage::AuthStep(AuthStep::Providers { kinds }) => {
+                return Ok(serde_json::json!({ "providers": kinds }))
+            }
+            ServerMessage::AuthStep(AuthStep::OpenBrowser { url, code, ticket }) => {
+                return Ok(serde_json::json!({ "url": url, "code": code, "ticket": ticket }))
+            }
+            ServerMessage::AuthStep(AuthStep::ProviderReady) => {
+                return Ok(serde_json::json!({ "ready": true }))
+            }
+            ServerMessage::AuthStep(AuthStep::ProviderPending) => {
+                return Ok(serde_json::json!({ "ready": false }))
+            }
+            ServerMessage::AuthError { reason } => return Err(reason),
+            ServerMessage::Refused { text, .. } => return Err(text),
+            _ => {}
+        }
+    }
+}
+
+/// The person's answer to `account-provider-signup` or `account-provider-choice`.
+#[tauri::command]
+pub async fn account_provider_answer(
+    state: State<'_, AppState>,
+    server: String,
+    answer: ProviderAnswer,
+) -> Result<(), String> {
+    let waiting = state
+        .provider_answers
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(&server);
+    match waiting {
+        Some(tx) => tx
+            .send(answer)
+            .map_err(|_| "That sign-in is over.".to_string()),
+        None => Err("No sign-in is waiting for that.".into()),
+    }
+}
+
+/// The person's answer to `account-pair-ask`, after comparing the codes.
+#[tauri::command]
+pub async fn account_pair_answer(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+    server: String,
+    pair: u64,
+    yes: bool,
+) -> Result<(), String> {
+    let connections = state.connections.read().await;
+    let (connection, link) = signed_in(&connections, &server)?;
+    let a = link.session().pair_answer(pair, yes);
+    run(&app, &server, &connection.tcp_tx, a).await;
+    Ok(())
+}
+
+/// Asks the front end and waits for `account_provider_answer`. The relay waits
+/// five minutes for a person; this a little less.
+async fn ask_provider(
+    state: &AppState,
+    app: &tauri::AppHandle,
+    server: &str,
+    event: &str,
+    payload: serde_json::Value,
+) -> Result<ProviderAnswer, String> {
+    let (tx, rx) = oneshot::channel();
+    state
+        .provider_answers
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(server.to_string(), tx);
+    emit_server(app, server, event, payload);
+    let answer = tokio::time::timeout(std::time::Duration::from_secs(290), rx).await;
+    state
+        .provider_answers
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(server);
+    match answer {
+        Ok(Ok(a)) => Ok(a),
+        Ok(Err(_)) => Err("Sign-in cancelled.".into()),
+        Err(_) => Err("Nothing was chosen in time.".into()),
+    }
 }
 
 impl AccountArgs {
@@ -65,7 +228,7 @@ impl AccountArgs {
             AccountArgs::Reset { recovery, password } => {
                 drop((Zeroizing::new(recovery), Zeroizing::new(password)))
             }
-            AccountArgs::Device => {}
+            AccountArgs::Device | AccountArgs::Provider { .. } => {}
         }
     }
 }
@@ -192,8 +355,14 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
     ),
     crate::network::Refusal,
 > {
-    let name = normalize_name(username)?;
+    // A provider's answer decides the account
+    let name = if matches!(args, AccountArgs::Provider { .. }) {
+        String::new()
+    } else {
+        normalize_name(username)?
+    };
     let method = match args {
+        AccountArgs::Provider { ticket, invite } => Method::Provider { ticket, invite },
         AccountArgs::Login { password } => Method::Password {
             password: Zeroizing::new(password),
         },
@@ -246,9 +415,22 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
         machine.expect_relay(here, elsewhere);
         here
     };
+    let remembered = state
+        .chat
+        .read()
+        .await
+        .archive
+        .devices
+        .iter()
+        .filter(|d| d.server == server)
+        .map(|d| d.name.clone())
+        .collect();
+    machine.remembered_here(remembered);
     write(send, &first, proto).await?;
 
     let mut asked = 0u32;
+    // What the person is asked at a provider's sign-in, kept for asking again
+    let mut choice: Option<serde_json::Value> = None;
     let (user_id, session_id, info, files, emotes) = loop {
         let msg = read(recv, buf, proto).await?;
         if let ServerMessage::Authenticated {
@@ -272,8 +454,9 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
         crate::network::note_refusal(app, server, &msg);
         // The password's stretching runs here: half a second of CPU, kept
         // off the other tasks on this worker.
-        let steps = tokio::task::block_in_place(|| machine.on_message(&msg))?;
-        for step in steps {
+        let mut steps: std::collections::VecDeque<Step> =
+            tokio::task::block_in_place(|| machine.on_message(&msg))?.into();
+        while let Some(step) = steps.pop_front() {
             match step {
                 Step::Send(out) => write(send, &out, proto).await?,
                 Step::Keys => {
@@ -297,6 +480,46 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
                 }
                 // Only the browser stretches outside the machine
                 Step::Stretch { .. } => return Err("unexpected sign-in step".into()),
+                // The front end asked `account_provider_ask` before coming here
+                Step::ProviderPending => return Err("Not finished in the browser yet.".into()),
+                Step::ProviderSignup {
+                    suggestion,
+                    problem,
+                } => {
+                    let payload =
+                        serde_json::json!({ "suggestion": suggestion, "problem": problem });
+                    let ProviderAnswer::Name { name } =
+                        ask_provider(state, app, server, "account-provider-signup", payload)
+                            .await?
+                    else {
+                        return Err("unexpected sign-in step".into());
+                    };
+                    let out = tokio::task::block_in_place(|| machine.provider_signup(&name))?;
+                    write(send, &out, proto).await?;
+                }
+                Step::ProviderChoice {
+                    name,
+                    claim,
+                    has_password,
+                } => {
+                    choice = Some(serde_json::json!({
+                        "name": name, "claim": claim, "has_password": has_password, "problem": "",
+                    }));
+                    steps.extend(
+                        choose(state, app, server, &mut machine, send, proto, &mut choice).await?,
+                    );
+                }
+                Step::PairCode { code } => {
+                    emit_server(app, server, "account-pair-code", code);
+                }
+                Step::PairRefused { reason } => {
+                    if let Some(c) = choice.as_mut() {
+                        c["problem"] = reason.into();
+                    }
+                    steps.extend(
+                        choose(state, app, server, &mut machine, send, proto, &mut choice).await?,
+                    );
+                }
                 Step::Ignore => {}
             }
         }
@@ -339,6 +562,54 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
         files,
         emotes,
     ))
+}
+
+/// What opens the account, as the person says: the steps that follow, or none
+/// where the relay answers first (a pairing).
+async fn choose<S: AsyncWrite + Unpin>(
+    state: &AppState,
+    app: &tauri::AppHandle,
+    server: &str,
+    machine: &mut SignIn,
+    send: &mut S,
+    proto: u32,
+    choice: &mut Option<serde_json::Value>,
+) -> Result<Vec<Step>, String> {
+    loop {
+        let payload = choice.clone().ok_or("unexpected sign-in step")?;
+        match ask_provider(state, app, server, "account-provider-choice", payload).await? {
+            ProviderAnswer::Claim => return machine.provider_claim(),
+            ProviderAnswer::Pair => {
+                write(send, &machine.pair_start()?, proto).await?;
+                return Ok(Vec::new());
+            }
+            ProviderAnswer::Password => {
+                let name = choice
+                    .as_ref()
+                    .and_then(|c| c["name"].as_str())
+                    .unwrap_or_default();
+                return Err(format!("{USE_PASSWORD}{name}"));
+            }
+            ProviderAnswer::Recovery { key } => {
+                let opened = recovery_parse(&key)
+                    .ok_or_else(|| {
+                        "That is not a recovery key: 52 letters and digits, as it was shown."
+                            .to_string()
+                    })
+                    .and_then(|key| machine.provider_recovery(&Zeroizing::new(key)));
+                match opened {
+                    Ok(steps) => return Ok(steps),
+                    // A mistyped key costs nothing: ask again
+                    Err(problem) => {
+                        if let Some(c) = choice.as_mut() {
+                            c["problem"] = problem.into();
+                        }
+                    }
+                }
+            }
+            ProviderAnswer::Name { .. } => return Err("unexpected sign-in step".into()),
+        }
+    }
 }
 
 /// Asks the front end for a code and waits for `account_totp`. The relay
@@ -439,6 +710,11 @@ pub async fn on_reply(
             warn!(server, "could not remember this device: {reason}");
         }
     }
+    // A run's frames are answered 8 times a second, in numbers a page cannot hold
+    #[cfg(not(target_os = "android"))]
+    let Some(reply) = app.state::<AppState>().import.on_reply(server, reply) else {
+        return;
+    };
     let a = link.session().on_reply(&reply);
     run(app, server, tcp_tx, a).await;
 }
@@ -458,6 +734,73 @@ fn signed_in<'a>(
         .as_ref()
         .ok_or("Not signed in to an account on that server")?;
     Ok((connection, link))
+}
+
+/// A password, stretched off the async workers. Empty: an account without one.
+async fn stretched(
+    state: &AppState,
+    server: &str,
+    password: String,
+) -> Result<Option<Zeroizing<[u8; 32]>>, String> {
+    if password.is_empty() {
+        return Ok(None);
+    }
+    let salt = {
+        let connections = state.connections.read().await;
+        let (_, link) = signed_in(&connections, server)?;
+        let salt = link.session().kdf_salt();
+        salt
+    };
+    let master = tokio::task::spawn_blocking(move || stretch_salted(&password, &salt))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(Some(master))
+}
+
+/// Link a provider, or prove it's you with one you have linked. The answers come
+/// as `account-reply` (`ProviderBrowser`, then `ProviderDone`).
+// A command's arguments are the fields of its call from the front end
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub async fn account_provider_start(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+    server: String,
+    provider: ProviderKind,
+    link: bool,
+    password: String,
+    totp: Option<String>,
+    recovery: Option<String>,
+) -> Result<(), String> {
+    let master = stretched(&state, &server, password).await?;
+    let connections = state.connections.read().await;
+    let (connection, account) = signed_in(&connections, &server)?;
+    let a = account
+        .session()
+        .provider_start(provider, link, master.as_deref(), totp, recovery);
+    run(&app, &server, &connection.tcp_tx, a).await;
+    Ok(())
+}
+
+/// `ProviderUnlinked`, or an `Error` for `ProviderUnlink`, as `account-reply`.
+#[tauri::command]
+pub async fn account_provider_unlink(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+    server: String,
+    provider: ProviderKind,
+    password: String,
+    totp: Option<String>,
+    recovery: Option<String>,
+) -> Result<(), String> {
+    let master = stretched(&state, &server, password).await?;
+    let connections = state.connections.read().await;
+    let (connection, account) = signed_in(&connections, &server)?;
+    let a = account
+        .session()
+        .provider_unlink(provider, master.as_deref(), totp, recovery);
+    run(&app, &server, &connection.tcp_tx, a).await;
+    Ok(())
 }
 
 /// A direct message for an account that is away (`account`, hex): kept in the
@@ -484,9 +827,12 @@ pub async fn send_kept_dm(
     let id = crate::crypto::new_message_id();
     let extras = crate::commands::checked_extras(reply_to, thread, file, fwd, event)?;
     let payload = crate::crypto::envelope_with(&id, &content, ttl_secs, &extras);
+    // A report kept for this one message: the dialog asked. Anything else needs
+    // cloud copies on.
+    let once = extras.fwd.as_ref().is_some_and(|f| f.report.is_some());
     let a = link
         .session()
-        .kept_dm(&account, payload, crate::crypto::now_ms(), ttl_secs)?;
+        .kept_dm(&account, payload, crate::crypto::now_ms(), ttl_secs, once)?;
     run(&app, &server, &connection.tcp_tx, a).await;
     Ok(id)
 }
@@ -536,18 +882,12 @@ pub async fn account_delete(
     totp: Option<String>,
     recovery: Option<String>,
 ) -> Result<(), String> {
-    let salt = {
-        let connections = state.connections.read().await;
-        let (_, link) = signed_in(&connections, &server)?;
-        let salt = link.session().kdf_salt();
-        salt
-    };
-    let master = tokio::task::spawn_blocking(move || stretch_salted(&password, &salt))
-        .await
-        .map_err(|e| e.to_string())?;
+    let master = stretched(&state, &server, password).await?;
     let connections = state.connections.read().await;
     let (connection, link) = signed_in(&connections, &server)?;
-    let a = link.session().delete_account(&master, totp, recovery);
+    let a = link
+        .session()
+        .delete_account(master.as_deref(), totp, recovery);
     run(&app, &server, &connection.tcp_tx, a).await;
     Ok(())
 }
@@ -588,6 +928,24 @@ pub async fn account_set_prefs(
     let connections = state.connections.read().await;
     let (connection, link) = signed_in(&connections, &server)?;
     let a = link.session().set_prefs(prefs);
+    run(&app, &server, &connection.tcp_tx, a).await;
+    Ok(())
+}
+
+/// Block or unblock the person `key` names on `server`: a sealed vault item,
+/// and `account-blocks` tells the front end. The person is told nothing.
+#[tauri::command]
+pub async fn account_block(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+    server: String,
+    key: String,
+    label: String,
+    on: bool,
+) -> Result<(), String> {
+    let connections = state.connections.read().await;
+    let (connection, link) = signed_in(&connections, &server)?;
+    let a = link.session().set_block(&key, &label, on)?;
     run(&app, &server, &connection.tcp_tx, a).await;
     Ok(())
 }
@@ -656,11 +1014,16 @@ pub async fn account_totp(
     }
 }
 
-/// Ends a sign-in waiting for a code (the person closed the prompt).
+/// Ends a sign-in waiting for a code or a choice (the person closed the prompt).
 #[tauri::command]
 pub async fn account_cancel(state: State<'_, AppState>, server: String) -> Result<(), String> {
     state
         .totp_answers
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(&server);
+    state
+        .provider_answers
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .remove(&server);
@@ -717,18 +1080,12 @@ pub async fn account_recovery_key_new(
     totp: Option<String>,
     recovery: Option<String>,
 ) -> Result<String, String> {
-    let salt = {
-        let connections = state.connections.read().await;
-        let (_, link) = signed_in(&connections, &server)?;
-        let salt = link.session().kdf_salt();
-        salt
-    };
-    let master = tokio::task::spawn_blocking(move || stretch_salted(&password, &salt))
-        .await
-        .map_err(|e| e.to_string())?;
+    let master = stretched(&state, &server, password).await?;
     let connections = state.connections.read().await;
     let (connection, link) = signed_in(&connections, &server)?;
-    let (a, key) = link.session().recovery_key_new(&master, totp, recovery);
+    let (a, key) = link
+        .session()
+        .recovery_key_new(master.as_deref(), totp, recovery);
     // A relay before 1.3 has no such request and would never answer
     for m in &a.send {
         encode_client_msg_for(m, connection.tcp_tx.proto()).map_err(|e| e.to_string())?;
@@ -746,7 +1103,13 @@ pub async fn account_request(
 ) -> Result<(), String> {
     let connections = state.connections.read().await;
     let (connection, _) = signed_in(&connections, &server)?;
-    crate::network::send_tcp_message_sync(&connection.tcp_tx, &ClientMessage::Account(request));
+    let message = ClientMessage::Account(request);
+    #[cfg(not(target_os = "android"))]
+    state
+        .import
+        .send_for_page(&server, &connection.tcp_tx, &message);
+    #[cfg(target_os = "android")]
+    crate::network::send_tcp_message_sync(&connection.tcp_tx, &message);
     Ok(())
 }
 

@@ -1,6 +1,7 @@
 /target
 /release
-/testkit
+/testkit/*
+!/testkit/6-mock-discord/
 *.swp
 *.swo
 *~

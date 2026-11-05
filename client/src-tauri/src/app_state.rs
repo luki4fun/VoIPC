@@ -73,9 +73,16 @@ pub struct AppState {
     /// another's. ponytail: entries are never removed; one per server id this
     /// session ever connected to.
     pub connect_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// A move from Discord: a bot's token in RAM and the run it drives, by server id.
+    #[cfg(not(target_os = "android"))]
+    pub import: Arc<crate::import::ImportHub>,
     /// Sign-ins waiting for the person to type a code, by server id.
     pub totp_answers:
         std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<crate::account::TotpAnswer>>>,
+    /// Sign-ins through a provider waiting for the person to choose, by server id.
+    pub provider_answers: std::sync::Mutex<
+        HashMap<String, tokio::sync::oneshot::Sender<crate::account::ProviderAnswer>>,
+    >,
     pub chat: RwLock<ChatState>,
     // ── Settings every connection shares ──
     // One user, one microphone, one pair of ears: each connection holds a
@@ -200,7 +207,10 @@ impl AppState {
             echo_reference: Arc::default(),
             voice_server: std::sync::Mutex::new(None),
             connect_locks: std::sync::Mutex::new(HashMap::new()),
+            #[cfg(not(target_os = "android"))]
+            import: Arc::default(),
             totp_answers: std::sync::Mutex::new(HashMap::new()),
+            provider_answers: std::sync::Mutex::new(HashMap::new()),
             chat: RwLock::new(ChatState::default()),
             is_muted: Arc::new(AtomicBool::new(false)),
             is_deafened: Arc::new(AtomicBool::new(false)),

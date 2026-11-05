@@ -23,6 +23,18 @@ export const accountHex = (id: number[]) => toHex(id);
 export type AccountPrompt =
   /** A sign-in waits for a code; `retry` after a wrong one. */
   | { kind: "totp"; server: string; retry: boolean }
+  /** A provider knows this person and nobody here does: choose a name. */
+  | { kind: "provider-name"; server: string; suggestion: string; problem: string }
+  /** A provider vouched for the person: what opens the account? */
+  | { kind: "provider-choice"; server: string; name: string; claim: boolean; hasPassword: boolean; problem: string }
+  /** This new device waits for the other one; `code` to compare, once known. */
+  | { kind: "pair-wait"; server: string; code: string }
+  /** A new device asks this one for the vault's key. */
+  | { kind: "pair-ask"; server: string; pair: number; code: string }
+  /** The password and code a provider link or unlink wants. */
+  | { kind: "provider-confirm"; server: string; provider: string; action: "link" | "unlink" }
+  /** A provider's page to open, with the code to tap there. */
+  | { kind: "provider-page"; server: string; url: string; code: string }
   /** A new account's recovery key, shown once; `renewed` for one that
    *  replaced the account's old key (Recovery key: New). */
   | { kind: "recovery"; server: string; key: string; renewed?: boolean }
@@ -49,6 +61,8 @@ export const accountPrompt = writable<AccountPrompt | null>(null);
 
 /** Shown once and never again: nothing replaces them while they are open. */
 const ONCE: AccountPrompt["kind"][] = ["recovery", "recovery-codes"];
+/** A sign-in waiting on the person, which fails unseen when its wait runs out. */
+const WAITS: AccountPrompt["kind"][] = ["totp", "provider-name", "provider-choice", "pair-wait"];
 /** What came while a once-only prompt was open, in order. */
 const waiting: AccountPrompt[] = [];
 
@@ -57,7 +71,7 @@ const waiting: AccountPrompt[] = [];
  *  (which would fail unseen when its wait runs out; 1.0 audit H5-11). */
 export function showPrompt(p: AccountPrompt): void {
   const now = get(accountPrompt);
-  if (now && (ONCE.includes(now.kind) || (now.kind === "totp" && now.server !== p.server))) waiting.push(p);
+  if (now && (ONCE.includes(now.kind) || (WAITS.includes(now.kind) && now.server !== p.server))) waiting.push(p);
   else accountPrompt.set(p);
 }
 

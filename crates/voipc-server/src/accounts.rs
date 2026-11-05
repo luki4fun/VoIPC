@@ -28,7 +28,7 @@ use l4f_accounts::service::{
 use l4f_accounts::store::{PutBlob, PutLimited, Store, StoreConn};
 use l4f_accounts::{pow, scope, util, IpMode};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::Semaphore;
 use tracing::{info, warn};
 use voipc_protocol::codec::{decode_client_msg, encode_server_msg};
 use voipc_protocol::conv::dm_parties;
@@ -36,11 +36,12 @@ use voipc_protocol::messages::{
     AccountReply, AccountRequest, AuthContinue, AuthStep, ClientMessage, ServerMessage,
 };
 use voipc_protocol::types::{
-    AccountInfo, AccountStart, PowChallenge, PreKeyBundleData, Registration, RelayAccounts,
-    VaultBlob,
+    AccountInfo, AccountStart, ChatMod, PowChallenge, PreKeyBundleData, Registration,
+    RelayAccounts, ReportTaker, VaultBlob,
 };
 
 use crate::config::{AccountsConfig, AccountsMode, RegistrationMode};
+use crate::control::ControlTx;
 use crate::state::ServerState;
 
 /// The privileges this relay checks (1.7). Each is a scope a group (an l4f
@@ -48,37 +49,75 @@ use crate::state::ServerState;
 pub const KICK: &str = "voipc:kick";
 pub const BAN: &str = "voipc:ban";
 pub const BANS: &str = "voipc:bans";
+pub const RESTRICT: &str = "voipc:restrict";
+pub const HIDE: &str = "voipc:hide";
+pub const REPORTS: &str = "voipc:reports";
+pub const MODLOG: &str = "voipc:modlog";
 pub const CHANNELS: &str = "voipc:channels";
+pub const PROFILES: &str = "voipc:profiles";
+pub const MENTION_ALL: &str = "voipc:mention_all";
 pub const EMOTES: &str = "voipc:emotes";
 const APP_SCOPES: &[ScopeDef] = &[
+    ScopeDef {
+        name: MENTION_ALL,
+        description: "Call on everybody with @everyone, @here and a group's @&badge",
+    },
+    ScopeDef {
+        name: PROFILES,
+        description: "Clear display names and profile pictures of accounts holding no more",
+    },
     ScopeDef {
         name: KICK,
         description: "Kick people from the server and from any channel",
     },
     ScopeDef {
         name: BAN,
-        description: "Ban people, by address and account",
+        description: "Ban people, by address and account, and remove the posts of someone banned",
     },
     ScopeDef {
         name: BANS,
-        description: "See the ban list, lift bans, ban an account by name",
+        description:
+            "See the ban list, lift bans, ban an account by name, and remove the posts of someone banned",
+    },
+    ScopeDef {
+        name: RESTRICT,
+        description: "Mute someone's voice or stop their channel posts for a while",
+    },
+    ScopeDef {
+        name: HIDE,
+        description: "Hide a message from its readers, who can still open it",
+    },
+    ScopeDef {
+        name: REPORTS,
+        description: "Receive what people report",
+    },
+    ScopeDef {
+        name: MODLOG,
+        description: "Read the moderation log",
     },
     ScopeDef {
         name: CHANNELS,
-        description: "Change the settings and gates of the channels you can see",
+        description: "Change the settings and gates of the channels you can see, and invite people to the one you stand in",
     },
     ScopeDef {
         name: EMOTES,
         description: "Add, rename and remove the server's emotes and stickers",
     },
 ];
-/// Before 1.7, the moderator's one scope: what it became.
+/// Before 1.7, the moderator's one scope: what it became. Frozen: a group from
+/// then keeps what it granted, and never gains what it did not.
 const MODERATE_WAS: &str = "voipc:moderate";
-const MODERATOR: [&str; 3] = [BAN, CHANNELS, KICK];
+const MODERATE_BECAME: [&str; 3] = [BAN, CHANNELS, KICK];
+/// The moderator group of a database made now, sorted as a role keeps them.
+const MODERATOR: [&str; 7] = [BAN, CHANNELS, HIDE, KICK, MODLOG, REPORTS, RESTRICT];
+const MODERATOR_SAYS: &str =
+    "Kick, ban, restrict, hide messages, read the moderation log, take reports and change the channels' settings";
+/// What the group said before 1.10.
+const MODERATOR_SAID: &str = "Kick, ban and change the channels' settings";
 
 /// What a session may do, one bit per privilege (`UserSession::can`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Powers(u8);
+pub struct Powers(u16);
 
 impl Powers {
     pub const KICK: Powers = Powers(1);
@@ -89,12 +128,14 @@ impl Powers {
     pub const USERS_READ: Powers = Powers(1 << 5);
     pub const USERS_ADMIN: Powers = Powers(1 << 6);
     pub const ROLES_ADMIN: Powers = Powers(1 << 7);
+    pub const RESTRICT: Powers = Powers(1 << 8);
 
     pub fn of(scopes: &[String]) -> Powers {
         [
             (KICK, Powers::KICK),
             (BAN, Powers::BAN),
             (BANS, Powers::BANS),
+            (RESTRICT, Powers::RESTRICT),
             (CHANNELS, Powers::CHANNELS),
             (EMOTES, Powers::EMOTES),
             ("users:read", Powers::USERS_READ),
@@ -119,6 +160,8 @@ impl Powers {
 pub struct Standing {
     pub groups: Vec<String>,
     pub badges: Vec<String>,
+    /// All of them; `badges` is what a row shows. Told only to the account.
+    pub my_badges: Vec<String>,
 }
 
 /// `*`: every privilege. `allowed` never answers for it (a wildcard is no
@@ -157,6 +200,9 @@ const PENDING_SIGN_INS: usize = 32;
 /// Of those, at most this many from one address (IPv6: one /64), so one
 /// address cannot hold them all.
 const PENDING_PER_ADDRESS: usize = 4;
+/// Closes a connection that only asked something (`AccountStart::Providers`,
+/// `Provider`); its `AuthStep` was the answer.
+const ANSWERED: &str = "Answered.";
 /// What a sign-in hears when no permit is free.
 pub const BUSY: &str = "the server is busy signing people in — try again in a moment";
 /// How often every signed-in connection is checked against the database: a
@@ -182,9 +228,18 @@ macro_rules! db {
 }
 
 mod admin;
+pub mod archive;
 pub mod bans;
 pub mod gates;
+pub mod import;
+pub mod layout;
+pub mod links;
 pub mod log;
+pub mod modlog;
+pub mod placeholder;
+pub mod profile;
+pub mod provider;
+pub mod restrict;
 
 /// What l4f calls back into.
 pub struct RelayHost {
@@ -199,19 +254,73 @@ impl Host for RelayHost {
 
     async fn export(&self, user: AccountId) -> Vec<(String, serde_json::Value)> {
         let identity = identity_of(&self.store, user).await.ok().flatten();
-        vec![(
+        let mut entries = vec![(
             "identity_key".into(),
             serde_json::json!(identity.map(hex::encode)),
-        )]
+        )];
+        // What the move holds on them. The archive's rows have a way of their own, `ArchiveMine`
+        match placeholder::discord_member(&self.store, user).await {
+            Ok(Some(member)) => entries.push(("discord_member".into(), member)),
+            Ok(None) => {}
+            // Not left out without a word: that would read as nothing being held
+            Err(e) => {
+                tracing::warn!("reading what the move holds for an export: {e:#}");
+                entries.push((
+                    "discord_member".into(),
+                    serde_json::json!("could not be read"),
+                ));
+            }
+        }
+        entries
     }
 
-    /// The relay's rows go with the account through their foreign keys.
+    /// The relay's rows go with the account through their foreign keys. What outlives it
+    /// is that no import makes them again, nor brings back what they wrote: someone who
+    /// deleted their account stays gone, whether they are in the move's table, or linked
+    /// Discord only later, or unlinked it first and are only in the other.
     async fn delete_user(
         &self,
-        _tx: StoreConn<'_>,
-        _user: AccountId,
+        tx: StoreConn<'_>,
+        user: AccountId,
         _delete_owned: bool,
     ) -> sqlx::Result<()> {
+        macro_rules! keep_them_out {
+            ($c:expr) => {{
+                let c = $c;
+                let mut ids: Vec<i64> = sqlx::query_scalar(
+                    "SELECT CAST(dc_id AS BIGINT) FROM voipc_placeholders WHERE account = $1",
+                )
+                .bind(&user.0[..])
+                .fetch_all(&mut *c)
+                .await?;
+                let linked: Vec<Vec<u8>> = sqlx::query_scalar(
+                    "SELECT ext_id FROM acct_credentials WHERE user_id = $1 AND kind = $2",
+                )
+                .bind(&user.0[..])
+                .bind(l4f_accounts::oauth::Kind::Discord.credential_kind())
+                .fetch_all(&mut *c)
+                .await?;
+                ids.extend(linked.iter().filter_map(|s| {
+                    std::str::from_utf8(s).ok()?.parse::<i64>().ok()
+                }));
+                for id in ids {
+                    sqlx::query(
+                        "INSERT INTO voipc_import_excluded (dc_id, own, erase, at) VALUES ($1, $2, $3, $4)
+                         ON CONFLICT (dc_id) DO UPDATE SET own = excluded.own, erase = excluded.erase",
+                    )
+                    .bind(id)
+                    .bind(true)
+                    .bind(true)
+                    .bind(util::now())
+                    .execute(&mut *c)
+                    .await?;
+                }
+            }};
+        }
+        match tx {
+            StoreConn::Pg(c) => keep_them_out!(c),
+            StoreConn::Lite(c) => keep_them_out!(c),
+        }
         Ok(())
     }
 }
@@ -226,14 +335,40 @@ pub struct Relay {
     pub quota: i64,
     /// The longest a stored message is kept.
     pub retention_ms: i64,
+    /// How long the moderation log keeps a row.
+    pub modlog_days: u32,
+    /// How long an account the move made waits for someone to open it. 0: for good.
+    pub unclaimed_days: u32,
+    /// The groups the move made that hold no privileges (`placeholder::load`). In memory,
+    /// so the new-member wait costs no query.
+    pub imported_groups: DashMap<String, ()>,
+    /// How long what came from Discord is kept, by when it was written. 0: until removed.
+    pub archive_days: u32,
+    /// What people said about the archive's rows (`archive::load`).
+    archive_wishes: std::sync::RwLock<Arc<archive::Wishes>>,
+    /// Something in the archive is to go: `archive::tidy` looks now.
+    pub(crate) archive_kick: tokio::sync::Notify,
+    /// Searches of the archive at once, whatever the number of members.
+    pub(crate) archive_searches: Semaphore,
     pending: Arc<Semaphore>,
     pending_by_address: Arc<DashMap<String, usize>>,
     pow_key: Vec<u8>,
+    /// One sign-up with a link at a time, from the gate's peek to its commit.
+    link_lock: tokio::sync::Mutex<()>,
     /// What address bans are hashed with (`crate::bans`).
     ban_key: Vec<u8>,
+    /// What an account the move made gets its id from, and what `Reset` shows for it.
+    placeholder_key: Vec<u8>,
     /// Recovery-key resets per address (`ConnLimits` key): each fetches a
     /// vault's recovery slot, so they are few (5, then one per 3 minutes).
     resets: DashMap<IpAddr, crate::state::RateLimiter>,
+    /// Sign-ins out at a provider's page.
+    providers: provider::Flows,
+    /// Pairings in progress, and how often each account may ask for one.
+    pairs: DashMap<u64, provider::PairLink>,
+    pair_asks: DashMap<AccountId, crate::state::RateLimiter>,
+    /// One claim of a provider's account at a time (`provider::claim`).
+    claiming: tokio::sync::Mutex<()>,
 }
 
 /// A key slot as `voipc_crypto::account::Vault` writes it: version byte,
@@ -242,6 +377,8 @@ const SLOT_LEN: usize = 1 + 32 + 8 + 12 + 48;
 /// `slot.reset`: the reset key's public half (Ed25519).
 const SLOT_RESET: &str = voipc_crypto::account::SLOT_RESET;
 const RESET_KEY_LEN: usize = 32;
+/// What a recovery key that does not open the account hears, on a real one and a decoy.
+const NOT_THIS_KEY: &str = "That recovery key is not this account's.";
 
 /// One sign-in in progress: a share of the relay's slots and of its
 /// address's, both given back when it ends.
@@ -278,7 +415,16 @@ impl Relay {
         })
         .is_some();
         let master = master_key(&cfg.key_file, made_with_key)?;
-        Self::open_with(cfg, store, &master).await
+        let mut relay = Self::open_with(cfg, store, &master).await?;
+        if !cfg.public_url.is_empty() {
+            match provider::from_env()? {
+                Some(oauth) => relay = relay.with_providers(oauth),
+                None => warn!(
+                    "[accounts] public_url is set, but no VOIPC_OAUTH_<PROVIDER>_ID and _SECRET are"
+                ),
+            }
+        }
+        Ok(relay)
     }
 
     pub async fn open_with(cfg: &AccountsConfig, store: Store, master: &[u8]) -> Result<Relay> {
@@ -291,6 +437,7 @@ impl Relay {
         check_key(&store, &keys).await?;
         let pow_key = keys.subkey("voipc-pow").to_vec();
         let ban_key = keys.subkey("voipc-ban").to_vec();
+        let placeholder_key = keys.subkey("voipc-placeholder").to_vec();
         let ip_salt = keys.subkey("voipc-ip").to_vec();
         let host = RelayHost {
             cfg: Arc::new(l4f_config(cfg, relay_id)),
@@ -307,7 +454,7 @@ impl Relay {
         )
         .await?;
         ensure_moderator(&store).await?;
-        Ok(Relay {
+        let relay = Relay {
             accounts,
             relay_id,
             required: cfg.mode == AccountsMode::Required,
@@ -315,12 +462,28 @@ impl Relay {
             cloud: cfg.cloud,
             quota: i64::from(cfg.quota_mb) * 1024 * 1024,
             retention_ms: i64::from(cfg.retention_days) * 86_400_000,
+            modlog_days: cfg.modlog_days,
+            unclaimed_days: cfg.unclaimed_days,
+            imported_groups: DashMap::new(),
+            archive_days: cfg.archive_days,
+            archive_wishes: std::sync::RwLock::default(),
+            archive_kick: tokio::sync::Notify::new(),
+            archive_searches: Semaphore::new(archive::SEARCHES),
             pending: Arc::new(Semaphore::new(PENDING_SIGN_INS)),
             pending_by_address: Arc::default(),
             pow_key,
+            link_lock: tokio::sync::Mutex::new(()),
             ban_key,
+            placeholder_key,
             resets: DashMap::new(),
-        })
+            providers: provider::Flows::default(),
+            pairs: DashMap::new(),
+            pair_asks: DashMap::new(),
+            claiming: tokio::sync::Mutex::new(()),
+        };
+        placeholder::load(&relay).await?;
+        archive::load(&relay).await?;
+        Ok(relay)
     }
 
     pub fn store(&self) -> &Store {
@@ -502,17 +665,16 @@ impl Relay {
     /// The account's `Standing`: one read of its roles.
     pub async fn standing(&self, user: &User, scopes: &[String]) -> Result<Standing> {
         let mut standing = Standing::default();
-        for role in self.store().user_roles(user.id).await? {
-            if !scope::covers(scopes, &role.scopes) {
-                continue;
-            }
-            if let Some(b) = role.badge.filter(|b| !b.is_empty()) {
-                if standing.badges.len() < voipc_protocol::types::MAX_BADGES {
-                    standing.badges.push(b);
-                }
-            }
-            standing.groups.push(role.name);
-        }
+        let roles = self.store().user_roles(user.id).await?;
+        let counted: Vec<_> = roles
+            .iter()
+            .filter(|r| scope::covers(scopes, &r.scopes))
+            .collect();
+        standing.groups = counted.iter().map(|r| r.name.clone()).collect();
+        standing.my_badges = self.badges_in_order(counted).await?;
+        // The top ones, when there are more than a row shows
+        standing.badges = standing.my_badges.clone();
+        standing.badges.truncate(voipc_protocol::types::MAX_BADGES);
         Ok(standing)
     }
 
@@ -602,7 +764,7 @@ async fn ensure_moderator(store: &Store) -> Result<()> {
                 .iter()
                 .filter(|s| *s != MODERATE_WAS)
                 .cloned()
-                .chain(MODERATOR.iter().map(|s| s.to_string()))
+                .chain(MODERATE_BECAME.iter().map(|s| s.to_string()))
                 .collect();
             scopes.sort();
             scopes.dedup();
@@ -612,31 +774,64 @@ async fn ensure_moderator(store: &Store) -> Result<()> {
                 .map_err(|e| anyhow!("moving {} off voipc:moderate: {e:?}", role.name))?;
         }
     }
-    if store.role_by_name("moderator").await?.is_some() {
+    // 1.10's tools reach a group still exactly at the old default, once. Written
+    // on every first boot, a new database's too, so a group trimmed back to the
+    // old three later is left there. A crash before the widening below errs
+    // towards less: the group keeps the old three.
+    let first_boot = db!(store, pool => {
+        sqlx::query("INSERT INTO voipc_meta (k, v) VALUES ('moderator_1_10', $1) ON CONFLICT DO NOTHING")
+            .bind(&[1u8][..])
+            .execute(pool)
+            .await?
+            .rows_affected()
+            == 1
+    });
+    let Some(role) = store.role_by_name("moderator").await? else {
+        // None: another boot made it first. The scopes come in the same
+        // transaction, so a crash never leaves a moderator role that grants nothing.
+        store
+            .create_role_with_scopes(
+                "moderator",
+                MODERATOR_SAYS,
+                Some("mod"),
+                &MODERATOR.map(String::from),
+            )
+            .await?;
         return Ok(());
+    };
+    let mut held = role.scopes.clone();
+    held.sort();
+    if first_boot && held == MODERATE_BECAME {
+        store
+            .set_role_scopes(role.id, &MODERATOR.map(String::from))
+            .await
+            .map_err(|e| anyhow!("widening the moderator group: {e:?}"))?;
+        if role.description == MODERATOR_SAID {
+            store
+                .update_role(role.id, MODERATOR_SAYS, role.badge.as_deref())
+                .await?;
+        }
+        info!(
+            "[accounts] the moderator group was untouched, so it now also hands out {RESTRICT}, \
+             {HIDE}, {REPORTS} and {MODLOG}. This happens once: take them away in the group \
+             editor and they stay away"
+        );
     }
-    // None: another boot made it first. The scopes come in the same
-    // transaction, so a crash never leaves a moderator role that grants nothing.
-    store
-        .create_role_with_scopes(
-            "moderator",
-            "Kick, ban and change the channels' settings",
-            Some("mod"),
-            &MODERATOR.map(String::from),
-        )
-        .await?;
     Ok(())
 }
 
 /// l4f's settings as a relay needs them.
-fn l4f_config(cfg: &AccountsConfig, relay_id: [u8; 16]) -> Config {
+pub(crate) fn l4f_config(cfg: &AccountsConfig, relay_id: [u8; 16]) -> Config {
     // The client solves the proof of work; there is no form to fill slowly.
     // People behind one address sign up together on a voice relay (a
     // household, a LAN party): more than l4f's two a day, still bounded.
     let signup = l4f_accounts::pow::Limits {
         min_form_seconds: 0,
         max_accounts_per_ip_day: 20,
-        max_accounts_per_hour: 60,
+        max_accounts_per_hour: cfg.signups_per_hour as usize,
+        // Each sign-up is an attempt too, so never fewer of those: at l4f's 60 a
+        // move past that stops at "Too many attempts" whatever the setting says.
+        max_attempts_per_hour: (cfg.signups_per_hour as usize).max(60),
         ..Default::default()
     };
     Config {
@@ -659,11 +854,15 @@ fn l4f_config(cfg: &AccountsConfig, relay_id: [u8; 16]) -> Config {
             "guest".into(),
             "moderator".into(),
             "general".into(),
+            // What `@everyone` and `@here` mean
+            "everyone".into(),
+            "here".into(),
         ],
         storage_quota_bytes: i64::from(cfg.quota_mb) * 1024 * 1024,
         totp_issuer: "VoIPC".into(),
         // Device keys sign for this origin; it names the relay, not its address.
         base_url: format!("voipc://{}", hex::encode(relay_id)),
+        oauth_base_url: cfg.public_url.clone(),
         cookie_secure: false,
         ip_mode: IpMode::Hash,
         ..Config::default()
@@ -776,6 +975,8 @@ pub struct SignedIn {
     pub account: AccountInfo,
     pub identity_key: Vec<u8>,
     pub prekey_bundle: PreKeyBundleData,
+    /// This connection's device opened the vault (`AccountSession::vault_proven`).
+    pub vault_proven: bool,
 }
 
 async fn send<S: AsyncWrite + Unpin>(stream: &mut S, msg: &ServerMessage) -> Result<(), String> {
@@ -890,12 +1091,66 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
         AccountStart::Reset => {
             return reset(state, relay, stream, buf, name, &ctx, ip, &mut answers).await
         }
+        AccountStart::Providers => {
+            let kinds = relay.provider_kinds();
+            step(stream, AuthStep::Providers { kinds }).await?;
+            return Err(ANSWERED.into());
+        }
+        AccountStart::Provider { kind } => {
+            relay.provider_open(stream, kind, ip).await?;
+            return Err(ANSWERED.into());
+        }
+        AccountStart::ProviderResume { ticket } => {
+            return provider::resume(
+                state,
+                relay,
+                stream,
+                buf,
+                &ticket,
+                None,
+                &ctx,
+                ip,
+                &mut answers,
+            )
+            .await;
+        }
+        AccountStart::ProviderResumeInvited { ticket, invite } => {
+            return provider::resume(
+                state,
+                relay,
+                stream,
+                buf,
+                &ticket,
+                Some(&invite),
+                &ctx,
+                ip,
+                &mut answers,
+            )
+            .await;
+        }
+        AccountStart::ProviderStatus { ticket } => {
+            let answer = if provider::ready(relay, &ticket)? {
+                AuthStep::ProviderReady
+            } else {
+                AuthStep::ProviderPending
+            };
+            step(stream, answer).await?;
+            return Err(ANSWERED.into());
+        }
         AccountStart::Register { invite } => {
             let invite = invite.filter(|c| !c.trim().is_empty());
             if invite.is_none() && relay.registration != RegistrationMode::Open {
                 return Err("Making an account here needs an invite.".into());
             }
-            let pow = if invite.is_none() {
+            // A link is told from a code by its length. Many people use one, so
+            // unlike a code it does not stand in for the proof of work
+            let linked = invite.as_deref().filter(|c| links::is_link_code(c));
+            if let Some(code) = linked {
+                if !relay.link_usable(code).await.unwrap_or(false) {
+                    return Err(links::GONE.into());
+                }
+            }
+            let pow = if invite.is_none() || linked.is_some() {
                 let cfg = relay.accounts.host.config();
                 let ch = pow::issue(
                     &relay.pow_key,
@@ -944,39 +1199,53 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
             }
             let pw = secret_text(&auth_secret)?;
             let _work = work()?;
-            let s = match &invite {
-                Some(code) => {
-                    let form = InviteForm {
-                        code,
-                        username: name,
-                        password: &pw,
-                        email: None,
-                        display_name: None,
-                    };
-                    relay.accounts.register_invite(&ctx, form).await
-                }
-                None => {
-                    // l4f takes an empty one as a browser without JavaScript;
-                    // every VoIPC client solves the puzzle.
-                    if altcha.is_empty() {
-                        return Err("The sign-up puzzle was not solved.".into());
+            let s = if let Some(code) = invite.as_deref().filter(|c| links::is_link_code(c)) {
+                links::register(
+                    relay,
+                    &ctx,
+                    code,
+                    name,
+                    links::How::Password(&pw),
+                    &altcha,
+                    &ts,
+                )
+                .await
+                .map_err(links::Refused::text)?
+            } else {
+                match &invite {
+                    Some(code) => {
+                        let form = InviteForm {
+                            code,
+                            username: name,
+                            password: &pw,
+                            email: None,
+                            display_name: None,
+                        };
+                        relay.accounts.register_invite(&ctx, form).await
                     }
-                    let proof = pow::Proof {
-                        altcha: &altcha,
-                        ts: &ts,
-                        ..Default::default()
-                    };
-                    let form = RegisterForm {
-                        username: name,
-                        password: &pw,
-                        email: None,
-                        display_name: None,
-                        proof,
-                    };
-                    relay.accounts.register(&ctx, form).await
+                    None => {
+                        // l4f takes an empty one as a browser without JavaScript;
+                        // every VoIPC client solves the puzzle.
+                        if altcha.is_empty() {
+                            return Err("The sign-up puzzle was not solved.".into());
+                        }
+                        let proof = pow::Proof {
+                            altcha: &altcha,
+                            ts: &ts,
+                            ..Default::default()
+                        };
+                        let form = RegisterForm {
+                            username: name,
+                            password: &pw,
+                            email: None,
+                            display_name: None,
+                            proof,
+                        };
+                        relay.accounts.register(&ctx, form).await
+                    }
                 }
-            }
-            .map_err(|e| e.message().to_string())?;
+                .map_err(|e| e.message().to_string())?
+            };
             for b in &vault {
                 // Anything but a write (over quota, a conflict) is a failure
                 // too: an account without its vault cannot be opened on
@@ -1053,13 +1322,15 @@ async fn reset<S: AsyncRead + AsyncWrite + Unpin>(
             .await
             .map_err(|_| gone())?
             .ok_or("No account of that name.")?;
-        let identity = relay
-            .identity(user.id)
-            .await
-            .map_err(|_| gone())?
-            .ok_or("This account cannot be reset.")?;
+        let identity = relay.identity(user.id).await.map_err(|_| gone())?;
         let vault = relay.vault(user.id).await.map_err(|_| gone())?;
         (user, identity, vault)
+    };
+    // Nobody has opened it: this answers as if someone had, since anyone can find out the
+    // name exists (a guest asking for it hears so), and the two together would say that
+    // nobody holds it yet.
+    let Some(identity) = identity else {
+        return decoy_reset(relay, stream, buf, user.id, answers).await;
     };
     // Never the password slot: with it anyone could guess the password offline
     let blobs: Vec<VaultBlob> = vault
@@ -1112,7 +1383,7 @@ async fn reset<S: AsyncRead + AsyncWrite + Unpin>(
         ),
     };
     if !proved {
-        return Err("That recovery key is not this account's.".into());
+        return Err(NOT_THIS_KEY.into());
     }
     if pass_slot.len() != SLOT_LEN {
         return Err(unexpected());
@@ -1144,6 +1415,32 @@ async fn reset<S: AsyncRead + AsyncWrite + Unpin>(
     sign_out_account(state, user.id).await;
     step(stream, AuthStep::ResetDone).await?;
     Err("Your password was reset. Sign in with the new one.".into())
+}
+
+/// What `reset` does for an account with no identity: the same steps as a real one, with
+/// blobs no key opens, ending as a wrong key ends.
+async fn decoy_reset<S: AsyncRead + AsyncWrite + Unpin>(
+    relay: &Relay,
+    stream: &mut S,
+    buf: &mut BytesMut,
+    user: AccountId,
+    answers: &mut u32,
+) -> Result<SignedIn, String> {
+    let challenge: [u8; 32] = rand::random();
+    step(
+        stream,
+        AuthStep::ResetChallenge {
+            relay_id: relay.relay_id,
+            challenge: challenge.to_vec(),
+            blobs: relay.decoy_blobs(user),
+            second_factor: false,
+        },
+    )
+    .await?;
+    match next(stream, buf, TOTP_WAIT, answers).await? {
+        AuthContinue::Reset { .. } => Err(NOT_THIS_KEY.into()),
+        _ => Err(unexpected()),
+    }
 }
 
 /// `slot.pass` and the password change together: the slot first
@@ -1312,6 +1609,7 @@ async fn finish<S: AsyncRead + AsyncWrite + Unpin>(
         account,
         identity_key,
         prekey_bundle,
+        vault_proven: false,
     })
 }
 
@@ -1376,18 +1674,18 @@ async fn recovery_key_new(
     (recovery_slot, reset_key): (&[u8], &[u8]),
     (totp, recovery_code): (Option<String>, Option<String>),
 ) -> Result<(), String> {
-    let password = secret_text(secret)?;
     if recovery_slot.len() != SLOT_LEN || reset_key.len() != RESET_KEY_LEN {
         return Err("malformed recovery key".into());
     }
-    let (user, _) = confirm_again(
+    let secret = (!secret.is_empty()).then_some(secret);
+    let user = prove_recent(
         state,
         relay,
         session_id,
         ctx,
         user,
         info,
-        &password,
+        secret,
         (totp, recovery_code),
     )
     .await?;
@@ -1496,9 +1794,8 @@ async fn delete_account(
     secret: &[u8],
     second: (Option<String>, Option<String>),
 ) -> Result<(), String> {
-    let password = secret_text(secret)?;
-    let (user, _) =
-        confirm_again(state, relay, session_id, ctx, user, info, &password, second).await?;
+    let secret = (!secret.is_empty()).then_some(secret);
+    let user = prove_recent(state, relay, session_id, ctx, user, info, secret, second).await?;
     let scopes = state
         .sessions
         .get(&session_id)
@@ -1518,8 +1815,92 @@ async fn delete_account(
             }
             e => e.message().to_string(),
         })?;
+    // `Host::delete_user` left them out for good: a frame coming now must know, and no
+    // reader gets what they wrote from here on
+    if let Err(e) = archive::load(relay).await {
+        warn!("reading the archive's wishes: {e:#}");
+    }
+    relay.archive_kick.notify_one();
     info!(user = %user.id.hex(), "account deleted by its owner");
     Ok(())
+}
+
+/// A recent sign-in for what a provider link, an unlink, or (without a password)
+/// a new recovery key or deleting the account takes: the password and the second
+/// factor where there is a password; without one the second factor; without
+/// that, a provider's proof already on this connection. The sign-in that got a
+/// connection in does not count, so neither a stolen device nor a provider account
+/// alone is enough. Returns the account as the database has it now.
+#[allow(clippy::too_many_arguments)]
+async fn prove_recent(
+    state: &ServerState,
+    relay: &Relay,
+    session_id: u32,
+    ctx: &Ctx,
+    user: &User,
+    info: &SessionInfo,
+    secret: Option<&[u8]>,
+    (totp, recovery_code): (Option<String>, Option<String>),
+) -> Result<User, String> {
+    let now_user = relay
+        .store()
+        .user_by_id(user.id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or("This account is gone.")?;
+    if now_user.has_password {
+        let secret = secret.ok_or("Enter your password.")?;
+        let password = secret_text(secret)?;
+        let (user, _) = confirm_again(
+            state,
+            relay,
+            session_id,
+            ctx,
+            &now_user,
+            info,
+            &password,
+            (totp, recovery_code),
+        )
+        .await?;
+        return Ok(user);
+    }
+    if l4f_accounts::service::has_second_factor(&now_user) {
+        let fresh = match (&totp, &recovery_code) {
+            (Some(code), _) => {
+                relay
+                    .accounts
+                    .step_up_totp(ctx, &now_user, info, code)
+                    .await
+            }
+            (None, Some(code)) => {
+                relay
+                    .accounts
+                    .step_up_recovery(ctx, &now_user, info, code)
+                    .await
+            }
+            (None, None) => {
+                return Err(
+                    "This account needs a code from the authenticator app, or a recovery code."
+                        .into(),
+                )
+            }
+        }
+        .map_err(|e| e.message().to_string())?;
+        if let Some(a) = state
+            .sessions
+            .get_mut(&session_id)
+            .as_mut()
+            .and_then(|s| s.account.as_mut())
+        {
+            a.token = fresh.token;
+            a.info = fresh.info;
+        }
+        return Ok(now_user);
+    }
+    if !relay.accounts.fresh(info, util::now()) {
+        return Err("Confirm it's you with a provider you have linked first.".into());
+    }
+    Ok(now_user)
 }
 
 /// Ends this relay's connection of an account whose sessions l4f just ended,
@@ -1552,7 +1933,7 @@ pub async fn handle_request(
     state: &Arc<ServerState>,
     session_id: u32,
     req: AccountRequest,
-    tx: &mpsc::Sender<Vec<u8>>,
+    tx: &ControlTx,
 ) -> Result<()> {
     let reply = |r: AccountReply| ServerMessage::Account(r);
     let Some(relay) = state.accounts.clone() else {
@@ -1561,10 +1942,10 @@ pub async fn handle_request(
             &reply(refused("Account", "This relay has no accounts.")),
         );
     };
-    let Some((user, info, peer_ip)) = state.sessions.get(&session_id).and_then(|s| {
+    let Some((user, info, peer_ip, vault_proven)) = state.sessions.get(&session_id).and_then(|s| {
         s.account
             .as_ref()
-            .map(|a| (a.user.clone(), a.info.clone(), s.peer_ip))
+            .map(|a| (a.user.clone(), a.info.clone(), s.peer_ip, a.vault_proven))
     }) else {
         return crate::session::send_msg(
             tx,
@@ -1580,9 +1961,13 @@ pub async fn handle_request(
             | AccountRequest::LogFetch { .. }
             | AccountRequest::LogKeys { .. }
             | AccountRequest::LogIndex
+            | AccountRequest::ArchiveFetch { .. }
     );
+    let searches = matches!(req, AccountRequest::ArchiveSearch { .. });
     let allowed = state.sessions.get_mut(&session_id).is_some_and(|mut s| {
-        if reads_log {
+        if searches {
+            s.archive_search_rate.try_consume()
+        } else if reads_log {
             s.log_read_rate.try_consume()
         } else {
             s.account_rate.try_consume()
@@ -1600,7 +1985,7 @@ pub async fn handle_request(
     let now = util::now();
     let out = match req {
         AccountRequest::DeviceChallenge => {
-            if !relay.accounts.fresh(&info, now) {
+            if !relay.accounts.fresh(&info, now) && !vault_proven {
                 refused(
                     "DeviceChallenge",
                     "Sign in with your password again to remember this device.",
@@ -1655,10 +2040,14 @@ pub async fn handle_request(
             }
         }
         AccountRequest::TotpEnable { sealed, code } => {
-            if !relay.accounts.fresh(&info, now) {
+            if !relay.accounts.fresh(&info, now) && !vault_proven {
                 refused(
                     "TotpEnable",
-                    "Sign in with your password again to turn codes on.",
+                    if user.has_password {
+                        "Sign in with your password again to turn codes on."
+                    } else {
+                        "Confirm it's you with a provider you have linked first."
+                    },
                 )
             } else {
                 match relay
@@ -1695,6 +2084,90 @@ pub async fn handle_request(
         }
         AccountRequest::VaultPut { k, v, expect } => {
             relay.vault_put(user.id, &k, &v, expect).await?
+        }
+        AccountRequest::ProviderList => provider::list(&relay, &user).await?,
+        AccountRequest::ProviderStart {
+            kind,
+            link,
+            secret,
+            totp,
+            recovery_code,
+        } => {
+            // A proof with a provider is the provider's page itself
+            let proved = if link {
+                prove_recent(
+                    state,
+                    &relay,
+                    session_id,
+                    &ctx,
+                    &user,
+                    &info,
+                    secret.as_deref(),
+                    (totp, recovery_code),
+                )
+                .await
+                .map(|_| ())
+            } else {
+                Ok(())
+            };
+            match proved {
+                Ok(()) => {
+                    provider::start_for_account(&relay, session_id, &user, kind, link, peer_ip)
+                }
+                Err(reason) => refused("ProviderStart", &reason),
+            }
+        }
+        AccountRequest::ProviderUnlink {
+            kind,
+            secret,
+            totp,
+            recovery_code,
+        } => {
+            match prove_recent(
+                state,
+                &relay,
+                session_id,
+                &ctx,
+                &user,
+                &info,
+                secret.as_deref(),
+                (totp, recovery_code),
+            )
+            .await
+            {
+                Ok(now_user) => {
+                    // The session the proof just made, not the one this began with
+                    let info = state
+                        .sessions
+                        .get(&session_id)
+                        .and_then(|s| s.account.as_ref().map(|a| a.info.clone()))
+                        .unwrap_or(info);
+                    provider::unlink(&relay, &ctx, &now_user, &info, kind).await?
+                }
+                Err(reason) => refused("ProviderUnlink", &reason),
+            }
+        }
+        AccountRequest::PairNonce { pair, nonce } => {
+            if nonce.len() == voipc_crypto::pair::NONCE_LEN {
+                relay
+                    .pair_event(user.id, pair, provider::PairEvent::Nonce(nonce))
+                    .await;
+            }
+            return Ok(());
+        }
+        AccountRequest::PairApprove { pair, wrapped } => {
+            if wrapped.len() <= 256 {
+                relay
+                    .pair_event(user.id, pair, provider::PairEvent::Wrapped(wrapped))
+                    .await;
+            }
+            return Ok(());
+        }
+        AccountRequest::PairDecline { pair } => {
+            relay
+                .pair_event(user.id, pair, provider::PairEvent::Declined)
+                .await;
+            return Ok(());
         }
         AccountRequest::LogPurge { conv } => log::purge(&relay, user.id, conv.as_deref()).await?,
         AccountRequest::DeleteAccount {
@@ -1850,6 +2323,35 @@ pub async fn handle_request(
         AccountRequest::Admin { op, code } => {
             admin::handle(state, &relay, session_id, &user, &ctx, op, code).await?
         }
+        AccountRequest::ProfileSet { name } => {
+            profile::set_name(state, &relay, session_id, &user, name).await?
+        }
+        AccountRequest::ProfilePictureSet { image } => {
+            profile::set_picture(state, &relay, session_id, &user, image).await?
+        }
+        // Who reads what here, and what they look for, goes in no log and no counter
+        AccountRequest::ArchiveFetch {
+            channel_id,
+            thread,
+            before,
+            pinned,
+        } => archive::fetch(
+            state, &relay, session_id, user.id, channel_id, thread, before, pinned,
+        )
+        .await
+        .unwrap_or_else(|e| read_failed("ArchiveFetch", e)),
+        AccountRequest::ArchiveSearch {
+            channel_id,
+            query,
+            from,
+        } => archive::search(state, &relay, session_id, user.id, channel_id, query, from)
+            .await
+            .unwrap_or_else(|e| read_failed("ArchiveSearch", e)),
+        AccountRequest::ArchiveMine { action, scope } => {
+            archive::mine(state, &relay, session_id, user.id, action, scope)
+                .await
+                .unwrap_or_else(|e| read_failed("ArchiveMine", e))
+        }
     };
     crate::session::send_msg(tx, &reply(out))
 }
@@ -1869,6 +2371,13 @@ async fn kept_post_ok(state: &ServerState, session_id: u32, conv: &str) -> Resul
     if !conv.starts_with("c:") {
         if state.names_of(user_id).await.1.is_some() {
             return Err("nothing is kept while you write under a pseudonym.".into());
+        }
+        if state
+            .sessions
+            .get(&session_id)
+            .is_some_and(|s| s.silence.direct())
+        {
+            return Err(crate::restrict::DIRECT_HELD.into());
         }
         return Ok(());
     }
@@ -1935,7 +2444,9 @@ pub async fn locked_logs_at_boot(state: &ServerState) -> Result<()> {
         let channels = state.channels.read().await;
         channels
             .values()
-            .filter(|c| c.persistent && !c.log_conv.is_empty())
+            // One made in the app changes its password only while running, where
+            // `locked_log` has already done this: its fingerprint is never written.
+            .filter(|c| c.persistent && !c.kept && !c.log_conv.is_empty())
             .map(|c| {
                 (
                     c.log_conv.clone(),
@@ -2030,11 +2541,24 @@ pub async fn refresh(
     session_id: u32,
     user: AccountId,
 ) -> Result<()> {
+    let read = scope_read(state, session_id);
     let Some(user) = relay.store().user_by_id(user).await? else {
         return Ok(());
     };
     let scopes = relay.accounts.effective_scopes(&user).await?;
-    apply_scopes(state, relay, session_id, user, scopes).await
+    apply_scopes(state, relay, session_id, user, scopes, read).await
+}
+
+/// A read of an account's scopes is about to start. Between it and the write there
+/// are more reads, and two at once on one session must not finish in the wrong
+/// order: a grant would be undone by the older answer until the next pass of
+/// `revalidate`. So a read older than the last one written is dropped. Whatever
+/// changed a role starts a read after changing it, so that one has seen the change.
+pub(crate) fn scope_read(state: &ServerState, session_id: u32) -> u64 {
+    state.sessions.get_mut(&session_id).map_or(0, |mut s| {
+        s.scope_read += 1;
+        s.scope_read
+    })
 }
 
 /// Every signed-in connection against the database, each
@@ -2061,6 +2585,7 @@ pub async fn revalidate(state: &Arc<ServerState>) {
         })
         .collect();
     for (session_id, token, scopes, needs_2fa, standing) in live {
+        let read = scope_read(state, session_id);
         match relay.accounts.session_from_token(&token, util::now()).await {
             Ok(None) => {
                 // The token may have been rotated while this pass ran (turning
@@ -2094,7 +2619,7 @@ pub async fn revalidate(state: &Arc<ServerState>) {
                         .await
                         .is_ok_and(|s| s != standing);
                 if changed {
-                    if let Err(e) = apply_scopes(state, &relay, session_id, user, now).await {
+                    if let Err(e) = apply_scopes(state, &relay, session_id, user, now, read).await {
                         warn!("a change from the server's shell: {e}");
                     }
                 }
@@ -2102,32 +2627,235 @@ pub async fn revalidate(state: &Arc<ServerState>) {
             Err(e) => warn!("checking a signed-in connection: {e}"),
         }
     }
+    // Holders who are not here too: a stored hide is read against them
+    refresh_chat_mods(state).await;
 }
 
 /// The session's powers as `scopes` say, and the account told. A change of
 /// groups reaches what they see and where they may be (`gates`), one of
 /// badges or privileges the rosters showing them.
-async fn apply_scopes(
+/// Holds power over others, which spares it from a kick and an address ban.
+/// Calling on everybody, taking reports and reading the log act on nobody: a
+/// helper holding only those can still be kicked.
+pub fn holds_power(scopes: &[String]) -> bool {
+    scopes
+        .iter()
+        .any(|s| ![MENTION_ALL, REPORTS, MODLOG].contains(&s.as_str()))
+}
+
+/// Whether this session's account may call on everybody.
+pub fn holds_mention_power(s: &crate::state::UserSession) -> bool {
+    s.account
+        .as_ref()
+        .is_some_and(|a| scope::allowed(&a.scopes, MENTION_ALL))
+}
+
+/// Whether this session's account may hide messages.
+pub fn holds_hide(s: &crate::state::UserSession) -> bool {
+    s.account
+        .as_ref()
+        .is_some_and(|a| scope::allowed(&a.scopes, HIDE))
+}
+
+/// Holders of `voipc:reports` who are away and could read a sealed copy: a role
+/// that grants it (not one still waiting for codes), a log key to wrap to, not
+/// banned. Group by group until there are `want`, so what this reads stays small.
+pub async fn takers_away(
+    state: &ServerState,
+    relay: &Relay,
+    want: usize,
+) -> Result<Vec<ReportTaker>> {
+    const PER_GROUP: u32 = 8;
+    let mut read = std::collections::BTreeSet::new();
+    let mut away = Vec::new();
+    for role in relay.store().roles().await? {
+        if away.len() >= want {
+            break;
+        }
+        if !scope::allowed(&role.scopes, REPORTS) {
+            continue;
+        }
+        let (users, _) = relay.store().role_members(role.id, PER_GROUP, 0).await?;
+        for user in users {
+            let id = user.id.0;
+            if !read.insert(id)
+                || state.account_sessions.contains_key(&id)
+                || crate::bans::account_ban(state, id).is_some()
+                || !scope::allowed(&relay.accounts.effective_scopes(&user).await?, REPORTS)
+                || !log::has_key(relay, &id).await?
+            {
+                continue;
+            }
+            away.push(ReportTaker {
+                user_id: None,
+                account: Some(id),
+                name: user.username.clone(),
+            });
+        }
+    }
+    Ok(away)
+}
+
+/// Accounts one `ChatMods` lists at most: about 54 KiB, one frame.
+pub(crate) const CHAT_MODS_MAX: usize = 3000;
+
+/// Every account holding a privilege (`holds_power`), whether or not it is here,
+/// by account id so that repeated reads compare equal.
+pub async fn read_chat_mods(relay: &Relay) -> Result<Vec<ChatMod>> {
+    const PAGE: u32 = if cfg!(test) { 2 } else { 500 };
+    let mut read = std::collections::BTreeSet::new();
+    let mut mods = std::collections::BTreeMap::new();
+    for role in relay.store().roles().await? {
+        if !holds_power(&role.scopes) {
+            continue;
+        }
+        let mut offset = 0;
+        loop {
+            let (users, total) = relay.store().role_members(role.id, PAGE, offset).await?;
+            for user in &users {
+                if !read.insert(user.id.0) {
+                    continue;
+                }
+                // Not the group's: one waiting for codes grants nothing yet
+                let scopes = relay.accounts.effective_scopes(user).await?;
+                if holds_power(&scopes) {
+                    let row = ChatMod {
+                        account: user.id.0,
+                        hide: scope::allowed(&scopes, HIDE),
+                        admin: is_star(&scopes),
+                    };
+                    mods.insert(user.id.0, row);
+                }
+            }
+            offset += users.len() as u32;
+            if users.is_empty() || i64::from(offset) >= total {
+                break;
+            }
+        }
+    }
+    if mods.len() > CHAT_MODS_MAX {
+        warn!(
+            held = mods.len(),
+            "more accounts hold privileges than clients can be told of: \
+             those past the first {CHAT_MODS_MAX} are not spared from a hide"
+        );
+    }
+    Ok(mods.into_values().take(CHAT_MODS_MAX).collect())
+}
+
+/// Reads who holds what and tells everybody, if that changed. The list stays locked
+/// throughout, so that two reads at once cannot end with the older one's answer.
+pub async fn refresh_chat_mods(state: &ServerState) {
+    let Some(relay) = state.accounts.as_ref() else {
+        return;
+    };
+    let mut held = state.chat_mods.write().await;
+    let mods = match read_chat_mods(relay).await {
+        Ok(mods) => mods,
+        Err(e) => {
+            warn!("reading who holds privileges: {e:#}");
+            return;
+        }
+    };
+    if *held == mods {
+        return;
+    }
+    *held = mods;
+    match encode_server_msg(&ServerMessage::ChatMods { mods: held.clone() }) {
+        Ok(data) => state.broadcast_raw_to_all(&data).await,
+        Err(e) => warn!("telling who holds privileges: {e:#}"),
+    }
+}
+
+/// A client that just connected: who holds what. Before it can ask for any stored
+/// log, whose hides are read against this.
+pub async fn chat_mods_at_connect(state: &ServerState, tx: &ControlTx) {
+    let mods = state.chat_mods.read().await.clone();
+    if !mods.is_empty() {
+        let _ = crate::session::send_msg(tx, &ServerMessage::ChatMods { mods });
+    }
+}
+
+/// A client that just connected: who may call on everybody, its own badges, and
+/// to everybody else, itself if it may.
+pub async fn mention_power_at_connect(
+    state: &ServerState,
+    session_id: u32,
+    user_id: u32,
+    tx: &crate::control::ControlTx,
+) {
+    let holders: Vec<u32> = state
+        .sessions
+        .iter()
+        .filter(|s| holds_mention_power(s))
+        .map(|s| s.user_id)
+        .collect();
+    if holders.contains(&user_id) {
+        if let Ok(data) = encode_server_msg(&ServerMessage::MentionPower {
+            user_ids: vec![user_id],
+            on: true,
+        }) {
+            state.broadcast_raw_to_all(&data).await;
+        }
+    }
+    if !holders.is_empty() {
+        let _ = crate::session::send_msg(
+            tx,
+            &ServerMessage::MentionPower {
+                user_ids: holders,
+                on: true,
+            },
+        );
+    }
+    let badges = state.sessions.get(&session_id).and_then(|s| {
+        s.account
+            .as_ref()
+            .map(|a| a.standing.my_badges.clone())
+            .filter(|b| !b.is_empty())
+    });
+    if let Some(badges) = badges {
+        let _ = crate::session::send_msg(tx, &ServerMessage::MyBadges { badges });
+    }
+}
+
+pub(crate) async fn apply_scopes(
     state: &Arc<ServerState>,
     relay: &Relay,
     session_id: u32,
     user: User,
     scopes: Vec<String>,
+    read: u64,
 ) -> Result<()> {
     let info = relay.info_of(&user, &scopes).await?;
     let standing = relay.standing(&user, &scopes).await?;
+    let (my_badges, calls, called_before, editor_changed, listed_changed, reads_restrictions);
     let (tx, user_id, channel_id, is_admin, became_admin, regated, shown) = {
         let Some(mut s) = state.sessions.get_mut(&session_id) else {
             return Ok(());
         };
+        if read < s.scope_written {
+            return Ok(());
+        }
+        s.scope_written = read;
         let (was_admin, was_editor) = (s.is_admin, s.powers.has(Powers::CHANNELS));
+        let could_call = holds_mention_power(&s);
+        let was_listed = (s.is_moderator, holds_hide(&s));
+        let could_restrict = s.can(Powers::RESTRICT);
         s.set_scopes(user, scopes);
+        listed_changed = was_listed != (s.is_moderator, holds_hide(&s)) || s.is_admin != was_admin;
+        reads_restrictions = s.can(Powers::RESTRICT) && !could_restrict;
         let mut old = Standing::default();
         if let Some(a) = s.account.as_mut() {
             a.needs_2fa = info.needs_2fa;
             old = std::mem::replace(&mut a.standing, standing);
         }
         let new = s.account.as_ref().map(|a| &a.standing);
+        my_badges = new
+            .filter(|n| n.my_badges != old.my_badges)
+            .map(|n| n.my_badges.clone());
+        calls = holds_mention_power(&s);
+        called_before = could_call;
+        editor_changed = s.powers.has(Powers::CHANNELS) != was_editor;
         (
             s.control_tx.clone(),
             s.user_id,
@@ -2140,6 +2868,16 @@ async fn apply_scopes(
         )
     };
     crate::session::send_msg(&tx, &ServerMessage::Account(AccountReply::Info(info)))?;
+    if let Some(badges) = my_badges {
+        crate::session::send_msg(&tx, &ServerMessage::MyBadges { badges })?;
+    }
+    if calls != called_before {
+        let data = encode_server_msg(&ServerMessage::MentionPower {
+            user_ids: vec![user_id],
+            on: calls,
+        })?;
+        state.broadcast_raw_to_all(&data).await;
+    }
     if became_admin {
         let data = encode_server_msg(&ServerMessage::AdminStatus { user_id, is_admin })?;
         state.broadcast_raw_to_all(&data).await;
@@ -2147,9 +2885,20 @@ async fn apply_scopes(
     if regated {
         crate::gates::standing_changed(state, session_id).await;
     }
+    // Who manages channels also sees the empty categories
+    if editor_changed {
+        crate::layout::send(state, session_id).await;
+    }
     if shown {
         let info = crate::session::user_info_for(state, user_id, session_id, channel_id);
         crate::session::broadcast_user_updated(state, info).await;
+    }
+    crate::restrict::standing_changed(state, session_id).await;
+    if reads_restrictions {
+        crate::restrict::reasons_for(state, &tx);
+    }
+    if listed_changed {
+        refresh_chat_mods(state).await;
     }
     Ok(())
 }
@@ -2265,6 +3014,40 @@ mod tests {
         }
     }
 
+    /// `discord::FINE_SCOPES` is what ADMINISTRATOR comes to: all of them, one by one, and
+    /// never `*`. A privilege added here and forgotten there fails this.
+    #[test]
+    fn the_fine_scopes_are_exactly_the_registered_privileges() {
+        use std::collections::BTreeSet;
+        use voipc_protocol::discord::FINE_SCOPES;
+        let fine: BTreeSet<&str> = FINE_SCOPES.iter().copied().collect();
+        let registered: BTreeSet<&str> = APP_SCOPES
+            .iter()
+            .map(|s| s.name)
+            .chain(["users:read", "users:admin", "roles:admin"])
+            .collect();
+        assert_eq!(fine, registered);
+        assert_eq!(fine.len(), FINE_SCOPES.len(), "each once");
+        let held: Vec<String> = FINE_SCOPES.iter().map(|s| s.to_string()).collect();
+        assert!(!is_star(&held), "all of them together are not `*`");
+        assert!(is_star(&["*".to_string()]));
+        // ... and every privilege a session can hold is in it
+        let p = Powers::of(&held);
+        for one in [
+            Powers::KICK,
+            Powers::BAN,
+            Powers::BANS,
+            Powers::CHANNELS,
+            Powers::EMOTES,
+            Powers::USERS_READ,
+            Powers::USERS_ADMIN,
+            Powers::ROLES_ADMIN,
+            Powers::RESTRICT,
+        ] {
+            assert!(p.has(one));
+        }
+    }
+
     #[test]
     fn powers_follow_wildcards_and_nothing_else() {
         let p = |s: &[&str]| Powers::of(&s.iter().map(|s| s.to_string()).collect::<Vec<_>>());
@@ -2273,5 +3056,1086 @@ mod tests {
         assert!(p(&["*"]).has(Powers::ROLES_ADMIN));
         assert_eq!(p(&["voipc:kickx", "voipcx:kick"]), Powers::default());
         assert!(is_star(&["*".into()]) && !is_star(&["voipc:*".into()]));
+        // The ninth bit, past what a byte held
+        assert!(p(&["voipc:*"]).has(Powers::RESTRICT) && p(&["*"]).has(Powers::RESTRICT));
+        assert!(p(&["voipc:restrict"]).has(Powers::RESTRICT));
+        assert!(!p(&["voipc:restrict"]).has(Powers::KICK));
+        assert!(!p(&["voipc:kick", "roles:admin"]).has(Powers::RESTRICT));
+        // These three read the scopes themselves
+        assert_eq!(
+            p(&["voipc:hide", "voipc:reports", "voipc:modlog"]),
+            Powers::default()
+        );
+    }
+
+    /// The moderator group's rules, on every database a relay can run on.
+    mod moderator_group {
+        use super::*;
+
+        const OLD: [&str; 3] = ["voipc:ban", "voipc:channels", "voipc:kick"];
+        const NEW: [&str; 7] = [
+            "voipc:ban",
+            "voipc:channels",
+            "voipc:hide",
+            "voipc:kick",
+            "voipc:modlog",
+            "voipc:reports",
+            "voipc:restrict",
+        ];
+
+        /// New databases: a SQLite file, and with `VOIPC_TEST_POSTGRES` also one on
+        /// that server (`postgres://user@host:port/postgres`, a throwaway; no CI
+        /// job runs one, so this is the only check of that SQL).
+        struct Databases {
+            stores: Vec<Store>,
+            file: std::path::PathBuf,
+        }
+
+        impl Drop for Databases {
+            fn drop(&mut self) {
+                for suffix in ["", "-wal", "-shm", ".lock"] {
+                    let _ = std::fs::remove_file(format!("{}{suffix}", self.file.display()));
+                }
+            }
+        }
+
+        async fn databases() -> Databases {
+            let id = rand::random::<u32>();
+            let file = std::env::temp_dir().join(format!("voipc-moderator-{id:08x}.db"));
+            let url = format!("sqlite://{}?mode=rwc", file.display());
+            let mut stores = vec![Store::connect(&url).await.unwrap()];
+            if let Ok(server) = std::env::var("VOIPC_TEST_POSTGRES") {
+                let name = format!("voipc_moderator_{id:08x}");
+                let admin = Store::connect(&server).await.unwrap();
+                db!(&admin, pool => {
+                    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
+                        .execute(pool)
+                        .await
+                        .unwrap();
+                });
+                let (base, _) = server.rsplit_once('/').unwrap();
+                stores.push(Store::connect(&format!("{base}/{name}")).await.unwrap());
+            }
+            Databases { stores, file }
+        }
+
+        async fn boot(store: &Store) {
+            let cfg = AccountsConfig {
+                mode: AccountsMode::Optional,
+                ..Default::default()
+            };
+            Relay::open_with(&cfg, store.clone(), &[9u8; 32])
+                .await
+                .unwrap();
+        }
+
+        async fn group(store: &Store) -> l4f_accounts::model::Role {
+            store.role_by_name("moderator").await.unwrap().unwrap()
+        }
+
+        async fn set(store: &Store, scopes: &[&str]) {
+            let scopes: Vec<String> = scopes.iter().map(|s| s.to_string()).collect();
+            let id = group(store).await.id;
+            store.set_role_scopes(id, &scopes).await.unwrap();
+        }
+
+        /// As a relay before 1.10 left it: the group holding `scopes`, the old
+        /// words, and the question of widening it not yet decided.
+        async fn before_1_10(store: &Store, scopes: &[&str]) {
+            set(store, scopes).await;
+            let m = group(store).await;
+            store
+                .update_role(m.id, MODERATOR_SAID, m.badge.as_deref())
+                .await
+                .unwrap();
+            db!(store, pool => {
+                sqlx::query("DELETE FROM voipc_meta WHERE k = 'moderator_1_10'")
+                    .execute(pool)
+                    .await
+                    .unwrap();
+            });
+        }
+
+        #[tokio::test]
+        async fn a_new_moderator_group_has_the_new_privileges() {
+            let dbs = databases().await;
+            for store in &dbs.stores {
+                boot(store).await;
+                let m = group(store).await;
+                assert_eq!(m.scopes, NEW);
+                assert_eq!(m.description, MODERATOR_SAYS);
+                assert_eq!(m.badge.as_deref(), Some("mod"));
+                assert!(Powers::of(&m.scopes).has(Powers::RESTRICT));
+                // Its very first boot decided too: trimmed before any other, it is
+                // not taken for an upgrade at the next
+                set(store, &OLD).await;
+                boot(store).await;
+                assert_eq!(group(store).await.scopes, OLD);
+            }
+        }
+
+        #[tokio::test]
+        async fn an_untouched_moderator_gains_them_once_on_upgrade() {
+            let dbs = databases().await;
+            for store in &dbs.stores {
+                boot(store).await;
+                before_1_10(store, &OLD).await;
+                let before = group(store).await;
+                assert_eq!(before.scopes, OLD, "control: nothing has widened it yet");
+                boot(store).await;
+                let m = group(store).await;
+                assert_eq!(m.scopes, NEW);
+                assert_eq!(m.id, before.id, "the same group, with its members");
+                assert_eq!(m.description, MODERATOR_SAYS);
+                assert_eq!(m.badge.as_deref(), Some("mod"));
+                boot(store).await;
+                assert_eq!(group(store).await.scopes, NEW);
+            }
+        }
+
+        /// From 1.6 in one step: what the old scope became is the old default.
+        /// Any other group keeps exactly what the old scope granted.
+        #[tokio::test]
+        async fn a_moderator_from_before_1_7_gains_them_too_and_other_groups_do_not() {
+            let dbs = databases().await;
+            for store in &dbs.stores {
+                boot(store).await;
+                before_1_10(store, &[MODERATE_WAS]).await;
+                store
+                    .create_role_with_scopes("helpers", "", None, &[MODERATE_WAS.to_string()])
+                    .await
+                    .unwrap();
+                boot(store).await;
+                assert_eq!(group(store).await.scopes, NEW);
+                let helpers = store.role_by_name("helpers").await.unwrap().unwrap();
+                assert_eq!(helpers.scopes, OLD);
+            }
+        }
+
+        #[tokio::test]
+        async fn an_edited_moderator_is_left_alone() {
+            let edits: [&[&str]; 4] = [
+                &[],
+                &["voipc:ban", "voipc:kick"],
+                &["voipc:ban", "voipc:bans", "voipc:channels", "voipc:kick"],
+                &["voipc:ban", "voipc:channels", "voipc:emotes"],
+            ];
+            for edited in edits {
+                let dbs = databases().await;
+                for store in &dbs.stores {
+                    boot(store).await;
+                    before_1_10(store, edited).await;
+                    boot(store).await;
+                    let m = group(store).await;
+                    assert_eq!(m.scopes, edited);
+                    assert_eq!(m.description, MODERATOR_SAID, "{edited:?}");
+                    // The one chance has passed: back at the old three is the owner's choice
+                    set(store, &OLD).await;
+                    boot(store).await;
+                    assert_eq!(group(store).await.scopes, OLD, "after {edited:?}");
+                }
+            }
+        }
+
+        /// The owner's own words are theirs; only the privileges were the default.
+        #[tokio::test]
+        async fn a_group_with_other_words_keeps_them() {
+            let dbs = databases().await;
+            for store in &dbs.stores {
+                boot(store).await;
+                before_1_10(store, &OLD).await;
+                let id = group(store).await.id;
+                store
+                    .update_role(id, "Our helpers", Some("crew"))
+                    .await
+                    .unwrap();
+                boot(store).await;
+                let m = group(store).await;
+                assert_eq!(m.scopes, NEW);
+                assert_eq!(
+                    (m.description.as_str(), m.badge.as_deref()),
+                    ("Our helpers", Some("crew"))
+                );
+            }
+        }
+
+        /// The log's own SQL on each database: i64 ids and times, and the longest
+        /// names, which only Postgres holds to their VARCHAR limits.
+        #[tokio::test]
+        async fn the_restrictions_round_trip_on_both_backends() {
+            use crate::bans::Key;
+            use crate::restrict::Held;
+            let dbs = databases().await;
+            for store in &dbs.stores {
+                let cfg = AccountsConfig {
+                    mode: AccountsMode::Optional,
+                    ..Default::default()
+                };
+                let relay = Relay::open_with(&cfg, store.clone(), &[9u8; 32])
+                    .await
+                    .unwrap();
+                let id = AccountId([7; 16]);
+                store
+                    .create_user(
+                        &l4f_accounts::model::NewUser {
+                            id,
+                            username: "kim".into(),
+                            display_name: "kim".into(),
+                            email_pending: None,
+                            password_hash: None,
+                            created_at: 1,
+                        },
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let wide = "\u{1F600}";
+                let voice = Held {
+                    voice: true,
+                    text: false,
+                    by: wide.repeat(64),
+                    reason: wide.repeat(200),
+                    expires_at: None,
+                };
+                let posts = Held {
+                    voice: false,
+                    text: true,
+                    expires_at: Some(1000),
+                    ..voice.clone()
+                };
+                let (account, address) = (Key::Account(id.0), Key::Addr([9; 32]));
+                relay.restriction_put(&account, &posts, 1).await.unwrap();
+                relay.restriction_put(&account, &voice, 2).await.unwrap();
+                relay.restriction_put(&address, &posts, 3).await.unwrap();
+
+                let rows = relay.restriction_rows(999).await.unwrap();
+                assert_eq!(rows.len(), 2, "one each: a second replaces the first");
+                let (_, of_account) = rows.iter().find(|(k, _)| *k == account).unwrap();
+                assert!(of_account.voice && !of_account.text);
+                assert_eq!(of_account.expires_at, None);
+                assert_eq!(of_account.reason.chars().count(), 200);
+                let (_, of_address) = rows.iter().find(|(k, _)| *k == address).unwrap();
+                assert!(!of_address.voice && of_address.text);
+                assert_eq!(of_address.expires_at, Some(1000));
+
+                // What ran out goes, and only that
+                let rows = relay.restriction_rows(1000).await.unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].0, account);
+                relay.restriction_put(&address, &posts, 3).await.unwrap();
+                relay.restrictions_sweep(1000).await.unwrap();
+                assert_eq!(relay.restriction_rows(0).await.unwrap().len(), 1);
+                relay.restriction_delete(&account).await.unwrap();
+                assert!(relay.restriction_rows(0).await.unwrap().is_empty());
+            }
+        }
+
+        /// What says a sealed report can be kept for someone away.
+        #[tokio::test]
+        async fn a_log_key_is_found_on_both_backends() {
+            let dbs = databases().await;
+            for store in &dbs.stores {
+                let cfg = AccountsConfig {
+                    mode: AccountsMode::Optional,
+                    ..Default::default()
+                };
+                let relay = Relay::open_with(&cfg, store.clone(), &[9u8; 32])
+                    .await
+                    .unwrap();
+                let id = AccountId([7; 16]);
+                store
+                    .create_user(
+                        &l4f_accounts::model::NewUser {
+                            id,
+                            username: "kim".into(),
+                            display_name: "kim".into(),
+                            email_pending: None,
+                            password_hash: None,
+                            created_at: 1,
+                        },
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                assert!(!log::has_key(&relay, &id.0).await.unwrap());
+                log::publish(&relay, id, &[1; 33], &[2; 64]).await.unwrap();
+                assert!(log::has_key(&relay, &id.0).await.unwrap());
+                assert!(!log::has_key(&relay, &[8; 16]).await.unwrap());
+            }
+        }
+
+        #[tokio::test]
+        async fn the_modlog_round_trips_on_both_backends() {
+            let dbs = databases().await;
+            for store in &dbs.stores {
+                let cfg = AccountsConfig {
+                    mode: AccountsMode::Optional,
+                    ..Default::default()
+                };
+                let relay = Relay::open_with(&cfg, store.clone(), &[9u8; 32])
+                    .await
+                    .unwrap();
+                let wide = "\u{1F600}x\0".repeat(400);
+                let key = format!("c:{}", "k".repeat(78));
+                let entry = |action| modlog::Entry {
+                    action,
+                    actor: Some([1; 16]),
+                    actor_name: &wide,
+                    target: Some([2; 16]),
+                    target_name: &wide,
+                    channel_key: &key,
+                    channel_name: &wide,
+                    reason: &wide,
+                    detail: &wide,
+                };
+                relay.modlog_put(&entry("ban")).await.unwrap();
+                relay.modlog_put(&entry("hide")).await.unwrap();
+                relay
+                    .modlog_put(&modlog::Entry {
+                        action: "kick",
+                        actor_name: "server shell",
+                        target_name: "kim",
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                let rows = relay.modlog_rows(0, 200).await.unwrap();
+                assert_eq!(rows.len(), 3);
+                assert!(rows[0].0 > rows[1].0 && rows[1].0 > rows[2].0);
+                assert!(rows[0].1 > 1_700_000_000, "seconds: {}", rows[0].1);
+                let (_, _, action, actor, target, k, name, reason, detail) = &rows[1];
+                assert_eq!(action, "hide");
+                assert_eq!(k.as_deref(), Some(key.as_str()));
+                for (text, chars) in [
+                    (actor, 64),
+                    (target, 64),
+                    (name.as_ref().unwrap(), 64),
+                    (reason, 200),
+                    (detail, 255),
+                ] {
+                    assert_eq!(text.chars().count(), chars, "{text}");
+                    assert!(!text.contains('\0'));
+                }
+                // An empty channel is none at all
+                assert!(rows[0].5.is_none() && rows[0].6.is_none());
+                assert_eq!(relay.modlog_rows(rows[1].0, 200).await.unwrap().len(), 1);
+                assert_eq!(
+                    relay.modlog_notes_since([1; 16], 0).await.unwrap(),
+                    1,
+                    "the note, not the ban, and only this actor's"
+                );
+                assert_eq!(relay.modlog_notes_since([2; 16], 0).await.unwrap(), 0);
+                assert_eq!(modlog::sweep(&relay).await.unwrap(), 0);
+                // The bind of a cutoff in the past takes what is older, on both
+                let old = util::now() - 181 * 86_400;
+                db!(store, pool => {
+                    sqlx::query("UPDATE voipc_modlog SET at = $1 WHERE action = 'kick'")
+                        .bind(old)
+                        .execute(pool)
+                        .await
+                        .unwrap();
+                });
+                assert_eq!(modlog::sweep(&relay).await.unwrap(), 1);
+
+                // What the log calls someone an admin banned, across a restart
+                let ban = crate::bans::Ban {
+                    id: 0,
+                    label: "tom".into(),
+                    reason: String::new(),
+                    by: "boss".into(),
+                    created_at: 1,
+                    expires_at: None,
+                    addr: None,
+                    alias: Some("Guest-0001".into()),
+                };
+                relay
+                    .ban_put(&crate::bans::Key::Addr([7; 32]), &ban)
+                    .await
+                    .unwrap();
+                let rows = relay.ban_rows(2).await.unwrap();
+                assert_eq!(rows[0].1.log_name(), "Guest-0001");
+                assert_eq!(rows[0].1.label, "tom");
+            }
+        }
+
+        /// What a shell ban takes out of the logs, on both: its statements are `ban_put`'s.
+        #[tokio::test]
+        async fn a_banned_account_leaves_the_logs_on_both_backends() {
+            let dbs = databases().await;
+            for store in &dbs.stores {
+                let cfg = AccountsConfig {
+                    mode: AccountsMode::Optional,
+                    ..Default::default()
+                };
+                let relay = Relay::open_with(&cfg, store.clone(), &[9u8; 32])
+                    .await
+                    .unwrap();
+                let (dan, cat) = ([7u8; 16], [8u8; 16]);
+                for (id, username) in [(dan, "dan"), (cat, "cat")] {
+                    store
+                        .create_user(
+                            &l4f_accounts::model::NewUser {
+                                id: AccountId(id),
+                                username: username.into(),
+                                display_name: username.into(),
+                                email_pending: None,
+                                password_hash: None,
+                                created_at: 1,
+                            },
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                }
+                db!(store, pool => {
+                    for id in [dan, cat] {
+                        sqlx::query("INSERT INTO voipc_members (conv, account, joined_at) VALUES ('c:aa', $1, 1)")
+                            .bind(&id[..])
+                            .execute(pool)
+                            .await
+                            .unwrap();
+                    }
+                    for (owner, recipient) in [(dan, cat), (cat, dan), (cat, cat)] {
+                        sqlx::query("INSERT INTO voipc_pending (conv, owner, recipient, created_at) VALUES ('c:aa', $1, $2, 1)")
+                            .bind(&owner[..])
+                            .bind(&recipient[..])
+                            .execute(pool)
+                            .await
+                            .unwrap();
+                    }
+                });
+                relay.ban_out_of_logs(&dan).await.unwrap();
+                let (members, pending): (i64, i64) = db!(store, pool => {
+                    let members = sqlx::query_scalar("SELECT CAST(COUNT(*) AS BIGINT) FROM voipc_members")
+                        .fetch_one(pool)
+                        .await
+                        .unwrap();
+                    let pending = sqlx::query_scalar("SELECT CAST(COUNT(*) AS BIGINT) FROM voipc_pending")
+                        .fetch_one(pool)
+                        .await
+                        .unwrap();
+                    (members, pending)
+                });
+                assert_eq!((members, pending), (1, 1), "the other member's stay");
+
+                // A reason with a NUL in it, which Postgres would refuse in the bind
+                let ban = crate::bans::Ban {
+                    id: 0,
+                    label: "dan".into(),
+                    reason: crate::session::ban_reason("a\0b".into()),
+                    by: "boss".into(),
+                    created_at: 1,
+                    expires_at: None,
+                    addr: None,
+                    alias: None,
+                };
+                relay
+                    .ban_put(&crate::bans::Key::Account(dan), &ban)
+                    .await
+                    .unwrap();
+                assert_eq!(relay.ban_rows(2).await.unwrap()[0].1.reason, "ab");
+            }
+        }
+
+        #[tokio::test]
+        async fn a_removal_round_trips_on_both_backends() {
+            let dbs = databases().await;
+            for store in &dbs.stores {
+                let cfg = AccountsConfig {
+                    mode: AccountsMode::Optional,
+                    ..Default::default()
+                };
+                let relay = Relay::open_with(&cfg, store.clone(), &[9u8; 32])
+                    .await
+                    .unwrap();
+                let id = AccountId([7; 16]);
+                store
+                    .create_user(
+                        &l4f_accounts::model::NewUser {
+                            id,
+                            username: "kim".into(),
+                            display_name: "kim".into(),
+                            email_pending: None,
+                            password_hash: None,
+                            created_at: 1,
+                        },
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                for (conv, server_at) in [
+                    ("c:aa", 2000_i64),
+                    ("c:bb", 3000),
+                    ("c:aa", 1),
+                    ("c:aa", 5000),
+                    ("d:aa", 2000),
+                ] {
+                    db!(store, pool => {
+                        sqlx::query(
+                            "INSERT INTO voipc_log (conv, sender, epoch, server_at, keep_until, ct) VALUES ($1, $2, 1, $3, $3, $4)",
+                        )
+                        .bind(conv)
+                        .bind(&id.0[..])
+                        .bind(server_at)
+                        .bind(&[0u8][..])
+                        .execute(pool)
+                        .await
+                        .unwrap();
+                    });
+                }
+                let wide = "\u{1F600}x\0".repeat(400);
+                let row = modlog::Entry {
+                    action: "remove_posts",
+                    actor: Some([1; 16]),
+                    actor_name: &wide,
+                    target: Some(id.0),
+                    target_name: &wide,
+                    reason: &wide,
+                    ..Default::default()
+                };
+                let window = "last hour";
+                // What came from Discord: a wish, and the row counts what it covers
+                db!(store, pool => {
+                    for (channel, dc_id, author) in [(5i64, 10i64, 77i64), (6, 11, 77), (5, 90, 77), (5, 12, 78)] {
+                        sqlx::query(
+                            "INSERT INTO voipc_archive (channel, dc_id, author_dc_id, author_name, body, import_id)
+                             VALUES ($1, $2, $3, 'x', 'y', 1)",
+                        )
+                        .bind(channel)
+                        .bind(dc_id)
+                        .bind(author)
+                        .execute(pool)
+                        .await
+                        .unwrap();
+                    }
+                });
+                let imported = modlog::Imported {
+                    ids: &[77],
+                    low: 10,
+                    high: 50,
+                    say_how_many: true,
+                };
+                assert_eq!(
+                    relay
+                        .posts_remove(Some(id.0), imported, 1000, 4000, window, &row)
+                        .await
+                        .unwrap(),
+                    2,
+                    "in the window, in channels"
+                );
+                let left: i64 = db!(store, pool => {
+                    sqlx::query_scalar("SELECT CAST(COUNT(*) AS BIGINT) FROM voipc_log")
+                        .fetch_one(pool)
+                        .await
+                        .unwrap()
+                });
+                assert_eq!(left, 3);
+                // A guest's deletes nothing, and has no account to name
+                let guest = modlog::Entry {
+                    action: "remove_posts",
+                    actor_name: "boss",
+                    target_name: "gus#0001",
+                    ..Default::default()
+                };
+                let imported = modlog::Imported {
+                    ids: &[],
+                    low: 0,
+                    high: 0,
+                    say_how_many: true,
+                };
+                assert_eq!(
+                    relay
+                        .posts_remove(None, imported, 0, 4000, window, &guest)
+                        .await
+                        .unwrap(),
+                    0
+                );
+                let marks = relay.modlog_marks().await.unwrap();
+                assert_eq!(marks.len(), 2);
+                assert_eq!(
+                    (
+                        marks[0].account,
+                        marks[0].name.as_str(),
+                        marks[0].since_ms,
+                        marks[0].before_ms,
+                        marks[0].by.as_str()
+                    ),
+                    (None, "gus#0001", 0, 4000, "boss")
+                );
+                assert_eq!(
+                    (marks[1].account, marks[1].since_ms, marks[1].before_ms),
+                    (Some(id.0), 1000, 4000)
+                );
+                assert_eq!(marks[1].name.chars().count(), 64);
+                assert_eq!(marks[1].by.chars().count(), 64);
+                let rows = relay.modlog_rows(0, 200).await.unwrap();
+                assert_eq!(rows[1].8, "2 kept messages, last hour, 2 imported");
+                archive::load(&relay).await.unwrap();
+                let wishes = relay.wishes();
+                use archive::{verdict, Verdict};
+                assert_eq!(verdict(&wishes, Some(77), 6, 11), Verdict::Erased);
+                assert_eq!(verdict(&wishes, Some(77), 5, 90), Verdict::Shown);
+                assert_eq!(verdict(&wishes, Some(78), 5, 12), Verdict::Shown);
+                // Others' rows are no removals
+                relay
+                    .modlog_put(&modlog::Entry {
+                        action: "ban",
+                        target_name: "kim",
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(relay.modlog_marks().await.unwrap().len(), 2);
+            }
+        }
+
+        #[tokio::test]
+        async fn a_privilege_removed_after_the_upgrade_is_not_given_back() {
+            let dbs = databases().await;
+            for store in &dbs.stores {
+                boot(store).await;
+                before_1_10(store, &OLD).await;
+                boot(store).await;
+                assert_eq!(group(store).await.scopes, NEW, "control: it did widen");
+                set(store, &OLD).await;
+                boot(store).await;
+                assert_eq!(group(store).await.scopes, OLD);
+                let fewer = &NEW[..NEW.len() - 1];
+                set(store, fewer).await;
+                boot(store).await;
+                assert_eq!(group(store).await.scopes, fewer);
+            }
+        }
+
+        /// The move's tables on each database: the longest text, ids past what a JS number
+        /// holds, the statements the steps after this rest on (Postgres has no two-argument
+        /// `max`, and no CI job runs it), and what goes with an account or a group.
+        #[tokio::test]
+        async fn the_move_tables_round_trip_on_both_backends() {
+            macro_rules! run {
+                ($store:expr, $sql:expr $(, $bind:expr)* $(,)?) => {
+                    db!($store, pool => {
+                        sqlx::query($sql)$(.bind($bind))*.execute(pool).await.map(|r| r.rows_affected())
+                    })
+                };
+            }
+            macro_rules! row {
+                ($store:expr, $ty:ty, $sql:expr $(, $bind:expr)* $(,)?) => {
+                    db!($store, pool => {
+                        sqlx::query_as::<_, $ty>($sql)$(.bind($bind))*.fetch_one(pool).await.unwrap()
+                    })
+                };
+            }
+            const SNOWFLAKE: i64 = 1_454_987_148_113_234_751;
+            const CURSOR: &str = "INSERT INTO voipc_import_cursors (uid, import_id, high) \
+                VALUES ($1, $2, $3) ON CONFLICT (uid, import_id) DO UPDATE \
+                SET high = excluded.high WHERE excluded.high > voipc_import_cursors.high";
+            const CURSORS: &str = "SELECT CAST(MAX(c.high) AS BIGINT) FROM voipc_import_cursors c \
+                JOIN voipc_imports i ON i.id = c.import_id WHERE c.uid = $1 AND i.undone_at IS NULL";
+            const WISH: &str = "INSERT INTO voipc_archive_wishes \
+                (author_dc_id, channel, low, high, erase, at) VALUES ($1, $2, $3, $4, $5, $6) \
+                ON CONFLICT (author_dc_id, channel, low, high) DO UPDATE \
+                SET erase = voipc_archive_wishes.erase OR excluded.erase";
+            const MESSAGE: &str = "INSERT INTO voipc_archive (channel, thread, dc_id, author_dc_id, \
+                author_name, body, reply_to, reactions, attachments, pinned, import_id) \
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+                ON CONFLICT (channel, thread, dc_id) DO UPDATE SET \
+                author_dc_id = excluded.author_dc_id, author_name = excluded.author_name, \
+                body = excluded.body, reply_to = excluded.reply_to, reactions = excluded.reactions, \
+                attachments = excluded.attachments, pinned = excluded.pinned";
+            const THREAD: &str = "INSERT INTO voipc_archive (channel, thread, dc_id, author_name, \
+                body, thread_name, replies, import_id) VALUES ($1, 0, $2, '', '', $3, $4, $5) \
+                ON CONFLICT (channel, thread, dc_id) DO UPDATE \
+                SET thread_name = excluded.thread_name, replies = excluded.replies";
+            type Page = (
+                i64,
+                Option<i64>,
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+                i32,
+                bool,
+                i64,
+            );
+            const PAGE: &str = "SELECT dc_id, author_dc_id, author_name, body, reactions, \
+                thread_name, replies, pinned, import_id FROM voipc_archive \
+                WHERE channel = $1 AND thread = $2 AND dc_id < $3 ORDER BY dc_id DESC LIMIT $4";
+
+            let dbs = databases().await;
+            for store in &dbs.stores {
+                boot(store).await;
+                let wide = "\u{1F600}";
+
+                // A run: ids go up, and marking one undone happens once
+                let (first, second) = {
+                    let mut ids = Vec::new();
+                    for _ in 0..2 {
+                        ids.push(row!(
+                            store,
+                            (i64,),
+                            "INSERT INTO voipc_imports (guild_id, by_name, started_at, options) \
+                             VALUES ($1, $2, $3, $4) RETURNING CAST(id AS BIGINT)",
+                            SNOWFLAKE,
+                            wide.repeat(64),
+                            100i64,
+                            "{\"messages\":true}",
+                        ));
+                    }
+                    (ids[0].0, ids[1].0)
+                };
+                assert!(second > first);
+                run!(
+                    store,
+                    "UPDATE voipc_imports SET archive_rows = archive_rows + $1 WHERE id = $2",
+                    5i64,
+                    first
+                )
+                .unwrap();
+                let (guild, by, options, report, backup, rows, undone, done) = row!(
+                    store,
+                    (
+                        i64,
+                        String,
+                        String,
+                        Option<String>,
+                        Option<String>,
+                        i64,
+                        Option<i64>,
+                        Option<i64>
+                    ),
+                    "SELECT guild_id, by_name, options, report, backup, archive_rows, undone_at, \
+                     archive_done_at FROM voipc_imports WHERE id = $1",
+                    first
+                );
+                assert_eq!(
+                    (guild, by, options.as_str(), rows),
+                    (SNOWFLAKE, wide.repeat(64), "{\"messages\":true}", 5)
+                );
+                assert_eq!((report, backup, undone, done), (None, None, None, None));
+
+                // What a run made: a row stays as the run that made it left it
+                for (run, local) in [(first, "c:dc-1"), (second, "changed")] {
+                    run!(
+                        store,
+                        "INSERT INTO voipc_import_items (kind, dc_id, import_id, local) \
+                         VALUES ($1, $2, $3, $4) ON CONFLICT (kind, dc_id) DO NOTHING",
+                        2i16,
+                        SNOWFLAKE,
+                        run,
+                        local
+                    )
+                    .unwrap();
+                }
+                let (import_id, local) = row!(
+                    store,
+                    (i64, String),
+                    "SELECT import_id, local FROM voipc_import_items WHERE kind = $1 AND dc_id = $2",
+                    2i16,
+                    SNOWFLAKE
+                );
+                assert_eq!((import_id, local.as_str()), (first, "c:dc-1"));
+
+                // A cursor only rises, and undoing a delta falls back to the run before
+                for high in [50i64, 40, 60] {
+                    run!(store, CURSOR, SNOWFLAKE, first, high).unwrap();
+                }
+                run!(store, CURSOR, SNOWFLAKE, second, SNOWFLAKE).unwrap();
+                let reached = row!(store, (i64,), CURSORS, SNOWFLAKE).0;
+                assert_eq!(reached, SNOWFLAKE);
+                let undo =
+                    "UPDATE voipc_imports SET undone_at = $1 WHERE id = $2 AND undone_at IS NULL";
+                let once = run!(store, undo, 200i64, second).unwrap();
+                let twice = run!(store, undo, 300i64, second).unwrap();
+                assert_eq!((once, twice), (1, 0));
+                let reached = row!(store, (i64,), CURSORS, SNOWFLAKE).0;
+                assert_eq!(reached, 60, "40 did not lower it");
+
+                // An account the move knows, and its group and twin
+                let id = AccountId([7; 16]);
+                store
+                    .create_user(
+                        &l4f_accounts::model::NewUser {
+                            id,
+                            username: "kim".into(),
+                            display_name: "kim".into(),
+                            email_pending: None,
+                            password_hash: None,
+                            created_at: 1,
+                        },
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let placeholder = "INSERT INTO voipc_placeholders \
+                    (account, dc_id, import_id, banned, joined_at, imported_at) \
+                    VALUES ($1, $2, $3, $4, $5, $6)";
+                let unknown_run = run!(
+                    store,
+                    placeholder,
+                    &id.0[..],
+                    SNOWFLAKE,
+                    i64::MAX,
+                    false,
+                    None::<i64>,
+                    100i64
+                );
+                assert!(unknown_run.is_err(), "a row names a run that exists");
+                run!(
+                    store,
+                    placeholder,
+                    &id.0[..],
+                    SNOWFLAKE,
+                    first,
+                    false,
+                    Some(50i64),
+                    100i64
+                )
+                .unwrap();
+                let (dc_id, banned, joined, imported, claimed) = row!(
+                    store,
+                    (i64, bool, Option<i64>, i64, Option<i64>),
+                    "SELECT p.dc_id, p.banned, p.joined_at, p.imported_at, p.claimed_at \
+                     FROM voipc_placeholders p \
+                     WHERE NOT p.banned AND p.claimed_at IS NULL AND p.imported_at <= $1 \
+                     ORDER BY p.imported_at LIMIT 200",
+                    100i64
+                );
+                assert_eq!(
+                    (dc_id, banned, joined, imported, claimed),
+                    (SNOWFLAKE, false, Some(50), 100, None)
+                );
+                let role = store.create_role("crew", "", None).await.unwrap().unwrap();
+                let twin = store
+                    .create_role("crew-power", "", None)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let group = "INSERT INTO voipc_import_groups (role, dc_role_id, power, import_id) \
+                    VALUES ($1, $2, $3, $4)";
+                run!(store, group, &role.0[..], SNOWFLAKE, false, first).unwrap();
+                run!(store, group, &twin.0[..], SNOWFLAKE, true, first).unwrap();
+                let another = store.create_role("crew2", "", None).await.unwrap().unwrap();
+                let same_role = run!(store, group, &another.0[..], SNOWFLAKE, false, first);
+                assert!(same_role.is_err(), "one zero-scope group for a role");
+                let waiting = "INSERT INTO voipc_power_waiting (account, role) VALUES ($1, $2)";
+                run!(store, waiting, &id.0[..], &twin.0[..]).unwrap();
+
+                // Who is left out: `erase` is always said, since it destroys posts
+                let excluded = "INSERT INTO voipc_import_excluded (dc_id, own, erase, at) \
+                    VALUES ($1, $2, $3, $4) ON CONFLICT (dc_id) DO UPDATE \
+                    SET own = excluded.own, erase = excluded.erase";
+                let unsaid = run!(
+                    store,
+                    "INSERT INTO voipc_import_excluded (dc_id, own, at) VALUES ($1, $2, $3)",
+                    1i64,
+                    false,
+                    1i64
+                );
+                assert!(unsaid.is_err(), "no default for `erase`");
+                run!(store, excluded, SNOWFLAKE, false, false, 1i64).unwrap();
+                run!(store, excluded, SNOWFLAKE, true, true, 2i64).unwrap();
+                let (own, erase) = row!(
+                    store,
+                    (bool, bool),
+                    "SELECT own, erase FROM voipc_import_excluded WHERE dc_id = $1",
+                    SNOWFLAKE
+                );
+                assert_eq!((own, erase), (true, true));
+
+                // A row of the archive: an upsert leaves its first run, a thread's name and
+                // count, and a thread's upsert leaves its text
+                let channel = SNOWFLAKE - 1;
+                let body = format!("first line\nsecond\t{}", "x".repeat(16_000));
+                let reactions = Some("[{\"emoji\":\"x\",\"count\":1}]");
+                run!(
+                    store,
+                    MESSAGE,
+                    channel,
+                    0i64,
+                    SNOWFLAKE,
+                    Some(SNOWFLAKE),
+                    wide.repeat(64),
+                    "soon replaced",
+                    None::<i64>,
+                    None::<&str>,
+                    None::<&str>,
+                    false,
+                    first
+                )
+                .unwrap();
+                run!(
+                    store,
+                    THREAD,
+                    channel,
+                    SNOWFLAKE,
+                    wide.repeat(100),
+                    12i32,
+                    second
+                )
+                .unwrap();
+                run!(
+                    store,
+                    MESSAGE,
+                    channel,
+                    0i64,
+                    SNOWFLAKE,
+                    Some(SNOWFLAKE),
+                    wide.repeat(64),
+                    body.clone(),
+                    Some(SNOWFLAKE - 5),
+                    reactions,
+                    None::<&str>,
+                    true,
+                    second
+                )
+                .unwrap();
+                // An anonymised row in a thread, and a thread with no such message
+                run!(
+                    store,
+                    MESSAGE,
+                    channel,
+                    SNOWFLAKE,
+                    SNOWFLAKE - 3,
+                    None::<i64>,
+                    "Former member",
+                    "older",
+                    None::<i64>,
+                    None::<&str>,
+                    None::<&str>,
+                    false,
+                    second
+                )
+                .unwrap();
+                run!(store, THREAD, channel, SNOWFLAKE - 9, "lone", 0i32, first).unwrap();
+                let page = db!(store, pool => {
+                    sqlx::query_as::<_, Page>(PAGE)
+                        .bind(channel)
+                        .bind(0i64)
+                        .bind(i64::MAX)
+                        .bind(200i64)
+                        .fetch_all(pool)
+                        .await
+                        .unwrap()
+                });
+                assert_eq!(page.len(), 2, "newest first: {page:?}");
+                assert_eq!(page[1].0, SNOWFLAKE - 9);
+                assert_eq!((page[1].2.as_str(), page[1].3.as_str()), ("", ""));
+                let top = &page[0];
+                assert_eq!((top.0, top.1), (SNOWFLAKE, Some(SNOWFLAKE)));
+                assert_eq!(top.2, wide.repeat(64));
+                assert_eq!(top.3, body, "its newlines kept");
+                assert_eq!(top.5.as_deref(), Some(wide.repeat(100).as_str()));
+                assert_eq!(top.4.as_deref(), reactions);
+                assert_eq!((top.6, top.7), (12, true));
+                assert_eq!(
+                    top.8, first,
+                    "a row belongs to the run that first brought it"
+                );
+
+                // The queries reading depends on, each on both
+                let pin = row!(
+                    store,
+                    (i64,),
+                    "SELECT dc_id FROM voipc_archive WHERE channel = $1 AND pinned = TRUE \
+                     AND dc_id < $2 ORDER BY dc_id DESC LIMIT $3",
+                    channel,
+                    i64::MAX,
+                    200i64
+                );
+                assert_eq!(pin.0, SNOWFLAKE);
+                let thread_row = row!(
+                    store,
+                    (i64, Option<i64>),
+                    "SELECT dc_id, author_dc_id FROM voipc_archive WHERE channel = $1 AND thread > 0 \
+                     AND (thread, dc_id) < ($2, $3) ORDER BY thread DESC, dc_id DESC LIMIT 2000",
+                    channel,
+                    i64::MAX,
+                    i64::MAX
+                );
+                assert_eq!(thread_row, (SNOWFLAKE - 3, None));
+
+                // A wish outlives its rows: a hide never softens a delete, and the widest fits
+                let wish = |erase: bool| (SNOWFLAKE, 0i64, 0i64, i64::MAX, erase, 1i64);
+                for (a, c, l, h, e, at) in [wish(false), wish(true), wish(false)] {
+                    run!(store, WISH, a, c, l, h, e, at).unwrap();
+                }
+                let (high, erase) = row!(
+                    store,
+                    (i64, bool),
+                    "SELECT high, erase FROM voipc_archive_wishes WHERE author_dc_id = $1",
+                    SNOWFLAKE
+                );
+                assert_eq!((high, erase), (i64::MAX, true));
+
+                // The worker's one statement: at most a batch, and only what it names
+                let taken = run!(
+                    store,
+                    "DELETE FROM voipc_archive WHERE (channel, thread, dc_id) IN \
+                     (SELECT channel, thread, dc_id FROM voipc_archive \
+                      WHERE author_dc_id = $1 LIMIT 5000)",
+                    SNOWFLAKE
+                )
+                .unwrap();
+                assert_eq!(taken, 1);
+                let left = row!(
+                    store,
+                    (i64,),
+                    "SELECT CAST(COUNT(*) AS BIGINT) FROM voipc_archive"
+                );
+                assert_eq!(left.0, 2, "the anonymised row and the lone root stay");
+
+                // A channel keeps its place and starts as not private; its reader still works
+                run!(
+                    store,
+                    "INSERT INTO voipc_channels (conv, position) VALUES ($1, $2)",
+                    "c:dc-1454987148113234751",
+                    0i32
+                )
+                .unwrap();
+                let private = "SELECT archive_private FROM voipc_channels WHERE conv = $1";
+                let conv = "c:dc-1454987148113234751";
+                assert!(!row!(store, (bool,), private, conv).0);
+                run!(
+                    store,
+                    "UPDATE voipc_channels SET archive_private = $1 WHERE conv = $2",
+                    true,
+                    conv
+                )
+                .unwrap();
+                assert!(row!(store, (bool,), private, conv).0);
+
+                // What goes with a group, and with an account. Nothing here is theirs to take
+                // but the marker: runs, cursors, what was left out and the archive stay
+                let count = |table: &'static str| {
+                    let store = store.clone();
+                    async move {
+                        let sql = format!("SELECT CAST(COUNT(*) AS BIGINT) FROM {table}");
+                        let (n,): (i64,) = db!(&store, pool => {
+                            sqlx::query_as(sqlx::AssertSqlSafe(sql)).fetch_one(pool).await.unwrap()
+                        });
+                        n
+                    }
+                };
+                assert!(store.delete_role(role).await.unwrap());
+                assert_eq!(count("voipc_import_groups").await, 1, "the twin stays");
+                assert_eq!(count("voipc_power_waiting").await, 1);
+                assert!(store.delete_role(twin).await.unwrap());
+                assert_eq!(count("voipc_import_groups").await, 0);
+                assert_eq!(count("voipc_power_waiting").await, 0, "with the twin");
+                run!(store, waiting, &id.0[..], &another.0[..]).unwrap();
+                let mut tx = store.begin().await.unwrap();
+                assert!(Store::delete_user(tx.conn(), id).await.unwrap());
+                tx.commit().await.unwrap();
+                assert_eq!(count("voipc_placeholders").await, 0);
+                assert_eq!(count("voipc_power_waiting").await, 0, "with the account");
+                assert_eq!(count("voipc_imports").await, 2);
+                assert_eq!(count("voipc_import_items").await, 1);
+                assert_eq!(count("voipc_import_cursors").await, 2);
+                assert_eq!(count("voipc_import_excluded").await, 1);
+                assert_eq!(count("voipc_archive_wishes").await, 1);
+                assert_eq!(count("voipc_archive").await, 2);
+            }
+        }
     }
 }

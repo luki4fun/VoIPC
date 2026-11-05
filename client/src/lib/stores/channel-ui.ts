@@ -13,8 +13,10 @@
 
 import { derived, get, writable, type Readable, type Writable } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
+import { levelOf, nextLevel, type NotifyLevel } from "../notify-rules.js";
+import { adminOps } from "../relay-rules.js";
 
-import { channels, currentChannelId, previewChannelId, previewUsers, voiceServer } from "./channels.js";
+import { channelLayout, channels, currentChannelId, previewChannelId, previewUsers, voiceServer } from "./channels.js";
 import {
   channelPassword,
   forgetChannelPassword,
@@ -34,21 +36,24 @@ import {
   joinedTextChannelIds,
   openDm,
   openTextChannel,
+  renameChannelChat,
 } from "./chat.js";
 import { openServers } from "./servers.js";
+import { currentRosterOf } from "./rosters.js";
 import { users } from "./users.js";
 import { shortName } from "../username.js";
-import type { ChatPlace } from "../chat-rules.js";
+import type { Actor, ChatPlace } from "../chat-rules.js";
 import { addNotification } from "./notifications.js";
 import { relayAccounts } from "./account.js";
-import { can, canOn } from "./powers.js";
+import { can, canOn, chatMods } from "./powers.js";
 import { adminGate, adminOp } from "./admin-ops.js";
 import { olderRelay } from "./relay.js";
 import { showChatPane } from "./platform.js";
 import { updateActiveStreamChat, updateUiPrefs, uiPrefs } from "./ui-prefs.js";
 import { streamStage } from "./screenshare.js";
 import { buildInviteLink, splitAddress } from "../invite.js";
-import { canManage, canManageAs, needsNsfwConsent, type Me } from "../channel-post-rules.js";
+import { canManage, canManageAs, hideRight, needsNsfwConsent, type Me } from "../channel-post-rules.js";
+import { moderation } from "../relay-rules.js";
 import type { ProximityMode } from "../spatial.js";
 import type { ChannelGate, ChannelInfo, ChatMessage } from "../types.js";
 
@@ -370,6 +375,73 @@ export function setDmMessageTtl(server: string, peerName: string, secs: number):
   });
 }
 
+/** Fold a category in the sidebar, or open it again. */
+export function toggleCategory(server: string, id: number): void {
+  const key = serverKey(server);
+  if (!key) return;
+  updateUiPrefs((p) => {
+    const now = p.folded_categories[key] ?? [];
+    const next = now.includes(id) ? now.filter((i) => i !== id) : [...now, id];
+    if (next.length > 0) p.folded_categories[key] = next;
+    else delete p.folded_categories[key];
+  });
+}
+
+/**
+ * The welcome channel to open on `server`, once ever on this device. A server
+ * with none is marked as well: nobody already here is pulled in when one is set.
+ * Not one that wants 18+ consent, which has to be asked for by opening it.
+ */
+export function firstVisit(server: string): ChannelInfo | null {
+  const key = serverKey(server);
+  if (!key || get(uiPrefs).welcomed.includes(key)) return null;
+  updateUiPrefs((p) => {
+    p.welcomed = [...p.welcomed, key];
+  });
+  const id = get(channelLayout.peek(server)).channels.find((p) => p.welcome)?.channel_id;
+  const channel = get(channels.peek(server)).find((c) => c.channel_id === id);
+  return channel && !needsNsfwConsent(channel, hasNsfwConsent(server)) ? channel : null;
+}
+
+/** A channel made in the app was renamed: what this device keeps by its name goes
+ *  with it. Otherwise its pane is empty, what was deleted can come back, and someone
+ *  who left is joined again. */
+export function channelRenamed(server: string, from: string, to: string): void {
+  renameChannelChat(server, from, to);
+  const pass = channelPassword(server, from);
+  if (pass) {
+    rememberChannelPassword(server, to, pass);
+    forgetChannelPassword(server, from);
+  }
+  const key = serverKey(server);
+  if (!key) return;
+  updateUiPrefs((p) => {
+    const left = p.left_text_channels[key];
+    if (left?.includes(from)) p.left_text_channels[key] = left.map((n) => (n === from ? to : n));
+    const level = p.channel_notify[`${key}/${from}`];
+    if (level) {
+      p.channel_notify[`${key}/${to}`] = level;
+      delete p.channel_notify[`${key}/${from}`];
+    }
+  });
+}
+
+/** What this channel's messages may do to this person (`notify-rules.ts`). */
+export function channelNotify(server: string, name: string, members: number): NotifyLevel {
+  const key = serverKey(server);
+  return levelOf(key ? get(uiPrefs).channel_notify[`${key}/${name}`] : undefined, members);
+}
+
+/** The next level, kept for this channel from then on. */
+export function cycleChannelNotify(server: string, name: string, members: number): void {
+  const key = serverKey(server);
+  if (!key) return;
+  const level = nextLevel(channelNotify(server, name, members));
+  updateUiPrefs((p) => {
+    p.channel_notify[`${key}/${name}`] = level;
+  });
+}
+
 function channelName(server: string, channelId: number): string | undefined {
   return get(channels.peek(server)).find((c) => c.channel_id === channelId)?.name;
 }
@@ -486,9 +558,45 @@ export const me: Readable<Me> = derived([userId, isAdmin, can], ([$id, $admin, $
 export function managesChannel(server: string, channelId: number, uid: number): boolean {
   const ch = get(channels.peek(server)).find((c) => c.channel_id === channelId);
   if (!ch) return false;
-  const entry = get(users.peek(server)).find((u) => u.user_id === uid);
+  // That channel's people first: `users` is only the voice room we stand in, and
+  // a moderator posting from outside it is still a moderator
+  const entry =
+    currentRosterOf(server, channelId).find((u) => u.user_id === uid) ??
+    get(users.peek(server)).find((u) => u.user_id === uid);
   if (uid !== get(userId.peek(server))) return canManageAs(ch, entry);
   return canManage(ch, { userId: uid, isAdmin: get(isAdmin.peek(server)), isModerator: canOn(server, "voipc:channels") });
+}
+
+/**
+ * Whether a hide from `by` counts in channel `channelId` of `server`, and on which
+ * messages; undefined where it counts on none, as with no such privilege or in an
+ * anonymous channel. Who holds it is the relay's word by account, so someone away
+ * counts; a token admin, who has no account, only while the roster shows them.
+ *
+ * A relay lying here gets a named fake moderator and one extra click: a hide
+ * destroys nothing.
+ */
+export function hideCheck(server: string, channelId: number, by: Actor): ((m: ChatMessage) => boolean) | undefined {
+  const ch = get(channels.peek(server)).find((c) => c.channel_id === channelId);
+  if (!ch || !moderation(get(olderRelay.peek(server))?.protocol ?? null)) return undefined;
+  const mods = get(chatMods.peek(server));
+  const listed = by.account ? mods.get(by.account) : undefined;
+  // Not 0, which is both someone away and us before `connect` has answered
+  const mine = by.user_id !== 0 && by.user_id === get(userId.peek(server));
+  const row =
+    currentRosterOf(server, channelId).find((u) => u.user_id === by.user_id) ??
+    get(users.peek(server)).find((u) => u.user_id === by.user_id);
+  const hider = {
+    hide: !!listed?.hide || (mine && canOn(server, "voipc:hide")),
+    admin: !!listed?.admin || (mine && get(isAdmin.peek(server))) || !!row?.is_admin,
+  };
+  if (!hideRight(ch, hider, false)) return undefined;
+  return (m) => hideRight(ch, hider, m.kind !== "shared" && !!m.account && mods.has(m.account));
+}
+
+/** Slow mode does not hold this account back on `server` (`postBlock`). */
+export function unhurriedOn(server: string): boolean {
+  return canOn(server, "voipc:hide") && moderation(get(olderRelay.peek(server))?.protocol ?? null);
 }
 
 /** When this client last posted in each channel, per server (ms). For slow
@@ -663,7 +771,7 @@ export function openChannelSettings(channelId: number, e?: Event): void {
   settingsGate.set(null);
   gateBefore = null;
   const server = settingsServer;
-  if (canOn(server, "voipc:channels") && get(relayAccounts.peek(server)) && !get(olderRelay.peek(server))) {
+  if (canOn(server, "voipc:channels") && get(relayAccounts.peek(server)) && adminOps(get(olderRelay.peek(server))?.protocol ?? null)) {
     void adminOp({ GateGet: { channel_id: channelId } }, null, server);
   }
 }

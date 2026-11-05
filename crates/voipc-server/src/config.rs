@@ -137,12 +137,28 @@ pub struct AccountsConfig {
     pub cloud: bool,
     /// How long a stored message stays at most.
     pub retention_days: u32,
+    /// How long the moderation log keeps a row, whatever happened to the
+    /// accounts it names.
+    pub modlog_days: u32,
     /// Per account: the vault and stored messages together.
     pub quota_mb: u32,
     /// The master key (seals second-factor secrets). Made on first start,
     /// readable by the server's user only; `VOIPC_ACCOUNTS_KEY` wins over it.
     /// Back it up: without it nobody's two-factor codes work.
     pub key_file: String,
+    /// This relay's web address (`https://voice.example.org:9987`), with a
+    /// certificate browsers accept: where a provider (Discord, Google) sends a
+    /// sign-in back. Empty: no sign-in with a provider. Each provider also needs
+    /// its application's `VOIPC_OAUTH_<PROVIDER>_ID` and `_SECRET` in the environment.
+    pub public_url: String,
+    /// New accounts an hour at most. A move from another service can want more.
+    pub signups_per_hour: u32,
+    /// How long an account a move from Discord made waits for someone to open it. 0: for
+    /// good, so a mistyped 0 cannot wipe an import.
+    pub unclaimed_days: u32,
+    /// How long what came from Discord is kept, by when it was written. 0: until someone
+    /// removes it, since an owner moved for the history and an expiry cannot be undone.
+    pub archive_days: u32,
 }
 
 impl Default for AccountsConfig {
@@ -153,8 +169,13 @@ impl Default for AccountsConfig {
             registration: RegistrationMode::Invite,
             cloud: true,
             retention_days: 365,
+            modlog_days: 180,
             quota_mb: 50,
             key_file: "voipc-accounts.key".into(),
+            public_url: String::new(),
+            signups_per_hour: 60,
+            unclaimed_days: 90,
+            archive_days: 0,
         }
     }
 }
@@ -288,11 +309,26 @@ impl ServerConfig {
             ));
         }
         if self.accounts.mode != AccountsMode::Off {
+            let url = &self.accounts.public_url;
+            if !url.is_empty() {
+                let host = url.strip_prefix("https://").unwrap_or_default();
+                if host.is_empty() || host.contains('/') {
+                    return Err(anyhow!(
+                        "[accounts] public_url must be like https://voice.example.org:9987, with no path or trailing slash: {url}"
+                    ));
+                }
+            }
+            if self.accounts.signups_per_hour == 0 {
+                return Err(anyhow!("[accounts] signups_per_hour must be at least 1"));
+            }
             if self.accounts.quota_mb == 0 {
                 return Err(anyhow!("[accounts] quota_mb must be at least 1: with 0, a new account's vault cannot be stored"));
             }
             if self.accounts.retention_days == 0 {
                 return Err(anyhow!("[accounts] retention_days must be at least 1: with 0, a kept message expires as it arrives"));
+            }
+            if self.accounts.modlog_days == 0 {
+                return Err(anyhow!("[accounts] modlog_days must be at least 1: with 0, the sweep empties the moderation log"));
             }
         }
         let f = &self.files;
@@ -549,6 +585,52 @@ mod tests {
         assert!(off.validate().is_ok(), "no accounts, no quota to mind");
         assert!(parse("max_users = 0").validate().is_err());
         assert!(parse("max_connections_per_ip = 1").validate().is_err());
+    }
+
+    #[test]
+    fn unclaimed_days_defaults_to_90_and_an_old_config_parses() {
+        let parse = |extra: &str| {
+            toml::from_str::<ServerConfig>(&format!("cert_path = \"c\"\nkey_path = \"k\"\n{extra}"))
+                .unwrap()
+        };
+        let old = parse("[accounts]\nmode = \"optional\"\ndatabase = \"sqlite://voipc.db\"");
+        assert_eq!(old.accounts.unclaimed_days, 90);
+        old.validate().unwrap();
+        let never = parse("[accounts]\nmode = \"optional\"\nunclaimed_days = 0");
+        assert_eq!(never.accounts.unclaimed_days, 0);
+        never.validate().unwrap();
+    }
+
+    #[test]
+    fn archive_days_defaults_to_keeping_and_a_mistyped_key_is_refused() {
+        let parse = |extra: &str| {
+            toml::from_str::<ServerConfig>(&format!("cert_path = \"c\"\nkey_path = \"k\"\n{extra}"))
+        };
+        let old = parse("[accounts]\nmode = \"optional\"").unwrap();
+        assert_eq!(old.accounts.archive_days, 0);
+        old.validate().unwrap();
+        let days = parse("[accounts]\nmode = \"optional\"\narchive_days = 400").unwrap();
+        assert_eq!(days.accounts.archive_days, 400);
+        days.validate().unwrap();
+        assert!(parse("[accounts]\nmode = \"optional\"\narchive_day = 400").is_err());
+    }
+
+    #[test]
+    fn modlog_days_zero_is_refused() {
+        let parse = |extra: &str| {
+            toml::from_str::<ServerConfig>(&format!("cert_path = \"c\"\nkey_path = \"k\"\n{extra}"))
+                .unwrap()
+        };
+        let zero = parse("[accounts]\nmode = \"optional\"\nmodlog_days = 0");
+        assert!(zero
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("modlog_days"));
+        // The rest of the same config is fine: it is the zero that stops the start
+        let one = parse("[accounts]\nmode = \"optional\"\nmodlog_days = 1");
+        assert!(one.validate().is_ok());
+        assert_eq!(ServerConfig::default().accounts.modlog_days, 180);
     }
 
     #[test]

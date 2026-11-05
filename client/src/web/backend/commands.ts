@@ -12,7 +12,7 @@ import { getConfig, resetConfig, updateConfig } from "./config";
 import * as session from "./session";
 import { forgetDevice, listDevices } from "./devices";
 import { wasm } from "./wasm";
-import { forgetRelayId, type AccountArgs } from "./account";
+import { forgetRelayId, type AccountArgs, type ProviderAnswer } from "./account";
 import { playCue } from "./sounds";
 import type { SavedServer, SoundSettings } from "../../lib/stores/settings";
 import type { ProximityMode } from "../../lib/spatial";
@@ -41,6 +41,13 @@ function need(server: unknown): session.Session {
 function needAccount(server: unknown): { s: session.Session; account: NonNullable<session.Session["account"]> } {
   const s = session.sessionFor(str(server, "server")) ?? fail("Not connected to that server");
   return { s, account: s.account ?? fail("Not signed in to an account on that server") };
+}
+
+/** `fail` for a release: it knows no fixture, and says where the importer is. */
+function importer(cmd: string, args: Args): Promise<unknown> {
+  return __SELFTEST__
+    ? import("./import-selftest").then((m) => m.answer(cmd, args, need(args.server)))
+    : fail("Reading a Discord server runs in the desktop app.");
 }
 
 /** A voice-scoped command's connection: the one whose voice channel we are in. */
@@ -151,6 +158,8 @@ function accountArgs(raw: unknown): AccountArgs | undefined {
       return { kind: "device" };
     case "reset":
       return { kind: "reset", recovery: str(a.recovery, "recovery"), password: str(a.password, "password") };
+    case "provider":
+      return { kind: "provider", ticket: a.ticket as number[], invite: optStr(a.invite, "invite") };
     default:
       fail("unknown account sign-in");
   }
@@ -175,8 +184,10 @@ const handlers: Record<string, Handler> = {
     const name = str(username, "username");
     if (addr.length === 0 || addr.length > 253) fail("address must be 1-253 characters");
     // 32 for the name and 5 for its "#0000" tag; the server checks each part
-    if (name.length === 0 || byteLength(name) > 37) fail("username must be 1-32 characters");
-    return session.connect(addr, name, accountArgs(account));
+    // A provider's sign-in has no name yet: its answer decides the account.
+    const args = accountArgs(account);
+    if ((name.length === 0 && args?.kind !== "provider") || byteLength(name) > 37) fail("username must be 1-32 characters");
+    return session.connect(addr, name, args);
   },
 
   // ── accounts (client/src-tauri/src/account.rs) ──
@@ -189,7 +200,48 @@ const handlers: Record<string, Handler> = {
   account_cancel: ({ server }) => {
     session.sessionOrSigningIn(str(server, "server"))?.account?.cancel();
   },
+  account_provider_ask: ({ address, ask }) => {
+    const a = ask as Record<string, unknown>;
+    const question =
+      a.kind === "providers" ? "providers"
+      : a.kind === "open" ? { open: a.provider }
+      : { status: a.ticket };
+    return session.askRelay(str(address, "address"), question);
+  },
+  account_open_page: ({ url }) => {
+    const page = str(url, "url");
+    if (!wasm().providerPageOk(page)) fail("This server named a page that is no provider's: not opening it.");
+    window.open(page, "_blank", "noopener");
+  },
+  account_provider_answer: ({ server, answer }) => {
+    const s = session.sessionOrSigningIn(str(server, "server"));
+    if (!s?.account) fail("No sign-in is waiting for that.");
+    s.account.answerProvider(answer as ProviderAnswer);
+  },
+  account_pair_answer: ({ server, pair, yes }) => {
+    const { s, account } = needAccount(server);
+    account.pairAnswer(s, pair as number, yes === true);
+  },
+  account_provider_start: ({ server, provider, link, password, totp, recovery }) => {
+    const { s, account } = needAccount(server);
+    const opt = (v: unknown, name: string) => (v == null ? null : str(v, name));
+    return account.providerStart(s, str(provider, "provider"), link === true, str(password, "password"), opt(totp, "totp"), opt(recovery, "recovery"));
+  },
+  account_provider_unlink: ({ server, provider, password, totp, recovery }) => {
+    const { s, account } = needAccount(server);
+    const opt = (v: unknown, name: string) => (v == null ? null : str(v, name));
+    return account.providerUnlink(s, str(provider, "provider"), str(password, "password"), opt(totp, "totp"), opt(recovery, "recovery"));
+  },
   account_request: ({ server, request }) => needAccount(server).s.sendControl({ Account: request }),
+  // Reading a Discord server is the desktop app's (import.rs): a page would hand the bot's
+  // token to whatever served it. A test build answers from a fixture, so that the wizard's
+  // own screens get clicked. In a release the import below is gone with its branch.
+  import_open: (a) => importer("import_open", a),
+  import_plan: (a) => importer("import_plan", a),
+  import_run: (a) => importer("import_run", a),
+  import_stop: (a) => importer("import_stop", a),
+  import_forget: (a) => importer("import_forget", a),
+  import_move_post: (a) => importer("import_move_post", a),
   account_password_change: ({ server, old, new: next, totp, recovery }) => {
     const { s, account } = needAccount(server);
     const opt = (v: unknown, name: string) => (v == null ? null : str(v, name));
@@ -248,6 +300,10 @@ const handlers: Record<string, Handler> = {
     const { s, account } = needAccount(server);
     const p = prefs as Record<string, unknown>;
     account.setPrefs(s, bool(p?.cloud, "cloud"), bool(p?.asked, "asked"));
+  },
+  account_block: ({ server, key, label, on }) => {
+    const { s, account } = needAccount(server);
+    account.setBlocked(s, str(key, "key"), str(label, "label"), bool(on, "on"));
   },
   safety_number: ({ server, userId }) => need(server).safetyNumber(u32(userId, "userId")),
   qr_svg: ({ text }) => {
@@ -333,6 +389,11 @@ const handlers: Record<string, Handler> = {
   },
   kick_user: ({ server, channelId, userId }) =>
     need(server).sendControl({ KickUser: { channel_id: u32(channelId, "channelId"), user_id: u32(userId, "userId") } }),
+  profiles_get: ({ server, accounts }) =>
+    need(server).sendControl({ ProfilesGet: { accounts } }),
+  report_takers_get: ({ server }) => need(server).sendControl("ReportTakersGet"),
+  profile_picture_get: ({ server, hash }) =>
+    need(server).sendControl({ ProfilePictureGet: { hash } }),
   request_channel_users: ({ server, channelId }) =>
     need(server).sendControl({ RequestChannelUsers: { channel_id: u32(channelId, "channelId") } }),
   send_invite: ({ server, channelId, targetUserId }) =>
@@ -517,6 +578,16 @@ const handlers: Record<string, Handler> = {
         account: account === true,
       },
     }),
+  admin_restrict: ({ server, userId, voice, text, durationSecs, reason }) =>
+    need(server).sendControl({
+      AdminRestrict: {
+        user_id: u32(userId, "userId"),
+        voice: voice === true,
+        text: text === true,
+        duration_secs: u32(durationSecs, "durationSecs"),
+        reason: str(reason, "reason"),
+      },
+    }),
   admin_ban_account: ({ server, name, reason, durationSecs }) =>
     need(server).sendControl({
       AdminBanAccount: { name: str(name, "name"), reason: str(reason, "reason"), duration_secs: u32(durationSecs, "durationSecs") },
@@ -526,6 +597,8 @@ const handlers: Record<string, Handler> = {
     return need(server).sendControl({ AdminUnban: { id } });
   },
   admin_list_bans: ({ server }) => need(server).sendControl("AdminListBans"),
+  admin_bans_page: ({ server, search, offset }) =>
+    need(server).sendControl({ AdminBansPage: { search: str(search, "search"), offset: u32(offset, "offset") } }),
 
   // ── voice ──
   start_transmit: async () => {

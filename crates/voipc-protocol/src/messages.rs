@@ -123,7 +123,8 @@ pub enum ClientMessage {
     /// Request the user list of a channel without joining it (preview).
     RequestChannelUsers { channel_id: ChannelId },
 
-    /// Invite a user to your channel (creator only).
+    /// Invite a user to your channel: its creator, or a holder of `voipc:channels`
+    /// standing in it (protocol v19).
     SendInvite {
         channel_id: ChannelId,
         target_user_id: UserId,
@@ -235,7 +236,8 @@ pub enum ClientMessage {
     /// Lift a ban, by its `BanInfo.id` (admin only).
     AdminUnban { id: u64 },
 
-    /// Request the list of active bans (admin only).
+    /// Request the list of active bans (admin only). A relay before protocol 20 answers
+    /// all of it, or nothing past a frame's worth; one at 20 answers the first page.
     AdminListBans,
 
     /// Ban an account by name, online or not (admin only). `duration_secs` 0
@@ -329,6 +331,26 @@ pub enum ClientMessage {
         pack: Option<String>,
         sticker: Option<bool>,
     },
+    /// Display names and pictures of these accounts, at most `MAX_PROFILES_ASKED`
+    /// (protocol v18). `ServerMessage::Profiles` answers.
+    ProfilesGet { accounts: Vec<[u8; 16]> },
+    /// `ServerMessage::ProfilePicture` answers (protocol v18).
+    ProfilePictureGet { hash: [u8; 32] },
+    /// Restrict a member (protocol v19). Both false lifts. `duration_secs` 0: until
+    /// lifted. Answered by `ServerMessage::Restrictions` to everyone, or `AdminError`.
+    AdminRestrict {
+        user_id: UserId,
+        voice: bool,
+        text: bool,
+        duration_secs: u32,
+        reason: String,
+    },
+    /// Who takes a report now (protocol v19). `ServerMessage::ReportTakers` answers.
+    ReportTakersGet,
+
+    /// A page of the active bans, by the name a row shows (protocol v20), for the
+    /// same privilege as `AdminListBans`. `ServerMessage::AdminBansPaged` answers.
+    AdminBansPage { search: String, offset: u32 },
 }
 
 /// The client's side of an account sign-in, between `Authenticate` and
@@ -379,6 +401,37 @@ pub enum AuthContinue {
         pass_slot: Vec<u8>,
         totp: Option<String>,
         recovery_code: Option<String>,
+    },
+    /// The answer to `AuthStep::ProviderSignup` (protocol v17): the name to take,
+    /// and the solved proof of work.
+    ProviderSignup {
+        name: String,
+        altcha: String,
+        ts: String,
+    },
+    /// The answer to `AuthStep::ProviderSigned` with `claim`: this account's
+    /// first vault (no `slot.pass`), and the identity in it.
+    Claim {
+        identity_key: Vec<u8>,
+        vault: Vec<VaultBlob>,
+    },
+    /// The answer to `AuthStep::ProviderSigned` without `claim`: the identity's
+    /// signature over the challenge (`voipc-provider/v1|<relay>|<name>|<challenge>`),
+    /// which only a device that opened the vault can make. Nothing else lets a
+    /// provider's sign-in in.
+    ProviderProof {
+        signature: Vec<u8>,
+    },
+    /// Asks a device of this account to hand over the vault's key:
+    /// `SHA-256(label | ephemeral | blind)`, so that the key is fixed before the
+    /// other device's nonce is known (`voipc_crypto::pair`).
+    PairStart {
+        commitment: Vec<u8>,
+    },
+    /// What `commitment` was over, once `AuthStep::PairNonce` came.
+    PairReveal {
+        ephemeral: Vec<u8>,
+        blind: Vec<u8>,
     },
 }
 
@@ -501,6 +554,69 @@ pub enum AccountRequest {
         op: AdminOp,
         code: Option<String>,
     },
+
+    // ── Providers (protocol v17) ──
+    /// What the relay offers and what this account has linked.
+    ProviderList,
+    /// Link a provider (`link`) or prove it's you with one you have. A link needs
+    /// a recent sign-in: with `secret` (and the second factor where there is
+    /// one) here, or, without a password, a provider's proof first.
+    /// `ProviderBrowser` answers, then `ProviderDone` when the browser is through.
+    ProviderStart {
+        kind: ProviderKind,
+        link: bool,
+        secret: Option<Vec<u8>>,
+        totp: Option<String>,
+        recovery_code: Option<String>,
+    },
+    /// Refused when it is the last way in. A recent sign-in, as for a link.
+    ProviderUnlink {
+        kind: ProviderKind,
+        secret: Option<Vec<u8>>,
+        totp: Option<String>,
+        recovery_code: Option<String>,
+    },
+    /// This device's nonce for a pairing (`AccountReply::PairAsked`).
+    PairNonce {
+        pair: u64,
+        nonce: Vec<u8>,
+    },
+    /// The person compared the codes and said yes: the vault's key, wrapped.
+    PairApprove {
+        pair: u64,
+        wrapped: Vec<u8>,
+    },
+    PairDecline {
+        pair: u64,
+    },
+    /// Shown beside the `@name`; `None` clears it (protocol v18).
+    ProfileSet {
+        name: Option<String>,
+    },
+    /// A PNG or WebP of at most `MAX_PROFILE_PICTURE` bytes; `None` clears it.
+    ProfilePictureSet {
+        image: Option<Vec<u8>>,
+    },
+    /// A page of what came from Discord, newest first (protocol v20): rows older than
+    /// `before` ("" from the newest), in the channel's flow or a thread (""), or only its
+    /// pins. Only from inside the channel.
+    ArchiveFetch {
+        channel_id: ChannelId,
+        thread: String,
+        before: String,
+        pinned: bool,
+    },
+    /// Words to find in it; the relay sees them. `from`: an answer's `next`, "" to start.
+    ArchiveSearch {
+        channel_id: ChannelId,
+        query: String,
+        from: String,
+    },
+    /// What this account's linked Discord id wrote.
+    ArchiveMine {
+        action: ArchiveAction,
+        scope: ArchiveScope,
+    },
 }
 
 /// What an admin asks for (`AccountRequest::Admin`). A step that changes
@@ -559,6 +675,215 @@ pub enum AdminOp {
         channel_id: ChannelId,
         gate: ChannelGate,
     },
+    // ── Channels and categories (protocol v18) ──
+    /// A new persistent channel (`id` none), or changes to one made in the app.
+    ChannelSave {
+        id: Option<ChannelId>,
+        name: String,
+        description: String,
+        text: bool,
+        auto_join: bool,
+        category: Option<u32>,
+        /// `None`: open, for a new one; as it is, for one that exists.
+        gate: Option<ChannelGate>,
+    },
+    /// A channel made in the app goes, with everything kept in it. Takes a fresh code.
+    ChannelDelete {
+        id: ChannelId,
+    },
+    CategorySave {
+        id: Option<u32>,
+        name: String,
+    },
+    /// The category goes; its channels stay, outside any.
+    CategoryDelete {
+        id: u32,
+    },
+    /// A new order, of what the editor can see: the categories, and the channels
+    /// with the category each is in.
+    LayoutSet {
+        categories: Vec<u32>,
+        channels: Vec<(ChannelId, Option<u32>)>,
+    },
+    /// The channel opened the first time someone comes here, or none.
+    WelcomeSet {
+        channel_id: Option<ChannelId>,
+    },
+    /// A group's colour, `0xRRGGBB` or none, and whether its people stand under it in
+    /// the member list. Hands out nothing, so no fresh code.
+    GroupStyle {
+        name: String,
+        color: Option<u32>,
+        section: bool,
+    },
+    /// Every group, in the order they should show. A group the editor could not
+    /// change stays where it is.
+    GroupOrder {
+        names: Vec<String>,
+    },
+    /// Clears this account's display name and/or picture.
+    ProfileReset {
+        id: [u8; 16],
+        name: bool,
+        picture: bool,
+    },
+    /// The server's name and description. Admins only, with a fresh code.
+    ServerProfileSet {
+        name: String,
+        description: String,
+    },
+    /// The server's icon (as a profile picture), or none.
+    ServerIconSet {
+        image: Option<Vec<u8>>,
+    },
+    InviteLinks,
+    /// A code many people can sign up with: `InviteLinkCode` answers, once.
+    /// `days` 0: it does not run out by time. `group`: one holding no privilege.
+    InviteLinkNew {
+        max_uses: u32,
+        days: u32,
+        group: Option<String>,
+    },
+    InviteLinkRevoke {
+        id: String,
+    },
+    /// The moderation log, newest first: rows older than id `before` (0: from
+    /// the newest).
+    ModLog {
+        before: i64,
+    },
+    /// A moderator's own word that they hid a message or showed it again. Hiding
+    /// is inside E2E, where the relay cannot see it; the log marks the row as this.
+    ModNote {
+        channel_id: ChannelId,
+        target: String,
+        message: String,
+        on: bool,
+    },
+    /// What `name`, banned now, wrote to channels' stored logs in the last
+    /// `window_secs` (0: all that is kept) goes, and devices are told to hide their
+    /// copies. Takes a fresh code. Never direct messages. Sent after the ban, whose
+    /// released shape cannot take a field.
+    RemovePosts {
+        name: String,
+        window_secs: u32,
+    },
+    // ── The move from Discord (protocol v20), every step `*`'s but `MoveAccounts` ──
+    /// What the dry-run needs of this relay.
+    ImportFacts,
+    /// Takes a fresh code. A new run, or the unfinished one of this guild. From the page,
+    /// so the guild is a string. `backup_taken`: on Postgres, the operator says so.
+    ImportBegin {
+        guild_id: String,
+        options: ImportOptions,
+        backup_taken: bool,
+    },
+    /// At most `IMPORT_FRAME_ROWS`.
+    ImportCategories {
+        run: i64,
+        rows: Vec<ImportCategory>,
+    },
+    /// At most `IMPORT_CHANNEL_ROWS`.
+    ImportChannels {
+        run: i64,
+        rows: Vec<ImportChannel>,
+    },
+    ImportEmote {
+        run: i64,
+        dc_id: u64,
+        name: String,
+    },
+    /// At most `IMPORT_FRAME_ROWS`. Only of a channel whose messages come.
+    ImportThreads {
+        run: i64,
+        rows: Vec<ImportThread>,
+    },
+    /// All of a channel or thread up to `high` is stored once this is answered. At most
+    /// `IMPORT_MESSAGE_ROWS`, and none is normal: system messages advance `high` too, and
+    /// `high` 1 on an empty frame says a channel was walked and found empty.
+    ImportMessages {
+        run: i64,
+        channel: u64,
+        thread: Option<u64>,
+        high: u64,
+        rows: Vec<ImportMessage>,
+    },
+    /// Where each channel, thread and emote stands over the runs not undone: rows past
+    /// this uid. Needs no run, so the dry-run can read it.
+    ImportCursors {
+        after: u64,
+    },
+    /// `report`: JSON, at most 40 KiB, counts and notes about what was imported and nothing
+    /// about what was left out.
+    ImportEnd {
+        run: i64,
+        report: String,
+    },
+    ImportReport {
+        run: i64,
+    },
+    /// What `ImportUndo` of this run would take, with no code asked.
+    ImportUndoPreview {
+        run: i64,
+    },
+    /// Raw `permissions`: the relay alone maps them.
+    ImportRoles {
+        run: i64,
+        roles: Vec<ImportRole>,
+    },
+    /// At most `IMPORT_FRAME_ROWS`.
+    ImportMembers {
+        run: i64,
+        members: Vec<ImportMember>,
+    },
+    /// At most `IMPORT_FRAME_ROWS`.
+    ImportBans {
+        run: i64,
+        bans: Vec<ImportBan>,
+    },
+    /// Accounts with what the move knows of them, a page at a time. Needs `users:read`.
+    MoveAccounts {
+        search: String,
+        offset: u32,
+        filter: MoveFilter,
+    },
+    /// What the move's dashboard shows.
+    MoveStatus,
+    /// Who waits for the owner's OK on what they could do on Discord.
+    PowerWaiting {
+        offset: u32,
+    },
+    /// Says yes (`grant`, with a fresh code) or no to one row of `PowerWaiting`.
+    PowerAnswer {
+        id: [u8; 16],
+        group: String,
+        grant: bool,
+    },
+    /// A decimal Discord id no import touches. `erase`: they asked to be out, so their
+    /// posts go for good. Otherwise held: no account, and their posts stay. `on: false`
+    /// lets them back in, and posts already gone do not come back.
+    MoveExclude {
+        dc_id: String,
+        on: bool,
+        erase: bool,
+    },
+    /// Rows past this decimal id, "" from the start.
+    MoveExcluded {
+        after: String,
+    },
+    /// In pieces: send it again while `ImportUndone.more`. Takes a fresh code.
+    ImportUndo {
+        run: i64,
+    },
+    /// Gone for good. Takes a fresh code.
+    ArchiveDelete {
+        target: ArchiveTarget,
+    },
+    /// What people said about their rows, by author, past the row given. A driver about to
+    /// anonymise has to know: once a row names nobody, no wish can find it. Needs no run.
+    ArchiveWishes {
+        after: Option<ArchiveWish>,
+    },
 }
 
 /// The relay's side of an account sign-in.
@@ -593,6 +918,48 @@ pub enum AuthStep {
     /// The password is reset; sign in with the new one. Every other device
     /// and session of the account was signed out.
     ResetDone,
+    /// The answer to `AccountStart::Providers` (protocol v17).
+    Providers { kinds: Vec<ProviderKind> },
+    /// Open `url` in the system browser, show `code`, and come back with
+    /// `ticket` (`AccountStart::ProviderResume`).
+    OpenBrowser {
+        url: String,
+        code: String,
+        ticket: Vec<u8>,
+    },
+    /// Nothing has happened in the browser yet: try the ticket again.
+    ProviderPending,
+    /// The browser is through: `AccountStart::ProviderResume` goes on from here.
+    ProviderReady,
+    /// The provider knows this person and nobody here does, and sign-up is open:
+    /// choose a name (`suggestion` is the provider's, in the username alphabet;
+    /// `problem` what was wrong with the last one).
+    ProviderSignup {
+        relay_id: [u8; 16],
+        suggestion: String,
+        problem: String,
+        pow: PowChallenge,
+    },
+    /// The provider's sign-in holds, for the account `name`, which is not in yet.
+    /// `claim`: nobody has opened this account (`AuthContinue::Claim`). Otherwise
+    /// open `blobs`, the vault without `slot.pass`, with the recovery key or a
+    /// paired device and sign `challenge`; or, with `has_password`, sign in
+    /// again with the password. A relay can say `claim` of any account, and hide
+    /// its vault: a device that remembers the account does not believe it.
+    ProviderSigned {
+        relay_id: [u8; 16],
+        name: String,
+        claim: bool,
+        has_password: bool,
+        challenge: Vec<u8>,
+        blobs: Vec<VaultBlob>,
+    },
+    /// The other device's nonce, for `AuthContinue::PairStart`.
+    PairNonce { nonce: Vec<u8> },
+    /// The other device agreed: the vault's key, wrapped to the ephemeral key.
+    PairWrapped { wrapped: Vec<u8> },
+    /// No device could, or would. `reason` says which.
+    PairRefused { reason: String },
 }
 
 /// Answers to `AccountRequest`.
@@ -698,6 +1065,68 @@ pub enum AccountReply {
     /// An answer to `AccountRequest::Admin` (protocol v16); a refusal is
     /// `Error` with `request` "Admin".
     Admin(AdminReply),
+    /// `ProviderList` (protocol v17). `has_password`: what to ask for a link.
+    Providers {
+        offered: Vec<ProviderKind>,
+        linked: Vec<LinkedProvider>,
+        has_password: bool,
+    },
+    /// `ProviderStart`: open `url`, show `code`.
+    ProviderBrowser {
+        url: String,
+        code: String,
+    },
+    /// The browser came through: linked, or proved.
+    ProviderDone {
+        kind: ProviderKind,
+        link: bool,
+    },
+    ProviderUnlinked {
+        kind: ProviderKind,
+    },
+    /// A device that signed in through a provider asks for the vault's key.
+    /// Send a nonce (`PairNonce`); `PairRevealed` follows.
+    PairAsked {
+        pair: u64,
+        commitment: Vec<u8>,
+    },
+    /// What the commitment was over: check it, show the code, ask the person.
+    PairRevealed {
+        pair: u64,
+        ephemeral: Vec<u8>,
+        blind: Vec<u8>,
+    },
+    /// The other device gave up or the time ran out.
+    PairEnded {
+        pair: u64,
+    },
+    /// `ProfileSet`, `ProfilePictureSet`, or an admin's `ProfileReset`.
+    ProfileDone,
+    /// What `ArchiveFetch` asked (protocol v20). `next`: the `before` of the next page, ""
+    /// when nothing older is left; it moves on past rows nobody may see.
+    ArchivePage {
+        channel_id: ChannelId,
+        thread: String,
+        before: String,
+        pinned: bool,
+        rows: Vec<ArchiveRow>,
+        next: String,
+    },
+    /// What `ArchiveSearch` found so far. `next`: carry on from here, "" at the channel's
+    /// end. `scanned`: rows this answer looked at.
+    ArchiveHits {
+        channel_id: ChannelId,
+        query: String,
+        from: String,
+        rows: Vec<ArchiveRow>,
+        next: String,
+        scanned: u32,
+    },
+    /// `ArchiveMine` is done: `rows` of theirs it came to.
+    ArchiveMineDone {
+        action: ArchiveAction,
+        rows: u64,
+    },
 }
 
 /// Answers to `AdminOp`.
@@ -716,7 +1145,9 @@ pub enum AdminReply {
         audit: Vec<AuditRow>,
     },
     /// Also after `GroupSave` and `GroupDelete`.
-    Groups { groups: Vec<GroupInfo> },
+    Groups {
+        groups: Vec<GroupInfo>,
+    },
     Members {
         name: String,
         offset: u32,
@@ -724,9 +1155,13 @@ pub enum AdminReply {
         users: Vec<AdminUser>,
     },
     /// Also after `InviteRevoke`.
-    Invites { invites: Vec<InviteInfo> },
+    Invites {
+        invites: Vec<InviteInfo>,
+    },
     /// The new code, shown once.
-    InviteCode { code: String },
+    InviteCode {
+        code: String,
+    },
     /// Also after `GateSet`. `groups`: every group's name, to pick from.
     Gate {
         channel_id: ChannelId,
@@ -735,6 +1170,155 @@ pub enum AdminReply {
     },
     /// This step hands out power: send it again with a code.
     StepUp,
+    /// A channel or layout step went through. `channel_id`: the channel it made.
+    ChannelDone {
+        channel_id: Option<ChannelId>,
+    },
+    /// Also after `InviteLinkRevoke`.
+    InviteLinks {
+        links: Vec<InviteLinkInfo>,
+    },
+    /// Shown once: only its hash is kept.
+    InviteLinkCode {
+        code: String,
+    },
+    /// A page of the moderation log, under the `before` it answers. `keep_days`:
+    /// how long this server keeps a row.
+    ModLog {
+        before: i64,
+        rows: Vec<ModRow>,
+        more: bool,
+        keep_days: u32,
+    },
+    /// `RemovePosts` is done: `entries` stored messages went.
+    PostsRemoved {
+        name: String,
+        entries: u64,
+    },
+    // ── The move from Discord (protocol v20) ──
+    ImportFacts {
+        facts: ImportFacts,
+    },
+    /// The copy of the database is being made: `ImportBegun` follows.
+    ImportBackingUp {
+        run: i64,
+    },
+    /// `resumed`: this guild's unfinished run. `backup`: where the copy is.
+    ImportBegun {
+        run: i64,
+        resumed: bool,
+        backup: Option<String>,
+    },
+    /// `refused`: what was not made (no room, or categories past the cap), channels removed
+    /// here by hand, and channels closed on Discord that are open here, each with why. Do not
+    /// walk those.
+    ImportChannelsDone {
+        refused: Vec<(u64, String)>,
+    },
+    /// The frame is stored. `skipped`: rows someone wished away, or left out.
+    ImportAcked {
+        stored: u32,
+        skipped: u32,
+    },
+    /// (uid, how far it is read), at most 2,000 a reply. `high` 0: a channel in the ledger
+    /// whose messages were never walked. `more`: ask again past the last uid.
+    ImportCursors {
+        rows: Vec<(u64, u64)>,
+        more: bool,
+    },
+    ImportEnded {
+        run: i64,
+    },
+    ImportReport {
+        run: i64,
+        report: String,
+    },
+    /// A frame of a run was refused. `channel`: skip that channel and go on. None: stop.
+    ImportRefused {
+        reason: String,
+        channel: Option<u64>,
+    },
+    ImportUndoPreview {
+        run: i64,
+        counts: ImportUndoCounts,
+    },
+    /// `skipped`: roles that did not fit one group list, or whose group someone deleted here.
+    /// `power_changed`: roles whose power differs from their held-back group, which only the
+    /// owner changes.
+    ImportRolesDone {
+        made: u32,
+        updated: u32,
+        skipped: Vec<String>,
+        power_changed: Vec<String>,
+    },
+    /// `left_out`: they are excluded. `unlinked`: they took their Discord off on purpose.
+    /// `kept_power`: privileges they lost on Discord and keep here, for the owner to judge.
+    ImportMembersDone {
+        made: u32,
+        updated: u32,
+        left_out: u32,
+        nicknames_dropped: u32,
+        unlinked: u32,
+        kept_power: u32,
+        failed: Vec<String>,
+    },
+    /// `claimed`: accounts someone has opened, left alone and named for the owner.
+    /// `names_kept`: rows now banned that still go by their old name, every other being taken.
+    ImportBansDone {
+        made: u32,
+        converted: u32,
+        claimed: Vec<String>,
+        names_kept: Vec<String>,
+    },
+    MoveAccounts {
+        search: String,
+        offset: u32,
+        filter: MoveFilter,
+        total: u32,
+        rows: Vec<MoveAccount>,
+    },
+    MoveStatus {
+        claimed: u32,
+        waiting: u32,
+        banned: u32,
+        power_waiting: u32,
+        excluded: u32,
+        unclaimed_days: u32,
+        runs: Vec<MoveRun>,
+    },
+    PowerWaiting {
+        offset: u32,
+        total: u32,
+        rows: Vec<PowerRow>,
+    },
+    /// (decimal id, they asked for it themselves, their posts go, when), by id.
+    MoveExcluded {
+        ids: Vec<(String, bool, bool, i64)>,
+        more: bool,
+    },
+    /// `more`: send `ImportUndo` again. The counts are what this call did, for the panel to
+    /// add up. `archive_rows`: the stored count of the whole run, so "about"; a worker takes
+    /// them after this.
+    ImportUndone {
+        run: i64,
+        more: bool,
+        accounts: u32,
+        kept_claimed: u32,
+        groups: u32,
+        groups_kept: Vec<String>,
+        channels: u32,
+        emotes: u32,
+        archive_rows: u64,
+    },
+    ArchiveDeleted {
+        rows: u64,
+    },
+    /// Whoever wrote it (`author` 0) is not listed: the relay holds every row to those itself.
+    /// `more`: ask again past the last row.
+    ArchiveWishes {
+        rows: Vec<ArchiveWish>,
+        more: bool,
+    },
 }
 
 /// A wrapped epoch key for one member (`AccountRequest::EpochPut`).
@@ -985,7 +1569,8 @@ pub enum ServerMessage {
     /// An admin command was refused.
     AdminError { reason: String },
 
-    /// Active IP bans (admin only; reply to AdminListBans and after changes).
+    /// Active bans, all in one frame: how a relay before protocol 20 answers. One at 20
+    /// sends `AdminBansPaged`.
     AdminBans { bans: Vec<BanInfo> },
 
     /// The server is closing this connection (kick or ban). Clients must not
@@ -1117,6 +1702,76 @@ pub enum ServerMessage {
     /// In this channel you may only listen and read (its gate names who may
     /// speak, and you are not in those groups), or (`on: false`) speak again.
     ListenOnly { channel_id: ChannelId, on: bool },
+
+    /// Where channels sit (protocol v18), on a relay with accounts: the persistent
+    /// channels this member sees, in order, and their categories, in order.
+    ChannelLayout {
+        categories: Vec<ChannelCategory>,
+        channels: Vec<ChannelPlace>,
+    },
+
+    /// The badged groups in the server's order (protocol v18), on a relay with
+    /// accounts: at connect and when one changes. Every badge, whoever holds it: a
+    /// badge is a public label. What a group is called stays with who manages groups.
+    GroupStyles { groups: Vec<GroupStyle> },
+
+    /// What `ClientMessage::ProfilesGet` asked, or a change (protocol v18).
+    Profiles { profiles: Vec<ProfileInfo> },
+
+    /// What `ClientMessage::ProfilePictureGet` asked (protocol v18). Empty: there
+    /// is no such picture. Sanitized by the client before it is shown.
+    ProfilePicture { hash: [u8; 32], image: Vec<u8> },
+
+    /// What this server calls itself (protocol v18): at connect when it says
+    /// anything, and when it changes. Its address stays what identifies it: a client
+    /// shows this beside the address and keeps it out of its bookmarks. The icon
+    /// is fetched as `ClientMessage::ProfilePictureGet`.
+    ServerProfile {
+        name: String,
+        description: String,
+        icon: Option<[u8; 32]>,
+    },
+
+    /// These members may (or from now on may not) call on everybody with
+    /// `@everyone`, `@here` or `@&badge` (protocol v18). Only the holders: the first
+    /// one after connecting is all of them. Advisory, as a pin's right is: the text
+    /// is end-to-end, and only clients act on it.
+    MentionPower { user_ids: Vec<UserId>, on: bool },
+
+    /// Every badge of our own groups (protocol v18), so `@&badge` reaches us even
+    /// where our row shows only the top ones (`MAX_BADGES`). Told to us alone.
+    MyBadges { badges: Vec<String> },
+
+    /// One change, or everyone held right after connect (protocol v19). `voice`,
+    /// `text` and `direct` all false: lifted.
+    Restrictions { list: Vec<Restriction> },
+
+    /// Every account holding a privilege (protocol v19), the whole list: at connect
+    /// and when it changes. By account, since a stored hide must still count when its
+    /// moderator is away. Advisory, as a pin's right is: chat is end to end, and only
+    /// clients act on it.
+    ChatMods { mods: Vec<ChatMod> },
+
+    /// This server says these posts were removed (protocol v19): at once, and
+    /// everything still in its log right after connect. Clients hide their copies in
+    /// channels, never delete them, and never touch direct messages. It names no
+    /// channel and no reason.
+    PostsHidden { marks: Vec<PostsMark> },
+
+    /// What `ReportTakersGet` asked (protocol v19): online first, at most
+    /// `MAX_REPORT_TAKERS`.
+    ReportTakers { takers: Vec<ReportTaker> },
+
+    /// A page of the active bans (protocol v20): the answer to `AdminBansPage`, to
+    /// `AdminListBans`, and to a change, which is offset 0 of no search. Never over a
+    /// frame, as `AdminBans` is past some hundreds of rows. `total` counts what the search
+    /// finds; a client asks on from however many rows it holds.
+    AdminBansPaged {
+        search: String,
+        offset: u32,
+        total: u32,
+        bans: Vec<BanInfo>,
+    },
 }
 
 /// `FileRefused.code`, final for this hash: not in a conversation of the

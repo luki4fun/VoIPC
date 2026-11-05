@@ -183,6 +183,11 @@ export interface ChatMessage {
   reactions?: Reaction[];
   /** Pinned in its channel by a manager (`on`), or unpinned; latest wins. */
   pin?: { on: boolean; at: number; by: string };
+  /** A moderator collapsed it for its readers (`on`), or took that back; latest
+   *  wins. Nothing of it is gone. Read through chat-rules.ts `isHidden`. */
+  hide?: { on: boolean; at: number; by: string; ban?: boolean };
+  /** It arrived from a member allowed to call on everybody (mention-rules.ts). */
+  power?: boolean;
   /** What a later version kept in this message's archive entry that this one
    *  does not know (JSON): written back on the next save, never read, never
    *  handed to anyone (chat-rules.ts `fromArchived`). */
@@ -195,6 +200,19 @@ export interface Forwarded {
   name: string;
   /** When it was written there (ms). */
   at: number;
+  /** It is a report of that message to a moderator (report-rules.ts). */
+  report?: ReportMark;
+}
+
+/** What makes a forward a report (envelope.rs `ReportMark`): the reporter's word. */
+export interface ReportMark {
+  /** The channel they say it was written in; empty: a direct message. */
+  channel: string;
+  /** Its id there. */
+  id?: string;
+  why: string;
+  /** Who it came from, as told by whoever passes a report on. */
+  by?: string;
 }
 
 /**
@@ -205,7 +223,8 @@ export type ChatEvent =
   | { kind: "edit"; target: string }
   | { kind: "delete"; target: string }
   | { kind: "react"; target: string; emoji: string; on: boolean }
-  | { kind: "pin"; target: string; on: boolean };
+  | { kind: "pin"; target: string; on: boolean }
+  | { kind: "hide"; target: string; on: boolean };
 
 /** One emoji on a message, and everyone who put it there or took it off. */
 export interface Reaction {
@@ -308,6 +327,31 @@ export interface AuditRow {
   at: number;
 }
 
+/** One line of the moderation log (1.10). */
+export interface ModRow {
+  id: number;
+  /** Unix seconds. */
+  at: number;
+  /** `kick`, `ban`, `unban`, `channel_kick`, `remove_posts`, `hide`, ...: an action this app does not know shows as it is. */
+  action: string;
+  actor: string;
+  target: string;
+  /** None: server-wide, or a channel this reader cannot see. */
+  channel: string | null;
+  reason: string;
+  detail: string;
+  /** The actor's app said so; the relay could not see it. */
+  advisory: boolean;
+}
+
+export interface InviteLinkInfo {
+  id: string;
+  max_uses: number;
+  uses: number;
+  expires_at: number | null;
+  group: string | null;
+}
+
 export interface InviteInfo {
   id: string;
   name: string | null;
@@ -322,6 +366,155 @@ export interface ChannelGate {
   groups: string[];
   speakers: string[];
 }
+
+/** What a run of the importer takes (protocol 20). */
+export interface ImportOptions {
+  channels: boolean;
+  roles: boolean;
+  permissions: boolean;
+  members: boolean;
+  bans: boolean;
+  emotes: boolean;
+  messages: boolean;
+  threads: boolean;
+  pins: boolean;
+  reactions: boolean;
+  anonymise: boolean;
+  acknowledged: boolean;
+}
+
+/** What the dry-run needs of this relay. Handed back to `import_plan` as it came. */
+export interface ImportFacts {
+  backup_here: boolean;
+  db_bytes?: number | null;
+  max_users: number;
+  online: number;
+  registration: unknown;
+  discord_sign_in: boolean;
+  public_url: string;
+  takes_guests: boolean;
+  accounts: number;
+  channel_list_bytes: number;
+  channel_list_limit: number;
+  categories: number;
+  max_categories: number;
+  emotes: number;
+  /** A run some live session is on. */
+  running?: number | null;
+  /** A run no one finished: its id and guild. */
+  unfinished?: [number, string] | null;
+  cloud: boolean;
+  last_options?: ImportOptions | null;
+}
+
+/** What `ImportUndo` of a run would take. */
+export interface ImportUndoCounts {
+  channels: number;
+  live_posts: number;
+  groups: number;
+  placeholders: number;
+  claimed_kept: number;
+  /** The stored count, so "about". */
+  archive_rows: number;
+  emotes: number;
+  /** Runs of this guild after it that are not undone: those go first. */
+  later_runs: number;
+}
+
+export type MoveFilter = "All" | "Waiting" | "Claimed" | "Banned";
+export type MoveState = "NotImported" | "Waiting" | "Claimed" | "Banned";
+
+export interface MoveAccount {
+  user: AdminUser;
+  state: MoveState;
+  /** Decimal; "" unless the reader holds `*`. */
+  dc_id: string;
+  /** Waiting with a limit, Unix seconds; else 0. */
+  expires_at: number;
+}
+
+/** Someone who could do `scopes` on Discord, and waits for the owner's OK. */
+export interface PowerRow {
+  account: number[];
+  name: string;
+  /** Someone has opened the account: the only ones the owner can answer. */
+  claimed: boolean;
+  group: string;
+  badge: string;
+  scopes: string[];
+}
+
+/** One run of the importer. Times in Unix seconds. */
+export interface MoveRun {
+  id: number;
+  guild_id: string;
+  by: string;
+  started_at: number;
+  finished_at?: number | null;
+  undone_at?: number | null;
+  accounts: number;
+  groups: number;
+  /** Undone, and not all of it has gone yet. A new run waits. */
+  clearing: boolean;
+}
+
+export interface MoveStatus {
+  claimed: number;
+  waiting: number;
+  banned: number;
+  power_waiting: number;
+  excluded: number;
+  unclaimed_days: number;
+  runs: MoveRun[];
+}
+
+/** What one `ImportUndo` call did; the panel adds them up. */
+export interface ImportUndone {
+  run: number;
+  more: boolean;
+  accounts: number;
+  kept_claimed: number;
+  groups: number;
+  groups_kept: string[];
+  channels: number;
+  emotes: number;
+  /** The whole run's stored count, on every reply: a worker takes them after this. */
+  archive_rows: number;
+}
+
+/** One message imported from Discord, as a reader gets it. The relay can read it and
+ *  nobody signed it. Ids are decimal strings: a JS number cannot hold them. */
+export interface ArchiveRow {
+  id: string;
+  /** "" for a root with no message of its own. */
+  author: string;
+  /** To `*` only; "" otherwise, and for an anonymised row or a webhook's. */
+  author_id: string;
+  at_ms: number;
+  body: string;
+  /** The thread it was written in; "" in the channel's own flow. */
+  thread: string;
+  /** What it answers; "" for nothing. */
+  reply_to: string;
+  reactions: { emoji: string; count: number }[];
+  pinned: boolean;
+  /** This row opens a thread when not "". */
+  thread_name: string;
+  replies: number;
+  /** Written by a Discord account this account has linked. */
+  mine: boolean;
+  /** Hidden by its author: only they get such a row. */
+  hidden: boolean;
+}
+
+export type ArchiveAction = "Count" | "Hide" | "Show" | "Delete";
+export type ArchiveScope =
+  | { Message: { channel_id: number; id: string } }
+  | { Channel: { channel_id: number } }
+  | "Everything";
+export type ArchiveTarget =
+  | { Author: { id: string } }
+  | { Message: { channel_id: number; id: string } };
 
 /** `AdminOp` as serde writes it. */
 export type AdminOp =
@@ -338,7 +531,46 @@ export type AdminOp =
   | { InviteNew: { name: string | null; days: number } }
   | { InviteRevoke: { id: string } }
   | { GateGet: { channel_id: number } }
-  | { GateSet: { channel_id: number; gate: ChannelGate } };
+  | { GateSet: { channel_id: number; gate: ChannelGate } }
+  | {
+      ChannelSave: {
+        id: number | null;
+        name: string;
+        description: string;
+        text: boolean;
+        auto_join: boolean;
+        category: number | null;
+        gate: ChannelGate | null;
+      };
+    }
+  | { ChannelDelete: { id: number } }
+  | { CategorySave: { id: number | null; name: string } }
+  | { CategoryDelete: { id: number } }
+  | { LayoutSet: { categories: number[]; channels: [number, number | null][] } }
+  | { WelcomeSet: { channel_id: number | null } }
+  | { GroupStyle: { name: string; color: number | null; section: boolean } }
+  | { GroupOrder: { names: string[] } }
+  | { ProfileReset: { id: number[]; name: boolean; picture: boolean } }
+  | { ServerProfileSet: { name: string; description: string } }
+  | { ServerIconSet: { image: number[] | null } }
+  | "InviteLinks"
+  | { InviteLinkNew: { max_uses: number; days: number; group: string | null } }
+  | { InviteLinkRevoke: { id: string } }
+  | { ModLog: { before: number } }
+  | { ModNote: { channel_id: number; target: string; message: string; on: boolean } }
+  | { RemovePosts: { name: string; window_secs: number } }
+  | "ImportFacts"
+  | { ImportBegin: { guild_id: string; options: ImportOptions; backup_taken: boolean } }
+  | { ImportReport: { run: number } }
+  | { ImportUndoPreview: { run: number } }
+  | { MoveAccounts: { search: string; offset: number; filter: MoveFilter } }
+  | "MoveStatus"
+  | { PowerWaiting: { offset: number } }
+  | { PowerAnswer: { id: number[]; group: string; grant: boolean } }
+  | { MoveExclude: { dc_id: string; on: boolean; erase: boolean } }
+  | { MoveExcluded: { after: string } }
+  | { ImportUndo: { run: number } }
+  | { ArchiveDelete: { target: ArchiveTarget } };
 
 /** `AdminReply` as serde writes it. */
 export type AdminReply =
@@ -348,5 +580,37 @@ export type AdminReply =
   | { Members: { name: string; offset: number; total: number; users: AdminUser[] } }
   | { Invites: { invites: InviteInfo[] } }
   | { InviteCode: { code: string } }
+  | { InviteLinks: { links: InviteLinkInfo[] } }
+  | { InviteLinkCode: { code: string } }
   | { Gate: { channel_id: number; gate: ChannelGate; groups: string[] } }
+  | { ChannelDone: { channel_id: number | null } }
+  | { ModLog: { before: number; rows: ModRow[]; more: boolean; keep_days: number } }
+  | { PostsRemoved: { name: string; entries: number } }
+  | { ImportFacts: { facts: ImportFacts } }
+  | { ImportBackingUp: { run: number } }
+  | { ImportBegun: { run: number; resumed: boolean; backup?: string | null } }
+  | { ImportReport: { run: number; report: string } }
+  | { ImportUndoPreview: { run: number; counts: ImportUndoCounts } }
+  | { MoveAccounts: { search: string; offset: number; filter: MoveFilter; total: number; rows: MoveAccount[] } }
+  | { MoveStatus: MoveStatus }
+  | { PowerWaiting: { offset: number; total: number; rows: PowerRow[] } }
+  | { MoveExcluded: { ids: [string, boolean, boolean, number][]; more: boolean } }
+  | { ImportUndone: ImportUndone }
+  | { ArchiveDeleted: { rows: number } }
   | "StepUp";
+
+/** A category of channels (protocol 18). */
+export interface ChannelCategory {
+  id: number;
+  name: string;
+}
+
+/** Where a channel sits (`ServerMessage::ChannelLayout`). */
+export interface ChannelPlace {
+  channel_id: number;
+  category: number | null;
+  /** Made in the app, so it can be renamed and deleted there. */
+  kept: boolean;
+  /** Opened the first time someone comes to this server. */
+  welcome: boolean;
+}

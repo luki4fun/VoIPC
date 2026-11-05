@@ -12,6 +12,8 @@
   import { avatarStyle } from "../../avatar.js";
   import { shortName } from "../../username.js";
   import { userId } from "../../stores/connection.js";
+  import { restrictions } from "../../stores/restrictions.js";
+  import { markTitle } from "../../restrict-rules.js";
   import { speakingUsers } from "../../stores/users.js";
   import { audibleIds } from "../../stores/room.js";
   import { isCulled } from "../../stores/roster.js";
@@ -19,6 +21,8 @@
   import { watchingUserId } from "../../stores/screenshare.js";
   import { memberMenu } from "../../actions/member-menu.js";
   import Icon from "../Icons.svelte";
+  import MemberName from "../MemberName.svelte";
+  import AvatarPicture from "../AvatarPicture.svelte";
   import type { UserInfo } from "../../types.js";
 
   interface Props {
@@ -38,6 +42,7 @@
       talking ? "talking" : null,
       user.is_muted ? "muted" : null,
       user.is_deafened ? "deafened" : null,
+      $restrictions.has(user.user_id) ? "held back on this server" : null,
       user.is_screen_sharing ? "sharing their screen" : null,
       culled ? "out of earshot in the game" : null,
     ]
@@ -54,13 +59,14 @@
     use:memberMenu={{ user, idle: false, self }}
   >
     <span class="avatar" style={avatarStyle(user.username)} aria-hidden="true"
-      >{user.username.charAt(0).toUpperCase()}</span
+      >{user.username.charAt(0).toUpperCase()}<AvatarPicture account={user.account} /></span
     >
     <span class="name" title={user.username}>
-      {shortName(user.username)}{#if self}<span class="you">(you)</span>{/if}
+      <MemberName username={user.username} account={user.account} />{#if self}<span class="you">(you)</span>{/if}
     </span>
     <span class="marks" aria-hidden="true">
       {#if user.is_muted}<span class="mark" title="Muted"><Icon name="mic-off" size={small ? 12 : 14} /></span>{/if}
+      {#if $restrictions.has(user.user_id)}<span class="mark restricted-mark" title={markTitle($restrictions.get(user.user_id)!, Date.now())}><Icon name="hourglass" size={small ? 12 : 14} /></span>{/if}
       {#if user.is_deafened}<span class="mark" title="Deafened"><Icon name="headphones-off" size={small ? 12 : 14} /></span>{/if}
     </span>
   </div>
@@ -133,6 +139,7 @@
   }
 
   .avatar {
+    position: relative;
     display: grid;
     place-items: center;
     width: 72px;

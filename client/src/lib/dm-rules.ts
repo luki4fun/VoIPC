@@ -128,10 +128,18 @@ export interface ListedRow<T> {
   last: ChatMessage | undefined;
 }
 
+/** Whether a message makes its direct conversation unread: not on screen, not
+ *  our own, as a forward into a conversation left closed is, and not from someone
+ *  blocked. */
+export function dmCountsUnread(m: { echo: boolean; onScreen: boolean; notice: boolean; blocked?: boolean }): boolean {
+  return !m.echo && !m.onScreen && !m.notice && !m.blocked;
+}
+
 /**
  * The rows the sidebar shows, newest conversation first. A closed one stays
  * out until something newer than its close is written there; the one open
- * and one with unread messages always show.
+ * and one with unread messages always show. One with someone blocked stays out
+ * unless it is the one open.
  */
 export function listRows<T extends { username: string; unread: number }>(
   rows: T[],
@@ -139,6 +147,7 @@ export function listRows<T extends { username: string; unread: number }>(
   serverKey: string,
   marks: Map<string, number>,
   activeName: string | null,
+  blocked?: (row: T) => boolean,
 ): ListedRow<T>[] {
   const out: ListedRow<T>[] = [];
   // Rows are keyed by name: a second row under a name (a relay that reused an
@@ -147,6 +156,7 @@ export function listRows<T extends { username: string; unread: number }>(
   for (const convo of rows) {
     if (seen.has(convo.username)) continue;
     seen.add(convo.username);
+    if (convo.username !== activeName && blocked?.(convo)) continue;
     const key = dmKeyIn(serverKey, convo.username);
     const last = lastSaid(dms.get(key) ?? []);
     const closedAt = marks.get(closeMarkKey(key));

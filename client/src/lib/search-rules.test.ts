@@ -62,3 +62,11 @@ test("a file is found by its name", () => {
   assert.equal(searchMessages([{ conv: 1, messages: [f] }], "2026.pdf").length, 1);
   assert.equal(searchMessages([{ conv: 1, messages: [f] }], "invoice").length, 0);
 });
+
+test("what a moderator hid is not found, and is once restored", () => {
+  const hidden = m("the spam itself", 1, { hide: { on: true, at: 2, by: "bobby" } });
+  assert.equal(searchMessages([{ conv: 1, messages: [hidden] }], "spam").length, 0);
+  assert.equal(searchMessages([{ conv: 1, messages: [hidden] }], hidden.username.replace(/#.*/, "")).length, 0, "nor by its writer");
+  const restored = { ...hidden, hide: { on: false, at: 3, by: "bobby" } };
+  assert.equal(searchMessages([{ conv: 1, messages: [restored] }], "spam").length, 1);
+});

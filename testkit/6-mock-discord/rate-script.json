@@ -1,0 +1,82 @@
+{
+  "_about": "Which calls answer something else: nth call to any path starting with route. The dry-run gets the same plan through all of it; the 403 and the second 429 are on a walk's route, for the driver.",
+  "rules": [
+    {
+      "route": "/guilds/1190000000000000001/channels",
+      "nth": 1,
+      "status": 429,
+      "headers": {
+        "retry-after": "2",
+        "x-ratelimit-scope": "user"
+      },
+      "body": {
+        "message": "You are being rate limited.",
+        "retry_after": 2.5,
+        "global": false
+      }
+    },
+    {
+      "route": "/guilds/1190000000000000001/roles",
+      "nth": 1,
+      "status": 429,
+      "headers": {
+        "retry-after": "1",
+        "x-ratelimit-scope": "shared"
+      },
+      "body": {
+        "message": "You are being rate limited.",
+        "retry_after": 1,
+        "global": false
+      }
+    },
+    {
+      "route": "/guilds/1190000000000000001/stickers",
+      "nth": 1,
+      "status": 429,
+      "headers": {
+        "retry-after": "1",
+        "x-ratelimit-global": "true",
+        "x-ratelimit-scope": "global"
+      },
+      "body": {
+        "message": "You are being rate limited.",
+        "retry_after": 1,
+        "global": true
+      }
+    },
+    {
+      "route": "/guilds/1190000000000000001/emojis",
+      "nth": 1,
+      "status": 500,
+      "headers": {},
+      "body": {
+        "message": "500: Internal Server Error",
+        "code": 0
+      }
+    },
+    {
+      "route": "/channels/1190000000000000213/messages?limit=100&after=",
+      "nth": 1,
+      "status": 403,
+      "headers": {},
+      "body": {
+        "message": "Missing Access",
+        "code": 50001
+      }
+    },
+    {
+      "route": "/channels/1190000000000000210/messages?limit=100&after=",
+      "nth": 2,
+      "status": 429,
+      "headers": {
+        "retry-after": "1",
+        "x-ratelimit-scope": "user"
+      },
+      "body": {
+        "message": "You are being rate limited.",
+        "retry_after": 1,
+        "global": false
+      }
+    }
+  ]
+}

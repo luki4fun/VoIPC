@@ -11,6 +11,12 @@ export const isWeb: boolean = __WEB__;
 export const isAndroidApp: boolean =
   !isWeb && typeof navigator !== "undefined" && /android/i.test(navigator.userAgent);
 
+/** Whether this build reads Discord servers: the desktop app only, since a page would
+ *  hand the bot's token to whatever served it. A test build's page has the wizard with
+ *  `?wizard`, answered from a fixture, so its own screens get clicked. */
+export const hasImporter: boolean =
+  (!isWeb && !isAndroidApp) || (__SELFTEST__ && typeof location !== "undefined" && new URLSearchParams(location.search).has("wizard"));
+
 /** true when running on Android (Tauri mobile) or, on the web client, in a
  *  mobile browser — both get the phone layout. */
 export const isMobile = writable(false);

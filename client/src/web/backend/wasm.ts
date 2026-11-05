@@ -184,11 +184,23 @@ export type AccountMethod =
   | { kind: "login"; password: string }
   | { kind: "register"; password: string; invite?: string | null }
   | { kind: "device"; device_id: number[]; device_key: number[]; relay_id: number[]; dek: number[] }
-  | { kind: "reset"; recovery: string; password: string };
+  | { kind: "reset"; recovery: string; password: string }
+  | { kind: "provider"; ticket: number[] };
 
 /** One step of a sign-in: a payload to send, "build the keys now", "ask for
  *  a code", "stretch the password with this salt", or "the reset went through". */
-export type SignInStep = { send?: Uint8Array; keys?: true; needTotp?: true; stretch?: string; resetDone?: true };
+export type SignInStep = {
+  send?: Uint8Array;
+  keys?: true;
+  needTotp?: true;
+  stretch?: string;
+  resetDone?: true;
+  providerPending?: true;
+  providerSignup?: { suggestion: string; problem: string };
+  providerChoice?: { name: string; claim: boolean; has_password: boolean };
+  pairCode?: string;
+  pairRefused?: string;
+};
 
 /**
  * An account sign-in: voipc_crypto::account::SignIn, the same steps the
@@ -210,6 +222,15 @@ export interface AccountSignIn {
   keys(prekeyBundle: PreKeyBundleData): Uint8Array;
   totp(code: string): Uint8Array;
   recovery(code: string): Uint8Array;
+  /** The accounts this browser remembers on this relay. */
+  rememberedHere(names: string[]): void;
+  /** The name for `providerSignup`. Runs the proof of work. */
+  providerSignup(name: string): Uint8Array;
+  providerClaim(): SignInStep[];
+  /** The recovery key as shown; throws why not, and the choice stays open. */
+  providerRecovery(key: string): SignInStep[];
+  /** Ask another device of this account: the payload to send. */
+  pairStart(): Uint8Array;
   /** After Authenticated: where this browser kept the log's read cursors. */
   finish(): { relay_id: Uint8Array; name: string };
   /** After finish: the account's session, from the AccountInfo in
@@ -242,11 +263,14 @@ export interface AccountSession {
   onReply(reply: unknown): AccountActions;
   /** The users of a UserList, UserJoined or ChannelUsers, for the pins. */
   noteRoster(users: unknown): AccountActions;
+  /** The people of a ReportTakers, for the pins. */
+  noteTakers(takers: unknown): void;
   /** An identity a user showed (a bundle, or a session they opened). */
   checkIdentity(userId: number, key: Uint8Array): AccountActions;
   outgoingDm(userId: number, envelope: Uint8Array, sentAt: number, ttlSecs?: number | null): AccountActions;
-  /** A direct message for an account that is away (its hex id); throws why not. */
-  keptDm(accountHex: string, envelope: Uint8Array, sentAt: number, ttlSecs?: number | null): AccountActions;
+  /** A direct message for an account that is away (its hex id); throws why not.
+   *  `once`: a report, kept whatever cloud copies say. */
+  keptDm(accountHex: string, envelope: Uint8Array, sentAt: number, ttlSecs: number | null | undefined, once: boolean): AccountActions;
   outgoingChannel(log: string, envelope: Uint8Array, sentAt: number, ttlSecs?: number | null): AccountActions;
   /** In a channel with log `conv`: keep it, and read what it kept. */
   enter(conv: string): AccountActions;
@@ -255,7 +279,12 @@ export interface AccountSession {
   /** Delete what this account wrote to the stored logs, in `conv` or (null) everywhere. */
   purge(conv: string | null): AccountActions;
   /** Delete this account, from its stretched password. */
-  deleteAccount(master: Uint8Array, totp?: string | null, recovery?: string | null): AccountActions;
+  deleteAccount(master: Uint8Array | null, totp?: string | null, recovery?: string | null): AccountActions;
+  /** Link a provider, or prove it's you with one you have linked. */
+  providerStart(kind: string, link: boolean, master: Uint8Array | null, totp?: string | null, recovery?: string | null): AccountActions;
+  providerUnlink(kind: string, master: Uint8Array | null, totp?: string | null, recovery?: string | null): AccountActions;
+  /** The person's answer to `account-pair-ask`. */
+  pairAnswer(pair: number, yes: boolean): AccountActions;
   /** Whether a DM to this user that did not arrive is kept for them all the same. */
   keptFor(userId: number): boolean;
   /** Throws why there is none. `live`: the key the session with them runs on. */
@@ -263,6 +292,7 @@ export interface AccountSession {
   cloud(): boolean;
   asked(): boolean;
   setPrefs(cloud: boolean, asked: boolean): AccountActions;
+  setBlocked(key: string, label: string, on: boolean): AccountActions;
   setShare(share: boolean): void;
   /** The PBKDF2 salt for this account's passwords. */
   kdfSalt(): string;
@@ -270,7 +300,7 @@ export interface AccountSession {
   passwordChange(oldMaster: Uint8Array, newMaster: Uint8Array, totp?: string | null, recovery?: string | null): AccountActions;
   /** A new recovery key, from the stretched password: the actions, and the
    *  key's text to show once `RecoveryKeyChanged` answers. */
-  recoveryKeyNew(master: Uint8Array, totp?: string | null, recovery?: string | null): AccountActions & { key: string };
+  recoveryKeyNew(master: Uint8Array | null, totp?: string | null, recovery?: string | null): AccountActions & { key: string };
   free(): void;
 }
 
@@ -347,6 +377,10 @@ export interface WasmApi {
   kdfRounds(): number;
   /** Throws why the name cannot be an account name. */
   newAccountSignIn(name: string, method: AccountMethod): AccountSignIn;
+  /** `Authenticate` for a question about providers. */
+  providerAsk(ask: unknown): Uint8Array;
+  /** Whether `url` is a provider's own page: the relay names it. */
+  providerPageOk(url: string): boolean;
   /** An account name as the relay stores it; throws why not. */
   normalizeAccountName(raw: string): string;
   /** An otpauth:// link as an SVG QR code, drawn locally. */
@@ -478,6 +512,8 @@ export async function loadWasm(): Promise<WasmApi> {
     newSignalClient: () => new mod.SignalClient(),
     kdfRounds: () => mod.kdfRounds(),
     newAccountSignIn: (name, method) => new mod.AccountSignIn(name, method),
+    providerAsk: (ask) => mod.providerAsk(ask),
+    providerPageOk: (url) => mod.providerPageOk(url),
     normalizeAccountName: (raw) => mod.normalizeAccountName(raw),
     qrSvg: (text) => mod.qrSvg(text),
     newMediaKeys: () => new mod.MediaKeys(),

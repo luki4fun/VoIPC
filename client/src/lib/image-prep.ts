@@ -8,6 +8,8 @@
 import { isAnimated, isHeif, sniff } from "./file-sniff";
 import { PHOTO_MAX_SIDE, PREVIEW_SIDE, fitWithin, previewOf, withExtension } from "./file-rules";
 import { cleanFileName } from "./chat-rules";
+import { prepareEmote } from "./emote-import";
+import { centerSquare, MAX_PICTURE_BYTES, PICTURE_TRIES, SANITIZE_ONLY_BYTES } from "./profile-rules";
 
 /** A file ready to seal, and what its message says about it. */
 export interface Prepared {
@@ -71,6 +73,29 @@ async function recode(bitmap: ImageBitmap, png: boolean): Promise<{ blob: Blob; 
   if (!png && blob?.type !== "image/webp") blob = await toBlob(canvas, "image/jpeg", 0.85);
   if (!blob) throw new CannotClean();
   return { blob, w, h };
+}
+
+/** The picture somebody picks for their own profile: what the sanitizer made of
+ *  it, as its middle square and small enough to store. Every other client
+ *  sanitizes it again before showing it. */
+export async function makeProfilePicture(file: Uint8Array): Promise<Uint8Array> {
+  const made = await prepareEmote(file, false, SANITIZE_ONLY_BYTES);
+  const png = made.still ?? made.preview;
+  const image = await createImageBitmap(new Blob([png as Uint8Array<ArrayBuffer>], { type: "image/png" }));
+  try {
+    const { x, y, side } = centerSquare(image.width, image.height);
+    for (const t of PICTURE_TRIES) {
+      const canvas = document.createElement("canvas");
+      canvas.width = canvas.height = t.side;
+      canvas.getContext("2d")?.drawImage(image, x, y, side, side, 0, 0, t.side, t.side);
+      // A page that cannot write WebP hands back a PNG, which the relay takes too
+      const blob = await toBlob(canvas, "image/webp", t.quality);
+      if (blob && blob.size <= MAX_PICTURE_BYTES) return new Uint8Array(await blob.arrayBuffer());
+    }
+  } finally {
+    image.close();
+  }
+  throw new Error("That picture does not get small enough.");
 }
 
 /** A video's or a sound's size and length, and a video's preview from the

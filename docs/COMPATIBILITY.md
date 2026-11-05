@@ -12,15 +12,19 @@ nobody checks, so a new one comes with its test.
 
 **1.x keeps:**
 - A relay admits a client exactly when their `PROTOCOL_VERSION` is equal (12 in 1.0, 13 in
-  1.3, 14 in 1.4, 15 in 1.5, 16 in 1.7). The app version is informational only.
+  1.3, 14 in 1.4, 15 in 1.5, 16 in 1.7, 17 in 1.8, 18 in 1.9, 19 in 1.10, 20 in 1.11). The app version is informational only.
 - **Since 1.6, an app talks to relays from its own protocol down to `OLDEST_RELAY_PROTOCOL`**
-  (`crates/voipc-protocol/src/compat.rs`; 12 in 1.6 and 1.7), never fewer than three protocols back.
+  (`crates/voipc-protocol/src/compat.rs`; 12 in 1.6 to 1.11), never fewer than three protocols back.
   It asks with its own; a relay of an older protocol refuses with its own (below), and the app
   connects again speaking that one. It shows a banner there, and holds back what that relay's
   other apps could not read:
 
-  | Relay | What a 1.7 app does not offer there |
+  | Relay | What a 1.11 app does not offer there |
   |---|---|
+  | 1.10 (19) | the move from Discord and its archive |
+  | 1.9 (18) | mute and timeouts, a wait for new members, hiding messages, removing a banned member's posts, summons, the moderation log, reports |
+  | 1.8 (17) | channels made in the app, categories, a welcome channel, group colours and order, display names, profile pictures, a server's name and icon, invite links, `@everyone`, `@here` and `@&badge` |
+  | 1.7 (16) | sign-in with a provider, linking one, and approving a new device from another |
   | 1.5, 1.6 (15) | users, groups, privileges and channel gates in the admin panel (and below); group badges are not shown |
   | 1.4 (14) | moving emotes between packs; its emote tokens use 1.4's 20 hex digits |
   | 1.3 (13) | emotes and stickers |
@@ -57,8 +61,8 @@ out of servers that have not upgraded yet.
 - Any change with the same `PROTOCOL_VERSION` fails it.
 - `compat.rs`'s tests fail when a message's layout at an older protocol differs from today's
   and `RESHAPED` does not name it, and when an old shape there differs from its golden file.
-- The nightly `old-relays` job runs the released 1.0, 1.3, 1.4 and 1.6 relays and speaks to each
-  in its own protocol (`voice_load`).
+- The nightly `old-relays` job runs the released 1.0, 1.3, 1.4, 1.6 and 1.7 relays and speaks to each
+  in its own protocol (`voice_load`). A release joins the list once it is tagged.
 
 ## 2. Game SDK (`docs/SDK.md`)
 
@@ -116,6 +120,15 @@ shape (`w`, `h`); a 1.4 manifest reads as it was, with no shape.
 itself ([OPERATING.md](OPERATING.md) §14). With it on, the relay refuses to start where it
 cannot replace its own binary.
 
+**What changed in 1.10:** `modlog_days` in `[accounts]` (180), and `new_member_wait_mins` in
+`server_settings.json` (0, off). A `modlog_days` of 0 stops the start: it would throw the log
+away at once. An older relay refuses the first and ignores the second.
+
+**What changed with the move from Discord (protocol 20):** `archive_days` (0, kept until someone
+removes it) and `unclaimed_days` (90, 0 is never) in `[accounts]`. An older relay refuses both.
+`AdminBans` and `AdminListBans` stay in the enums for relays before protocol 20: an app at 20 sends
+`AdminBansPage` to a relay at 20 and `AdminListBans` below it.
+
 **An older relay on a newer config:** it refuses the unknown key, never ignores it, so a relay
 cannot silently run without a setting it was given. The JSON files stay lenient: a rewrite of
 `channels.json` keeps keys it does not know.
@@ -153,6 +166,10 @@ storage, the accounts database, the kept-message log and its crypto labels.
 | accounts database | sqlx refuses a database with migrations it does not know |
 
 A downgrade is not supported, but it is safe: nothing is destroyed.
+
+**A new vault item** needs no protocol and no new `ITEM_FORMAT`: `VaultPut` takes any name on every relay down to 12,
+and an older app leaves an item it does not know alone. So what an account newly keeps goes in an item of its own
+(`item.blocks` since 1.10). `item.prefs` is positional: a field added to it would make every saved copy unreadable.
 
 **Going back from 1.3 to 1.0.** A 1.3 app does not connect to a 1.0 relay, and the desktop
 updater only ever moves forward, so a user whose server stays on 1.0 had to go back by hand.

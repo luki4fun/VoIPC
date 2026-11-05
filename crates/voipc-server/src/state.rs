@@ -15,6 +15,7 @@ use voipc_protocol::types::*;
 
 use crate::channels::{ChannelEntry, MAX_SLOW_MODE_SECS};
 use crate::config::ServerConfig;
+use crate::control::ControlTx;
 use crate::settings::ServerSettings;
 
 /// Simple token-bucket rate limiter.
@@ -68,7 +69,7 @@ pub struct UserSession {
     pub is_muted: bool,
     pub is_deafened: bool,
     /// Sender for pushing control messages to this user's writer task.
-    pub control_tx: mpsc::Sender<Vec<u8>>,
+    pub control_tx: ControlTx,
     /// Media packets (voice, video, screen audio) queued for this user's
     /// QUIC session. A full queue drops the packet, like UDP would.
     pub media_tx: mpsc::Sender<Bytes>,
@@ -81,6 +82,10 @@ pub struct UserSession {
     pub is_moderator: bool,
     /// The privileges the account's scopes grant (`can`).
     pub powers: crate::accounts::Powers,
+    /// Which read of the account's scopes is the latest one started (`refresh`),
+    /// and which is the latest one written.
+    pub scope_read: u64,
+    pub scope_written: u64,
     /// The relay account this connection signed in with; `None` for a guest.
     pub account: Option<AccountSession>,
     /// This user answers requests for recent channel chat. Told to the server
@@ -116,6 +121,15 @@ pub struct UserSession {
     /// every reload, and that must not refuse the writes (or uploads) sharing
     /// `account_rate` meanwhile. Bounded queries, so a larger budget.
     pub log_read_rate: RateLimiter,
+    /// Display names and pictures asked for. A member list asks for all it shows,
+    /// and pictures are the larger part: its own budget, not `account_rate`.
+    pub profile_rate: RateLimiter,
+    /// Asking who takes a report: each ask reads the groups of a relay with
+    /// accounts, and nobody reports twice a minute for long.
+    pub report_rate: RateLimiter,
+    /// Searching what came from Discord: each request reads rows for up to a fifth of a
+    /// second, so it has its own small budget.
+    pub archive_search_rate: RateLimiter,
     /// Rate limiter for keyframe requests relayed *to* this user as a sharer
     /// (each one forces an IDR); per share, so many viewers losing the same
     /// frames cannot storm the sharer.
@@ -184,6 +198,8 @@ pub struct UserSession {
     /// names who speaks, and they are not one (`gates`). Set on every join
     /// and when a gate or their groups change, so voice checks no gate.
     pub listen_only: HashSet<ChannelId>,
+    /// What keeps them from speaking anywhere on this server now (`restrict`).
+    pub silence: crate::restrict::Silence,
     /// The user_id of the screenshare this user is currently watching (if any).
     pub watching_screenshare: Option<UserId>,
 
@@ -208,10 +224,19 @@ pub struct AccountSession {
     /// A device-key enrolment challenge waiting for its signature, and the
     /// nonce it was issued against (kept here, never sent).
     pub device_challenge: Option<(String, [u8; 16])>,
+    /// When the new-member wait starts for an account the move from Discord knows, 0 if
+    /// it was served there (`placeholder::wait_start`). None: from `created_at`, as for
+    /// anyone else, and always while no wait is set.
+    pub wait_from: Option<i64>,
     /// Its groups and badges, read with the scopes.
     pub standing: crate::accounts::Standing,
     /// When a code last passed an admin step-up (`AdminReply::StepUp`).
     pub step_up_at: Option<std::time::Instant>,
+    /// A provider's sign-in, and this connection's device then opened the vault
+    /// (or made it): as good as a recent password for remembering this device or
+    /// turning codes on, and for nothing else. A provider alone never sets this,
+    /// nor does a remembered device, so one stolen device stays what it was.
+    pub vault_proven: bool,
 }
 
 impl UserSession {
@@ -239,7 +264,7 @@ impl UserSession {
     /// are set, at sign-in and after a change alike.
     pub fn set_scopes(&mut self, user: l4f_accounts::model::User, scopes: Vec<String>) {
         self.is_admin = crate::accounts::is_star(&scopes);
-        self.is_moderator = !scopes.is_empty();
+        self.is_moderator = crate::accounts::holds_power(&scopes);
         self.powers = crate::accounts::Powers::of(&scopes);
         if let Some(a) = self.account.as_mut() {
             a.user = user;
@@ -258,7 +283,7 @@ impl UserSession {
     pub fn new(
         user_id: UserId,
         username: String,
-        control_tx: mpsc::Sender<Vec<u8>>,
+        control_tx: ControlTx,
         media_tx: mpsc::Sender<Bytes>,
         peer_ip: IpAddr,
         max_users: u32,
@@ -276,6 +301,8 @@ impl UserSession {
             is_admin: false,
             is_moderator: false,
             powers: Default::default(),
+            scope_read: 0,
+            scope_written: 0,
             account: None,
             shares_history: false,
             admin_login_failures: 0,
@@ -309,6 +336,9 @@ impl UserSession {
             chat_rate: RateLimiter::new(5.0, 5.0),
             account_rate: RateLimiter::new(30.0, 10.0),
             log_read_rate: RateLimiter::new(60.0, 20.0),
+            profile_rate: RateLimiter::new(40.0, 10.0),
+            report_rate: RateLimiter::new(4.0, 1.0 / 30.0),
+            archive_search_rate: RateLimiter::new(10.0, 1.0),
             keyframe_relay_rate: RateLimiter::new(2.0, 1.0),
             loss_report_rate: RateLimiter::new(2.0, 1.0),
             // Everything a client says about itself — muted, deafened, sharing
@@ -345,6 +375,7 @@ impl UserSession {
             prekey_bundle_rate: RateLimiter::new(max_users.max(16) as f64, 10.0),
             is_screen_sharing: false,
             listen_only: HashSet::new(),
+            silence: Default::default(),
             watching_screenshare: None,
             identity_key: None,
             bundle: None,
@@ -394,6 +425,9 @@ pub struct Channel {
     pub delete_timer: Option<tokio::task::JoinHandle<()>>,
     /// Users who have been invited (bypass password on join).
     pub invited_users: HashSet<UserId>,
+    /// An invite sent by someone other than the creator, who hears its answer
+    /// (`add_invite`): invited -> who asked.
+    pub summons: HashMap<UserId, UserId>,
     /// Active screen shares: sharer_user_id -> ScreenShareSession.
     pub screen_shares: HashMap<UserId, ScreenShareSession>,
     /// Whether this channel was loaded from channels.json and cannot be auto-deleted.
@@ -406,12 +440,117 @@ pub struct Channel {
     pub log_conv: String,
     /// Who may see, join and speak here (`gates`).
     pub gate: ChannelGate,
-    /// What the gate of a channel from channels.json is kept under in the
-    /// database (`ChannelEntry::log_conv`); empty for the ones people make.
+    /// What the gate of a persistent channel is kept under in the database
+    /// (`ChannelEntry::log_conv`); empty for the temporary ones people make.
     pub gate_key: String,
+    /// Made in the app (`crate::layout`): a row of `voipc_channels`, not of the file.
+    pub kept: bool,
 }
 
 impl Channel {
+    /// A persistent channel, as an entry says. `logs`: this relay keeps messages.
+    pub fn from_entry(
+        entry: &ChannelEntry,
+        channel_id: ChannelId,
+        logs: bool,
+        proximity_enabled: bool,
+    ) -> Channel {
+        // A server with proximity chat switched off serves every channel
+        // as `off`, so clients never see a mode they may not use.
+        let proximity = if proximity_enabled {
+            entry.proximity
+        } else {
+            if entry.proximity != ProximityMode::Off {
+                warn!(
+                    channel = %entry.name,
+                    "proximity chat is disabled on this server; channel served as off"
+                );
+            }
+            ProximityMode::Off
+        };
+        let mut channel = Channel {
+            info: ChannelInfo {
+                channel_id,
+                name: entry.name.clone(),
+                description: entry.description.clone(),
+                max_users: entry.max_users,
+                has_password: entry.password_hash.is_some(),
+                // A text channel has no voice, so no mode to serve.
+                proximity: if entry.text {
+                    ProximityMode::Off
+                } else {
+                    proximity
+                },
+                routed: entry.routed,
+                hidden: entry.hidden,
+                anonymous: entry.anonymous,
+                screen_share: entry.screen_share && !entry.text,
+                hide_members: entry.hide_members,
+                text: entry.text,
+                auto_join: entry.auto_join,
+                message_ttl_secs: entry.message_ttl_secs,
+                announce: entry.announce && entry.text,
+                slow_mode_secs: entry.slow_mode_secs.min(MAX_SLOW_MODE_SECS),
+                nsfw: entry.nsfw,
+                ..Default::default()
+            },
+            members: HashSet::new(),
+            password: entry.password_hash.clone().map(Zeroizing::new),
+            delete_timer: None,
+            invited_users: HashSet::new(),
+            summons: HashMap::new(),
+            screen_shares: HashMap::new(),
+            persistent: true,
+            pseudonyms: HashMap::new(),
+            log_conv: if logs {
+                entry.log_conv()
+            } else {
+                String::new()
+            },
+            gate: ChannelGate::default(),
+            gate_key: entry.log_conv(),
+            kept: false,
+        };
+        channel.refresh_log();
+        channel
+    }
+
+    /// The entry a channel made in the app is kept as, its options as they are now.
+    pub fn to_entry(&self) -> ChannelEntry {
+        let i = &self.info;
+        ChannelEntry {
+            name: i.name.clone(),
+            description: i.description.clone(),
+            password_hash: self.password.as_ref().map(|p| p.to_string()),
+            max_users: i.max_users,
+            proximity: i.proximity,
+            hidden: i.hidden,
+            anonymous: i.anonymous,
+            screen_share: i.screen_share,
+            hide_members: i.hide_members,
+            routed: i.routed,
+            text: i.text,
+            auto_join: i.auto_join,
+            message_ttl_secs: i.message_ttl_secs,
+            announce: i.announce,
+            slow_mode_secs: i.slow_mode_secs,
+            nsfw: i.nsfw,
+            uid: self.gate_key.strip_prefix("c:").map(String::from),
+            ..ChannelEntry::default()
+        }
+    }
+
+    /// An invite of `user_id` is over, used or not. Whether there was one.
+    fn end_invite(&mut self, user_id: UserId) -> bool {
+        self.summons.remove(&user_id);
+        self.invited_users.remove(&user_id)
+    }
+
+    /// Who hears the answer to an invite of `user_id`.
+    pub fn inviter_of(&self, user_id: UserId) -> Option<UserId> {
+        self.summons.get(&user_id).copied().or(self.info.created_by)
+    }
+
     /// Offers the log in `info.log` unless an option rules it out: in an
     /// anonymous channel, or one hiding its members, a log would show who is
     /// there (its members wrap keys to each other by account).
@@ -466,6 +605,15 @@ fn check_admission(
     }
 
     Ok(is_invited)
+}
+
+/// The pseudonym `subject` goes by in whichever anonymous channel they stand in.
+fn alias_anywhere(channels: &HashMap<ChannelId, Channel>, subject: UserId) -> Option<String> {
+    channels.values().find_map(|ch| {
+        (ch.info.anonymous && ch.members.contains(&subject))
+            .then(|| ch.pseudonyms.get(&subject).cloned())
+            .flatten()
+    })
 }
 
 /// What a `set_channel_options` call actually moved. Both answers exist to
@@ -523,10 +671,12 @@ pub fn pick_name(real: &str, alias: &Option<String>, viewer_is_admin: bool) -> S
     }
 }
 
-/// A pseudonym for an anonymous channel, unique among the ones in use.
+/// A pseudonym for an anonymous channel, unique among the ones in use. Long enough
+/// not to come round again: a removal goes by this name, and hides the copies of
+/// whoever else once held it.
 fn mint_pseudonym(taken: &HashMap<UserId, String>) -> String {
     for _ in 0..64 {
-        let name = format!("Guest-{:04}", rand::random::<u16>() % 10_000);
+        let name = format!("Guest-{:08}", rand::random::<u32>() % 100_000_000);
         if !taken.values().any(|n| n == &name) {
             return name;
         }
@@ -534,6 +684,13 @@ fn mint_pseudonym(taken: &HashMap<UserId, String>) -> String {
     // 64 collisions in a row means the channel is impossibly full; fall back
     // to something unique rather than looping.
     format!("Guest-{}", rand::random::<u32>())
+}
+
+/// Whether `name` has the shape `mint_pseudonym` gives. An account may be called
+/// `guest-1234`, but stored in lower case: this capital is never an account's.
+pub fn is_pseudonym(name: &str) -> bool {
+    name.strip_prefix("Guest-")
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// The shared server state, designed for concurrent access.
@@ -560,6 +717,8 @@ pub struct ServerState {
     pub username_to_session: DashMap<String, SessionId>,
     /// All channels, keyed by channel_id.
     pub channels: RwLock<HashMap<ChannelId, Channel>>,
+    /// Where persistent channels sit (`crate::layout`).
+    pub layout: RwLock<crate::layout::Layout>,
     /// Maximum concurrent users.
     pub max_users: u32,
     /// How many channels can exist here at once: the lobby, every channel from
@@ -570,7 +729,7 @@ pub struct ServerState {
     /// server, so the budgets that pay for joining them, for handing each one a
     /// sender key and for asking each one's members for its history all have to
     /// be able to cover doing it once, on a server of any size.
-    pub channel_budget: u32,
+    pub channel_budget: AtomicU32,
     /// Runtime settings.
     pub settings: ServerSettings,
     /// Admin token (from config, or generated at startup).
@@ -580,6 +739,15 @@ pub struct ServerState {
     pub channel_kdf: tokio::sync::Semaphore,
     /// Bans in force (`crate::bans`), as kept in the database or `bans.json`.
     pub bans: DashMap<crate::bans::Key, crate::bans::Ban>,
+    /// Restrictions in force (`crate::restrict`), as kept in the database, or
+    /// here alone on a relay without accounts.
+    pub restrictions: DashMap<crate::bans::Key, crate::restrict::Held>,
+    /// When a guest at each address (`limit_key`) was first and last seen, while the
+    /// wait for new members is on.
+    pub guest_clocks: DashMap<IpAddr, crate::restrict::GuestClock>,
+    /// Every account holding a privilege (`accounts::read_chat_mods`), as clients
+    /// were last told. Stays empty on a relay without accounts.
+    pub chat_mods: RwLock<Vec<voipc_protocol::types::ChatMod>>,
     /// Address bans' hash key on a relay without accounts (made at start).
     pub ban_salt: [u8; 32],
     /// `bans.json`, on a relay without accounts; None keeps bans in memory.
@@ -595,6 +763,8 @@ pub struct ServerState {
     pub routing: crate::routing::Routing,
     /// Opt-in accounts; `None` when `[accounts] mode = "off"`.
     pub accounts: Option<Arc<crate::accounts::Relay>>,
+    /// The importer's run in progress (`accounts::import`).
+    pub import: tokio::sync::Mutex<Option<crate::accounts::import::ActiveRun>>,
     /// The live session of each signed-in account: a new sign-in replaces it.
     pub account_sessions: DashMap<[u8; 16], SessionId>,
     /// When each member last wrote in each slow-mode channel (`post_rules`).
@@ -682,12 +852,14 @@ impl ServerState {
                 password: None,
                 delete_timer: None,
                 invited_users: HashSet::new(),
+                summons: HashMap::new(),
                 screen_shares: HashMap::new(),
                 persistent: false,
                 pseudonyms: HashMap::new(),
                 log_conv: String::new(),
                 gate: ChannelGate::default(),
                 gate_key: String::new(),
+                kept: false,
             },
         );
 
@@ -702,66 +874,9 @@ impl ServerState {
             let channel_id = next_id;
             next_id += 1;
 
-            let has_password = entry.password_hash.is_some();
-            let password = entry.password_hash.clone().map(Zeroizing::new);
-
-            // A server with proximity chat switched off serves every channel
-            // as `off`, so clients never see a mode they may not use.
-            let proximity = if settings.proximity_enabled {
-                entry.proximity
-            } else {
-                if entry.proximity != ProximityMode::Off {
-                    warn!(
-                        channel = %entry.name,
-                        "proximity chat is disabled on this server; channel served as off"
-                    );
-                }
-                ProximityMode::Off
-            };
-
             channels.insert(
                 channel_id,
-                Channel {
-                    info: ChannelInfo {
-                        channel_id,
-                        name: entry.name.clone(),
-                        description: entry.description.clone(),
-                        max_users: entry.max_users,
-                        has_password,
-                        // A text channel has no voice, so no mode to serve.
-                        proximity: if entry.text {
-                            ProximityMode::Off
-                        } else {
-                            proximity
-                        },
-                        routed: entry.routed,
-                        hidden: entry.hidden,
-                        anonymous: entry.anonymous,
-                        screen_share: entry.screen_share && !entry.text,
-                        hide_members: entry.hide_members,
-                        text: entry.text,
-                        auto_join: entry.auto_join,
-                        message_ttl_secs: entry.message_ttl_secs,
-                        announce: entry.announce && entry.text,
-                        slow_mode_secs: entry.slow_mode_secs.min(MAX_SLOW_MODE_SECS),
-                        nsfw: entry.nsfw,
-                        ..Default::default()
-                    },
-                    members: HashSet::new(),
-                    password,
-                    delete_timer: None,
-                    invited_users: HashSet::new(),
-                    screen_shares: HashMap::new(),
-                    persistent: true,
-                    pseudonyms: HashMap::new(),
-                    log_conv: if logs {
-                        entry.log_conv()
-                    } else {
-                        String::new()
-                    },
-                    gate: ChannelGate::default(),
-                    gate_key: entry.log_conv(),
-                },
+                Channel::from_entry(entry, channel_id, logs, settings.proximity_enabled),
             );
             if let Some(ch) = channels.get_mut(&channel_id) {
                 ch.refresh_log();
@@ -772,17 +887,23 @@ impl ServerState {
             sessions: DashMap::new(),
             username_to_session: DashMap::new(),
             channels: RwLock::new(channels),
+            layout: RwLock::default(),
             limits: Arc::new(crate::ConnLimits::from_config(config)),
             token_failures: DashMap::new(),
             max_users: config.max_users,
-            channel_budget: settings
-                .max_channels
-                .saturating_add(persistent_channels.len() as u32)
-                .saturating_add(1),
+            channel_budget: AtomicU32::new(
+                settings
+                    .max_channels
+                    .saturating_add(persistent_channels.len() as u32)
+                    .saturating_add(1),
+            ),
             settings,
             admin_token,
             channel_kdf: tokio::sync::Semaphore::new(2),
             bans: DashMap::new(),
+            restrictions: DashMap::new(),
+            guest_clocks: DashMap::new(),
+            chat_mods: RwLock::new(Vec::new()),
             ban_salt: rand::random(),
             bans_file: None,
             bans_writer: std::sync::Mutex::new(()),
@@ -790,6 +911,7 @@ impl ServerState {
             next_channel_id: AtomicU32::new(next_id),
             routing: crate::routing::Routing::default(),
             accounts: None,
+            import: tokio::sync::Mutex::new(None),
             account_sessions: DashMap::new(),
             post_marks: DashMap::new(),
             tcp_fallback: config.tcp_fallback,
@@ -851,11 +973,29 @@ impl ServerState {
         {
             return Err(format!("you can only read in #{name}"));
         }
+        // Before the managers' pass below, which would let them through, and
+        // before slow mode's clock, which a refused post must not start
+        if self
+            .sessions
+            .get(&session_id)
+            .is_some_and(|s| s.silence.text())
+        {
+            return Err(crate::restrict::TEXT_HELD.into());
+        }
         if !(announce || slow_mode_secs > 0) || self.may_manage(session_id, created_by) {
             return Ok(());
         }
         if announce {
             return Err(format!("only moderators can post in #{name}"));
+        }
+        // A hide is a post the relay cannot tell from any other, and slow mode
+        // must not hold back taking something down
+        if self
+            .sessions
+            .get(&session_id)
+            .is_some_and(|s| crate::accounts::holds_hide(&s))
+        {
+            return Ok(());
         }
         let poster = match self.sessions.get(&session_id).and_then(|s| s.account_id()) {
             Some(a) => Poster::Account(a),
@@ -961,6 +1101,16 @@ impl ServerState {
                 .sessions
                 .get(&user_id)
                 .is_some_and(|s| crate::gates::passes(&s, groups))
+    }
+
+    /// False for a channel whose gate this session is outside, and for none at all:
+    /// one answer for both, or the answer says which channels exist.
+    pub async fn may_reach(&self, session_id: SessionId, channel_id: ChannelId) -> bool {
+        self.channels
+            .read()
+            .await
+            .get(&channel_id)
+            .is_some_and(|c| self.passes(session_id, &c.gate.groups))
     }
 
     /// Get a snapshot of all channel info (for sending to clients).
@@ -1113,7 +1263,7 @@ impl ServerState {
         // the admission has been granted in full.
         let passes = self.passes(user_id, &channel.gate.groups);
         if check_admission(channel, user_id, password, passes)? {
-            channel.invited_users.remove(&user_id);
+            channel.end_invite(user_id);
         }
         let speakers = channel.gate.speakers.clone();
 
@@ -1219,7 +1369,7 @@ impl ServerState {
 
         let passes = self.passes(user_id, &channel.gate.groups);
         if check_admission(channel, user_id, password, passes)? {
-            channel.invited_users.remove(&user_id);
+            channel.end_invite(user_id);
         }
         if let Some(mut session) = self.sessions.get_mut(&user_id) {
             let listen = !crate::gates::passes(&session, &channel.gate.speakers);
@@ -1336,7 +1486,7 @@ impl ServerState {
         // Unanswered invites would otherwise pin the user_id in every
         // channel's invite set forever (ids are never reused) and fill the cap.
         for channel in channels.values_mut() {
-            channel.invited_users.remove(&session.user_id);
+            channel.end_invite(session.user_id);
         }
         // And the same for the budget everybody else holds for relaying keys
         // *to* them. A user id is never handed out twice, so an entry left here
@@ -1433,12 +1583,14 @@ impl ServerState {
                 password: password.map(Zeroizing::new),
                 delete_timer: None,
                 invited_users: HashSet::new(),
+                summons: HashMap::new(),
                 screen_shares: HashMap::new(),
                 persistent: false,
                 pseudonyms: HashMap::new(),
                 log_conv: String::new(),
                 gate: ChannelGate::default(),
                 gate_key: String::new(),
+                kept: false,
             },
         );
 
@@ -1707,12 +1859,7 @@ impl ServerState {
     /// the loop, would take the channels lock while holding a session shard.
     pub async fn names_of(&self, subject: UserId) -> (String, Option<String>) {
         let real = self.real_name_of(subject);
-        let channels = self.channels.read().await;
-        let alias = channels.values().find_map(|ch| {
-            (ch.info.anonymous && ch.members.contains(&subject))
-                .then(|| ch.pseudonyms.get(&subject).cloned())
-                .flatten()
-        });
+        let alias = alias_anywhere(&*self.channels.read().await, subject);
         (real, alias)
     }
 
@@ -1756,6 +1903,60 @@ impl ServerState {
         pick_name(&real, &alias, self.is_admin(viewer_session))
     }
 
+    /// Why `kick_user` would refuse, with nothing done: a moderator's kick is
+    /// written down first, and only one that goes through.
+    pub async fn may_kick(
+        &self,
+        channel_id: ChannelId,
+        requester_id: UserId,
+        target_id: UserId,
+        requester_moderates: bool,
+        target_spared: bool,
+    ) -> anyhow::Result<()> {
+        Self::check_kick(
+            &*self.channels.read().await,
+            channel_id,
+            requester_id,
+            target_id,
+            requester_moderates,
+            target_spared,
+        )
+    }
+
+    fn check_kick(
+        channels: &HashMap<ChannelId, Channel>,
+        channel_id: ChannelId,
+        requester_id: UserId,
+        target_id: UserId,
+        requester_moderates: bool,
+        target_spared: bool,
+    ) -> anyhow::Result<()> {
+        if channel_id == 0 {
+            anyhow::bail!("cannot kick users from the General channel");
+        }
+
+        if requester_id == target_id {
+            anyhow::bail!("you cannot kick yourself");
+        }
+
+        let channel = channels
+            .get(&channel_id)
+            .ok_or_else(|| anyhow::anyhow!("channel does not exist"))?;
+
+        let creator = channel.info.created_by == Some(requester_id);
+        if !requester_moderates && !creator {
+            anyhow::bail!("only the channel creator can kick users");
+        }
+        if target_spared && !creator {
+            anyhow::bail!("only an admin can kick an admin or someone with privileges");
+        }
+
+        if !channel.members.contains(&target_id) {
+            anyhow::bail!("user is not in this channel");
+        }
+        Ok(())
+    }
+
     /// Remove a user from a channel (creator or admin kicks them).
     /// Returns the kicked user's session_id, the channel's remaining member
     /// count, and whether they were moved to General (a voice room's kick).
@@ -1767,30 +1968,20 @@ impl ServerState {
         requester_moderates: bool,
         target_spared: bool,
     ) -> anyhow::Result<(SessionId, usize, bool)> {
-        if channel_id == 0 {
-            anyhow::bail!("cannot kick users from the General channel");
-        }
-
-        if requester_id == target_id {
-            anyhow::bail!("you cannot kick yourself");
-        }
-
         let mut channels = self.channels.write().await;
+        Self::check_kick(
+            &channels,
+            channel_id,
+            requester_id,
+            target_id,
+            requester_moderates,
+            target_spared,
+        )?;
         let channel = channels
             .get_mut(&channel_id)
             .ok_or_else(|| anyhow::anyhow!("channel does not exist"))?;
 
-        let creator = channel.info.created_by == Some(requester_id);
-        if !requester_moderates && !creator {
-            anyhow::bail!("only the channel creator can kick users");
-        }
-        if target_spared && !creator {
-            anyhow::bail!("only an admin can kick an admin or someone with privileges");
-        }
-
-        if !channel.members.remove(&target_id) {
-            anyhow::bail!("user is not in this channel");
-        }
+        channel.members.remove(&target_id);
         channel.info.user_count = channel.members.len() as u32;
         channel.pseudonyms.remove(&target_id);
 
@@ -1848,25 +2039,60 @@ impl ServerState {
         }
     }
 
-    /// Add a user to a channel's invite list (creator only).
-    /// Returns (channel_name, inviter_username) for the notification.
-    pub async fn add_invite(
+    /// Why `add_invite` would refuse, with nothing done. `Ok(true)`: this one takes
+    /// a row in the moderation log, written before it goes out.
+    pub async fn may_invite(
         &self,
         channel_id: ChannelId,
         requester_id: UserId,
         target_id: UserId,
-    ) -> anyhow::Result<(String, String)> {
+        manages: bool,
+    ) -> anyhow::Result<bool> {
+        self.check_invite(
+            &*self.channels.read().await,
+            channel_id,
+            requester_id,
+            target_id,
+            manages,
+        )
+    }
+
+    /// `manages`: the requester holds `voipc:channels`, which lets someone who is
+    /// not the creator invite too. Only into a room they stand in, whose password
+    /// they could change anyway, and by their own name: an invite says who sent it,
+    /// and from behind a pseudonym it would say who that is.
+    fn check_invite(
+        &self,
+        channels: &HashMap<ChannelId, Channel>,
+        channel_id: ChannelId,
+        requester_id: UserId,
+        target_id: UserId,
+        manages: bool,
+    ) -> anyhow::Result<bool> {
         if channel_id == 0 {
             anyhow::bail!("cannot invite to the General channel");
         }
 
-        let mut channels = self.channels.write().await;
         let channel = channels
-            .get_mut(&channel_id)
+            .get(&channel_id)
             .ok_or_else(|| anyhow::anyhow!("channel does not exist"))?;
 
-        if channel.info.created_by != Some(requester_id) {
-            anyhow::bail!("only the channel creator can invite users");
+        let summon = channel.info.created_by != Some(requester_id);
+        if summon {
+            if !manages {
+                anyhow::bail!("only the channel creator can invite users");
+            }
+            if !channel.members.contains(&requester_id) {
+                anyhow::bail!("you can only invite people to a channel you are in");
+            }
+            if alias_anywhere(channels, requester_id).is_some() {
+                anyhow::bail!("you cannot invite people while you go by a pseudonym");
+            }
+            // Nobody will ever come to spend it, and ids are not reused, so it would
+            // hold a place on the list until the relay restarts
+            if !self.sessions.contains_key(&target_id) {
+                anyhow::bail!("they cannot join this channel");
+            }
         }
 
         if channel.members.contains(&target_id) {
@@ -1879,6 +2105,32 @@ impl ServerState {
         // The invite would name the channel to someone it is hidden from
         if !self.passes(target_id, &channel.gate.groups) {
             anyhow::bail!("they cannot join this channel");
+        }
+
+        // A re-send only raises the same popup again: one row for one invite
+        Ok(summon && channel.summons.get(&target_id) != Some(&requester_id))
+    }
+
+    /// Add a user to a channel's invite list, by its creator or, `manages`, by
+    /// someone `check_invite` lets. Whoever asked last hears the answer.
+    /// Returns (channel_name, inviter_username) for the notification.
+    pub async fn add_invite(
+        &self,
+        channel_id: ChannelId,
+        requester_id: UserId,
+        target_id: UserId,
+        manages: bool,
+    ) -> anyhow::Result<(String, String)> {
+        let mut channels = self.channels.write().await;
+        self.check_invite(&channels, channel_id, requester_id, target_id, manages)?;
+        let channel = channels
+            .get_mut(&channel_id)
+            .ok_or_else(|| anyhow::anyhow!("channel does not exist"))?;
+
+        if channel.info.created_by == Some(requester_id) {
+            channel.summons.remove(&target_id);
+        } else {
+            channel.summons.insert(target_id, requester_id);
         }
 
         let channel_name = channel.info.name.clone();
@@ -1897,12 +2149,12 @@ impl ServerState {
     /// Remove a user from a channel's invite list. Returns whether there was
     /// one — declining an invitation nobody sent must not reach anybody: the
     /// message names a channel of the sender's choosing and the reply goes to
-    /// that channel's creator.
+    /// that channel's creator, or whoever asked.
     pub async fn remove_invite(&self, channel_id: ChannelId, user_id: UserId) -> bool {
         let mut channels = self.channels.write().await;
         channels
             .get_mut(&channel_id)
-            .is_some_and(|channel| channel.invited_users.remove(&user_id))
+            .is_some_and(|channel| channel.end_invite(user_id))
     }
 
     /// Check if a user is a member of a channel or the channel is public (no password).
@@ -1958,6 +2210,9 @@ impl ServerState {
         if let Some(mut session) = self.sessions.get_mut(&session_id) {
             if session.listen_only.contains(&channel_id) {
                 anyhow::bail!("you can only listen in this channel");
+            }
+            if session.silence.voice() {
+                anyhow::bail!("you cannot share your screen on this server for now");
             }
             if session.is_screen_sharing {
                 anyhow::bail!("already screen sharing");
@@ -2272,7 +2527,7 @@ pub(crate) mod test_support {
     ) -> (UserId, SessionId, mpsc::Receiver<Bytes>) {
         let user_id = state.next_user_id();
         let session_id = user_id;
-        let (tx, _rx) = mpsc::channel(1);
+        let tx = ControlTx::placeholder();
         let (media_tx, media_rx) = mpsc::channel(16);
         let session = UserSession::new(
             user_id,
@@ -2281,7 +2536,9 @@ pub(crate) mod test_support {
             media_tx,
             std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             state.max_users,
-            state.channel_budget,
+            state
+                .channel_budget
+                .load(std::sync::atomic::Ordering::Relaxed),
         );
         state.sessions.insert(session_id, session);
         state
@@ -2308,12 +2565,14 @@ pub(crate) mod test_support {
             password: None,
             delete_timer: None,
             invited_users: HashSet::new(),
+            summons: HashMap::new(),
             screen_shares: HashMap::new(),
             persistent: false,
             pseudonyms: HashMap::new(),
             log_conv: String::new(),
             gate: ChannelGate::default(),
             gate_key: String::new(),
+            kept: false,
         });
         for &(user_id, session_id) in users {
             channel.members.insert(user_id);
@@ -2778,6 +3037,23 @@ mod tests {
         // Even about themselves, so they know what the others see
         let own = state.display_name(bob, bob_sid).await;
         assert!(own.starts_with("Guest-"), "{own}");
+    }
+
+    #[test]
+    fn a_pseudonym_is_too_long_to_come_round_again_and_has_a_shape_of_its_own() {
+        let name = mint_pseudonym(&HashMap::new());
+        assert!(is_pseudonym(&name), "{name}");
+        assert_eq!(name.len(), "Guest-".len() + 8, "{name}");
+        assert!(is_pseudonym("Guest-1234"), "a ban from before");
+        for other in [
+            "guest-1234",
+            "GUEST-1234",
+            "Guest-",
+            "Guest-12a4",
+            "gus#1234",
+        ] {
+            assert!(!is_pseudonym(other), "{other}");
+        }
     }
 
     #[tokio::test]
@@ -4130,7 +4406,10 @@ mod tests {
             .await
             .unwrap();
         let (uid2, _) = add_user(&state, "bob");
-        let (ch_name, inviter) = state.add_invite(ch.channel_id, uid, uid2).await.unwrap();
+        let (ch_name, inviter) = state
+            .add_invite(ch.channel_id, uid, uid2, false)
+            .await
+            .unwrap();
         assert_eq!(ch_name, "Room");
         assert_eq!(inviter, "alice");
         let channels = state.channels.read().await;
@@ -4151,11 +4430,69 @@ mod tests {
             .unwrap();
         for i in 0..50 {
             let (target, _) = add_user(&state, &format!("user{i}"));
-            state.add_invite(ch.channel_id, uid, target).await.unwrap();
+            state
+                .add_invite(ch.channel_id, uid, target, false)
+                .await
+                .unwrap();
         }
         let (target, _) = add_user(&state, "overflow");
-        let err = state.add_invite(ch.channel_id, uid, target).await;
+        let err = state.add_invite(ch.channel_id, uid, target, false).await;
         assert!(err.unwrap_err().to_string().contains("full"));
+    }
+
+    #[tokio::test]
+    async fn a_summon_goes_with_its_invite() {
+        let state = make_state();
+        let (alice, _) = add_user(&state, "alice");
+        let (mod_id, mod_sid) = add_user(&state, "mod");
+        let (bob, bob_sid) = add_user(&state, "bob");
+        let ch = state
+            .create_channel("Room".into(), None, ProximityMode::Off, false, false, alice)
+            .await
+            .unwrap()
+            .channel_id;
+        state.join_channel(mod_id, mod_sid, ch, None).await.unwrap();
+        let summoned = || async { state.channels.read().await[&ch].summons.get(&bob).copied() };
+        let summon = || state.add_invite(ch, mod_id, bob, true);
+
+        summon().await.unwrap();
+        assert_eq!(summoned().await, Some(mod_id));
+        assert!(state.remove_invite(ch, bob).await);
+        assert_eq!(summoned().await, None, "declined");
+
+        // A creator's invite after it takes the answer back
+        summon().await.unwrap();
+        state.add_invite(ch, alice, bob, false).await.unwrap();
+        assert_eq!(summoned().await, None, "the creator asked last");
+
+        summon().await.unwrap();
+        state.join_channel(bob, bob_sid, ch, None).await.unwrap();
+        assert_eq!(summoned().await, None, "joined");
+        state.leave_current_channel(bob, bob_sid).await;
+
+        summon().await.unwrap();
+        state.remove_session(bob_sid).await;
+        assert_eq!(summoned().await, None, "gone");
+        assert!(state.channels.read().await[&ch].invited_users.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_summon_needs_someone_there_to_answer_it() {
+        let state = make_state();
+        let (alice, _) = add_user(&state, "alice");
+        let (mod_id, mod_sid) = add_user(&state, "mod");
+        let ch = state
+            .create_channel("Room".into(), None, ProximityMode::Off, false, false, alice)
+            .await
+            .unwrap()
+            .channel_id;
+        state.join_channel(mod_id, mod_sid, ch, None).await.unwrap();
+        let err = state.add_invite(ch, mod_id, 4242, true).await.unwrap_err();
+        assert!(err.to_string().contains("cannot join"), "{err}");
+        assert!(state.channels.read().await[&ch].invited_users.is_empty());
+
+        // A creator asks about nobody as before: this must not say who is online
+        assert!(state.add_invite(ch, alice, 4242, false).await.is_ok());
     }
 
     // ── Screen share ───────────────────────────────────────────────────

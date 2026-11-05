@@ -1,0 +1,10 @@
+{
+  "id": "1190000000000000002",
+  "name": "VoIPC Importer",
+  "description": "",
+  "bot_public": false,
+  "bot_require_code_grant": false,
+  "flags": 557056,
+  "verify_key": "00",
+  "team": null
+}

@@ -1,0 +1,18 @@
+{
+  "fine": ["Night Owls", "v1.2 Night Owls", "St. Pauli", "Dr. Who & co", "A:B", "Mr.T", "Foo. Bar", "Café"],
+  "address": [
+    "ivy.l4f.cc",
+    "10.0.0.1:9987",
+    "10.0.0.1",
+    "chat.example.org (official)",
+    "voipc.example.com :443",
+    "[::1]:9987",
+    "the real ivy.l4f.cc",
+    "https://voipc.example.com",
+    "voipc.example.com.",
+    "[voipc.example.com]",
+    "voipc.example.com:",
+    "voipc.example.com:abc",
+    "chat.example.org/join"
+  ]
+}

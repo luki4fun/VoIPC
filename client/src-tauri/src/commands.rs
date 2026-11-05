@@ -46,8 +46,10 @@ pub async fn connect(
     if address.is_empty() || address.len() > 253 {
         return Err("address must be 1-253 characters".into());
     }
-    // 32 for the name and 5 for its "#0000" tag; the server checks each part
-    if username.is_empty() || username.len() > 37 {
+    // 32 for the name and 5 for its "#0000" tag; the server checks each part. A
+    // provider's sign-in has no name yet: its answer decides the account.
+    let named = !matches!(account, Some(crate::account::AccountArgs::Provider { .. }));
+    if (named && username.is_empty()) || username.len() > 37 {
         return Err("username must be 1-32 characters".into());
     }
 
@@ -75,6 +77,10 @@ pub async fn disconnect(
     // The user's own leave: a game may not bring them back with a hello after
     // a reconnect (S-030)
     state.user_moved.fetch_add(1, Ordering::Relaxed);
+    // A cut comes this way too, on every reconnect try, and a run goes on after one with the
+    // token it has. Only what is going stops: the page forgets when the person disconnects
+    #[cfg(not(target_os = "android"))]
+    state.import.stop(&server);
     // Out of the map under the lock, torn down outside it (see `teardown`).
     // Its Signal state goes with it: it lived on the connection.
     let connection = state.connections.write().await.remove(&server);
@@ -97,6 +103,10 @@ pub async fn disconnect_all(
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
+    // Of every server, connected or not: a cut has taken its own out of the map, and the page
+    // that could go on with its token is gone
+    #[cfg(not(target_os = "android"))]
+    state.import.forget_all();
     let all: Vec<_> = state.connections.write().await.drain().collect();
     for (server, connection) in all {
         network::teardown(&state, &app_handle, &server, connection).await;
@@ -418,7 +428,35 @@ pub async fn request_channel_users(
     .await
 }
 
-/// Invite a user to your channel (creator only).
+/// Display names and pictures of these accounts (`ServerMessage::Profiles`).
+#[tauri::command]
+pub async fn profiles_get(
+    state: State<'_, AppState>,
+    server: String,
+    accounts: Vec<[u8; 16]>,
+) -> Result<(), String> {
+    let conns = state.connections.read().await;
+    let connection = conn(&conns, &server)?;
+    network::send_tcp_message(&connection.tcp_tx, &ClientMessage::ProfilesGet { accounts }).await
+}
+
+/// A profile picture's file (`ServerMessage::ProfilePicture`), for the sanitizer.
+#[tauri::command]
+pub async fn profile_picture_get(
+    state: State<'_, AppState>,
+    server: String,
+    hash: [u8; 32],
+) -> Result<(), String> {
+    let conns = state.connections.read().await;
+    let connection = conn(&conns, &server)?;
+    network::send_tcp_message(
+        &connection.tcp_tx,
+        &ClientMessage::ProfilePictureGet { hash },
+    )
+    .await
+}
+
+/// Invite a user to your channel, as its creator or on `voipc:channels` (the relay decides).
 #[tauri::command]
 pub async fn send_invite(
     state: State<'_, AppState>,
@@ -3444,6 +3482,32 @@ pub async fn admin_ban(
     .await
 }
 
+/// Restrict a member (`voipc:restrict`): both false lifts, `duration_secs` 0 is
+/// until lifted.
+#[tauri::command]
+pub async fn admin_restrict(
+    state: State<'_, AppState>,
+    server: String,
+    user_id: u32,
+    voice: bool,
+    text: bool,
+    duration_secs: u32,
+    reason: String,
+) -> Result<(), String> {
+    send_admin_message(
+        &state,
+        &server,
+        ClientMessage::AdminRestrict {
+            user_id,
+            voice,
+            text,
+            duration_secs,
+            reason,
+        },
+    )
+    .await
+}
+
 /// Ban an account by name, online or not (admin only).
 #[tauri::command]
 pub async fn admin_ban_account(
@@ -3465,7 +3529,8 @@ pub async fn admin_ban_account(
     .await
 }
 
-/// Lift a ban by its id (admin only). The updated list arrives as `admin-bans`.
+/// Lift a ban by its id (admin only). The updated list arrives as `admin-bans-page`, or
+/// `admin-bans` from a relay before protocol 20.
 #[tauri::command]
 pub async fn admin_unban(
     state: State<'_, AppState>,
@@ -3475,10 +3540,33 @@ pub async fn admin_unban(
     send_admin_message(&state, &server, ClientMessage::AdminUnban { id }).await
 }
 
-/// Request the ban list (admin only); delivered as the `admin-bans` event.
+/// Who takes a report of a message now; delivered as the `report-takers` event.
+#[tauri::command]
+pub async fn report_takers_get(state: State<'_, AppState>, server: String) -> Result<(), String> {
+    send_admin_message(&state, &server, ClientMessage::ReportTakersGet).await
+}
+
+/// Request the ban list (admin only) of a relay before protocol 20; delivered as the
+/// `admin-bans` event.
 #[tauri::command]
 pub async fn admin_list_bans(state: State<'_, AppState>, server: String) -> Result<(), String> {
     send_admin_message(&state, &server, ClientMessage::AdminListBans).await
+}
+
+/// A page of the ban list (admin only), protocol 20; delivered as the `admin-bans-page` event.
+#[tauri::command]
+pub async fn admin_bans_page(
+    state: State<'_, AppState>,
+    server: String,
+    search: String,
+    offset: u32,
+) -> Result<(), String> {
+    send_admin_message(
+        &state,
+        &server,
+        ClientMessage::AdminBansPage { search, offset },
+    )
+    .await
 }
 
 /// Forget the TOFU-pinned certificate of a server (after a legitimate

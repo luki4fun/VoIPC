@@ -403,8 +403,32 @@ fn a_label_and_an_event_cross_from_js_as_json_text() {
         m.extras.fwd,
         Some(voipc_crypto::Forwarded {
             name: "ann#0001".into(),
-            at: 1_700_000_000_000
+            at: 1_700_000_000_000,
+            report: None
         })
+    );
+    let report =
+        r#"{"name":"dan","at":7,"report":{"channel":"lobby-chat","id":"m1","why":"spam"}}"#;
+    let packed = voipc_web::envelope(
+        "r1",
+        "look",
+        None,
+        None,
+        None,
+        None,
+        Some(report.into()),
+        None,
+    )
+    .unwrap();
+    let mark = voipc_crypto::open_envelope(&packed)
+        .extras
+        .fwd
+        .unwrap()
+        .report
+        .unwrap();
+    assert_eq!(
+        (mark.channel.as_str(), mark.why.as_str()),
+        ("lobby-chat", "spam")
     );
     let react = r#"{"kind":"react","target":"m1","emoji":"👍","on":true}"#;
     let packed = voipc_web::envelope(

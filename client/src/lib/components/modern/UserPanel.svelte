@@ -4,7 +4,6 @@
   // classic voice bar and the push-to-talk key use.
 
   import { avatarStyle } from "../../avatar.js";
-  import { shortName } from "../../username.js";
   import {
     connectionState,
     isDeafened,
@@ -16,6 +15,8 @@
   import { users } from "../../stores/users.js";
   import { toggleDeafen, toggleMute } from "../../stores/voice.js";
   import Icon from "../Icons.svelte";
+  import MemberName from "../MemberName.svelte";
+  import AvatarPicture from "../AvatarPicture.svelte";
 
   interface Props {
     onopensettings: () => void;
@@ -25,18 +26,17 @@
 
   // The name the channel knows us by: in an anonymous channel that is not the
   // one we connected with, and the member list carries the right one.
-  const displayName = $derived(
-    $users.find((u) => u.user_id === $userId)?.username ?? $username,
-  );
+  const me = $derived($users.find((u) => u.user_id === $userId));
+  const displayName = $derived(me?.username ?? $username);
 </script>
 
 <div class="user-panel">
   <button class="me" onclick={onopenvoice} title="Voice settings">
     <span class="avatar" class:speaking={$isTransmitting} style={avatarStyle(displayName)}
-      >{displayName.charAt(0).toUpperCase() || "?"}</span
+      >{displayName.charAt(0).toUpperCase() || "?"}<AvatarPicture account={me?.account} /></span
     >
     <span class="who">
-      <span class="name" title={displayName}>{shortName(displayName)}</span>
+      <span class="name" title={displayName}><MemberName username={displayName} account={me?.account} /></span>
       <!-- What the line under your name says is about the connection first:
            it read "Connected" behind the connect dialog otherwise. -->
       <span class="sub">
@@ -109,6 +109,7 @@
   }
 
   .avatar {
+    position: relative;
     display: flex;
     align-items: center;
     justify-content: center;

@@ -805,6 +805,22 @@ fn server_name(host: &str) -> Result<ServerName<'static>, String> {
     }
 }
 
+/// Checks a certificate against the public CAs, for `host`.
+fn public_verifier(
+    host: &str,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+) -> Result<VerifyAs, String> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let inner = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider)
+        .build()
+        .map_err(|e| format!("TLS configuration error: {e}"))?;
+    Ok(VerifyAs {
+        inner,
+        name: server_name(host)?,
+    })
+}
+
 fn tls_config(
     host: &str,
     port: u16,
@@ -824,18 +840,13 @@ fn tls_config(
             .with_custom_certificate_verifier(Arc::new(TofuCertVerifier {
                 key: tofu_key(host, port),
                 seen: sight.clone(),
+                public: public_verifier(host, provider)?,
             }))
             .with_no_client_auth()
     } else {
-        let mut roots = rustls::RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let inner = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider)
-            .build()
-            .map_err(|e| format!("TLS configuration error: {e}"))?;
-        let name = server_name(host)?;
         builder
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(VerifyAs { inner, name }))
+            .with_custom_certificate_verifier(Arc::new(public_verifier(host, provider)?))
             .with_no_client_auth()
     };
     config.alpn_protocols = vec![alpn.to_vec()];
@@ -1038,16 +1049,17 @@ pub fn tofu_forget(host: &str, port: u16) -> bool {
 struct TofuCertVerifier {
     key: String,
     seen: FirstSight,
+    public: VerifyAs,
 }
 
 impl ServerCertVerifier for TofuCertVerifier {
     fn verify_server_cert(
         &self,
         end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
         // Compute SHA-256 fingerprint of the server's certificate
         use ring::digest;
@@ -1070,6 +1082,18 @@ impl ServerCertVerifier for TofuCertVerifier {
         if let Some(pinned) = store.get(host_key) {
             // We've connected to this host before — verify the fingerprint matches
             if *pinned != fp_bytes {
+                // A relay that moved to a public certificate, which is what a
+                // provider's sign-in needs, and which changes at each renewal.
+                // The pin stays: it is dropped by nothing short of a person,
+                // since a certificate is public and this handshake not done yet.
+                if self
+                    .public
+                    .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+                    .is_ok()
+                {
+                    info!("TOFU: {} now has a public certificate", host_key);
+                    return Ok(ServerCertVerified::assertion());
+                }
                 warn!(
                     "TOFU: certificate fingerprint changed for {}! Possible MITM attack.",
                     host_key
@@ -1145,6 +1169,73 @@ impl ServerCertVerifier for TofuCertVerifier {
 mod tests {
     use super::*;
 
+    fn ring() -> Arc<rustls::crypto::CryptoProvider> {
+        Arc::new(rustls::crypto::ring::default_provider())
+    }
+
+    /// The real roots: nothing a test makes passes them.
+    fn no_public_ca() -> VerifyAs {
+        public_verifier("tofu-test.invalid", ring()).unwrap()
+    }
+
+    /// A relay that moved to a public certificate renews it every few months,
+    /// so a pin must not stop it. Anything the public CAs do not accept still
+    /// meets the pin, and the pin itself is never touched here: this runs before
+    /// the handshake has proved the key, and a certificate is public.
+    #[test]
+    fn a_changed_certificate_passes_only_if_the_public_cas_accept_it() {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
+        let host = "moved.invalid";
+        let name = ServerName::try_from(host).unwrap();
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca = ca_params.clone().self_signed(&ca_key).unwrap();
+        let issuer = Issuer::new(ca_params, ca_key);
+        let leaf_key = KeyPair::generate().unwrap();
+        let leaf = CertificateParams::new(vec![host.to_string()])
+            .unwrap()
+            .signed_by(&leaf_key, &issuer)
+            .unwrap();
+        let stranger_key = KeyPair::generate().unwrap();
+        let stranger = CertificateParams::new(vec![host.to_string()])
+            .unwrap()
+            .self_signed(&stranger_key)
+            .unwrap();
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca.der().clone()).unwrap();
+        let inner = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), ring())
+            .build()
+            .unwrap();
+        let key = tofu_key(host, 3);
+        TOFU_STORE.lock().unwrap().insert(key.clone(), vec![9; 32]);
+        let verifier = TofuCertVerifier {
+            key: key.clone(),
+            seen: FirstSight::default(),
+            public: VerifyAs {
+                inner,
+                name: name.clone(),
+            },
+        };
+
+        verifier
+            .verify_server_cert(leaf.der(), &[], &name, &[], UnixTime::now())
+            .expect("what the CAs accept passes the old pin");
+        let refused = verifier
+            .verify_server_cert(stranger.der(), &[], &name, &[], UnixTime::now())
+            .unwrap_err();
+        assert!(
+            refused.to_string().contains("fingerprint changed"),
+            "{refused}"
+        );
+        assert_eq!(
+            TOFU_STORE.lock().unwrap().get(&key),
+            Some(&vec![9; 32]),
+            "the pin is left alone"
+        );
+    }
+
     /// The verifier sees the certificate before the handshake proves the
     /// server holds its key, so it must not pin by itself: only a connect
     /// that went through does (`tofu_settle`).
@@ -1154,6 +1245,7 @@ mod tests {
         let verifier = TofuCertVerifier {
             key: key.clone(),
             seen: FirstSight::default(),
+            public: no_public_ca(),
         };
         let cert = CertificateDer::from(vec![1u8, 2, 3]);
         let name = ServerName::try_from("tofu-test.invalid").unwrap();
@@ -1179,10 +1271,12 @@ mod tests {
         let winner = TofuCertVerifier {
             key: key.clone(),
             seen: FirstSight::default(),
+            public: no_public_ca(),
         };
         let loser = TofuCertVerifier {
             key: key.clone(),
             seen: FirstSight::default(),
+            public: no_public_ca(),
         };
         winner
             .verify_server_cert(

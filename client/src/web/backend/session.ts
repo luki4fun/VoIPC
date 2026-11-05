@@ -23,6 +23,7 @@ import { share } from "./share";
 import { Files, originOf, sanitizeImage } from "./files";
 import { Emotes, emoteLimitsOf } from "./emotes";
 import { motionOf } from "./media";
+import { postsMarks } from "./posts-marks";
 
 /** Bound for the authentication response (network.rs CONNECT_TIMEOUT). */
 const AUTH_TIMEOUT_MS = 10_000;
@@ -69,6 +70,29 @@ const utf8 = new TextEncoder();
 const utf8Decoder = new TextDecoder();
 
 const toBytes = (v: number[] | Uint8Array): Uint8Array => (v instanceof Uint8Array ? v : Uint8Array.from(v));
+
+/** A list of bans: u64s may arrive as BigInt, plain numbers for the UI (types.ts BanInfo). */
+function banRows(bans: unknown): unknown[] {
+  return (
+    bans as {
+      id: bigint | number;
+      account: boolean;
+      label: string;
+      reason: string;
+      by: string;
+      created_at: bigint | number;
+      expires_in_secs?: bigint | number | null;
+    }[]
+  ).map((x) => ({
+    id: Number(x.id),
+    account: x.account,
+    label: x.label,
+    reason: x.reason,
+    by: x.by,
+    created_at: Number(x.created_at),
+    expires_in_secs: x.expires_in_secs == null ? null : Number(x.expires_in_secs),
+  }));
+}
 
 /** Milliseconds since the Unix epoch truncated to u32: the ping sequence. */
 const nowU32 = () => Date.now() >>> 0;
@@ -219,6 +243,49 @@ async function doConnect(address: string, username: string, account?: AccountArg
   return session.userId;
 }
 
+/** A question for the relay at `address` that ends with its answer, on a
+ *  connection of its own (account.rs `account_provider_ask`). */
+export async function askRelay(address: string, ask: unknown): Promise<unknown> {
+  const { host, port } = parseAddress(address);
+  const api = await loadWasm();
+  return new Promise((resolve, reject) => {
+    let transport: Transport | undefined;
+    let over = false;
+    const end = (go: () => void) => {
+      if (over) return;
+      over = true;
+      clearTimeout(timer);
+      transport?.close();
+      go();
+    };
+    const timer = setTimeout(() => end(() => reject(new Error("The server did not answer."))), AUTH_TIMEOUT_MS);
+    openTransport(host, port, {
+      onControl: (payload) => {
+        const [tag, body] = Object.entries(api.decodeServerMsg(payload) as Record<string, any>)[0] ?? ["", null];
+        if (tag === "AuthError") return end(() => reject(new Error(body.reason)));
+        // Another protocol: an older relay has no providers
+        if (tag === "Refused") return end(() => resolve({ providers: [] }));
+        if (tag !== "AuthStep") return;
+        const [step, b] = typeof body === "string" ? [body, null] : (Object.entries(body)[0] as [string, any]);
+        if (step === "Providers") end(() => resolve({ providers: b.kinds }));
+        else if (step === "OpenBrowser") end(() => resolve({ url: b.url, code: b.code, ticket: Array.from(b.ticket as number[]) }));
+        else if (step === "ProviderReady") end(() => resolve({ ready: true }));
+        else if (step === "ProviderPending") end(() => resolve({ ready: false }));
+      },
+      onDatagram: () => {},
+      onVideoPacket: () => {},
+      onClosed: (reason) => end(() => reject(new Error(reason))),
+    }).then(
+      (t) => {
+        if (over) return t.close();
+        transport = t;
+        t.sendControl(api.providerAsk(ask));
+      },
+      (e) => end(() => reject(e)),
+    );
+  });
+}
+
 /** network.rs parse_address's rules: the port defaults to 9987. */
 function parseAddress(address: string): { host: string; port: number } {
   const parsed = parseHostPort(address);
@@ -309,7 +376,7 @@ export class Session implements SessionContext, AccountHost {
     /** The server id: the address the UI connected with, verbatim. */
     readonly server: string,
     public signal: SignalClient,
-    readonly username: string,
+    public username: string,
   ) {
     this.mediaKeys = wasm().newMediaKeys();
   }
@@ -640,6 +707,8 @@ export class Session implements SessionContext, AccountHost {
           }
           try {
             this.account.onAuthenticated(this, b.account);
+            // A provider's sign-in only knows now who it is
+            this.username = b.account.name;
           } catch (e) {
             this.failAuth(e instanceof Error ? e : new Error(String(e)));
             break;
@@ -671,6 +740,40 @@ export class Session implements SessionContext, AccountHost {
           our_version: wasm().appVersion(),
         });
         this.auth?.reject(new Error(b.text));
+        break;
+      case "Profiles":
+        this.emit("profiles", b.profiles);
+        break;
+      case "ProfilePicture":
+        this.emit("profile-picture", { hash: b.hash, image: b.image });
+        break;
+      case "ServerProfile":
+        this.emit("server-profile", { name: b.name, description: b.description, icon: b.icon });
+        break;
+      case "MentionPower":
+        this.emit("mention-power", { user_ids: b.user_ids, on: b.on });
+        break;
+      case "MyBadges":
+        this.emit("my-badges", b.badges);
+        break;
+      case "Restrictions":
+        this.emit("restrictions", { list: b.list });
+        break;
+      case "ChatMods":
+        this.emit("chat-mods", { mods: b.mods });
+        break;
+      case "PostsHidden":
+        this.emit("posts-hidden", { marks: postsMarks(b.marks) });
+        break;
+      case "ReportTakers":
+        this.account?.noteTakers(b.takers);
+        this.emit("report-takers", { takers: b.takers });
+        break;
+      case "GroupStyles":
+        this.emit("group-styles", b.groups);
+        break;
+      case "ChannelLayout":
+        this.emit("channel-layout", { categories: b.categories, channels: b.channels });
         break;
       case "ChannelList":
         // Our own copy: the emitted array ends up in the UI's store
@@ -929,28 +1032,10 @@ export class Session implements SessionContext, AccountHost {
         this.emit("admin-error", { reason: b.reason });
         break;
       case "AdminBans":
-        // u64s may arrive as BigInt: plain numbers for the UI (types.ts BanInfo)
-        this.emit("admin-bans", {
-          bans: (
-            b.bans as {
-              id: bigint | number;
-              account: boolean;
-              label: string;
-              reason: string;
-              by: string;
-              created_at: bigint | number;
-              expires_in_secs?: bigint | number | null;
-            }[]
-          ).map((x) => ({
-            id: Number(x.id),
-            account: x.account,
-            label: x.label,
-            reason: x.reason,
-            by: x.by,
-            created_at: Number(x.created_at),
-            expires_in_secs: x.expires_in_secs == null ? null : Number(x.expires_in_secs),
-          })),
-        });
+        this.emit("admin-bans", { bans: banRows(b.bans) });
+        break;
+      case "AdminBansPaged":
+        this.emit("admin-bans-page", { search: b.search, offset: b.offset, total: b.total, bans: banRows(b.bans) });
         break;
       case "Disconnected":
         // The server closes the session right after; the UI must not auto-reconnect
@@ -1575,7 +1660,10 @@ export class Session implements SessionContext, AccountHost {
   sendKeptDm(accountHex: string, content: string, ttlSecs?: number, refs?: MessageRefs): string {
     if (!this.account) throw new Error("Not signed in to an account on that server");
     const messageId = wasm().newMessageId();
-    this.account.keptDm(this, accountHex, wasm().envelope(messageId, content, ttlSecs, refs), ttlSecs);
+    // A report kept for this one message: the dialog asked. Anything else needs
+    // cloud copies on.
+    const once = !!refs?.fwd?.report;
+    this.account.keptDm(this, accountHex, wasm().envelope(messageId, content, ttlSecs, refs), ttlSecs, once);
     return messageId;
   }
 

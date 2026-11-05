@@ -38,18 +38,31 @@ export function privilegeLabel(scope: string): string {
 
 /** The privileges a group can hand out, in the order the group editor lists
  *  them. A group may hold others (from the server's shell): those show as
- *  they are named. */
-export const PRIVILEGES: readonly { scope: string; label: string; hint: string }[] = [
+ *  they are named. `since`: the protocol that brought it, if newer than the
+ *  group editor. */
+export const PRIVILEGES: readonly { scope: string; label: string; hint: string; since?: number }[] = [
   { scope: "*", label: "Everything (admin)", hint: "Every privilege, and the real names behind anonymous channels" },
   { scope: "voipc:kick", label: "Kick", hint: "Kick people from the server and from any channel" },
-  { scope: "voipc:ban", label: "Ban", hint: "Ban people, by address and account" },
-  { scope: "voipc:bans", label: "Ban list", hint: "See the ban list, lift bans, ban an account by name" },
-  { scope: "voipc:channels", label: "Channels", hint: "Change the settings and gates of the channels they can see; post in announcement channels" },
+  { scope: "voipc:ban", label: "Ban", hint: "Ban people, by address and account, and remove the posts of someone banned" },
+  { scope: "voipc:bans", label: "Ban list", hint: "See the ban list, lift bans, ban an account by name, and remove the posts of someone banned" },
+  { scope: "voipc:restrict", label: "Restrict", hint: "Mute someone's voice or stop their channel posts for a while", since: 19 },
+  { scope: "voipc:hide", label: "Hide messages", hint: "Hide a message from its readers, who can still open it. Only an admin can then kick them or hide what they write", since: 19 },
+  { scope: "voipc:reports", label: "Take reports", hint: "Receive what people report. Spares nobody from a kick", since: 19 },
+  { scope: "voipc:modlog", label: "Moderation log", hint: "Read who did what to whom. Spares nobody from a kick", since: 19 },
+  { scope: "voipc:channels", label: "Channels", hint: "Change the settings and gates of the channels they can see; post in announcement channels; invite people to a room they stand in" },
+  { scope: "voipc:profiles", label: "Profiles", hint: "Clear the display name and picture of someone holding no more than they do", since: 18 },
+  { scope: "voipc:mention_all", label: "Call on everybody", hint: "Use @everyone, @here and a group's @&badge", since: 18 },
   { scope: "voipc:emotes", label: "Emotes", hint: "Add, rename and remove the server's emotes and stickers" },
   { scope: "users:read", label: "See accounts", hint: "The account list, an account's groups and history" },
   { scope: "users:admin", label: "Manage accounts", hint: "Give and take groups, reset two-factor codes, make invites" },
   { scope: "roles:admin", label: "Manage groups", hint: "Make, change and delete groups and what they hand out" },
 ];
+
+/** What a relay of protocol `p` can hand out (`null`: our own). It refuses a whole
+ *  group whose privileges it has never heard of, so the others are not offered. */
+export function privilegesOn(p: number | null): readonly (typeof PRIVILEGES)[number][] {
+  return PRIVILEGES.filter((x) => p === null || !x.since || p >= x.since);
+}
 
 /** The admin panel's tabs, and what opens each. */
 export const PANEL_SCOPES = ["voipc:bans", "voipc:emotes", "users:read", "users:admin", "roles:admin"] as const;

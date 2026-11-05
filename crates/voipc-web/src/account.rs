@@ -16,7 +16,7 @@ use voipc_protocol::conv::unhex16;
 use voipc_protocol::messages::AccountReply;
 use voipc_protocol::messages::{ClientMessage, ServerMessage};
 use voipc_protocol::types::PreKeyBundleData;
-use voipc_protocol::types::{AccountInfo, UserInfo};
+use voipc_protocol::types::{AccountInfo, ReportTaker, UserInfo};
 use wasm_bindgen::prelude::*;
 
 fn bytes(msg: &ClientMessage) -> Vec<u8> {
@@ -56,6 +56,42 @@ enum MethodJs {
         recovery: String,
         password: String,
     },
+    /// Back from a provider's page, with the relay's ticket.
+    Provider {
+        ticket: Vec<u8>,
+        #[serde(default)]
+        invite: Option<String>,
+    },
+}
+
+/// `Authenticate` for a question about providers: `{ providers: true }`, `{ open:
+/// "Discord" }` or `{ status: ticket }`. The relay answers, and ends the connection.
+#[wasm_bindgen(js_name = providerAsk)]
+pub fn provider_ask(ask: JsValue) -> Result<Vec<u8>, JsError> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    enum Ask {
+        Providers,
+        Open(voipc_protocol::types::ProviderKind),
+        Status(Vec<u8>),
+    }
+    use voipc_protocol::types::AccountStart;
+    let start = match serde_wasm_bindgen::from_value::<Ask>(ask)? {
+        Ask::Providers => AccountStart::Providers,
+        Ask::Open(kind) => AccountStart::Provider { kind },
+        Ask::Status(ticket) => AccountStart::ProviderStatus { ticket },
+    };
+    Ok(bytes(&voipc_crypto::account::provider_ask(
+        start,
+        PROTOCOL_VERSION,
+        APP_VERSION,
+    )))
+}
+
+/// Whether `url` is a provider's own page: the relay names it.
+#[wasm_bindgen(js_name = providerPageOk)]
+pub fn provider_page_ok(url: &str) -> bool {
+    voipc_crypto::account::provider_page_ok(url)
 }
 
 #[wasm_bindgen]
@@ -75,8 +111,15 @@ impl AccountSignIn {
     /// (`{ stretch: salt }`, then `stretched`), with WebCrypto.
     #[wasm_bindgen(constructor)]
     pub fn new(name: &str, method: JsValue) -> Result<AccountSignIn, JsError> {
-        let name = normalize_name(name).map_err(JsError::new)?;
-        let method = match serde_wasm_bindgen::from_value::<MethodJs>(method)? {
+        let method = serde_wasm_bindgen::from_value::<MethodJs>(method)?;
+        // A provider's answer decides the account
+        let name = if matches!(method, MethodJs::Provider { .. }) {
+            String::new()
+        } else {
+            normalize_name(name).map_err(JsError::new)?
+        };
+        let method = match method {
+            MethodJs::Provider { ticket, invite } => Method::Provider { ticket, invite },
             MethodJs::Login { password } => Method::Password {
                 password: Zeroizing::new(password),
             },
@@ -128,6 +171,12 @@ impl AccountSignIn {
         self.first.clone()
     }
 
+    fn m_mut(&mut self) -> Result<&mut SignIn, JsError> {
+        self.machine
+            .as_mut()
+            .ok_or_else(|| JsError::new("the sign-in is over"))
+    }
+
     fn m(&self) -> Result<&SignIn, JsError> {
         self.machine
             .as_ref()
@@ -168,6 +217,54 @@ impl AccountSignIn {
             .as_mut()
             .ok_or_else(|| JsError::new("the sign-in is over"))?;
         Ok(steps(m.on_message(&msg).map_err(|e| JsError::new(&e))?))
+    }
+
+    /// The accounts this browser remembers on this relay: a relay saying one of
+    /// them was never opened is hiding its vault.
+    #[wasm_bindgen(js_name = rememberedHere)]
+    pub fn remembered_here(&mut self, names: JsValue) -> Result<(), JsError> {
+        let names: Vec<String> = serde_wasm_bindgen::from_value(names)?;
+        self.m_mut()?.remembered_here(names);
+        Ok(())
+    }
+
+    /// The name for `{ providerSignup }`. The proof of work runs here.
+    #[wasm_bindgen(js_name = providerSignup)]
+    pub fn provider_signup(&mut self, name: &str) -> Result<Vec<u8>, JsError> {
+        let out = self
+            .m_mut()?
+            .provider_signup(name)
+            .map_err(|e| JsError::new(&e))?;
+        Ok(bytes(&out))
+    }
+
+    /// "First time here", for `{ providerChoice }` with `claim`.
+    #[wasm_bindgen(js_name = providerClaim)]
+    pub fn provider_claim(&mut self) -> Result<js_sys::Array, JsError> {
+        Ok(steps(
+            self.m_mut()?
+                .provider_claim()
+                .map_err(|e| JsError::new(&e))?,
+        ))
+    }
+
+    /// The recovery key as it was shown. Throws why not; the choice stays open.
+    #[wasm_bindgen(js_name = providerRecovery)]
+    pub fn provider_recovery(&mut self, key: &str) -> Result<js_sys::Array, JsError> {
+        let key =
+            Zeroizing::new(recovery_parse(key).ok_or_else(|| JsError::new(NOT_A_RECOVERY_KEY))?);
+        Ok(steps(
+            self.m_mut()?
+                .provider_recovery(&key)
+                .map_err(|e| JsError::new(&e))?,
+        ))
+    }
+
+    /// Ask another device of this account: the payload to send.
+    #[wasm_bindgen(js_name = pairStart)]
+    pub fn pair_start(&mut self) -> Result<Vec<u8>, JsError> {
+        let out = self.m_mut()?.pair_start().map_err(|e| JsError::new(&e))?;
+        Ok(bytes(&out))
     }
 
     /// PBKDF2-SHA256 (`kdfRounds()`, 32 bytes) of the password with the salt
@@ -283,6 +380,35 @@ fn steps(steps: Vec<Step>) -> js_sys::Array {
             Step::ResetDone => {
                 out.push(&obj("resetDone", JsValue::TRUE));
             }
+            Step::ProviderPending => {
+                out.push(&obj("providerPending", JsValue::TRUE));
+            }
+            Step::ProviderSignup {
+                suggestion,
+                problem,
+            } => {
+                let o = js_sys::Object::new();
+                let _ = js_sys::Reflect::set(&o, &"suggestion".into(), &suggestion.into());
+                let _ = js_sys::Reflect::set(&o, &"problem".into(), &problem.into());
+                out.push(&obj("providerSignup", o.into()));
+            }
+            Step::ProviderChoice {
+                name,
+                claim,
+                has_password,
+            } => {
+                let o = js_sys::Object::new();
+                let _ = js_sys::Reflect::set(&o, &"name".into(), &name.into());
+                let _ = js_sys::Reflect::set(&o, &"claim".into(), &claim.into());
+                let _ = js_sys::Reflect::set(&o, &"has_password".into(), &has_password.into());
+                out.push(&obj("providerChoice", o.into()));
+            }
+            Step::PairCode { code } => {
+                out.push(&obj("pairCode", JsValue::from_str(&code)));
+            }
+            Step::PairRefused { reason } => {
+                out.push(&obj("pairRefused", JsValue::from_str(&reason)));
+            }
             Step::Ignore => {}
         }
     }
@@ -361,6 +487,12 @@ impl AccountSession {
         actions(self.session.tick())
     }
 
+    /// The person's answer to `account-pair-ask`, after comparing the codes.
+    #[wasm_bindgen(js_name = pairAnswer)]
+    pub fn pair_answer(&mut self, pair: f64, yes: bool) -> Result<JsValue, JsError> {
+        actions(self.session.pair_answer(pair as u64, yes))
+    }
+
     /// A decoded `AccountReply`.
     #[wasm_bindgen(js_name = onReply)]
     pub fn on_reply(&mut self, reply: JsValue) -> Result<JsValue, JsError> {
@@ -373,6 +505,14 @@ impl AccountSession {
     pub fn note_roster(&mut self, users: JsValue) -> Result<JsValue, JsError> {
         let users: Vec<UserInfo> = serde_wasm_bindgen::from_value(users)?;
         actions(self.session.note_roster(&users))
+    }
+
+    /// The `takers` of a `ReportTakers`, for the pins.
+    #[wasm_bindgen(js_name = noteTakers)]
+    pub fn note_takers(&mut self, takers: JsValue) -> Result<(), JsError> {
+        let takers: Vec<ReportTaker> = serde_wasm_bindgen::from_value(takers)?;
+        self.session.note_takers(&takers);
+        Ok(())
     }
 
     /// An identity `user_id` showed (a pre-key bundle, or a session they
@@ -404,10 +544,17 @@ impl AccountSession {
         envelope: &[u8],
         sent_at: f64,
         ttl_secs: Option<u32>,
+        once: bool,
     ) -> Result<JsValue, JsError> {
         let a = self
             .session
-            .kept_dm(account_hex, envelope.to_vec(), sent_at as u64, ttl_secs)
+            .kept_dm(
+                account_hex,
+                envelope.to_vec(),
+                sent_at as u64,
+                ttl_secs,
+                once,
+            )
             .map_err(|e| JsError::new(&e))?;
         actions(a)
     }
@@ -441,14 +588,49 @@ impl AccountSession {
     #[wasm_bindgen(js_name = deleteAccount)]
     pub fn delete_account(
         &self,
-        master: &[u8],
+        master: Option<Vec<u8>>,
         totp: Option<String>,
         recovery_code: Option<String>,
     ) -> Result<JsValue, JsError> {
-        let master: [u8; 32] = master
-            .try_into()
-            .map_err(|_| JsError::new("the stretched password is not 32 bytes"))?;
-        actions(self.session.delete_account(&master, totp, recovery_code))
+        let master = master32(master)?;
+        actions(
+            self.session
+                .delete_account(master.as_ref(), totp, recovery_code),
+        )
+    }
+
+    /// `AccountSession::provider_start`. `kind`: "Discord", "Google", "Facebook".
+    #[wasm_bindgen(js_name = providerStart)]
+    pub fn provider_start(
+        &self,
+        kind: JsValue,
+        link: bool,
+        master: Option<Vec<u8>>,
+        totp: Option<String>,
+        recovery_code: Option<String>,
+    ) -> Result<JsValue, JsError> {
+        let kind = serde_wasm_bindgen::from_value(kind)?;
+        let master = master32(master)?;
+        actions(
+            self.session
+                .provider_start(kind, link, master.as_ref(), totp, recovery_code),
+        )
+    }
+
+    #[wasm_bindgen(js_name = providerUnlink)]
+    pub fn provider_unlink(
+        &self,
+        kind: JsValue,
+        master: Option<Vec<u8>>,
+        totp: Option<String>,
+        recovery_code: Option<String>,
+    ) -> Result<JsValue, JsError> {
+        let kind = serde_wasm_bindgen::from_value(kind)?;
+        let master = master32(master)?;
+        actions(
+            self.session
+                .provider_unlink(kind, master.as_ref(), totp, recovery_code),
+        )
     }
 
     /// Out of channel log `conv`; with `tell`, asks the relay to take us out.
@@ -485,6 +667,17 @@ impl AccountSession {
     #[wasm_bindgen(js_name = setPrefs)]
     pub fn set_prefs(&mut self, cloud: bool, asked: bool) -> Result<JsValue, JsError> {
         actions(self.session.set_prefs(Prefs { cloud, asked }))
+    }
+
+    /// Block or unblock the person `key` names; throws why the list could not
+    /// be kept (`AccountSession::set_block`).
+    #[wasm_bindgen(js_name = setBlocked)]
+    pub fn set_blocked(&mut self, key: &str, label: &str, on: bool) -> Result<JsValue, JsError> {
+        actions(
+            self.session
+                .set_block(key, label, on)
+                .map_err(|e| JsError::new(&e))?,
+        )
     }
 
     #[wasm_bindgen(js_name = setShare)]
@@ -526,19 +719,29 @@ impl AccountSession {
     #[wasm_bindgen(js_name = recoveryKeyNew)]
     pub fn recovery_key_new(
         &self,
-        master: &[u8],
+        master: Option<Vec<u8>>,
         totp: Option<String>,
         recovery_code: Option<String>,
     ) -> Result<JsValue, JsError> {
-        let master: [u8; 32] = master
-            .try_into()
-            .map_err(|_| JsError::new("the stretched password is not 32 bytes"))?;
-        let (a, key) = self.session.recovery_key_new(&master, totp, recovery_code);
+        let master = master32(master)?;
+        let (a, key) = self
+            .session
+            .recovery_key_new(master.as_ref(), totp, recovery_code);
         let out = actions(a)?;
         js_sys::Reflect::set(&out, &JsValue::from_str("key"), &JsValue::from_str(&key))
             .map_err(|_| JsError::new("could not hand the key over"))?;
         Ok(out)
     }
+}
+
+/// A stretched password, where the account has one.
+fn master32(master: Option<Vec<u8>>) -> Result<Option<[u8; 32]>, JsError> {
+    master
+        .map(|m| {
+            m.try_into()
+                .map_err(|_| JsError::new("the stretched password is not 32 bytes"))
+        })
+        .transpose()
 }
 
 /// The authenticator app's QR code for an `otpauth://` link, drawn here.

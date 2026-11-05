@@ -105,6 +105,16 @@ export interface UiPrefs {
    */
   dm_timers: Record<string, number>;
   /**
+   * What a channel's messages may do to this person, by `"host:port/name"`: every
+   * message, only what is for them, or nothing. By name, as the channel's id
+   * moves between restarts. No entry follows the channel's size (`notify-rules.ts`).
+   */
+  channel_notify: Record<string, "all" | "mentions" | "nothing">;
+  /** Categories folded in the sidebar, by `"host:port"`. */
+  folded_categories: Record<string, number[]>;
+  /** Servers whose welcome channel, if any, was offered on this device. */
+  welcomed: string[];
+  /**
    * Servers (`"host:port"`) on which the user confirmed being 18 or older, so
    * their channels marked 18+ join and show without asking again.
    *
@@ -112,6 +122,11 @@ export interface UiPrefs {
    * The server is never told: the flag on a channel is all it carries.
    */
   nsfw_ok: string[];
+  /**
+   * Servers whose Discord bot this person says they removed, so the dashboard stops
+   * reminding them (`"host:port"`). A later run takes the server off again.
+   */
+  discord_bot_gone: string[];
   /**
    * Whether a loaded video or sound plays inside VoIPC, through the system's
    * own decoders; null is this platform's default (media.ts `playsMedia`).
@@ -128,6 +143,12 @@ export interface UiPrefs {
    * Files lists them, each with "Ask again".
    */
   emotes_mobile_ok: string[];
+  /**
+   * Who a guest blocked, per server (`"host:port"` -> key -> what to call them;
+   * block-rules.ts has the keys). Only here: it is never sent to a relay. An
+   * account keeps its own list sealed in its vault, not here.
+   */
+  blocked: Record<string, Record<string, string>>;
 }
 
 /** Bounds. A width outside these is a panel you cannot get back by dragging. */
@@ -180,11 +201,16 @@ export function defaultUiPrefs(): UiPrefs {
     dm_previews: false,
     left_text_channels: {},
     dm_timers: {},
+    channel_notify: {},
+    folded_categories: {},
+    welcomed: [],
     nsfw_ok: [],
+    discord_bot_gone: [],
     play_media: null,
     show_stickers: true,
     animate_emotes: "always",
     emotes_mobile_ok: [],
+    blocked: {},
   };
 }
 
@@ -214,6 +240,26 @@ const DM_TIMER_MAX = 500;
 /** The same 30 days a message's own timer is bounded to (chat-rules.ts). */
 const DM_TIMER_MAX_SECS = 30 * 24 * 60 * 60;
 
+function foldedCategories(raw: unknown): Record<string, number[]> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const out: Record<string, number[]> = {};
+  for (const [server, ids] of Object.entries(raw as Record<string, unknown>)) {
+    if (!Array.isArray(ids)) continue;
+    const list = ids.filter((i): i is number => Number.isInteger(i));
+    if (list.length > 0) out[server] = [...new Set(list)];
+  }
+  return out;
+}
+
+function channelNotify(raw: unknown): UiPrefs["channel_notify"] {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const out: UiPrefs["channel_notify"] = {};
+  for (const [channel, level] of Object.entries(raw as Record<string, unknown>)) {
+    if (level === "all" || level === "mentions" || level === "nothing") out[channel] = level;
+  }
+  return out;
+}
+
 function dmTimers(raw: unknown): Record<string, number> {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
   const out: Record<string, number> = {};
@@ -233,6 +279,24 @@ function nsfwOk(raw: unknown): string[] {
   if (!Array.isArray(raw)) return [];
   const list = raw.filter((k): k is string => typeof k === "string" && k !== "");
   return [...new Set(list)].slice(-NSFW_OK_MAX);
+}
+
+/** How many servers' lists, and how many people on each: `BLOCKS_MAX` in block-rules.ts. */
+const BLOCKED_MAX_SERVERS = 200;
+const BLOCKED_MAX_PER_SERVER = 200;
+
+/** A key this build does not know stays: a newer one may have written it. */
+function blockedLists(raw: unknown): UiPrefs["blocked"] {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const out: UiPrefs["blocked"] = {};
+  for (const [server, list] of Object.entries(raw as Record<string, unknown>).slice(-BLOCKED_MAX_SERVERS)) {
+    if (!list || typeof list !== "object" || Array.isArray(list)) continue;
+    const kept = Object.entries(list as Record<string, unknown>)
+      .filter(([, label]) => typeof label === "string")
+      .slice(-BLOCKED_MAX_PER_SERVER);
+    if (kept.length > 0) out[server] = Object.fromEntries(kept) as Record<string, string>;
+  }
+  return out;
 }
 
 function clamp(value: unknown, lo: number, hi: number, fallback: number): number {
@@ -348,10 +412,15 @@ export function sanitizeUiPrefs(raw: unknown): UiPrefs {
     dm_previews: bool(r.dm_previews, d.dm_previews),
     left_text_channels: leftTextChannels(r.left_text_channels),
     dm_timers: dmTimers(r.dm_timers),
+    channel_notify: channelNotify(r.channel_notify),
+    folded_categories: foldedCategories(r.folded_categories),
+    welcomed: nsfwOk(r.welcomed),
     nsfw_ok: nsfwOk(r.nsfw_ok),
+    discord_bot_gone: nsfwOk(r.discord_bot_gone),
     play_media: typeof r.play_media === "boolean" ? r.play_media : null,
     show_stickers: bool(r.show_stickers, d.show_stickers),
     animate_emotes: r.animate_emotes === "hover" || r.animate_emotes === "never" ? r.animate_emotes : "always",
     emotes_mobile_ok: nsfwOk(r.emotes_mobile_ok),
+    blocked: blockedLists(r.blocked),
   };
 }

@@ -15,6 +15,8 @@
     transmitHeldByGame,
   } from "../stores/connection.js";
   import { viewingVoice, voice, voiceChannel } from "../stores/channels.js";
+  import { voiceRestriction } from "../stores/restrictions.js";
+  import { heldLine } from "../restrict-rules.js";
   import { serverEntries } from "../connect.js";
   import { volume, inputGain, pttKey, noiseSuppression } from "../stores/settings.js";
   import { micLane } from "../stores/mixer.js";
@@ -40,6 +42,8 @@
 
   // In no voice channel on any server there is nothing to talk into
   let voiceDisabled = $derived($voice === null);
+
+  const heldBack = $derived($voiceRestriction?.voice ? heldLine($voiceRestriction, "voice", Date.now()) : "");
 
   // Whether the talk button holds a press of its own (not the hotkey's or the
   // game's): one still held when the button goes away without a blur is let
@@ -133,6 +137,7 @@
           class:active={$isTransmitting}
           class:by-game={$transmitHeldByGame}
           aria-pressed={$isTransmitting}
+          disabled={!!heldBack}
           onpointerdown={(e) => {
             if (e.button !== 0) return;
             (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
@@ -156,11 +161,12 @@
             if ($isTransmitting && !$transmitHeldByGame) pttStop();
           }}
           use:letGoOnRemove
-          title={$transmitHeldByGame
-            ? "The game is holding your push-to-talk (Settings → Game Integration)"
-            : undefined}
+          title={heldBack ||
+            ($transmitHeldByGame
+              ? "The game is holding your push-to-talk (Settings → Game Integration)"
+              : undefined)}
         >
-          {$transmitHeldByGame ? "Game is talking" : `Talk: ${$pttKey}`}
+          {heldBack ? "Nobody hears you" : $transmitHeldByGame ? "Game is talking" : `Talk: ${$pttKey}`}
         </button>
       {/if}
     {:else if $voiceMode === "vad"}

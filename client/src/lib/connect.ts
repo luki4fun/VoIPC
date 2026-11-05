@@ -11,7 +11,7 @@
 // mirrors it; closing the server that carries voice only lets go of the mirror.
 
 import { hasNsfwConsent } from "./stores/channel-ui.js";
-import { dropPrompts } from "./stores/account.js";
+import { account as signedInAccount, dropPrompts } from "./stores/account.js";
 import { isWeb } from "./stores/platform.js";
 import { derived, get, writable, type Readable } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
@@ -33,14 +33,17 @@ import {
   unreadPerChannel,
   releaseBrowserMarks,
 } from "./stores/chat.js";
+import { loadGuestBlocks } from "./stores/blocks.js";
 import { pendingInvites } from "./stores/invites.js";
 import { parseHostPort } from "./invite.js";
 import { addNotification } from "./stores/notifications.js";
 import { pendingPokes } from "./stores/pokes.js";
 import { splitName, withTag } from "./username.js";
 import { clearRosters } from "./stores/rosters.js";
+import { clearProfiles } from "./stores/profiles.js";
 import { dropEmotes } from "./stores/emotes.js";
-import { dropServer, scoped } from "./stores/scoped.js";
+import { dropKept, dropServer, scoped } from "./stores/scoped.js";
+import { lastOp, removalWithCode } from "./stores/admin-ops.js";
 import {
   buildEntries,
   openServers,
@@ -209,14 +212,20 @@ export function withReloadServers(list: SavedServer[]): SavedServer[] {
 /** How a connect signs in to a relay account (account.rs `AccountArgs`). */
 export interface AccountSignIn {
   /** "device": with the key this device got at an earlier sign-in. "reset":
-   *  a new password with the recovery key, which ends in `RESET_DONE`. */
-  mode: "login" | "register" | "device" | "reset";
+   *  a new password with the recovery key, which ends in `RESET_DONE`.
+   *  "provider": back from a provider's page, with the relay's ticket. */
+  mode: "login" | "register" | "device" | "reset" | "provider";
+  ticket?: number[];
   password?: string;
   /** A sign-up invite code, where the relay wants one. */
   invite?: string | null;
   /** The recovery key as it was shown, for "reset". */
   recovery?: string;
 }
+
+/** What a provider's sign-in ends with when the person chose their password
+ *  (account.rs `USE_PASSWORD`); the name follows. */
+export const USE_PASSWORD = "Sign in with your password: ";
 
 /** What a reset ends with (account.rs `RESET_DONE`): sign in with the new password. */
 export const RESET_DONE = "Your password was reset. Sign in with the new one.";
@@ -267,7 +276,8 @@ export async function connectTo(
   // takes the tag last used, or a new one, and keeps it. An account's name
   // has no tag: the account is what tells it apart.
   const { name, tag } = account ? { name: request.username.trim(), tag: "" } : splitName(request.username.trim());
-  if (!host.trim() || !name.trim()) return { ok: false, error: "Please fill in all fields" };
+  // A provider's sign-in has no name yet: its answer decides the account.
+  if (!host.trim() || (!name.trim() && account?.mode !== "provider")) return { ok: false, error: "Please fill in all fields" };
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     return { ok: false, error: "Port must be between 1 and 65535" };
   }
@@ -279,7 +289,7 @@ export async function connectTo(
     return { ok: true, server, userId: get(userId.peek(server)) };
   }
 
-  const asked = account ? name : withTag(name, tag || splitName(get(lastUsername)).tag);
+  let asked = account ? name : withTag(name, tag || splitName(get(lastUsername)).tag);
   let actual = asked;
   details.set(server, { host, port, username: actual, asked, acceptSelfSigned: selfSigned, account: !!account });
   // Open before the invoke, not after: the channel list arrives from the
@@ -287,6 +297,7 @@ export async function connectTo(
   // returns, and `listenServer` drops events for servers that are not open.
   openServers.update((list) => [...list, server]);
   connectionState.of(server).set("connecting");
+  loadGuestBlocks(server);
 
   let id: number;
   for (let tries = 0; ; tries++) {
@@ -296,7 +307,9 @@ export async function connectTo(
         username: actual,
         acceptInvalidCerts: selfSigned,
         account: account
-          ? { kind: account.mode, password: account.password ?? "", invite: account.invite ?? null, recovery: account.recovery ?? null }
+          ? account.mode === "provider"
+            ? { kind: "provider", ticket: account.ticket ?? [], invite: account.invite ?? null }
+            : { kind: account.mode, password: account.password ?? "", invite: account.invite ?? null, recovery: account.recovery ?? null }
           : null,
       });
       break;
@@ -327,6 +340,11 @@ export async function connectTo(
     return { ok: false, error: "Disconnected" };
   }
 
+  // A provider's sign-in only knows now who it is, and a reconnect goes by the name
+  if (account?.mode === "provider") {
+    asked = actual = get(signedInAccount.peek(server))?.name ?? actual;
+    details.set(server, { host, port, username: actual, asked, acceptSelfSigned: selfSigned, account: true });
+  }
   userId.of(server).set(id);
   username.of(server).set(actual);
   acceptSelfSigned.of(server).set(selfSigned);
@@ -433,7 +451,8 @@ export async function saveOpenServers(): Promise<void> {
 
 /**
  * Forget what a connection held, keeping the server open: everything in a
- * scoped store, its unread counts, and the call if it was this server's.
+ * scoped store but one made `kept`, its unread counts, and the call if it was
+ * this server's.
  *
  * A channel id or a user id is a slot in one server's run — a reconnect may
  * land on a restarted server where the numbers have been handed out again — so
@@ -441,8 +460,13 @@ export async function saveOpenServers(): Promise<void> {
  */
 export function resetServer(server: string): void {
   clearRosters(server);
+  clearProfiles(server);
   dropEmotes(server);
   dropServer(server);
+  // Not scoped, and as much the connection's: what they name gets no answer now, and a later
+  // refusal must not bring it back
+  lastOp.delete(server);
+  removalWithCode.delete(server);
   dropPrompts(server);
   clearServerUnread(server);
   if (get(voice)?.server === server) voice.set(null);
@@ -455,6 +479,9 @@ function removeServer(server: string): void {
   reconnectRuns.delete(server);
   releaseBrowserMarks(server);
   resetServer(server);
+  dropKept(server);
+  // The bot's token goes with the wizard that holds it. A cut keeps both, for a run to go on
+  invoke("import_forget", { server }).catch(() => {});
   details.delete(server);
   // What it sent can no longer be answered: its connection is gone
   pendingInvites.update((list) => list.filter((i) => i.server !== server));
@@ -616,6 +643,7 @@ async function reconnectLoop(
       // Registered before connecting: the server sends the channel list while
       // logging us in, so it can be here before `connect` has resolved.
       const listArrived = nextChannelList(server);
+      loadGuestBlocks(server);
       const id = await invoke<number>("connect", {
         address: server,
         username: d.username,
