@@ -13744,6 +13744,8 @@ mod providers {
 
             let (mut seen, mut before, mut pages) = (Vec::new(), String::new(), Vec::new());
             loop {
+                // A release build asks faster than the relay's limit on one connection
+                tokio::time::sleep(Duration::from_millis(25)).await;
                 let reply = asks(&mut ann, fetch_of(id, &before)).await;
                 let frame = ServerMessage::Account(reply.clone());
                 voipc_protocol::codec::encode_server_msg(&frame).expect("fits");

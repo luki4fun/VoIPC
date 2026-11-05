@@ -260,8 +260,9 @@ run_browser alice talker "&channel=e2e&textchannel=e2e-text&dm=bob&admin=e2e-adm
 # the channel, alice is the late joiner who gets the empty history, and the only
 # check that fails is the one that names neither cause ("bob joined via the
 # invite link" passes on a channel he created himself).
-# alice logs early-chat-sent once her message is in her own history.
-for _ in $(seq 1 300); do
+# alice logs early-chat-sent once her message is in her own history. With UDP blocked she
+# gives up on QUIC first, which took a cold runner over 30 s.
+for _ in $(seq 1 900); do
   if grep -q 'SELFTEST early-chat-sent' "$WORK/alice.log"; then break; fi
   sleep 0.1
 done

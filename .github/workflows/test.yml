@@ -402,11 +402,12 @@ jobs:
           for name in tests community moderation move; do
             PGPASSWORD=voipc createdb -h 127.0.0.1 -U voipc "$name"
           done
-      # --release: `npm run web` has built every dependency that way already
+      # --release: `npm run web` has built every dependency that way already. Only the tests
+      # that take a second database: all the others stay on SQLite whatever this says.
       - name: Accounts tests on Postgres
         if: matrix.part == 'postgres'
         timeout-minutes: 15
-        run: bash tools/ci-run.sh "accounts tests on Postgres" cargo test --release --locked -p voipc-server --bin voipc-server
+        run: bash tools/ci-run.sh "accounts tests on Postgres" cargo test --release --locked -p voipc-server --bin voipc-server -- moderator_group accounts::placeholder::tests
         env: { VOIPC_SELFTEST: '1', VOIPC_TEST_POSTGRES: 'postgres://voipc:voipc@127.0.0.1:5432/tests' }
       - name: Community lane on Postgres
         if: ${{ !cancelled() && matrix.part == 'postgres' }}
