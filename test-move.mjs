@@ -375,9 +375,12 @@ const pickBy = (tab, selector, value) =>
 /** The relay's page, up to the sign-in form: a browser just started can take two goes. */
 async function reachDialog(tab, path = "/", port = PORT) {
   const shown = `document.querySelector(".skip-link") || document.querySelector(".connect-btn")`;
+  const before = tab.errors.length;
   await tab.send("Page.navigate", { url: `https://127.0.0.1:${port}${path}` });
   if (await seen(tab, shown, 25_000)) return;
   await tab.send("Page.navigate", { url: `https://127.0.0.1:${port}${path}` });
+  // The load given up on dies mid-fetch, and says so: that is this lane's doing, not the page's
+  tab.errors.splice(before);
   await waitFor(tab, shown, 60_000);
 }
 async function pastAudioStep(tab) {
@@ -1102,7 +1105,10 @@ async function lane() {
   check("gone from those still to sign in", await seen(ann, `![...document.querySelectorAll(".waiting-row .row-name")].some((n) => n.textContent === ${JSON.stringify(heldName)})`), heldName);
   await mouse(ann, `document.querySelector(".excluded-row .let-back")`, "Let back in");
   check("let back in", await seen(ann, `!document.querySelector(".excluded-row")`), await panelText(ann));
-  // bea by her id: rows of one second stand in the order of their random account ids, and frank's posts are for further down
+  // bea by her id: rows of one second stand in the order of their random account ids, and frank's posts are for further down.
+  // If she was the one held, her row is back only once the list has come again.
+  const beaRow = `[...document.querySelectorAll(".waiting-row")].find((r) => r.textContent.includes("1190000000000001003"))`;
+  await waitFor(ann, `!!${beaRow}`, 30_000);
   await mouse(ann, `[...document.querySelectorAll(".waiting-row")].find((r) => r.textContent.includes("1190000000000001003")).querySelector(".move-leave")`, "bea's Leave out");
   await confirmDialog(ann, "Leave out and delete");
   check("left out: says their posts go", await seen(ann, byText(".excluded-row .row-meta", "Left out")), await panelText(ann));

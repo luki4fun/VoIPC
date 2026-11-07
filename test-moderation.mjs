@@ -203,9 +203,12 @@ const totpAt = (b32, step) => {
 /** The relay's page up. A browser just started on a busy runner can leave its first page blank. */
 async function reachDialog(tab) {
   const shown = `document.querySelector(".skip-link") || document.querySelector(".connect-btn")`;
+  const before = tab.errors.length;
   await tab.send("Page.navigate", { url: `${ORIGIN}/` });
   if (await waitFor(tab, shown).then(() => true, () => false)) return;
   await tab.send("Page.navigate", { url: `${ORIGIN}/` });
+  // The load given up on dies mid-fetch, and says so: that is this lane's doing, not the page's
+  tab.errors.splice(before);
   await waitFor(tab, shown, 60_000);
 }
 
