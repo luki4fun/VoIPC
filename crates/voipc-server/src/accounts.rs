@@ -37,7 +37,7 @@ use voipc_protocol::messages::{
 };
 use voipc_protocol::types::{
     AccountInfo, AccountStart, ChatMod, PowChallenge, PreKeyBundleData, Registration,
-    RelayAccounts, ReportTaker, VaultBlob,
+    RelayAccounts, ReportTaker, VaultBlob, PIN_PAGES,
 };
 
 use crate::config::{AccountsConfig, AccountsMode, RegistrationMode};
@@ -57,6 +57,7 @@ pub const CHANNELS: &str = "voipc:channels";
 pub const PROFILES: &str = "voipc:profiles";
 pub const MENTION_ALL: &str = "voipc:mention_all";
 pub const EMOTES: &str = "voipc:emotes";
+pub use voipc_protocol::types::SHARE_HISTORY;
 const APP_SCOPES: &[ScopeDef] = &[
     ScopeDef {
         name: MENTION_ALL,
@@ -102,6 +103,10 @@ const APP_SCOPES: &[ScopeDef] = &[
     ScopeDef {
         name: EMOTES,
         description: "Add, rename and remove the server's emotes and stickers",
+    },
+    ScopeDef {
+        name: SHARE_HISTORY,
+        description: "Share your own history with newcomers, once you turn that on",
     },
 ];
 /// Before 1.7, the moderator's one scope: what it became. Frozen: a group from
@@ -179,6 +184,10 @@ const VAULT_MAX_BYTES: usize = 48 * 1024;
 /// frame, so it must fit in one with every item's framing (about 80 bytes
 /// each at most) on top.
 const VAULT_TOTAL_BYTES: usize = 56 * 1024;
+/// Pins past what that frame holds (`pins.N`), each page a vault item at most, asked for
+/// one at a time after sign-in.
+pub(crate) const PINS_NS: &str = "voipc.pins";
+const PINS_TOTAL_BYTES: usize = PIN_PAGES as usize * VAULT_MAX_BYTES;
 
 /// The derived secret is 32 bytes; l4f stores it as if it were a password.
 const SECRET_LEN: usize = 32;
@@ -232,6 +241,8 @@ pub mod archive;
 pub mod bans;
 pub mod gates;
 pub mod import;
+#[cfg(test)]
+mod kept_sync_tests;
 pub mod layout;
 pub mod links;
 pub mod log;
@@ -317,9 +328,25 @@ impl Host for RelayHost {
                 }
             }};
         }
+        // Rows naming them that only the sweep can reach (`log::sweep_tombstones`)
+        macro_rules! stone {
+            ($c:expr) => {
+                sqlx::query("INSERT INTO voipc_tombstones (account, at) VALUES ($1, $2) ON CONFLICT DO NOTHING")
+                    .bind(&user.0[..])
+                    .bind(util::now())
+                    .execute(&mut *$c)
+                    .await?
+            };
+        }
         match tx {
-            StoreConn::Pg(c) => keep_them_out!(c),
-            StoreConn::Lite(c) => keep_them_out!(c),
+            StoreConn::Pg(c) => {
+                keep_them_out!(&mut *c);
+                stone!(c);
+            }
+            StoreConn::Lite(c) => {
+                keep_them_out!(&mut *c);
+                stone!(c);
+            }
         }
         Ok(())
     }
@@ -335,6 +362,12 @@ pub struct Relay {
     pub quota: i64,
     /// The longest a stored message is kept.
     pub retention_ms: i64,
+    /// How many messages a channel keeps at most.
+    pub kept_window: i64,
+    /// How many accounts a channel keeps messages for; 0 for no limit.
+    pub kept_seats: i64,
+    /// What each account that posted lately has left under `quota`, and when it was counted.
+    pub kept_room: DashMap<[u8; 16], (i64, i64)>,
     /// How long the moderation log keeps a row.
     pub modlog_days: u32,
     /// How long an account the move made waits for someone to open it. 0: for good.
@@ -346,6 +379,9 @@ pub struct Relay {
     pub archive_days: u32,
     /// What people said about the archive's rows (`archive::load`).
     archive_wishes: std::sync::RwLock<Arc<archive::Wishes>>,
+    /// Which Discord channels hold rows, and when that was read (`archive::channels`).
+    archive_held:
+        tokio::sync::Mutex<Option<(std::time::Instant, Arc<std::collections::HashSet<i64>>)>>,
     /// Something in the archive is to go: `archive::tidy` looks now.
     pub(crate) archive_kick: tokio::sync::Notify,
     /// Searches of the archive at once, whatever the number of members.
@@ -443,6 +479,13 @@ impl Relay {
             cfg: Arc::new(l4f_config(cfg, relay_id)),
             store: store.clone(),
         };
+        // l4f seeds `user` with what `default_user_scopes` names, on a database with no such
+        // row. Here that list says what needs no codes, so the row is made first, empty.
+        // It never regrows (l4f: builtin_roles_are_seeded_once_and_never_regrow).
+        store
+            .ensure_builtin_roles(&[])
+            .await
+            .context("built-in groups")?;
         let accounts = Accounts::build(
             store.clone(),
             keys,
@@ -462,11 +505,15 @@ impl Relay {
             cloud: cfg.cloud,
             quota: i64::from(cfg.quota_mb) * 1024 * 1024,
             retention_ms: i64::from(cfg.retention_days) * 86_400_000,
+            kept_window: i64::from(cfg.kept_window.max(1)),
+            kept_seats: i64::from(cfg.kept_seats),
+            kept_room: DashMap::new(),
             modlog_days: cfg.modlog_days,
             unclaimed_days: cfg.unclaimed_days,
             imported_groups: DashMap::new(),
             archive_days: cfg.archive_days,
             archive_wishes: std::sync::RwLock::default(),
+            archive_held: tokio::sync::Mutex::default(),
             archive_kick: tokio::sync::Notify::new(),
             archive_searches: Semaphore::new(archive::SEARCHES),
             pending: Arc::new(Semaphore::new(PENDING_SIGN_INS)),
@@ -577,7 +624,39 @@ impl Relay {
             .collect())
     }
 
-    /// One vault item, compare-and-set on `expect` (0 = new).
+    /// One page of an account's pins.
+    pub async fn vault_page(&self, user: AccountId, k: &str) -> Result<AccountReply> {
+        if !is_pin_page(k) {
+            return Ok(refused("VaultPage", "No such page."));
+        }
+        let blob = self
+            .store()
+            .blob(user, PINS_NS, k)
+            .await?
+            .map(|b| VaultBlob {
+                k: b.k,
+                v: b.v,
+                version: b.version,
+            });
+        Ok(AccountReply::VaultPageFound {
+            k: k.to_string(),
+            blob,
+        })
+    }
+
+    /// What an account holds in `ns`. l4f adds up all of an account's blobs against the
+    /// quota it is handed, and each namespace here has a bound of its own.
+    async fn blob_bytes(&self, user: AccountId, ns: &str) -> Result<i64> {
+        Ok(db!(self.store(), pool => {
+            sqlx::query_scalar("SELECT CAST(COALESCE(SUM(LENGTH(v)), 0) AS BIGINT) FROM acct_blobs WHERE user_id = $1 AND ns = $2")
+                .bind(&user.0[..])
+                .bind(ns)
+                .fetch_one(pool)
+                .await?
+        }))
+    }
+
+    /// One vault item or page of pins, compare-and-set on `expect` (0 = new).
     pub async fn vault_put(
         &self,
         user: AccountId,
@@ -598,22 +677,25 @@ impl Relay {
             ));
         }
         // The count and the size are checked inside the write's transaction, so
-        // two writes at once cannot both pass. The vault is all an account
-        // keeps in l4f's storage, so its total is the quota there.
-        let quota = self.quota.min(VAULT_TOTAL_BYTES as i64);
+        // two writes at once cannot both pass. The vault and the pins are all an
+        // account keeps in l4f's storage, each with its own total there, and the pins'
+        // leave room in the quota for a vault at its fullest: a password change writes
+        // there under the quota alone.
+        let (ns, other, max_items, room) = if k.starts_with("pins.") {
+            if !is_pin_page(k) {
+                return Ok(refused("VaultPut", "No such page."));
+            }
+            let room = (self.quota - VAULT_TOTAL_BYTES as i64).clamp(0, PINS_TOTAL_BYTES as i64);
+            (PINS_NS, VAULT_NS, i64::from(PIN_PAGES), room)
+        } else {
+            let room = self.quota.min(VAULT_TOTAL_BYTES as i64);
+            (VAULT_NS, PINS_NS, VAULT_MAX_ITEMS, room)
+        };
+        let quota = room + self.blob_bytes(user, other).await?;
         Ok(
             match self
                 .store()
-                .put_blob_limited(
-                    user,
-                    VAULT_NS,
-                    k,
-                    v,
-                    expect,
-                    quota,
-                    Some(VAULT_MAX_ITEMS),
-                    false,
-                )
+                .put_blob_limited(user, ns, k, v, expect, quota, Some(max_items), false)
                 .await?
             {
                 PutLimited::Put(PutBlob::Done(version)) => AccountReply::VaultStored {
@@ -621,15 +703,11 @@ impl Relay {
                     version,
                 },
                 PutLimited::Put(PutBlob::Conflict) => {
-                    let blob = self
-                        .store()
-                        .blob(user, VAULT_NS, k)
-                        .await?
-                        .map(|b| VaultBlob {
-                            k: b.k,
-                            v: b.v,
-                            version: b.version,
-                        });
+                    let blob = self.store().blob(user, ns, k).await?.map(|b| VaultBlob {
+                        k: b.k,
+                        v: b.v,
+                        version: b.version,
+                    });
                     AccountReply::VaultConflict {
                         k: k.to_string(),
                         blob,
@@ -841,8 +919,9 @@ pub(crate) fn l4f_config(cfg: &AccountsConfig, relay_id: [u8; 16]) -> Config {
         // session ends with it; these only bound a session a crash left behind.
         session_idle_days: 30,
         session_max_days: 90,
-        // Nothing is free of the second-factor rule but having no role at all.
-        default_user_scopes: Vec::new(),
+        // What needs no codes, not what every account holds (`Relay::open_with` seeds
+        // `user` empty). Sharing history reaches no one: the password opened it already.
+        default_user_scopes: vec![SHARE_HISTORY.to_string()],
         require_2fa_for_privileged: true,
         signup,
         // Every new device signs in with the password once: a LAN party does
@@ -921,6 +1000,13 @@ fn redact(url: &str) -> String {
         (Some((scheme, _)), Some(at)) => format!("{scheme}://…{}{query}", &base[at..]),
         _ => format!("{base}{query}"),
     }
+}
+
+/// `pins.0` to `pins.55`, written one way, so one page has one name.
+fn is_pin_page(k: &str) -> bool {
+    k.strip_prefix("pins.")
+        .and_then(|n| n.parse::<u16>().ok().filter(|n| k == format!("pins.{n}")))
+        .is_some_and(|n| n < PIN_PAGES)
 }
 
 fn vault_item_ok(k: &str, v: &[u8]) -> Result<(), &'static str> {
@@ -1815,6 +1901,9 @@ async fn delete_account(
             }
             e => e.message().to_string(),
         })?;
+    if let Err(e) = log::walk(relay.store(), &user.id.0).await {
+        warn!("marking a deleted account's rows: {e:#}");
+    }
     // `Host::delete_user` left them out for good: a frame coming now must know, and no
     // reader gets what they wrote from here on
     if let Err(e) = archive::load(relay).await {
@@ -1962,6 +2051,15 @@ pub async fn handle_request(
             | AccountRequest::LogKeys { .. }
             | AccountRequest::LogIndex
             | AccountRequest::ArchiveFetch { .. }
+            | AccountRequest::ArchiveChannels
+            | AccountRequest::LogMemberIds { .. }
+            | AccountRequest::ChainFetch { .. }
+            | AccountRequest::WrapsPage { .. }
+            | AccountRequest::OwnChains { .. }
+            | AccountRequest::OwnBuckets { .. }
+            | AccountRequest::BucketLists { .. }
+            | AccountRequest::OwnChainRows { .. }
+            | AccountRequest::VaultPage { .. }
     );
     let searches = matches!(req, AccountRequest::ArchiveSearch { .. });
     let allowed = state.sessions.get_mut(&session_id).is_some_and(|mut s| {
@@ -2085,6 +2183,7 @@ pub async fn handle_request(
         AccountRequest::VaultPut { k, v, expect } => {
             relay.vault_put(user.id, &k, &v, expect).await?
         }
+        AccountRequest::VaultPage { k } => relay.vault_page(user.id, &k).await?,
         AccountRequest::ProviderList => provider::list(&relay, &user).await?,
         AccountRequest::ProviderStart {
             kind,
@@ -2189,12 +2288,7 @@ pub async fn handle_request(
             {
                 Ok(()) => {
                     crate::session::send_msg(tx, &reply(AccountReply::AccountDeleted))?;
-                    crate::session::force_disconnect(
-                        state,
-                        session_id,
-                        "Your account was deleted.",
-                    )
-                    .await;
+                    crate::session::eject(state, session_id, "Your account was deleted.").await;
                     return Ok(());
                 }
                 Err(reason) => refused("DeleteAccount", &reason),
@@ -2270,8 +2364,23 @@ pub async fn handle_request(
             ttl_secs,
         } => match kept_post_ok(state, session_id, &conv).await {
             Err(reason) => refused("LogAppend", &reason),
-            Ok(()) => {
+            Ok(channel) => {
                 let out = log::append(&relay, user.id, &conv, epoch, &ct, ttl_secs).await?;
+                // Slow mode's clock starts with what was filed. A `ChainRekey` filed nothing
+                // and the same post comes straight back; two connections at once can each
+                // get one through, which the clock is not there to stop.
+                if let (AccountReply::LogAppended { .. }, Some((user_id, channel_id))) =
+                    (&out, channel)
+                {
+                    let _ = state
+                        .post_rules(
+                            session_id,
+                            user_id,
+                            channel_id,
+                            crate::state::PostStamp::Kept,
+                        )
+                        .await;
+                }
                 // The other party, if online, reads it now: a live copy that
                 // missed them (they just reloaded, or sit on no list the
                 // writer sees) has nothing else to bring it before their next
@@ -2316,6 +2425,107 @@ pub async fn handle_request(
             }
             out
         }
+        AccountRequest::LogJoinMany { convs } => {
+            let user_id = state.sessions.get(&session_id).map(|s| s.user_id);
+            let here: std::collections::HashSet<String> = match user_id {
+                Some(uid) => state
+                    .channels
+                    .read()
+                    .await
+                    .values()
+                    .filter(|c| !c.info.log.is_empty() && c.members.contains(&uid))
+                    .map(|c| c.info.log.clone())
+                    .collect(),
+                None => Default::default(),
+            };
+            let present: Vec<bool> = convs.iter().map(|c| here.contains(c)).collect();
+            let (out, told) = log::join_many(&relay, user.id, &convs, &present).await?;
+            for (conv, owners) in told {
+                for o in owners {
+                    tell(
+                        state,
+                        &o,
+                        AccountReply::LogPending {
+                            conv: conv.clone(),
+                            joiners: vec![user.id.0],
+                        },
+                    )
+                    .await;
+                }
+            }
+            out
+        }
+        AccountRequest::ChainPut {
+            conv,
+            epoch,
+            self_wrap,
+            step,
+            link,
+            wraps,
+            buckets,
+            seals,
+            last,
+        } => {
+            let sharing = state
+                .sessions
+                .get(&session_id)
+                .map(|s| log::Sharing {
+                    shares: s.shares_history,
+                    may: holds_share_history(&s),
+                })
+                .unwrap_or(log::Sharing {
+                    shares: false,
+                    may: false,
+                });
+            let frame = log::ChainFrame {
+                epoch,
+                self_wrap,
+                step,
+                link,
+                wraps,
+                buckets,
+                seals,
+                last,
+            };
+            let (out, told) = log::chain_put(&relay, user.id, &conv, frame, sharing).await?;
+            for r in told {
+                tell(state, &r, AccountReply::LogNews { conv: conv.clone() }).await;
+            }
+            out
+        }
+        AccountRequest::LogMemberIds { conv, after } => {
+            log::member_ids(&relay, user.id, &conv, after)
+                .await
+                .unwrap_or_else(|e| read_failed("LogMemberIds", e))
+        }
+        AccountRequest::ChainFetch { conv, after } => {
+            log::chain_fetch(&relay, user.id, &conv, after)
+                .await
+                .unwrap_or_else(|e| read_failed("ChainFetch", e))
+        }
+        AccountRequest::WrapsPage { conv, asks } => log::wraps_page(&relay, user.id, &conv, &asks)
+            .await
+            .unwrap_or_else(|e| read_failed("WrapsPage", e)),
+        AccountRequest::OwnChains { conv, before } => {
+            log::own_chains(&relay, user.id, &conv, before)
+                .await
+                .unwrap_or_else(|e| read_failed("OwnChains", e))
+        }
+        AccountRequest::OwnBuckets { conv, after } => {
+            log::own_buckets(&relay, user.id, &conv, after)
+                .await
+                .unwrap_or_else(|e| read_failed("OwnBuckets", e))
+        }
+        AccountRequest::BucketLists { conv, wanted } => {
+            log::bucket_lists(&relay, user.id, &conv, &wanted)
+                .await
+                .unwrap_or_else(|e| read_failed("BucketLists", e))
+        }
+        AccountRequest::OwnChainRows { conv, chain, after } => {
+            log::own_chain_rows(&relay, user.id, &conv, chain, after)
+                .await
+                .unwrap_or_else(|e| read_failed("OwnChainRows", e))
+        }
         AccountRequest::LogLeave { conv } => log::leave(&relay, user.id, &conv).await?,
         AccountRequest::LogMembers { conv } => log::members_of(&relay, user.id, &conv)
             .await
@@ -2352,6 +2562,9 @@ pub async fn handle_request(
                 .await
                 .unwrap_or_else(|e| read_failed("ArchiveMine", e))
         }
+        AccountRequest::ArchiveChannels => archive::channels(state, &relay, session_id)
+            .await
+            .unwrap_or_else(|e| read_failed("ArchiveChannels", e)),
     };
     crate::session::send_msg(tx, &reply(out))
 }
@@ -2362,7 +2575,13 @@ pub async fn handle_request(
 /// conversation has its two parties, which `log::append` checks; a copy there
 /// carries the writer's account, so none is kept behind a pseudonym, where the
 /// live message goes out under the alias and the copy would tie the two.
-async fn kept_post_ok(state: &ServerState, session_id: u32, conv: &str) -> Result<(), String> {
+///
+/// Starts no clock. For a channel, says whose and where, so the caller can once it is filed.
+async fn kept_post_ok(
+    state: &ServerState,
+    session_id: u32,
+    conv: &str,
+) -> Result<Option<(u32, u32)>, String> {
     let user_id = state
         .sessions
         .get(&session_id)
@@ -2379,25 +2598,31 @@ async fn kept_post_ok(state: &ServerState, session_id: u32, conv: &str) -> Resul
         {
             return Err(crate::restrict::DIRECT_HELD.into());
         }
-        return Ok(());
+        return Ok(None);
     }
     let channel_id = {
         let channels = state.channels.read().await;
         channels
             .iter()
-            .find(|(_, c)| !c.info.log.is_empty() && c.info.log == conv)
+            .find(|(_, c)| {
+                !c.info.log.is_empty()
+                    && c.info.log == conv
+                    && state.passes(session_id, &c.gate.groups)
+            })
             .map(|(id, _)| *id)
     };
-    // An anonymous channel, or one hiding its members, offers no log.
+    // An anonymous channel, or one hiding its members, offers no log; nor does one outside
+    // its gate, in the same words.
     let channel_id = channel_id.ok_or("That channel keeps no messages.")?;
     state
         .post_rules(
             session_id,
             user_id,
             channel_id,
-            crate::state::PostStamp::Kept,
+            crate::state::PostStamp::KeptCheck,
         )
-        .await
+        .await?;
+    Ok(Some((user_id, channel_id)))
 }
 
 /// The account behind `session_id` leaves `channel_id`'s log: kicked from
@@ -2406,6 +2631,16 @@ async fn kept_post_ok(state: &ServerState, session_id: u32, conv: &str) -> Resul
 /// on is not for them. Moving between voice channels keeps a log; "Stop
 /// keeping this channel" (`LogLeave`) ends it there.
 pub async fn out_of_log(state: &ServerState, channel_id: u32, session_id: u32) {
+    leave_log(state, channel_id, session_id, true).await;
+}
+
+/// `out_of_log` for someone a gate put out, who waits for nothing to come back
+/// (`log::unseat`).
+pub async fn gated_out_of_log(state: &ServerState, channel_id: u32, session_id: u32) {
+    leave_log(state, channel_id, session_id, false).await;
+}
+
+async fn leave_log(state: &ServerState, channel_id: u32, session_id: u32, waits: bool) {
     let Some(relay) = state.accounts.as_ref() else {
         return;
     };
@@ -2426,7 +2661,12 @@ pub async fn out_of_log(state: &ServerState, channel_id: u32, session_id: u32) {
     if conv.is_empty() {
         return;
     }
-    if let Err(e) = log::remove(relay.store(), &conv, &account).await {
+    let out = if waits {
+        log::remove(relay.store(), &conv, &account).await
+    } else {
+        log::unseat(relay.store(), &conv, &account).await
+    };
+    if let Err(e) = out {
         warn!("log membership after a kick: {e}");
     }
 }
@@ -2596,12 +2836,8 @@ pub async fn revalidate(state: &Arc<ServerState>) {
                     .get(&session_id)
                     .and_then(|s| s.account.as_ref().map(|a| a.token.clone()));
                 if current.as_deref() == Some(token.as_str()) {
-                    crate::session::force_disconnect(
-                        state,
-                        session_id,
-                        "You were signed out of this server.",
-                    )
-                    .await;
+                    crate::session::eject(state, session_id, "You were signed out of this server.")
+                        .await;
                 }
             }
             Ok(Some((user, _, now))) => {
@@ -2629,18 +2865,38 @@ pub async fn revalidate(state: &Arc<ServerState>) {
     }
     // Holders who are not here too: a stored hide is read against them
     refresh_chat_mods(state).await;
+    // And the share flag of someone away, whose session cannot clear it
+    if let Err(e) = log::recheck_shares(&relay).await {
+        warn!("rechecking who shares: {e:#}");
+    }
 }
 
 /// The session's powers as `scopes` say, and the account told. A change of
 /// groups reaches what they see and where they may be (`gates`), one of
 /// badges or privileges the rosters showing them.
 /// Holds power over others, which spares it from a kick and an address ban.
-/// Calling on everybody, taking reports and reading the log act on nobody: a
-/// helper holding only those can still be kicked.
+/// Calling on everybody, taking reports, reading the log and sharing history act
+/// on nobody: a helper holding only those can still be kicked.
 pub fn holds_power(scopes: &[String]) -> bool {
     scopes
         .iter()
-        .any(|s| ![MENTION_ALL, REPORTS, MODLOG].contains(&s.as_str()))
+        .any(|s| ![MENTION_ALL, REPORTS, MODLOG, SHARE_HISTORY].contains(&s.as_str()))
+}
+
+/// What counts when asking "holds no more than I do": someone who shares is no harder
+/// to act on for it.
+pub(crate) fn without_share(scopes: &[String]) -> Vec<String> {
+    scopes
+        .iter()
+        .filter(|s| s.as_str() != SHARE_HISTORY)
+        .cloned()
+        .collect()
+}
+
+/// A group that gives nobody power over anyone: nothing, or only sharing what its
+/// holder already holds. May start a link, and sit on what the move made.
+pub(crate) fn no_power_over_anyone(scopes: &[String]) -> bool {
+    scopes.iter().all(|s| s == SHARE_HISTORY)
 }
 
 /// Whether this session's account may call on everybody.
@@ -2648,6 +2904,14 @@ pub fn holds_mention_power(s: &crate::state::UserSession) -> bool {
     s.account
         .as_ref()
         .is_some_and(|a| scope::allowed(&a.scopes, MENTION_ALL))
+}
+
+/// Whether this session's switch counts on a relay with accounts. A guest, or a token
+/// admin not signed in, holds no privileges.
+pub fn holds_share_history(s: &crate::state::UserSession) -> bool {
+    s.account
+        .as_ref()
+        .is_some_and(|a| scope::allowed(&a.scopes, SHARE_HISTORY))
 }
 
 /// Whether this session's account may hide messages.
@@ -2827,8 +3091,10 @@ pub(crate) async fn apply_scopes(
     read: u64,
 ) -> Result<()> {
     let info = relay.info_of(&user, &scopes).await?;
+    let account = info.id;
     let standing = relay.standing(&user, &scopes).await?;
     let (my_badges, calls, called_before, editor_changed, listed_changed, reads_restrictions);
+    let stopped_sharing;
     let (tx, user_id, channel_id, is_admin, became_admin, regated, shown) = {
         let Some(mut s) = state.sessions.get_mut(&session_id) else {
             return Ok(());
@@ -2842,6 +3108,11 @@ pub(crate) async fn apply_scopes(
         let was_listed = (s.is_moderator, holds_hide(&s));
         let could_restrict = s.can(Powers::RESTRICT);
         s.set_scopes(user, scopes);
+        // The relay only ever clears this: only the client may ask for it
+        stopped_sharing = s.shares_history && !holds_share_history(&s);
+        if stopped_sharing {
+            s.shares_history = false;
+        }
         listed_changed = was_listed != (s.is_moderator, holds_hide(&s)) || s.is_admin != was_admin;
         reads_restrictions = s.can(Powers::RESTRICT) && !could_restrict;
         let mut old = Standing::default();
@@ -2875,6 +3146,14 @@ pub(crate) async fn apply_scopes(
         let data = encode_server_msg(&ServerMessage::MentionPower {
             user_ids: vec![user_id],
             on: calls,
+        })?;
+        state.broadcast_raw_to_all(&data).await;
+    }
+    if stopped_sharing {
+        log::set_shares(relay.store(), &account, false).await?;
+        let data = encode_server_msg(&ServerMessage::UserHistorySharing {
+            user_id,
+            enabled: false,
         })?;
         state.broadcast_raw_to_all(&data).await;
     }
@@ -3014,6 +3293,34 @@ mod tests {
         }
     }
 
+    /// The relay reads the right through `scope::allowed`, the app through
+    /// `may_share_history`. A wildcard they disagree on is a flag the relay refuses, or one
+    /// the app never asks for.
+    #[test]
+    fn the_two_readings_of_the_right_agree() {
+        use voipc_protocol::types::may_share_history;
+        for (grant, want) in [
+            ("*", true),
+            ("voipc:*", true),
+            (SHARE_HISTORY, true),
+            ("voipc:share_historyx", false),
+            ("voipcx:*", false),
+            ("voipc:share_history:*", false),
+            ("voipc:kick", false),
+            ("users:*", false),
+            ("voipc*", false),
+            ("", false),
+        ] {
+            let held = [grant.to_string()];
+            assert_eq!(scope::allowed(&held, SHARE_HISTORY), want, "relay: {grant}");
+            assert_eq!(
+                may_share_history(21, true, Some(&held)),
+                want,
+                "app: {grant}"
+            );
+        }
+    }
+
     /// `discord::FINE_SCOPES` is what ADMINISTRATOR comes to: all of them, one by one, and
     /// never `*`. A privilege added here and forgotten there fails this.
     #[test]
@@ -3024,9 +3331,12 @@ mod tests {
         let registered: BTreeSet<&str> = APP_SCOPES
             .iter()
             .map(|s| s.name)
+            .filter(|s| *s != SHARE_HISTORY)
             .chain(["users:read", "users:admin", "roles:admin"])
             .collect();
         assert_eq!(fine, registered);
+        // Only an admin applies this one: Discord's ADMINISTRATOR does not bring it
+        assert!(!FINE_SCOPES.contains(&SHARE_HISTORY));
         assert_eq!(fine.len(), FINE_SCOPES.len(), "each once");
         let held: Vec<String> = FINE_SCOPES.iter().map(|s| s.to_string()).collect();
         assert!(!is_star(&held), "all of them together are not `*`");
@@ -3358,10 +3668,819 @@ mod tests {
                     .await
                     .unwrap();
                 assert!(!log::has_key(&relay, &id.0).await.unwrap());
-                log::publish(&relay, id, &[1; 33], &[2; 64]).await.unwrap();
+                use voipc_crypto::log::LogKey;
+                let identity = voipc_crypto::generate_identity_key_pair();
+                relay
+                    .set_identity(id, &identity.identity_key().serialize())
+                    .await
+                    .unwrap();
+                let key = LogKey::generate();
+                assert!(matches!(
+                    log::publish(&relay, id, &key.public(), &key.endorse(&identity))
+                        .await
+                        .unwrap(),
+                    AccountReply::LogKeyStored
+                ));
                 assert!(log::has_key(&relay, &id.0).await.unwrap());
                 assert!(!log::has_key(&relay, &[8; 16]).await.unwrap());
             }
+        }
+
+        /// A page of pins, what counts them against the vault's bound, and what pages a
+        /// writer's joiners: every vault write runs through the first of these.
+        #[tokio::test]
+        async fn the_pin_pages_run_on_both_backends() {
+            let dbs = databases().await;
+            for store in &dbs.stores {
+                let cfg = AccountsConfig {
+                    mode: AccountsMode::Optional,
+                    ..Default::default()
+                };
+                let relay = Relay::open_with(&cfg, store.clone(), &[9u8; 32])
+                    .await
+                    .unwrap();
+                let id = AccountId([1; 16]);
+                relay
+                    .store()
+                    .create_user(
+                        &l4f_accounts::model::NewUser {
+                            id,
+                            username: "kim".into(),
+                            display_name: "kim".into(),
+                            email_pending: None,
+                            password_hash: None,
+                            created_at: 1,
+                        },
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                for k in ["pins.0", "item.prefs"] {
+                    assert!(matches!(
+                        relay.vault_put(id, k, &[1; 100], 0).await.unwrap(),
+                        AccountReply::VaultStored { version: 1, .. }
+                    ));
+                }
+                assert!(matches!(
+                    relay.vault_put(id, "pins.0", &[2; 100], 0).await.unwrap(),
+                    AccountReply::VaultConflict { blob: Some(_), .. }
+                ));
+                assert!(matches!(
+                    relay.vault_page(id, "pins.0").await.unwrap(),
+                    AccountReply::VaultPageFound { blob: Some(_), .. }
+                ));
+                assert_eq!(relay.vault(id).await.unwrap().len(), 1);
+                let (convs, pending) = log::index(&relay, id).await.unwrap();
+                assert!(matches!(convs, AccountReply::LogConvs { .. }));
+                assert!(pending.is_empty());
+                let (joined, _) = log::join(&relay, id, "c:lounge", true).await.unwrap();
+                assert!(matches!(joined, AccountReply::LogJoined { .. }));
+                assert!(matches!(
+                    log::members_of(&relay, id, "c:lounge").await.unwrap(),
+                    AccountReply::LogMembersFound { .. }
+                ));
+            }
+        }
+
+        async fn kept_relay(store: &Store, people: u8) -> Relay {
+            let cfg = AccountsConfig {
+                mode: AccountsMode::Optional,
+                ..Default::default()
+            };
+            let relay = Relay::open_with(&cfg, store.clone(), &[9u8; 32])
+                .await
+                .unwrap();
+            for n in 1..=people {
+                store
+                    .create_user(
+                        &l4f_accounts::model::NewUser {
+                            id: AccountId([n; 16]),
+                            username: format!("kept{n}"),
+                            display_name: format!("kept{n}"),
+                            email_pending: None,
+                            password_hash: None,
+                            created_at: 1,
+                        },
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }
+            relay
+        }
+
+        /// `writer`'s first chain in `conv`, with a seat and a row of its own to `reader`.
+        async fn chain_reaching(relay: &Relay, conv: &str, writer: AccountId, reader: [u8; 16]) {
+            use voipc_crypto::log::{OWN_ROW_BYTES, ROW_BYTES};
+            use voipc_protocol::messages::{BucketIn, ChainRow, ChainSeal, WrapIn};
+            let row = || vec![0xAB; ROW_BYTES];
+            let (out, _) = log::chain_put(
+                relay,
+                writer,
+                conv,
+                log::ChainFrame {
+                    epoch: 1 << 12,
+                    self_wrap: Some(row()),
+                    step: None,
+                    link: None,
+                    wraps: vec![ChainRow {
+                        recipient: reader,
+                        index: 0,
+                        wrapped: row(),
+                    }],
+                    buckets: vec![BucketIn {
+                        bucket: 9,
+                        version: 0,
+                        list: vec![1; 28 + 24],
+                        seats: vec![
+                            WrapIn {
+                                recipient: reader,
+                                wrapped: row(),
+                            },
+                            WrapIn {
+                                recipient: writer.0,
+                                wrapped: vec![0xEE; OWN_ROW_BYTES],
+                            },
+                        ],
+                        down: None,
+                    }],
+                    seals: vec![ChainSeal {
+                        bucket: 9,
+                        version: 0,
+                        index: 0,
+                        sealed: row(),
+                    }],
+                    last: true,
+                },
+                log::Sharing {
+                    shares: true,
+                    may: true,
+                },
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(out, AccountReply::ChainStored { behind: false, .. }),
+                "{out:?}"
+            );
+        }
+
+        /// A new log key's walk that dies leaves the key stored and rows under the old one
+        /// live. They do not stay: the mark brings it back at the next publish or sweep,
+        /// from where it stopped.
+        #[tokio::test]
+        async fn a_walk_that_died_is_finished_by_a_retry_and_by_the_sweep() {
+            use voipc_crypto::log::LogKey;
+            let dbs = databases().await;
+            for store in &dbs.stores {
+                let relay = kept_relay(store, 3).await;
+                let id = |n: u8| AccountId([n; 16]);
+                let (me, conv) = (id(1), "c:aa");
+                let identity = voipc_crypto::generate_identity_key_pair();
+                relay
+                    .set_identity(me, &identity.identity_key().serialize())
+                    .await
+                    .unwrap();
+                let publish = async |key: &LogKey| {
+                    log::publish(&relay, me, &key.public(), &key.endorse(&identity)).await
+                };
+                let stand = async || {
+                    raw(&relay, "UPDATE voipc_logkeys SET updated_at = 0")
+                        .await
+                        .unwrap();
+                };
+                let count = async |sql: &str| raw(&relay, sql).await.unwrap();
+                let first = LogKey::generate();
+                assert!(publish(&first).await.is_ok());
+                for who in [me, id(2), id(3)] {
+                    log::join(&relay, who, conv, true).await.unwrap();
+                }
+                chain_reaching(&relay, conv, id(2), me.0).await;
+                chain_reaching(&relay, conv, id(3), me.0).await;
+                let to_me = hex::encode(me.0);
+                let live_seats = format!(
+                    "SELECT COUNT(*) FROM voipc_seats WHERE dead = FALSE AND {}",
+                    recipient_is(store, &to_me)
+                );
+                let live_rows = format!(
+                    "SELECT COUNT(*) FROM voipc_chain_wraps WHERE dead = FALSE AND {}",
+                    recipient_is(store, &to_me)
+                );
+                assert_eq!(count(&live_seats).await, 2);
+                assert_eq!(count(&live_rows).await, 2);
+
+                // The walk's first statement fails: the key is stored, and the walk is owed
+                let second = LogKey::generate();
+                stand().await;
+                raw(&relay, "ALTER TABLE voipc_seats RENAME TO voipc_seats_away")
+                    .await
+                    .unwrap();
+                assert!(publish(&second).await.is_err());
+                raw(&relay, "ALTER TABLE voipc_seats_away RENAME TO voipc_seats")
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    count("SELECT COUNT(*) FROM voipc_logkeys WHERE walk_after = 0").await,
+                    1
+                );
+                assert_eq!(count(&live_seats).await, 2, "nothing done yet");
+
+                // The app's retry names the same key, so no change: the mark is what walks
+                assert!(matches!(
+                    publish(&second).await.unwrap(),
+                    AccountReply::LogKeyStored
+                ));
+                assert_eq!(count(&live_seats).await, 0);
+                assert_eq!(count(&live_rows).await, 0);
+                assert_eq!(
+                    count("SELECT COUNT(*) FROM voipc_logkeys WHERE walk_after IS NOT NULL").await,
+                    0,
+                    "the mark ends with the walk"
+                );
+
+                // Died past the first writer: the sweep takes it on from there, and what is
+                // behind that stays, since it may be under the new key by now.
+                raw(&relay, "UPDATE voipc_seats SET dead = FALSE")
+                    .await
+                    .unwrap();
+                raw(&relay, "UPDATE voipc_chain_wraps SET dead = FALSE")
+                    .await
+                    .unwrap();
+                let lowest = count("SELECT CAST(MIN(id) AS BIGINT) FROM voipc_writers").await;
+                raw(
+                    &relay,
+                    &format!("UPDATE voipc_logkeys SET walk_after = {lowest}"),
+                )
+                .await
+                .unwrap();
+                log::sweep(&relay).await.unwrap();
+                assert_eq!(count(&live_seats).await, 1);
+                assert_eq!(count(&live_rows).await, 1);
+                assert_eq!(
+                    count(&format!(
+                        "SELECT COUNT(*) FROM voipc_chain_wraps WHERE dead = FALSE AND writer = {lowest}"
+                    ))
+                    .await,
+                    1
+                );
+                assert_eq!(
+                    count("SELECT COUNT(*) FROM voipc_logkeys WHERE walk_after IS NOT NULL").await,
+                    0
+                );
+
+                // An ordinary change walks all of it, and leaves no mark
+                raw(&relay, "UPDATE voipc_seats SET dead = FALSE")
+                    .await
+                    .unwrap();
+                raw(&relay, "UPDATE voipc_chain_wraps SET dead = FALSE")
+                    .await
+                    .unwrap();
+                stand().await;
+                assert!(publish(&LogKey::generate()).await.is_ok());
+                assert_eq!(count(&live_seats).await, 0);
+                assert_eq!(
+                    count("SELECT COUNT(*) FROM voipc_logkeys WHERE walk_after IS NOT NULL").await,
+                    0
+                );
+            }
+        }
+
+        fn recipient_is(store: &Store, hex: &str) -> String {
+            match store {
+                Store::Pg(_) => format!("recipient = '\\x{hex}'"),
+                Store::Lite(_) => format!("recipient = X'{hex}'"),
+            }
+        }
+
+        /// Two chains can link down to one, a chain never finished and the one its writer
+        /// made instead. A reader holding the start of the second gets down past the first.
+        #[tokio::test]
+        async fn a_run_of_links_goes_past_a_chain_never_finished() {
+            use voipc_crypto::log::ROW_BYTES;
+            use voipc_protocol::messages::{ChainAsk, ChainRow};
+            let dbs = databases().await;
+            for store in &dbs.stores {
+                let relay = kept_relay(store, 2).await;
+                let (writer, reader, conv) = (AccountId([1; 16]), AccountId([2; 16]), "c:aa");
+                log::join(&relay, writer, conv, true).await.unwrap();
+                let row = || vec![0xAB; ROW_BYTES];
+                let put =
+                    async |chain: u32, link: Option<u32>, wraps: Vec<ChainRow>, last: bool| {
+                        let (out, _) = log::chain_put(
+                            &relay,
+                            writer,
+                            conv,
+                            log::ChainFrame {
+                                epoch: chain << 12,
+                                self_wrap: Some(row()),
+                                step: None,
+                                link: link.map(|older| (older, row())),
+                                wraps,
+                                buckets: vec![],
+                                seals: vec![],
+                                last,
+                            },
+                            log::Sharing {
+                                shares: true,
+                                may: true,
+                            },
+                        )
+                        .await
+                        .unwrap();
+                        assert!(
+                            matches!(out, AccountReply::ChainStored { behind: false, .. }),
+                            "{out:?}"
+                        );
+                    };
+                put(1, None, vec![], true).await;
+                log::join(&relay, reader, conv, true).await.unwrap();
+                // A crash: its last frame never comes, and it lasts up to the sweep's hour
+                put(2, Some(1), vec![], false).await;
+                put(
+                    3,
+                    Some(1),
+                    vec![ChainRow {
+                        recipient: reader.0,
+                        index: 0,
+                        wrapped: row(),
+                    }],
+                    true,
+                )
+                .await;
+                let asks = [ChainAsk {
+                    owner: writer.0,
+                    chain: 1,
+                    from: None,
+                }];
+                let out = log::wraps_page(&relay, reader, conv, &asks).await.unwrap();
+                let AccountReply::WrapsPage { keys, served, .. } = out else {
+                    panic!("{out:?}");
+                };
+                assert_eq!(served, 1);
+                let chains: Vec<u32> = keys.iter().map(|k| k.chain).collect();
+                assert_eq!(chains, [3, 1], "from the start it holds, down its link");
+                assert!(keys[0].direct.is_some() && keys[0].link.is_some());
+            }
+        }
+
+        /// Listing someone's direct conversations reads no channel's rows, and finds them
+        /// wherever the account's id falls in the conversation's name.
+        #[tokio::test]
+        async fn the_direct_conversations_read_keeps_out_of_channels_rows() {
+            let dbs = databases().await;
+            for store in &dbs.stores {
+                let relay = kept_relay(store, 4).await;
+                let id = |n: u8| AccountId([n; 16]);
+                let me = id(2);
+                for (who, conv) in [
+                    (id(1), voipc_protocol::conv::dm_conv(&id(1).0, &me.0)),
+                    (id(3), voipc_protocol::conv::dm_conv(&id(3).0, &me.0)),
+                    (id(1), voipc_protocol::conv::dm_conv(&id(1).0, &id(3).0)),
+                    (id(1), "c:aa".to_string()),
+                ] {
+                    db!(store, pool => {
+                        sqlx::query("INSERT INTO voipc_log (conv, sender, epoch, server_at, keep_until, ct) VALUES ($1, $2, 0, 1, 9007199254740991, $3)")
+                            .bind(&conv)
+                            .bind(&who.0[..])
+                            .bind(&[1u8; 8][..])
+                            .execute(pool)
+                            .await
+                            .unwrap();
+                    });
+                }
+                let (out, _) = log::index(&relay, me).await.unwrap();
+                let AccountReply::LogConvs { convs } = out else {
+                    panic!("{out:?}");
+                };
+                let names: Vec<&str> = convs.iter().map(|(c, _)| c.as_str()).collect();
+                assert_eq!(
+                    names,
+                    [
+                        voipc_protocol::conv::dm_conv(&id(1).0, &me.0),
+                        voipc_protocol::conv::dm_conv(&me.0, &id(3).0)
+                    ]
+                );
+                // Only SQLite's plan says so on a table this small
+                if let Store::Lite(b) = store {
+                    let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(
+                        format!("EXPLAIN QUERY PLAN {}", log::DIRECT_CONVS),
+                    ))
+                    .bind("d:aa:%")
+                    .bind("d:%:aa")
+                    .bind(0i64)
+                    .fetch_all(&b.0)
+                    .await
+                    .unwrap();
+                    assert!(
+                        plan.iter()
+                            .any(|p| p.3.contains("voipc_log_conv_seq (conv>? AND conv<?)")),
+                        "{plan:?}"
+                    );
+                    let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(
+                        "EXPLAIN QUERY PLAN SELECT SUM(LENGTH(wrapped)) FROM voipc_wraps WHERE owner = $1",
+                    )
+                    .bind(&me.0[..])
+                    .fetch_all(&b.0)
+                    .await
+                    .unwrap();
+                    assert!(
+                        plan.iter().any(|p| p.3.contains("voipc_wraps_owner")),
+                        "{plan:?}"
+                    );
+                }
+            }
+        }
+
+        /// Every statement of the kept path, once, with what comes back read in the types
+        /// the code reads: a column type wrong on one dialect fails only there, at run time.
+        #[tokio::test]
+        async fn the_kept_path_runs_on_both_backends() {
+            use voipc_crypto::log::{LogKey, OWN_ROW_BYTES, ROW_BYTES};
+            use voipc_protocol::messages::{BucketIn, ChainAsk, ChainRow, ChainSeal, WrapIn};
+            let row = || vec![0xAB; ROW_BYTES];
+            let frame = |epoch: u32, self_wrap: bool, last: bool| log::ChainFrame {
+                epoch,
+                self_wrap: self_wrap.then(row),
+                step: None,
+                link: None,
+                wraps: vec![],
+                buckets: vec![],
+                seals: vec![],
+                last,
+            };
+            let seal = |bucket: u64, version: u32, index: u32| ChainSeal {
+                bucket,
+                version,
+                index,
+                sealed: row(),
+            };
+            let bucket = |id: u64, version: u32, me: [u8; 16], seats: &[[u8; 16]]| BucketIn {
+                bucket: id,
+                version,
+                list: vec![1; 28 + 24 * seats.len()],
+                seats: seats
+                    .iter()
+                    .map(|r| WrapIn {
+                        recipient: *r,
+                        wrapped: row(),
+                    })
+                    .chain([WrapIn {
+                        recipient: me,
+                        wrapped: vec![0xEE; OWN_ROW_BYTES],
+                    }])
+                    .collect(),
+                down: None,
+            };
+            let dbs = databases().await;
+            for store in &dbs.stores {
+                let cfg = AccountsConfig {
+                    mode: AccountsMode::Optional,
+                    kept_window: 2,
+                    ..Default::default()
+                };
+                let relay = Relay::open_with(&cfg, store.clone(), &[9u8; 32])
+                    .await
+                    .unwrap();
+                let id = |n: u8| AccountId([n; 16]);
+                for n in 1..=5u8 {
+                    store
+                        .create_user(
+                            &l4f_accounts::model::NewUser {
+                                id: id(n),
+                                username: format!("kept{n}"),
+                                display_name: format!("kept{n}"),
+                                email_pending: None,
+                                password_hash: None,
+                                created_at: 1,
+                            },
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                }
+                let (a, b, c, d, e) = (id(1), id(2), id(3), id(4), id(5));
+                let conv = "c:aa";
+                let count = async |sql: &str| raw(&relay, sql).await.unwrap();
+                let may = || log::Sharing {
+                    shares: true,
+                    may: true,
+                };
+                for who in [a, b, c, d] {
+                    let (out, _) = log::join(&relay, who, conv, true).await.unwrap();
+                    assert!(matches!(out, AccountReply::LogJoined { .. }), "{out:?}");
+                }
+                let (out, _) = log::join_many(&relay, e, &[conv.to_string()], &[true])
+                    .await
+                    .unwrap();
+                assert!(matches!(out, AccountReply::LogJoinedMany { .. }), "{out:?}");
+                log::leave(&relay, e, conv).await.unwrap();
+
+                // A chain with a bucket of two and a row of its own
+                let mut f = frame(1 << 12, true, true);
+                f.buckets = vec![bucket(u64::MAX - 7, 0, a.0, &[b.0, c.0])];
+                f.seals = vec![seal(u64::MAX - 7, 0, 0)];
+                f.wraps = vec![ChainRow {
+                    recipient: d.0,
+                    index: 0,
+                    wrapped: row(),
+                }];
+                let (out, _) = log::chain_put(&relay, a, conv, f, may()).await.unwrap();
+                assert!(
+                    matches!(out, AccountReply::ChainStored { behind: false, .. }),
+                    "{out:?}"
+                );
+                let out = log::append(&relay, a, conv, 1 << 12, &[1; 64], None)
+                    .await
+                    .unwrap();
+                assert!(matches!(out, AccountReply::LogAppended { .. }), "{out:?}");
+
+                // A step and a row to someone new, once they are
+                log::join(&relay, e, conv, true).await.unwrap();
+                run_wait_over(&relay).await;
+                let out = log::append(&relay, a, conv, 1 << 12, &[1; 64], None)
+                    .await
+                    .unwrap();
+                assert!(
+                    matches!(&out, AccountReply::ChainRekey { new_chain: false, missing, .. } if missing == &[e.0]),
+                    "{out:?}"
+                );
+                // ... which, as the last of an answer, ends the wait on this writer
+                let mut f = frame(1 << 12 | 1, false, true);
+                f.step = Some(row());
+                f.wraps = vec![ChainRow {
+                    recipient: e.0,
+                    index: 1,
+                    wrapped: row(),
+                }];
+                let (out, _) = log::chain_put(&relay, a, conv, f, may()).await.unwrap();
+                assert!(
+                    matches!(out, AccountReply::ChainStored { behind: false, .. }),
+                    "{out:?}"
+                );
+
+                // The reads
+                let out = log::append(&relay, a, conv, 1 << 12 | 1, &[1; 64], None)
+                    .await
+                    .unwrap();
+                assert!(matches!(out, AccountReply::LogAppended { .. }), "{out:?}");
+                let out = log::chain_fetch(&relay, e, conv, -500).await.unwrap();
+                assert!(
+                    matches!(&out, AccountReply::ChainPage { entries, skipped: 1, .. } if entries.len() == 1),
+                    "{out:?}"
+                );
+                let out = log::fetch(&relay, b, conv, 0).await.unwrap();
+                assert!(matches!(out, AccountReply::LogPage { .. }), "{out:?}");
+                let ask = ChainAsk {
+                    owner: a.0,
+                    chain: 1,
+                    from: None,
+                };
+                let out = log::wraps_page(&relay, b, conv, std::slice::from_ref(&ask))
+                    .await
+                    .unwrap();
+                assert!(
+                    matches!(&out, AccountReply::WrapsPage { keys, .. } if keys[0].seal.is_some() && keys[0].steps.len() == 1),
+                    "{out:?}"
+                );
+                let out = log::wraps_page(&relay, a, conv, std::slice::from_ref(&ask))
+                    .await
+                    .unwrap();
+                assert!(
+                    matches!(&out, AccountReply::WrapsPage { keys, .. } if keys[0].self_wrap.is_some()),
+                    "{out:?}"
+                );
+                assert!(matches!(
+                    log::member_ids(&relay, a, conv, None).await.unwrap(),
+                    AccountReply::LogMemberIdsFound { .. }
+                ));
+                assert!(matches!(
+                    log::member_ids(&relay, a, conv, Some(b.0)).await.unwrap(),
+                    AccountReply::LogMemberIdsFound { .. }
+                ));
+                let out = log::own_chains(&relay, a, conv, None).await.unwrap();
+                assert!(
+                    matches!(&out, AccountReply::OwnChains { chains, newest: Some(1), .. } if chains[0].top == 1),
+                    "{out:?}"
+                );
+                let out = log::own_buckets(&relay, a, conv, None).await.unwrap();
+                assert!(
+                    matches!(&out, AccountReply::OwnBuckets { buckets, .. } if buckets[0].bucket == u64::MAX - 7 && buckets[0].seats == 2),
+                    "{out:?}"
+                );
+                let out = log::bucket_lists(&relay, a, conv, &[(u64::MAX - 7, 0)])
+                    .await
+                    .unwrap();
+                assert!(
+                    matches!(&out, AccountReply::BucketLists { lists, .. } if lists.len() == 1),
+                    "{out:?}"
+                );
+                let out = log::own_chain_rows(&relay, a, conv, 1, None).await.unwrap();
+                assert!(
+                    matches!(&out, AccountReply::OwnChainRows { seals, direct, .. } if seals.len() == 1 && direct.len() == 2),
+                    "{out:?}"
+                );
+                let out = log::own_chain_rows(&relay, a, conv, 1, Some(d.0))
+                    .await
+                    .unwrap();
+                assert!(matches!(out, AccountReply::OwnChainRows { .. }), "{out:?}");
+
+                // Someone leaves: a new chain, a rotation, a link. Then the way down.
+                log::leave(&relay, b, conv).await.unwrap();
+                assert_eq!(count("SELECT COUNT(*) FROM voipc_left").await, 1);
+                let out = log::append(&relay, a, conv, 1 << 12 | 1, &[1; 64], None)
+                    .await
+                    .unwrap();
+                assert!(
+                    matches!(&out, AccountReply::ChainRekey { new_chain: true, gone, .. } if gone == &[(b.0, u64::MAX - 7)]),
+                    "{out:?}"
+                );
+                let mut f = frame(2 << 12, true, true);
+                f.link = Some((1, row()));
+                f.buckets = vec![BucketIn {
+                    down: Some((0, row())),
+                    ..bucket(u64::MAX - 7, 1, a.0, &[c.0])
+                }];
+                f.seals = vec![seal(u64::MAX - 7, 1, 0)];
+                f.wraps = vec![
+                    ChainRow {
+                        recipient: d.0,
+                        index: 0,
+                        wrapped: row(),
+                    },
+                    ChainRow {
+                        recipient: e.0,
+                        index: 0,
+                        wrapped: row(),
+                    },
+                ];
+                let (out, _) = log::chain_put(&relay, a, conv, f, may()).await.unwrap();
+                assert!(
+                    matches!(out, AccountReply::ChainStored { behind: false, .. }),
+                    "{out:?}"
+                );
+                assert_eq!(
+                    count("SELECT COUNT(*) FROM voipc_seats WHERE version = 0").await,
+                    1,
+                    "a leaver's frozen row, and only that"
+                );
+                let out = log::wraps_page(&relay, c, conv, std::slice::from_ref(&ask))
+                    .await
+                    .unwrap();
+                assert!(
+                    matches!(&out, AccountReply::WrapsPage { keys, .. } if keys[0].down.len() == 1),
+                    "{out:?}"
+                );
+                // e holds index 1 of chain 1 by a row, and the start of chain 2 which links
+                // down to it: the entry at index 0 opens now, and the path comes with it
+                let out = log::chain_fetch(&relay, e, conv, 0).await.unwrap();
+                assert!(
+                    matches!(&out, AccountReply::ChainPage { entries, skipped: 0, .. } if entries.len() == 2),
+                    "{out:?}"
+                );
+                let out = log::wraps_page(&relay, e, conv, std::slice::from_ref(&ask))
+                    .await
+                    .unwrap();
+                assert!(
+                    matches!(&out, AccountReply::WrapsPage { keys, .. } if keys.len() == 2 && keys[0].chain == 2 && keys[0].direct.is_some() && keys[0].link.is_some()),
+                    "{out:?}"
+                );
+                let (out, _) = log::index(&relay, e).await.unwrap();
+                assert!(
+                    matches!(&out, AccountReply::LogConvs { convs } if convs.len() == 1),
+                    "{out:?}"
+                );
+
+                // A new log key, a share flag, a tombstone
+                let identity = voipc_crypto::generate_identity_key_pair();
+                relay
+                    .set_identity(d, &identity.identity_key().serialize())
+                    .await
+                    .unwrap();
+                let key = LogKey::generate();
+                let out = log::publish(&relay, d, &key.public(), &key.endorse(&identity))
+                    .await
+                    .unwrap();
+                assert!(matches!(out, AccountReply::LogKeyStored), "{out:?}");
+                raw(&relay, "UPDATE voipc_logkeys SET updated_at = 0")
+                    .await
+                    .unwrap();
+                let key = LogKey::generate();
+                let out = log::publish(&relay, d, &key.public(), &key.endorse(&identity))
+                    .await
+                    .unwrap();
+                assert!(matches!(out, AccountReply::LogKeyStored), "{out:?}");
+                assert_eq!(
+                    count("SELECT COUNT(*) FROM voipc_chain_wraps WHERE dead = TRUE").await,
+                    2
+                );
+                log::set_shares(store, &a.0, false).await.unwrap();
+                raw(&relay, "UPDATE voipc_writers SET shares = TRUE")
+                    .await
+                    .unwrap();
+                log::recheck_shares(&relay).await.unwrap();
+                assert_eq!(
+                    count("SELECT COUNT(*) FROM voipc_writers WHERE shares = TRUE").await,
+                    0
+                );
+                // Someone who does not share owes nobody: any last frame ends a wait on them
+                db!(store, pool => {
+                    sqlx::query("INSERT INTO voipc_pending (conv, owner, recipient, created_at) VALUES ($1, $2, $3, 1)")
+                        .bind(conv)
+                        .bind(&a.0[..])
+                        .bind(&e.0[..])
+                        .execute(pool)
+                        .await
+                        .unwrap();
+                });
+                let none = log::Sharing {
+                    shares: false,
+                    may: false,
+                };
+                let f = frame(1 << 12 | 1, false, true);
+                let (out, told) = log::chain_put(&relay, a, conv, f, none).await.unwrap();
+                assert!(
+                    matches!(out, AccountReply::ChainStored { behind: false, .. }),
+                    "{out:?}"
+                );
+                assert_eq!(told, [e.0]);
+                db!(store, pool => {
+                    sqlx::query("INSERT INTO voipc_tombstones (account, at) VALUES ($1, 1)")
+                        .bind(&b.0[..])
+                        .execute(pool)
+                        .await
+                        .unwrap();
+                });
+
+                // The sweep: a floor, text and keys under it, an unfinished chain, the stone
+                let mut f = frame(3 << 12, true, false);
+                f.buckets = vec![bucket(9, 0, a.0, &[c.0])];
+                let (out, _) = log::chain_put(&relay, a, conv, f, may()).await.unwrap();
+                assert!(
+                    matches!(out, AccountReply::ChainStored { behind: false, .. }),
+                    "{out:?}"
+                );
+                raw(&relay, "UPDATE voipc_log SET server_at = 1")
+                    .await
+                    .unwrap();
+                let mut f = frame(2 << 12 | 1, false, false);
+                f.step = Some(row());
+                f.wraps = vec![ChainRow {
+                    recipient: d.0,
+                    index: 1,
+                    wrapped: row(),
+                }];
+                let (out, _) = log::chain_put(&relay, a, conv, f, may()).await.unwrap();
+                assert!(
+                    matches!(out, AccountReply::ChainStored { behind: false, .. }),
+                    "{out:?}"
+                );
+                let out = log::append(&relay, a, conv, 2 << 12 | 1, &[1; 64], None)
+                    .await
+                    .unwrap();
+                assert!(matches!(out, AccountReply::LogAppended { .. }), "{out:?}");
+                raw(&relay, "UPDATE voipc_log SET server_at = 1")
+                    .await
+                    .unwrap();
+                raw(&relay, "UPDATE voipc_chains SET created_at = 1")
+                    .await
+                    .unwrap();
+                raw(&relay, "UPDATE voipc_bucket_lists SET created_at = 1")
+                    .await
+                    .unwrap();
+                log::sweep(&relay).await.unwrap();
+                assert_eq!(
+                    count("SELECT COUNT(*) FROM voipc_log").await,
+                    2,
+                    "the window"
+                );
+                assert!(count("SELECT floor FROM voipc_log_floors").await > 0);
+                assert_eq!(
+                    count("SELECT COUNT(*) FROM voipc_chains WHERE chain = 3").await,
+                    0
+                );
+                assert_eq!(
+                    count("SELECT COUNT(*) FROM voipc_seats WHERE bucket = 9").await,
+                    0
+                );
+                assert_eq!(count("SELECT COUNT(*) FROM voipc_tombstones").await, 0);
+                let out = log::chain_fetch(&relay, a, conv, 0).await.unwrap();
+                assert!(matches!(out, AccountReply::ChainPage { .. }), "{out:?}");
+
+                // Delete what I wrote, and a channel going
+                let out = log::purge(&relay, a, Some(conv)).await.unwrap();
+                assert!(matches!(out, AccountReply::LogPurged { .. }), "{out:?}");
+                assert_eq!(count("SELECT COUNT(*) FROM voipc_chains").await, 0);
+                assert_eq!(count("SELECT COUNT(*) FROM voipc_seats").await, 0);
+                relay.channel_purge(conv).await.unwrap();
+                assert_eq!(count("SELECT COUNT(*) FROM voipc_log_floors").await, 0);
+            }
+        }
+
+        /// Lets a rejoin through at once: the wait has its own test.
+        async fn run_wait_over(relay: &Relay) {
+            raw(relay, "UPDATE voipc_left SET left_at = 0")
+                .await
+                .unwrap();
         }
 
         #[tokio::test]

@@ -241,6 +241,9 @@ impl Relay {
                 "DELETE FROM voipc_gates WHERE conv = $1",
                 "DELETE FROM voipc_log WHERE conv = $1",
                 "DELETE FROM voipc_wraps WHERE conv = $1",
+                "DELETE FROM voipc_writers WHERE conv = $1",
+                "DELETE FROM voipc_log_floors WHERE conv = $1",
+                "DELETE FROM voipc_left WHERE conv = $1",
                 "DELETE FROM voipc_members WHERE conv = $1",
                 "DELETE FROM voipc_pending WHERE conv = $1",
             ] {

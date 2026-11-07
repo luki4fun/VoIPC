@@ -95,3 +95,39 @@ test("nothing survives of the floating effects panel", () => {
     assert.deepEqual(found, [], `${name} is back`);
   }
 });
+
+/** Each named listener in a source, from its name up to the next listener. */
+function listenerBody(source: string, event: string): string {
+  const start = source.indexOf(`"${event}"`);
+  assert.ok(start >= 0, `no listener for ${event}`);
+  const end = source.indexOf("listenServer", start);
+  return source.slice(start, end < 0 ? undefined : end);
+}
+
+test("what a relay lists is held each once before anything draws it", () => {
+  // A repeated id stops a keyed each and the whole window with it, in production too, and
+  // these three lists draw every member list and channel sidebar. App.svelte cannot load under
+  // Node, so this holds the order of the lines, not the window.
+  const app = readFileSync(join(SRC, "App.svelte"), "utf8");
+  for (const event of ["channel-list", "user-list", "channel-users"]) {
+    assert.ok(listenerBody(app, event).includes("eachOnce("), `${event} files its list raw`);
+  }
+  const raw = 'listenServer<ChannelInfo[]>("channel-list", (server, list) => { channels.of(server).set(list); });';
+  assert.ok(!listenerBody(raw, "channel-list").includes("eachOnce("), "the check above cannot see a raw write");
+});
+
+test("a device list is held each once before a keyed each draws it", () => {
+  // Two devices can go by one name, and the first-run steps come before any window behind them
+  const setup = readFileSync(join(SRC, "lib/components/AudioSetup.svelte"), "utf8");
+  for (const list of ["$inputDevices", "$outputDevices"]) {
+    assert.ok(setup.includes(`{#each eachOnce(${list},`), `${list} is drawn raw`);
+  }
+});
+
+test("a provider list is held each once before a keyed each draws it", () => {
+  // The kinds key their each, one of them on the connect dialog, before any sign-in
+  const connect = readFileSync(join(SRC, "lib/components/ConnectDialog.svelte"), "utf8");
+  assert.ok(!connect.includes("providers = r.providers"), "ConnectDialog files the kinds raw");
+  const prompts = readFileSync(join(SRC, "lib/components/AccountPrompts.svelte"), "utf8");
+  assert.ok(!prompts.includes("offered: body.offered"), "AccountPrompts files the kinds raw");
+});

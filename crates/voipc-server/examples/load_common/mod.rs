@@ -18,7 +18,7 @@ use voipc_protocol::compat::{
     decode_server_msg_from, encode_client_msg_for, OLDEST_RELAY_PROTOCOL,
 };
 use voipc_protocol::messages::{ClientMessage, ServerMessage, REFUSED_VERSION};
-use voipc_protocol::types::{SessionId, UserId};
+use voipc_protocol::types::{PreKeyBundleData, SessionId, UserId};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
@@ -40,6 +40,15 @@ pub struct Connected {
 
 /// Connects and signs in as guest `load<index>`.
 pub async fn connect(index: usize, server: &str) -> Result<Connected, Error> {
+    connect_with(index, server, None).await
+}
+
+/// `connect`, with the keys a writer on the live path hands out: `(identity, bundle)`.
+pub async fn connect_with(
+    index: usize,
+    server: &str,
+    keys: Option<(Vec<u8>, PreKeyBundleData)>,
+) -> Result<Connected, Error> {
     // The server caps connections per IP (DoS guard), so spread the load
     // clients across 127.0.0.0/8 source addresses (4 clients per IP).
     let server_addr: SocketAddr = tokio::net::lookup_host(server)
@@ -63,8 +72,8 @@ pub async fn connect(index: usize, server: &str) -> Result<Connected, Error> {
             username: format!("load{index}#0001"),
             protocol_version: proto,
             app_version: APP_VERSION.to_string(),
-            identity_key: None,
-            prekey_bundle: None,
+            identity_key: keys.as_ref().map(|k| k.0.clone()),
+            prekey_bundle: keys.as_ref().map(|k| k.1.clone()),
             account: None,
         };
         send.write_all(&enc(&auth, proto)?).await?;

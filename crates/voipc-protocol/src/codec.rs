@@ -91,18 +91,39 @@ pub const CONTROL_MSGS_PER_SEC: u32 = 50;
 ///      AdminReply answers, AccountRequest::ArchiveFetch/ArchiveSearch/ArchiveMine,
 ///      AccountReply::ArchivePage/ArchiveHits/ArchiveMineDone, AdminBansPage,
 ///      AdminBansPaged
+/// v21: the `voipc:share_history` privilege (`types::may_share_history`);
+///      text channels on the live path — JoinTextChannels/KeyCheck/OpenSessions/SessionHello/
+///      DistributeSenderKeys/KeyWanted/RequestChannelPage/SetQuiet/RenewSessionKeys, TextJoined/KeysOwed/
+///      SessionAsked/SessionHello/TextKeyReceived/KeyWanted/ChannelPage/ChannelMarks/Evicted/
+///      ChannelExits/TextPost/ChannelListMore/MemberGone, AccountRequest::ArchiveChannels and
+///      its AccountReply; kept channel messages on chains and buckets —
+///      AccountRequest::LogJoinMany/ChainPut/LogMemberIds/ChainFetch/WrapsPage/OwnChains/
+///      OwnBuckets/BucketLists/OwnChainRows, AccountReply::LogJoinedMany/ChainStored/ChainRekey/
+///      LogMemberIdsFound/ChainPage/WrapsPage/OwnChains/OwnBuckets/BucketLists/OwnChainRows
 ///
 /// A relay admits only its own protocol; an app speaks its own down to
 /// `compat::OLDEST_RELAY_PROTOCOL` (1.6).
-pub const PROTOCOL_VERSION: u32 = 20;
+pub const PROTOCOL_VERSION: u32 = 21;
 
 /// Application version, read from Cargo.toml at compile time.
 /// Single source of truth: workspace root `Cargo.toml` `[workspace.package] version`.
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// A `ClientMessage`'s postcard bytes, refused past `MAX_MSG_SIZE`: the relay ends the
+/// connection at such a length (`try_decode_frame`), voice included, and an app that built
+/// the frame once builds it again at the next connect. So one message is lost, with a line
+/// in the log, and not the session. Both backends' frames pass here.
+pub fn client_payload(msg: &ClientMessage) -> Result<Vec<u8>, ProtocolError> {
+    let payload = postcard::to_allocvec(msg)?;
+    if payload.len() > MAX_MSG_SIZE as usize {
+        return Err(ProtocolError::MessageTooLarge(payload.len()));
+    }
+    Ok(payload)
+}
+
 /// Encode a `ClientMessage` into a length-prefixed byte buffer for TCP transmission.
 pub fn encode_client_msg(msg: &ClientMessage) -> Result<Vec<u8>, ProtocolError> {
-    Ok(frame(postcard::to_allocvec(msg)?))
+    Ok(frame(client_payload(msg)?))
 }
 
 /// A payload behind its big-endian length.
@@ -520,6 +541,39 @@ mod tests {
 
         let err = encode_server_msg(&wrapped(MAX_MSG_SIZE as usize));
         assert!(matches!(err, Err(ProtocolError::MessageTooLarge(_))));
+    }
+
+    /// The relay ends a connection at a frame past the limit, so a client must not be able
+    /// to send one, by any road: at this protocol, at an older one, or in the browser.
+    #[test]
+    fn a_client_frame_the_relay_would_drop_is_refused_here() {
+        let put = |len: usize| {
+            ClientMessage::Account(crate::messages::AccountRequest::LogAppend {
+                conv: "c:lounge".into(),
+                epoch: 1,
+                ct: vec![0u8; len],
+                ttl_secs: None,
+            })
+        };
+        let over = MAX_MSG_SIZE as usize;
+        assert!(client_payload(&put(over - 64)).is_ok());
+        assert!(matches!(
+            client_payload(&put(over)),
+            Err(ProtocolError::MessageTooLarge(_))
+        ));
+        assert!(matches!(
+            encode_client_msg(&put(over)),
+            Err(ProtocolError::MessageTooLarge(_))
+        ));
+        for proto in [PROTOCOL_VERSION, crate::compat::OLDEST_RELAY_PROTOCOL] {
+            assert!(
+                matches!(
+                    crate::compat::encode_client_msg_for(&put(over), proto),
+                    Err(ProtocolError::MessageTooLarge(_))
+                ),
+                "at {proto}"
+            );
+        }
     }
 
     #[test]

@@ -38,6 +38,17 @@ import { shortName } from "./username.ts";
 
 /** Per conversation, in the store and in the archive. */
 export const MAX_MESSAGES = 500;
+
+/**
+ * `msg` in a conversation's list: at the end, or behind what is newer than it among what came
+ * within `floor`. So a post held for its key shows at its own time among the others, and a
+ * relay's old timestamp cannot bury one further back than a hold could have.
+ */
+export function placedByTime(existing: readonly ChatMessage[], msg: ChatMessage, floor: number): ChatMessage[] {
+  let at = existing.length;
+  while (at > 0 && existing[at - 1].timestamp > msg.timestamp && existing[at - 1].timestamp >= floor) at -= 1;
+  return [...existing.slice(0, at), msg, ...existing.slice(at)];
+}
 /**
  * How many conversations are kept by default. See [`pruneConversations`].
  *

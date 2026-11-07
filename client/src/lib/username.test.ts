@@ -2,7 +2,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { randomTag, shortName, splitName, withTag } from "./username.ts";
+import { isAccountName, randomTag, shortName, splitName, withTag } from "./username.ts";
 
 test("the tag is the last # and exactly four digits", () => {
   assert.deepEqual(splitName("luki#0420"), { name: "luki", tag: "0420" });
@@ -13,6 +13,12 @@ test("the tag is the last # and exactly four digits", () => {
   assert.deepEqual(splitName("Guest-1234"), { name: "Guest-1234", tag: "" });
   assert.deepEqual(splitName(""), { name: "", tag: "" });
   assert.equal(shortName("bob#0001"), "bob");
+});
+
+test("a remembered name with no tag opens on the Account tab", () => {
+  assert.equal(isAccountName("luki"), true);
+  assert.equal(isAccountName("luki#0420"), false, "a guest's");
+  assert.equal(isAccountName(""), false, "nothing remembered");
 });
 
 test("a missing or malformed tag becomes a random one", () => {

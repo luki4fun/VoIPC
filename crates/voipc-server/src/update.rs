@@ -47,6 +47,10 @@ const MAX_FEED: usize = 1 << 20;
 const MAX_BINARY: usize = 200 << 20;
 /// Copies of the accounts database kept from before an update.
 const KEEP_BACKUPS: usize = 2;
+/// Past this a copy goes at the next update, as OPERATING says of every copy: it still holds
+/// what people have since deleted, and it is stale for a rollback. Not the newest: until that
+/// update has finished, its copy is the only way back.
+const BACKUP_MAX_AGE: Duration = Duration::from_secs(30 * 86_400);
 
 /// The running binary and the files beside it.
 #[derive(Debug, Clone)]
@@ -478,8 +482,14 @@ fn prune_backups(paths: &Paths) {
         .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
         .collect();
     found.sort();
-    for (_, path) in found.iter().rev().skip(KEEP_BACKUPS) {
-        let _ = std::fs::remove_file(path);
+    let now = std::time::SystemTime::now();
+    for (i, (at, path)) in found.iter().rev().enumerate() {
+        let aged = now
+            .duration_since(*at)
+            .is_ok_and(|age| age > BACKUP_MAX_AGE);
+        if i >= KEEP_BACKUPS || (i > 0 && aged) {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
@@ -601,25 +611,47 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// A copy of `version`, this many days old.
+    fn copy_aged(paths: &Paths, version: &str, days: u64) {
+        let p = paths.backup(version);
+        std::fs::write(&p, "db").unwrap();
+        let at = std::time::SystemTime::now() - Duration::from_secs(days * 86_400);
+        std::fs::File::options()
+            .write(true)
+            .open(&p)
+            .unwrap()
+            .set_modified(at)
+            .unwrap();
+    }
+
     #[test]
     fn two_backups_stay() {
         let (paths, dir) = temp_paths("prune");
         for (i, v) in ["1.6.1", "1.6.2", "1.6.3"].iter().enumerate() {
-            let p = paths.backup(v);
-            std::fs::write(&p, "db").unwrap();
-            let at = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000 + i as u64);
-            std::fs::File::options()
-                .write(true)
-                .open(&p)
-                .unwrap()
-                .set_modified(at)
-                .unwrap();
+            copy_aged(&paths, v, 3 - i as u64);
         }
         std::fs::write(&paths.exe, "bin").unwrap();
         prune_backups(&paths);
         assert!(!paths.backup("1.6.1").exists());
         assert!(paths.backup("1.6.2").exists() && paths.backup("1.6.3").exists());
         assert!(paths.exe.exists(), "nothing else goes");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_copy_past_thirty_days_goes_and_the_newest_stays_whatever_its_age() {
+        let (paths, dir) = temp_paths("prune-aged");
+        copy_aged(&paths, "1.6.1", 90);
+        copy_aged(&paths, "1.6.2", 31);
+        prune_backups(&paths);
+        assert!(!paths.backup("1.6.1").exists());
+        assert!(paths.backup("1.6.2").exists(), "the only way back");
+        // Under the age, the second stays with the newest
+        copy_aged(&paths, "1.6.3", 29);
+        copy_aged(&paths, "1.6.4", 1);
+        prune_backups(&paths);
+        assert!(!paths.backup("1.6.2").exists());
+        assert!(paths.backup("1.6.3").exists() && paths.backup("1.6.4").exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

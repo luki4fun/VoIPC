@@ -5,6 +5,7 @@
     removeNotification,
     resumeNotification,
   } from "../stores/notifications.js";
+  import { holdsToast } from "../notify-rules.js";
   import Icon from "./Icons.svelte";
 </script>
 
@@ -15,8 +16,12 @@
     <div
       class="toast toast-{notification.type}"
       role={notification.type === "error" ? "alert" : "status"}
-      onmouseenter={() => pauseNotification(notification.id)}
-      onmouseleave={() => resumeNotification(notification.id)}
+      onpointerenter={(e) => {
+        if (holdsToast(e.pointerType)) pauseNotification(notification.id);
+      }}
+      onpointerleave={(e) => {
+        if (holdsToast(e.pointerType)) resumeNotification(notification.id);
+      }}
       onfocusin={() => pauseNotification(notification.id)}
       onfocusout={() => resumeNotification(notification.id)}
     >

@@ -7,9 +7,11 @@ use std::future::Future;
 
 use futures_util::FutureExt;
 use serde::Serialize;
+use voipc_crypto::channel_state::{WRAPS_A_FRAME, WRAPS_A_FRAME_BROWSER_CALL};
 use voipc_crypto::prekey::{self, PREKEY_REFILL_COUNT};
-use voipc_crypto::{group, session, ChannelKeying, SignalStores};
-use voipc_protocol::types::{OneTimePreKey, PreKeyBundleData};
+use voipc_crypto::{group, session, ChannelKeying, KeptSessions, LiveOut, Seen, SignalStores};
+use voipc_protocol::messages::{ClientMessage, ServerMessage};
+use voipc_protocol::types::{OneTimePreKey, PreKeyBundleData, UserInfo};
 
 /// Drives a libsignal future to completion. Every store is in memory, so the
 /// future is ready on the first poll; anything else is a programming error.
@@ -192,5 +194,70 @@ impl SignalCore {
             channel_id,
             ciphertext,
         ))
+    }
+
+    // ── The live path: `ChannelKeying`'s, with the stores it needs ───────
+
+    pub fn live_frame(&mut self, own_channel: u32, msg: &ServerMessage, now: u64) -> LiveOut {
+        self.keying
+            .live_frame(&mut self.stores, own_channel, msg, now)
+    }
+
+    pub fn live_post(
+        &mut self,
+        channel_id: u32,
+        payload: Vec<u8>,
+        now: u64,
+    ) -> Result<LiveOut, String> {
+        self.keying
+            .live_post(&mut self.stores, channel_id, payload, now)
+    }
+
+    pub fn live_tick(&mut self, now: u64) -> LiveOut {
+        self.keying.live_tick(&mut self.stores, now)
+    }
+
+    /// The page thread also feeds the microphone: in a call it makes few wraps at a time.
+    pub fn live_next_frame(&mut self, now: u64, in_call: bool) -> Option<ClientMessage> {
+        let wraps = if in_call {
+            WRAPS_A_FRAME_BROWSER_CALL
+        } else {
+            WRAPS_A_FRAME
+        };
+        self.keying
+            .live_next_frame(&mut self.stores, now, in_call, wraps)
+    }
+
+    pub fn live_answer_job(&mut self, channel_id: u32, go: bool, now: u64) -> LiveOut {
+        self.keying
+            .live_answer_job(&mut self.stores, channel_id, go, now)
+    }
+
+    pub fn live_note_rows(&mut self, rows: &[UserInfo]) -> Vec<Seen> {
+        self.keying.live_note_rows(&self.stores, rows)
+    }
+
+    pub fn live_pins_in(&mut self, own_channel: u32, now: u64) -> LiveOut {
+        self.keying.live_pins_in(&mut self.stores, own_channel, now)
+    }
+
+    pub fn live_keep_sessions(&mut self, now: u64) -> KeptSessions {
+        self.keying.live_keep_sessions(&self.stores, now)
+    }
+
+    pub fn live_drop_kept_session(&mut self, user_id: u32) -> bool {
+        self.keying
+            .live_drop_kept_session(&mut self.stores, user_id)
+    }
+
+    pub fn live_seal_answer(
+        &mut self,
+        channel_id: u32,
+        target: u32,
+        messages: &serde_json::Value,
+        now: u64,
+    ) -> anyhow::Result<ClientMessage> {
+        self.keying
+            .live_seal_answer(&mut self.stores, channel_id, target, messages, now)
     }
 }

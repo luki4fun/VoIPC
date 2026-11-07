@@ -12,10 +12,15 @@
 //! every writer start a new key (the relay refuses entries under a key that
 //! still reaches them).
 //!
+//! On a relay at protocol 21 a channel's log goes on chains and buckets instead:
+//! the `chains` module below. Direct conversations stay as above everywhere. And
+//! there the pins go in pages outside the sign-in frame: the `pins` module.
+//!
 //! The host feeds every `AccountReply` to `on_reply` and sends whatever comes
 //! back; stored messages come out as `Event::Message` / `Event::ChannelMessage`.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 use libsignal_protocol::IdentityKeyPair;
 use serde::{Deserialize, Serialize};
@@ -26,10 +31,16 @@ use voipc_protocol::messages::{
 use voipc_protocol::types::VaultBlob;
 use zeroize::Zeroizing;
 
-use crate::account::{PinCheck, Pins, SignedIn, Vault, VaultError, ITEM_PINS};
+use crate::account::{Item, PinCheck, Pins, SignedIn, Vault, VaultError, ITEM_PINS};
 use crate::log::{
     endorsed, epoch_key, open_entry, seal_entry, self_unwrap, self_wrap, unwrap, wrap, LogKey,
+    StaticKey,
 };
+
+mod chains;
+mod pins;
+
+pub use pins::KeptPins;
 
 pub const ITEM_LOGKEY: &str = "item.logkey";
 pub const ITEM_PREFS: &str = "item.prefs";
@@ -53,6 +64,9 @@ const MAX_REKEYS: u32 = 2;
 const READ_BACK: i64 = 500;
 /// `AccountSync::tick`s without an answer before a read counts as lost.
 const LOST_AFTER_TICKS: u32 = 3;
+/// And before what went out to be kept counts as lost, at about 30 s. Sent again it would
+/// be kept twice if only the answer was lost, so this waits longer than a read does.
+const APPEND_LOST_AFTER_TICKS: u32 = 15;
 /// How the relay says its budget ran out for now (`accounts.rs`).
 const SLOW_DOWN: &str = "slow down";
 
@@ -176,11 +190,16 @@ pub struct LogMemory {
     pub cursors: HashMap<String, i64>,
     /// Per channel log, the accounts this device has told its user can read
     /// what they write there (`Event::Readers`).
+    #[serde(default)]
     pub readers: HashMap<String, Vec<[u8; 16]>>,
     /// Per vault item, the newest generation this device has seen: an older
     /// one, or none, from the relay later is a rollback.
     #[serde(default)]
     pub vault_gens: HashMap<String, u64>,
+    /// Per channel log, the bucket lists this device has named to its user, by digest
+    /// (`log::Bucket::seal_list`): what it may seal to without reading the list again.
+    #[serde(default)]
+    pub named: HashMap<String, Vec<[u8; 32]>>,
 }
 
 /// What comes out besides messages to send.
@@ -232,14 +251,21 @@ pub enum Event {
         history: bool,
     },
     /// A vault item this device cannot use as the relay holds it ("missing",
-    /// "older" than one seen before, "newer" VoIPC, "unreadable"): it is left
-    /// alone this session, and the person is told.
+    /// "older" than one seen before, "newer" VoIPC, "unreadable", or "hidden" in
+    /// pages a relay this old cannot hand over): it is left alone this session,
+    /// and the person is told.
     VaultProblem {
         item: &'static str,
         problem: &'static str,
     },
     /// Who is blocked now, as another device's list joined ours.
     Blocks { entries: Vec<(String, String)> },
+    /// Entries in this channel log could not be opened: written before we joined, or before
+    /// many people left. Said quietly, once a read.
+    Unopened { conv: String },
+    /// The relay no longer keeps what this device had not read of this channel log: it
+    /// keeps the newest `window` entries.
+    Clamped { conv: String, window: u32 },
 }
 
 impl Event {
@@ -395,6 +421,11 @@ impl Event {
             Event::Blocks { entries } => {
                 ("account-blocks", serde_json::json!({ "blocks": entries }))
             }
+            Event::Unopened { conv } => ("stored-unopened", serde_json::json!({ "conv": conv })),
+            Event::Clamped { conv, window } => (
+                "stored-clamped",
+                serde_json::json!({ "conv": conv, "window": window }),
+            ),
             Event::IdentityChanged { .. } => return None,
         })
     }
@@ -403,7 +434,10 @@ impl Event {
     pub fn reads(&self) -> bool {
         matches!(
             self,
-            Event::Message { .. } | Event::ChannelMessage { .. } | Event::Readers { .. }
+            Event::Message { .. }
+                | Event::ChannelMessage { .. }
+                | Event::Readers { .. }
+                | Event::Unopened { .. }
         )
     }
 }
@@ -464,6 +498,8 @@ pub struct AccountSync {
     writing_gen: HashMap<&'static str, u64>,
     /// `gens` moved since the host last kept the memory.
     memory_changed: bool,
+    /// And of what it kept, `readers` or `named`.
+    named_changed: bool,
     logkey: LogKey,
     logkey_version: i64,
     /// A log key made this run: published only once the vault keeps it, and
@@ -477,6 +513,8 @@ pub struct AccountSync {
     /// Each `LogKeys` not answered yet, in order: an account the relay has
     /// no key for is judged by the answer to the request that named it.
     key_asks: VecDeque<Vec<[u8; 16]>>,
+    /// Those an empty `LogKeysFound` left without a key once, and asked for again.
+    key_misses: HashSet<[u8; 16]>,
     /// Our own current epoch per conversation.
     own_epochs: HashMap<String, (u32, Zeroizing<[u8; 32]>)>,
     /// Every epoch key we hold: (conversation, owner, epoch).
@@ -486,6 +524,8 @@ pub struct AccountSync {
     /// Appends the relay has not answered yet, in order: the log, the epoch
     /// it went under, and (for a channel) the message, to send again on a rekey.
     in_flight: VecDeque<(String, u32, Option<Outgoing>)>,
+    /// `tick`s since one of those last got an answer.
+    append_idle: u32,
     rekeys: HashMap<String, u32>,
     /// A channel log's members with trusted keys (us included), as last asked.
     members: HashMap<String, Vec<[u8; 16]>>,
@@ -528,6 +568,44 @@ pub struct AccountSync {
     opened: HashSet<(String, i64)>,
     /// Events from a send, handed out with the next reply.
     later: Vec<Event>,
+    /// Our pins in pages, on a relay that keeps them so (`sync::pins`).
+    book: pins::PinBook,
+    /// `LogPendingMore`: another `LogIndex` once what it brought is answered. Only while one
+    /// brings someone new: a joiner nobody can answer stays at the front of every page.
+    pending_more: bool,
+    pending_seen: HashSet<(String, [u8; 16])>,
+    pending_new: bool,
+    /// Channel logs with a gate: who is met there keeps the half of the pins' room open
+    /// channels cannot fill.
+    gated_logs: HashSet<String>,
+    /// The relay keeps channel logs on chains and buckets (`sync::chains`).
+    chains: bool,
+    /// Per channel log, our chains and buckets as far as they were read back.
+    writers: HashMap<String, chains::Writer>,
+    /// The asks of `writers` not answered yet, in order, each with its request's name: a
+    /// refusal names no conversation.
+    writer_asks: VecDeque<(&'static str, String)>,
+    /// Each `WrapsPage` not answered yet, in order.
+    wraps_asked: VecDeque<chains::WrapsAsked>,
+    /// Per channel log, what this device holds of every writer's chains.
+    holds: HashMap<String, chains::Holds>,
+    /// One X25519 per peer per connection: with the log key it was made from.
+    statics: HashMap<[u8; 16], (Vec<u8>, Arc<StaticKey>)>,
+    /// `LogMemory::named`.
+    named: HashMap<String, HashSet<[u8; 32]>>,
+    /// The `BucketLists` out, per channel log.
+    lists_asked: HashMap<String, Vec<(u64, u32)>>,
+    /// Whether the `ChainPage` being worked through says there is more, and where the last
+    /// ask for one started.
+    page_more: HashMap<String, bool>,
+    page_after: HashMap<String, i64>,
+    /// Entries of a read in progress that could not be opened.
+    unopened: HashMap<String, u32>,
+    /// Each `LogJoin` and `LogJoinMany` not answered yet, in order: a refusal names no
+    /// conversation. And what to ask again at the next tick.
+    join_asks: VecDeque<String>,
+    join_many_asks: VecDeque<Vec<String>>,
+    join_many_due: Vec<String>,
 }
 
 fn ask(r: AccountRequest) -> ClientMessage {
@@ -579,9 +657,26 @@ impl AccountSync {
             problems.push(Event::VaultProblem { item: k, problem });
             None
         };
-        let pins = load(ITEM_PINS, &|b| Pins::from_bytes(b).is_some())
-            .and_then(|b| Pins::from_bytes(&b))
-            .unwrap_or_default();
+        // `item.pins` is the old single item or, as its format says, the index of pages
+        let paged = matches!(signed.vault.open_item(blobs, ITEM_PINS), Ok(i) if i.format == pins::PIN_INDEX_FORMAT);
+        let held = load(ITEM_PINS, &|b| {
+            if paged {
+                pins::PinIndex::from_bytes(b).is_some()
+            } else {
+                Pins::from_bytes(b).is_some()
+            }
+        });
+        let (pins, index) = if paged {
+            (
+                Pins::default(),
+                held.and_then(|b| pins::PinIndex::from_bytes(&b)),
+            )
+        } else {
+            (
+                held.and_then(|b| Pins::from_bytes(&b)).unwrap_or_default(),
+                None,
+            )
+        };
         let prefs = load(ITEM_PREFS, &|b| postcard::from_bytes::<Prefs>(b).is_ok())
             .and_then(|b| postcard::from_bytes(&b).ok())
             .unwrap_or_default();
@@ -613,6 +708,7 @@ impl AccountSync {
             gens,
             writing_gen: HashMap::new(),
             memory_changed: true,
+            named_changed: false,
             logkey,
             logkey_version,
             logkey_unsettled: fresh,
@@ -620,11 +716,13 @@ impl AccountSync {
             distrusted: HashSet::new(),
             asked_keys: HashSet::new(),
             key_asks: VecDeque::new(),
+            key_misses: HashSet::new(),
             own_epochs: HashMap::new(),
             keys: HashMap::new(),
             wraps_known: HashSet::new(),
             outbox: Vec::new(),
             in_flight: VecDeque::new(),
+            append_idle: 0,
             rekeys: HashMap::new(),
             members: HashMap::new(),
             asked_members: HashSet::new(),
@@ -652,6 +750,29 @@ impl AccountSync {
             waiting: Vec::new(),
             opened: HashSet::new(),
             later: problems,
+            book: pins::PinBook::reading(index),
+            pending_more: false,
+            pending_seen: HashSet::new(),
+            pending_new: false,
+            gated_logs: HashSet::new(),
+            chains: false,
+            writers: HashMap::new(),
+            writer_asks: VecDeque::new(),
+            wraps_asked: VecDeque::new(),
+            holds: HashMap::new(),
+            statics: HashMap::new(),
+            named: memory
+                .named
+                .into_iter()
+                .map(|(c, d)| (c, d.into_iter().collect()))
+                .collect(),
+            lists_asked: HashMap::new(),
+            page_more: HashMap::new(),
+            page_after: HashMap::new(),
+            unopened: HashMap::new(),
+            join_asks: VecDeque::new(),
+            join_many_asks: VecDeque::new(),
+            join_many_due: Vec::new(),
         };
         if fresh {
             out.extend(s.save(ITEM_LOGKEY));
@@ -712,6 +833,17 @@ impl AccountSync {
         self.share = share;
     }
 
+    /// The relay's protocol: from `KEPT_CHAINS_SINCE` channel logs go on chains and buckets.
+    pub fn set_protocol(&mut self, proto: u32) {
+        self.chains = proto >= voipc_protocol::types::KEPT_CHAINS_SINCE;
+        self.pins_on_protocol(proto);
+    }
+
+    /// A channel log that has a gate (`TextJoined`).
+    pub fn note_gated_log(&mut self, conv: &str) {
+        self.gated_logs.insert(conv.to_string());
+    }
+
     /// What the host keeps for next time.
     pub fn memory(&self) -> LogMemory {
         LogMemory {
@@ -722,6 +854,11 @@ impl AccountSync {
                 .map(|(c, r)| (c.clone(), r.iter().copied().collect()))
                 .collect(),
             vault_gens: self.gens.clone(),
+            named: self
+                .named
+                .iter()
+                .map(|(c, d)| (c.clone(), d.iter().copied().collect()))
+                .collect(),
         }
     }
 
@@ -729,6 +866,12 @@ impl AccountSync {
     /// vault item's generation): the host keeps it again. Clears the flag.
     pub fn take_memory_changed(&mut self) -> bool {
         std::mem::take(&mut self.memory_changed)
+    }
+
+    /// Whether who it names as readers moved since this was last asked: thousands of ids a
+    /// channel, which a host may keep apart. Clears the flag.
+    pub fn take_named_changed(&mut self) -> bool {
+        std::mem::take(&mut self.named_changed)
     }
 
     /// Whether `name` was first met as an account (a guest using it now is a
@@ -752,6 +895,7 @@ impl AccountSync {
 
     fn item_bytes(&self, k: &str) -> Vec<u8> {
         match k {
+            ITEM_PINS if self.book.paged => self.book.index_bytes(),
             ITEM_PINS => self.pins.to_bytes(),
             ITEM_PREFS => postcard::to_allocvec(&self.prefs).expect("prefs encode"),
             ITEM_BLOCKS => self.blocks.to_padded(),
@@ -779,7 +923,12 @@ impl AccountSync {
         self.dirty.remove(k);
         let gen = self.gens.get(k).copied().unwrap_or(0) + 1;
         self.writing_gen.insert(k, gen);
-        let blob = self.vault.seal_item(k, gen, &self.item_bytes(k));
+        let blob = if k == ITEM_PINS && self.book.paged {
+            self.vault
+                .seal_item_as(k, gen, pins::PIN_INDEX_FORMAT, &self.item_bytes(k))
+        } else {
+            self.vault.seal_item(k, gen, &self.item_bytes(k))
+        };
         let expect = *self.version_of(k);
         vec![ask(AccountRequest::VaultPut {
             k: blob.k,
@@ -822,18 +971,11 @@ impl AccountSync {
                         self.memory_changed = true;
                         let plain = item.payload;
                         match k {
-                            ITEM_PINS => {
-                                if let Some(p) = Pins::from_bytes(&plain) {
-                                    for (account, name) in self.pins.merge(p) {
-                                        self.later.push(Event::IdentityChanged {
-                                            account,
-                                            name,
-                                            replaced: false,
-                                        });
-                                    }
-                                    self.dirty.insert(k);
-                                }
-                            }
+                            ITEM_PINS => self.on_pins_conflict(Item {
+                                format: item.format,
+                                gen: item.gen,
+                                payload: plain,
+                            }),
                             ITEM_PREFS => {
                                 if let Ok(p) = postcard::from_bytes(&plain) {
                                     self.prefs = p;
@@ -880,6 +1022,9 @@ impl AccountSync {
         } else {
             Vec::new()
         };
+        if k == ITEM_PINS {
+            out.extend(self.pins_read_more());
+        }
         if k == ITEM_LOGKEY && settled && self.logkey_unsettled {
             // The vault keeps this key now: the relay may hand it out, and
             // what waited for it can go.
@@ -902,8 +1047,15 @@ impl AccountSync {
         name: &str,
         identity: &[u8],
     ) -> (PinCheck, Vec<ClientMessage>) {
+        let name_was = self
+            .book
+            .paged
+            .then(|| self.pins.owner_of_name(name))
+            .flatten();
         let check = self.pins.check(account, name, identity);
-        let out = if check == PinCheck::Same {
+        let out = if self.book.paged {
+            self.pin_noted(account, name.len(), name_was, check)
+        } else if check == PinCheck::Same {
             Vec::new()
         } else {
             self.save(ITEM_PINS)
@@ -1014,6 +1166,7 @@ impl AccountSync {
         if peer == self.me {
             return Vec::new();
         }
+        self.reserve_pin(peer);
         self.outbox.push(Outgoing {
             conv: dm_conv(&self.me, &peer),
             peer: Some(peer),
@@ -1038,9 +1191,7 @@ impl AccountSync {
         }
         let mut out = Vec::new();
         if self.joined.insert(conv.to_string()) {
-            out.push(ask(AccountRequest::LogJoin {
-                conv: conv.to_string(),
-            }));
+            out.push(self.ask_join(conv));
         }
         self.outbox.push(Outgoing {
             conv: conv.to_string(),
@@ -1061,11 +1212,63 @@ impl AccountSync {
         }
         if self.joined.insert(conv.to_string()) {
             // The fetch follows `LogJoined`.
-            return vec![ask(AccountRequest::LogJoin {
-                conv: conv.to_string(),
-            })];
+            return vec![self.ask_join(conv)];
         }
         self.fetch(conv)
+    }
+
+    /// A key for us, or a message: what waited for it, and what came after. A burst of them
+    /// while it is being read is one more read.
+    fn read_news(&mut self, conv: &str) -> Vec<ClientMessage> {
+        self.wraps_known.remove(conv);
+        self.chain_news(conv);
+        if self.fetching.contains_key(conv) {
+            self.target.insert(conv.to_string());
+            self.again.insert(conv.to_string());
+            return Vec::new();
+        }
+        self.fetch(conv)
+    }
+
+    /// A channel that slept (quiet mode) came on screen. Nothing told us of what was written
+    /// meanwhile: `LogNews` comes for a new key or seat, not for a post on a chain we hold.
+    /// With no seat there is nothing to read, and opening a channel takes none.
+    pub fn read_now(&mut self, conv: &str) -> Vec<ClientMessage> {
+        if !self.joined.contains(conv) {
+            return Vec::new();
+        }
+        self.read_news(conv)
+    }
+
+    fn ask_join(&mut self, conv: &str) -> ClientMessage {
+        if self.chains {
+            self.join_asks.push_back(conv.to_string());
+        }
+        ask(AccountRequest::LogJoin {
+            conv: conv.to_string(),
+        })
+    }
+
+    /// `enter` for channels newly followed, all in one frame where the relay takes that:
+    /// joining tells nobody, and a silent follow takes a log only up to half its seats.
+    pub fn enter_many(&mut self, convs: &[String]) -> Vec<ClientMessage> {
+        if !self.prefs.cloud {
+            return Vec::new();
+        }
+        if !self.chains {
+            return convs.iter().flat_map(|c| self.enter(c)).collect();
+        }
+        self.enter_many_on_chains(convs)
+    }
+
+    /// `account` was put out of this channel's log, or left it (`MemberGone`; `None`: nobody
+    /// with an account we can tell, so no seat we know of). If we could have reached them, our
+    /// chain there ends at our next post, whatever the relay says, and they are named again
+    /// if they come back.
+    pub fn member_gone(&mut self, conv: &str, account: Option<[u8; 16]>) {
+        if let (true, Some(a)) = (self.on_chains(conv), account) {
+            self.someone_left(conv, &a);
+        }
     }
 
     /// Out of a channel's log: the relay took us out (we left the text
@@ -1089,6 +1292,13 @@ impl AccountSync {
         self.joiners.remove(conv);
         self.readers.remove(conv);
         self.rekeys.remove(conv);
+        self.named.remove(conv);
+        self.memory_changed = true;
+        self.named_changed = true;
+        self.writers.remove(conv);
+        if self.on_chains(conv) {
+            self.end_chain(conv, None);
+        }
         if tell {
             vec![ask(AccountRequest::LogLeave {
                 conv: conv.to_string(),
@@ -1119,6 +1329,11 @@ impl AccountSync {
                 continue;
             }
             self.reading = Some(conv.clone());
+            if self.on_chains(&conv) {
+                // The rows follow from which chains its entries are on
+                self.fetching.insert(conv.clone(), Fetch::Entries);
+                return vec![self.first_page(&conv)];
+            }
             self.fetching.insert(conv.clone(), Fetch::Wraps);
             return vec![self.ask_wraps(&conv)];
         }
@@ -1161,9 +1376,18 @@ impl AccountSync {
 
     fn ask_page(&mut self, conv: &str, after: i64) -> ClientMessage {
         self.fetch_asks.push_back(conv.to_string());
-        ask(AccountRequest::LogFetch {
-            conv: conv.to_string(),
-            after,
+        let conv_name = conv.to_string();
+        ask(if self.on_chains(conv) {
+            self.page_after.insert(conv.to_string(), after);
+            AccountRequest::ChainFetch {
+                conv: conv_name,
+                after,
+            }
+        } else {
+            AccountRequest::LogFetch {
+                conv: conv_name,
+                after,
+            }
         })
     }
 
@@ -1201,6 +1425,10 @@ impl AccountSync {
         let mut out = Vec::new();
         for conv in ready {
             if self.target.contains(&conv) {
+                if self.on_chains(&conv) {
+                    out.extend(self.chain_read(&conv));
+                    continue;
+                }
                 self.fetching.insert(conv.clone(), Fetch::Entries);
                 out.push(self.first_page(&conv));
             } else {
@@ -1215,6 +1443,16 @@ impl AccountSync {
     /// relay drops a reply on a full queue). Nothing else ever would.
     pub fn tick(&mut self) -> (Vec<ClientMessage>, Vec<Event>) {
         self.held = false;
+        // What it would go on with waits for the pages, and is no answer lost
+        if !self.pins_in() {
+            let out = self.pins_wait_tick();
+            return (out, std::mem::take(&mut self.later));
+        }
+        if self.pending_more && self.joiners.is_empty() {
+            self.pending_more = false;
+            self.index_due = true;
+        }
+        self.tick_appends();
         let waiting = !self.fetch_asks.is_empty() || !self.key_asks.is_empty() || self.index_asked;
         self.idle = if waiting { self.idle + 1 } else { 0 };
         if self.idle >= LOST_AFTER_TICKS {
@@ -1222,6 +1460,7 @@ impl AccountSync {
             for conv in std::mem::take(&mut self.fetch_asks) {
                 self.ask_again(&conv);
             }
+            self.wraps_asked.retain(chains::WrapsAsked::is_writer);
             for a in std::mem::take(&mut self.key_asks).into_iter().flatten() {
                 self.asked_keys.remove(&a);
             }
@@ -1240,6 +1479,7 @@ impl AccountSync {
             .filter_map(|(c, _)| self.other_party(c))
             .collect();
         out.extend(self.ask_keys(want));
+        // Their writers' on chains: `chain_read` asks again, once `keys_in` gets there
         // Nothing asked, because they came in some other way meanwhile
         if self.key_asks.is_empty() {
             out.extend(self.keys_in());
@@ -1247,21 +1487,57 @@ impl AccountSync {
         out.extend(self.next_read());
         let mut events = Vec::new();
         self.drain(&mut out, &mut events);
+        out.extend(self.tick_writers());
         out.extend(self.flush());
         out.extend(self.answer());
+        out.extend(self.pins_tick(crate::time::now_millis()));
         let mut all = std::mem::take(&mut self.later);
         all.extend(events);
         (out, all)
     }
 
+    /// The relay drops an answer on a full queue, and what follows waits behind it: a
+    /// refusal for all that went under its key never settles with one that will not come.
+    fn tick_appends(&mut self) {
+        if self.in_flight.is_empty() {
+            self.append_idle = 0;
+            return;
+        }
+        self.append_idle += 1;
+        if self.append_idle >= APPEND_LOST_AFTER_TICKS {
+            self.append_idle = 0;
+            self.in_flight.clear();
+            self.copy_refused = true;
+            self.later.push(Event::NotKept {
+                reason: "it did not answer in time, so a message may be missing there".into(),
+            });
+        }
+    }
+
     fn flush(&mut self) -> Vec<ClientMessage> {
-        if self.logkey_unsettled {
+        if self.logkey_unsettled || !self.pins_in() {
             return Vec::new();
         }
         let mut out = Vec::new();
         let mut keep = Vec::new();
+        let mut blocked = BTreeSet::new();
         for o in std::mem::take(&mut self.outbox) {
             let conv = o.conv.clone();
+            if o.peer.is_none() && self.on_chains(&conv) {
+                let Some((epoch, ct)) = self.seal_on_chain(&o) else {
+                    blocked.insert(conv);
+                    keep.push(o);
+                    continue;
+                };
+                out.push(ask(AccountRequest::LogAppend {
+                    conv: conv.clone(),
+                    epoch,
+                    ct,
+                    ttl_secs: o.ttl_secs,
+                }));
+                self.in_flight.push_back((conv, epoch, Some(o)));
+                continue;
+            }
             match o.peer {
                 Some(peer) if !self.peers.contains_key(&peer) => {
                     if !self.distrusted.contains(&peer) {
@@ -1315,6 +1591,9 @@ impl AccountSync {
                 .push_back((conv, epoch, o.peer.is_none().then_some(o)));
         }
         self.outbox = keep;
+        for conv in blocked {
+            out.extend(self.advance(&conv));
+        }
         out
     }
 
@@ -1400,6 +1679,7 @@ impl AccountSync {
             return;
         }
         seen.extend(new.iter().copied());
+        self.named_changed = true;
         let accounts = new
             .iter()
             .map(|a| {
@@ -1422,12 +1702,16 @@ impl AccountSync {
     /// Answers whoever joined a channel log since we last wrapped there:
     /// our older keys when we share with joiners, else a new epoch for all.
     fn answer(&mut self) -> Vec<ClientMessage> {
-        if self.logkey_unsettled {
+        if self.logkey_unsettled || !self.pins_in() {
             return Vec::new();
         }
         let mut out = Vec::new();
         let convs: Vec<String> = self.joiners.keys().cloned().collect();
         for conv in convs {
+            if self.on_chains(&conv) {
+                out.extend(self.advance(&conv));
+                continue;
+            }
             let joiners: Vec<[u8; 16]> = self.joiners[&conv].iter().copied().collect();
             out.extend(self.ask_keys(joiners.iter().copied()));
             if joiners
@@ -1456,11 +1740,11 @@ impl AccountSync {
             if self.share && !mine.is_empty() {
                 for (epoch, k) in mine {
                     let wraps = self.wraps_for(&trusted, &k, &conv, epoch);
-                    if !wraps.is_empty() {
+                    for chunk in wraps.chunks(chains::WRAPS_PER_FRAME) {
                         out.push(ask(AccountRequest::EpochPut {
                             conv: conv.clone(),
                             epoch,
-                            wraps,
+                            wraps: chunk.to_vec(),
                         }));
                     }
                 }
@@ -1507,31 +1791,69 @@ impl AccountSync {
             if e.seq <= self.cursors.get(&conv).copied().unwrap_or(0) {
                 continue;
             }
-            let Some(key) = self.keys.get(&(conv.clone(), e.sender, e.epoch)) else {
-                // Not ours to read, unless its writer still owes us an answer,
-                // or told us of a key after we asked for the wraps.
-                if self.owed.get(&conv).is_some_and(|o| o.contains(&e.sender))
-                    || self.again.contains(&conv)
-                {
-                    still.push((conv, e));
+            let waits_for_writer = self.owed.get(&conv).is_some_and(|o| o.contains(&e.sender))
+                || self.again.contains(&conv);
+            let (envelope, sent_at) = if self.on_chains(&conv) {
+                let Some(signer) = self.logkey_of(&e.sender) else {
+                    if self.distrusted.contains(&e.sender) {
+                        self.count_unopened(&conv);
+                    } else {
+                        unknown.push(e.sender);
+                        still.push((conv, e));
+                    }
+                    continue;
+                };
+                // What a version before chains kept, under a writer's epoch: signed over
+                // its own label, so it opens only as what it was written as.
+                let old = self
+                    .keys
+                    .get(&(conv.clone(), e.sender, e.epoch))
+                    .and_then(|key| {
+                        open_entry(key, &conv, &e.sender, e.epoch, &signer, &e.ct).ok()
+                    });
+                match old.map_or_else(|| self.open_on_chain(&conv, &e, &signer), |o| Ok(Some(o))) {
+                    Ok(Some(opened)) => opened,
+                    Ok(None) => {
+                        still.push((conv, e));
+                        continue;
+                    }
+                    Err(()) => {
+                        // While its read asks for keys, it may open yet
+                        if waits_for_writer || self.fetching.get(&conv) == Some(&Fetch::Wraps) {
+                            still.push((conv, e));
+                        } else {
+                            self.count_unopened(&conv);
+                        }
+                        continue;
+                    }
                 }
-                continue;
-            };
-            let Some(signer) = self.logkey_of(&e.sender) else {
-                if !self.distrusted.contains(&e.sender) {
-                    unknown.push(e.sender);
-                    still.push((conv, e));
-                }
-                continue;
-            };
-            // Sealed or forged entries are dropped: the relay moved or made them.
-            let Ok((envelope, sent_at)) =
-                open_entry(key, &conv, &e.sender, e.epoch, &signer, &e.ct)
-            else {
-                continue;
+            } else {
+                let Some(key) = self.keys.get(&(conv.clone(), e.sender, e.epoch)) else {
+                    // Not ours to read, unless its writer still owes us an answer,
+                    // or told us of a key after we asked for the wraps.
+                    if waits_for_writer {
+                        still.push((conv, e));
+                    }
+                    continue;
+                };
+                let Some(signer) = self.logkey_of(&e.sender) else {
+                    if !self.distrusted.contains(&e.sender) {
+                        unknown.push(e.sender);
+                        still.push((conv, e));
+                    }
+                    continue;
+                };
+                // Sealed or forged entries are dropped: the relay moved or made them.
+                let Ok(opened) = open_entry(key, &conv, &e.sender, e.epoch, &signer, &e.ct) else {
+                    continue;
+                };
+                opened
             };
             if !self.opened.insert((conv.clone(), e.seq)) {
                 continue;
+            }
+            if let Some(peer) = self.other_party(&conv) {
+                self.reserve_pin(peer);
             }
             let from_me = e.sender == me;
             let name_of = |a: &[u8; 16]| {
@@ -1590,7 +1912,25 @@ impl AccountSync {
     pub fn on_reply(&mut self, reply: &AccountReply) -> Option<(Vec<ClientMessage>, Vec<Event>)> {
         let mut out = Vec::new();
         let mut events = Vec::new();
+        if self.holds_for_pages(reply) {
+            return Some((out, std::mem::take(&mut self.later)));
+        }
         match reply {
+            AccountReply::VaultStored { k, version } if k.starts_with("pins.") => {
+                out.extend(self.on_page_stored(k, *version))
+            }
+            AccountReply::VaultConflict { k, blob } if k.starts_with("pins.") => {
+                out.extend(self.on_page_conflict(k, blob.as_ref()))
+            }
+            AccountReply::VaultPageFound { k, blob } => {
+                self.on_pin_page(k, blob.as_ref(), &mut out, &mut events)
+            }
+            AccountReply::Error { request, reason } if request == "VaultPage" => {
+                self.on_page_refused(reason, &mut out, &mut events)
+            }
+            AccountReply::LogPendingMore => {
+                self.pending_more = std::mem::take(&mut self.pending_new);
+            }
             AccountReply::VaultStored { k, version } => {
                 out.extend(self.on_vault(Self::which(k)?, Some(*version), None))
             }
@@ -1599,18 +1939,32 @@ impl AccountSync {
             }
             AccountReply::Error { request, reason } if request == "VaultPut" => {
                 self.saving.clear();
-                events.push(Event::NotKept {
-                    reason: reason.clone(),
-                });
+                self.pin_write_refused(reason);
+                // For now is not news when it goes again by itself
+                if !self.book.paged || !reason.contains(SLOW_DOWN) {
+                    events.push(Event::NotKept {
+                        reason: reason.clone(),
+                    });
+                }
             }
             AccountReply::Error { request, reason }
                 if request.starts_with("Log")
                     || request.starts_with("Epoch")
-                    || request.starts_with("Wraps") =>
+                    || request.starts_with("Wraps")
+                    || request.starts_with("Chain")
+                    || request.starts_with("Own")
+                    || request == "BucketLists" =>
             {
                 let for_now = reason.contains(SLOW_DOWN);
+                // Whose `WrapsPage` it was: a read's goes on as a `LogFetch`'s does.
+                let writers_page = request == "WrapsPage"
+                    && self.wraps_asked.front().is_some_and(|a| a.is_writer());
+                let writers_epoch = self.writer_asks.iter().any(|(what, _)| *what == "EpochPut");
+                if request == "WrapsPage" {
+                    self.wraps_asked.pop_front();
+                }
                 match request.as_str() {
-                    "WrapsFetch" | "LogFetch" => {
+                    "WrapsFetch" | "LogFetch" | "ChainFetch" | "WrapsPage" if !writers_page => {
                         self.idle = 0;
                         if let Some(conv) = self.fetch_asks.pop_front() {
                             if for_now {
@@ -1624,6 +1978,62 @@ impl AccountSync {
                                 self.outbox.retain(|o| o.conv != conv);
                                 out.extend(self.fetch_done(&conv));
                                 events.push(Event::NotRead {
+                                    reason: reason.clone(),
+                                });
+                            }
+                        }
+                    }
+                    "WrapsPage" | "OwnChains" | "OwnBuckets" | "BucketLists" | "OwnChainRows"
+                    | "ChainPut" | "LogMemberIds" | "EpochPut"
+                        if request != "EpochPut" || writers_epoch =>
+                    {
+                        let conv = self
+                            .writer_asks
+                            .iter()
+                            .find(|(what, _)| what == request)
+                            .map(|(_, conv)| conv.clone());
+                        if let Some(conv) = conv {
+                            if for_now {
+                                // What it holds stays, and the next tick goes on
+                                self.held = true;
+                                self.writer_held(&conv, request);
+                            } else if self.join_asks.contains(&conv) {
+                                // Refused ahead of a seat on its way: goes on the same, for
+                                // a round or two if that answer was lost
+                                self.writer_held(&conv, request);
+                                self.round(&conv, &mut events);
+                            } else {
+                                // Nothing waiting is nothing to tell: a seat refused has
+                                // said so, or said nothing on purpose. A post is always told.
+                                let posts = self.outbox.iter().any(|o| o.conv == conv);
+                                let waited = posts || self.joiners.contains_key(&conv);
+                                self.writer_refused(&conv, request);
+                                if request == "ChainPut" || posts {
+                                    self.copy_refused = true;
+                                }
+                                if posts || (waited && self.joined.contains(&conv)) {
+                                    events.push(Event::NotKept {
+                                        reason: reason.clone(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    "LogJoinMany" => self.join_many_refused(for_now, reason),
+                    "LogJoin" if self.chains => {
+                        if let Some(conv) = self.join_asks.pop_front() {
+                            // Just left holding a key: a wait, not news, unless a post is
+                            // lost to it. The next time it is entered asks again.
+                            let waits = reason.contains("again later");
+                            if for_now || waits {
+                                self.joined.remove(&conv);
+                            }
+                            self.held |= for_now;
+                            let posts = self.outbox.iter().any(|o| o.conv == conv);
+                            self.outbox.retain(|o| o.conv != conv);
+                            self.copy_refused |= posts;
+                            if posts || (!for_now && !waits) {
+                                events.push(Event::NotKept {
                                     reason: reason.clone(),
                                 });
                             }
@@ -1658,6 +2068,7 @@ impl AccountSync {
                     _ => {
                         if request == "LogAppend" {
                             self.in_flight.pop_front();
+                            self.append_idle = 0;
                             self.copy_refused = true;
                         }
                         events.push(Event::NotKept {
@@ -1665,6 +2076,12 @@ impl AccountSync {
                         });
                     }
                 }
+            }
+            AccountReply::EpochStored { conv, .. } if self.on_chains(conv) => {
+                self.on_chain_stored(conv, false, "EpochPut", &mut out, &mut events);
+                out.extend(self.advance(conv));
+                out.extend(self.flush());
+                out.extend(self.answer());
             }
             AccountReply::LogKeyStored
             | AccountReply::EpochStored { .. }
@@ -1679,6 +2096,7 @@ impl AccountSync {
                     }
                     None => self.own_epochs.clear(),
                 }
+                self.purged(conv.as_deref());
                 return None;
             }
             AccountReply::LogConvs { convs } => {
@@ -1696,12 +2114,101 @@ impl AccountSync {
                     .iter()
                     .filter_map(|conv| self.other_party(conv))
                     .collect();
+                for peer in &peers {
+                    self.reserve_pin(*peer);
+                }
                 out.extend(self.ask_keys(peers));
                 for conv in unread {
                     out.extend(self.fetch(conv));
                 }
             }
-            AccountReply::LogJoined { conv } => out.extend(self.fetch(conv)),
+            AccountReply::LogJoined { conv } => {
+                if let Some(at) = self.join_asks.iter().position(|c| c == conv) {
+                    self.join_asks.remove(at);
+                }
+                out.extend(self.fetch(conv))
+            }
+            AccountReply::LogJoinedMany { joined, refused } => {
+                out.extend(self.on_joined_many(joined, refused))
+            }
+            AccountReply::ChainPage {
+                conv,
+                entries,
+                more,
+                owed,
+                skipped,
+                upto,
+                floor,
+                window,
+            } if self.on_chains(conv) => {
+                out.extend(
+                    self.on_chain_page(
+                        conv, entries, *more, owed, *skipped, *upto, *floor, *window,
+                    ),
+                );
+                out.extend(self.flush());
+            }
+            AccountReply::WrapsPage { conv, keys, served } if self.on_chains(conv) => {
+                out.extend(self.on_wraps_page(conv, keys, *served));
+                out.extend(self.advance(conv));
+                self.drain(&mut out, &mut events);
+                out.extend(self.flush());
+                out.extend(self.answer());
+            }
+            AccountReply::ChainStored { conv, behind, .. } if self.on_chains(conv) => {
+                self.on_chain_stored(conv, *behind, "ChainPut", &mut out, &mut events);
+                out.extend(self.advance(conv));
+                out.extend(self.flush());
+                out.extend(self.answer());
+            }
+            AccountReply::ChainRekey {
+                conv,
+                new_chain,
+                missing,
+                gone,
+            } if self.on_chains(conv) => {
+                self.on_chain_rekey(conv, *new_chain, missing, gone, &mut events);
+                out.extend(self.advance(conv));
+                out.extend(self.flush());
+            }
+            AccountReply::LogMemberIdsFound { conv, ids, more } if self.on_chains(conv) => {
+                self.on_member_ids(conv, ids, *more);
+                out.extend(self.advance(conv));
+            }
+            AccountReply::OwnChains {
+                conv,
+                newest,
+                chains,
+                more,
+            } if self.on_chains(conv) => {
+                self.on_own_chains(conv, *newest, chains, *more);
+                out.extend(self.advance(conv));
+                out.extend(self.flush());
+                out.extend(self.answer());
+            }
+            AccountReply::OwnBuckets {
+                conv,
+                buckets,
+                more,
+            } if self.on_chains(conv) => {
+                self.on_own_buckets(conv, buckets, *more);
+                out.extend(self.advance(conv));
+            }
+            AccountReply::BucketLists { conv, lists } if self.on_chains(conv) => {
+                self.on_bucket_lists(conv, lists);
+                out.extend(self.advance(conv));
+            }
+            AccountReply::OwnChainRows {
+                conv,
+                chain,
+                seals,
+                direct,
+                links,
+                more,
+            } if self.on_chains(conv) => {
+                self.on_own_rows(conv, *chain, seals, direct, links, *more);
+                out.extend(self.advance(conv));
+            }
             AccountReply::Wraps { conv, wraps } => {
                 self.answered(conv);
                 self.wraps_known.insert(conv.clone());
@@ -1727,7 +2234,10 @@ impl AccountSync {
                 // to them; a channel's writers are asked for as their entries come.
                 let want = self.ask_keys(self.other_party(conv));
                 let target = self.target.contains(conv);
-                if !want.is_empty() {
+                if self.on_chains(conv) {
+                    // Keys of a version before chains, for what chains did not open
+                    out.extend(self.chain_read(conv));
+                } else if !want.is_empty() {
                     out.extend(want);
                     self.fetching.insert(conv.clone(), Fetch::Keys);
                 } else if target {
@@ -1757,14 +2267,25 @@ impl AccountSync {
                 } else {
                     None
                 };
-                // Asked, and the relay had nothing for some: they cannot be written to.
+                // Asked, and the relay had nothing for some: they cannot be written to. An empty
+                // answer names no ask, and may be the next one's with this one's lost. Since
+                // whoever is judged here gets rows that open nothing, it takes asking again.
+                let mut again = Vec::new();
                 for a in answered.unwrap_or_default() {
                     if !self.peers.contains_key(&a) && !keys.iter().any(|k| k.account == a) {
-                        self.distrusted.insert(a);
+                        if keys.is_empty() && self.key_misses.insert(a) {
+                            self.asked_keys.remove(&a);
+                            again.push(a);
+                        } else {
+                            self.key_misses.remove(&a);
+                            self.distrusted.insert(a);
+                        }
                     }
                 }
+                out.extend(self.ask_keys(again));
                 out.extend(self.keys_in());
                 self.drain(&mut out, &mut events);
+                out.extend(self.advance_waiting());
                 out.extend(self.flush());
                 out.extend(self.answer());
             }
@@ -1804,12 +2325,15 @@ impl AccountSync {
             AccountReply::LogAppended { conv, seq, .. } => {
                 self.copy_refused = false;
                 self.in_flight.pop_front();
+                self.append_idle = 0;
                 self.rekeys.remove(conv);
-                // Ours: nothing to fetch back up to here.
-                let c = self.cursors.entry(conv.clone()).or_insert(0);
-                if c.saturating_add(1) >= *seq {
-                    *c = *seq;
+                if self.settle_rekey(conv, &mut events) {
+                    out.extend(self.advance(conv));
+                    out.extend(self.flush());
                 }
+                // The cursor stays where it is. It reaches disk ahead of this post, whose save
+                // waits in the front end, and a crash between the two would lose the post on
+                // this device for good. Read back once at the next read, it is one we hold.
                 events.push(Event::Kept {
                     conv: conv.clone(),
                     seq: *seq,
@@ -1819,6 +2343,7 @@ impl AccountSync {
                 // Somebody joined or left since our key: ask who is there now,
                 // start a new key for them, and send it again.
                 let (_, epoch, again) = self.in_flight.pop_front().unwrap_or_default();
+                self.append_idle = 0;
                 // Counted once per refused key: the messages sent under it
                 // come back one by one, and only the first starts a new one.
                 if self.own_epochs.get(conv).is_some_and(|(e, _)| *e == epoch) {
@@ -1855,6 +2380,9 @@ impl AccountSync {
                 out.extend(self.answer());
             }
             AccountReply::LogPending { conv, joiners } => {
+                for j in joiners {
+                    self.pending_new |= self.pending_seen.insert((conv.clone(), *j));
+                }
                 self.joiners
                     .entry(conv.clone())
                     .or_default()
@@ -1864,17 +2392,7 @@ impl AccountSync {
                 self.asked_members.remove(conv);
                 out.extend(self.answer());
             }
-            AccountReply::LogNews { conv } => {
-                // A key for us, or a message: what waited for it, and what came
-                // after. A burst of them while it is being read is one more read.
-                self.wraps_known.remove(conv);
-                if self.fetching.contains_key(conv) {
-                    self.target.insert(conv.clone());
-                    self.again.insert(conv.clone());
-                } else {
-                    out.extend(self.fetch(conv));
-                }
-            }
+            AccountReply::LogNews { conv } => out.extend(self.read_news(conv)),
             _ => return None,
         }
         let mut all = std::mem::take(&mut self.later);
@@ -2797,6 +3315,37 @@ mod tests {
         })
         .unwrap();
         assert!(s.distrusted.contains(&first[0].id));
+    }
+
+    /// An empty answer names no ask, so the one in front may just have lost its own. Whoever is
+    /// judged here gets rows that open nothing, and hears nothing of it.
+    #[test]
+    fn an_empty_answer_judges_nobody_until_it_comes_twice() {
+        let me = account(1);
+        let mut s = sync_for(&me);
+        let (bob, cat, dee) = (account(2), account(3), account(4));
+        s.ask_keys([bob.id]);
+        s.ask_keys([cat.id]);
+        // Bob's answer never comes, and cat's is empty
+        let (out, _) = s
+            .on_reply(&AccountReply::LogKeysFound { keys: Vec::new() })
+            .unwrap();
+        assert!(!s.distrusted.contains(&bob.id), "bob was only unlucky");
+        assert_eq!(sent(&out, "LogKeys").len(), 1, "and is asked for again");
+        s.on_reply(&AccountReply::LogKeysFound {
+            keys: vec![bob.info("bob")],
+        })
+        .unwrap();
+        assert!(s.peers.contains_key(&bob.id));
+        assert!(!s.distrusted.contains(&bob.id));
+
+        // Whereas someone with truly no key is found out at the second
+        s.ask_keys([dee.id]);
+        for _ in 0..2 {
+            s.on_reply(&AccountReply::LogKeysFound { keys: Vec::new() })
+                .unwrap();
+        }
+        assert!(s.distrusted.contains(&dee.id));
     }
 
     /// Refused for good: what waits for that conversation is let go, so it is

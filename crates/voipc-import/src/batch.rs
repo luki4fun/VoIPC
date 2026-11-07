@@ -1,6 +1,6 @@
-//! Rows into frames. Nothing else guards a client's frame: `encode_client_msg` has no limit,
-//! and one past `MAX_MSG_SIZE` ends the connection. A frame seals before it passes
-//! `IMPORT_FRAME_BYTES` or its row cap. One row always fits; two need not.
+//! Rows into frames. `encode_client_msg` refuses a frame past `MAX_MSG_SIZE`, which would
+//! lose those rows. A frame seals before it passes `IMPORT_FRAME_BYTES` or its row cap. One
+//! row always fits; two need not.
 
 use serde::Serialize;
 use voipc_protocol::codec::{encode_client_msg, MAX_MSG_SIZE};

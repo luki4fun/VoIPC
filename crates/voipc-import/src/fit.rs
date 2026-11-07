@@ -1,7 +1,8 @@
-//! One channel list. It goes in one message to everyone at every connect, and one that
-//! does not fit is not sent: everybody would arrive at a server with no channels. Discord's
-//! 500 channels at the longest name fit once topics give way, so topics do, and the
-//! relay still refuses whatever would not fit.
+//! One channel list, on a relay before protocol 21: it goes in one message to everyone at
+//! every connect, and one that does not fit is not sent, so everybody would arrive at a
+//! server with no channels. Discord's 500 channels at the longest name fit once topics give
+//! way, so topics do, and that relay refuses whatever would not fit. From 21 on a list comes
+//! in as many frames as it takes, and the relay names no limit here.
 
 use std::collections::HashMap;
 
@@ -95,7 +96,7 @@ mod tests {
     use voipc_protocol::messages::ServerMessage;
     use voipc_protocol::types::{ChannelInfo, ProximityMode};
 
-    /// The relay's `LIST_LIMIT`, which it reports in `ImportFacts`.
+    /// What a relay before protocol 21 reports in `ImportFacts`.
     const LIMIT: usize = 60 * 1024;
 
     fn row(id: u64, name: &str, topic: &str, text: bool) -> FitRow {

@@ -167,6 +167,27 @@ fn admin_state() -> Arc<ServerState> {
 }
 
 /// Authenticates `username` from `ip` over a duplex.
+/// What a click into a text channel comes to: the relay's answer, and nobody else hears.
+fn text_joined(channel_id: ChannelId) -> impl Fn(&ServerMessage) -> bool {
+    move |m| matches!(m, ServerMessage::TextJoined { joined, .. } if joined.iter().any(|row| row.0 == channel_id))
+}
+
+/// What a writer does before its first post in a text channel: a post goes only to people
+/// it has been told of.
+async fn key_check(writer: &mut Client, channel_id: ChannelId) {
+    writer
+        .send(&ClientMessage::KeyCheck {
+            channel_id,
+            restart: true,
+        })
+        .await;
+    writer
+        .expect("KeysOwed", |m| {
+            matches!(m, ServerMessage::KeysOwed { channel_id: c, more: false, .. } if *c == channel_id)
+        })
+        .await;
+}
+
 async fn connect(state: &Arc<ServerState>, username: &str, ip: IpAddr) -> Client {
     let mut client = open(state, username, ip).await;
     client
@@ -1247,11 +1268,8 @@ async fn text_channel_chat_reaches_members_without_moving_them() {
     else {
         unreachable!()
     };
-    bob.expect(
-        "UserList for the text channel",
-        |m| matches!(m, ServerMessage::UserList { channel_id: c, .. } if *c == text.channel_id),
-    )
-    .await;
+    bob.expect("the text channel", text_joined(text.channel_id))
+        .await;
     // Creating a text channel did not move bob out of the lobby
     assert_eq!(state.sessions.get(&2).unwrap().channel_id, 0);
 
@@ -1262,16 +1280,14 @@ async fn text_channel_chat_reaches_members_without_moving_them() {
         })
         .await;
     alice
-        .expect(
-            "UserList for the text channel",
-            |m| matches!(m, ServerMessage::UserList { channel_id: c, .. } if *c == text.channel_id),
-        )
+        .expect("the text channel", text_joined(text.channel_id))
         .await;
     // ...and joining it did not take alice out of the voice room
     assert_eq!(state.sessions.get(&1).unwrap().channel_id, voice.channel_id);
     assert!(state.is_member(text.channel_id, 1).await);
 
     // A message naming the text channel reaches its other member
+    key_check(&mut alice, text.channel_id).await;
     alice
         .send(&ClientMessage::SendEncryptedChannelMessage {
             channel_id: text.channel_id,
@@ -1279,13 +1295,11 @@ async fn text_channel_chat_reaches_members_without_moving_them() {
         })
         .await;
     let got = bob
-        .expect("EncryptedChannelChatMessage", |m| {
-            matches!(m, ServerMessage::EncryptedChannelChatMessage { .. })
-        })
+        .expect("TextPost", |m| matches!(m, ServerMessage::TextPost { .. }))
         .await;
     assert!(matches!(
         got,
-        ServerMessage::EncryptedChannelChatMessage { channel_id, user_id: 1, .. }
+        ServerMessage::TextPost { channel_id, user_id: 1, .. }
             if channel_id == text.channel_id
     ));
 
@@ -1302,7 +1316,7 @@ async fn text_channel_chat_reaches_members_without_moving_them() {
         .await;
     assert!(matches!(refused, ServerMessage::ChannelError { reason } if reason.contains("not in")));
 
-    // Leaving is its own message, and everybody hears about it
+    // Leaving is its own message, which only they hear
     alice
         .send(&ClientMessage::LeaveChannel {
             channel_id: text.channel_id,
@@ -1368,12 +1382,7 @@ async fn announce_and_slow_mode_hold_back_members_but_not_managers() {
             password: None,
         })
         .await;
-    alice
-        .expect(
-            "UserList for news",
-            |m| matches!(m, ServerMessage::UserList { channel_id: c, .. } if *c == news),
-        )
-        .await;
+    alice.expect("news", text_joined(news)).await;
 
     let set =
         |announce: Option<bool>, slow_mode_secs: Option<u32>| ClientMessage::SetChannelOptions {
@@ -1388,8 +1397,12 @@ async fn announce_and_slow_mode_hold_back_members_but_not_managers() {
         channel_id: news,
         ciphertext: vec![byte],
     };
-    let is_post = |byte: u8| move |m: &ServerMessage| matches!(m, ServerMessage::EncryptedChannelChatMessage { ciphertext, .. } if ciphertext == &vec![byte]);
+    let is_post = |byte: u8| move |m: &ServerMessage| matches!(m, ServerMessage::TextPost { ciphertext, .. } if ciphertext == &vec![byte]);
     let is_refusal = |what: &'static str| move |m: &ServerMessage| matches!(m, ServerMessage::ChannelError { reason } if reason.contains(what));
+
+    // Told of each other: a check is no post, so nothing below counts it
+    key_check(&mut bob, news).await;
+    key_check(&mut alice, news).await;
 
     // Announcements: alice is refused, the creator gets through
     bob.send(&set(Some(true), None)).await;
@@ -1418,9 +1431,7 @@ async fn announce_and_slow_mode_hold_back_members_but_not_managers() {
         .await;
     // The first post bob gets from alice is 3, so 1 never left the relay
     let got = bob
-        .expect("a post", |m| {
-            matches!(m, ServerMessage::EncryptedChannelChatMessage { .. })
-        })
+        .expect("a post", |m| matches!(m, ServerMessage::TextPost { .. }))
         .await;
     assert!(
         is_post(3)(&got),
@@ -1436,9 +1447,7 @@ async fn announce_and_slow_mode_hold_back_members_but_not_managers() {
     alice.send(&post(7)).await;
     // ...and the next one is 7, so 4 did not either
     let got = bob
-        .expect("a post", |m| {
-            matches!(m, ServerMessage::EncryptedChannelChatMessage { .. })
-        })
+        .expect("a post", |m| matches!(m, ServerMessage::TextPost { .. }))
         .await;
     assert!(
         is_post(7)(&got),
@@ -1526,10 +1535,7 @@ async fn text_channel_with_two(owner: &mut Client, other: &mut Client, name: &st
     };
     let channel_id = channel.channel_id;
     owner
-        .expect(
-            "UserList",
-            |m| matches!(m, ServerMessage::UserList { channel_id: c, .. } if *c == channel_id),
-        )
+        .expect("the text channel", text_joined(channel_id))
         .await;
     other
         .send(&ClientMessage::JoinChannel {
@@ -1538,10 +1544,7 @@ async fn text_channel_with_two(owner: &mut Client, other: &mut Client, name: &st
         })
         .await;
     other
-        .expect(
-            "UserList",
-            |m| matches!(m, ServerMessage::UserList { channel_id: c, .. } if *c == channel_id),
-        )
+        .expect("the text channel", text_joined(channel_id))
         .await;
     channel_id
 }
@@ -1575,6 +1578,7 @@ async fn an_oversized_message_is_refused_instead_of_dropping_the_channel() {
 
     // Bob is the one this protects: his connection is still there and
     // still carrying the channel's chat.
+    key_check(&mut alice, channel_id).await;
     alice
         .send(&ClientMessage::SendEncryptedChannelMessage {
             channel_id,
@@ -1582,13 +1586,11 @@ async fn an_oversized_message_is_refused_instead_of_dropping_the_channel() {
         })
         .await;
     let got = bob
-        .expect("EncryptedChannelChatMessage", |m| {
-            matches!(m, ServerMessage::EncryptedChannelChatMessage { .. })
-        })
+        .expect("TextPost", |m| matches!(m, ServerMessage::TextPost { .. }))
         .await;
     assert!(matches!(
         got,
-        ServerMessage::EncryptedChannelChatMessage { channel_id: c, user_id: 1, .. }
+        ServerMessage::TextPost { channel_id: c, user_id: 1, .. }
             if c == channel_id
     ));
 }
@@ -1811,13 +1813,10 @@ async fn a_join_to_a_hidden_member_channel_names_nobody_to_outsiders() {
     assert_eq!((user.user_id, user.username.as_str()), (1, "alice"));
 }
 
-/// The id rule above must not widen the *name* rule it sits next to: an
-/// ordinary channel's joins carry an id to everybody, and have never
-/// carried a name to anybody outside it. That is what stops a move between
-/// an anonymous channel and an ordinary one from handing an outsider both
-/// names for one person.
+/// An ordinary channel's joins carry an id and a name to everybody: anyone may ask its list,
+/// and every app would. An anonymous room's carry neither (`an_anonymous_rooms_does_not`).
 #[tokio::test]
-async fn an_ordinary_channel_still_names_its_members_to_nobody_outside() {
+async fn an_ordinary_channel_names_its_members_to_everyone_outside() {
     let state = admin_state();
     let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
     let mut alice = connect(&state, "alice", lo).await; // user 1
@@ -1849,7 +1848,7 @@ async fn an_ordinary_channel_still_names_its_members_to_nobody_outside() {
         unreachable!()
     };
     assert_eq!(user.user_id, 1, "the count has to be attributable");
-    assert_eq!(user.username, "", "an outsider was told the name");
+    assert_eq!(user.username, "alice");
 }
 
 /// A game drives the audio filter in a routed channel — `docs/SDK.md`
@@ -1956,10 +1955,7 @@ async fn keys_to_many_members_pass_while_a_flood_at_one_is_capped() {
         })
         .await;
     carol
-        .expect(
-            "UserList",
-            |m| matches!(m, ServerMessage::UserList { channel_id: c, .. } if *c == channel_id),
-        )
+        .expect("the text channel", text_joined(channel_id))
         .await;
 
     // Past one target's budget, aimed at Bob — and deliberately still
@@ -2004,6 +2000,7 @@ async fn keys_to_many_members_pass_while_a_flood_at_one_is_capped() {
 
     // Bob got his burst and no more. Counted against a message that must
     // arrive after them rather than against a timeout.
+    key_check(&mut alice, channel_id).await;
     alice
         .send(&ClientMessage::SendEncryptedChannelMessage {
             channel_id,
@@ -2014,7 +2011,7 @@ async fn keys_to_many_members_pass_while_a_flood_at_one_is_capped() {
     loop {
         match bob.next().await {
             Some(ServerMessage::SenderKeyReceived { .. }) => relayed += 1,
-            Some(ServerMessage::EncryptedChannelChatMessage { .. }) => break,
+            Some(ServerMessage::TextPost { .. }) => break,
             Some(_) => continue,
             None => panic!("connection closed"),
         }
@@ -2046,6 +2043,7 @@ async fn a_history_request_stops_at_a_member_who_does_not_share() {
         .await;
     // Driven by a message that must arrive rather than by a timeout: if
     // the request was forwarded it is already in Bob's queue ahead of it.
+    key_check(&mut alice, channel_id).await;
     alice
         .send(&ClientMessage::SendEncryptedChannelMessage {
             channel_id,
@@ -2057,7 +2055,7 @@ async fn a_history_request_stops_at_a_member_who_does_not_share() {
             Some(ServerMessage::ChannelHistoryRequested { .. }) => {
                 panic!("the request reached a member who does not share history")
             }
-            Some(ServerMessage::EncryptedChannelChatMessage { .. }) => break,
+            Some(ServerMessage::TextPost { .. }) => break,
             Some(_) => continue,
             None => panic!("connection closed"),
         }
@@ -3456,7 +3454,14 @@ async fn a_password_change_keeps_this_connection_and_forgets_the_device_keys() {
         ServerMessage::Account(AccountReply::DeviceAdded)
     ));
     let (relay_id, dek) = (signed.relay_id, signed.vault.dek());
-    let (mut session, _) = AccountSession::start(signed, &info, Default::default(), false, true);
+    let (mut session, _) = AccountSession::start(
+        signed,
+        &info,
+        Default::default(),
+        false,
+        true,
+        PROTOCOL_VERSION,
+    );
     let old = stretch("correct horse battery", &relay_id, "max");
     let new = stretch("another good password", &relay_id, "max");
     for m in session.password_change(&new, &new, None, None).send {
@@ -3542,14 +3547,17 @@ async fn a_failed_password_change_puts_the_old_slot_back() {
 }
 
 async fn open_raw(state: &Arc<ServerState>, first: &ClientMessage) -> Client {
+    open_raw_from(state, first, IpAddr::V4(Ipv4Addr::LOCALHOST)).await
+}
+
+async fn open_raw_from(state: &Arc<ServerState>, first: &ClientMessage, ip: IpAddr) -> Client {
     let (stream, server) = tokio::io::duplex(65536);
     let (media_tx, _media_rx) = mpsc::channel(8);
     let (sid_tx, _sid_rx) = oneshot::channel();
-    let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
     let handler = tokio::spawn(handle_connection(
         server,
         "raw".into(),
-        lo,
+        ip,
         media_tx,
         sid_tx,
         state.clone(),
@@ -3638,10 +3646,11 @@ async fn one_writer_cannot_crowd_another_out_of_the_wraps() {
         .await
         .unwrap();
     }
-    assert!(matches!(
-        epoch_put(&mut alice, conv, 1, &[a.id, b.id, e.id]).await,
-        ServerMessage::Account(AccountReply::EpochStored { .. })
-    ));
+    let _ = &mut alice;
+    crate::accounts::raw(&relay, &format!(
+        "INSERT INTO voipc_wraps (conv, owner, epoch, recipient, wrapped, created_at) VALUES ('{conv}', x'{}', 1, x'{}', x'00', 1)",
+        hex::encode(a.id), hex::encode(b.id)
+    )).await.unwrap();
     let later = l4f_accounts::util::now() + 10;
     for epoch in 0..400 {
         crate::accounts::raw(&relay, &format!(
@@ -3807,6 +3816,123 @@ async fn the_clients_sign_in_machine_signs_up_remembers_the_device_and_signs_in_
     );
     let mut c4 = open_raw(&state, &first).await;
     assert!(drive(&mut c4, &mut m).await.unwrap_err().contains("Wrong"));
+}
+
+/// Pins past the sign-in frame: their own namespace, their own bound, and neither fills up
+/// the other, though l4f adds up all of an account's blobs.
+#[tokio::test]
+async fn a_pin_page_lies_outside_the_sign_in_frame_and_has_its_own_bound() {
+    let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+    let (mut c, info) = register(&state, "kim").await;
+    let relay = state.accounts.clone().unwrap();
+    let id = l4f_accounts::model::AccountId(info.id);
+    // A client's own pace is a page or two at a time, and each has a test of its own
+    for mut s in state.sessions.iter_mut() {
+        s.account_rate = crate::state::RateLimiter::new(1e9, 1e9);
+        s.global_rate = crate::state::RateLimiter::new(1e9, 1e9);
+    }
+    let put = async |c: &mut Client, k: &str, v: Vec<u8>, expect: i64| {
+        c.send(&ClientMessage::Account(AccountRequest::VaultPut {
+            k: k.into(),
+            v,
+            expect,
+        }))
+        .await;
+        reply(&c.expect("an answer", |m| reply(m).is_some()).await)
+            .unwrap()
+            .clone()
+    };
+    let full = vec![7u8; 48 * 1024];
+    for n in 0..56 {
+        let out = put(&mut c, &format!("pins.{n}"), full.clone(), 0).await;
+        assert!(
+            matches!(out, AccountReply::VaultStored { version: 1, .. }),
+            "{n}: {out:?}"
+        );
+    }
+    // 2.7 MB of them, and the vault is written as before, to its own 56 KiB
+    let out = put(&mut c, "item.big", vec![1; 48 * 1024], 0).await;
+    assert!(matches!(out, AccountReply::VaultStored { .. }), "{out:?}");
+    let out = put(&mut c, "item.more", vec![1; 9 * 1024], 0).await;
+    assert!(
+        matches!(&out, AccountReply::Error { reason, .. } if reason.contains("full")),
+        "{out:?}"
+    );
+    // And a page is rewritten on top of a full vault
+    let out = put(&mut c, "pins.3", full.clone(), 1).await;
+    assert!(
+        matches!(out, AccountReply::VaultStored { version: 2, .. }),
+        "{out:?}"
+    );
+    // No page by any other name
+    for k in ["pins.56", "pins.01", "pins.x", "pins.", "pins.65536"] {
+        let out = put(&mut c, k, vec![1], 0).await;
+        assert!(matches!(out, AccountReply::Error { .. }), "{k}: {out:?}");
+    }
+    // A stale write gets what is there
+    let out = put(&mut c, "pins.3", vec![1], 1).await;
+    let AccountReply::VaultConflict { blob: Some(b), .. } = out else {
+        panic!("{out:?}");
+    };
+    assert_eq!(b.version, 2);
+
+    // Read one at a time, and never in what a sign-in sends
+    c.send(&ClientMessage::Account(AccountRequest::VaultPage {
+        k: "pins.3".into(),
+    }))
+    .await;
+    let ServerMessage::Account(AccountReply::VaultPageFound { k, blob: Some(b) }) =
+        c.expect("a page", |m| reply(m).is_some()).await
+    else {
+        panic!("a page")
+    };
+    assert_eq!((k.as_str(), b.v.len(), b.version), ("pins.3", 48 * 1024, 2));
+    let vault = relay.vault(id).await.unwrap();
+    assert!(
+        vault.iter().all(|b| !b.k.starts_with("pins.")),
+        "a page in the sign-in frame"
+    );
+    assert_eq!(
+        relay
+            .store()
+            .blob_count(id, crate::accounts::PINS_NS)
+            .await
+            .unwrap(),
+        56
+    );
+
+    c.send(&ClientMessage::Account(AccountRequest::VaultPage {
+        k: "pins.99".into(),
+    }))
+    .await;
+    assert!(matches!(
+        c.expect("refused", |m| reply(m).is_some()).await,
+        ServerMessage::Account(AccountReply::Error { request, .. }) if request == "VaultPage"
+    ));
+}
+
+/// A page nobody wrote is none, not an error: a device new to the account sees the difference
+/// from what its index says.
+#[tokio::test]
+async fn a_pin_page_nobody_wrote_is_none_and_another_accounts_is_not_read() {
+    let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+    let (mut a, _) = register(&state, "kim").await;
+    let (mut b, _) = register(&state, "lou").await;
+    a.send(&ClientMessage::Account(AccountRequest::VaultPut {
+        k: "pins.0".into(),
+        v: b"kims".to_vec(),
+        expect: 0,
+    }))
+    .await;
+    a.expect("stored", |m| reply(m).is_some()).await;
+    b.send(&ClientMessage::Account(AccountRequest::VaultPage {
+        k: "pins.0".into(),
+    }))
+    .await;
+    assert!(matches!(
+        b.expect("none", |m| reply(m).is_some()).await,
+        ServerMessage::Account(AccountReply::VaultPageFound { blob: None, .. })
+    ));
 }
 
 #[tokio::test]
@@ -4192,8 +4318,10 @@ async fn a_dm_written_while_they_were_away_is_read_on_every_device_once() {
     let (mut alice, a, alice_signed) = register_with(&state, "alice").await;
     let (mut bob, b, bob_signed) = register_with(&state, "bob").await;
     let (mut sa, first) = AccountSync::start(&alice_signed, a.id, Default::default(), true);
+    sa.set_protocol(PROTOCOL_VERSION);
     pump(&mut alice, &mut sa, first).await;
     let (mut sb, first) = AccountSync::start(&bob_signed, b.id, Default::default(), true);
+    sb.set_protocol(PROTOCOL_VERSION);
     pump(&mut bob, &mut sb, first).await;
     drop(bob);
 
@@ -4219,6 +4347,7 @@ async fn a_dm_written_while_they_were_away_is_read_on_every_device_once() {
     // Bob comes back: it is there, from alice, opened and proven.
     let (mut bob2, _, bob_signed2) = sign_in_password(&state, "bob").await;
     let (mut sb2, first) = AccountSync::start(&bob_signed2, b.id, Default::default(), true);
+    sb2.set_protocol(PROTOCOL_VERSION);
     let events = pump(&mut bob2, &mut sb2, first).await;
     let got: Vec<_> = events
         .iter()
@@ -4252,6 +4381,7 @@ async fn a_dm_written_while_they_were_away_is_read_on_every_device_once() {
     drop(bob2);
     let (mut bob3, _, bob_signed3) = sign_in_password(&state, "bob").await;
     let (mut sb3, first) = AccountSync::start(&bob_signed3, b.id, memory, true);
+    sb3.set_protocol(PROTOCOL_VERSION);
     let again = pump(&mut bob3, &mut sb3, first).await;
     assert!(
         !again.iter().any(|e| matches!(e, Event::Message { .. })),
@@ -4261,6 +4391,7 @@ async fn a_dm_written_while_they_were_away_is_read_on_every_device_once() {
     drop(alice);
     let (mut alice2, _, alice_signed2) = sign_in_password(&state, "alice").await;
     let (mut sa2, first) = AccountSync::start(&alice_signed2, a.id, Default::default(), true);
+    sa2.set_protocol(PROTOCOL_VERSION);
     let mine = pump(&mut alice2, &mut sa2, first).await;
     assert!(
         mine.iter()
@@ -4283,8 +4414,10 @@ async fn a_message_kept_for_somebody_online_reaches_them_at_once() {
     let (mut alice, a, alice_signed) = register_with(&state, "alice").await;
     let (mut bob, b, bob_signed) = register_with(&state, "bob").await;
     let (mut sa, first) = AccountSync::start(&alice_signed, a.id, Default::default(), true);
+    sa.set_protocol(PROTOCOL_VERSION);
     pump(&mut alice, &mut sa, first).await;
     let (mut sb, first) = AccountSync::start(&bob_signed, b.id, Default::default(), true);
+    sb.set_protocol(PROTOCOL_VERSION);
     pump(&mut bob, &mut sb, first).await;
     let save = sa.set_prefs(Prefs {
         cloud: true,
@@ -4509,14 +4642,27 @@ async fn member(
     share: bool,
 ) -> (Client, AccountInfo, voipc_crypto::sync::AccountSync) {
     use voipc_crypto::sync::{AccountSync, Prefs};
+    // Sharing takes the privilege, as in an app: whoever shares here is given it first
+    if share {
+        let relay = state.accounts.clone().unwrap();
+        let user = relay.store().role_by_name("user").await.unwrap().unwrap();
+        relay
+            .store()
+            .set_role_scopes(user.id, &[voipc_protocol::types::SHARE_HISTORY.to_string()])
+            .await
+            .unwrap();
+    }
     let (mut c, info, signed) = register_with(state, name).await;
     let (mut s, first) = AccountSync::start(&signed, info.id, Default::default(), share);
+    s.set_protocol(PROTOCOL_VERSION);
     pump(&mut c, &mut s, first).await;
     let save = s.set_prefs(Prefs {
         cloud: true,
         asked: true,
     });
     pump(&mut c, &mut s, save).await;
+    c.send(&ClientMessage::SetHistorySharing { enabled: share })
+        .await;
     into_lounge(state, &info.id).await;
     let out = s.enter(log);
     pump(&mut c, &mut s, out).await;
@@ -4579,6 +4725,7 @@ async fn a_channel_log_is_read_by_members_who_were_away() {
     // Bob, on another device and not in the channel: it is there for him.
     let (mut bob2, _, signed) = sign_in_password(&state, "bob").await;
     let (mut sb2, first) = AccountSync::start(&signed, b.id, Default::default(), true);
+    sb2.set_protocol(PROTOCOL_VERSION);
     let events = pump(&mut bob2, &mut sb2, first).await;
     assert_eq!(
         channel_texts(&events),
@@ -4589,6 +4736,7 @@ async fn a_channel_log_is_read_by_members_who_were_away() {
     drop(bob2);
     let (mut bob3, _, signed) = sign_in_password(&state, "bob").await;
     let (mut sb3, first) = AccountSync::start(&signed, b.id, memory, true);
+    sb3.set_protocol(PROTOCOL_VERSION);
     assert!(channel_texts(&pump(&mut bob3, &mut sb3, first).await).is_empty());
 
     // Somebody who never kept the channel reads nothing of it, and cannot
@@ -5403,6 +5551,53 @@ async fn a_channels_stored_copy_keeps_to_its_announce_and_slow_mode_rules() {
     assert!(reason.contains("not in that channel"), "{reason}");
 }
 
+/// A copy answered with a rekey files nothing and comes straight back: the clock starts with
+/// what was filed, or a busy slow channel loses a copy for every arrival.
+#[tokio::test]
+async fn a_copy_that_needed_a_rekey_is_not_held_back_by_slow_mode() {
+    use voipc_crypto::sync::Event;
+    let (state, _db, log) = relay_with_log().await;
+    // Not sharing, so nothing tells her of a joiner but the answer to her post
+    let (mut alice, _, mut sa) = member(&state, &log, "alice", false).await;
+    let (_bob, _, _) = member(&state, &log, "bob", false).await;
+    state
+        .channels
+        .write()
+        .await
+        .get_mut(&1)
+        .unwrap()
+        .info
+        .slow_mode_secs = 60;
+    let out = sa.send_channel(&log, say("s1", "first"), 1, None);
+    pump(&mut alice, &mut sa, out).await;
+    state.post_marks.clear();
+    let relay = state.accounts.clone().unwrap();
+    let steps = async || {
+        crate::accounts::raw(&relay, "SELECT COUNT(*) FROM voipc_chain_steps")
+            .await
+            .unwrap()
+    };
+    assert_eq!(steps().await, 0);
+
+    let (_cat, _, _) = member(&state, &log, "cat", false).await;
+    let out = sa.send_channel(&log, say("s2", "to the newcomer too"), 2, None);
+    let events = pump(&mut alice, &mut sa, out).await;
+    assert!(
+        events.iter().any(|e| matches!(e, Event::Kept { .. })),
+        "{events:?}"
+    );
+    assert_eq!(steps().await, 1, "it did take a rekey");
+
+    let out = sa.send_channel(&log, say("s3", "too soon"), 3, None);
+    let events = pump(&mut alice, &mut sa, out).await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::NotKept { reason } if reason.contains("slow mode"))),
+        "what was filed started it: {events:?}"
+    );
+}
+
 #[tokio::test]
 async fn joiners_read_older_messages_only_from_writers_who_share() {
     let (state, _db, log) = relay_with_log().await;
@@ -5422,11 +5617,7 @@ async fn joiners_read_older_messages_only_from_writers_who_share() {
         "alice shares what she wrote before"
     );
     let from_bob = pump(&mut bob, &mut sb, Vec::new()).await;
-    assert_eq!(
-        readers(&from_bob),
-        vec![(vec!["carol".to_string()], false)],
-        "bob only lets her read what comes next"
-    );
+    assert!(readers(&from_bob).is_empty(), "bob is told nothing yet");
     let got = channel_texts(&pump(&mut carol, &mut sc, Vec::new()).await);
     assert_eq!(
         got,
@@ -5434,9 +5625,14 @@ async fn joiners_read_older_messages_only_from_writers_who_share() {
         "bob's earlier message stays closed to her"
     );
 
-    // What bob writes now, she reads.
+    // What bob writes now, she reads, and that is when he names her.
     let out = sb.send_channel(&log, say("b2", "from bob, after"), 3, None);
-    pump(&mut bob, &mut sb, out).await;
+    let from_bob = pump(&mut bob, &mut sb, out).await;
+    assert_eq!(
+        readers(&from_bob),
+        vec![(vec!["carol".to_string()], false)],
+        "bob only lets her read what comes next"
+    );
     let out = sc.enter(&log);
     let got = channel_texts(&pump(&mut carol, &mut sc, out).await);
     assert_eq!(
@@ -5474,7 +5670,7 @@ async fn who_leaves_reads_nothing_after_and_every_new_reader_is_named() {
     let relay = state.accounts.clone().unwrap();
     let bobs = crate::accounts::raw(
             &relay,
-            &format!("SELECT COUNT(*) FROM voipc_wraps w WHERE w.recipient = x'{}' AND w.epoch = (SELECT epoch FROM voipc_log ORDER BY seq DESC LIMIT 1)", hex::encode(b.id)),
+            &format!("SELECT COUNT(*) FROM voipc_seats t JOIN voipc_seals s ON s.bucket = t.bucket AND t.version >= s.version WHERE t.recipient = x'{}' AND s.chain_id = (SELECT MAX(id) FROM voipc_chains)", hex::encode(b.id)),
         )
         .await
         .unwrap();
@@ -5721,6 +5917,13 @@ async fn an_account_deletes_itself_and_its_name_is_free() {
         matches!(&msg, ServerMessage::Account(AccountReply::Error { request, .. }) if request == "DeleteAccount"),
         "{msg:?}"
     );
+    dora.send(&ClientMessage::Account(AccountRequest::VaultPut {
+        k: "pins.0".into(),
+        v: b"who she met".to_vec(),
+        expect: 0,
+    }))
+    .await;
+    dora.expect("stored", |m| reply(m).is_some()).await;
     dora.send(&delete(secret("correct horse battery"))).await;
     assert!(matches!(
         dora.expect("deleted", |m| reply(m).is_some()).await,
@@ -5737,6 +5940,7 @@ async fn an_account_deletes_itself_and_its_name_is_free() {
         "voipc_members WHERE account",
         "voipc_log WHERE sender",
         "voipc_wraps WHERE owner",
+        "acct_blobs WHERE user_id",
     ] {
         assert_eq!(
             crate::accounts::raw(&relay, &format!("SELECT COUNT(*) FROM {table} = x'{id}'"))
@@ -5783,7 +5987,8 @@ async fn an_account_deletes_itself_and_its_name_is_free() {
 async fn the_sweep_drops_keys_nothing_uses_any_more() {
     let (state, _db, log) = relay_with_log().await;
     let (mut alice, a, mut sa) = member(&state, &log, "alice", true).await;
-    let out = sa.send_channel(&log, say("m1", "kept"), 1, None);
+    let (_bob, b, _) = member(&state, &log, "bob", true).await;
+    let out = sa.send_dm(b.id, say("m1", "kept"), 1, None);
     pump(&mut alice, &mut sa, out).await;
     let relay = state.accounts.clone().unwrap();
     let me = hex::encode(a.id);
@@ -7017,11 +7222,33 @@ async fn a_channel_editor_reaches_only_channels_it_may_see() {
     ))
     .await;
     ann.expect("Gate", admin_answer).await;
+    // Too long or naming no real group, the same: those answers would say the channel is there
+    let long: Vec<String> = (0..17).map(|i| format!("g{i}")).collect();
+    let too_long = ChannelGate {
+        groups: long,
+        speakers: vec![],
+    };
     for op in [
         AdminOp::GateGet { channel_id: room },
         AdminOp::GateSet {
             channel_id: room,
             gate: gate(&[]),
+        },
+        AdminOp::GateSet {
+            channel_id: room,
+            gate: gate(&["no-such-group"]),
+        },
+        AdminOp::GateSet {
+            channel_id: room,
+            gate: too_long.clone(),
+        },
+        AdminOp::GateSet {
+            channel_id: 99_999,
+            gate: gate(&["no-such-group"]),
+        },
+        AdminOp::GateSet {
+            channel_id: 99_999,
+            gate: too_long.clone(),
         },
     ] {
         eve.send(&admin_op(op, None)).await;
@@ -7033,6 +7260,21 @@ async fn a_channel_editor_reaches_only_channels_it_may_see() {
         assert!(reason.contains("does not exist"), "{reason}");
     }
     assert_eq!(state.channels.read().await[&room].gate.groups, ["staff"]);
+    // The control: who passes hears why
+    ann.send(&admin_op(
+        AdminOp::GateSet {
+            channel_id: room,
+            gate: gate(&["no-such-group"]),
+        },
+        None,
+    ))
+    .await;
+    let ServerMessage::Account(AccountReply::Error { reason, .. }) =
+        ann.expect("refused", admin_answer).await
+    else {
+        panic!("refused")
+    };
+    assert_eq!(reason, "There is no group named no-such-group.");
     // Nor shuts itself out of one it may
     let open = create(&mut eve, "lobby2", false).await;
     eve.send(&admin_op(
@@ -7111,7 +7353,10 @@ async fn a_gated_channels_log_keeps_only_who_passes() {
         .await
         .unwrap();
     }
-    relay.prune_log("c:aa", &["crew".into()]).await.unwrap();
+    relay
+        .prune_log("c:aa", &["crew".into()], &mut Default::default())
+        .await
+        .unwrap();
     let count = |sql: String| {
         let relay = relay.clone();
         async move { crate::accounts::raw(&relay, &sql).await.unwrap() }
@@ -7128,6 +7373,183 @@ async fn a_gated_channels_log_keeps_only_who_passes() {
         .await,
         1,
         "the one in the crew stays"
+    );
+}
+
+/// The same people sit in every gated log, and reading what one holds is four queries.
+#[tokio::test]
+async fn a_pass_decides_each_account_once_however_many_logs_it_sits_in() {
+    let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+    group(&state, "crew", None, &[]).await;
+    let (_bob, bi) = register(&state, "bob").await;
+    let (_cat, ci) = register(&state, "cat").await;
+    give(&state, bi.id, "crew", true).await;
+    let relay = state.accounts.clone().unwrap();
+    for conv in ["c:aa", "c:bb"] {
+        for a in [bi.id, ci.id] {
+            seat_in_log(&relay, conv, a).await;
+        }
+    }
+    let seats = async |conv: &str| {
+        crate::accounts::raw(
+            &relay,
+            &format!("SELECT COUNT(*) FROM voipc_members WHERE conv = '{conv}'"),
+        )
+        .await
+        .unwrap()
+    };
+    let crew = ["crew".to_string()];
+    let mut decided = std::collections::HashMap::new();
+    relay.prune_log("c:aa", &crew, &mut decided).await.unwrap();
+    assert_eq!(decided.len(), 2);
+    assert_eq!(seats("c:aa").await, 1, "the one outside is out");
+    // Bob loses the group now: this pass read him once, the next one sees it
+    give(&state, bi.id, "crew", false).await;
+    relay.prune_log("c:bb", &crew, &mut decided).await.unwrap();
+    assert_eq!(decided.len(), 2);
+    assert_eq!(seats("c:bb").await, 1);
+    relay
+        .prune_log("c:bb", &crew, &mut Default::default())
+        .await
+        .unwrap();
+    assert_eq!(seats("c:bb").await, 0);
+}
+
+async fn seat_in_log(relay: &crate::accounts::Relay, conv: &str, account: [u8; 16]) {
+    crate::accounts::raw(
+        relay,
+        &format!(
+            "INSERT INTO voipc_members (conv, account, joined_at) VALUES ('{conv}', X'{}', 1)",
+            hex::encode(account)
+        ),
+    )
+    .await
+    .unwrap();
+}
+
+/// A channel 7 with a kept log and a gate.
+async fn gated_log(state: &ServerState, conv: &str, groups: &[&str]) {
+    crate::state::test_support::put_in_channel(state, 7, &[]).await;
+    let mut channels = state.channels.write().await;
+    let c = channels.get_mut(&7).unwrap();
+    c.log_conv = conv.into();
+    c.gate.groups = groups.iter().map(|g| g.to_string()).collect();
+}
+
+/// An admin's group change does not wait in its own frame for a pass over the whole relay,
+/// and an ask while one runs is not lost.
+#[tokio::test]
+async fn a_pass_runs_beside_the_frame_that_asked_one_at_a_time() {
+    let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+    group(&state, "crew", None, &[]).await;
+    let (_cat, ci) = register(&state, "cat").await;
+    let relay = state.accounts.clone().unwrap();
+    gated_log(&state, "c:aa", &["crew"]).await;
+    let seats = async || {
+        crate::accounts::raw(&relay, "SELECT COUNT(*) FROM voipc_members")
+            .await
+            .unwrap()
+    };
+    async fn until_empty(relay: &crate::accounts::Relay) {
+        for _ in 0..500 {
+            let left = crate::accounts::raw(relay, "SELECT COUNT(*) FROM voipc_members")
+                .await
+                .unwrap();
+            if left == 0 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the pass never came");
+    }
+    seat_in_log(&relay, "c:aa", ci.id).await;
+    // The channel map held: a pass cannot start, and whoever asked goes on all the same
+    let held = state.channels.write().await;
+    crate::gates::prune_soon(&state);
+    tokio::task::yield_now().await;
+    crate::gates::prune_soon(&state);
+    assert_eq!(seats().await, 1);
+    drop(held);
+    until_empty(&relay).await;
+
+    // And it ended, so a later ask runs too
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    seat_in_log(&relay, "c:aa", ci.id).await;
+    crate::gates::prune_soon(&state);
+    until_empty(&relay).await;
+}
+
+/// A group taken from the shell while they are away, and they are back before the hourly
+/// pass: a seat is all a read of the log asks for, so it goes as they sign in.
+#[tokio::test]
+async fn someone_back_before_the_pass_is_out_of_a_gate_they_lost_away() {
+    let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+    group(&state, "crew", None, &[]).await;
+    let (bob, bi) = register(&state, "bob").await;
+    give(&state, bi.id, "crew", true).await;
+    let relay = state.accounts.clone().unwrap();
+    gated_log(&state, "c:aa", &["crew"]).await;
+    seat_in_log(&relay, "c:aa", bi.id).await;
+    let seats = async || {
+        crate::accounts::raw(&relay, "SELECT COUNT(*) FROM voipc_members")
+            .await
+            .unwrap()
+    };
+    let away = async |c: Client| {
+        drop(c);
+        for _ in 0..500 {
+            if !state.account_sessions.contains_key(&bi.id) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("still connected");
+    };
+    away(bob).await;
+
+    // Still in the group: the seat stays
+    let mut c = login(&state, "bob", &IDENTITY, false).await;
+    c.expect("Authenticated", |m| {
+        matches!(m, ServerMessage::Authenticated { .. })
+    })
+    .await;
+    assert_eq!(seats().await, 1);
+    away(c).await;
+
+    let ctx = relay.ctx(IpAddr::V4(Ipv4Addr::LOCALHOST), "test");
+    relay
+        .accounts
+        .revoke_role_as_host(&ctx, AccountId(bi.id), "crew")
+        .await
+        .unwrap();
+    assert_eq!(seats().await, 1, "nothing has looked yet");
+    let mut c = login(&state, "bob", &IDENTITY, false).await;
+    c.expect("Authenticated", |m| {
+        matches!(m, ServerMessage::Authenticated { .. })
+    })
+    .await;
+    assert_eq!(seats().await, 0);
+}
+
+/// Eviction goes by the channels someone is in. A seat in the log of one they are not in
+/// goes with the same change.
+#[tokio::test]
+async fn a_lost_group_takes_the_seat_of_a_channel_they_were_not_in() {
+    let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+    group(&state, "crew", None, &[]).await;
+    let (_bob, bi) = register(&state, "bob").await;
+    give(&state, bi.id, "crew", true).await;
+    let relay = state.accounts.clone().unwrap();
+    gated_log(&state, "c:aa", &["crew"]).await;
+    seat_in_log(&relay, "c:aa", bi.id).await;
+    give(&state, bi.id, "crew", false).await;
+    assert_eq!(
+        crate::accounts::raw(&relay, "SELECT COUNT(*) FROM voipc_members")
+            .await
+            .unwrap(),
+        0
     );
 }
 
@@ -7173,7 +7595,11 @@ mod providers {
     use voipc_crypto::account::{provider_ask, Method, SignIn, Step};
     use voipc_protocol::types::{AccountStart, ProviderKind};
 
-    use hyper::StatusCode;
+    use bytes::Bytes;
+    use http_body_util::{BodyExt as _, Full};
+    use hyper::{Response, StatusCode};
+    use std::net::Ipv6Addr;
+    use std::time::Instant;
 
     const LO: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
     const IDENTITY_OTHER: [u8; 33] = [6; 33];
@@ -7263,6 +7689,14 @@ mod providers {
 
     /// `AccountStart::Provider`: the page, the code, the ticket.
     async fn open_page(state: &Arc<ServerState>) -> (String, String, Vec<u8>) {
+        open_page_from(state, LO).await.expect("no page to open")
+    }
+
+    /// `open_page` from `ip`, or why not.
+    async fn open_page_from(
+        state: &Arc<ServerState>,
+        ip: IpAddr,
+    ) -> Result<(String, String, Vec<u8>), String> {
         let first = provider_ask(
             AccountStart::Provider {
                 kind: ProviderKind::Discord,
@@ -7270,13 +7704,14 @@ mod providers {
             PROTOCOL_VERSION,
             APP_VERSION,
         );
-        let mut c = open_raw(state, &first).await;
-        let Some(ServerMessage::AuthStep(AuthStep::OpenBrowser { url, code, ticket })) =
-            c.next().await
-        else {
-            panic!("no page to open")
-        };
-        (url, code, ticket)
+        let mut c = open_raw_from(state, &first, ip).await;
+        match c.next().await {
+            Some(ServerMessage::AuthStep(AuthStep::OpenBrowser { url, code, ticket })) => {
+                Ok((url, code, ticket))
+            }
+            Some(ServerMessage::AuthError { reason }) => Err(reason),
+            other => panic!("{other:?}"),
+        }
     }
 
     /// `AccountStart::ProviderStatus`.
@@ -7302,18 +7737,37 @@ mod providers {
             .unwrap()
     }
 
+    /// The provider sends a browser back with `code`.
+    fn back(state: &ServerState, s: &str, code: &str) -> Response<Full<Bytes>> {
+        provider::callback(
+            state,
+            "/account/oauth/discord/cb",
+            &format!("state={s}&code={code}"),
+        )
+    }
+
+    /// The hidden field in the page a browser came back to.
+    async fn page_key(page: Response<Full<Bytes>>) -> String {
+        let body = page.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8_lossy(&body)
+            .split("name=\"key\" value=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("a page with a key")
+            .to_string()
+    }
+
+    async fn tap(state: &Arc<ServerState>, form: &str) -> StatusCode {
+        provider::confirm(state, form.as_bytes(), LO).await.status()
+    }
+
     /// The browser: back from the provider, and `pick` tapped.
     async fn browser(state: &Arc<ServerState>, url: &str, pick: &str) -> StatusCode {
         let s = state_in(url);
-        let back = provider::callback(
-            state,
-            "/account/oauth/discord/cb",
-            &format!("state={s}&code=abc"),
-        );
-        assert_eq!(back.status(), StatusCode::OK);
-        provider::confirm(state, format!("state={s}&pick={pick}").as_bytes(), LO)
-            .await
-            .status()
+        let came_back = back(state, s, "abc");
+        assert_eq!(came_back.status(), StatusCode::OK);
+        let key = page_key(came_back).await;
+        tap(state, &format!("state={s}&pick={pick}&key={key}")).await
     }
 
     /// What the person chooses at `Step::ProviderChoice`.
@@ -7350,6 +7804,7 @@ mod providers {
             APP_VERSION,
         );
         let mut c = open_raw(state, &first).await;
+        let mut shown = None;
         loop {
             let msg = c.next().await.ok_or("closed")?;
             if matches!(
@@ -7359,7 +7814,9 @@ mod providers {
                     ..
                 }
             ) {
-                return Ok((c, m.finish()?));
+                let mut signed = m.finish()?;
+                signed.recovery = shown;
+                return Ok((c, signed));
             }
             let mut steps = m.on_message(&msg)?;
             while !steps.is_empty() {
@@ -7380,7 +7837,10 @@ mod providers {
                     }
                     Step::ProviderChoice { .. } => {
                         steps = match &choice {
-                            Choice::Claim => m.provider_claim()?,
+                            Choice::Claim => {
+                                shown = Some(m.provider_claim_key()?);
+                                m.provider_claim()?
+                            }
                             Choice::Recovery(key) => m.provider_recovery(key)?,
                         };
                     }
@@ -7446,17 +7906,14 @@ mod providers {
         );
 
         let s = state_in(&url).to_string();
-        let page = provider::callback(
-            &state,
-            "/account/oauth/discord/cb",
-            &format!("state={s}&code=abc"),
-        );
+        let page = back(&state, &s, "abc");
         assert_eq!(page.status(), StatusCode::OK);
         let csp = page
             .headers()
             .get(hyper::header::CONTENT_SECURITY_POLICY)
             .unwrap();
         assert!(csp.to_str().unwrap().contains("form-action 'self'"));
+        let key = page_key(page).await;
         let not_yet = sign_in(&state, ticket.clone(), Choice::Claim).await;
         assert_eq!(
             not_yet.err().as_deref(),
@@ -7465,16 +7922,266 @@ mod providers {
         );
 
         let wrong = if code == "100" { "101" } else { "100" };
-        let tapped =
-            provider::confirm(&state, format!("state={s}&pick={wrong}").as_bytes(), LO).await;
-        assert_eq!(tapped.status(), StatusCode::FORBIDDEN);
+        let tapped = tap(&state, &format!("state={s}&pick={wrong}&key={key}")).await;
+        assert_eq!(tapped, StatusCode::FORBIDDEN);
         // A second tap, now with the right code, changes nothing
-        let again =
-            provider::confirm(&state, format!("state={s}&pick={code}").as_bytes(), LO).await;
-        assert_eq!(again.status(), StatusCode::GONE);
+        let again = tap(&state, &format!("state={s}&pick={code}&key={key}")).await;
+        assert_eq!(again, StatusCode::GONE);
         assert!(status(&state, &ticket).await, "through, if not well");
         let ended = sign_in(&state, ticket, Choice::Claim).await;
         assert!(ended.err().unwrap().contains("not the one"));
+    }
+
+    /// Whoever starts a sign-in holds its `state` and its code, and can send the
+    /// link to somebody. That person's approval must not be theirs to use.
+    #[tokio::test]
+    async fn a_tap_from_outside_the_browser_that_came_back_does_nothing() {
+        let (state, _db, _) = relay(RegistrationMode::Open).await;
+        let (url, code, ticket) = open_page(&state).await;
+        let s = state_in(&url).to_string();
+        let without_key = format!("state={s}&pick={code}");
+        assert_eq!(tap(&state, &without_key).await, StatusCode::GONE);
+
+        let key = page_key(back(&state, &s, "abc")).await;
+        for tried in [
+            without_key.clone(),
+            format!("{without_key}&key="),
+            format!("{without_key}&key={}", "A".repeat(43)),
+            // Nor may a wrong key end the flow with a wrong pick
+            format!("state={s}&pick=000&key={}", "A".repeat(43)),
+        ] {
+            assert_eq!(tap(&state, &tried).await, StatusCode::GONE, "{tried}");
+            assert!(!status(&state, &ticket).await, "{tried}");
+            let not_yet = sign_in(&state, ticket.clone(), Choice::Claim).await;
+            assert_eq!(not_yet.err().as_deref(), Some(NOT_YET), "{tried}");
+        }
+        // A callback with no code is handed no key
+        let bare = provider::callback(&state, "/account/oauth/discord/cb", &format!("state={s}"));
+        assert_eq!(bare.status(), StatusCode::GONE);
+
+        // The browser that came back still can, after a reload too
+        let reload = back(&state, &s, "abc");
+        assert_eq!(reload.status(), StatusCode::OK);
+        assert_eq!(page_key(reload).await, key, "a reload keeps the key");
+        let form = format!("{without_key}&key={key}");
+        assert_eq!(tap(&state, &form).await, StatusCode::OK);
+        assert!(status(&state, &ticket).await);
+        sign_in(&state, ticket, Choice::Claim).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_link_is_not_tied_by_someone_else_tapping() {
+        let (state, _db, subject) = relay(RegistrationMode::Open).await;
+        *subject.lock().unwrap() = "3003".into();
+        let (mut c, _, signed) = register_with(&state, "wendy").await;
+        let secret =
+            voipc_crypto::account::derive("correct horse battery", &signed.relay_id, "wendy")
+                .auth_secret
+                .to_vec();
+        c.send(&ClientMessage::Account(AccountRequest::ProviderStart {
+            kind: ProviderKind::Discord,
+            link: true,
+            secret: Some(secret),
+            totp: None,
+            recovery_code: None,
+        }))
+        .await;
+        let ServerMessage::Account(AccountReply::ProviderBrowser { url, code }) =
+            c.expect("page", |m| reply(m).is_some()).await
+        else {
+            panic!("no page")
+        };
+        let s = state_in(&url).to_string();
+        let page = back(&state, &s, "abc");
+        assert_eq!(page.status(), StatusCode::OK);
+        let outside = tap(&state, &format!("state={s}&pick={code}")).await;
+        assert_eq!(outside, StatusCode::GONE);
+        c.send(&ClientMessage::Account(AccountRequest::ProviderList))
+            .await;
+        let ServerMessage::Account(AccountReply::Providers { linked, .. }) =
+            c.expect("list", |m| reply(m).is_some()).await
+        else {
+            panic!("no list")
+        };
+        assert!(linked.is_empty(), "{linked:?}");
+
+        assert_eq!(browser(&state, &url, &code).await, StatusCode::OK);
+        assert!(matches!(
+            c.expect("done", |m| reply(m).is_some()).await,
+            ServerMessage::Account(AccountReply::ProviderDone { link: true, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_step_up_is_not_given_by_someone_else_tapping() {
+        let (state, _db, _) = relay(RegistrationMode::Open).await;
+        let (mut c, _, _) = claimed(&state).await;
+        c.send(&ClientMessage::Account(AccountRequest::ProviderStart {
+            kind: ProviderKind::Discord,
+            link: false,
+            secret: None,
+            totp: None,
+            recovery_code: None,
+        }))
+        .await;
+        let ServerMessage::Account(AccountReply::ProviderBrowser { url, code }) =
+            c.expect("page", |m| reply(m).is_some()).await
+        else {
+            panic!("no page")
+        };
+        let s = state_in(&url).to_string();
+        back(&state, &s, "abc");
+        let outside = tap(&state, &format!("state={s}&pick={code}")).await;
+        assert_eq!(outside, StatusCode::GONE);
+
+        assert_eq!(browser(&state, &url, &code).await, StatusCode::OK);
+        assert!(matches!(
+            c.expect("done", |m| reply(m).is_some()).await,
+            ServerMessage::Account(AccountReply::ProviderDone { link: false, .. })
+        ));
+    }
+
+    /// The key goes with one provider code. Holding `state` gets someone a key to
+    /// a code they brought themselves, never a key to somebody else's.
+    #[tokio::test]
+    async fn another_code_back_takes_the_flow_and_the_key_with_it() {
+        let (state, _db, _) = relay(RegistrationMode::Open).await;
+        let (url, code, ticket) = open_page(&state).await;
+        let s = state_in(&url).to_string();
+        let junk = page_key(back(&state, &s, "junk")).await;
+        let real = page_key(back(&state, &s, "abc")).await;
+        assert!(!junk.is_empty() && !real.is_empty());
+        assert_ne!(junk, real);
+        let stale = format!("state={s}&pick={code}&key={junk}");
+        assert_eq!(tap(&state, &stale).await, StatusCode::GONE);
+        assert!(!status(&state, &ticket).await);
+        let fresh = format!("state={s}&pick={code}&key={real}");
+        assert_eq!(tap(&state, &fresh).await, StatusCode::OK);
+        assert!(status(&state, &ticket).await);
+    }
+
+    /// A person who sees none of their code here says so, and ends it: tapping one
+    /// anyway hits the right one time in three.
+    #[tokio::test]
+    async fn none_of_these_ends_the_sign_in() {
+        let (state, _db, _) = relay(RegistrationMode::Open).await;
+        let (url, code, ticket) = open_page(&state).await;
+        let s = state_in(&url).to_string();
+        let page = back(&state, &s, "abc");
+        let body = page.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&body);
+        assert!(html.contains("name=\"none\""), "{html}");
+        assert_eq!(html.matches("name=\"pick\"").count(), 3, "{html}");
+
+        let key = page_key(back(&state, &s, "abc")).await;
+        let none = format!("state={s}&key={key}&none=1");
+        assert_eq!(tap(&state, &none).await, StatusCode::FORBIDDEN);
+        let late = format!("state={s}&pick={code}&key={key}");
+        assert_eq!(tap(&state, &late).await, StatusCode::GONE);
+        assert!(status(&state, &ticket).await);
+        let ended = sign_in(&state, ticket, Choice::Claim).await;
+        assert!(ended.err().unwrap().contains("not the one"));
+    }
+
+    /// Each /64 of one /48, inside its own limit, is what held every sign-in out.
+    #[tokio::test]
+    async fn a_stranger_with_one_site_cannot_keep_everyone_out() {
+        let (state, _db, _) = relay(RegistrationMode::Open).await;
+        let mut started = 0;
+        for subnet in 0..410 {
+            let ip = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 1, subnet, 0, 0, 0, 1));
+            for _ in 0..10 {
+                started += usize::from(open_page_from(&state, ip).await.is_ok());
+            }
+        }
+        assert!(started < 100, "{started} started from one /48");
+        let elsewhere = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 2, 0, 0, 0, 0, 1));
+        open_page_from(&state, elsewhere).await.unwrap();
+    }
+
+    /// The same one level up: a leased /32 holds 65 536 /48s, each with a whole
+    /// budget of its own.
+    #[tokio::test]
+    async fn a_stranger_with_a_whole_block_cannot_keep_everyone_out() {
+        let (state, _db, _) = relay(RegistrationMode::Open).await;
+        let began = Instant::now();
+        let mut started = 0;
+        for site in 0..4096 {
+            let ip = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, site, 0, 0, 0, 0, 1));
+            started += usize::from(open_page_from(&state, ip).await.is_ok());
+        }
+        let most = 257.0 + began.elapsed().as_secs_f64();
+        assert!((started as f64) <= most, "{started} started from one /32");
+        let elsewhere = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb9, 0, 0, 0, 0, 0, 1));
+        open_page_from(&state, elsewhere).await.unwrap();
+    }
+
+    /// Enough IPv4 addresses fill the table whatever each one's limit: nobody is
+    /// refused for it, and it costs whoever holds the most, not someone holding one.
+    #[tokio::test]
+    async fn a_full_table_drops_from_whoever_holds_the_most_and_refuses_nobody() {
+        let (state, _db, _) = relay(RegistrationMode::Open).await;
+        let host = |h: u32| IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + h));
+        let (lone, _, lone_ticket) = open_page_from(&state, host(5000)).await.unwrap();
+        let mut flood = Vec::new();
+        for address in 0..410 {
+            for _ in 0..10 {
+                flood.push(open_page_from(&state, host(address)).await.unwrap());
+            }
+        }
+        open_page_from(&state, host(5001)).await.unwrap();
+
+        let (first, _, first_ticket) = &flood[0];
+        assert_eq!(
+            back(&state, state_in(first), "abc").status(),
+            StatusCode::GONE
+        );
+        let asked = provider_ask(
+            AccountStart::ProviderStatus {
+                ticket: first_ticket.clone(),
+            },
+            PROTOCOL_VERSION,
+            APP_VERSION,
+        );
+        let Some(ServerMessage::AuthError { reason }) = open_raw(&state, &asked).await.next().await
+        else {
+            panic!("a dropped flow is not still going")
+        };
+        assert!(reason.contains("has ended"), "{reason}");
+
+        let (newest, _, _) = flood.last().unwrap();
+        assert_eq!(
+            back(&state, state_in(newest), "abc").status(),
+            StatusCode::OK,
+            "only the oldest went"
+        );
+        assert_eq!(
+            back(&state, state_in(&lone), "abc").status(),
+            StatusCode::OK,
+            "someone holding one is safe"
+        );
+        assert!(!status(&state, &lone_ticket).await);
+    }
+
+    /// A shared IPv4 prefix is as often a carrier's NAT as one site, so no budget
+    /// above the address reaches it.
+    #[tokio::test]
+    async fn one_ipv4_address_is_not_a_site() {
+        let (state, _db, _) = relay(RegistrationMode::Open).await;
+        for host in 1..=200 {
+            let ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, host));
+            open_page_from(&state, ip).await.unwrap();
+        }
+        let one = Ipv4Addr::new(203, 0, 113, 7);
+        for _ in 0..10 {
+            open_page_from(&state, IpAddr::V4(one)).await.unwrap();
+        }
+        for over in [IpAddr::V4(one), IpAddr::V6(one.to_ipv6_mapped())] {
+            let refused = open_page_from(&state, over).await.unwrap_err();
+            assert!(refused.contains("Too many sign-ins"), "{over}: {refused}");
+        }
+        let next = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 8));
+        open_page_from(&state, next).await.unwrap();
     }
 
     #[tokio::test]
@@ -7869,6 +8576,48 @@ mod providers {
             .unwrap();
     }
 
+    /// Whoever held the old log key is out at each writer's next post: the row stays to
+    /// say so, though the seat and the key are gone and the new owner may be seated by then.
+    #[tokio::test]
+    async fn a_reclaimed_account_is_marked_in_every_writers_rows() {
+        let (state, _db, _subject) = relay(RegistrationMode::Open).await;
+        let (c, _, _) = claimed(&state).await;
+        drop(c);
+        let (_w, wendy, _) = register_with(&state, "wendy").await;
+        let relay = relay_of(&state);
+        let user = relay
+            .store()
+            .user_by_username("deedee")
+            .await
+            .unwrap()
+            .unwrap();
+        let writer = crate::accounts::raw(
+            relay,
+            &format!(
+                "INSERT INTO voipc_writers (conv, owner) VALUES ('c:aa', x'{}') RETURNING id",
+                hex::encode(wendy.id)
+            ),
+        )
+        .await
+        .unwrap();
+        crate::accounts::raw(
+            relay,
+            &format!(
+                "INSERT INTO voipc_seats (writer, recipient, bucket, version, wrapped) VALUES ({writer}, x'{}', 7, 0, x'00')",
+                hex::encode(user.id.0)
+            ),
+        )
+        .await
+        .unwrap();
+        relay.reclaim(&relay.ctx(LO, "test"), &user).await.unwrap();
+        assert_eq!(
+            crate::accounts::raw(relay, "SELECT COUNT(*) FROM voipc_seats WHERE dead = TRUE")
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
     /// The way back for someone who lost everything, from the shell only, and not
     /// for an account with a password, which it would lock out.
     #[tokio::test]
@@ -8249,8 +8998,8 @@ mod providers {
 
     // ── Pairing ──
 
-    /// The old device hears the ask and answers with a nonce.
-    async fn pair_asked(old: &mut Client) -> (u64, Vec<u8>, Vec<u8>) {
+    /// The old device hears the ask.
+    async fn pair_heard(old: &mut Client) -> (u64, Vec<u8>) {
         let ServerMessage::Account(AccountReply::PairAsked { pair, commitment }) = old
             .expect("asked", |m| {
                 matches!(reply(m), Some(AccountReply::PairAsked { .. }))
@@ -8259,16 +9008,22 @@ mod providers {
         else {
             unreachable!()
         };
-        let nonce = vec![3u8; voipc_crypto::pair::NONCE_LEN];
+        (pair, commitment)
+    }
+
+    /// The old device hears the ask and, on the person's yes, answers with its key.
+    async fn pair_asked(old: &mut Client) -> (u64, Vec<u8>, voipc_crypto::pair::KeyPair, Vec<u8>) {
+        let (pair, commitment) = pair_heard(old).await;
+        let (own, nonce) = voipc_crypto::pair::answer_key();
         old.send(&ClientMessage::Account(AccountRequest::PairNonce {
             pair,
             nonce: nonce.clone(),
         }))
         .await;
-        (pair, commitment, nonce)
+        (pair, commitment, own, nonce)
     }
 
-    /// The new device answers the nonce: the reveal goes out, its code comes back.
+    /// The new device takes the answer: the reveal goes out, its code comes back.
     async fn pair_reveal(m: &mut SignIn, c: &mut Client) -> String {
         let msg = c.next().await.unwrap();
         let mut steps = m.on_message(&msg).unwrap();
@@ -8299,6 +9054,21 @@ mod providers {
         ));
         let code = voipc_crypto::pair::code(commitment, nonce, &ephemeral);
         (ephemeral, code)
+    }
+
+    /// Up to where the old device has told the relay no, after a whole ask.
+    async fn pair_said_no(old: &mut Client, m: &mut SignIn, c: &mut Client) {
+        c.send(&m.pair_start().unwrap()).await;
+        let (pair, commitment, _own, nonce) = pair_asked(old).await;
+        pair_reveal(m, c).await;
+        pair_revealed(old, &commitment, &nonce).await;
+        old.send(&ClientMessage::Account(AccountRequest::PairDecline {
+            pair,
+        }))
+        .await;
+        let msg = c.next().await.unwrap();
+        let steps = m.on_message(&msg).unwrap();
+        assert!(matches!(steps[0], Step::PairRefused { .. }));
     }
 
     /// Runs what the machine returned, until the relay says the device is in.
@@ -8358,12 +9128,13 @@ mod providers {
         let (mut old, signed, _) = claimed(&state).await;
         let (mut m, mut c) = new_device(&state).await;
         c.send(&m.pair_start().unwrap()).await;
-        let (pair, commitment, nonce) = pair_asked(&mut old).await;
+        let (pair, commitment, own, nonce) = pair_asked(&mut old).await;
         let code = pair_reveal(&mut m, &mut c).await;
         let (ephemeral, old_code) = pair_revealed(&mut old, &commitment, &nonce).await;
-        assert_eq!(code, old_code, "both show the same");
+        assert_eq!(code, old_code, "both work out the same");
 
         let wrapped = voipc_crypto::pair::wrap_dek(
+            &own,
             &ephemeral,
             &signed.vault.dek(),
             &signed.relay_id,
@@ -8378,6 +9149,8 @@ mod providers {
         .await;
         let msg = c.next().await.unwrap();
         let steps = m.on_message(&msg).unwrap();
+        assert!(matches!(&steps[..], [Step::PairSame { code: asked, .. }] if *asked == code));
+        let steps = m.pair_same(true).unwrap();
         run_to_authenticated(&mut m, &mut c, steps).await;
         assert_eq!(
             m.finish().unwrap().identity.public_key().serialize(),
@@ -8390,20 +9163,296 @@ mod providers {
         let (state, _db, _) = relay(RegistrationMode::Open).await;
         let (mut old, _, key) = claimed(&state).await;
         let (mut m, mut c) = new_device(&state).await;
+        pair_said_no(&mut old, &mut m, &mut c).await;
+        // Still waiting for an answer: the recovery key works
+        let steps = m.provider_recovery(&key).unwrap();
+        run_to_authenticated(&mut m, &mut c, steps).await;
+    }
+
+    /// W2-18: the relay waited for the old device without reading this one, so a new
+    /// device gone left the question up, and the next ask was declined behind it.
+    #[tokio::test]
+    async fn a_new_device_gone_ends_the_ask_on_the_other_device() {
+        let (state, _db, _) = relay(RegistrationMode::Open).await;
+        let (mut old, _, _) = claimed(&state).await;
+        let (mut m, mut c) = new_device(&state).await;
         c.send(&m.pair_start().unwrap()).await;
-        let (pair, commitment, nonce) = pair_asked(&mut old).await;
+        let (pair, _) = pair_heard(&mut old).await;
+        drop(c);
+        let ended = old
+            .expect("ended", |m| {
+                matches!(reply(m), Some(AccountReply::PairEnded { .. }))
+            })
+            .await;
+        assert!(
+            matches!(ended, ServerMessage::Account(AccountReply::PairEnded { pair: p }) if p == pair)
+        );
+        assert!(relay_of(&state).pairs_open() == 0, "and its entry goes");
+    }
+
+    /// The same once the code is on screen: the second wait has it too.
+    #[tokio::test]
+    async fn a_new_device_gone_at_the_code_ends_the_ask_too() {
+        let (state, _db, _) = relay(RegistrationMode::Open).await;
+        let (mut old, _, _) = claimed(&state).await;
+        let (mut m, mut c) = new_device(&state).await;
+        c.send(&m.pair_start().unwrap()).await;
+        let (_, commitment, _own, nonce) = pair_asked(&mut old).await;
         pair_reveal(&mut m, &mut c).await;
         pair_revealed(&mut old, &commitment, &nonce).await;
+        drop(c);
+        old.expect("ended", |m| {
+            matches!(reply(m), Some(AccountReply::PairEnded { .. }))
+        })
+        .await;
+        assert!(relay_of(&state).pairs_open() == 0);
+    }
+
+    /// Measured on the native apps: asking again after a death failed within about
+    /// 1.2 s with "Your other device did not answer", the old device's session being
+    /// stuck on the first ask and so declining the second.
+    #[tokio::test]
+    async fn asking_again_right_after_a_death_reaches_the_person() {
+        let (state, _db, _) = relay(RegistrationMode::Open).await;
+        let (mut old, signed, _) = claimed(&state).await;
+        let info = voipc_protocol::types::AccountInfo {
+            id: [1; 16],
+            name: signed.name.clone(),
+            scopes: Vec::new(),
+            needs_2fa: false,
+            totp_enabled: false,
+        };
+        let (mut session, _) = voipc_crypto::account_session::AccountSession::start(
+            signed,
+            &info,
+            Default::default(),
+            false,
+            false,
+            PROTOCOL_VERSION,
+        );
+        let hear = |msg: ServerMessage| match msg {
+            ServerMessage::Account(r) => r,
+            _ => unreachable!(),
+        };
+        let is_pair = |m: &ServerMessage| {
+            matches!(
+                reply(m),
+                Some(AccountReply::PairAsked { .. } | AccountReply::PairEnded { .. })
+            )
+        };
+
+        let (mut m, mut c) = new_device(&state).await;
+        c.send(&m.pair_start().unwrap()).await;
+        let a = session.on_reply(&hear(old.expect("asked", is_pair).await));
+        assert_eq!(a.emit[0].0, "account-pair-look");
+        drop(c);
+        let a = session.on_reply(&hear(old.expect("ended", is_pair).await));
+        assert_eq!(
+            a.emit[0].0, "account-pair-ended",
+            "the stale question closes"
+        );
+
+        let (mut m, mut c) = new_device(&state).await;
+        c.send(&m.pair_start().unwrap()).await;
+        let a = session.on_reply(&hear(old.expect("asked again", is_pair).await));
+        assert_eq!(
+            a.emit[0].0, "account-pair-look",
+            "and the next one is heard"
+        );
+        assert!(a.send.is_empty(), "not declined: {:?}", a.send);
+        // The control: the new device is still waiting, nothing refused it
+        let said = tokio::time::timeout(Duration::from_millis(300), c.next()).await;
+        assert!(said.is_err(), "the new device heard {:?}", said.unwrap());
+        let _ = m.pairing();
+    }
+
+    /// A new device that dies with no hang-up (a killed app, a lost network) leaves its
+    /// ask open for up to half a minute. Asking again in that time reached the old device
+    /// behind it, which declined for being busy, and the new device read "said no".
+    #[tokio::test]
+    async fn a_new_ask_ends_the_one_before_it() {
+        let (state, _db, _) = relay(RegistrationMode::Open).await;
+        let (mut old, signed, _) = claimed(&state).await;
+        let info = voipc_protocol::types::AccountInfo {
+            id: [1; 16],
+            name: signed.name.clone(),
+            scopes: Vec::new(),
+            needs_2fa: false,
+            totp_enabled: false,
+        };
+        let (mut session, _) = voipc_crypto::account_session::AccountSession::start(
+            signed,
+            &info,
+            Default::default(),
+            false,
+            false,
+            PROTOCOL_VERSION,
+        );
+        let hear = |msg: ServerMessage| match msg {
+            ServerMessage::Account(r) => r,
+            _ => unreachable!(),
+        };
+        let is_pair = |m: &ServerMessage| {
+            matches!(
+                reply(m),
+                Some(AccountReply::PairAsked { .. } | AccountReply::PairEnded { .. })
+            )
+        };
+
+        // Still connected as far as the relay knows
+        let (mut dead, mut dead_c) = new_device(&state).await;
+        dead_c.send(&dead.pair_start().unwrap()).await;
+        let a = session.on_reply(&hear(old.expect("asked", is_pair).await));
+        assert_eq!(a.emit[0].0, "account-pair-look");
+
+        let (mut m, mut c) = new_device(&state).await;
+        c.send(&m.pair_start().unwrap()).await;
+        let a = session.on_reply(&hear(old.expect("the first ask's end", is_pair).await));
+        assert_eq!(
+            a.emit.first().map(|e| e.0),
+            Some("account-pair-ended"),
+            "the first ask stayed open: {:?}",
+            a.send
+        );
+        let a = session.on_reply(&hear(old.expect("the second ask", is_pair).await));
+        assert_eq!(a.emit[0].0, "account-pair-look", "the person hears it");
+        assert!(a.send.is_empty(), "declined behind the first: {:?}", a.send);
+        assert_eq!(relay_of(&state).pairs_open(), 1, "the one ask is open");
+        // The control: nothing told the new device no
+        let said = tokio::time::timeout(Duration::from_millis(300), c.next()).await;
+        assert!(said.is_err(), "the new device heard {:?}", said.unwrap());
+        // A first device that was alive after all hears that it is over
+        let msg = dead_c.next().await.unwrap();
+        let steps = dead.on_message(&msg).unwrap();
+        assert!(
+            matches!(&steps[..], [Step::PairRefused { reason }] if reason.contains("did not answer"))
+        );
+        let _ = m.pairing();
+    }
+
+    #[tokio::test]
+    async fn saying_no_before_looking_tells_the_new_device() {
+        let (state, _db, _) = relay(RegistrationMode::Open).await;
+        let (mut old, _, _) = claimed(&state).await;
+        let (mut m, mut c) = new_device(&state).await;
+        c.send(&m.pair_start().unwrap()).await;
+        let (pair, _) = pair_heard(&mut old).await;
         old.send(&ClientMessage::Account(AccountRequest::PairDecline {
             pair,
         }))
         .await;
         let msg = c.next().await.unwrap();
         let steps = m.on_message(&msg).unwrap();
-        assert!(matches!(steps[0], Step::PairRefused { .. }));
-        // Still waiting for an answer: the recovery key works
-        let steps = m.provider_recovery(&key).unwrap();
+        let Step::PairRefused { reason } = &steps[0] else {
+            panic!("no refusal")
+        };
+        assert!(reason.contains("said no"), "{reason}");
+        old.expect("ended", |m| {
+            matches!(reply(m), Some(AccountReply::PairEnded { .. }))
+        })
+        .await;
+    }
+
+    /// The old device now waits for the person before it answers, which takes longer
+    /// than a step. A real wait: tokio's test-util is not on here.
+    #[tokio::test]
+    async fn the_relay_waits_longer_than_a_step_for_a_person_to_look() {
+        let (state, _db, _) = relay(RegistrationMode::Open).await;
+        let (mut old, _, _) = claimed(&state).await;
+        let (mut m, mut c) = new_device(&state).await;
+        c.send(&m.pair_start().unwrap()).await;
+        let (pair, _) = pair_heard(&mut old).await;
+        tokio::time::sleep(Duration::from_secs(31)).await;
+        let (_, nonce) = voipc_crypto::pair::answer_key();
+        old.send(&ClientMessage::Account(AccountRequest::PairNonce {
+            pair,
+            nonce,
+        }))
+        .await;
+        pair_reveal(&mut m, &mut c).await;
+    }
+
+    /// A frame while the relay waits for the other device: an honest device sends none.
+    #[tokio::test]
+    async fn a_frame_during_the_wait_ends_the_pairing() {
+        let (state, _db, _) = relay(RegistrationMode::Open).await;
+        let (mut old, _, _) = claimed(&state).await;
+        let (mut m, mut c) = new_device(&state).await;
+        c.send(&m.pair_start().unwrap()).await;
+        pair_heard(&mut old).await;
+        c.send(&m.pair_start().unwrap()).await;
+        old.expect("ended", |m| {
+            matches!(reply(m), Some(AccountReply::PairEnded { .. }))
+        })
+        .await;
+    }
+
+    /// Two asks said no to, and the one that goes through: without the answers given
+    /// back that is 8 on one connection, and "Too many sign-in attempts" after both
+    /// devices said yes.
+    #[tokio::test]
+    async fn a_refused_ask_gives_back_its_answers() {
+        let (state, _db, _) = relay(RegistrationMode::Open).await;
+        let (mut old, signed, _) = claimed(&state).await;
+        let (mut m, mut c) = new_device(&state).await;
+        pair_said_no(&mut old, &mut m, &mut c).await;
+        pair_said_no(&mut old, &mut m, &mut c).await;
+
+        c.send(&m.pair_start().unwrap()).await;
+        let (pair, commitment, own, nonce) = pair_asked(&mut old).await;
+        pair_reveal(&mut m, &mut c).await;
+        let (ephemeral, _) = pair_revealed(&mut old, &commitment, &nonce).await;
+        let wrapped = voipc_crypto::pair::wrap_dek(
+            &own,
+            &ephemeral,
+            &signed.vault.dek(),
+            &signed.relay_id,
+            &signed.name,
+            &commitment,
+        )
+        .unwrap();
+        old.send(&ClientMessage::Account(AccountRequest::PairApprove {
+            pair,
+            wrapped,
+        }))
+        .await;
+        let msg = c.next().await.unwrap();
+        m.on_message(&msg).unwrap();
+        let steps = m.pair_same(true).unwrap();
         run_to_authenticated(&mut m, &mut c, steps).await;
+    }
+
+    /// The control for the above: an ask past the limit gives nothing back, or a
+    /// client could spin on one connection for as long as it liked.
+    #[tokio::test]
+    async fn an_ask_past_the_limit_gives_nothing_back() {
+        let (state, _db, _) = relay(RegistrationMode::Open).await;
+        let (_old, _, _) = claimed(&state).await;
+        let (mut m, mut c) = new_device(&state).await;
+        let relay = relay_of(&state);
+        let user = relay
+            .store()
+            .user_by_username("deedee")
+            .await
+            .unwrap()
+            .unwrap();
+        for _ in 0..3 {
+            assert!(relay.spend_pair_ask(user.id));
+        }
+        for _ in 0..8 {
+            c.send(&m.pair_start().unwrap()).await;
+            match c.next().await {
+                Some(ServerMessage::AuthStep(AuthStep::PairRefused { reason })) => {
+                    assert!(reason.contains("Too many"), "{reason}")
+                }
+                Some(ServerMessage::AuthError { reason }) => {
+                    assert!(reason.contains("Too many sign-in"), "{reason}");
+                    return;
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        panic!("eight asks past the limit, on one connection");
     }
 
     /// A stranger with the provider account must not be able to wear the person
@@ -8473,6 +9522,178 @@ mod providers {
             panic!("somebody else answered")
         };
         assert_eq!(got, nonce);
+    }
+
+    // ── The first vault's key ──
+
+    /// A new sign-in by the same person, up to its `ProviderSigned`.
+    async fn back_at_the_choice(state: &Arc<ServerState>) -> (SignIn, Client, bool) {
+        let (url, code, ticket) = open_page(state).await;
+        browser(state, &url, &code).await;
+        let (mut m, first) = SignIn::start(
+            "",
+            Method::Provider {
+                ticket,
+                invite: None,
+            },
+            PROTOCOL_VERSION,
+            APP_VERSION,
+        );
+        let mut c = open_raw(state, &first).await;
+        let msg = c.next().await.unwrap();
+        let steps = m.on_message(&msg).unwrap();
+        let [Step::ProviderChoice { claim, .. }] = &steps[..] else {
+            panic!("no choice")
+        };
+        let claim = *claim;
+        (m, c, claim)
+    }
+
+    /// A first sign-in up to the claim's message: the key on screen, nothing sent.
+    async fn at_the_key(state: &Arc<ServerState>) -> (SignIn, Client, String, Vec<Step>) {
+        let (url, code, ticket) = open_page(state).await;
+        browser(state, &url, &code).await;
+        let (mut m, first) = SignIn::start(
+            "",
+            Method::Provider {
+                ticket,
+                invite: None,
+            },
+            PROTOCOL_VERSION,
+            APP_VERSION,
+        );
+        let mut c = open_raw(state, &first).await;
+        let msg = c.next().await.unwrap();
+        let mut steps = m.on_message(&msg).unwrap();
+        if matches!(steps[0], Step::ProviderSignup { .. }) {
+            let out = m.provider_signup("deedee").unwrap();
+            c.send(&out).await;
+            let msg = c.next().await.unwrap();
+            steps = m.on_message(&msg).unwrap();
+        }
+        assert!(matches!(steps[0], Step::ProviderChoice { claim: true, .. }));
+        let key = m.provider_claim_key().unwrap();
+        let steps = m.provider_claim().unwrap();
+        (m, c, key, steps)
+    }
+
+    /// Sends what the claim's steps say, keys included.
+    async fn send_claim(m: &mut SignIn, c: &mut Client, steps: Vec<Step>) {
+        for s in steps {
+            match s {
+                Step::Send(out) => c.send(&out).await,
+                Step::Keys => {
+                    let ik = m.identity().unwrap().public_key().serialize().to_vec();
+                    let b = PreKeyBundleData {
+                        identity_key: ik,
+                        ..bundle()
+                    };
+                    c.send(&m.keys(b)).await;
+                }
+                _ => panic!("unexpected step"),
+            }
+        }
+    }
+
+    /// W1-10: the store happened and the session was refused after it. The key the
+    /// person was shown opens what got stored, and nothing else does.
+    #[tokio::test]
+    async fn a_claim_refused_afterwards_opens_with_the_key_shown() {
+        let (state, _db, _) = relay(RegistrationMode::Open).await;
+        let (mut m, mut c, key, steps) = at_the_key(&state).await;
+        let user = relay_of(&state)
+            .store()
+            .user_by_username("deedee")
+            .await
+            .unwrap()
+            .unwrap();
+        state.bans.insert(
+            crate::bans::Key::Account(user.id.0),
+            crate::bans::Ban {
+                id: 1,
+                label: "deedee".into(),
+                reason: "not today".into(),
+                by: "server shell".into(),
+                created_at: 1_800_000_000,
+                expires_at: None,
+                addr: None,
+                alias: None,
+            },
+        );
+        send_claim(&mut m, &mut c, steps).await;
+        let refused = loop {
+            match c.next().await {
+                Some(ServerMessage::Authenticated { .. }) => panic!("signed in past the ban"),
+                Some(ServerMessage::Refused { text, .. }) => break text,
+                Some(ServerMessage::AuthError { reason }) => break reason,
+                Some(_) => {}
+                None => panic!("closed with no reason"),
+            }
+        };
+        assert!(refused.contains("banned"), "{refused}");
+        state.bans.clear();
+
+        let (mut m, mut c, claim) = back_at_the_choice(&state).await;
+        assert!(
+            !claim,
+            "the vault was stored, so the relay asks what opens it"
+        );
+        // The control: a key that is not the one shown opens nothing
+        assert!(m.provider_recovery(&[0x55; 32]).is_err());
+        let shown = voipc_crypto::account::recovery_parse(&key).unwrap();
+        let steps = m.provider_recovery(&shown).unwrap();
+        run_to_authenticated(&mut m, &mut c, steps).await;
+    }
+
+    /// The same when the connection is what goes, once the vault is stored.
+    #[tokio::test]
+    async fn a_cut_after_the_claim_opens_with_the_key_shown() {
+        let (state, _db, _) = relay(RegistrationMode::Open).await;
+        let (_m, mut c, key, mut steps) = at_the_key(&state).await;
+        let user = relay_of(&state)
+            .store()
+            .user_by_username("deedee")
+            .await
+            .unwrap()
+            .unwrap();
+        let Step::Send(claim) = steps.remove(0) else {
+            panic!("no claim")
+        };
+        c.send(&claim).await;
+        for _ in 0..200 {
+            if relay_of(&state).identity(user.id).await.unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(relay_of(&state).identity(user.id).await.unwrap().is_some());
+        drop(c);
+
+        let (mut m, mut c, claim) = back_at_the_choice(&state).await;
+        assert!(!claim);
+        assert!(m.provider_recovery(&[0x55; 32]).is_err());
+        let shown = voipc_crypto::account::recovery_parse(&key).unwrap();
+        let steps = m.provider_recovery(&shown).unwrap();
+        run_to_authenticated(&mut m, &mut c, steps).await;
+    }
+
+    /// Two devices at the key with the account unopened: the first claim counts, and
+    /// the other is told its key is dead.
+    #[tokio::test]
+    async fn the_claim_that_comes_second_says_its_key_is_dead() {
+        let (state, _db, _) = relay(RegistrationMode::Open).await;
+        let (mut m, mut c, _, steps) = at_the_key(&state).await;
+        let (mut m2, mut c2, _, steps2) = at_the_key(&state).await;
+        send_claim(&mut m, &mut c, steps).await;
+        c.expect("Authenticated", |x| {
+            matches!(x, ServerMessage::Authenticated { .. })
+        })
+        .await;
+        send_claim(&mut m2, &mut c2, steps2).await;
+        let Some(ServerMessage::AuthError { reason }) = c2.next().await else {
+            panic!("no refusal")
+        };
+        assert!(reason.contains("does not count"), "{reason}");
     }
 
     // ── A signed-in account's providers ──
@@ -10124,6 +11345,85 @@ mod providers {
             assert_eq!(a_group(&state, "moderator-x-power").await.scopes, old);
         }
 
+        /// An admin may give a Discord-made group Share history, and nothing else: it stays a
+        /// plain group, handed out by the next import and kept through a claim, or the gates
+        /// that name it would throw people out. The owner's ruling.
+        #[tokio::test]
+        async fn a_share_only_group_sits_on_an_imported_group() {
+            const SHARE: &str = voipc_protocol::types::SHARE_HISTORY;
+            let (state, _db, subject) = relay(RegistrationMode::Open).await;
+            let (mut ann, secret, run) = running(&state).await;
+            roles(&mut ann, run, vec![role(11, "Crew", 0)]).await;
+            let save = |scopes: &[&str]| AdminOp::GroupSave {
+                create: false,
+                group: GroupInfo {
+                    name: "crew".into(),
+                    description: String::new(),
+                    badge: String::new(),
+                    scopes: scopes.iter().map(|s| s.to_string()).collect(),
+                    builtin: false,
+                },
+            };
+            // The control: anything else is refused, for the -power group to carry
+            let r = op(&mut ann, save(&[SHARE, "voipc:kick"]), Some(code(&secret))).await;
+            assert!(matches!(r, AccountReply::Error { .. }), "{r:?}");
+            assert!(a_group(&state, "crew").await.scopes.is_empty());
+            let r = op(&mut ann, save(&[SHARE]), Some(code(&secret))).await;
+            assert!(!matches!(r, AccountReply::Error { .. }), "saved: {r:?}");
+            assert_eq!(a_group(&state, "crew").await.scopes, [SHARE]);
+
+            // The next import still hands it out, and a claim keeps it
+            members(&mut ann, run, vec![member(1001, "dee", &[11])]).await;
+            assert!(groups_of(&state, "dee").await.contains(&"crew".to_string()));
+            assert!(waiting(&mut ann).await.is_empty());
+            let (mut c, _) = come(&state, &subject, 1001, &["dee"]).await.unwrap();
+            settled(&mut c).await;
+            assert!(
+                groups_of(&state, "dee").await.contains(&"crew".to_string()),
+                "the claim leaves it"
+            );
+            assert!(
+                waiting(&mut ann).await.is_empty(),
+                "and it waits for nobody"
+            );
+            let user = account(&state, "dee").await;
+            let sid = *state.account_sessions.get(&user.id.0).unwrap();
+            let s = state.sessions.get(&sid).unwrap();
+            let a = s.account.as_ref().unwrap();
+            assert_eq!(a.scopes, [SHARE]);
+            assert!(!s.is_moderator && a.standing.groups.contains(&"crew".to_string()));
+        }
+
+        /// Discord never says Share history, so an admin adding it to a held-back group
+        /// changes nothing that a next import should report.
+        #[tokio::test]
+        async fn share_history_on_a_held_back_group_is_not_power_changed() {
+            const SHARE: &str = voipc_protocol::types::SHARE_HISTORY;
+            let (state, _db, _) = relay(RegistrationMode::Open).await;
+            let (mut ann, _, run) = running(&state).await;
+            roles(&mut ann, run, vec![role(11, "Mods", discord::KICK_MEMBERS)]).await;
+            let twin = a_group(&state, "mods-power").await;
+            relay_of(&state)
+                .store()
+                .set_role_scopes(twin.id, &["voipc:kick".to_string(), SHARE.to_string()])
+                .await
+                .unwrap();
+            let done = roles(&mut ann, run, vec![role(11, "Mods", discord::KICK_MEMBERS)]).await;
+            assert!(done.power_changed.is_empty(), "{:?}", done.power_changed);
+            // The control: what Discord does say still shows
+            let done = roles(
+                &mut ann,
+                run,
+                vec![role(
+                    11,
+                    "Mods",
+                    discord::KICK_MEMBERS | discord::BAN_MEMBERS,
+                )],
+            )
+            .await;
+            assert_eq!(done.power_changed, ["mods-power"]);
+        }
+
         // ── Power ──
 
         /// The plan's own test. Someone holding the Discord account of an admin gets the
@@ -10723,6 +12023,323 @@ mod providers {
                 .contains(&"mine".to_string()));
         }
 
+        /// Not only what came from Discord: whatever privileges the account held were given to
+        /// the person before.
+        #[tokio::test]
+        async fn a_reclaim_holds_every_group_with_privileges_and_no_plain_one() {
+            let (state, _db, subject) = relay(RegistrationMode::Open).await;
+            let (mut ann, _, run) = running(&state).await;
+            group(&state, "reports", Some("R"), &["voipc:reports"]).await;
+            group(&state, "fans", None, &[]).await;
+            members(&mut ann, run, vec![member(1001, "dee", &[])]).await;
+            let (dee, _) = come(&state, &subject, 1001, &["dee"]).await.unwrap();
+            let user = account(&state, "dee").await;
+            for name in ["moderator", "reports", "fans"] {
+                let r = op(
+                    &mut ann,
+                    AdminOp::Grant {
+                        id: user.id.0,
+                        group: name.into(),
+                    },
+                    None,
+                )
+                .await;
+                assert!(
+                    matches!(r, AccountReply::Admin(AdminReply::User { .. })),
+                    "{r:?}"
+                );
+            }
+            drop(dee);
+
+            let relay = relay_of(&state);
+            relay.reclaim(&relay.ctx(LO, "test"), &user).await.unwrap();
+            let held = groups_of(&state, "dee").await;
+            assert!(held.contains(&"fans".to_string()), "{held:?}");
+            assert!(!held.contains(&"moderator".to_string()), "{held:?}");
+            assert!(!held.contains(&"reports".to_string()), "{held:?}");
+            let rows = waiting(&mut ann).await;
+            let mut names: Vec<&str> = rows.iter().map(|r| r.group.as_str()).collect();
+            names.sort();
+            assert_eq!(names, ["moderator", "reports"]);
+            assert!(rows.iter().all(|r| !r.claimed), "{rows:?}");
+            let shown = rows.iter().find(|r| r.group == "reports").unwrap();
+            assert_eq!(shown.badge, "R", "no twin to take it from: its own");
+            // The account's history says so
+            let r = op(&mut ann, AdminOp::User { id: user.id.0 }, None).await;
+            let AccountReply::Admin(AdminReply::User { audit, .. }) = &r else {
+                panic!("{r:?}")
+            };
+            assert!(
+                audit
+                    .iter()
+                    .any(|a| a.event == "role_revoke" && a.detail.starts_with("reports: waits")),
+                "{audit:?}"
+            );
+
+            // Someone opens it: they hold neither until the OK, and then both
+            let (_again, _) = come(&state, &subject, 1001, &[]).await.unwrap();
+            let held = groups_of(&state, "dee").await;
+            assert!(!held.contains(&"moderator".to_string()), "{held:?}");
+            assert!(!held.contains(&"reports".to_string()), "{held:?}");
+            for name in ["moderator", "reports"] {
+                let r = op(
+                    &mut ann,
+                    AdminOp::PowerAnswer {
+                        id: user.id.0,
+                        group: name.into(),
+                        grant: true,
+                    },
+                    None,
+                )
+                .await;
+                assert!(
+                    matches!(r, AccountReply::Admin(AdminReply::PowerWaiting { .. })),
+                    "{r:?}"
+                );
+                assert!(groups_of(&state, "dee").await.contains(&name.to_string()));
+            }
+        }
+
+        /// The claim is the one door from nobody to somebody: however an unopened account came
+        /// to hold a group, whoever walks through holds no power until an admin says OK.
+        #[tokio::test]
+        async fn every_order_of_grant_save_claim_and_reclaim_leaves_a_new_opener_with_no_power() {
+            #[derive(Clone, Copy, Debug)]
+            enum Order {
+                /// `plain`, by an admin
+                GrantPlain,
+                /// `plain` comes to hold something
+                Gains,
+                /// And no longer does
+                Loses,
+                /// `power`, by an admin, who is refused it on an account nobody opened
+                GrantPower,
+                /// `power`, from the shell, which refuses nothing
+                ShellPower,
+                Claim,
+                Reclaim,
+            }
+            use Order::*;
+            #[rustfmt::skip]
+            let waits: [(&[Order], &str); 6] = [
+                (&[ShellPower], "power"),
+                (&[Claim, Reclaim, ShellPower], "power"),
+                (&[GrantPlain, Gains], "plain"),
+                (&[Claim, GrantPower, Reclaim], "power"),
+                (&[Claim, GrantPlain, Reclaim, Gains], "plain"),
+                (&[Claim, Reclaim, GrantPlain, Gains], "plain"),
+            ];
+            #[rustfmt::skip]
+            let stays: [(&[Order], &str); 2] = [
+                // Nothing to hold
+                (&[GrantPlain, Gains, Loses], "plain"),
+                // The person opened first: any group's save reaches them
+                (&[Claim, GrantPlain, Gains], "plain"),
+            ];
+            let orders = waits
+                .iter()
+                .map(|(o, g)| (*o, *g, true))
+                .chain(stays.iter().map(|(o, g)| (*o, *g, false)));
+            for (order, name, held_back) in orders {
+                let (state, _db, subject) = relay(RegistrationMode::Open).await;
+                let (mut ann, _, run) = running(&state).await;
+                group(&state, "plain", None, &[]).await;
+                group(&state, "power", None, &["voipc:kick"]).await;
+                members(&mut ann, run, vec![member(1001, "dee", &[])]).await;
+                let id = account(&state, "dee").await.id;
+                let save = |scopes: &[&str]| AdminOp::GroupSave {
+                    create: false,
+                    group: GroupInfo {
+                        name: "plain".into(),
+                        description: "x".into(),
+                        badge: String::new(),
+                        scopes: strings(scopes),
+                        builtin: false,
+                    },
+                };
+                let grant = |group: &str| AdminOp::Grant {
+                    id: id.0,
+                    group: group.into(),
+                };
+                let mut open = None;
+                let mut named = false;
+                for step in order {
+                    let r = match step {
+                        GrantPlain => Some(op(&mut ann, grant("plain"), None).await),
+                        Gains => Some(op(&mut ann, save(&["voipc:kick"]), None).await),
+                        Loses => Some(op(&mut ann, save(&[]), None).await),
+                        GrantPower => Some(op(&mut ann, grant("power"), None).await),
+                        ShellPower => {
+                            let relay = relay_of(&state);
+                            relay
+                                .accounts
+                                .grant_role_as_host(&relay.ctx(LO, "test"), id, "power")
+                                .await
+                                .unwrap();
+                            None
+                        }
+                        Claim => {
+                            let names: &[&str] = if named { &[] } else { &["dee"] };
+                            let (c, _) = come(&state, &subject, 1001, names).await.unwrap();
+                            open = Some(c);
+                            named = true;
+                            None
+                        }
+                        Reclaim => {
+                            open = None;
+                            let user = account(&state, "dee").await;
+                            let relay = relay_of(&state);
+                            relay.reclaim(&relay.ctx(LO, "test"), &user).await.unwrap();
+                            None
+                        }
+                    };
+                    if let Some(r) = r {
+                        assert!(
+                            matches!(
+                                r,
+                                AccountReply::Admin(
+                                    AdminReply::User { .. } | AdminReply::Groups { .. }
+                                )
+                            ),
+                            "{order:?}, {step:?}: {r:?}"
+                        );
+                    }
+                }
+                let _new_opener = match open {
+                    Some(c) => c,
+                    None => {
+                        let names: &[&str] = if named { &[] } else { &["dee"] };
+                        come(&state, &subject, 1001, names).await.unwrap().0
+                    }
+                };
+                let held = groups_of(&state, "dee").await;
+                let rows = waiting(&mut ann).await;
+                let wanting = rows.iter().find(|r| r.group == name);
+                if held_back {
+                    assert!(!held.contains(&name.to_string()), "{order:?}: {held:?}");
+                    let row = wanting.unwrap_or_else(|| panic!("{order:?}: {rows:?}"));
+                    assert!(row.claimed, "{order:?}: to be answered at once");
+                    let r = op(
+                        &mut ann,
+                        AdminOp::PowerAnswer {
+                            id: id.0,
+                            group: name.into(),
+                            grant: true,
+                        },
+                        None,
+                    )
+                    .await;
+                    assert!(
+                        matches!(r, AccountReply::Admin(AdminReply::PowerWaiting { .. })),
+                        "{order:?}: {r:?}"
+                    );
+                } else {
+                    assert!(held.contains(&name.to_string()), "{order:?}: {held:?}");
+                    assert!(wanting.is_none(), "{order:?}: {rows:?}");
+                }
+            }
+        }
+
+        /// Reclaiming the only `*` would leave nobody to say OK, and leaving it would hand `*`
+        /// to whoever holds that Discord login next.
+        #[tokio::test]
+        async fn the_last_admin_is_refused_a_reclaim_and_nothing_changes() {
+            let (state, _db, subject) = relay(RegistrationMode::Open).await;
+            let (mut ann, _, run) = running(&state).await;
+            members(&mut ann, run, vec![member(1001, "dee", &[])]).await;
+            let (dee, _) = come(&state, &subject, 1001, &["dee"]).await.unwrap();
+            drop(dee);
+            let user = account(&state, "dee").await;
+            let them = account(&state, "ann").await.id;
+            let relay = relay_of(&state);
+            let ctx = relay.ctx(LO, "test");
+            relay
+                .accounts
+                .grant_role_as_host(&ctx, user.id, "admin")
+                .await
+                .unwrap();
+            relay
+                .accounts
+                .grant_role_as_host(&ctx, user.id, "moderator")
+                .await
+                .unwrap();
+            relay
+                .accounts
+                .revoke_role_as_host(&ctx, them, "admin")
+                .await
+                .unwrap();
+            let waits = "SELECT CAST(COUNT(*) AS BIGINT) FROM voipc_power_waiting";
+
+            let err = relay.reclaim(&ctx, &user).await.unwrap_err();
+            assert!(
+                err.contains("admin holds the last admin group here"),
+                "{err}"
+            );
+            assert!(err.contains("give it to another account first"), "{err}");
+            assert!(relay.identity(user.id).await.unwrap().is_some());
+            assert!(!relay.vault(user.id).await.unwrap().is_empty());
+            let held = groups_of(&state, "dee").await;
+            assert!(held.contains(&"admin".to_string()), "{held:?}");
+            assert!(held.contains(&"moderator".to_string()), "{held:?}");
+            assert_eq!(count(&state, waits).await, 0);
+
+            // The control: with a second `*` it goes through, and both wait
+            relay
+                .accounts
+                .grant_role_as_host(&ctx, them, "admin")
+                .await
+                .unwrap();
+            relay.reclaim(&ctx, &user).await.unwrap();
+            assert!(relay.identity(user.id).await.unwrap().is_none());
+            let held = groups_of(&state, "dee").await;
+            assert!(!held.contains(&"admin".to_string()), "{held:?}");
+            assert!(!held.contains(&"moderator".to_string()), "{held:?}");
+            assert_eq!(count(&state, waits).await, 2);
+        }
+
+        /// Only the shell can do this: `*` given to an account nobody opened, and no other. The
+        /// claim is refused, and the log says what to do; nothing of it is left behind.
+        #[tokio::test]
+        async fn a_claim_meeting_the_last_admin_is_refused_and_nothing_changes() {
+            let (state, _db, subject) = relay(RegistrationMode::Open).await;
+            let (mut ann, _, run) = running(&state).await;
+            members(&mut ann, run, vec![member(1001, "dee", &[])]).await;
+            let user = account(&state, "dee").await;
+            let them = account(&state, "ann").await.id;
+            let relay = relay_of(&state);
+            let ctx = relay.ctx(LO, "test");
+            relay
+                .accounts
+                .grant_role_as_host(&ctx, user.id, "admin")
+                .await
+                .unwrap();
+            relay
+                .accounts
+                .revoke_role_as_host(&ctx, them, "admin")
+                .await
+                .unwrap();
+            let waits = "SELECT CAST(COUNT(*) AS BIGINT) FROM voipc_power_waiting";
+
+            assert!(come(&state, &subject, 1001, &["dee"]).await.is_err());
+            assert!(relay.identity(user.id).await.unwrap().is_none());
+            assert!(relay.vault(user.id).await.unwrap().is_empty());
+            assert!(relay.placeholder_open(user.id).await.unwrap());
+            let held = groups_of(&state, "dee").await;
+            assert!(held.contains(&"admin".to_string()), "{held:?}");
+            assert_eq!(count(&state, waits).await, 0);
+
+            // The control: with another `*` the claim goes through, and `*` waits for an OK
+            relay
+                .accounts
+                .grant_role_as_host(&ctx, them, "admin")
+                .await
+                .unwrap();
+            let (_dee, _) = come(&state, &subject, 1001, &["dee"]).await.unwrap();
+            let held = groups_of(&state, "dee").await;
+            assert!(!held.contains(&"admin".to_string()), "{held:?}");
+            assert_eq!(count(&state, waits).await, 1);
+        }
+
         // ── Claiming ──
 
         #[tokio::test]
@@ -10843,6 +12460,7 @@ mod providers {
             let msg = b.next().await.unwrap();
             mb.on_message(&msg).unwrap();
 
+            ma.provider_claim_key().unwrap();
             let Step::Send(claim) = ma.provider_claim().unwrap().remove(0) else {
                 panic!("no claim")
             };
@@ -10859,6 +12477,7 @@ mod providers {
             assert!(relay_of(&state).identity(user.id).await.unwrap().is_none());
 
             // The control: under the name it has, it goes through, and opens with its key
+            let key = mb.provider_claim_key().unwrap();
             let steps = mb.provider_claim().unwrap();
             for s in steps {
                 match s {
@@ -10884,9 +12503,7 @@ mod providers {
                 )
             })
             .await;
-            let signed = mb.finish().unwrap();
-            let key =
-                voipc_crypto::account::recovery_parse(signed.recovery.as_ref().unwrap()).unwrap();
+            let key = voipc_crypto::account::recovery_parse(&key).unwrap();
             drop(b);
             tokio::time::sleep(Duration::from_millis(100)).await;
             *subject.lock().unwrap() = "1001".into();
@@ -11639,6 +13256,7 @@ mod providers {
                     .unwrap(),
                 1
             );
+            m.provider_claim_key().unwrap();
             let Step::Send(claim) = m.provider_claim().unwrap().remove(0) else {
                 panic!("no claim")
             };
@@ -12033,7 +13651,7 @@ mod providers {
             assert!(kept, "the app's, so it can be edited and deleted");
             assert_eq!(gate, ChannelGate::default());
             assert_eq!(i.description, "a topic");
-            assert_eq!((i.slow_mode_secs, i.nsfw, i.auto_join), (30, true, false));
+            assert_eq!((i.slow_mode_secs, i.nsfw, i.auto_join), (30, true, true));
             assert!(i.text && !i.announce);
             assert_eq!(i.log, "c:dc-601", "a log that outlives its name");
             assert!(live(&state, 602).await.unwrap().1.announce);
@@ -12105,6 +13723,52 @@ mod providers {
             assert!(refused_rows(op(&mut ann, step, None).await).is_empty());
             assert_eq!(gate_of(&state, 601).await.groups, strings(&["admin"]));
             assert_eq!(state.channel_budget.load(Ordering::Relaxed), budget + 1);
+        }
+
+        #[tokio::test]
+        async fn a_moved_text_channel_asks_to_be_followed_and_a_later_run_leaves_it() {
+            let (state, _db, _) = relay(RegistrationMode::Open).await;
+            let (mut ann, _, run) = running(&state).await;
+            roles(&mut ann, run, vec![role(12, "Mods", discord::KICK_MEMBERS)]).await;
+            let open = || a_channel(601, "open");
+            let gated = || {
+                let mut gated = a_channel(602, "gated");
+                gated.see = ImportGate::Roles(vec![12]);
+                gated
+            };
+            let mut room = a_channel(603, "room");
+            room.text = false;
+            assert!(channels(&mut ann, run, vec![open(), gated(), room])
+                .await
+                .is_empty());
+            assert!(live(&state, 601).await.unwrap().1.auto_join);
+            assert!(
+                live(&state, 602).await.unwrap().1.auto_join,
+                "a gate says who may, not whether"
+            );
+            assert!(!live(&state, 603).await.unwrap().1.auto_join, "the control");
+
+            let (id, info, _, _) = live(&state, 601).await.unwrap();
+            let reply = op(
+                &mut ann,
+                AdminOp::ChannelSave {
+                    id: Some(id),
+                    name: info.name,
+                    description: info.description,
+                    text: true,
+                    auto_join: false,
+                    category: None,
+                    gate: None,
+                },
+                None,
+            )
+            .await;
+            assert!(matches!(reply, AccountReply::Admin(_)), "{reply:?}");
+            assert!(channels(&mut ann, run, vec![open()]).await.is_empty());
+            assert!(
+                !live(&state, 601).await.unwrap().1.auto_join,
+                "an untick stays"
+            );
         }
 
         #[tokio::test]
@@ -12351,38 +14015,26 @@ mod providers {
         }
 
         #[tokio::test]
-        async fn a_list_overflow_is_refused_and_a_restart_loads_all() {
+        async fn a_list_past_one_frame_is_made_and_a_restart_loads_all() {
             let (state, db, _) = relay(RegistrationMode::Open).await;
             let (mut ann, _, run) = running(&state).await;
-            let mut next = 1000u64;
             let mut made = Vec::new();
-            let refused = loop {
-                let rows: Vec<ImportChannel> = (next..next + 32)
+            for first in (1000u64..).step_by(32).take(12) {
+                let rows: Vec<ImportChannel> = (first..first + 32)
                     .map(|id| {
                         let mut c = a_channel(id, &format!("channel {id}"));
                         c.description = "d".repeat(250);
                         c
                     })
                     .collect();
-                let refused = channels(&mut ann, run, rows).await;
-                made.extend((next..next + 32).filter(|id| !refused.iter().any(|r| r.0 == *id)));
-                if !refused.is_empty() {
-                    break refused;
-                }
-                next += 32;
-            };
-            assert!(made.len() > 100, "{}", made.len());
-            for (id, why) in &refused {
-                assert!(why.contains("One channel list"), "{why}");
-                assert!(live(&state, *id).await.is_none());
+                assert!(channels(&mut ann, run, rows).await.is_empty());
+                made.extend(first..first + 32);
             }
-            let channels_now = state.channel_list().await;
-            let list = encode_server_msg(&ServerMessage::ChannelList {
-                channels: channels_now,
-            })
-            .unwrap();
-            assert!(list.len() <= crate::layout::LIST_LIMIT, "{}", list.len());
-            // Never written, or the next start would leave channels out
+            // The control: it really would not fit one frame
+            let one_frame = encode_server_msg(&ServerMessage::ChannelList {
+                channels: state.channel_list().await,
+            });
+            assert!(one_frame.is_err() || one_frame.unwrap().len() > 60 * 1024);
             let n = made.len() as i64;
             let q = "SELECT CAST(COUNT(*) AS BIGINT) FROM voipc_channels";
             assert_eq!(count(&state, q).await, n);
@@ -12393,11 +14045,6 @@ mod providers {
             for id in &made {
                 assert!(live(&after, *id).await.is_some(), "{id} left out");
             }
-            // The control: it really would not have fitted
-            let mut one_more = after.channel_list().await;
-            one_more.push(one_more.last().unwrap().clone());
-            let list = encode_server_msg(&ServerMessage::ChannelList { channels: one_more });
-            assert!(list.is_err() || list.unwrap().len() > crate::layout::LIST_LIMIT);
         }
 
         #[tokio::test]
@@ -13363,7 +15010,8 @@ mod providers {
                 ServerMessage::Account(
                     AccountReply::ArchivePage { .. }
                     | AccountReply::ArchiveHits { .. }
-                    | AccountReply::ArchiveMineDone { .. },
+                    | AccountReply::ArchiveMineDone { .. }
+                    | AccountReply::ArchiveChannels { .. },
                 ) => true,
                 ServerMessage::Account(AccountReply::Error { request, .. }) => {
                     request.starts_with("Archive")
@@ -13413,10 +15061,10 @@ mod providers {
                 password: None,
             })
             .await;
-            c.expect(
-                "UserList",
-                |m| matches!(m, ServerMessage::UserList { channel_id: c, .. } if *c == channel_id),
-            )
+            let joined = text_joined(channel_id);
+            c.expect("in the channel", |m| {
+                joined(m) || matches!(m, ServerMessage::UserList { channel_id: c, .. } if *c == channel_id)
+            })
             .await;
         }
 
@@ -13585,15 +15233,15 @@ mod providers {
             assert_eq!(refusal_of(&asks(&mut bea, fetch_of(id, "")).await), JOIN);
         }
 
-        /// Reading must not hang on `voipc_members`: that list is opt-in and stops at 256.
+        /// Reading must not hang on `voipc_members`: that list is opt-in and stops at `kept_seats`.
         #[tokio::test]
-        async fn the_257th_member_reads_too() {
+        async fn a_member_past_the_seats_reads_too() {
             let (state, _db, _) = relay(RegistrationMode::Open).await;
             let (mut ann, _, run) = filing(&state).await;
             acked(&mut ann, run, 601, None, 100, vec![a_row(100, 7, "hi")]).await;
             let id = lounge(&state).await;
             let q =
-                "WITH RECURSIVE s(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM s WHERE i + 1 < 256)
+                "WITH RECURSIVE s(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM s WHERE i + 1 < 5000)
                  INSERT INTO acct_users (id, username, display_name, status, created_at)
                  SELECT randomblob(16), 'x' || i, 'x', 'active', 1 FROM s";
             sql(&state, q).await;
@@ -14217,6 +15865,51 @@ mod providers {
 
         /// Who opens what, and what they look for, is new knowledge for the relay. Not a line
         /// of it reaches a log, at any level, on the way that works or the way that fails.
+        /// Asked once at connect, so opening a channel sends nothing. A channel with no rows, or
+        /// one this session does not stand in, is not named.
+        #[tokio::test]
+        async fn a_connect_learns_which_of_its_channels_hold_an_archive() {
+            let (state, _db, _) = relay(RegistrationMode::Open).await;
+            let (mut ann, _, run) = filing(&state).await;
+            acked(&mut ann, run, 601, None, 100, vec![a_row(100, 7, "hello")]).await;
+            let id = lounge(&state).await;
+            let mut bea = standing(&state, "bea", 7, id).await;
+            let plain = create(&mut bea, "plain", true).await;
+            let names = |r: AccountReply| match r {
+                AccountReply::ArchiveChannels { channels } => channels,
+                other => panic!("{other:?}"),
+            };
+            let got = asks(&mut bea, AccountRequest::ArchiveChannels).await;
+            assert_eq!(names(got), [id]);
+            assert!(state.channels.read().await[&plain]
+                .members
+                .contains(state.username_to_session.get("bea").unwrap().value()));
+            let (mut cid, _) = register(&state, "cid").await;
+            let got = asks(&mut cid, AccountRequest::ArchiveChannels).await;
+            assert!(names(got).is_empty(), "not in the channel");
+        }
+
+        /// Everybody online asks as an import ends. A read from before its rows must not answer.
+        #[tokio::test]
+        async fn an_imports_end_drops_what_the_list_read() {
+            let (state, _db, _) = relay(RegistrationMode::Open).await;
+            let (mut ann, _, run) = filing(&state).await;
+            let id = lounge(&state).await;
+            let mut bea = standing(&state, "bea", 7, id).await;
+            let names = |r: AccountReply| match r {
+                AccountReply::ArchiveChannels { channels } => channels,
+                other => panic!("{other:?}"),
+            };
+            let got = asks(&mut bea, AccountRequest::ArchiveChannels).await;
+            assert!(names(got).is_empty(), "no rows yet");
+            acked(&mut ann, run, 601, None, 100, vec![a_row(100, 7, "hello")]).await;
+            let got = asks(&mut bea, AccountRequest::ArchiveChannels).await;
+            assert!(names(got).is_empty(), "the read holds for a while");
+            end(&mut ann, run).await;
+            let got = asks(&mut bea, AccountRequest::ArchiveChannels).await;
+            assert_eq!(names(got), [id]);
+        }
+
         #[tokio::test]
         async fn who_reads_and_what_they_search_for_reach_no_log() {
             use std::io::Write;
@@ -15331,6 +17024,108 @@ mod providers {
 
         // ── What was private stays narrow ──
 
+        /// Its whole archive goes with it and no later run brings it back, so it takes what
+        /// `ArchiveDelete` takes. Asked before the code: nothing asks for what it will refuse.
+        #[tokio::test]
+        async fn a_channel_holding_an_archive_takes_an_admin_to_delete() {
+            const ONLY_AN_ADMIN: &str =
+                "This channel holds what came from Discord: only an admin can delete it.";
+            let (state, _db, _) = relay(RegistrationMode::Open).await;
+            let (mut ann, _, run) = filing(&state).await;
+            roles(&mut ann, run, vec![role(11, "Crew", 0)]).await;
+            assert!(categories(&mut ann, run, vec![a_category(801, "Talk")])
+                .await
+                .is_empty());
+            let empty = a_channel(602, "empty");
+            let hidden = a_channel(603, "hidden");
+            let inside = ImportChannel {
+                category: Some(801),
+                ..a_channel(604, "inside")
+            };
+            assert!(channels(&mut ann, run, vec![empty, hidden, inside])
+                .await
+                .is_empty());
+            for channel in [601, 603, 604] {
+                let row = a_row(100, 7, "hi");
+                let stored = acked(&mut ann, run, channel, None, 100, vec![row]).await;
+                assert_eq!(stored, (1, 0));
+            }
+            let (hidden_id, ..) = live(&state, 603).await.unwrap();
+            let gate = ChannelGate {
+                groups: strings(&["crew"]),
+                speakers: vec![],
+            };
+            let r = op(
+                &mut ann,
+                AdminOp::GateSet {
+                    channel_id: hidden_id,
+                    gate,
+                },
+                None,
+            )
+            .await;
+            assert!(
+                matches!(r, AccountReply::Admin(AdminReply::Gate { .. })),
+                "{r:?}"
+            );
+            let (mut chan, _, secret) = holder(&state, "chan", &["voipc:channels"]).await;
+            let delete = |id| AdminOp::ChannelDelete { id };
+
+            let (lounge_id, ..) = live(&state, 601).await.unwrap();
+            let r = op(&mut chan, delete(lounge_id), None).await;
+            assert_eq!(refusal_of(&r), ONLY_AN_ADMIN);
+            assert!(live(&state, 601).await.is_some());
+            assert_eq!(tidied(&state).await, 0);
+            assert_eq!(rows_here(&state).await, 3);
+            assert!(
+                !modlog(&mut ann)
+                    .await
+                    .iter()
+                    .any(|m| m.action == "channel_delete"),
+                "nothing happened"
+            );
+            // Behind a gate they do not pass, it answers as one that does not exist
+            let behind = op(&mut chan, delete(hidden_id), None).await;
+            let random = op(&mut chan, delete(987_654), None).await;
+            assert_eq!(refusal_of(&behind), "channel does not exist");
+            assert_eq!(refusal_of(&behind), refusal_of(&random));
+
+            // No rows under it: theirs to delete, with a code
+            let (empty_id, ..) = live(&state, 602).await.unwrap();
+            let r = op(&mut chan, delete(empty_id), None).await;
+            assert!(
+                matches!(r, AccountReply::Admin(AdminReply::StepUp)),
+                "{r:?}"
+            );
+            assert!(live(&state, 602).await.is_some());
+            let r = op(&mut chan, delete(empty_id), Some(code(&secret))).await;
+            saved(&r);
+            assert!(live(&state, 602).await.is_none());
+            // One made in the app: the same
+            let r = op(&mut chan, save_op(None, "made", true, None), None).await;
+            let AccountReply::Admin(AdminReply::ChannelDone {
+                channel_id: Some(made),
+            }) = r
+            else {
+                panic!("{r:?}")
+            };
+            saved(&op(&mut chan, delete(made), None).await);
+
+            // Its category going takes nothing from it
+            let category = state.layout.read().await.categories[0].id;
+            let step = AdminOp::CategoryDelete { id: category };
+            saved(&op(&mut chan, step, None).await);
+            assert!(live(&state, 604).await.is_some());
+            assert_eq!(tidied(&state).await, 0);
+            assert_eq!(rows_here(&state).await, 3);
+
+            // `*` may, and then the rows go
+            saved(&op(&mut ann, delete(lounge_id), None).await);
+            assert!(live(&state, 601).await.is_none());
+            assert_eq!(tidied(&state).await, 1);
+            assert_eq!(rows_here(&state).await, 2);
+        }
+
         #[tokio::test]
         async fn opening_a_private_archive_takes_an_admin() {
             let (state, _db, _) = relay(RegistrationMode::Open).await;
@@ -16207,9 +18002,10 @@ mod providers {
                 );
             }
 
-            // A Discord id is `*`'s: someone who may read the list sees the rest
+            // A Discord id is `*`'s, and so is who was banned there: someone who may read the
+            // list sees the rest
             let (_, rows) = listed(&mut reader, "", MoveFilter::All).await;
-            assert_eq!(rows.len(), 6);
+            assert_eq!(rows.len(), 5);
             assert!(rows.iter().all(|r| r.dc_id.is_empty()), "{rows:?}");
             assert_eq!(
                 rows.iter().find(|r| r.user.name == "dee").unwrap().state,
@@ -16241,6 +18037,105 @@ mod providers {
                 panic!("{r:?}")
             };
             assert_eq!((total, rows.len()), (6, 1));
+        }
+
+        /// Who was banned on Discord is `*`'s, on every list, and it goes by the mark: someone
+        /// who chose such a name is listed, and a banned row that kept a real one is not.
+        #[tokio::test]
+        async fn the_discord_banned_are_stars_alone() {
+            async fn users(c: &mut Client, search: &str) -> (u32, Vec<String>) {
+                let step = AdminOp::Users {
+                    search: search.into(),
+                    offset: 0,
+                };
+                match op(c, step, None).await {
+                    AccountReply::Admin(AdminReply::Users { total, users, .. }) => {
+                        (total, users.into_iter().map(|u| u.name).collect())
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+            async fn holding(c: &mut Client, group: &str) -> (u32, Vec<String>) {
+                let step = AdminOp::GroupMembers {
+                    name: group.into(),
+                    offset: 0,
+                };
+                match op(c, step, None).await {
+                    AccountReply::Admin(AdminReply::Members { total, users, .. }) => {
+                        (total, users.into_iter().map(|u| u.name).collect())
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+            let (state, _db, subject) = relay(RegistrationMode::Open).await;
+            let mut m = moved(&state, &subject).await;
+            let (mut reader, _, _) = holder(&state, "reader", &["users:read"]).await;
+            let (mut nobody, _) = register(&state, "nobody").await;
+            let (_chose_it, _) = register(&state, "dc-9").await;
+            let banned = account(&state, "dc-1003").await.id;
+            let found = |id: AccountId| AdminOp::User { id: id.0 };
+            let anyone = AccountId([9; 16]);
+            let name = "dc-1003".to_string();
+
+            let (total, rows) = listed(&mut reader, "", MoveFilter::All).await;
+            assert_eq!(total as usize, rows.len());
+            assert!(!names_in(&rows).contains(&name), "{rows:?}");
+            assert_eq!(listed(&mut reader, "dc-1", MoveFilter::All).await.0, 0);
+            let (_, rows) = listed(&mut reader, "dc-", MoveFilter::All).await;
+            assert_eq!(names_in(&rows), ["dc-9"], "who chose it stays listed");
+            let step = AdminOp::MoveAccounts {
+                search: String::new(),
+                offset: 0,
+                filter: MoveFilter::Banned,
+            };
+            let r = op(&mut reader, step.clone(), None).await;
+            assert!(refusal_of(&r).contains("Only an admin"), "{r:?}");
+
+            let (total, names) = users(&mut reader, "").await;
+            assert_eq!(total as usize, names.len());
+            assert!(!names.contains(&name), "{names:?}");
+            assert_eq!(users(&mut reader, "dc-").await.1, ["dc-9"]);
+            assert_eq!(users(&mut reader, "dc-1").await.0, 0);
+
+            let (total, names) = holding(&mut reader, "user").await;
+            assert_eq!(total as usize, names.len());
+            assert!(!names.contains(&name), "{names:?}");
+            assert!(names.contains(&"dc-9".to_string()), "{names:?}");
+
+            let hidden = op(&mut reader, found(banned), None).await;
+            let random = op(&mut reader, found(anyone), None).await;
+            assert_eq!(refusal_of(&hidden), refusal_of(&random));
+
+            // Someone who may read nothing cannot tell the banned from anyone: no new oracle
+            let hidden = op(&mut nobody, found(banned), None).await;
+            let random = op(&mut nobody, found(anyone), None).await;
+            assert_eq!(refusal_of(&hidden), refusal_of(&random));
+
+            // `*` sees it on all four
+            let (_, rows) = listed(&mut m.ann, "", MoveFilter::All).await;
+            assert!(names_in(&rows).contains(&name), "{rows:?}");
+            let r = op(&mut m.ann, step, None).await;
+            assert!(
+                matches!(r, AccountReply::Admin(AdminReply::MoveAccounts { .. })),
+                "{r:?}"
+            );
+            assert!(users(&mut m.ann, "").await.1.contains(&name));
+            assert!(holding(&mut m.ann, "user").await.1.contains(&name));
+            let r = op(&mut m.ann, found(banned), None).await;
+            assert!(
+                matches!(r, AccountReply::Admin(AdminReply::User { .. })),
+                "{r:?}"
+            );
+
+            // By the mark: this row kept a name of its own
+            sql(
+                &state,
+                "UPDATE acct_users SET username = 'kept-name' WHERE username = 'dc-1003'",
+            )
+            .await;
+            assert_eq!(listed(&mut reader, "kept", MoveFilter::All).await.0, 0);
+            assert_eq!(users(&mut reader, "kept").await.0, 0);
+            assert_eq!(listed(&mut m.ann, "kept", MoveFilter::All).await.0, 1);
         }
 
         #[tokio::test]
@@ -16418,6 +18313,132 @@ mod providers {
             };
             assert!(channels(&mut ann, run, vec![closed]).await.is_empty());
             assert_eq!(gate_of(&state, 601).await.groups, ["crew"]);
+        }
+
+        /// The gate those words asked for is what keeps its new rows from everyone: past `*`
+        /// it may only narrow from then on. Open there too, nothing changes.
+        #[tokio::test]
+        async fn a_channel_closed_since_and_gated_by_hand_is_private_from_then_on() {
+            let (state, _db, _) = relay(RegistrationMode::Open).await;
+            let (mut ann, _, run) = filing(&state).await;
+            roles(
+                &mut ann,
+                run,
+                vec![role(11, "Crew", 0), role(12, "Core", 0)],
+            )
+            .await;
+            assert!(channels(&mut ann, run, vec![a_channel(602, "open")])
+                .await
+                .is_empty());
+            let gate_set = |channel_id, groups: &[&str]| AdminOp::GateSet {
+                channel_id,
+                gate: ChannelGate {
+                    groups: strings(groups),
+                    speakers: vec![],
+                },
+            };
+            let (closed_there, ..) = live(&state, 601).await.unwrap();
+            let (open_there, ..) = live(&state, 602).await.unwrap();
+            for id in [closed_there, open_there] {
+                let r = op(&mut ann, gate_set(id, &["core", "crew"]), None).await;
+                assert!(
+                    matches!(r, AccountReply::Admin(AdminReply::Gate { .. })),
+                    "{r:?}"
+                );
+            }
+            let rows = vec![
+                ImportChannel {
+                    see: ImportGate::Closed,
+                    ..a_channel(601, "lounge")
+                },
+                a_channel(602, "open"),
+            ];
+            assert!(channels(&mut ann, run, rows).await.is_empty());
+            assert!(is_private(&state, 601).await);
+            assert!(!is_private(&state, 602).await);
+
+            let (mut chan, info, _) = holder(&state, "chan", &["voipc:channels"]).await;
+            give(&state, info.id, "crew", true).await;
+            for groups in [&[][..], &["user"][..], &["core", "crew", "user"][..]] {
+                let r = op(&mut chan, gate_set(closed_there, groups), None).await;
+                assert!(
+                    refusal_of(&r).contains("only an admin"),
+                    "{groups:?}: {r:?}"
+                );
+            }
+            assert_eq!(gate_of(&state, 601).await.groups, ["core", "crew"]);
+            let r = op(&mut chan, gate_set(closed_there, &["crew"]), None).await;
+            assert!(
+                matches!(r, AccountReply::Admin(AdminReply::Gate { .. })),
+                "{r:?}"
+            );
+            // The control: the same gate on a channel Discord still has open
+            let r = op(&mut chan, gate_set(open_there, &[]), None).await;
+            assert!(
+                matches!(r, AccountReply::Admin(AdminReply::Gate { .. })),
+                "{r:?}"
+            );
+        }
+
+        /// Every account holds `user`, so a gate of it keeps nobody with an account out.
+        #[tokio::test]
+        async fn a_gate_of_user_counts_as_open_for_what_was_private() {
+            let (state, _db, _) = relay(RegistrationMode::Open).await;
+            let (mut ann, _, run) = filing(&state).await;
+            roles(&mut ann, run, vec![role(11, "Crew", 0)]).await;
+            let gate_set = |channel_id, groups: &[&str]| AdminOp::GateSet {
+                channel_id,
+                gate: ChannelGate {
+                    groups: strings(groups),
+                    speakers: vec![],
+                },
+            };
+            let (lounge, ..) = live(&state, 601).await.unwrap();
+            let r = op(&mut ann, gate_set(lounge, &["user"]), None).await;
+            assert!(
+                matches!(r, AccountReply::Admin(AdminReply::Gate { .. })),
+                "{r:?}"
+            );
+            let closed = |dc_id, name| ImportChannel {
+                see: ImportGate::Closed,
+                ..a_channel(dc_id, name)
+            };
+            let named = channels(&mut ann, run, vec![closed(601, "lounge")]).await;
+            assert_eq!(named, [(601, PRIVATE_NOW.to_string())]);
+            assert!(!is_private(&state, 601).await, "nothing was stored");
+
+            // One already flagged takes no rows behind it
+            assert!(channels(&mut ann, run, vec![closed(602, "staff")])
+                .await
+                .is_empty());
+            assert!(is_private(&state, 602).await);
+            let (staff, ..) = live(&state, 602).await.unwrap();
+            let r = op(&mut ann, gate_set(staff, &["user"]), None).await;
+            assert!(
+                matches!(r, AccountReply::Admin(AdminReply::Gate { .. })),
+                "{r:?}"
+            );
+            let filable = crate::accounts::archive::may_file(&state, relay_of(&state), 602)
+                .await
+                .unwrap();
+            assert!(filable.is_err(), "{filable:?}");
+
+            // The control: a gate that keeps someone out passes both
+            for id in [lounge, staff] {
+                let r = op(&mut ann, gate_set(id, &["crew"]), None).await;
+                assert!(
+                    matches!(r, AccountReply::Admin(AdminReply::Gate { .. })),
+                    "{r:?}"
+                );
+            }
+            assert!(channels(&mut ann, run, vec![closed(601, "lounge")])
+                .await
+                .is_empty());
+            assert!(is_private(&state, 601).await);
+            let filable = crate::accounts::archive::may_file(&state, relay_of(&state), 602)
+                .await
+                .unwrap();
+            assert!(filable.is_ok(), "{filable:?}");
         }
 
         async fn unlink(state: &ServerState, name: &str, dc_id: u64) {
@@ -17185,7 +19206,7 @@ mod providers {
             assert_eq!(row.detail, "0 kept messages, last hour, 1 imported");
         }
 
-        /// The Banned filter is for `users:read`: being on it must not name anyone.
+        /// The Banned filter is `*`'s: being on it must not name anyone.
         #[tokio::test]
         async fn a_row_that_turned_out_banned_keeps_none_of_their_names() {
             let (state, _db, _) = relay(RegistrationMode::Open).await;
@@ -17608,6 +19629,114 @@ mod providers {
                 "{r:?}"
             );
             assert!(store.role_by_name("fans").await.unwrap().is_none());
+        }
+
+        /// Whoever may not make a step hears one refusal, whatever they name: anything else
+        /// says which accounts nobody has opened and which groups exist.
+        #[tokio::test]
+        async fn a_step_asks_for_power_before_it_answers() {
+            let (state, _db, _) = relay(RegistrationMode::Open).await;
+            let (mut ann, _, run) = running(&state).await;
+            roles(
+                &mut ann,
+                run,
+                vec![role(11, "Mods", discord::KICK_MEMBERS), role(12, "Crew", 0)],
+            )
+            .await;
+            members(&mut ann, run, vec![member(1001, "dee", &[11])]).await;
+            let unopened = account(&state, "dee").await.id.0;
+            let (mut pat, _) = register(&state, "pat").await;
+            let (_oli, opened) = register(&state, "oli").await;
+            let grant = |id: [u8; 16], group: &str| AdminOp::Grant {
+                id,
+                group: group.into(),
+            };
+            let revoke = |group: &str| AdminOp::Revoke {
+                id: opened.id,
+                group: group.into(),
+            };
+            let save = |name: &str| AdminOp::GroupSave {
+                create: false,
+                group: GroupInfo {
+                    name: name.into(),
+                    description: String::new(),
+                    badge: String::new(),
+                    scopes: strings(&["voipc:kick"]),
+                    builtin: false,
+                },
+            };
+            for step in [
+                grant(unopened, "admin"),
+                grant(opened.id, "admin"),
+                grant(opened.id, "crew"),
+                grant(opened.id, "no-such"),
+                revoke("crew"),
+                revoke("no-such"),
+                save("crew"),
+                save("no-such"),
+                AdminOp::Reset2fa { id: opened.id },
+            ] {
+                let asked = format!("{step:?}");
+                let r = op(&mut pat, step, None).await;
+                assert_eq!(refusal_of(&r), "You are not allowed to do that.", "{asked}");
+            }
+            // The controls: who holds the power still hears what the step found
+            let (mut uma, ..) = holder(&state, "uma", &["users:admin"]).await;
+            let r = op(&mut uma, grant(unopened, "admin"), None).await;
+            assert_eq!(refusal_of(&r), "Nobody has opened this account yet.");
+            let (mut roly, ..) = holder(&state, "roly", &["roles:admin"]).await;
+            let r = op(&mut roly, save("crew"), None).await;
+            assert!(refusal_of(&r).contains("came from Discord"), "{r:?}");
+        }
+
+        /// A group a gate names is not deleted, and the refusal does not open what the gate
+        /// closed: only someone who can see the channel hears which one.
+        #[tokio::test]
+        async fn a_group_delete_names_a_channel_only_to_who_can_see_it() {
+            let (state, _db, _) = relay(RegistrationMode::Open).await;
+            let (mut ann, _, run) = running(&state).await;
+            roles(&mut ann, run, vec![role(11, "Crew", 0)]).await;
+            let mut gated = a_channel(601, "gated");
+            gated.see = ImportGate::Roles(vec![11]);
+            assert!(channels(&mut ann, run, vec![gated]).await.is_empty());
+            let delete = |name: &str| AdminOp::GroupDelete { name: name.into() };
+
+            // Their own codes are no way in
+            let (mut pat, _) = register(&state, "pat").await;
+            let secret = totp_on(&mut pat).await;
+            settled(&mut pat).await;
+            for name in ["crew", "no-such"] {
+                let r = op(&mut pat, delete(name), Some(code(&secret))).await;
+                assert_eq!(refusal_of(&r), "You are not allowed to do that.", "{name}");
+            }
+
+            // Who manages groups from outside the gate hears that one exists, not which
+            let (mut roly, ri, secret) = holder(&state, "roly", &["roles:admin"]).await;
+            let r = op(&mut roly, delete("crew"), Some(code(&secret))).await;
+            let reason = refusal_of(&r);
+            assert!(reason.contains("cannot see"), "{reason}");
+            assert!(!reason.contains("gated"), "{reason}");
+            let store = relay_of(&state).store();
+            assert!(store.role_by_name("crew").await.unwrap().is_some());
+
+            // One they can see is named ahead of it, whichever the map gives first
+            let open = create(&mut ann, "open", false).await;
+            let set_speakers = async |list: &[&str]| {
+                let mut channels = state.channels.write().await;
+                channels.get_mut(&open).unwrap().gate.speakers = strings(list);
+            };
+            set_speakers(&["crew"]).await;
+            let r = op(&mut roly, delete("crew"), None).await;
+            assert!(refusal_of(&r).starts_with("#open lets in"), "{r:?}");
+            set_speakers(&[]).await;
+
+            // The controls: inside the gate, and `*`
+            give(&state, ri.id, "crew", true).await;
+            let r = op(&mut roly, delete("crew"), None).await;
+            assert!(refusal_of(&r).starts_with("#gated lets in"), "{r:?}");
+            let r = op(&mut ann, delete("crew"), None).await;
+            assert!(refusal_of(&r).starts_with("#gated lets in"), "{r:?}");
+            assert!(store.role_by_name("crew").await.unwrap().is_some());
         }
 
         #[tokio::test]
@@ -18919,15 +21048,17 @@ mod providers {
             /// A gate opened by hand between runs: what was private must not land where everyone
             /// can read it. The channel is skipped, and the run goes on.
             /// A delta's wizard, once Discord has closed `#lounge` after the first run: `@everyone`
-            /// loses it, and the channel's tick is on.
+            /// loses it. Its tick starts off, and the operator gives it: what is looked at here is
+            /// the relay's refusal.
             async fn closed_since(s: &mut Scene) -> Wizard {
                 s.mock.add_messages(LOUNGE, 3, 8);
                 s.mock.deny_everyone(LOUNGE, discord::VIEW_CHANNEL);
-                let wizard = s.wizard().await;
+                let mut wizard = s.wizard().await;
                 assert!(
-                    wizard.choices.messages_on.contains(&LOUNGE),
-                    "the channel's tick is on, with no word from the operator"
+                    !wizard.choices.messages_on.contains(&LOUNGE),
+                    "a private channel starts off, whatever the relay says of it"
                 );
+                wizard.choices.messages_on.insert(LOUNGE);
                 wizard
             }
 
@@ -18967,7 +21098,8 @@ mod providers {
                     matches!(r, AccountReply::Admin(AdminReply::Gate { .. })),
                     "{r:?}"
                 );
-                let wizard = s.wizard().await;
+                let mut wizard = s.wizard().await;
+                wizard.choices.messages_on.insert(LOUNGE);
                 let ran = s.go(wizard).await.finished();
                 assert_eq!(rows_of(&state, LOUNGE).await, rows + 3, "the control");
                 let text = ran.out.report.end_screen().join("\n");
@@ -19018,6 +21150,29 @@ mod providers {
                 wizard.choices.options.channels = true;
                 s.go(wizard).await.finished();
                 assert_eq!(rows_of(&state, LOUNGE).await, in_lounge + 3);
+            }
+
+            /// What a real relay says of a private channel ticked last time is a cursor, and that
+            /// is not a tick. Forgotten, it falls behind and loses nothing.
+            #[tokio::test]
+            async fn a_private_channel_ticked_last_time_takes_its_tick_again() {
+                let mut s = scene().await;
+                let mut wizard = s.wizard().await;
+                wizard.choices.messages_on.insert(STAFF);
+                s.go(wizard).await.finished();
+                let state = s.state.clone();
+                let rows = rows_of(&state, STAFF).await;
+                assert!(rows > 0);
+                s.mock.add_messages(STAFF, 3, 8);
+                let wizard = s.wizard().await;
+                assert!(!wizard.choices.messages_on.contains(&STAFF));
+                s.go(wizard).await.finished();
+                assert_eq!(rows_of(&state, STAFF).await, rows, "not without the tick");
+                // The control: ticked, the next run catches up
+                let mut wizard = s.wizard().await;
+                wizard.choices.messages_on.insert(STAFF);
+                s.go(wizard).await.finished();
+                assert_eq!(rows_of(&state, STAFF).await, rows + 3);
             }
 
             #[tokio::test]
@@ -19788,7 +21943,7 @@ mod layouts {
     }
 
     #[tokio::test]
-    async fn a_list_that_would_not_fit_is_refused_when_it_is_asked_for() {
+    async fn a_channel_past_what_one_frame_of_list_holds_is_made() {
         let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
         let mut m = manager(&state, "mona").await;
         // Past the 60 KiB one list holds: full descriptions, directly
@@ -19806,13 +21961,27 @@ mod layouts {
                 );
             }
         }
-        let why = refused(&mut m, save(None, "one-more", true, None)).await;
-        assert!(why.contains("One channel list"), "{why}");
+        m.send(&admin_op(save(None, "one-more", true, None), None))
+            .await;
+        m.expect("the channel", |m| {
+            matches!(
+                m,
+                ServerMessage::Account(AccountReply::Admin(AdminReply::ChannelDone {
+                    channel_id: Some(_)
+                }))
+            )
+        })
+        .await;
+        assert!(state
+            .channel_list()
+            .await
+            .iter()
+            .any(|c| c.name == "one-more"));
     }
 
-    /// With too many at a start, the newest made in the app wait; the rest serve.
+    /// A list comes in as many frames as it takes: nobody waits for room.
     #[tokio::test]
-    async fn a_start_past_what_one_list_holds_leaves_out_the_newest_made_here() {
+    async fn a_start_past_what_one_frame_of_list_holds_serves_every_channel() {
         let (state, db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
         let relay = state.accounts.as_deref().unwrap();
         for i in 0..250i64 {
@@ -19829,14 +21998,13 @@ mod layouts {
         }
         let again = restart(&db, Vec::new()).await;
         let list = again.channel_list().await;
-        assert!(list.len() < 251, "some wait: {}", list.len());
-        assert!(list.iter().any(|c| c.name == "kept-0"), "the oldest stay");
+        assert!(list.iter().any(|c| c.name == "kept-0"));
+        assert!(list.iter().any(|c| c.name == "kept-249"));
+        let framed = encode_server_msg(&ServerMessage::ChannelList { channels: list });
         assert!(
-            !list.iter().any(|c| c.name == "kept-249"),
-            "the newest wait"
+            framed.is_err() || framed.unwrap().len() > 60 * 1024,
+            "the control"
         );
-        let framed = encode_server_msg(&ServerMessage::ChannelList { channels: list }).unwrap();
-        assert!(framed.len() <= 60 * 1024);
     }
 }
 
@@ -20784,6 +22952,136 @@ mod profiles {
             "written down, without the mod's address"
         );
     }
+
+    /// A warden with codes, and someone who chose a name and a picture.
+    async fn warden_and_rude(state: &Arc<ServerState>) -> (Client, Client, [u8; 16], [u8; 32]) {
+        group(state, "wardens", None, &["voipc:profiles"]).await;
+        let (mut kim, ki) = register(state, "kim").await;
+        totp_on(&mut kim).await;
+        give(state, ki.id, "wardens", true).await;
+        let (mut bob, bi) = register(state, "bob").await;
+        name_is(&mut bob, "Rude Name").await;
+        let set = AccountRequest::ProfilePictureSet {
+            image: Some(PNG.to_vec()),
+        };
+        assert!(matches!(
+            answer(&mut bob, set).await,
+            AccountReply::ProfileDone
+        ));
+        let hash = asked(&mut bob, &[bi.id]).await[0].picture.unwrap();
+        (kim, bob, bi.id, hash)
+    }
+
+    fn says_nothing_about(told: &[ProfileInfo], account: [u8; 16]) {
+        assert_eq!(told[0].account, account);
+        assert_eq!(told[0].name, None);
+        assert_eq!(told[0].picture, None);
+    }
+
+    #[tokio::test]
+    async fn a_reset_of_someone_gone_reaches_everyone_connected() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let (mut kim, bob, id, hash) = warden_and_rude(&state).await;
+        drop(bob);
+        while state.account_sessions.contains_key(&id) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let (mut cara, _) = register(&state, "cara").await;
+        assert_eq!(
+            asked(&mut cara, &[id]).await[0].name.as_deref(),
+            Some("Rude Name"),
+            "what her screen holds"
+        );
+        let mut guest = connect(&state, "guest#1234", IpAddr::V4(Ipv4Addr::LOCALHOST)).await;
+        settled(&mut guest).await;
+
+        assert!(matches!(
+            op(&mut kim, id).await,
+            ServerMessage::Account(AccountReply::ProfileDone)
+        ));
+        says_nothing_about(&profiles(&mut cara).await, id);
+        says_nothing_about(&profiles(&mut guest).await, id);
+        assert!(
+            picture(&mut cara, hash).await.is_empty(),
+            "gone, not hidden"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reset_is_told_the_same_wherever_they_stand() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let (mut kim, mut bob, id, _) = warden_and_rude(&state).await;
+        let (mut cara, _) = register(&state, "cara").await;
+        let mut guest = connect(&state, "guest#1234", IpAddr::V4(Ipv4Addr::LOCALHOST)).await;
+        settled(&mut guest).await;
+        state
+            .channels
+            .write()
+            .await
+            .get_mut(&0)
+            .unwrap()
+            .info
+            .hide_members = true;
+        settled(&mut bob).await;
+
+        assert!(matches!(
+            op(&mut kim, id).await,
+            ServerMessage::Account(AccountReply::ProfileDone)
+        ));
+        for c in [&mut bob, &mut cara, &mut guest] {
+            says_nothing_about(&profiles(c).await, id);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_reset_tells_nobody() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let (mut kim, _bob, _, _) = warden_and_rude(&state).await;
+        let (mut ann, ai, _) = admin_account(&state, "ann").await;
+        name_is(&mut ann, "The Owner").await;
+        let mut guest = connect(&state, "guest#1234", IpAddr::V4(Ipv4Addr::LOCALHOST)).await;
+        settled(&mut guest).await;
+
+        assert!(matches!(
+            op(&mut kim, ai.id).await,
+            ServerMessage::Account(AccountReply::Error { .. })
+        ));
+        assert_eq!(
+            asked(&mut guest, &[[9; 16]]).await[0].account,
+            [9; 16],
+            "no push came first"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reset_keeps_to_the_change_budget() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let (mut kim, bob, id, _) = warden_and_rude(&state).await;
+        drop(bob);
+        // This is about the change budget, not the one on account requests around it
+        for mut s in state.sessions.iter_mut() {
+            s.account_rate = crate::state::RateLimiter::new(1e9, 1e9);
+        }
+        let (mut passed, mut slowed) = (0, 0);
+        for _ in 0..30 {
+            match op(&mut kim, id).await {
+                ServerMessage::Account(AccountReply::ProfileDone) => passed += 1,
+                ServerMessage::Account(AccountReply::Error { reason, .. }) => {
+                    assert!(reason.contains("a lot of changes"), "{reason}");
+                    slowed += 1;
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        assert!(slowed > 0, "30 in a row, and a budget of 8");
+        let rows = crate::accounts::raw(
+            state.accounts.as_ref().unwrap(),
+            "SELECT CAST(COUNT(*) AS BIGINT) FROM voipc_modlog",
+        )
+        .await
+        .unwrap();
+        assert_eq!(rows, passed, "a slowed one writes nothing");
+    }
 }
 
 /// What the review of 1.9's layouts found.
@@ -21143,6 +23441,32 @@ mod layout_limits {
     }
 
     #[tokio::test]
+    async fn a_kept_post_outside_a_gate_answers_as_for_no_channel() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let (_kim, ki) = register(&state, "kim").await;
+        let (id, _) = hidden_channel(&state, sid_of(&state, ki.id)).await;
+        state.channels.write().await.get_mut(&id).unwrap().info.log = "c:secret".into();
+        let (mut out, oi) = register(&state, "out").await;
+        for conv in ["c:secret", "c:missing"] {
+            let r = append_raw(&mut out, conv, 8).await;
+            assert!(
+                matches!(&r, AccountReply::Error { reason, .. }
+                    if reason == "That channel keeps no messages."),
+                "{conv}: {r:?}"
+            );
+        }
+        // The control: inside the gate the channel is there, and they are not in it
+        give(&state, oi.id, "board", true).await;
+        settled(&mut out).await;
+        let r = append_raw(&mut out, "c:secret", 8).await;
+        assert!(
+            matches!(&r, AccountReply::Error { reason, .. }
+                if reason == "you are not in that channel"),
+            "{r:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_refused_edit_changes_nothing() {
         let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
         let (_kim, ki) = register(&state, "kim").await;
@@ -21486,6 +23810,179 @@ mod moderation {
         }
     }
 
+    /// Sharing what you hold acts on nobody. Each step a moderator takes works on a holder as
+    /// on someone with nothing, and what they hold beside it still counts.
+    #[tokio::test]
+    async fn share_history_spares_nobody() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        const SHARE: &str = voipc_protocol::types::SHARE_HISTORY;
+        group(&state, "kickers", None, &["voipc:kick"]).await;
+        let (mut kim, ki) = register(&state, "kim").await;
+        totp_on(&mut kim).await;
+        give(&state, ki.id, "kickers", true).await;
+        // No codes: it applies at once
+        let (mut sam, si) = holder_no_codes(&state, "sam").await;
+        let sid = *state.account_sessions.get(&si.id).unwrap();
+        assert!(!state.sessions.get(&sid).unwrap().is_moderator);
+        assert!(!crate::accounts::holds_power(&[SHARE.to_string()]));
+        crate::accounts::refresh_chat_mods(&state).await;
+        assert!(
+            !state
+                .chat_mods
+                .read()
+                .await
+                .iter()
+                .any(|m| m.account == si.id),
+            "not on the list of those who hold power"
+        );
+
+        // A kick
+        kim.send(&ClientMessage::AdminKick {
+            user_id: uid_of(&state, si.id),
+            reason: String::new(),
+        })
+        .await;
+        sam.expect("Disconnected", gone).await;
+
+        // The control: a hide holder is spared
+        let (_hal, hi) = holder(&state, "hal", "voipc:hide").await;
+        kim.send(&ClientMessage::AdminKick {
+            user_id: uid_of(&state, hi.id),
+            reason: String::new(),
+        })
+        .await;
+        let ServerMessage::AdminError { reason } = kim
+            .expect("refused", |m| matches!(m, ServerMessage::AdminError { .. }))
+            .await
+        else {
+            unreachable!()
+        };
+        assert!(reason.contains("only an admin"), "{reason}");
+
+        // A ban by name, and their posts come off with a ban's removal
+        let (mut molly, _, secret) = holder_with_codes(&state, "molly", "voipc:bans").await;
+        let (_ann, ai) = holder_no_codes(&state, "ann").await;
+        kept(&state, "c:aa", ai.id, 1000).await;
+        molly
+            .send(&ClientMessage::AdminBanAccount {
+                name: "ann".into(),
+                reason: String::new(),
+                duration_secs: 0,
+            })
+            .await;
+        let bans = molly.expect("the list", the_bans).await;
+        assert!(
+            matches!(&bans, ServerMessage::AdminBansPaged { bans, .. } if bans.iter().any(|b| b.label == "ann")),
+            "{bans:?}"
+        );
+        assert_eq!(removed(&mut molly, "ann", 3600, &secret).await, 1);
+
+        // An address ban ends them, and keeps them out from there
+        let (mut boss, _, _) = admin_account(&state, "boss").await;
+        let (mut ivy, ii) = holder_no_codes(&state, "ivy").await;
+        boss.send(&ClientMessage::AdminBan {
+            user_id: uid_of(&state, ii.id),
+            reason: "spam".into(),
+            duration_secs: 0,
+            account: false,
+        })
+        .await;
+        ivy.expect("Disconnected", gone).await;
+    }
+
+    /// `without_share`: what someone holds beside sharing is what "holds no more" reads.
+    #[tokio::test]
+    async fn sharing_does_not_put_someone_out_of_a_moderators_reach() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        const SHARE: &str = voipc_protocol::types::SHARE_HISTORY;
+        group(&state, "minders", None, &["voipc:restrict", "voipc:hide"]).await;
+        group(&state, "hide-and-share", None, &["voipc:hide", SHARE]).await;
+        group(&state, "kick-and-share", None, &["voipc:kick", SHARE]).await;
+        let (mut mia, mi) = register(&state, "mia").await;
+        totp_on(&mut mia).await;
+        give(&state, mi.id, "minders", true).await;
+        let restrict = |user_id| ClientMessage::AdminRestrict {
+            user_id,
+            voice: false,
+            text: true,
+            duration_secs: 60,
+            reason: String::new(),
+        };
+
+        let (mut lea, li) = register(&state, "lea").await;
+        totp_on(&mut lea).await;
+        give(&state, li.id, "hide-and-share", true).await;
+        mia.send(&restrict(uid_of(&state, li.id))).await;
+        mia.expect(
+            "the row",
+            |m| matches!(m, ServerMessage::Restrictions { list } if list.iter().any(|r| r.text)),
+        )
+        .await;
+
+        // The control: more than she holds, sharing or not
+        let (mut rob, ri) = register(&state, "rob").await;
+        totp_on(&mut rob).await;
+        give(&state, ri.id, "kick-and-share", true).await;
+        mia.send(&restrict(uid_of(&state, ri.id))).await;
+        let ServerMessage::AdminError { reason } = mia
+            .expect("refused", |m| matches!(m, ServerMessage::AdminError { .. }))
+            .await
+        else {
+            unreachable!()
+        };
+        assert!(reason.contains("at least as much"), "{reason}");
+
+        // Clearing a name goes by the same reading
+        group(&state, "wardens", None, &["voipc:profiles"]).await;
+        let (mut wes, wi) = register(&state, "wes").await;
+        totp_on(&mut wes).await;
+        give(&state, wi.id, "wardens", true).await;
+        let (_ted, ti) = holder_no_codes(&state, "ted").await;
+        let reset = |id| {
+            admin_op(
+                AdminOp::ProfileReset {
+                    id,
+                    name: true,
+                    picture: false,
+                },
+                None,
+            )
+        };
+        let told = |m: &ServerMessage| {
+            matches!(
+                m,
+                ServerMessage::Account(AccountReply::ProfileDone | AccountReply::Error { .. })
+            )
+        };
+        wes.send(&reset(ti.id)).await;
+        let r = wes.expect("the answer", told).await;
+        assert!(
+            matches!(r, ServerMessage::Account(AccountReply::ProfileDone)),
+            "{r:?}"
+        );
+        wes.send(&reset(ri.id)).await;
+        let r = wes.expect("the answer", told).await;
+        assert!(
+            matches!(r, ServerMessage::Account(AccountReply::Error { .. })),
+            "the control: {r:?}"
+        );
+    }
+
+    /// Someone in a group holding only Share history, with no codes.
+    async fn holder_no_codes(state: &Arc<ServerState>, name: &str) -> (Client, AccountInfo) {
+        let group_name = format!("g-{name}");
+        group(
+            state,
+            &group_name,
+            None,
+            &[voipc_protocol::types::SHARE_HISTORY],
+        )
+        .await;
+        let (c, info) = register(state, name).await;
+        give(state, info.id, &group_name, true).await;
+        (c, info)
+    }
+
     /// l4f refuses a scope nobody registered, and with it the whole group save: a
     /// privilege missing from `APP_SCOPES` could be ticked and never saved.
     #[tokio::test]
@@ -21595,11 +24092,83 @@ mod moderation {
             password: None,
         })
         .await;
-        c.expect(
-            "UserList",
-            |m| matches!(m, ServerMessage::UserList { channel_id: c, .. } if *c == channel_id),
-        )
+        let joined = text_joined(channel_id);
+        c.expect("in the channel", |m| {
+            joined(m)
+                || matches!(m, ServerMessage::UserList { channel_id: c, .. } if *c == channel_id)
+        })
         .await;
+    }
+
+    /// `*` and a server-wide kick reach anyone. Past that nobody reaches into a channel they
+    /// cannot see, or the answer says it is there and who is in it.
+    #[tokio::test]
+    async fn a_kick_past_a_gate_answers_as_for_no_channel() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        group(&state, "crew", None, &[]).await;
+        let (mut olga, _) = register(&state, "olga").await;
+        let (mut pat, pi) = register(&state, "pat").await;
+        let (mut kim, _) = register(&state, "kim").await;
+        let (_sam, si) = register(&state, "sam").await;
+        let (mut molly, mi) = holder(&state, "molly", "voipc:kick").await;
+        let room = create(&mut olga, "room", false).await;
+        give(&state, pi.id, "crew", true).await;
+        join(&mut pat, room).await;
+        state.channels.write().await.get_mut(&room).unwrap().gate = ChannelGate {
+            groups: vec!["crew".into()],
+            speakers: vec![],
+        };
+        let pat_uid = uid_of(&state, pi.id);
+        let sam_uid = uid_of(&state, si.id);
+        let written = rows_written(&state).await;
+        let answer = async |c: &mut Client, channel_id: ChannelId, user_id: UserId| {
+            c.send(&ClientMessage::KickUser {
+                channel_id,
+                user_id,
+            })
+            .await;
+            let ServerMessage::ChannelError { reason } = c
+                .expect("refused", |m| {
+                    matches!(m, ServerMessage::ChannelError { .. })
+                })
+                .await
+            else {
+                unreachable!()
+            };
+            reason
+        };
+        // Someone with no say, a holder of the privilege, and the creator who lost the group
+        for (who, c) in [
+            ("kim", &mut kim),
+            ("molly", &mut molly),
+            ("olga", &mut olga),
+        ] {
+            for channel_id in [room, 99_999] {
+                for target in [pat_uid, sam_uid] {
+                    let reason = answer(c, channel_id, target).await;
+                    assert_eq!(
+                        reason, "channel does not exist",
+                        "{who} {channel_id} {target}"
+                    );
+                }
+            }
+        }
+        assert!(state.channels.read().await[&room]
+            .members
+            .contains(&pat_uid));
+        assert_eq!(rows_written(&state).await, written, "nothing happened");
+
+        // The control: in the group, the same kick lands, and is written down
+        give(&state, mi.id, "crew", true).await;
+        molly
+            .send(&ClientMessage::KickUser {
+                channel_id: room,
+                user_id: pat_uid,
+            })
+            .await;
+        pat.expect("Kicked", |m| matches!(m, ServerMessage::Kicked { .. }))
+            .await;
+        assert_eq!(rows_written(&state).await, written + 1);
     }
 
     #[tokio::test]
@@ -23783,6 +26352,7 @@ mod moderation {
         // The control: all of it reads, hers among it
         let (mut before, _, signed) = sign_in_password(&state, "dan").await;
         let (mut sd, first) = AccountSync::start(&signed, di.id, Default::default(), true);
+        sd.set_protocol(PROTOCOL_VERSION);
         let events = pump(&mut before, &mut sd, first).await;
         let text = |t: &str, n: &str| (n.to_string(), t.to_string());
         assert_eq!(
@@ -23811,6 +26381,7 @@ mod moderation {
         // Another device of a member who was away: what is left reads, with no complaint
         let (mut fresh, _, signed) = sign_in_password(&state, "dan").await;
         let (mut sd, first) = AccountSync::start(&signed, di.id, Default::default(), true);
+        sd.set_protocol(PROTOCOL_VERSION);
         let events = pump(&mut fresh, &mut sd, first).await;
         assert_eq!(
             channel_texts(&events),
@@ -23829,28 +26400,29 @@ mod moderation {
         // A later message: its writer is told to rekey, she being out of the log, and
         // the reader's cursor passes the gap to it
         let relay = state.accounts.clone().unwrap();
-        let wraps = |who: String| {
+        let count = |sql: String| {
             let relay = relay.clone();
-            async move {
-                let sql = format!(
-                    "SELECT CAST(COUNT(*) AS BIGINT) FROM voipc_wraps WHERE recipient {who}"
-                );
-                crate::accounts::raw(&relay, &sql).await.unwrap()
-            }
+            async move { crate::accounts::raw(&relay, &sql).await.unwrap() }
         };
-        let to_her = || format!("= X'{}'", hex::encode(ei.id));
-        let to_others = || format!("<> X'{}'", hex::encode(ei.id));
-        let (hers, others) = (wraps(to_her()).await, wraps(to_others()).await);
+        let to_her = || {
+            format!(
+                "SELECT CAST(COUNT(*) AS BIGINT) FROM voipc_seats WHERE recipient = X'{}'",
+                hex::encode(ei.id)
+            )
+        };
+        let chains = || "SELECT CAST(COUNT(*) AS BIGINT) FROM voipc_chains".to_string();
+        let (hers, others) = (count(to_her()).await, count(chains()).await);
         let out = sa.send_channel(&log, say("a3", "a3"), at + 6, None);
         let events = pump(&mut ann, &mut sa, out).await;
         assert!(
             events.iter().any(|e| matches!(e, Event::Kept { .. })),
             "{events:?}"
         );
-        assert!(wraps(to_others()).await > others, "a new key");
-        assert_eq!(wraps(to_her()).await, hers, "and none of it to her");
+        assert!(count(chains()).await > others, "a new key");
+        assert!(count(to_her()).await <= hers, "and none of it to her");
         let (mut later, _, signed) = sign_in_password(&state, "dan").await;
         let (mut sd, first) = AccountSync::start(&signed, di.id, memory, true);
+        sd.set_protocol(PROTOCOL_VERSION);
         let events = pump(&mut later, &mut sd, first).await;
         assert_eq!(channel_texts(&events), [text("a3", "ann")], "{events:?}");
     }
@@ -23888,9 +26460,15 @@ mod moderation {
         boss.expect("the list", the_bans).await;
         drop(eve);
 
-        // Back, on the same device. Nothing told her to start new keys
+        // Back, on the same device, past the wait for who left holding a key. Nothing told
+        // her to start new keys
+        let waited = state.accounts.clone().unwrap();
+        crate::accounts::raw(&waited, "DELETE FROM voipc_left")
+            .await
+            .unwrap();
         let (mut back, _, signed) = sign_in_password(&state, "eve").await;
         let (mut se, first) = AccountSync::start(&signed, ei.id, se.memory(), true);
+        se.set_protocol(PROTOCOL_VERSION);
         pump(&mut back, &mut se, first).await;
         into_lounge(&state, &ei.id).await;
         let out = se.enter(&log);
@@ -23911,6 +26489,7 @@ mod moderation {
         // Ann, on another device, reads it all, and only what removal left of the channel
         let (mut fresh, _, signed) = sign_in_password(&state, "ann").await;
         let (mut sa, first) = AccountSync::start(&signed, ai.id, Default::default(), true);
+        sa.set_protocol(PROTOCOL_VERSION);
         let events = pump(&mut fresh, &mut sa, first).await;
         assert_eq!(
             channel_texts(&events),
@@ -25160,6 +27739,66 @@ mod invite_links {
                 .any(|r| r.name == "crew"),
             "the group was given power since: the link no longer hands it out"
         );
+    }
+
+    /// Sharing what you hold gives power over nobody, so it does not stop a group starting a
+    /// link, when made or when used. The owner's ruling.
+    #[tokio::test]
+    async fn a_share_only_group_can_start_a_link() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Invite).await;
+        const SHARE: &str = voipc_protocol::types::SHARE_HISTORY;
+        group(&state, "sharers", None, &[SHARE]).await;
+        group(&state, "crew", None, &[]).await;
+        group(&state, "mods", None, &[SHARE, "voipc:kick"]).await;
+        let (mut ann, _, _) = admin_on_invite_relay(&state, "ann").await;
+        let relay = state.accounts.clone().unwrap();
+        let in_group = |bi: AccountInfo, name: &'static str| {
+            let relay = relay.clone();
+            async move {
+                relay
+                    .store()
+                    .user_roles(AccountId(bi.id))
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|r| r.name == name)
+            }
+        };
+
+        // Made, and used, and it reads the group's scopes at the use
+        let code = new_link(&mut ann, 5, 0, Some("sharers")).await;
+        let (_bob, bi) = sign_up(&state, "bob", &code).await.unwrap();
+        assert!(in_group(bi.clone(), "sharers").await);
+        assert_eq!(bi.scopes, [SHARE], "and it applies at once, with no codes");
+
+        // A group that came to share since still goes out
+        let code = new_link(&mut ann, 5, 0, Some("crew")).await;
+        let crew = relay.store().role_by_name("crew").await.unwrap().unwrap();
+        relay
+            .store()
+            .set_role_scopes(crew.id, &[SHARE.to_string()])
+            .await
+            .unwrap();
+        let (_cat, ci) = sign_up(&state, "cat", &code).await.unwrap();
+        assert!(in_group(ci, "crew").await);
+
+        // The controls: anything more is refused when made, and when used
+        let op = AdminOp::InviteLinkNew {
+            max_uses: 5,
+            days: 7,
+            group: Some("mods".into()),
+        };
+        assert!(matches!(
+            answer(&mut ann, op).await,
+            AccountReply::Error { .. }
+        ));
+        relay
+            .store()
+            .set_role_scopes(crew.id, &[SHARE.to_string(), "voipc:kick".to_string()])
+            .await
+            .unwrap();
+        let (_dee, di) = sign_up(&state, "dee", &code).await.unwrap();
+        assert!(!in_group(di, "crew").await);
     }
 
     #[tokio::test]
@@ -27220,5 +29859,6072 @@ mod restriction {
         let mut gee = connect(&on, "gee", FAR).await;
         assert_eq!(on.guest_clocks.len(), 1);
         assert!(told_of(&drained(&mut gee).await, named(&on, "gee")));
+    }
+}
+
+mod share_history {
+    use super::*;
+    use l4f_accounts::scope;
+    use voipc_protocol::messages::AdminOp;
+    use voipc_protocol::types::{GroupInfo, SHARE_HISTORY};
+
+    fn uid_of(state: &ServerState, account: [u8; 16]) -> UserId {
+        let sid = *state.account_sessions.get(&account).unwrap();
+        state.sessions.get(&sid).unwrap().user_id
+    }
+
+    /// All they are sent before a ping comes back, so all they were sent by then.
+    async fn drained(c: &mut Client) -> Vec<ServerMessage> {
+        let stamp: u64 = rand::random();
+        c.send(&ClientMessage::Ping { timestamp: stamp }).await;
+        let mut seen = Vec::new();
+        loop {
+            match c.next().await.expect("the connection stays") {
+                ServerMessage::Pong { timestamp } if timestamp == stamp => return seen,
+                m => seen.push(m),
+            }
+        }
+    }
+
+    fn flags(seen: &[ServerMessage], user: UserId) -> Vec<bool> {
+        seen.iter()
+            .filter_map(|m| match m {
+                ServerMessage::UserHistorySharing { user_id, enabled } if *user_id == user => {
+                    Some(*enabled)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn asked(seen: &[ServerMessage]) -> bool {
+        seen.iter()
+            .any(|m| matches!(m, ServerMessage::ChannelHistoryRequested { .. }))
+    }
+
+    async fn reopen(state: &ServerState) {
+        let mut config = ServerConfig::default();
+        config.accounts.mode = AccountsMode::Optional;
+        let store = state.accounts.as_ref().unwrap().store().clone();
+        crate::accounts::Relay::open_with(&config.accounts, store, &[9u8; 32])
+            .await
+            .unwrap();
+    }
+
+    async fn scopes_of(state: &ServerState, name: &str) -> Vec<String> {
+        let store = state.accounts.as_ref().unwrap().store();
+        store.role_by_name(name).await.unwrap().unwrap().scopes
+    }
+
+    /// Fresh: `*` passes, as for any new scope, and nothing else holds it. Fails if the
+    /// early seed goes, or a later l4f re-syncs `user` at boot.
+    #[tokio::test]
+    async fn no_group_holds_share_history_out_of_the_box() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let store = state.accounts.as_ref().unwrap().store();
+        let roles = store.roles().await.unwrap();
+        let names: Vec<&str> = roles.iter().map(|r| r.name.as_str()).collect();
+        assert!(
+            names.contains(&"user") && names.contains(&"moderator"),
+            "{names:?}"
+        );
+        for role in &roles {
+            if role.name == "admin" {
+                assert_eq!(role.scopes, ["*"]);
+                continue;
+            }
+            assert!(
+                !scope::allowed(&role.scopes, SHARE_HISTORY),
+                "{}: {:?}",
+                role.name,
+                role.scopes
+            );
+        }
+        assert!(scopes_of(&state, "user").await.is_empty());
+        let (_bob, bi) = register(&state, "bob").await;
+        assert!(bi.scopes.is_empty(), "{:?}", bi.scopes);
+    }
+
+    #[tokio::test]
+    async fn an_upgrade_gives_nobody_share_history() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let relay = state.accounts.as_ref().unwrap();
+        let store = relay.store();
+        // As 1.9 left it: `user`, and the moderator at the old three, widened on this boot
+        let moderator = store.role_by_name("moderator").await.unwrap().unwrap();
+        let old: Vec<String> = ["voipc:ban", "voipc:channels", "voipc:kick"]
+            .map(String::from)
+            .to_vec();
+        store.set_role_scopes(moderator.id, &old).await.unwrap();
+        crate::accounts::raw(relay, "DELETE FROM voipc_meta WHERE k = 'moderator_1_10'")
+            .await
+            .unwrap();
+        reopen(&state).await;
+        let now = scopes_of(&state, "moderator").await;
+        assert!(now.len() > 3, "the control: it widened: {now:?}");
+        for role in store.roles().await.unwrap() {
+            assert!(
+                role.name == "admin" || !scope::allowed(&role.scopes, SHARE_HISTORY),
+                "{}: {:?}",
+                role.name,
+                role.scopes
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_admin_who_gave_it_to_user_keeps_it_through_a_restart() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let store = state.accounts.as_ref().unwrap().store();
+        let user = store.role_by_name("user").await.unwrap().unwrap();
+        store
+            .set_role_scopes(user.id, &[SHARE_HISTORY.to_string()])
+            .await
+            .unwrap();
+        reopen(&state).await;
+        assert_eq!(scopes_of(&state, "user").await, [SHARE_HISTORY]);
+    }
+
+    /// Without the exemption the scope would be withheld, and a group holding it would stop
+    /// counting: its code-less members thrown out of channels it gates, and their seats gone.
+    #[tokio::test]
+    async fn share_history_needs_no_codes() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        group(&state, "sharers", Some("Sharers"), &[SHARE_HISTORY]).await;
+        group(&state, "both", Some("Both"), &[SHARE_HISTORY, "voipc:kick"]).await;
+        let (mut bob, bi) = register(&state, "bob").await;
+        give(&state, bi.id, "sharers", true).await;
+        let sid = *state.account_sessions.get(&bi.id).unwrap();
+        {
+            let s = state.sessions.get(&sid).unwrap();
+            let a = s.account.as_ref().unwrap();
+            assert_eq!(a.scopes, [SHARE_HISTORY]);
+            assert!(!a.needs_2fa, "no prompt, nothing asks for codes");
+            assert_eq!(a.standing.groups, ["sharers", "user"].map(String::from));
+            assert!(a.standing.my_badges.contains(&"Sharers".to_string()));
+        }
+        assert!(
+            state.passes(sid, &["sharers".to_string()]),
+            "the gate opens"
+        );
+        // Their device can be remembered
+        bob.send(&ClientMessage::Account(AccountRequest::DeviceChallenge))
+            .await;
+        let r = bob
+            .expect("the answer", |m| {
+                matches!(
+                    m,
+                    ServerMessage::Account(
+                        AccountReply::DeviceChallenge { .. } | AccountReply::Error { .. }
+                    )
+                )
+            })
+            .await;
+        assert!(
+            matches!(
+                r,
+                ServerMessage::Account(AccountReply::DeviceChallenge { .. })
+            ),
+            "{r:?}"
+        );
+        // Their seat in what the group gates stays
+        let relay = state.accounts.clone().unwrap();
+        let seat = format!(
+            "INSERT INTO voipc_members (conv, account, joined_at) VALUES ('c:aa', X'{}', 1)",
+            hex::encode(bi.id)
+        );
+        crate::accounts::raw(&relay, &seat).await.unwrap();
+        relay
+            .prune_log("c:aa", &["sharers".into()], &mut Default::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::accounts::raw(
+                &relay,
+                "SELECT COUNT(*) FROM voipc_members WHERE conv = 'c:aa'"
+            )
+            .await
+            .unwrap(),
+            1
+        );
+
+        // The control: with kick beside it, the group waits for codes, and only the
+        // sharing applies
+        let (_cat, ci) = register(&state, "cat").await;
+        give(&state, ci.id, "both", true).await;
+        let sid = *state.account_sessions.get(&ci.id).unwrap();
+        let s = state.sessions.get(&sid).unwrap();
+        let a = s.account.as_ref().unwrap();
+        assert_eq!(a.scopes, [SHARE_HISTORY]);
+        assert!(a.needs_2fa);
+        assert!(!a.standing.groups.contains(&"both".to_string()));
+        assert!(!s.can(crate::accounts::Powers::KICK));
+    }
+
+    /// If an admin ticks it on `user`, a whole server must not become unkickable.
+    #[tokio::test]
+    async fn giving_share_history_to_user_makes_no_one_a_moderator() {
+        let (state, _db) = relay_state_then(AccountsMode::Optional, RegistrationMode::Open, |s| {
+            s.settings.new_member_wait_mins = 60;
+        })
+        .await;
+        let store = state.accounts.as_ref().unwrap().store();
+        let user = store.role_by_name("user").await.unwrap().unwrap();
+        store
+            .set_role_scopes(user.id, &[SHARE_HISTORY.to_string()])
+            .await
+            .unwrap();
+        let (_ann, ai) = register(&state, "ann").await;
+        assert_eq!(ai.scopes, [SHARE_HISTORY]);
+        let sid = *state.account_sessions.get(&ai.id).unwrap();
+        {
+            let s = state.sessions.get(&sid).unwrap();
+            assert!(!s.is_moderator && !s.is_admin);
+            assert!(s.silence.text(), "and they wait as anyone new");
+        }
+        crate::accounts::refresh_chat_mods(&state).await;
+        assert!(state.chat_mods.read().await.is_empty());
+    }
+
+    /// The flag follows the right here: anything else changes nothing and tells nobody.
+    #[tokio::test]
+    async fn the_flag_takes_the_privilege() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        group(&state, "sharers", None, &[SHARE_HISTORY]).await;
+        let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let mut watcher = connect(&state, "watcher#1234", lo).await;
+        let (mut boss, bi, _) = admin_account(&state, "boss").await;
+        let (mut hal, hi) = register(&state, "hal").await;
+        give(&state, hi.id, "sharers", true).await;
+        let (mut bob, oi) = register(&state, "bob").await;
+        let mut gus = connect(&state, "gus#1234", lo).await;
+        let channel_id = text_channel_with_two(&mut watcher, &mut bob, "lounge").await;
+        for c in [&mut gus, &mut hal, &mut boss] {
+            c.send(&ClientMessage::JoinChannel {
+                channel_id,
+                password: None,
+            })
+            .await;
+            drained(c).await;
+        }
+        drained(&mut watcher).await;
+        let on = ClientMessage::SetHistorySharing { enabled: true };
+        let (o, h, b) = (
+            uid_of(&state, oi.id),
+            uid_of(&state, hi.id),
+            uid_of(&state, bi.id),
+        );
+        let g = *state.username_to_session.get("gus#1234").unwrap();
+
+        // No privilege, and a guest: a `true` changes nothing and tells nobody
+        for (c, who) in [(&mut bob, o), (&mut gus, g)] {
+            c.send(&on).await;
+            assert!(flags(&drained(c).await, who).is_empty());
+            assert!(!state.sessions.get(&who).unwrap().shares_history);
+            assert!(flags(&drained(&mut watcher).await, who).is_empty());
+            watcher
+                .send(&ClientMessage::RequestChannelHistory {
+                    channel_id,
+                    target_user_id: who,
+                })
+                .await;
+            drained(&mut watcher).await;
+            assert!(!asked(&drained(c).await), "not asked");
+        }
+
+        // A holder and `*`: yes
+        for (c, who) in [(&mut hal, h), (&mut boss, b)] {
+            c.send(&on).await;
+            assert_eq!(flags(&drained(c).await, who), [true]);
+            assert!(state.sessions.get(&who).unwrap().shares_history);
+            assert_eq!(flags(&drained(&mut watcher).await, who), [true]);
+            watcher
+                .send(&ClientMessage::RequestChannelHistory {
+                    channel_id,
+                    target_user_id: who,
+                })
+                .await;
+            drained(&mut watcher).await;
+            assert!(asked(&drained(c).await), "asked");
+        }
+    }
+
+    /// The flag cannot go stale: GroupSave reaches it at once, the shell at the next check.
+    #[tokio::test]
+    async fn taking_the_privilege_clears_the_flag_and_tells_everyone() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        group(&state, "sharers", None, &[SHARE_HISTORY]).await;
+        let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let (mut ann, _, secret) = admin_account(&state, "ann").await;
+        let mut watcher = connect(&state, "watcher#1234", lo).await;
+        let (mut hal, hi) = register(&state, "hal").await;
+        give(&state, hi.id, "sharers", true).await;
+        let channel_id = text_channel_with_two(&mut watcher, &mut hal, "lounge").await;
+        let h = uid_of(&state, hi.id);
+        let on = ClientMessage::SetHistorySharing { enabled: true };
+        hal.send(&on).await;
+        assert_eq!(flags(&drained(&mut hal).await, h), [true]);
+        assert_eq!(flags(&drained(&mut watcher).await, h), [true]);
+        crate::accounts::raw(
+            state.accounts.as_ref().unwrap(),
+            &format!(
+                "INSERT INTO voipc_writers (conv, owner, shares) VALUES ('c:aa', x'{}', TRUE) RETURNING id",
+                hex::encode(hi.id)
+            ),
+        )
+        .await
+        .unwrap();
+
+        // Taken in the editor. Nobody signs out for it
+        let save = |scopes: &[&str]| AdminOp::GroupSave {
+            create: false,
+            group: GroupInfo {
+                name: "sharers".into(),
+                description: String::new(),
+                badge: String::new(),
+                scopes: scopes.iter().map(|s| s.to_string()).collect(),
+                builtin: false,
+            },
+        };
+        let code = format!(
+            "{:06}",
+            l4f_accounts::totp::code_at(&secret, l4f_accounts::util::now() / 30 + 1)
+        );
+        ann.send(&admin_op(save(&[]), Some(code))).await;
+        let r = ann.expect("saved", admin_answer).await;
+        assert!(
+            !matches!(r, ServerMessage::Account(AccountReply::Error { .. })),
+            "{r:?}"
+        );
+        assert_eq!(flags(&drained(&mut watcher).await, h), [false]);
+        assert_eq!(flags(&drained(&mut hal).await, h), [false]);
+        assert!(!state.sessions.get(&h).unwrap().shares_history);
+        assert_eq!(
+            crate::accounts::raw(
+                state.accounts.as_ref().unwrap(),
+                "SELECT COUNT(*) FROM voipc_writers WHERE shares = TRUE"
+            )
+            .await
+            .unwrap(),
+            0,
+            "nor at rest"
+        );
+
+        // Then a `true` is refused, and an ask stops
+        hal.send(&on).await;
+        assert!(flags(&drained(&mut hal).await, h).is_empty());
+        watcher
+            .send(&ClientMessage::RequestChannelHistory {
+                channel_id,
+                target_user_id: h,
+            })
+            .await;
+        drained(&mut watcher).await;
+        assert!(!asked(&drained(&mut hal).await));
+
+        // The shell: given back, and flagged again only when asked
+        let store = state.accounts.as_ref().unwrap().store();
+        let role = store.role_by_name("sharers").await.unwrap().unwrap();
+        store
+            .set_role_scopes(role.id, &[SHARE_HISTORY.to_string()])
+            .await
+            .unwrap();
+        crate::accounts::revalidate(&state).await;
+        assert!(
+            flags(&drained(&mut hal).await, h).is_empty(),
+            "never by itself"
+        );
+        hal.send(&on).await;
+        assert_eq!(flags(&drained(&mut hal).await, h), [true]);
+        drained(&mut watcher).await;
+        store.set_role_scopes(role.id, &[]).await.unwrap();
+        crate::accounts::revalidate(&state).await;
+        assert_eq!(flags(&drained(&mut watcher).await, h), [false]);
+        assert!(!state.sessions.get(&h).unwrap().shares_history);
+    }
+
+    /// Nothing is handed over by someone who does not share, asked or not.
+    #[tokio::test]
+    async fn an_unasked_hand_off_is_dropped() {
+        let state = admin_state();
+        let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let mut alice = connect(&state, "alice", lo).await;
+        let mut bob = connect(&state, "bob", lo).await;
+        let channel_id = text_channel_with_two(&mut alice, &mut bob, "lounge").await;
+        let a = *state.username_to_session.get("alice").unwrap();
+        let hand_off = ClientMessage::SendChannelHistory {
+            channel_id,
+            target_user_id: a,
+            ciphertext: vec![1],
+            message_type: 2,
+        };
+        let received = |seen: &[ServerMessage]| {
+            seen.iter()
+                .any(|m| matches!(m, ServerMessage::ChannelHistoryReceived { .. }))
+        };
+        bob.send(&hand_off).await;
+        drained(&mut bob).await;
+        assert!(!received(&drained(&mut alice).await));
+        // The control: flagged, the same frame goes. No accounts here, so the switch alone
+        bob.send(&ClientMessage::SetHistorySharing { enabled: true })
+            .await;
+        drained(&mut bob).await;
+        bob.send(&hand_off).await;
+        alice
+            .expect("handed over", |m| {
+                matches!(m, ServerMessage::ChannelHistoryReceived { .. })
+            })
+            .await;
+    }
+}
+
+/// Protocol 21's live path: being in a text channel is one frame, nobody is told, nobody holds
+/// a key until somebody writes, and a post goes only to people its writer has keyed.
+mod live_path {
+    use super::*;
+    use crate::channels::ChannelEntry;
+    use crate::state::test_support::{add_user, put_in_channel};
+    use crate::state::{Channel, RateLimiter};
+
+    /// All they are sent before a ping comes back, so all they were sent by then.
+    async fn drained(c: &mut Client) -> Vec<ServerMessage> {
+        let stamp: u64 = rand::random();
+        c.send(&ClientMessage::Ping { timestamp: stamp }).await;
+        let mut seen = Vec::new();
+        loop {
+            match c.next().await.expect("the connection stays") {
+                ServerMessage::Pong { timestamp } if timestamp == stamp => return seen,
+                m => seen.push(m),
+            }
+        }
+    }
+
+    fn entry(name: &str) -> ChannelEntry {
+        ChannelEntry {
+            name: name.into(),
+            text: true,
+            auto_join: true,
+            ..ChannelEntry::default()
+        }
+    }
+
+    /// A channel from the file: it never expires under a test.
+    async fn text_channel(state: &ServerState, name: &str) -> ChannelId {
+        let id = state.next_channel_id();
+        let channel = Channel::from_entry(&entry(name), id, false, false);
+        state.channels.write().await.insert(id, channel);
+        id
+    }
+
+    /// A person on the live path, in these channels: their client and their id.
+    async fn follower(
+        state: &Arc<ServerState>,
+        name: &str,
+        channels: &[ChannelId],
+    ) -> (Client, UserId) {
+        let (mut c, uid) = connect_with_bundle(state, name, test_bundle(20)).await;
+        follow(&mut c, channels).await;
+        (c, uid)
+    }
+
+    async fn follow(c: &mut Client, channels: &[ChannelId]) {
+        c.send(&ClientMessage::JoinTextChannels {
+            channels: channels.to_vec(),
+            quiet: vec![],
+        })
+        .await;
+        c.expect("TextJoined", |m| {
+            matches!(m, ServerMessage::TextJoined { .. })
+        })
+        .await;
+    }
+
+    /// The whole answer to a `KeyCheck`: who is owed, as ids and as rows' ids.
+    async fn check(c: &mut Client, channel_id: ChannelId, restart: bool) -> Vec<UserId> {
+        c.send(&ClientMessage::KeyCheck {
+            channel_id,
+            restart,
+        })
+        .await;
+        let mut owed = Vec::new();
+        loop {
+            match c
+                .expect("KeysOwed", |m| matches!(m, ServerMessage::KeysOwed { .. }))
+                .await
+            {
+                ServerMessage::KeysOwed {
+                    ids,
+                    rows,
+                    more,
+                    refused,
+                    ..
+                } => {
+                    assert!(!refused);
+                    owed.extend(ids);
+                    owed.extend(rows.iter().map(|r| r.user_id));
+                    if !more {
+                        owed.sort_unstable();
+                        return owed;
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    /// A check that is refused, and that says why.
+    async fn check_refused(c: &mut Client, channel_id: ChannelId) -> String {
+        c.send(&ClientMessage::KeyCheck {
+            channel_id,
+            restart: false,
+        })
+        .await;
+        let seen = drained(c).await;
+        assert!(
+            seen.iter().any(
+                |m| matches!(m, ServerMessage::KeysOwed { refused: true, ids, rows, .. }
+                    if ids.is_empty() && rows.is_empty())
+            ),
+            "{seen:?}"
+        );
+        seen.iter()
+            .find_map(|m| match m {
+                ServerMessage::ChannelError { reason } => Some(reason.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    async fn post(c: &mut Client, channel_id: ChannelId, ciphertext: Vec<u8>) {
+        c.send(&ClientMessage::SendEncryptedChannelMessage {
+            channel_id,
+            ciphertext,
+        })
+        .await;
+        settled(c).await;
+    }
+
+    fn posts(seen: &[ServerMessage]) -> usize {
+        seen.iter()
+            .filter(|m| matches!(m, ServerMessage::TextPost { .. }))
+            .count()
+    }
+
+    fn exits(seen: &[ServerMessage]) -> Vec<Vec<ChannelId>> {
+        seen.iter()
+            .filter_map(|m| match m {
+                ServerMessage::ChannelExits { channels } => {
+                    let mut c = channels.clone();
+                    c.sort_unstable();
+                    Some(c)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn gone_from_the_relay(state: &ServerState, uid: UserId) {
+        for _ in 0..500 {
+            if !state.sessions.contains_key(&uid) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("session {uid} is still there");
+    }
+
+    // ── Joining ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn one_frame_joins_three_hundred_and_tells_nobody() {
+        let state = admin_state();
+        let mut ids = Vec::new();
+        for i in 0..300 {
+            ids.push(text_channel(&state, &format!("c{i}")).await);
+        }
+        let (mut bob, _) = follower(&state, "bob", &[]).await;
+        let (mut ann, ann_id) = connect_with_bundle(&state, "ann", test_bundle(1)).await;
+        settled(&mut ann).await;
+        settled(&mut bob).await;
+
+        ann.send(&ClientMessage::JoinTextChannels {
+            channels: ids.clone(),
+            quiet: vec![],
+        })
+        .await;
+        let seen = drained(&mut ann).await;
+        let rows: Vec<_> = seen
+            .iter()
+            .filter_map(|m| match m {
+                ServerMessage::TextJoined { joined, refused } => {
+                    assert!(refused.is_empty());
+                    Some(joined.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rows.len(), 1, "one frame back: {rows:?}");
+        assert_eq!(rows[0].len(), 300);
+        assert!(rows[0].iter().all(|r| !r.1 && !r.2 && r.3 == 0));
+        {
+            let channels = state.channels.read().await;
+            assert!(ids.iter().all(|i| channels[i].members.contains(&ann_id)));
+        }
+
+        let told = drained(&mut bob).await;
+        assert!(
+            !told.iter().any(|m| matches!(
+                m,
+                ServerMessage::UserJoined { .. } | ServerMessage::UserList { .. }
+            )),
+            "{told:?}"
+        );
+
+        // The control: a voice join still tells everyone
+        let room = create(&mut ann, "room", false).await;
+        bob.expect(
+            "UserJoined",
+            |m| matches!(m, ServerMessage::UserJoined { user } if user.channel_id == room),
+        )
+        .await;
+    }
+
+    /// The channels a frame cannot name in one answer come in several.
+    #[tokio::test]
+    async fn a_long_join_answer_comes_in_frames_that_fit() {
+        let state = admin_state();
+        let mut ids = Vec::new();
+        for i in 0..7000 {
+            ids.push(text_channel(&state, &format!("c{i}")).await);
+        }
+        let (mut ann, _) = connect_with_bundle(&state, "ann", test_bundle(1)).await;
+        ann.send(&ClientMessage::JoinTextChannels {
+            channels: ids.clone(),
+            quiet: vec![],
+        })
+        .await;
+        let seen = drained(&mut ann).await;
+        let frames = seen
+            .iter()
+            .filter(|m| matches!(m, ServerMessage::TextJoined { .. }))
+            .count();
+        let joined: usize = seen
+            .iter()
+            .map(|m| match m {
+                ServerMessage::TextJoined { joined, .. } => joined.len(),
+                _ => 0,
+            })
+            .sum();
+        assert_eq!((frames, joined), (3, 7000));
+    }
+
+    #[tokio::test]
+    async fn a_gate_keeps_the_join_many_out_and_says_nothing() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        group(&state, "crew", None, &[]).await;
+        let (mut bob, bi) = register(&state, "bob").await;
+        let (mut cat, ci) = register(&state, "cat").await;
+        let mut gia = connect(&state, "gia#1234", "203.0.113.4".parse().unwrap()).await;
+        give(&state, bi.id, "crew", true).await;
+        let gated = text_channel(&state, "gated").await;
+        let locked = text_channel(&state, "locked").await;
+        let room = create(&mut bob, "room", false).await;
+        {
+            let mut channels = state.channels.write().await;
+            channels.get_mut(&gated).unwrap().gate.groups = vec!["crew".into()];
+            channels.get_mut(&locked).unwrap().password =
+                Some(zeroize::Zeroizing::new("pw".to_string()));
+        }
+        let missing = 999_999;
+        let asked = vec![gated, locked, room, missing];
+        let refused_of = |seen: &[ServerMessage]| -> Vec<ChannelId> {
+            seen.iter()
+                .find_map(|m| match m {
+                    ServerMessage::TextJoined { joined, refused } => {
+                        assert!(joined.is_empty(), "{joined:?}");
+                        Some(refused.clone())
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        };
+        for c in [&mut cat, &mut gia] {
+            c.send(&ClientMessage::JoinTextChannels {
+                channels: asked.clone(),
+                quiet: vec![],
+            })
+            .await;
+            assert_eq!(refused_of(&drained(c).await), asked, "one answer for all");
+        }
+        assert!(!state.channels.read().await[&gated]
+            .members
+            .contains(&sid_of_account(&state, ci.id)));
+
+        // The control: who is in the group is in, and hears that it has a gate
+        bob.send(&ClientMessage::JoinTextChannels {
+            channels: vec![gated],
+            quiet: vec![],
+        })
+        .await;
+        let seen = drained(&mut bob).await;
+        assert!(
+            seen.iter().any(|m| matches!(
+                m,
+                ServerMessage::TextJoined { joined, refused }
+                    if refused.is_empty() && joined.len() == 1 && joined[0].0 == gated && joined[0].2
+            )),
+            "{seen:?}"
+        );
+    }
+
+    fn sid_of_account(state: &ServerState, id: [u8; 16]) -> SessionId {
+        *state.account_sessions.get(&id).unwrap()
+    }
+
+    /// `*` sees a gated channel and enters by a click, a person's own act.
+    #[tokio::test]
+    async fn a_star_only_passer_is_refused_by_the_join_many_and_a_click_admits_them() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        group(&state, "crew", None, &[]).await;
+        let (mut ann, ai, _) = admin_account(&state, "ann").await;
+        let gated = text_channel(&state, "gated").await;
+        state
+            .channels
+            .write()
+            .await
+            .get_mut(&gated)
+            .unwrap()
+            .gate
+            .groups = vec!["crew".into()];
+        ann.send(&ClientMessage::JoinTextChannels {
+            channels: vec![gated],
+            quiet: vec![],
+        })
+        .await;
+        let seen = drained(&mut ann).await;
+        assert!(
+            seen.iter().any(
+                |m| matches!(m, ServerMessage::TextJoined { joined, refused }
+                if joined.is_empty() && refused == &[gated])
+            ),
+            "{seen:?}"
+        );
+        ann.send(&ClientMessage::JoinChannel {
+            channel_id: gated,
+            password: None,
+        })
+        .await;
+        let seen = drained(&mut ann).await;
+        assert!(
+            seen.iter()
+                .any(|m| matches!(m, ServerMessage::TextJoined { joined, .. }
+                if joined.len() == 1 && joined[0].0 == gated)),
+            "{seen:?}"
+        );
+        let sid = sid_of_account(&state, ai.id);
+        assert!(state.channels.read().await[&gated].members.contains(&sid));
+    }
+
+    /// The room tests below: what someone outside it hears of a join by `amy` once `room` is
+    /// made up as `shape` says.
+    async fn a_join_as_heard(shape: impl FnOnce(&mut Channel)) -> UserInfo {
+        let state = admin_state();
+        let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let (mut bob, _) = follower(&state, "bob", &[]).await;
+        let mut amy = connect(&state, "amy", lo).await;
+        let room = create(&mut amy, "room", false).await;
+        amy.expect(
+            "UserList",
+            |m| matches!(m, ServerMessage::UserList { channel_id, .. } if *channel_id == room),
+        )
+        .await;
+        amy.send(&ClientMessage::JoinChannel {
+            channel_id: 0,
+            password: None,
+        })
+        .await;
+        settled(&mut amy).await;
+        shape(state.channels.write().await.get_mut(&room).unwrap());
+        settled(&mut bob).await;
+        amy.send(&ClientMessage::JoinChannel {
+            channel_id: room,
+            password: Some("pw".into()),
+        })
+        .await;
+        let heard = |m: &ServerMessage| matches!(m, ServerMessage::UserJoined { user } if user.channel_id == room);
+        match bob.expect("UserJoined", heard).await {
+            ServerMessage::UserJoined { user } => user,
+            _ => unreachable!(),
+        }
+    }
+
+    /// An ask would answer anyone with these rows, and every app would ask.
+    #[tokio::test]
+    async fn a_public_rooms_join_carries_the_name() {
+        assert_eq!(a_join_as_heard(|_| {}).await.username, "amy");
+    }
+
+    #[tokio::test]
+    async fn an_anonymous_rooms_does_not() {
+        let heard = a_join_as_heard(|c| c.info.anonymous = true).await;
+        assert_eq!((heard.username.as_str(), heard.account), ("", None));
+    }
+
+    #[tokio::test]
+    async fn a_private_rooms_does_not() {
+        let heard = a_join_as_heard(|c| c.info.hide_members = true).await;
+        assert_eq!((heard.username.as_str(), heard.user_id), ("", 0));
+        let heard = a_join_as_heard(|c| {
+            c.password = Some(zeroize::Zeroizing::new("pw".to_string()));
+        })
+        .await;
+        assert_eq!((heard.username.as_str(), heard.user_id), ("", 0));
+    }
+
+    /// A change of badges reaches who may now hold that row, as a join does.
+    #[tokio::test]
+    async fn a_change_reaches_who_was_told_a_public_rooms_name() {
+        let state = admin_state();
+        let (mut bob, _) = follower(&state, "bob", &[]).await;
+        let (mut amy, amy_id) = connect_with_bundle(&state, "amy", test_bundle(1)).await;
+        let room = create(&mut bob, "room", false).await;
+        settled(&mut amy).await;
+        settled(&mut bob).await;
+        let info = user_info_for(&state, amy_id, amy_id, 0);
+        broadcast_user_updated(&state, info).await;
+        let got = bob
+            .expect("UserUpdated", |m| {
+                matches!(m, ServerMessage::UserUpdated { .. })
+            })
+            .await;
+        assert!(
+            matches!(&got, ServerMessage::UserUpdated { user } if user.username == "amy"),
+            "{got:?}"
+        );
+        assert!(room > 0);
+    }
+
+    #[tokio::test]
+    async fn a_click_into_a_text_channel_answers_alone_with_no_roster() {
+        let state = admin_state();
+        let lobby = text_channel(&state, "lobby").await;
+        let (mut bob, _) = follower(&state, "bob", &[lobby]).await;
+        let (mut ann, _) = follower(&state, "ann", &[]).await;
+        settled(&mut bob).await;
+        for _ in 0..2 {
+            ann.send(&ClientMessage::JoinChannel {
+                channel_id: lobby,
+                password: None,
+            })
+            .await;
+            let seen = drained(&mut ann).await;
+            assert!(
+                seen.iter()
+                    .any(|m| matches!(m, ServerMessage::TextJoined { joined, .. }
+                    if joined.len() == 1 && joined[0].0 == lobby)),
+                "{seen:?}"
+            );
+            assert!(
+                !seen
+                    .iter()
+                    .any(|m| matches!(m, ServerMessage::UserList { channel_id, .. }
+                    if *channel_id == lobby)),
+                "{seen:?}"
+            );
+        }
+        // A second click is no newcomer: only one stamp was given
+        assert_eq!(state.channels.read().await[&lobby].follow.last_join, 2);
+        let told = drained(&mut bob).await;
+        assert!(
+            !told
+                .iter()
+                .any(|m| matches!(m, ServerMessage::UserJoined { .. })),
+            "{told:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn leaving_tells_the_leaver_alone_and_a_hand_joined_channels_followers() {
+        let state = admin_state();
+        let open = text_channel(&state, "open").await;
+        let by_hand = text_channel(&state, "by hand").await;
+        state
+            .channels
+            .write()
+            .await
+            .get_mut(&by_hand)
+            .unwrap()
+            .info
+            .auto_join = false;
+        let (mut bob, _) = follower(&state, "bob", &[open, by_hand]).await;
+        let (mut ann, ann_id) = follower(&state, "ann", &[open, by_hand]).await;
+        for id in [open, by_hand] {
+            ann.send(&ClientMessage::LeaveChannel { channel_id: id })
+                .await;
+            ann.expect(
+                "UserLeft",
+                |m| matches!(m, ServerMessage::UserLeft { user_id, channel_id } if *user_id == ann_id && *channel_id == id),
+            )
+            .await;
+        }
+        let seen = drained(&mut bob).await;
+        assert!(
+            !seen
+                .iter()
+                .any(|m| matches!(m, ServerMessage::UserLeft { .. })),
+            "{seen:?}"
+        );
+        let gone: Vec<_> = seen
+            .iter()
+            .filter_map(|m| match m {
+                ServerMessage::MemberGone {
+                    channel_id,
+                    user_id,
+                } => Some((*channel_id, *user_id)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            gone,
+            [(by_hand, ann_id)],
+            "an open channel needs no such word"
+        );
+    }
+
+    /// Text channels cannot be anonymous; a room that is keeps every frame it has.
+    #[tokio::test]
+    async fn an_anonymous_room_refuses_the_join_many_and_its_page_keeps_its_pseudonyms() {
+        let state = admin_state();
+        let (mut ann, ann_id) = connect_with_bundle(&state, "ann", test_bundle(1)).await;
+        let room = create(&mut ann, "room", false).await;
+        {
+            let mut channels = state.channels.write().await;
+            let c = channels.get_mut(&room).unwrap();
+            c.info.anonymous = true;
+            c.pseudonyms.insert(ann_id, "Quiet Otter".into());
+        }
+        let (mut bob, _) = follower(&state, "bob", &[]).await;
+        bob.send(&ClientMessage::JoinTextChannels {
+            channels: vec![room],
+            quiet: vec![],
+        })
+        .await;
+        let seen = drained(&mut bob).await;
+        assert!(
+            seen.iter().any(
+                |m| matches!(m, ServerMessage::TextJoined { refused, .. } if refused == &[room])
+            ),
+            "{seen:?}"
+        );
+        bob.send(&ClientMessage::RequestChannelPage {
+            channel_id: room,
+            after: 0,
+        })
+        .await;
+        let page = bob
+            .expect("ChannelPage", |m| {
+                matches!(m, ServerMessage::ChannelPage { .. })
+            })
+            .await;
+        assert!(
+            matches!(&page, ServerMessage::ChannelPage { ids, rows, total: 1, next: 0, .. }
+                if ids.is_empty() && rows.len() == 1 && rows[0].username == "Quiet Otter" && rows[0].account.is_none()),
+            "{page:?}"
+        );
+    }
+
+    // ── Keys and posts ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_post_reaches_only_those_the_writer_keyed() {
+        let state = admin_state();
+        let id = text_channel(&state, "lobby").await;
+        let (mut ann, ann_id) = follower(&state, "ann", &[id]).await;
+        let (mut bob, bob_id) = follower(&state, "bob", &[id]).await;
+
+        // A member the writer never asked about gets nothing
+        post(&mut ann, id, vec![1]).await;
+        assert_eq!(posts(&drained(&mut bob).await), 0);
+
+        assert_eq!(check(&mut ann, id, false).await, [bob_id]);
+        post(&mut ann, id, vec![2]).await;
+        let seen = drained(&mut bob).await;
+        assert!(
+            seen.iter().any(|m| matches!(
+                m,
+                ServerMessage::TextPost { channel_id, user_id, username, account: None, is_admin: false, is_moderator: false, ciphertext, .. }
+                    if *channel_id == id && *user_id == ann_id && username == "ann" && ciphertext == &[2]
+            )),
+            "{seen:?}"
+        );
+        assert_eq!(posts(&seen), 1);
+        assert_eq!(posts(&drained(&mut ann).await), 0, "not to the writer");
+
+        // Someone newer than the writer's last check waits for the next one
+        let (mut cat, cat_id) = follower(&state, "cat", &[id]).await;
+        post(&mut ann, id, vec![3]).await;
+        assert_eq!(posts(&drained(&mut cat).await), 0);
+        assert_eq!(posts(&drained(&mut bob).await), 1);
+        assert_eq!(check(&mut ann, id, false).await, [cat_id]);
+        post(&mut ann, id, vec![4]).await;
+        assert_eq!(posts(&drained(&mut cat).await), 1);
+
+        // The mark is the post's time, for someone joining later
+        let (mut dan, _) = connect_with_bundle(&state, "dan", test_bundle(1)).await;
+        dan.send(&ClientMessage::JoinTextChannels {
+            channels: vec![id],
+            quiet: vec![],
+        })
+        .await;
+        let seen = drained(&mut dan).await;
+        assert!(
+            seen.iter()
+                .any(|m| matches!(m, ServerMessage::TextJoined { joined, .. }
+                if joined.len() == 1 && joined[0].3 > 0)),
+            "{seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn keys_owed_names_newcomers_then_everyone_on_restart() {
+        let state = admin_state();
+        let id = text_channel(&state, "lobby").await;
+        let (mut ann, _) = follower(&state, "ann", &[id]).await;
+        assert!(check(&mut ann, id, false).await.is_empty());
+        let (_bob, bob_id) = follower(&state, "bob", &[id]).await;
+        assert_eq!(check(&mut ann, id, false).await, [bob_id]);
+        assert!(check(&mut ann, id, false).await.is_empty(), "named already");
+        let (_cat, cat_id) = follower(&state, "cat", &[id]).await;
+        assert_eq!(
+            check(&mut ann, id, false).await,
+            [cat_id],
+            "the newcomer alone"
+        );
+        let (_dan, dan_id) = follower(&state, "dan", &[id]).await;
+        assert_eq!(check(&mut ann, id, true).await, [bob_id, cat_id, dan_id]);
+        assert!(check(&mut ann, id, false).await.is_empty());
+    }
+
+    /// Bare ids for whoever a public list names, so 2000 people are 8 KB, not 66; rows for
+    /// who it does not. A row feeds the pin check, and says the text channel, never a room.
+    #[tokio::test]
+    async fn keys_owed_names_only_who_no_public_list_names() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let id = text_channel(&state, "lobby").await;
+        let (mut ann, _) = register(&state, "ann").await;
+        follow(&mut ann, &[id]).await;
+        check(&mut ann, id, false).await;
+
+        let (mut bob, bi) = register(&state, "bob").await; // stays in General
+        let (mut cat, ci) = register(&state, "cat").await; // a public room
+        let (mut dia, di) = register(&state, "dia").await; // an anonymous room
+        let (mut eve, ei) = register(&state, "eve").await; // a room with a gate
+        let room = create(&mut cat, "public", false).await;
+        let anonymous = create(&mut dia, "anon", false).await;
+        let gated = create(&mut eve, "gated", false).await;
+        for c in [&mut bob, &mut cat, &mut dia, &mut eve] {
+            follow(c, &[id]).await;
+        }
+        {
+            let mut channels = state.channels.write().await;
+            channels.get_mut(&anonymous).unwrap().info.anonymous = true;
+            channels.get_mut(&gated).unwrap().gate.groups = vec!["admin".into()];
+        }
+        ann.send(&ClientMessage::KeyCheck {
+            channel_id: id,
+            restart: false,
+        })
+        .await;
+        let got = ann
+            .expect("KeysOwed", |m| matches!(m, ServerMessage::KeysOwed { .. }))
+            .await;
+        let ServerMessage::KeysOwed {
+            mut ids,
+            rows,
+            more: false,
+            refused: false,
+            ..
+        } = got
+        else {
+            panic!("{got:?}");
+        };
+        ids.sort_unstable();
+        let mut expected = vec![sid_of_account(&state, bi.id), sid_of_account(&state, ci.id)];
+        expected.sort_unstable();
+        assert_eq!(ids, expected);
+        let mut named: Vec<_> = rows
+            .iter()
+            .map(|r| (r.username.as_str(), r.account, r.channel_id))
+            .collect();
+        named.sort_unstable();
+        assert_eq!(
+            named,
+            [("dia", Some(di.id), id), ("eve", Some(ei.id), id),],
+            "their name, their account, and this channel"
+        );
+        assert!(room > 0);
+    }
+
+    /// Past what a frame holds, `more` says so: at 13,000 ids and well before with rows.
+    #[tokio::test]
+    async fn a_long_keys_owed_comes_in_frames_that_fit() {
+        let state = admin_state();
+        let id = text_channel(&state, "lobby").await;
+        let hidden = 1_000_000;
+        put_in_channel(&state, hidden, &[]).await;
+        state
+            .channels
+            .write()
+            .await
+            .get_mut(&hidden)
+            .unwrap()
+            .info
+            .hide_members = true;
+        let mut everyone = Vec::new();
+        for i in 0..15_000 {
+            let (uid, _) = add_user(&state, &format!("u{i}"));
+            everyone.push(uid);
+        }
+        {
+            let mut channels = state.channels.write().await;
+            let c = channels.get_mut(&id).unwrap();
+            for uid in &everyone {
+                c.members.insert(*uid);
+                c.follow.set(*uid, false);
+            }
+        }
+        for uid in &everyone[..1500] {
+            state.sessions.get_mut(uid).unwrap().channel_id = hidden;
+        }
+        let frames = state.keys_owed(id, 0, false).await.unwrap();
+        assert!(frames.len() > 1);
+        let mut seen = Vec::new();
+        for (ids, rows) in frames {
+            let msg = ServerMessage::KeysOwed {
+                channel_id: id,
+                ids: ids.clone(),
+                rows: rows.clone(),
+                more: true,
+                refused: false,
+            };
+            assert!(encode_server_msg(&msg).is_ok(), "over a frame");
+            seen.extend(ids);
+            seen.extend(rows.iter().map(|r| r.user_id));
+        }
+        seen.sort_unstable();
+        assert_eq!(seen, everyone);
+    }
+
+    /// Someone who may not post uploads nothing for it, and a refused check is no attempt.
+    #[tokio::test]
+    async fn a_writer_who_may_not_post_is_owed_nothing_and_slow_mode_does_not_start() {
+        let state = admin_state();
+        let id = text_channel(&state, "lobby").await;
+        let (mut ann, ann_id) = follower(&state, "ann", &[id]).await;
+        let (_bob, _) = follower(&state, "bob", &[id]).await;
+
+        // Read-only here
+        state
+            .sessions
+            .get_mut(&ann_id)
+            .unwrap()
+            .listen_only
+            .insert(id);
+        assert!(check_refused(&mut ann, id).await.contains("only read"));
+        state
+            .sessions
+            .get_mut(&ann_id)
+            .unwrap()
+            .listen_only
+            .remove(&id);
+        // Only moderators post
+        state
+            .channels
+            .write()
+            .await
+            .get_mut(&id)
+            .unwrap()
+            .info
+            .announce = true;
+        assert!(check_refused(&mut ann, id)
+            .await
+            .contains("only moderators"));
+        state
+            .channels
+            .write()
+            .await
+            .get_mut(&id)
+            .unwrap()
+            .info
+            .announce = false;
+        // Not a channel for this at all, and not one they are in
+        assert!(check_refused(&mut ann, 999_999)
+            .await
+            .contains("not in that channel"));
+        assert!(!state.channels.read().await[&id]
+            .follow
+            .keyed
+            .contains_key(&ann_id));
+
+        // Slow mode: the check starts no clock, the post does, and then a check says wait
+        state
+            .channels
+            .write()
+            .await
+            .get_mut(&id)
+            .unwrap()
+            .info
+            .slow_mode_secs = 60;
+        assert_eq!(check(&mut ann, id, false).await.len(), 1);
+        assert_eq!(state.post_marks.len(), 0);
+        post(&mut ann, id, vec![1]).await;
+        assert_eq!(state.post_marks.len(), 1);
+        assert!(check_refused(&mut ann, id).await.contains("slow mode"));
+    }
+
+    /// A voice room's chat keeps its own path, and has no check.
+    #[tokio::test]
+    async fn a_voice_room_has_no_key_check_and_keeps_its_chat() {
+        let state = admin_state();
+        let (mut ann, _) = follower(&state, "ann", &[]).await;
+        let (mut bob, _) = follower(&state, "bob", &[]).await;
+        let room = create(&mut ann, "room", false).await;
+        bob.send(&ClientMessage::JoinChannel {
+            channel_id: room,
+            password: None,
+        })
+        .await;
+        settled(&mut bob).await;
+        settled(&mut ann).await;
+        check_refused(&mut ann, room).await;
+        post(&mut ann, room, vec![1]).await;
+        bob.expect("the room's chat", |m| {
+            matches!(m, ServerMessage::EncryptedChannelChatMessage { channel_id, .. } if *channel_id == room)
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_flood_of_key_checks_is_refused_and_says_so() {
+        let state = admin_state();
+        let id = text_channel(&state, "lobby").await;
+        let (mut ann, ann_id) = follower(&state, "ann", &[id]).await;
+        state.sessions.get_mut(&ann_id).unwrap().key_check_rate = RateLimiter::new(1.0, 0.0);
+        check(&mut ann, id, false).await;
+        assert!(check_refused(&mut ann, id).await.contains("too fast"));
+    }
+
+    /// One post goes to everyone online, so what it weighs is limited as well as how many.
+    #[tokio::test]
+    async fn a_text_post_has_a_size_and_a_byte_budget() {
+        let state = admin_state();
+        let id = text_channel(&state, "lobby").await;
+        let (mut ann, _) = follower(&state, "ann", &[id]).await;
+        let (mut bob, _) = follower(&state, "bob", &[id]).await;
+        check(&mut ann, id, false).await;
+
+        ann.send(&ClientMessage::SendEncryptedChannelMessage {
+            channel_id: id,
+            ciphertext: vec![0; 16 * 1024 + 1],
+        })
+        .await;
+        let seen = drained(&mut ann).await;
+        assert!(
+            seen.iter().any(|m| matches!(m, ServerMessage::ChannelError { reason } if reason == "message too large")),
+            "{seen:?}"
+        );
+        assert_eq!(posts(&drained(&mut bob).await), 0);
+
+        // 64 KiB at once, and a burst of 5 posts: the fifth of these is past the bytes
+        for _ in 0..4 {
+            post(&mut ann, id, vec![0; 16 * 1024]).await;
+        }
+        assert_eq!(posts(&drained(&mut bob).await), 4);
+        ann.send(&ClientMessage::SendEncryptedChannelMessage {
+            channel_id: id,
+            ciphertext: vec![0; 16 * 1024],
+        })
+        .await;
+        let seen = drained(&mut ann).await;
+        assert!(
+            seen.iter().any(|m| matches!(m, ServerMessage::ChannelError { reason } if reason.contains("too fast"))),
+            "{seen:?}"
+        );
+        assert_eq!(posts(&drained(&mut bob).await), 0);
+    }
+
+    #[tokio::test]
+    async fn a_disconnect_tells_nobody_and_an_exit_tells_only_who_keyed_the_leaver() {
+        let state = admin_state();
+        let one = text_channel(&state, "one").await;
+        let two = text_channel(&state, "two").await;
+        let (mut wes, _) = follower(&state, "wes", &[one, two]).await; // keys the leavers
+        let (mut old, _) = follower(&state, "old", &[one, two]).await; // keyed before they came
+        check(&mut old, one, false).await;
+        check(&mut old, two, false).await;
+        let (mut non, _) = follower(&state, "non", &[one, two]).await; // never wrote
+        let (lou, lou_id) = follower(&state, "lou", &[one, two]).await; // goes offline
+        let (mut lea, _) = follower(&state, "lea", &[one, two]).await; // leaves
+        let (mut ban, ban_id) = follower(&state, "ban", &[one, two]).await; // is thrown out
+        check(&mut wes, one, false).await;
+        check(&mut wes, two, false).await;
+        for c in [&mut wes, &mut old, &mut non] {
+            drained(c).await;
+        }
+
+        // Going offline
+        drop(lou);
+        gone_from_the_relay(&state, lou_id).await;
+        crate::session::send_exits(&state);
+        assert!(
+            exits(&drained(&mut wes).await).is_empty(),
+            "age covers this"
+        );
+        assert!(!state.channels.read().await[&one].members.contains(&lou_id));
+
+        // Leaving one
+        lea.send(&ClientMessage::LeaveChannel { channel_id: one })
+            .await;
+        settled(&mut lea).await;
+        crate::session::send_exits(&state);
+        assert_eq!(exits(&drained(&mut wes).await), [vec![one]]);
+        assert!(exits(&drained(&mut old).await).is_empty());
+        assert!(exits(&drained(&mut non).await).is_empty());
+
+        // Thrown out of both is one frame for the writer
+        state.sessions.get_mut(&ban_id).unwrap().ejected = true;
+        ban.send(&ClientMessage::Disconnect).await;
+        drop(ban);
+        gone_from_the_relay(&state, ban_id).await;
+        crate::session::send_exits(&state);
+        let mut both = vec![one, two];
+        both.sort_unstable();
+        assert_eq!(exits(&drained(&mut wes).await), [both]);
+        assert!(exits(&drained(&mut old).await).is_empty());
+    }
+
+    /// A kick and a ban from the server are exits; each path sets the flag behind that.
+    #[tokio::test]
+    async fn a_server_kick_is_an_exit() {
+        let state = admin_state();
+        let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let id = text_channel(&state, "lobby").await;
+        let mut boss = connect(&state, "boss", lo).await;
+        boss.send(&ClientMessage::AdminLogin {
+            token: "test-admin-token".into(),
+        })
+        .await;
+        settled(&mut boss).await;
+        let (mut wes, _) = follower(&state, "wes", &[id]).await;
+        let (mut tom, tom_id) = follower(&state, "tom", &[id]).await;
+        check(&mut wes, id, false).await;
+        boss.send(&ClientMessage::AdminKick {
+            user_id: tom_id,
+            reason: String::new(),
+        })
+        .await;
+        tom.expect("Disconnected", |m| {
+            matches!(m, ServerMessage::Disconnected { .. })
+        })
+        .await;
+        drop(tom);
+        gone_from_the_relay(&state, tom_id).await;
+        crate::session::send_exits(&state);
+        assert_eq!(exits(&drained(&mut wes).await), [vec![id]]);
+    }
+
+    #[tokio::test]
+    async fn a_leaver_nobody_keyed_rotates_nothing() {
+        let state = admin_state();
+        let id = text_channel(&state, "lobby").await;
+        let (mut wes, _) = follower(&state, "wes", &[id]).await;
+        check(&mut wes, id, false).await;
+        let (mut lea, _) = follower(&state, "lea", &[id]).await;
+        lea.send(&ClientMessage::LeaveChannel { channel_id: id })
+            .await;
+        settled(&mut lea).await;
+        crate::session::send_exits(&state);
+        assert!(state.exits_due.is_empty());
+        assert!(exits(&drained(&mut wes).await).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_batch_is_checked_per_target() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let id = text_channel(&state, "lobby").await;
+        let (mut ann, ai) = register(&state, "ann").await;
+        let (mut bob, bi) = register(&state, "bob").await;
+        let (mut out, oi) = register(&state, "out").await;
+        follow(&mut ann, &[id]).await;
+        follow(&mut bob, &[id]).await;
+        follow(&mut out, &[]).await;
+        let ann_id = sid_of_account(&state, ai.id);
+        let bob_id = sid_of_account(&state, bi.id);
+        let out_id = sid_of_account(&state, oi.id);
+        ann.send(&ClientMessage::DistributeSenderKeys {
+            channel_id: id,
+            keys: vec![(out_id, 2, vec![1]), (bob_id, 2, vec![2])],
+        })
+        .await;
+        settled(&mut ann).await;
+        let got = bob
+            .expect("TextKeyReceived", |m| {
+                matches!(m, ServerMessage::TextKeyReceived { .. })
+            })
+            .await;
+        assert!(
+            matches!(&got, ServerMessage::TextKeyReceived { channel_id, from, account: Some(a), message_type: 2, ciphertext }
+                if *channel_id == id && *from == ann_id && *a == ai.id && ciphertext == &[2]),
+            "{got:?}"
+        );
+        let seen = drained(&mut out).await;
+        assert!(
+            !seen
+                .iter()
+                .any(|m| matches!(m, ServerMessage::TextKeyReceived { .. })),
+            "{seen:?}"
+        );
+
+        // The writer's budget for each target is the one the single frame draws on
+        {
+            let mut a = state.sessions.get_mut(&ann_id).unwrap();
+            a.key_relay_burst = 1.0;
+            a.key_relay_rate.clear();
+        }
+        ann.send(&ClientMessage::DistributeSenderKeys {
+            channel_id: id,
+            keys: vec![(bob_id, 2, vec![3]), (bob_id, 2, vec![4])],
+        })
+        .await;
+        settled(&mut ann).await;
+        let seen = drained(&mut bob).await;
+        let keys = seen
+            .iter()
+            .filter(|m| matches!(m, ServerMessage::TextKeyReceived { .. }))
+            .count();
+        assert_eq!(keys, 1, "{seen:?}");
+
+        // Someone outside the channel hands nobody a key for it
+        out.send(&ClientMessage::DistributeSenderKeys {
+            channel_id: id,
+            keys: vec![(bob_id, 2, vec![5])],
+        })
+        .await;
+        settled(&mut out).await;
+        assert!(!drained(&mut bob)
+            .await
+            .iter()
+            .any(|m| matches!(m, ServerMessage::TextKeyReceived { .. })));
+    }
+
+    // ── The reader opens the session ─────────────────────────────────
+
+    #[tokio::test]
+    async fn open_sessions_ask_whole_followers_and_spend_the_writers_keys() {
+        let state = admin_state();
+        let id = text_channel(&state, "lobby").await;
+        let (mut wes, wes_id) = connect_with_bundle(&state, "wes", test_bundle(12)).await;
+        follow(&mut wes, &[id]).await;
+        let (mut bob, bob_id) = follower(&state, "bob", &[id]).await;
+        let (mut qua, qua_id) = connect_with_bundle(&state, "qua", test_bundle(1)).await;
+        qua.send(&ClientMessage::JoinTextChannels {
+            channels: vec![],
+            quiet: vec![id],
+        })
+        .await;
+        settled(&mut qua).await;
+        let (mut out, out_id) = follower(&state, "out", &[]).await;
+        wes.send(&ClientMessage::OpenSessions {
+            channel_id: id,
+            targets: vec![bob_id, qua_id, out_id, wes_id, 999_999],
+        })
+        .await;
+        settled(&mut wes).await;
+        let got = bob
+            .expect("SessionAsked", |m| {
+                matches!(m, ServerMessage::SessionAsked { .. })
+            })
+            .await;
+        assert!(
+            matches!(&got, ServerMessage::SessionAsked { channel_id, from, account: None, name, bundle }
+                if *channel_id == id && *from == wes_id && name == "wes"
+                    && bundle.prekeys.len() == 1 && bundle.kyber_prekey.len() == MAX_KEM_KEY_BYTES),
+            "{got:?}"
+        );
+        for c in [&mut qua, &mut out, &mut wes] {
+            let seen = drained(c).await;
+            assert!(
+                !seen
+                    .iter()
+                    .any(|m| matches!(m, ServerMessage::SessionAsked { .. })),
+                "{seen:?}"
+            );
+        }
+        let pool = |state: &ServerState| {
+            state
+                .sessions
+                .get(&wes_id)
+                .unwrap()
+                .bundle
+                .as_ref()
+                .unwrap()
+                .prekeys
+                .len()
+        };
+        assert_eq!(pool(&state), 11, "one key for the one asked");
+
+        // The pool's low mark says so once, and past the pool a bundle carries none
+        for _ in 0..12 {
+            wes.send(&ClientMessage::OpenSessions {
+                channel_id: id,
+                targets: vec![bob_id],
+            })
+            .await;
+        }
+        let seen = drained(&mut wes).await;
+        let low = seen
+            .iter()
+            .filter(|m| matches!(m, ServerMessage::PreKeysLow { .. }))
+            .count();
+        assert_eq!((low, pool(&state)), (1, 0), "{seen:?}");
+        let seen = drained(&mut bob).await;
+        assert!(
+            seen.iter().any(|m| matches!(m, ServerMessage::SessionAsked { bundle, .. } if bundle.prekeys.is_empty())),
+            "{seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_sessions_stop_at_the_writers_budget() {
+        let state = admin_state();
+        let id = text_channel(&state, "lobby").await;
+        let (mut wes, wes_id) = follower(&state, "wes", &[id]).await;
+        let (mut bob, bob_id) = follower(&state, "bob", &[id]).await;
+        let (mut cat, cat_id) = follower(&state, "cat", &[id]).await;
+        state.sessions.get_mut(&wes_id).unwrap().prekey_bundle_rate = RateLimiter::new(1.0, 0.0);
+        wes.send(&ClientMessage::OpenSessions {
+            channel_id: id,
+            targets: vec![bob_id, cat_id],
+        })
+        .await;
+        settled(&mut wes).await;
+        let asked = |seen: &[ServerMessage]| {
+            seen.iter()
+                .filter(|m| matches!(m, ServerMessage::SessionAsked { .. }))
+                .count()
+        };
+        assert_eq!(
+            asked(&drained(&mut bob).await) + asked(&drained(&mut cat).await),
+            1
+        );
+        let left = state
+            .sessions
+            .get(&wes_id)
+            .unwrap()
+            .bundle
+            .as_ref()
+            .unwrap()
+            .prekeys
+            .len();
+        assert_eq!(left, 19, "no key for whoever was not asked");
+    }
+
+    /// After a key job the next reader gets the new keys, so that a thief of the writer's
+    /// memory opens no wrap from before them.
+    #[tokio::test]
+    async fn renewed_session_keys_go_in_the_next_bundle() {
+        let state = admin_state();
+        let id = text_channel(&state, "lobby").await;
+        let (mut wes, wes_id) = follower(&state, "wes", &[id]).await;
+        let (mut bob, bob_id) = follower(&state, "bob", &[id]).await;
+        let renew = |id: u32, key_len: usize| ClientMessage::RenewSessionKeys {
+            signed_prekey_id: id,
+            signed_prekey: vec![1; 33],
+            signed_prekey_signature: vec![2; 64],
+            kyber_prekey_id: id,
+            kyber_prekey: vec![3; key_len],
+            kyber_prekey_signature: vec![4; 64],
+        };
+        wes.send(&renew(9, MAX_KEM_KEY_BYTES)).await;
+        settled(&mut wes).await;
+        // One too long for a frame's room goes unstored, as a bundle would at the door
+        wes.send(&renew(10, MAX_KEM_KEY_BYTES + 1)).await;
+        settled(&mut wes).await;
+        wes.send(&ClientMessage::OpenSessions {
+            channel_id: id,
+            targets: vec![bob_id],
+        })
+        .await;
+        let got = bob
+            .expect("SessionAsked", |m| {
+                matches!(m, ServerMessage::SessionAsked { .. })
+            })
+            .await;
+        let ServerMessage::SessionAsked { bundle, .. } = got else {
+            unreachable!()
+        };
+        assert_eq!((bundle.signed_prekey_id, bundle.kyber_prekey_id), (9, 9));
+        assert_eq!(bundle.kyber_prekey, vec![3; MAX_KEM_KEY_BYTES]);
+        assert_eq!(bundle.signed_prekey_signature, vec![2; 64]);
+        // The refused one changed nothing
+        let held = state
+            .sessions
+            .get(&wes_id)
+            .unwrap()
+            .bundle
+            .as_ref()
+            .unwrap()
+            .kyber_prekey_id;
+        assert_eq!(held, 9);
+    }
+
+    /// A hello is someone making the writer run a handshake: only as asked, and only once.
+    #[tokio::test]
+    async fn a_hello_goes_only_for_an_asked_pair_and_only_once() {
+        let state = admin_state();
+        let id = text_channel(&state, "lobby").await;
+        let (mut wes, wes_id) = follower(&state, "wes", &[id]).await;
+        let (mut bob, bob_id) = follower(&state, "bob", &[id]).await;
+        let hello = ClientMessage::SessionHello {
+            to: wes_id,
+            message_type: 3,
+            ciphertext: vec![7],
+        };
+        let hellos = |seen: &[ServerMessage]| {
+            seen.iter()
+                .filter(|m| matches!(m, ServerMessage::SessionHello { .. }))
+                .count()
+        };
+        bob.send(&hello).await;
+        settled(&mut bob).await;
+        assert_eq!(hellos(&drained(&mut wes).await), 0, "nobody asked");
+
+        wes.send(&ClientMessage::OpenSessions {
+            channel_id: id,
+            targets: vec![bob_id],
+        })
+        .await;
+        bob.expect("SessionAsked", |m| {
+            matches!(m, ServerMessage::SessionAsked { .. })
+        })
+        .await;
+        bob.send(&hello).await;
+        let got = wes
+            .expect("SessionHello", |m| {
+                matches!(m, ServerMessage::SessionHello { .. })
+            })
+            .await;
+        assert!(
+            matches!(&got, ServerMessage::SessionHello { from, message_type: 3, ciphertext }
+                if *from == bob_id && ciphertext == &[7]),
+            "{got:?}"
+        );
+        bob.send(&hello).await;
+        settled(&mut bob).await;
+        assert_eq!(hellos(&drained(&mut wes).await), 0, "used up");
+    }
+
+    #[tokio::test]
+    async fn a_pair_dies_with_the_session() {
+        let state = admin_state();
+        let id = text_channel(&state, "lobby").await;
+        let (mut wes, wes_id) = follower(&state, "wes", &[id]).await;
+        let (mut bob, bob_id) = follower(&state, "bob", &[id]).await;
+        wes.send(&ClientMessage::OpenSessions {
+            channel_id: id,
+            targets: vec![bob_id],
+        })
+        .await;
+        bob.expect("SessionAsked", |m| {
+            matches!(m, ServerMessage::SessionAsked { .. })
+        })
+        .await;
+        assert!(state
+            .sessions
+            .get(&bob_id)
+            .unwrap()
+            .session_asked
+            .contains(&wes_id));
+        drop(wes);
+        gone_from_the_relay(&state, wes_id).await;
+        assert!(state
+            .sessions
+            .get(&bob_id)
+            .unwrap()
+            .session_asked
+            .is_empty());
+    }
+
+    /// Keys go out behind the post that started slow mode's clock, and reading is not posting.
+    #[tokio::test]
+    async fn opening_passes_after_a_post_under_slow_mode_and_for_a_reader_who_may_not_post() {
+        let state = admin_state();
+        let id = text_channel(&state, "lobby").await;
+        state
+            .channels
+            .write()
+            .await
+            .get_mut(&id)
+            .unwrap()
+            .info
+            .slow_mode_secs = 60;
+        let (mut wes, wes_id) = follower(&state, "wes", &[id]).await;
+        let (mut bob, bob_id) = follower(&state, "bob", &[id]).await;
+        state
+            .sessions
+            .get_mut(&bob_id)
+            .unwrap()
+            .listen_only
+            .insert(id);
+        check(&mut wes, id, false).await;
+        post(&mut wes, id, vec![1]).await;
+        // A listener reads as anyone does
+        assert_eq!(posts(&drained(&mut bob).await), 1);
+        for _ in 0..2 {
+            wes.send(&ClientMessage::OpenSessions {
+                channel_id: id,
+                targets: vec![bob_id],
+            })
+            .await;
+            bob.expect("SessionAsked", |m| {
+                matches!(m, ServerMessage::SessionAsked { .. })
+            })
+            .await;
+        }
+        assert_eq!(state.post_marks.len(), 1, "keys start no clock");
+        bob.send(&ClientMessage::SessionHello {
+            to: wes_id,
+            message_type: 3,
+            ciphertext: vec![7],
+        })
+        .await;
+        wes.expect("SessionHello", |m| {
+            matches!(m, ServerMessage::SessionHello { .. })
+        })
+        .await;
+
+        // A writer who may not post asks nobody
+        state
+            .sessions
+            .get_mut(&wes_id)
+            .unwrap()
+            .listen_only
+            .insert(id);
+        wes.send(&ClientMessage::OpenSessions {
+            channel_id: id,
+            targets: vec![bob_id],
+        })
+        .await;
+        let seen = drained(&mut wes).await;
+        assert!(
+            seen.iter()
+                .any(|m| matches!(m, ServerMessage::ChannelError { .. })),
+            "{seen:?}"
+        );
+        assert!(!drained(&mut bob)
+            .await
+            .iter()
+            .any(|m| matches!(m, ServerMessage::SessionAsked { .. })));
+    }
+
+    #[tokio::test]
+    async fn a_listener_is_keyed_and_reads_as_anyone_does() {
+        let state = admin_state();
+        let id = text_channel(&state, "lobby").await;
+        let (mut wes, _) = follower(&state, "wes", &[id]).await;
+        let (mut bob, bob_id) = follower(&state, "bob", &[id]).await;
+        state
+            .sessions
+            .get_mut(&bob_id)
+            .unwrap()
+            .listen_only
+            .insert(id);
+        assert_eq!(check(&mut wes, id, false).await, [bob_id]);
+        post(&mut wes, id, vec![1]).await;
+        assert_eq!(posts(&drained(&mut bob).await), 1);
+    }
+
+    /// The gate's bit and `listen_only` ride in the answer: no toast off screen.
+    #[tokio::test]
+    async fn listen_only_rides_in_the_answer_with_no_frame_of_its_own() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        group(&state, "leads", None, &[]).await;
+        let id = text_channel(&state, "lobby").await;
+        state
+            .channels
+            .write()
+            .await
+            .get_mut(&id)
+            .unwrap()
+            .gate
+            .speakers = vec!["leads".into()];
+        let (mut bob, bi) = register(&state, "bob").await;
+        bob.send(&ClientMessage::JoinTextChannels {
+            channels: vec![id],
+            quiet: vec![],
+        })
+        .await;
+        let seen = drained(&mut bob).await;
+        assert!(
+            seen.iter()
+                .any(|m| matches!(m, ServerMessage::TextJoined { joined, .. }
+                if joined.len() == 1 && joined[0].1 && !joined[0].2)),
+            "{seen:?}"
+        );
+        assert!(
+            !seen
+                .iter()
+                .any(|m| matches!(m, ServerMessage::ListenOnly { .. })),
+            "{seen:?}"
+        );
+        assert!(state
+            .sessions
+            .get(&sid_of_account(&state, bi.id))
+            .unwrap()
+            .listen_only
+            .contains(&id));
+    }
+
+    #[tokio::test]
+    async fn a_missing_key_is_asked_for_between_members_only() {
+        let state = admin_state();
+        let id = text_channel(&state, "lobby").await;
+        let (mut wes, wes_id) = follower(&state, "wes", &[id]).await;
+        let (mut bob, bob_id) = follower(&state, "bob", &[id]).await;
+        let (mut out, _) = follower(&state, "out", &[]).await;
+        bob.send(&ClientMessage::KeyWanted {
+            channel_id: id,
+            from: wes_id,
+            reset: true,
+        })
+        .await;
+        let got = wes
+            .expect("KeyWanted", |m| {
+                matches!(m, ServerMessage::KeyWanted { .. })
+            })
+            .await;
+        assert!(
+            matches!(&got, ServerMessage::KeyWanted { channel_id, from, reset: true }
+                if *channel_id == id && *from == bob_id),
+            "{got:?}"
+        );
+        out.send(&ClientMessage::KeyWanted {
+            channel_id: id,
+            from: wes_id,
+            reset: false,
+        })
+        .await;
+        settled(&mut out).await;
+        assert!(!drained(&mut wes)
+            .await
+            .iter()
+            .any(|m| matches!(m, ServerMessage::KeyWanted { .. })));
+    }
+
+    /// Quiet is no post and no key, on the connection it is there to spare.
+    #[tokio::test]
+    async fn a_quiet_member_is_sent_no_key_and_no_ask_for_one() {
+        let state = admin_state();
+        let id = text_channel(&state, "lobby").await;
+        let (mut wes, _) = follower(&state, "wes", &[id]).await;
+        let (mut qua, qua_id) = follower(&state, "qua", &[id]).await;
+        let (mut bob, _) = follower(&state, "bob", &[id]).await;
+        let key = ClientMessage::DistributeSenderKeys {
+            channel_id: id,
+            keys: vec![(qua_id, 1, vec![9])],
+        };
+        let ask = ClientMessage::KeyWanted {
+            channel_id: id,
+            from: qua_id,
+            reset: false,
+        };
+        let keyed = |seen: &[ServerMessage]| {
+            seen.iter()
+                .filter(|m| {
+                    matches!(
+                        m,
+                        ServerMessage::TextKeyReceived { .. } | ServerMessage::KeyWanted { .. }
+                    )
+                })
+                .count()
+        };
+        wes.send(&key).await;
+        settled(&mut wes).await;
+        bob.send(&ask).await;
+        settled(&mut bob).await;
+        assert_eq!(keyed(&drained(&mut qua).await), 2, "whole: both come");
+
+        qua.send(&ClientMessage::SetQuiet {
+            channels: vec![id],
+            quiet: true,
+        })
+        .await;
+        drained(&mut qua).await;
+        wes.send(&key).await;
+        settled(&mut wes).await;
+        bob.send(&ask).await;
+        settled(&mut bob).await;
+        assert_eq!(keyed(&drained(&mut qua).await), 0, "quiet: neither");
+
+        qua.send(&ClientMessage::SetQuiet {
+            channels: vec![id],
+            quiet: false,
+        })
+        .await;
+        drained(&mut qua).await;
+        bob.send(&ask).await;
+        settled(&mut bob).await;
+        assert_eq!(keyed(&drained(&mut qua).await), 1, "whole again");
+    }
+
+    /// One frame names some 60,000 ids, and each went through the map's write lock, which
+    /// every room's voice queues behind.
+    #[tokio::test]
+    async fn a_list_naming_one_channel_over_and_over_is_one_row() {
+        let state = admin_state();
+        let (one, two) = (
+            text_channel(&state, "one").await,
+            text_channel(&state, "two").await,
+        );
+        let (mut ann, ann_id) = connect_with_bundle(&state, "ann", test_bundle(1)).await;
+        ann.send(&ClientMessage::JoinTextChannels {
+            channels: vec![one; 30_000],
+            quiet: vec![two; 30_000],
+        })
+        .await;
+        let seen = drained(&mut ann).await;
+        let rows: Vec<ChannelId> = seen
+            .iter()
+            .flat_map(|m| match m {
+                ServerMessage::TextJoined { joined, .. } => {
+                    joined.iter().map(|r| r.0).collect::<Vec<_>>()
+                }
+                _ => Vec::new(),
+            })
+            .collect();
+        assert_eq!(rows, [one, two]);
+        {
+            let channels = state.channels.read().await;
+            assert!(channels[&one].follow.joined.contains_key(&ann_id));
+            assert!(channels[&two].follow.quiet.contains_key(&ann_id));
+        }
+        // Named both ways, the later word holds, as it did
+        ann.send(&ClientMessage::JoinTextChannels {
+            channels: vec![one],
+            quiet: vec![one],
+        })
+        .await;
+        drained(&mut ann).await;
+        assert!(state.channels.read().await[&one]
+            .follow
+            .quiet
+            .contains_key(&ann_id));
+        // Going whole
+        ann.send(&ClientMessage::SetQuiet {
+            channels: vec![one; 60_000],
+            quiet: false,
+        })
+        .await;
+        let seen = drained(&mut ann).await;
+        assert!(
+            seen.iter().any(
+                |m| matches!(m, ServerMessage::TextJoined { joined, .. } if joined.len() == 1)
+            ),
+            "{seen:?}"
+        );
+    }
+
+    /// What is not a text channel they could follow is refused on the read lock alone: a long
+    /// list of made-up ids takes nothing from anyone's voice.
+    #[tokio::test]
+    async fn a_list_of_nothing_real_never_asks_for_the_write_lock() {
+        let state = admin_state();
+        let id = text_channel(&state, "lobby").await;
+        let (mut ann, ann_id) = connect_with_bundle(&state, "ann", test_bundle(1)).await;
+        let tx = state.sessions.get(&ann_id).unwrap().control_tx.clone();
+        let made_up: Vec<ChannelId> = (100_000..120_000).collect();
+        let soon = std::time::Duration::from_secs(5);
+        {
+            // Open to readers, and shut to a writer until it goes
+            let _read = state.channels.read().await;
+            tokio::time::timeout(soon, state.follow_text_channels(ann_id, &made_up, &[], &tx))
+                .await
+                .expect("no write lock for that");
+            tokio::time::timeout(soon, state.set_quiet(ann_id, &made_up, false, &tx))
+                .await
+                .expect("no write lock for that");
+            // Not following it is the same to `set_quiet`
+            tokio::time::timeout(soon, state.set_quiet(ann_id, &[id], false, &tx))
+                .await
+                .expect("no write lock for that");
+        }
+        let seen = drained(&mut ann).await;
+        let refused: usize = seen
+            .iter()
+            .map(|m| match m {
+                ServerMessage::TextJoined { joined, refused } => {
+                    assert!(joined.is_empty());
+                    refused.len()
+                }
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(
+            refused,
+            2 * made_up.len() + 1,
+            "each answered, as a refusal"
+        );
+    }
+
+    /// Each answer builds and sorts the whole list and can be megabytes.
+    #[tokio::test]
+    async fn lists_asked_for_too_fast_get_no_answer() {
+        let state = admin_state();
+        let id = text_channel(&state, "lobby").await;
+        let (mut ann, ann_id) = follower(&state, "ann", &[id]).await;
+        let list = |m: &ServerMessage| {
+            matches!(
+                m,
+                ServerMessage::ChannelUsers { .. } | ServerMessage::ChannelPage { .. }
+            )
+        };
+        ann.send(&ClientMessage::RequestChannelUsers { channel_id: id })
+            .await;
+        ann.send(&ClientMessage::RequestChannelPage {
+            channel_id: id,
+            after: 0,
+        })
+        .await;
+        assert_eq!(
+            drained(&mut ann).await.iter().filter(|m| list(m)).count(),
+            2
+        );
+        {
+            let mut session = state.sessions.get_mut(&ann_id).unwrap();
+            while session.roster_rate.try_consume() {}
+        }
+        ann.send(&ClientMessage::RequestChannelUsers { channel_id: id })
+            .await;
+        ann.send(&ClientMessage::RequestChannelPage {
+            channel_id: id,
+            after: 0,
+        })
+        .await;
+        assert_eq!(
+            drained(&mut ann).await.iter().filter(|m| list(m)).count(),
+            0
+        );
+    }
+
+    // ── Quiet ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_quiet_member_gets_no_post_and_is_owed_no_key() {
+        let state = admin_state();
+        let id = text_channel(&state, "lobby").await;
+        let (mut wes, _) = follower(&state, "wes", &[id]).await;
+        let (mut qua, qua_id) = connect_with_bundle(&state, "qua", test_bundle(1)).await;
+        qua.send(&ClientMessage::JoinTextChannels {
+            channels: vec![],
+            quiet: vec![id],
+        })
+        .await;
+        let seen = drained(&mut qua).await;
+        assert!(
+            seen.iter().any(|m| matches!(m, ServerMessage::TextJoined { joined, .. } if joined.len() == 1 && joined[0].0 == id)),
+            "{seen:?}"
+        );
+        assert!(
+            state.channels.read().await[&id].members.contains(&qua_id),
+            "still a member"
+        );
+        assert!(check(&mut wes, id, true).await.is_empty());
+        post(&mut wes, id, vec![1]).await;
+        assert_eq!(posts(&drained(&mut qua).await), 0);
+
+        // Going whole: answered, and owed at the next check
+        qua.send(&ClientMessage::SetQuiet {
+            channels: vec![id],
+            quiet: false,
+        })
+        .await;
+        let seen = drained(&mut qua).await;
+        assert!(
+            seen.iter().any(
+                |m| matches!(m, ServerMessage::TextJoined { joined, .. } if joined.len() == 1)
+            ),
+            "{seen:?}"
+        );
+        assert_eq!(check(&mut wes, id, false).await, [qua_id]);
+        post(&mut wes, id, vec![2]).await;
+        assert_eq!(posts(&drained(&mut qua).await), 1);
+        // And no longer marks: the news came as the post
+        crate::session::send_marks(&state, 1).await;
+        assert!(!drained(&mut qua)
+            .await
+            .iter()
+            .any(|m| matches!(m, ServerMessage::ChannelMarks { .. })));
+    }
+
+    /// A phone moving to mobile data must not make every writer rotate. A writer who keyed
+    /// them holds on to that across quiet and back, so what they do next still reaches it.
+    #[tokio::test]
+    async fn going_quiet_is_no_exit_and_a_kick_still_reaches_who_keyed_them() {
+        let state = admin_state();
+        let id = text_channel(&state, "lobby").await;
+        let (mut wes, _) = follower(&state, "wes", &[id]).await;
+        let (mut qua, qua_id) = follower(&state, "qua", &[id]).await;
+        assert_eq!(check(&mut wes, id, false).await, [qua_id]);
+
+        let set = |quiet| ClientMessage::SetQuiet {
+            channels: vec![id],
+            quiet,
+        };
+        qua.send(&set(true)).await;
+        settled(&mut qua).await;
+        crate::session::send_exits(&state);
+        assert!(exits(&drained(&mut wes).await).is_empty());
+
+        // Whole again, with a later stamp than the writer's: their first still counts
+        qua.send(&set(false)).await;
+        settled(&mut qua).await;
+        evict(&state, id, qua_id).await;
+        crate::session::send_exits(&state);
+        assert_eq!(exits(&drained(&mut wes).await), [vec![id]]);
+
+        // Quiet from the start: no writer keyed them, and nobody rotates for them
+        let (mut who, who_id) = connect_with_bundle(&state, "who", test_bundle(1)).await;
+        who.send(&ClientMessage::JoinTextChannels {
+            channels: vec![],
+            quiet: vec![id],
+        })
+        .await;
+        settled(&mut who).await;
+        evict(&state, id, who_id).await;
+        crate::session::send_exits(&state);
+        assert!(exits(&drained(&mut wes).await).is_empty());
+    }
+
+    #[tokio::test]
+    async fn quiet_changes_nothing_when_empty_and_a_stranger_sets_nothing() {
+        let state = admin_state();
+        let id = text_channel(&state, "lobby").await;
+        let other = text_channel(&state, "other").await;
+        let (mut ann, ann_id) = follower(&state, "ann", &[id]).await;
+        ann.send(&ClientMessage::SetQuiet {
+            channels: vec![],
+            quiet: true,
+        })
+        .await;
+        settled(&mut ann).await;
+        assert!(state.channels.read().await[&id]
+            .follow
+            .joined
+            .contains_key(&ann_id));
+
+        // Not a channel they follow: nothing, and one answer if it was to go whole
+        for quiet in [true, false] {
+            ann.send(&ClientMessage::SetQuiet {
+                channels: vec![other],
+                quiet,
+            })
+            .await;
+            let seen = drained(&mut ann).await;
+            assert_eq!(
+                seen.iter().any(|m| matches!(m, ServerMessage::TextJoined { refused, .. } if refused == &[other])),
+                !quiet,
+                "{seen:?}"
+            );
+        }
+        let channels = state.channels.read().await;
+        assert!(!channels[&other].follow.holds(ann_id));
+        assert!(!channels[&other].members.contains(&ann_id));
+    }
+
+    #[tokio::test]
+    async fn marks_reach_quiet_members_for_channels_with_news_only() {
+        let state = admin_state();
+        let news = text_channel(&state, "news").await;
+        let silent = text_channel(&state, "silent").await;
+        let (mut wes, _) = follower(&state, "wes", &[news, silent]).await;
+        let (mut qua, _) = connect_with_bundle(&state, "qua", test_bundle(1)).await;
+        qua.send(&ClientMessage::JoinTextChannels {
+            channels: vec![],
+            quiet: vec![news, silent],
+        })
+        .await;
+        settled(&mut qua).await;
+        check(&mut wes, news, false).await;
+        post(&mut wes, news, vec![1]).await;
+
+        let since = crate::session::send_marks(&state, 1).await;
+        let seen = drained(&mut qua).await;
+        assert!(
+            seen.iter()
+                .any(|m| matches!(m, ServerMessage::ChannelMarks { marks }
+                if marks.len() == 1 && marks[0].0 == news && marks[0].1 > 0)),
+            "{seen:?}"
+        );
+        assert!(
+            !drained(&mut wes)
+                .await
+                .iter()
+                .any(|m| matches!(m, ServerMessage::ChannelMarks { .. })),
+            "whoever is whole gets the post"
+        );
+        // Nothing new, nothing said
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        let later = crate::session::send_marks(&state, since + 1).await;
+        assert!(later >= since);
+        assert!(!drained(&mut qua)
+            .await
+            .iter()
+            .any(|m| matches!(m, ServerMessage::ChannelMarks { .. })));
+    }
+
+    // ── Who is gone ──────────────────────────────────────────────────
+
+    /// Dana's device answers sealed asks by its last list: this is what stops it answering
+    /// someone taken out since. The relay cannot check those for it, it does not see them.
+    #[tokio::test]
+    async fn an_eviction_says_evicted_keeps_no_mark_and_tells_the_channel() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        group(&state, "crew", None, &[]).await;
+        let id = text_channel(&state, "mods").await;
+        state
+            .channels
+            .write()
+            .await
+            .get_mut(&id)
+            .unwrap()
+            .gate
+            .groups = vec!["crew".into()];
+        let (mut dana, di) = register(&state, "dana").await;
+        let (mut wes, wi) = register(&state, "wes").await;
+        give(&state, di.id, "crew", true).await;
+        give(&state, wi.id, "crew", true).await;
+        follow(&mut dana, &[id]).await;
+        follow(&mut wes, &[id]).await;
+        let dana_id = sid_of_account(&state, di.id);
+        check(&mut wes, id, false).await;
+        drained(&mut dana).await;
+
+        give(&state, di.id, "crew", false).await;
+        let seen = drained(&mut dana).await;
+        assert!(
+            seen.iter().any(
+                |m| matches!(m, ServerMessage::Evicted { channel_id, .. } if *channel_id == id)
+            ),
+            "{seen:?}"
+        );
+        assert!(
+            seen.iter().any(
+                |m| matches!(m, ServerMessage::ChannelDeleted { channel_id } if *channel_id == id)
+            ),
+            "{seen:?}"
+        );
+        assert!(
+            !seen
+                .iter()
+                .any(|m| matches!(m, ServerMessage::Kicked { .. })),
+            "{seen:?}"
+        );
+        // Named, and its log given up, by the list the app still holds: the new one comes last
+        let put_out = seen
+            .iter()
+            .position(
+                |m| matches!(m, ServerMessage::UserLeft { channel_id, .. } if *channel_id == id),
+            )
+            .unwrap();
+        let list = seen
+            .iter()
+            .position(|m| matches!(m, ServerMessage::ChannelList { .. }))
+            .unwrap();
+        assert!(put_out < list, "{seen:?}");
+        crate::session::send_exits(&state);
+        let seen = drained(&mut wes).await;
+        assert!(
+            seen.iter().any(
+                |m| matches!(m, ServerMessage::MemberGone { channel_id, user_id }
+                if *channel_id == id && *user_id == dana_id)
+            ),
+            "{seen:?}"
+        );
+        assert_eq!(exits(&seen), [vec![id]]);
+        assert!(
+            !seen
+                .iter()
+                .any(|m| matches!(m, ServerMessage::UserLeft { .. })),
+            "{seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_kick_from_a_hand_joined_channel_tells_its_followers_and_an_open_one_does_not() {
+        let state = admin_state();
+        let open = text_channel(&state, "open").await;
+        let by_hand = text_channel(&state, "by hand").await;
+        state
+            .channels
+            .write()
+            .await
+            .get_mut(&by_hand)
+            .unwrap()
+            .info
+            .auto_join = false;
+        let (mut boss, boss_id) = follower(&state, "boss", &[open, by_hand]).await;
+        boss.send(&ClientMessage::AdminLogin {
+            token: "test-admin-token".into(),
+        })
+        .await;
+        settled(&mut boss).await;
+        let (mut tom, tom_id) = follower(&state, "tom", &[open, by_hand]).await;
+        for channel_id in [open, by_hand] {
+            boss.send(&ClientMessage::KickUser {
+                channel_id,
+                user_id: tom_id,
+            })
+            .await;
+            tom.expect(
+                "Kicked",
+                |m| matches!(m, ServerMessage::Kicked { channel_id: c, .. } if *c == channel_id),
+            )
+            .await;
+        }
+        let gone: Vec<_> = drained(&mut boss)
+            .await
+            .iter()
+            .filter_map(|m| match m {
+                ServerMessage::MemberGone {
+                    channel_id,
+                    user_id,
+                } => Some((*channel_id, *user_id)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(gone, [(by_hand, tom_id)]);
+        assert!(state.channels.read().await[&by_hand].follow.holds(boss_id));
+        assert!(!state.channels.read().await[&by_hand].follow.holds(tom_id));
+    }
+
+    /// `gated` is what makes an app draw a page rather than who is online.
+    #[tokio::test]
+    async fn a_gate_that_comes_or_goes_is_told_to_those_who_stay() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        group(&state, "crew", None, &[]).await;
+        let (mut ann, ai, _) = admin_account(&state, "ann").await;
+        let (mut bob, bi) = register(&state, "bob").await;
+        give(&state, bi.id, "crew", true).await;
+        give(&state, ai.id, "crew", true).await;
+        let id = text_channel(&state, "lobby").await;
+        follow(&mut bob, &[id]).await;
+        drained(&mut bob).await;
+        let gate = |groups: Vec<String>| {
+            admin_op(
+                AdminOp::GateSet {
+                    channel_id: id,
+                    gate: ChannelGate {
+                        groups,
+                        speakers: Vec::new(),
+                    },
+                },
+                None,
+            )
+        };
+        for (groups, is_gated) in [(vec!["crew".to_string()], true), (vec![], false)] {
+            ann.send(&gate(groups)).await;
+            ann.expect("Gate", admin_answer).await;
+            let seen = drained(&mut bob).await;
+            assert!(
+                seen.iter()
+                    .any(|m| matches!(m, ServerMessage::TextJoined { joined, .. }
+                    if joined.len() == 1 && joined[0].0 == id && joined[0].2 == is_gated)),
+                "{seen:?}"
+            );
+        }
+    }
+
+    /// An undo takes 300 channels at 2000 people: one `ChannelDeleted`, with no mark and no
+    /// toast, and a channel regained later is simply followed again.
+    #[tokio::test]
+    async fn a_channel_that_goes_sends_its_followers_only_that() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let (mut kim, ki) = register(&state, "kim").await;
+        let (mut bob, _) = register(&state, "bob").await;
+        let sid = sid_of_account(&state, ki.id);
+        grant(&state, sid, &["voipc:channels"]);
+        let id =
+            crate::layout::channel_save(&state, sid, None, "going", "", true, false, None, None)
+                .await
+                .unwrap();
+        follow(&mut bob, &[id]).await;
+        follow(&mut kim, &[id]).await;
+        drained(&mut bob).await;
+        crate::layout::channel_delete(&state, sid, id)
+            .await
+            .unwrap();
+        assert!(!state.channels.read().await.contains_key(&id));
+        let seen = drained(&mut bob).await;
+        assert!(
+            seen.iter().any(
+                |m| matches!(m, ServerMessage::ChannelDeleted { channel_id } if *channel_id == id)
+            ),
+            "{seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|m| matches!(
+                m,
+                ServerMessage::Kicked { .. }
+                    | ServerMessage::Evicted { .. }
+                    | ServerMessage::UserLeft { .. }
+                    | ServerMessage::MemberGone { .. }
+            )),
+            "{seen:?}"
+        );
+    }
+
+    /// A limiter keeps the burst it was made with, so a channel made now must reach it.
+    #[tokio::test]
+    async fn a_channel_made_now_is_paid_for_on_a_session_already_here() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let (_kim, ki) = register(&state, "kim").await;
+        let sid = sid_of_account(&state, ki.id);
+        grant(&state, sid, &["voipc:channels"]);
+        let (burst, had) = {
+            let mut s = state.sessions.get_mut(&sid).unwrap();
+            s.may_relay_key_to(12345);
+            (s.key_relay_burst, s.key_relay_rate.len())
+        };
+        assert_eq!(had, 1);
+        crate::layout::channel_save(&state, sid, None, "new", "", true, false, None, None)
+            .await
+            .unwrap();
+        let s = state.sessions.get(&sid).unwrap();
+        assert_eq!(s.key_relay_burst, burst + 1.0);
+        assert!(s.key_relay_rate.is_empty());
+    }
+
+    // ── Lists ────────────────────────────────────────────────────────
+
+    /// Walks every page a channel gives, returning who it listed and the frames it took.
+    async fn walk(c: &mut Client, channel_id: ChannelId) -> (Vec<UserId>, usize, u32) {
+        let (mut seen, mut after, mut frames) = (Vec::new(), 0, 0);
+        loop {
+            c.send(&ClientMessage::RequestChannelPage { channel_id, after })
+                .await;
+            let page = c
+                .expect("ChannelPage", |m| {
+                    matches!(m, ServerMessage::ChannelPage { channel_id: id, .. } if *id == channel_id)
+                })
+                .await;
+            let ServerMessage::ChannelPage {
+                ids,
+                rows,
+                next,
+                total,
+                ..
+            } = page
+            else {
+                unreachable!()
+            };
+            frames += 1;
+            seen.extend(ids);
+            seen.extend(rows.iter().map(|r| r.user_id));
+            if next == 0 {
+                seen.sort_unstable();
+                return (seen, frames, total);
+            }
+            assert!(next > after, "a page moves on");
+            after = next;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_page_walks_two_thousand_members() {
+        let state = admin_state();
+        let id = text_channel(&state, "lobby").await;
+        let hidden = 1_000_000;
+        put_in_channel(&state, hidden, &[]).await;
+        state
+            .channels
+            .write()
+            .await
+            .get_mut(&hidden)
+            .unwrap()
+            .info
+            .hide_members = true;
+        let (mut ann, ann_id) = follower(&state, "ann", &[id]).await;
+        let mut everyone = vec![ann_id];
+        for i in 0..2000 {
+            let (uid, _) = add_user(&state, &format!("someone-rather-long-{i}"));
+            everyone.push(uid);
+            state.sessions.get_mut(&uid).unwrap().channel_id = hidden;
+        }
+        {
+            let mut channels = state.channels.write().await;
+            let c = channels.get_mut(&id).unwrap();
+            c.members.extend(everyone.iter().copied());
+        }
+        everyone.sort_unstable();
+        let (seen, frames, total) = walk(&mut ann, id).await;
+        assert_eq!(seen, everyone);
+        assert!(frames >= 2, "{frames}");
+        assert_eq!(total, 2001);
+
+        // Bare ids in one page, once a public list names them
+        for uid in &everyone {
+            state.sessions.get_mut(uid).unwrap().channel_id = 0;
+        }
+        let (seen, frames, _) = walk(&mut ann, id).await;
+        assert_eq!((seen, frames), (everyone, 1));
+    }
+
+    /// General's list is `UserList` as far as a frame holds and pages behind: past some 800
+    /// people it used to be no list at all.
+    #[tokio::test]
+    async fn generals_list_comes_whole_at_any_size() {
+        let state = Arc::new(ServerState::new(
+            &ServerConfig {
+                max_users: 4000,
+                ..ServerConfig::default()
+            },
+            ServerSettings::default(),
+            Vec::new(),
+            "test-admin-token".into(),
+        ));
+        let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let mut everyone = Vec::new();
+        for i in 0..2000 {
+            let (uid, _) = add_user(&state, &format!("someone-rather-long-{i}"));
+            everyone.push(uid);
+        }
+        let pairs: Vec<_> = everyone.iter().map(|u| (*u, *u)).collect();
+        put_in_channel(&state, 0, &pairs).await;
+        let mut ann = connect(&state, "ann", lo).await;
+        let first = ann
+            .expect("UserList", |m| {
+                matches!(m, ServerMessage::UserList { channel_id: 0, .. })
+            })
+            .await;
+        let ServerMessage::UserList { users, .. } = first else {
+            unreachable!()
+        };
+        assert!(users.len() < 2001);
+        let mut seen: Vec<UserId> = users.iter().map(|u| u.user_id).collect();
+        let mut pages = drained(&mut ann).await.into_iter();
+        for m in &mut pages {
+            if let ServerMessage::ChannelPage {
+                channel_id: 0,
+                rows,
+                total,
+                ..
+            } = m
+            {
+                assert_eq!(total, 2001);
+                seen.extend(rows.iter().map(|r| r.user_id));
+            }
+        }
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), 2001);
+
+        let (walked, frames, total) = walk(&mut ann, 0).await;
+        assert_eq!((walked.len(), total), (2001, 2001));
+        assert!(frames >= 2);
+    }
+
+    /// Anyone outside gets the same empty page as for a channel that is not there.
+    #[tokio::test]
+    async fn hide_members_refuses_the_page_to_an_outsider() {
+        let state = admin_state();
+        let id = text_channel(&state, "lobby").await;
+        state
+            .channels
+            .write()
+            .await
+            .get_mut(&id)
+            .unwrap()
+            .info
+            .hide_members = true;
+        let (mut ann, ann_id) = follower(&state, "ann", &[id]).await;
+        let (mut out, _) = follower(&state, "out", &[]).await;
+        let (seen, _, total) = walk(&mut ann, id).await;
+        assert_eq!((seen, total), (vec![ann_id], 1), "a member sees it");
+        let (seen, _, total) = walk(&mut out, id).await;
+        assert_eq!((seen, total), (vec![], 0));
+        let (seen, _, total) = walk(&mut out, 999_999).await;
+        assert_eq!((seen, total), (vec![], 0), "the same as nothing there");
+    }
+
+    #[tokio::test]
+    async fn a_gated_page_is_for_who_passes_the_gate() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        group(&state, "crew", None, &[]).await;
+        let id = text_channel(&state, "mods").await;
+        state
+            .channels
+            .write()
+            .await
+            .get_mut(&id)
+            .unwrap()
+            .gate
+            .groups = vec!["crew".into()];
+        let (mut bob, bi) = register(&state, "bob").await;
+        let (mut cat, _) = register(&state, "cat").await;
+        give(&state, bi.id, "crew", true).await;
+        follow(&mut bob, &[id]).await;
+        let (seen, _, _) = walk(&mut bob, id).await;
+        assert_eq!(seen.len(), 1);
+        let (seen, _, total) = walk(&mut cat, id).await;
+        assert_eq!((seen, total), (vec![], 0));
+    }
+
+    #[tokio::test]
+    async fn a_list_too_long_for_one_frame_arrives_whole() {
+        let state = admin_state();
+        let mut ids = Vec::new();
+        for i in 0..1500 {
+            let long = format!("a channel with quite a long name here, number {i}");
+            ids.push(text_channel(&state, &long).await);
+        }
+        let (mut ann, _) = follower(&state, "ann", &[]).await;
+        ann.send(&ClientMessage::RequestChannelList).await;
+        let seen = drained(&mut ann).await;
+        let mut got = Vec::new();
+        let (mut more, mut ended) = (0, false);
+        for m in &seen {
+            match m {
+                ServerMessage::ChannelList { .. } => {
+                    panic!("a `ChannelList` is a whole list, and a reconnect goes by it")
+                }
+                ServerMessage::ChannelListMore { channels, more: m } => {
+                    assert!(!ended, "more said after the end");
+                    more += 1;
+                    ended = !*m;
+                    got.extend(channels.iter().map(|c| c.channel_id));
+                }
+                _ => {}
+            }
+        }
+        assert!(more >= 2 && ended, "{more} {ended}");
+        for id in ids {
+            assert_eq!(got.iter().filter(|g| **g == id).count(), 1);
+        }
+    }
+
+    /// Who keys, opens and pages what says what a person looks at: it goes in no log.
+    #[tokio::test]
+    async fn pages_and_handoffs_reach_no_log() {
+        use std::io::Write;
+        use tracing_subscriber::fmt::MakeWriter;
+        #[derive(Clone, Default)]
+        struct Lines(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl Write for Lines {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for Lines {
+            type Writer = Lines;
+            fn make_writer(&'a self) -> Lines {
+                self.clone()
+            }
+        }
+        let lines = Lines::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(lines.clone())
+            .finish();
+        let _on = tracing::subscriber::set_default(subscriber);
+
+        let state = admin_state();
+        let id = text_channel(&state, "xyzzychannel").await;
+        let (mut ann, _) = follower(&state, "ann", &[id]).await;
+        let (mut bob, bob_id) = follower(&state, "bob", &[id]).await;
+        ann.send(&ClientMessage::RequestChannelPage {
+            channel_id: id,
+            after: 0,
+        })
+        .await;
+        check(&mut ann, id, false).await;
+        ann.send(&ClientMessage::OpenSessions {
+            channel_id: id,
+            targets: vec![bob_id],
+        })
+        .await;
+        bob.send(&ClientMessage::SendEncryptedDirectMessage {
+            target_user_id: *state.username_to_session.get("ann").unwrap(),
+            ciphertext: vec![1; 2048],
+            message_type: 2,
+        })
+        .await;
+        settled(&mut ann).await;
+        settled(&mut bob).await;
+
+        let text = String::from_utf8(lines.0.lock().unwrap().clone()).unwrap();
+        for word in [
+            "xyzzychannel",
+            "RequestChannelPage",
+            "ChannelPage",
+            "OpenSessions",
+            "KeyCheck",
+            "KeysOwed",
+            "SendEncryptedDirectMessage",
+            "EncryptedDirectChatMessage",
+        ] {
+            assert!(!text.contains(word), "{word} is in the log: {text}");
+        }
+        // The control: this is a log that hears things
+        tracing::warn!("xyzzychannel");
+        let text = String::from_utf8(lines.0.lock().unwrap().clone()).unwrap();
+        assert!(text.contains("xyzzychannel"));
+    }
+
+    /// A sealed hand-off is a direct message to the relay, with nothing to tell it apart but
+    /// its size, and the sender's copy of a big one no longer comes back.
+    #[tokio::test]
+    async fn a_handoff_on_a_text_channel_is_only_a_direct_message() {
+        let state = admin_state();
+        let (mut ann, ann_id) = follower(&state, "ann", &[]).await;
+        let (mut bob, bob_id) = follower(&state, "bob", &[]).await;
+        let dm = |target_user_id, size: usize| ClientMessage::SendEncryptedDirectMessage {
+            target_user_id,
+            ciphertext: vec![0; size],
+            message_type: 2,
+        };
+        let copies = |seen: &[ServerMessage]| {
+            seen.iter()
+                .filter(|m| matches!(m, ServerMessage::EncryptedDirectChatMessage { .. }))
+                .count()
+        };
+        ann.send(&dm(bob_id, 48 * 1024)).await;
+        let got = bob
+            .expect("the message", |m| {
+                matches!(m, ServerMessage::EncryptedDirectChatMessage { .. })
+            })
+            .await;
+        assert!(
+            matches!(&got, ServerMessage::EncryptedDirectChatMessage { from_user_id, to_user_id, ciphertext, .. }
+                if *from_user_id == ann_id && *to_user_id == bob_id && ciphertext.len() == 48 * 1024),
+            "{got:?}"
+        );
+        assert_eq!(copies(&drained(&mut ann).await), 0, "no echo of an answer");
+
+        // The control: an ordinary short one is echoed as ever
+        ann.send(&dm(bob_id, 1024)).await;
+        settled(&mut ann).await;
+        let echoed = drained(&mut ann).await;
+        assert_eq!(copies(&echoed), 0, "consumed by settled");
+        ann.send(&dm(bob_id, 1024)).await;
+        ann.expect("its echo", |m| {
+            matches!(m, ServerMessage::EncryptedDirectChatMessage { from_user_id, .. } if *from_user_id == ann_id)
+        })
+        .await;
+    }
+}
+
+/// The app's side of the live path (`voipc_crypto::ChannelKeying`), with real keys, against
+/// the real relay: what an app does with each frame, and what comes of it at the other app.
+mod live_keys {
+    use super::*;
+    use crate::channels::ChannelEntry;
+    use crate::state::Channel;
+    use voipc_crypto::{prekey, ChannelKeying, LiveOut, SignalStores};
+
+    struct App {
+        c: Client,
+        id: UserId,
+        stores: SignalStores,
+        keying: ChannelKeying,
+        shown: Vec<String>,
+        sent: Vec<ClientMessage>,
+        rings: usize,
+    }
+
+    async fn app(state: &Arc<ServerState>, name: &str, channels: &[ChannelId]) -> App {
+        let identity = voipc_crypto::generate_identity_key_pair();
+        let mut stores = SignalStores::new(&identity, rand::random());
+        prekey::generate_prekeys(&mut stores, &identity).unwrap();
+        let bundle = prekey::bundle(&stores).unwrap();
+        let (mut c, id) = connect_with_bundle(state, name, bundle).await;
+        stores.own_user_id = id;
+        c.send(&ClientMessage::JoinTextChannels {
+            channels: channels.to_vec(),
+            quiet: vec![],
+        })
+        .await;
+        let mut keying = ChannelKeying::default();
+        keying.live_start(0);
+        App {
+            c,
+            id,
+            stores,
+            keying,
+            shown: Vec::new(),
+            sent: Vec::new(),
+            rings: 0,
+        }
+    }
+
+    async fn apply(a: &mut App, out: LiveOut) -> bool {
+        let moved = !out.send.is_empty();
+        for (name, value) in &out.emit {
+            match *name {
+                "channel-chat-message" => {
+                    a.shown.push(value["content"].as_str().unwrap().to_string());
+                }
+                "channel-ring" => a.rings += 1,
+                _ => {}
+            }
+        }
+        for m in out.send {
+            a.c.send(&m).await;
+            a.sent.push(m);
+        }
+        moved
+    }
+
+    /// Everyone reads and answers until nobody has anything more. With no clock: a chain's
+    /// limits are the core's tests, and frames here all go at once.
+    async fn settle(apps: &mut [&mut App]) {
+        let mut quiet_rounds = 0;
+        while quiet_rounds < 3 {
+            let mut moved = false;
+            for a in apps.iter_mut() {
+                let stamp: u64 = rand::random();
+                a.c.send(&ClientMessage::Ping { timestamp: stamp }).await;
+                loop {
+                    let m = a.c.next().await.expect("the connection stays");
+                    if matches!(m, ServerMessage::Pong { timestamp } if timestamp == stamp) {
+                        break;
+                    }
+                    if let ServerMessage::UserList { users, .. }
+                    | ServerMessage::ChannelUsers { users, .. } = &m
+                    {
+                        a.keying.live_note_rows(&a.stores, users);
+                    }
+                    if let ServerMessage::UserJoined { user } = &m {
+                        a.keying
+                            .live_note_rows(&a.stores, std::slice::from_ref(user));
+                    }
+                    let out = a.keying.live_frame(&mut a.stores, 0, &m, CLOCK);
+                    moved |= !matches!(m, ServerMessage::UserJoined { .. });
+                    moved |= apply(a, out).await;
+                }
+                while let Some(frame) = a.keying.live_next_frame(
+                    &mut a.stores,
+                    CLOCK,
+                    false,
+                    voipc_crypto::channel_state::WRAPS_A_FRAME,
+                ) {
+                    a.c.send(&frame).await;
+                    a.sent.push(frame);
+                    moved = true;
+                }
+            }
+            quiet_rounds = if moved { 0 } else { quiet_rounds + 1 };
+        }
+    }
+
+    /// Past the two seconds a new connection's session keys wait before renewing.
+    const CLOCK: u64 = 10_000;
+
+    async fn post(a: &mut App, channel: ChannelId, text: &str, now: u64) {
+        let payload = voipc_crypto::envelope("id", text, None);
+        let out = a
+            .keying
+            .live_post(&mut a.stores, channel, payload, now)
+            .unwrap();
+        apply(a, out).await;
+    }
+
+    async fn channel(state: &ServerState, name: &str) -> ChannelId {
+        let id = state.next_channel_id();
+        let entry = ChannelEntry {
+            name: name.into(),
+            text: true,
+            auto_join: true,
+            ..ChannelEntry::default()
+        };
+        let made = Channel::from_entry(&entry, id, false, false);
+        state.channels.write().await.insert(id, made);
+        id
+    }
+
+    #[tokio::test]
+    async fn a_first_post_reaches_readers_who_open_the_session_themselves() {
+        let state = admin_state();
+        let ch = channel(&state, "general-chat").await;
+        let mut w = app(&state, "writer", &[ch]).await;
+        let mut r1 = app(&state, "reader1", &[ch]).await;
+        let mut r2 = app(&state, "reader2", &[ch]).await;
+        settle(&mut [&mut w, &mut r1, &mut r2]).await;
+        // Everyone's list of General: what a bare id in `KeysOwed` goes by
+        w.c.send(&ClientMessage::RequestChannelUsers { channel_id: 0 })
+            .await;
+        settle(&mut [&mut w, &mut r1, &mut r2]).await;
+
+        post(&mut w, ch, "hello all", CLOCK).await;
+        settle(&mut [&mut w, &mut r1, &mut r2]).await;
+        assert_eq!(r1.shown, vec!["hello all"]);
+        assert_eq!(r2.shown, vec!["hello all"]);
+        assert_eq!(r1.rings + r2.rings, 0);
+
+        // The reader opened the session, so the writer's wrap is the short one
+        let wraps: Vec<&(UserId, u8, Vec<u8>)> = w
+            .sent
+            .iter()
+            .filter_map(|m| match m {
+                ClientMessage::DistributeSenderKeys { keys, .. } => Some(keys),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(wraps.len(), 2);
+        assert!(wraps
+            .iter()
+            .all(|(_, kind, ct)| *kind == 2 && ct.len() < 400));
+        let hello = |a: &App| {
+            a.sent
+                .iter()
+                .filter(|m| matches!(m, ClientMessage::SessionHello { .. }))
+                .count()
+        };
+        assert_eq!((hello(&r1), hello(&r2)), (1, 1));
+        // And nobody who only reads wrapped anything
+        for r in [&r1, &r2] {
+            assert!(!r
+                .sent
+                .iter()
+                .any(|m| matches!(m, ClientMessage::DistributeSenderKeys { .. })));
+        }
+
+        // New keys after the job, and the relay hands them out from then on
+        assert!(w
+            .sent
+            .iter()
+            .any(|m| matches!(m, ClientMessage::RenewSessionKeys { .. })));
+        let held = state.sessions.get(&w.id).unwrap();
+        let bundle = held.bundle.as_ref().unwrap();
+        assert_eq!(bundle.signed_prekey_id, w.stores.signed_prekey.current);
+        assert_eq!(bundle.kyber_prekey_id, w.stores.kyber.current);
+    }
+
+    #[tokio::test]
+    async fn a_leaver_reads_nothing_after_the_next_post_and_nobody_else_misses_a_word() {
+        let state = admin_state();
+        let ch = channel(&state, "chat").await;
+        let mut w = app(&state, "writer", &[ch]).await;
+        let mut stays = app(&state, "stays", &[ch]).await;
+        let mut goes = app(&state, "goes", &[ch]).await;
+        settle(&mut [&mut w, &mut stays, &mut goes]).await;
+        w.c.send(&ClientMessage::RequestChannelUsers { channel_id: 0 })
+            .await;
+        settle(&mut [&mut w, &mut stays, &mut goes]).await;
+        post(&mut w, ch, "first", CLOCK).await;
+        settle(&mut [&mut w, &mut stays, &mut goes]).await;
+        assert_eq!(goes.shown, vec!["first"]);
+
+        goes.c
+            .send(&ClientMessage::LeaveChannel { channel_id: ch })
+            .await;
+        settle(&mut [&mut w, &mut stays, &mut goes]).await;
+        // The relay's tick passes on who is out
+        crate::session::send_exits(&state);
+        settle(&mut [&mut w, &mut stays, &mut goes]).await;
+
+        post(&mut w, ch, "second", CLOCK + 2_000).await;
+        settle(&mut [&mut w, &mut stays, &mut goes]).await;
+        assert_eq!(stays.shown, vec!["first", "second"]);
+        assert_eq!(goes.shown, vec!["first"], "the relay no longer forwards it");
+        assert!(w
+            .sent
+            .iter()
+            .any(|m| matches!(m, ClientMessage::KeyCheck { restart: true, .. })));
+        let restarts = w
+            .sent
+            .iter()
+            .filter(|m| matches!(m, ClientMessage::KeyCheck { restart: true, .. }))
+            .count();
+        assert_eq!(restarts, 2, "the exit started a new chain");
+    }
+
+    /// Someone who came after the post gets the next, and nothing further back.
+    #[tokio::test]
+    async fn a_newcomer_is_keyed_at_the_next_post() {
+        let state = admin_state();
+        let ch = channel(&state, "chat").await;
+        let mut w = app(&state, "writer", &[ch]).await;
+        let mut old = app(&state, "old", &[ch]).await;
+        settle(&mut [&mut w, &mut old]).await;
+        w.c.send(&ClientMessage::RequestChannelUsers { channel_id: 0 })
+            .await;
+        settle(&mut [&mut w, &mut old]).await;
+        post(&mut w, ch, "before", CLOCK).await;
+        settle(&mut [&mut w, &mut old]).await;
+
+        let mut new = app(&state, "new", &[ch]).await;
+        settle(&mut [&mut w, &mut old, &mut new]).await;
+        post(&mut w, ch, "after", CLOCK + 2_000).await;
+        settle(&mut [&mut w, &mut old, &mut new]).await;
+        assert_eq!(new.shown, vec!["after"]);
+        assert_eq!(old.shown, vec!["before", "after"]);
+    }
+
+    /// A sealed ask and its answer pass as direct messages, and the relay's only sight of
+    /// them is that: no channel in the frame, and no check of its own.
+    #[tokio::test]
+    async fn a_handoff_on_a_text_channel_is_only_a_direct_message() {
+        let state = admin_state();
+        let ch = channel(&state, "chat").await;
+        let mut w = app(&state, "writer", &[ch]).await;
+        let mut r = app(&state, "reader", &[ch]).await;
+        settle(&mut [&mut w, &mut r]).await;
+        w.c.send(&ClientMessage::RequestChannelUsers { channel_id: 0 })
+            .await;
+        settle(&mut [&mut w, &mut r]).await;
+        post(&mut w, ch, "so they have a session", CLOCK).await;
+        settle(&mut [&mut w, &mut r]).await;
+
+        let asked = r.keying.live_ask_history(ch, &[w.id], CLOCK);
+        assert_eq!(asked, vec![w.id]);
+        let frame = r
+            .keying
+            .live_next_frame(
+                &mut r.stores,
+                CLOCK,
+                false,
+                voipc_crypto::channel_state::WRAPS_A_FRAME,
+            )
+            .expect("an ask");
+        let ClientMessage::SendEncryptedDirectMessage { .. } = &frame else {
+            panic!("{frame:?}");
+        };
+        r.c.send(&frame).await;
+        let got =
+            w.c.expect("the ask", |m| {
+                matches!(m, ServerMessage::EncryptedDirectChatMessage { .. })
+            })
+            .await;
+        let ServerMessage::EncryptedDirectChatMessage {
+            from_user_id,
+            ciphertext,
+            message_type,
+            ..
+        } = got
+        else {
+            unreachable!()
+        };
+        let plain = voipc_session_decrypt(&mut w.stores, from_user_id, &ciphertext, message_type);
+        assert_eq!(
+            voipc_crypto::open_sealed(&plain),
+            Some(voipc_crypto::Sealed::Ask { channel_id: ch })
+        );
+
+        let messages = serde_json::json!([{ "id": "a", "text": "so they have a session" }]);
+        let frame = w
+            .keying
+            .live_seal_answer(&mut w.stores, ch, r.id, &messages, CLOCK)
+            .unwrap();
+        w.c.send(&frame).await;
+        // Past its own echo, which an app skips before anything else
+        let writer = w.id;
+        let got =
+            r.c.expect("the answer", |m| {
+                matches!(m, ServerMessage::EncryptedDirectChatMessage { from_user_id, .. }
+                    if *from_user_id == writer)
+            })
+            .await;
+        let ServerMessage::EncryptedDirectChatMessage {
+            from_user_id,
+            ciphertext,
+            message_type,
+            ..
+        } = got
+        else {
+            unreachable!()
+        };
+        let plain = voipc_session_decrypt(&mut r.stores, from_user_id, &ciphertext, message_type);
+        match voipc_crypto::open_sealed(&plain) {
+            Some(voipc_crypto::Sealed::Answer {
+                channel_id,
+                messages,
+            }) => {
+                assert_eq!(channel_id, ch);
+                assert_eq!(messages.len(), 1);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(r.keying.live_answer_wanted(ch, w.id, CLOCK));
+    }
+
+    fn voipc_session_decrypt(
+        stores: &mut SignalStores,
+        from: UserId,
+        ciphertext: &[u8],
+        message_type: u8,
+    ) -> Vec<u8> {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+        let fut = voipc_crypto::session::decrypt_message(stores, from, ciphertext, message_type);
+        match Box::pin(fut)
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        {
+            Poll::Ready(result) => result.unwrap(),
+            Poll::Pending => panic!("in-memory stores never pend"),
+        }
+    }
+}
+
+/// Kept channel messages on chains and buckets: the relay's half. The rows are opaque here,
+/// of the sizes `voipc_crypto::log` makes: what is tested is what the relay holds a writer
+/// to and what it serves a reader. Opening them is `voipc_crypto::log`'s tests and `sync.rs`'s.
+mod kept_chains {
+    use super::*;
+    use voipc_crypto::log::{OWN_ROW_BYTES, ROW_BYTES};
+    use voipc_protocol::messages::{
+        BucketIn, ChainAsk, ChainKeys, ChainRow, ChainSeal, OwnBucket, WrapIn,
+    };
+
+    const HOUR: i64 = 3600;
+    const DAY_MS: i64 = 86_400_000;
+
+    async fn relay_kept(window: u32, seats: u32) -> (Arc<ServerState>, TempDb, String) {
+        let mut config = ServerConfig::default();
+        config.accounts.mode = AccountsMode::Optional;
+        config.accounts.registration = RegistrationMode::Open;
+        config.accounts.kept_window = window;
+        config.accounts.kept_seats = seats;
+        let db = TempDb(std::env::temp_dir().join(format!(
+            "voipc-relay-{}.db",
+            hex::encode(rand::random::<[u8; 8]>())
+        )));
+        let store = l4f_accounts::store::Store::connect(&format!("sqlite://{}", db.0.display()))
+            .await
+            .unwrap();
+        let relay = crate::accounts::Relay::open_with(&config.accounts, store, &[9u8; 32])
+            .await
+            .unwrap();
+        let lounge = crate::channels::ChannelEntry {
+            name: "lounge".into(),
+            text: true,
+            ..Default::default()
+        };
+        let mut state = ServerState::new(
+            &config,
+            ServerSettings::default(),
+            vec![lounge],
+            "test-admin-token".into(),
+        );
+        state.accounts = Some(Arc::new(relay));
+        let log = state.channels.get_mut()[&1].info.log.clone();
+        (Arc::new(state), db, log)
+    }
+
+    /// The wait for a seat stops someone walking out and back at will. Put out by a gate they
+    /// did neither, whether they were here or away, and a group restored costs nobody a thing.
+    #[tokio::test]
+    async fn a_gate_lost_and_won_back_leaves_no_wait_for_a_seat() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        group(&state, "crew", None, &[]).await;
+        let (mut a, aid) = seated(&state, &log, "alice").await;
+        let (mut b, bid) = seated(&state, &log, "bob").await;
+        give(&state, aid, "crew", true).await;
+        give(&state, bid, "crew", true).await;
+        state
+            .channels
+            .write()
+            .await
+            .get_mut(&1)
+            .unwrap()
+            .gate
+            .groups = vec!["crew".into()];
+        sealed_chain(&mut a, &log, aid, &[bid]).await;
+        let rejoin = AccountRequest::LogJoin { conv: log.clone() };
+
+        // Online: evicted
+        give(&state, bid, "crew", false).await;
+        assert_eq!(count(&state, "SELECT COUNT(*) FROM voipc_members").await, 1);
+        assert_eq!(count(&state, "SELECT COUNT(*) FROM voipc_left").await, 0);
+        give(&state, bid, "crew", true).await;
+        lounge(&state, &mut b, &bid).await;
+        let out = ask(&mut b, rejoin.clone()).await;
+        assert!(matches!(out, AccountReply::LogJoined { .. }), "{out:?}");
+
+        // Away: the pass
+        let relay = state.accounts.clone().unwrap();
+        let ctx = relay.ctx(IpAddr::V4(Ipv4Addr::LOCALHOST), "test");
+        relay
+            .accounts
+            .revoke_role_as_host(&ctx, AccountId(bid), "crew")
+            .await
+            .unwrap();
+        crate::gates::prune_logs(&state).await;
+        assert_eq!(count(&state, "SELECT COUNT(*) FROM voipc_members").await, 1);
+        assert_eq!(count(&state, "SELECT COUNT(*) FROM voipc_left").await, 0);
+        give(&state, bid, "crew", true).await;
+        lounge(&state, &mut b, &bid).await;
+        let out = ask(&mut b, rejoin).await;
+        assert!(matches!(out, AccountReply::LogJoined { .. }), "{out:?}");
+        assert_eq!(count(&state, "SELECT COUNT(*) FROM voipc_reseats").await, 0);
+    }
+
+    /// Signed up and holding a seat in the lounge's log.
+    async fn seated(state: &Arc<ServerState>, log: &str, name: &str) -> (Client, [u8; 16]) {
+        let (mut c, info) = register(state, name).await;
+        lounge(state, &mut c, &info.id).await;
+        let out = ask(
+            &mut c,
+            AccountRequest::LogJoin {
+                conv: log.to_string(),
+            },
+        )
+        .await;
+        assert!(matches!(out, AccountReply::LogJoined { .. }), "{out:?}");
+        (c, info.id)
+    }
+
+    /// In the lounge, once a sign-in has done with where it puts a session: the handler
+    /// reaches an answer only after that.
+    async fn lounge(state: &Arc<ServerState>, c: &mut Client, id: &[u8; 16]) {
+        ask(c, AccountRequest::LogKeys { accounts: vec![] }).await;
+        into_lounge(state, id).await;
+    }
+
+    /// The next answer, past pushes that come whenever.
+    async fn ask(c: &mut Client, r: AccountRequest) -> AccountReply {
+        c.send(&ClientMessage::Account(r)).await;
+        let m = c
+            .expect("an answer", |m| {
+                matches!(m, ServerMessage::Account(r) if !matches!(
+                    r,
+                    AccountReply::LogNews { .. } | AccountReply::LogPending { .. } | AccountReply::Info(_)
+                ))
+            })
+            .await;
+        let ServerMessage::Account(r) = m else {
+            unreachable!()
+        };
+        r
+    }
+
+    fn row() -> Vec<u8> {
+        vec![0xAB; ROW_BYTES]
+    }
+
+    /// A frame at `(chain, index)`, for a test to fill in.
+    #[derive(Default)]
+    struct Frame {
+        chain: u32,
+        index: u32,
+        self_wrap: Option<Vec<u8>>,
+        step: Option<Vec<u8>>,
+        link: Option<(u32, Vec<u8>)>,
+        wraps: Vec<ChainRow>,
+        buckets: Vec<BucketIn>,
+        seals: Vec<ChainSeal>,
+        last: bool,
+    }
+
+    impl Frame {
+        fn on(chain: u32, index: u32) -> Frame {
+            Frame {
+                chain,
+                index,
+                ..Default::default()
+            }
+        }
+
+        /// The first frame of a chain, which is also the last.
+        fn start(chain: u32) -> Frame {
+            Frame {
+                chain,
+                self_wrap: Some(row()),
+                last: true,
+                ..Default::default()
+            }
+        }
+
+        fn request(self, conv: &str) -> AccountRequest {
+            AccountRequest::ChainPut {
+                conv: conv.to_string(),
+                epoch: self.chain << 12 | self.index,
+                self_wrap: self.self_wrap,
+                step: self.step,
+                link: self.link,
+                wraps: self.wraps,
+                buckets: self.buckets,
+                seals: self.seals,
+                last: self.last,
+            }
+        }
+    }
+
+    fn direct(recipient: [u8; 16], index: u32) -> ChainRow {
+        ChainRow {
+            recipient,
+            index,
+            wrapped: row(),
+        }
+    }
+
+    /// A version of a bucket with `seats`, and the writer's own row.
+    fn bucket(id: u64, version: u32, me: [u8; 16], seats: &[[u8; 16]]) -> BucketIn {
+        let mut rows = vec![WrapIn {
+            recipient: me,
+            wrapped: vec![0xEE; OWN_ROW_BYTES],
+        }];
+        rows.extend(seats.iter().map(|r| WrapIn {
+            recipient: *r,
+            wrapped: row(),
+        }));
+        BucketIn {
+            bucket: id,
+            version,
+            list: vec![0x11; 28 + 24 * seats.len()],
+            seats: rows,
+            down: None,
+        }
+    }
+
+    fn rotated(id: u64, version: u32, me: [u8; 16], seats: &[[u8; 16]], old: u32) -> BucketIn {
+        BucketIn {
+            down: Some((old, row())),
+            ..bucket(id, version, me, seats)
+        }
+    }
+
+    fn seal(id: u64, version: u32, index: u32) -> ChainSeal {
+        ChainSeal {
+            bucket: id,
+            version,
+            index,
+            sealed: row(),
+        }
+    }
+
+    async fn put(c: &mut Client, conv: &str, f: Frame) -> AccountReply {
+        ask(c, f.request(conv)).await
+    }
+
+    fn stored(r: &AccountReply) -> bool {
+        matches!(r, AccountReply::ChainStored { behind: false, .. })
+    }
+
+    fn behind(r: &AccountReply) -> bool {
+        matches!(r, AccountReply::ChainStored { behind: true, .. })
+    }
+
+    fn refused_put(r: &AccountReply, why: &str) -> bool {
+        matches!(r, AccountReply::Error { request, reason } if request == "ChainPut" && reason.contains(why))
+    }
+
+    async fn post(c: &mut Client, conv: &str, chain: u32, index: u32) -> AccountReply {
+        ask(
+            c,
+            AccountRequest::LogAppend {
+                conv: conv.to_string(),
+                epoch: chain << 12 | index,
+                ct: vec![0x55; 64],
+                ttl_secs: None,
+            },
+        )
+        .await
+    }
+
+    fn filed(r: &AccountReply) -> bool {
+        matches!(r, AccountReply::LogAppended { .. })
+    }
+
+    async fn count(state: &Arc<ServerState>, sql: &str) -> i64 {
+        crate::accounts::raw(state.accounts.as_ref().unwrap(), sql)
+            .await
+            .unwrap()
+    }
+
+    /// A statement that returns nothing, for a test that ages rows.
+    async fn run(state: &Arc<ServerState>, sql: &str) {
+        crate::accounts::raw(state.accounts.as_ref().unwrap(), sql)
+            .await
+            .unwrap();
+    }
+
+    async fn sweep(state: &Arc<ServerState>) {
+        crate::accounts::log::sweep(state.accounts.as_ref().unwrap())
+            .await
+            .unwrap();
+    }
+
+    /// Chain 1 sealed to one bucket holding `seats`: `alice` is ready to post at (1, 0).
+    async fn sealed_chain(c: &mut Client, log: &str, me: [u8; 16], seats: &[[u8; 16]]) {
+        let f = Frame {
+            buckets: vec![bucket(7, 0, me, seats)],
+            seals: vec![seal(7, 0, 0)],
+            ..Frame::start(1)
+        };
+        assert!(stored(&put(c, log, f).await));
+    }
+
+    #[tokio::test]
+    async fn a_low_order_log_key_is_refused_at_publish() {
+        use voipc_crypto::log::LogKey;
+        let (state, _db, _log) = relay_kept(10, 256).await;
+        let (mut c, _, signed) = register_with(&state, "alice").await;
+        let publish = |logkey: Vec<u8>, sig: Vec<u8>| AccountRequest::LogKeyPublish { logkey, sig };
+        let refused = |r: &AccountReply| matches!(r, AccountReply::Error { request, .. } if request == "LogKeyPublish");
+
+        // Low order, each encoding, signed by the very identity
+        let mut signing = voipc_crypto::rng();
+        for u in [[0u8; 32], {
+            let mut one = [0u8; 32];
+            one[0] = 1;
+            one
+        }] {
+            let mut logkey = vec![0x05];
+            logkey.extend_from_slice(&u);
+            let mut msg = b"voipc-logkey/v1|".to_vec();
+            msg.extend_from_slice(&logkey);
+            let sig = signed
+                .identity
+                .private_key()
+                .calculate_signature(&msg, &mut signing)
+                .unwrap()
+                .to_vec();
+            assert!(refused(&ask(&mut c, publish(logkey, sig)).await));
+        }
+        // Junk, and a good key with the signature of another identity
+        assert!(refused(
+            &ask(&mut c, publish(vec![1; 33], vec![2; 64])).await
+        ));
+        let key = LogKey::generate();
+        let other = voipc_crypto::generate_identity_key_pair();
+        assert!(refused(
+            &ask(&mut c, publish(key.public(), key.endorse(&other))).await
+        ));
+        // The control: its own identity's
+        let good = ask(&mut c, publish(key.public(), key.endorse(&signed.identity))).await;
+        assert!(matches!(good, AccountReply::LogKeyStored), "{good:?}");
+    }
+
+    /// `publish` with a new key walks; a modified member cannot publish, leave and keep what
+    /// they held with nothing to say so.
+    #[tokio::test]
+    async fn a_new_log_key_and_a_leave_still_end_the_chain() {
+        use voipc_crypto::log::LogKey;
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, aid) = seated(&state, &log, "alice").await;
+        let (mut m, info, signed) = register_with(&state, "mallory").await;
+        lounge(&state, &mut m, &info.id).await;
+        ask(&mut m, AccountRequest::LogJoin { conv: log.clone() }).await;
+        let publish = |k: &LogKey| AccountRequest::LogKeyPublish {
+            logkey: k.public(),
+            sig: k.endorse(&signed.identity),
+        };
+        let first = LogKey::generate();
+        assert!(matches!(
+            ask(&mut m, publish(&first)).await,
+            AccountReply::LogKeyStored
+        ));
+        sealed_chain(&mut a, &log, aid, &[info.id]).await;
+
+        // A second change within the minute: each change walks every writer
+        let second = LogKey::generate();
+        assert!(matches!(
+            ask(&mut m, publish(&second)).await,
+            AccountReply::Error { .. }
+        ));
+        run(&state, "UPDATE voipc_logkeys SET updated_at = 0").await;
+        assert!(matches!(
+            ask(&mut m, publish(&second)).await,
+            AccountReply::LogKeyStored
+        ));
+        assert_eq!(
+            count(&state, "SELECT COUNT(*) FROM voipc_seats WHERE dead = TRUE").await,
+            1,
+            "marked, not deleted"
+        );
+        assert_eq!(
+            count(
+                &state,
+                "SELECT COUNT(*) FROM voipc_seats WHERE dead = TRUE AND LENGTH(wrapped) = 0"
+            )
+            .await,
+            1,
+            "and emptied: it opens for nobody they are now"
+        );
+
+        ask(&mut m, AccountRequest::LogLeave { conv: log.clone() }).await;
+        let r = post(&mut a, &log, 1, 0).await;
+        assert!(
+            matches!(&r, AccountReply::ChainRekey { new_chain: true, gone, .. } if gone == &[(info.id, 7)]),
+            "{r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_log_key_brings_a_wrap_at_the_next_post() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, aid) = seated(&state, &log, "alice").await;
+        let (_b, bid) = seated(&state, &log, "bob").await;
+        sealed_chain(&mut a, &log, aid, &[bid]).await;
+        assert!(filed(&post(&mut a, &log, 1, 0).await));
+        crate::accounts::log::walk(state.accounts.as_ref().unwrap().store(), &bid)
+            .await
+            .unwrap();
+        let r = post(&mut a, &log, 1, 0).await;
+        assert!(
+            matches!(&r, AccountReply::ChainRekey { new_chain: false, missing, gone, .. } if missing == &[bid] && gone.is_empty()),
+            "{r:?}"
+        );
+        let f = Frame {
+            step: Some(row()),
+            wraps: vec![direct(bid, 1)],
+            ..Frame::on(1, 1)
+        };
+        assert!(stored(&put(&mut a, &log, f).await));
+        assert!(filed(&post(&mut a, &log, 1, 1).await));
+        // And the next new chain must rotate them out, for whoever holds the old key
+        let f = Frame {
+            seals: vec![seal(7, 0, 0)],
+            ..Frame::start(2)
+        };
+        let r = put(&mut a, &log, f).await;
+        assert!(
+            matches!(&r, AccountReply::ChainRekey { new_chain: true, gone, .. } if gone == &[(bid, 7)]),
+            "a chain sealed to a bucket someone's old key opens: {r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rekey_says_new_chain_on_a_leavers_row() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, aid) = seated(&state, &log, "alice").await;
+        let (mut b, bid) = seated(&state, &log, "bob").await;
+        let (_c, cid) = seated(&state, &log, "cat").await;
+        sealed_chain(&mut a, &log, aid, &[bid, cid]).await;
+        assert!(filed(&post(&mut a, &log, 1, 0).await));
+        ask(&mut b, AccountRequest::LogLeave { conv: log.clone() }).await;
+        let (_d, did) = seated(&state, &log, "dan").await;
+        let r = post(&mut a, &log, 1, 0).await;
+        let AccountReply::ChainRekey {
+            new_chain: true,
+            missing,
+            gone,
+            ..
+        } = r
+        else {
+            panic!("{r:?}")
+        };
+        assert_eq!(gone, vec![(bid, 7)], "only that list needs reading");
+        assert_eq!(missing, vec![did], "and who needs a seat");
+    }
+
+    /// A channel's keys go through `ChainPut` alone, and a post under an epoch is told to
+    /// re-read. One with no chain yet is told to start one.
+    #[tokio::test]
+    async fn a_writer_is_on_chains_from_the_first_post() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, aid) = seated(&state, &log, "alice").await;
+        let r = post(&mut a, &log, 0, 999).await;
+        assert!(
+            matches!(
+                &r,
+                AccountReply::ChainRekey {
+                    new_chain: true,
+                    ..
+                }
+            ),
+            "{r:?}"
+        );
+        let wraps = vec![WrapIn {
+            recipient: aid,
+            wrapped: vec![0xAB; 92],
+        }];
+        let r = ask(
+            &mut a,
+            AccountRequest::EpochPut {
+                conv: log.clone(),
+                epoch: 999,
+                wraps,
+            },
+        )
+        .await;
+        assert!(matches!(r, AccountReply::Error { .. }), "{r:?}");
+        assert!(stored(&put(&mut a, &log, Frame::start(1)).await));
+        let r = post(&mut a, &log, 0, 999).await;
+        assert!(
+            matches!(&r, AccountReply::ChainRekey { new_chain: false, missing, gone, .. } if missing.is_empty() && gone.is_empty()),
+            "{r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_direct_rows_leaver_ends_the_chain_too() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, _) = seated(&state, &log, "alice").await;
+        let (mut b, bid) = seated(&state, &log, "bob").await;
+        let f = Frame {
+            wraps: vec![direct(bid, 0)],
+            ..Frame::start(1)
+        };
+        assert!(stored(&put(&mut a, &log, f).await));
+        assert!(filed(&post(&mut a, &log, 1, 0).await));
+        ask(&mut b, AccountRequest::LogLeave { conv: log.clone() }).await;
+        let r = post(&mut a, &log, 1, 0).await;
+        assert!(
+            matches!(&r, AccountReply::ChainRekey { new_chain: true, gone, .. } if gone == &[(bid, 0)]),
+            "named, at no bucket, so its writer forgets it named them: {r:?}"
+        );
+    }
+
+    /// A step made an arrival's row. At the next new chain they need a seat, and so does
+    /// someone whose only seat is under an old key: both are said, by id.
+    #[tokio::test]
+    async fn a_new_chain_names_whoever_has_no_seat_yet() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, aid) = seated(&state, &log, "alice").await;
+        let (mut b, bid) = seated(&state, &log, "bob").await;
+        let (_c, cid) = seated(&state, &log, "cat").await;
+        let (_d, did) = seated(&state, &log, "dan").await;
+        let f = Frame {
+            buckets: vec![bucket(7, 0, aid, &[bid, cid])],
+            seals: vec![seal(7, 0, 0)],
+            wraps: vec![direct(did, 0)],
+            ..Frame::start(1)
+        };
+        assert!(stored(&put(&mut a, &log, f).await));
+        assert!(filed(&post(&mut a, &log, 1, 0).await));
+        crate::accounts::log::walk(state.accounts.as_ref().unwrap().store(), &cid)
+            .await
+            .unwrap();
+        ask(&mut b, AccountRequest::LogLeave { conv: log.clone() }).await;
+        let r = post(&mut a, &log, 1, 0).await;
+        let AccountReply::ChainRekey {
+            new_chain: true,
+            mut missing,
+            mut gone,
+            ..
+        } = r
+        else {
+            panic!("{r:?}")
+        };
+        missing.sort_unstable();
+        let mut want = vec![cid, did];
+        want.sort_unstable();
+        assert_eq!(missing, want);
+        gone.sort_unstable();
+        let mut want = vec![(bid, 7), (cid, 7)];
+        want.sort_unstable();
+        assert_eq!(gone, want);
+    }
+
+    /// A dead row is out of everything a reader is served.
+    #[tokio::test]
+    async fn a_dead_row_opens_nothing_and_is_served_to_nobody() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, aid) = seated(&state, &log, "alice").await;
+        let (mut b, bid) = seated(&state, &log, "bob").await;
+        let (mut c, cid) = seated(&state, &log, "cat").await;
+        let f = Frame {
+            buckets: vec![bucket(7, 0, aid, &[bid])],
+            seals: vec![seal(7, 0, 0)],
+            wraps: vec![direct(cid, 0)],
+            ..Frame::start(1)
+        };
+        assert!(stored(&put(&mut a, &log, f).await));
+        assert!(filed(&post(&mut a, &log, 1, 0).await));
+        for who in [bid, cid] {
+            crate::accounts::log::walk(state.accounts.as_ref().unwrap().store(), &who)
+                .await
+                .unwrap();
+        }
+        for reader in [&mut b, &mut c] {
+            let r = ask(
+                reader,
+                AccountRequest::ChainFetch {
+                    conv: log.clone(),
+                    after: 0,
+                },
+            )
+            .await;
+            assert!(
+                matches!(&r, AccountReply::ChainPage { entries, skipped: 1, .. } if entries.is_empty()),
+                "{r:?}"
+            );
+            let k = &keys_of(reader, &log, aid, 1, None).await[0];
+            assert!(k.direct.is_none() && k.seal.is_none() && k.seat.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rejoiner_with_no_post_between_needs_no_rekey() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, aid) = seated(&state, &log, "alice").await;
+        let (mut b, bid) = seated(&state, &log, "bob").await;
+        sealed_chain(&mut a, &log, aid, &[bid]).await;
+        ask(&mut b, AccountRequest::LogLeave { conv: log.clone() }).await;
+        run(&state, "UPDATE voipc_left SET left_at = 0").await;
+        assert!(matches!(
+            ask(&mut b, AccountRequest::LogJoin { conv: log.clone() }).await,
+            AccountReply::LogJoined { .. }
+        ));
+        assert!(filed(&post(&mut a, &log, 1, 0).await));
+    }
+
+    #[tokio::test]
+    async fn a_second_step_at_one_index_is_behind() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, _) = seated(&state, &log, "alice").await;
+        let (_b, bid) = seated(&state, &log, "bob").await;
+        let (_c, cid) = seated(&state, &log, "cat").await;
+        assert!(stored(&put(&mut a, &log, Frame::start(1)).await));
+        let step = |who: [u8; 16], index: u32| Frame {
+            step: Some(row()),
+            wraps: vec![direct(who, index)],
+            ..Frame::on(1, index)
+        };
+        assert!(stored(&put(&mut a, &log, step(bid, 1)).await));
+        assert!(
+            behind(&put(&mut a, &log, step(cid, 1)).await),
+            "insert only"
+        );
+        assert!(
+            behind(&put(&mut a, &log, step(cid, 3)).await),
+            "only top + 1"
+        );
+        assert_eq!(
+            count(&state, "SELECT COUNT(*) FROM voipc_chain_steps").await,
+            1
+        );
+        // And a post anywhere but the top is told to re-read
+        let r = post(&mut a, &log, 1, 0).await;
+        assert!(
+            matches!(&r, AccountReply::ChainRekey { new_chain: false, missing, gone, .. } if missing.is_empty() && gone.is_empty()),
+            "{r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chain_has_at_most_128_steps() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, _) = seated(&state, &log, "alice").await;
+        let (_b, bid) = seated(&state, &log, "bob").await;
+        assert!(stored(&put(&mut a, &log, Frame::start(1)).await));
+        run(&state, "UPDATE voipc_chains SET top = 128").await;
+        let f = Frame {
+            step: Some(row()),
+            wraps: vec![direct(bid, 129)],
+            ..Frame::on(1, 129)
+        };
+        let r = put(&mut a, &log, f).await;
+        assert!(
+            refused_put(&r, "malformed") || behind(&r),
+            "a writer starts a new chain here: {r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lower_index_wrap_replaces_and_a_higher_one_does_not() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, _) = seated(&state, &log, "alice").await;
+        let (_b, bid) = seated(&state, &log, "bob").await;
+        assert!(stored(&put(&mut a, &log, Frame::start(1)).await));
+        let idx = || "SELECT idx FROM voipc_chain_wraps";
+        let f = Frame {
+            step: Some(row()),
+            wraps: vec![direct(bid, 1)],
+            ..Frame::on(1, 1)
+        };
+        assert!(stored(&put(&mut a, &log, f).await));
+        assert_eq!(count(&state, idx()).await, 1);
+        // No right to share, but they hold 1 already: 1 again changes nothing
+        let f = Frame {
+            wraps: vec![direct(bid, 1)],
+            ..Frame::on(1, 1)
+        };
+        assert!(stored(&put(&mut a, &log, f).await));
+        // With the right, a lower one replaces it
+        run(&state, "UPDATE voipc_chain_wraps SET idx = 1").await;
+        let sid = *state
+            .account_sessions
+            .get(&a_id(&state, "alice").await)
+            .unwrap();
+        grant_share(&state, sid).await;
+        let f = Frame {
+            wraps: vec![direct(bid, 0)],
+            ..Frame::on(1, 1)
+        };
+        assert!(stored(&put(&mut a, &log, f).await));
+        assert_eq!(count(&state, idx()).await, 0, "the lowest they ever held");
+        // A step later, a higher row does not undo it
+        let (_c, cid) = seated(&state, &log, "cat").await;
+        let f = Frame {
+            step: Some(row()),
+            wraps: vec![direct(bid, 2), direct(cid, 2)],
+            ..Frame::on(1, 2)
+        };
+        assert!(stored(&put(&mut a, &log, f).await));
+        assert_eq!(
+            count(
+                &state,
+                &format!(
+                    "SELECT idx FROM voipc_chain_wraps WHERE recipient = x'{}'",
+                    hex::encode(bid)
+                )
+            )
+            .await,
+            0
+        );
+    }
+
+    async fn a_id(state: &Arc<ServerState>, name: &str) -> [u8; 16] {
+        let relay = state.accounts.as_ref().unwrap();
+        relay
+            .store()
+            .user_by_username(name)
+            .await
+            .unwrap()
+            .unwrap()
+            .id
+            .0
+    }
+
+    /// As if an admin gave this session's account the privilege, in the session.
+    async fn grant_share(state: &Arc<ServerState>, sid: u32) {
+        let mut s = state.sessions.get_mut(&sid).unwrap();
+        let a = s.account.as_mut().unwrap();
+        a.scopes
+            .push(voipc_protocol::types::SHARE_HISTORY.to_string());
+    }
+
+    #[tokio::test]
+    async fn a_step_with_no_new_reader_is_refused() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, aid) = seated(&state, &log, "alice").await;
+        let (_b, bid) = seated(&state, &log, "bob").await;
+        let (_c, cid) = seated(&state, &log, "cat").await;
+        sealed_chain(&mut a, &log, aid, &[bid]).await;
+        // Nobody at all, then someone who already holds it by a seat
+        let f = Frame {
+            step: Some(row()),
+            ..Frame::on(1, 1)
+        };
+        assert!(refused_put(&put(&mut a, &log, f).await, "someone new"));
+        let f = Frame {
+            step: Some(row()),
+            wraps: vec![direct(bid, 1)],
+            ..Frame::on(1, 1)
+        };
+        assert!(refused_put(&put(&mut a, &log, f).await, "someone new"));
+        // The control
+        let f = Frame {
+            step: Some(row()),
+            wraps: vec![direct(cid, 1)],
+            ..Frame::on(1, 1)
+        };
+        assert!(stored(&put(&mut a, &log, f).await));
+    }
+
+    #[tokio::test]
+    async fn a_chain_is_not_newest_until_its_last_frame() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, aid) = seated(&state, &log, "alice").await;
+        let (_b, bid) = seated(&state, &log, "bob").await;
+        let (_c, cid) = seated(&state, &log, "cat").await;
+        sealed_chain(&mut a, &log, aid, &[bid, cid]).await;
+        assert!(filed(&post(&mut a, &log, 1, 0).await));
+        // The first frame of a chain of several: posts stay on the old one
+        let f = Frame {
+            seals: vec![seal(7, 0, 0)],
+            last: false,
+            ..Frame::start(2)
+        };
+        assert!(stored(&put(&mut a, &log, f).await));
+        assert!(filed(&post(&mut a, &log, 1, 0).await));
+        let r = post(&mut a, &log, 2, 0).await;
+        assert!(
+            matches!(&r, AccountReply::ChainRekey { new_chain: false, missing, .. } if missing.is_empty()),
+            "{r:?}"
+        );
+        // Its last frame
+        let f = Frame {
+            last: true,
+            ..Frame::on(2, 0)
+        };
+        assert!(stored(&put(&mut a, &log, f).await));
+        assert!(filed(&post(&mut a, &log, 2, 0).await));
+        let r = post(&mut a, &log, 1, 0).await;
+        assert!(
+            matches!(
+                &r,
+                AccountReply::ChainRekey {
+                    new_chain: false,
+                    ..
+                }
+            ),
+            "the old chain takes no more: {r:?}"
+        );
+        // A chain number only goes up, also past one the sweep took
+        assert!(behind(&put(&mut a, &log, Frame::start(2)).await));
+        assert!(behind(&put(&mut a, &log, Frame::start(1)).await));
+        run(&state, "DELETE FROM voipc_chains WHERE chain = 1").await;
+        assert!(behind(&put(&mut a, &log, Frame::start(1)).await));
+        let f = Frame {
+            last: false,
+            ..Frame::start(1)
+        };
+        assert!(behind(&put(&mut a, &log, f).await));
+        // And once finished, it takes neither bucket nor seal
+        let f = Frame {
+            seals: vec![seal(7, 0, 0)],
+            ..Frame::on(2, 0)
+        };
+        assert!(behind(&put(&mut a, &log, f).await));
+    }
+
+    #[tokio::test]
+    async fn a_crash_between_rotation_and_chain_still_ends_the_chain() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, aid) = seated(&state, &log, "alice").await;
+        let (mut b, bid) = seated(&state, &log, "bob").await;
+        let (_c, cid) = seated(&state, &log, "cat").await;
+        sealed_chain(&mut a, &log, aid, &[bid, cid]).await;
+        ask(&mut b, AccountRequest::LogLeave { conv: log.clone() }).await;
+        // The rotation frame lands, and the app dies before the chain's last frame
+        let f = Frame {
+            buckets: vec![rotated(7, 1, aid, &[cid], 0)],
+            last: false,
+            ..Frame::start(2)
+        };
+        assert!(stored(&put(&mut a, &log, f).await));
+        // Seats are at 1, the newest chain still sealed at 0, and bob's row at 0 counts
+        let r = post(&mut a, &log, 1, 0).await;
+        assert!(
+            matches!(&r, AccountReply::ChainRekey { new_chain: true, gone, .. } if gone.contains(&(bid, 7))),
+            "{r:?}"
+        );
+        // cat, in version 1 too, is not "missing": a row at or above the seal's version counts,
+        // whichever of her rows is still there
+        let AccountReply::ChainRekey { missing, .. } = r else {
+            unreachable!()
+        };
+        assert!(missing.is_empty(), "{missing:?}");
+        run(
+            &state,
+            &format!(
+                "DELETE FROM voipc_seats WHERE version = 0 AND recipient = x'{}'",
+                hex::encode(cid)
+            ),
+        )
+        .await;
+        let r = post(&mut a, &log, 1, 0).await;
+        assert!(
+            matches!(&r, AccountReply::ChainRekey { new_chain: true, missing, .. } if missing.is_empty()),
+            "{r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_seal_to_an_old_version_is_behind() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, aid) = seated(&state, &log, "alice").await;
+        let (_b, bid) = seated(&state, &log, "bob").await;
+        let (_c, cid) = seated(&state, &log, "cat").await;
+        sealed_chain(&mut a, &log, aid, &[bid, cid]).await;
+        let f = Frame {
+            buckets: vec![rotated(7, 1, aid, &[cid], 0)],
+            last: false,
+            ..Frame::start(2)
+        };
+        assert!(stored(&put(&mut a, &log, f).await));
+        let f = Frame {
+            seals: vec![seal(7, 0, 0)],
+            ..Frame::on(2, 0)
+        };
+        assert!(behind(&put(&mut a, &log, f).await));
+        // Nor a bucket that is not there, nor above where the chain stands
+        let f = Frame {
+            seals: vec![seal(9, 0, 0)],
+            ..Frame::on(2, 0)
+        };
+        assert!(behind(&put(&mut a, &log, f).await));
+        let f = Frame {
+            seals: vec![seal(7, 1, 1)],
+            ..Frame::on(2, 0)
+        };
+        assert!(behind(&put(&mut a, &log, f).await));
+        let f = Frame {
+            seals: vec![seal(7, 1, 0)],
+            last: true,
+            ..Frame::on(2, 0)
+        };
+        assert!(stored(&put(&mut a, &log, f).await));
+    }
+
+    #[tokio::test]
+    async fn a_new_version_must_be_a_strict_subset_of_the_last() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, aid) = seated(&state, &log, "alice").await;
+        let (_b, bid) = seated(&state, &log, "bob").await;
+        let (_c, cid) = seated(&state, &log, "cat").await;
+        let (_d, did) = seated(&state, &log, "dan").await;
+        sealed_chain(&mut a, &log, aid, &[bid, cid]).await;
+        let mut try_version = async |f: BucketIn, chain: u32| {
+            let frame = Frame {
+                buckets: vec![f],
+                last: false,
+                ..Frame::start(chain)
+            };
+            put(&mut a, &log, frame).await
+        };
+        // The same people: version spam
+        let r = try_version(rotated(7, 1, aid, &[bid, cid], 0), 2).await;
+        assert!(refused_put(&r, "loses people"), "{r:?}");
+        // Someone added: a bucket never grows
+        let r = try_version(rotated(7, 1, aid, &[bid, did], 0), 2).await;
+        assert!(refused_put(&r, "loses people"), "{r:?}");
+        let r = try_version(rotated(7, 1, aid, &[bid, cid, did], 0), 2).await;
+        assert!(refused_put(&r, "loses people"), "{r:?}");
+        // No way down, or down to some other version
+        let mut no_link = rotated(7, 1, aid, &[bid], 0);
+        no_link.down = None;
+        let r = try_version(no_link, 2).await;
+        assert!(refused_put(&r, "way down"), "{r:?}");
+        let r = try_version(rotated(7, 1, aid, &[bid], 5), 2).await;
+        assert!(refused_put(&r, "way down"), "{r:?}");
+        // At or below the newest
+        let r = try_version(rotated(7, 0, aid, &[bid], 0), 2).await;
+        assert!(behind(&r), "{r:?}");
+        // The control
+        let r = try_version(rotated(7, 1, aid, &[bid], 0), 2).await;
+        assert!(stored(&r), "{r:?}");
+        // A version comes whole: no later row in it
+        let r = try_version(rotated(7, 1, aid, &[cid], 0), 2).await;
+        assert!(behind(&r), "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn at_most_three_new_buckets_in_a_put_unless_none_is_live() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, aid) = seated(&state, &log, "alice").await;
+        let (_b, bid) = seated(&state, &log, "bob").await;
+        // A first post is all new buckets, frame after frame, none live yet
+        let many = |from: u64| -> Vec<BucketIn> {
+            (from..from + 4)
+                .map(|i| bucket(i, 0, aid, &[bid]))
+                .collect()
+        };
+        let f = Frame {
+            buckets: many(100),
+            last: false,
+            ..Frame::start(1)
+        };
+        assert!(stored(&put(&mut a, &log, f).await));
+        let f = Frame {
+            buckets: many(200),
+            seals: vec![seal(100, 0, 0), seal(200, 0, 0)],
+            last: true,
+            ..Frame::on(1, 0)
+        };
+        assert!(stored(&put(&mut a, &log, f).await));
+        // Now live: at most three
+        let f = Frame {
+            buckets: many(300),
+            last: false,
+            ..Frame::start(2)
+        };
+        assert!(refused_put(&put(&mut a, &log, f).await, "new buckets"));
+        let f = Frame {
+            buckets: (300..303).map(|i| bucket(i, 0, aid, &[bid])).collect(),
+            last: false,
+            ..Frame::start(2)
+        };
+        assert!(stored(&put(&mut a, &log, f).await));
+    }
+
+    /// The attack's raid: buckets aimed at one reader, a whole quota of them. What it may
+    /// fetch for what it reads stays a chain's worth, whatever is in the tables.
+    #[tokio::test]
+    async fn a_writers_bucket_spam_costs_a_reader_only_the_entries_it_reads() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut w, wid) = seated(&state, &log, "wendy").await;
+        let (mut v, vid) = seated(&state, &log, "victor").await;
+        // A first post sealed to 40 one-seat buckets at victor, all at index 0
+        let ids: Vec<u64> = (1..=40).collect();
+        for part in ids.chunks(10) {
+            let f = Frame {
+                buckets: part.iter().map(|i| bucket(*i, 0, wid, &[vid])).collect(),
+                seals: part.iter().map(|i| seal(*i, 0, 0)).collect(),
+                last: false,
+                self_wrap: (part[0] == 1).then(row),
+                chain: 1,
+                ..Default::default()
+            };
+            assert!(stored(&put(&mut w, &log, f).await));
+        }
+        let f = Frame {
+            last: true,
+            ..Frame::on(1, 0)
+        };
+        assert!(stored(&put(&mut w, &log, f).await));
+        // More of them on a chain that holds no entry of what victor reads
+        let f = Frame {
+            buckets: (50..53).map(|i| bucket(i, 0, wid, &[vid])).collect(),
+            seals: (50..53).map(|i| seal(i, 0, 0)).collect(),
+            ..Frame::start(2)
+        };
+        assert!(stored(&put(&mut w, &log, f).await));
+        run(&state, "UPDATE voipc_writers SET newest_chain = 1").await;
+        assert!(filed(&post(&mut w, &log, 1, 0).await));
+
+        let page = ask(
+            &mut v,
+            AccountRequest::ChainFetch {
+                conv: log.clone(),
+                after: 0,
+            },
+        )
+        .await;
+        let AccountReply::ChainPage {
+            entries, skipped, ..
+        } = page
+        else {
+            panic!("{page:?}")
+        };
+        assert_eq!((entries.len(), skipped), (1, 0));
+        let keys = keys_of(&mut v, &log, wid, 1, None).await;
+        assert_eq!(keys.len(), 1, "one chain asked, one chain served");
+        assert!(keys[0].seal.is_some() && keys[0].seat.is_some());
+        let bytes = encode_server_msg(&ServerMessage::Account(AccountReply::WrapsPage {
+            conv: log.clone(),
+            keys,
+            served: 1,
+        }))
+        .unwrap();
+        assert!(
+            bytes.len() < 512,
+            "one seal and one seat, not 43: {}",
+            bytes.len()
+        );
+    }
+
+    async fn keys_of(
+        c: &mut Client,
+        log: &str,
+        owner: [u8; 16],
+        chain: u32,
+        from: Option<u32>,
+    ) -> Vec<ChainKeys> {
+        let r = ask(
+            c,
+            AccountRequest::WrapsPage {
+                conv: log.to_string(),
+                asks: vec![ChainAsk { owner, chain, from }],
+            },
+        )
+        .await;
+        let AccountReply::WrapsPage {
+            keys, served: 1, ..
+        } = r
+        else {
+            panic!("{r:?}")
+        };
+        keys
+    }
+
+    #[tokio::test]
+    async fn rows_are_served_only_to_whom_they_were_made_for() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, aid) = seated(&state, &log, "alice").await;
+        let (mut b, bid) = seated(&state, &log, "bob").await;
+        let (mut c, cid) = seated(&state, &log, "cat").await;
+        let (mut d, _) = seated(&state, &log, "dan").await;
+        // bob by a seat, cat by a row of her own, dan by nothing
+        let f = Frame {
+            buckets: vec![bucket(7, 0, aid, &[bid])],
+            seals: vec![seal(7, 0, 0)],
+            wraps: vec![direct(cid, 0)],
+            ..Frame::start(1)
+        };
+        assert!(stored(&put(&mut a, &log, f).await));
+        let k = &keys_of(&mut b, &log, aid, 1, None).await[0];
+        assert!(
+            k.seal.is_some() && k.seat.is_some() && k.direct.is_none() && k.self_wrap.is_none()
+        );
+        let k = &keys_of(&mut c, &log, aid, 1, None).await[0];
+        assert!(
+            k.direct.is_some() && k.seal.is_none() && k.seat.is_none() && k.self_wrap.is_none()
+        );
+        let k = &keys_of(&mut d, &log, aid, 1, None).await[0];
+        assert!(
+            k.direct.is_none() && k.seal.is_none() && k.seat.is_none() && k.self_wrap.is_none()
+        );
+        let k = &keys_of(&mut a, &log, aid, 1, None).await[0];
+        assert!(k.self_wrap.is_some(), "and the start to its own writer");
+        // Someone who left gets nothing at all
+        ask(&mut b, AccountRequest::LogLeave { conv: log.clone() }).await;
+        let r = ask(
+            &mut b,
+            AccountRequest::WrapsPage {
+                conv: log.clone(),
+                asks: vec![ChainAsk {
+                    owner: aid,
+                    chain: 1,
+                    from: None,
+                }],
+            },
+        )
+        .await;
+        assert!(matches!(r, AccountReply::Error { .. }), "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn a_reader_through_a_rotation_reads_by_the_link_and_only_a_leavers_row_stays() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, aid) = seated(&state, &log, "alice").await;
+        let (mut b, bid) = seated(&state, &log, "bob").await;
+        let (mut c, cid) = seated(&state, &log, "cat").await;
+        sealed_chain(&mut a, &log, aid, &[bid, cid]).await;
+        assert!(filed(&post(&mut a, &log, 1, 0).await));
+        ask(&mut b, AccountRequest::LogLeave { conv: log.clone() }).await;
+        let f = Frame {
+            buckets: vec![rotated(7, 1, aid, &[cid], 0)],
+            seals: vec![seal(7, 1, 0)],
+            ..Frame::start(2)
+        };
+        assert!(stored(&put(&mut a, &log, f).await));
+        assert!(filed(&post(&mut a, &log, 2, 0).await));
+        let rows = |who: [u8; 16], v: i32| {
+            format!(
+                "SELECT COUNT(*) FROM voipc_seats WHERE recipient = x'{}' AND version = {v}",
+                hex::encode(who)
+            )
+        };
+        assert_eq!(count(&state, &rows(bid, 0)).await, 1, "bob's frozen row");
+        assert_eq!(count(&state, &rows(cid, 0)).await, 0, "cat's is replaced");
+        assert_eq!(count(&state, &rows(cid, 1)).await, 1);
+        assert_eq!(count(&state, &rows(aid, 0)).await, 0);
+        // cat reads chain 1 at version 0 with her row at 1 and the link
+        let k = &keys_of(&mut c, &log, aid, 1, None).await[0];
+        let (seal, seat) = (k.seal.as_ref().unwrap(), k.seat.as_ref().unwrap());
+        assert_eq!((seal.version, seat.0), (0, 1));
+        assert_eq!(k.down.len(), 1);
+        assert_eq!((k.down[0].0, k.down[0].1), (1, 0));
+        // And of chain 2: nothing to walk
+        let k = &keys_of(&mut c, &log, aid, 2, None).await[0];
+        assert_eq!(k.seal.as_ref().unwrap().version, 1);
+        assert!(k.down.is_empty());
+        // A list of an older version goes with the rotation
+        assert_eq!(
+            count(&state, "SELECT COUNT(*) FROM voipc_bucket_lists").await,
+            1
+        );
+        // bob, back with his old row: what he held opens, what was sealed after him does not
+        run(&state, "UPDATE voipc_left SET left_at = 0").await;
+        ask(&mut b, AccountRequest::LogJoin { conv: log.clone() }).await;
+        let k = &keys_of(&mut b, &log, aid, 1, None).await[0];
+        assert_eq!(k.seat.as_ref().map(|s| s.0), Some(0));
+        let k = &keys_of(&mut b, &log, aid, 2, None).await[0];
+        assert!(k.seal.is_none() && k.seat.is_none());
+        let r = ask(
+            &mut b,
+            AccountRequest::ChainFetch {
+                conv: log.clone(),
+                after: 0,
+            },
+        )
+        .await;
+        assert!(
+            matches!(&r, AccountReply::ChainPage { entries, skipped: 1, .. } if entries.len() == 1),
+            "{r:?}"
+        );
+    }
+
+    /// Two ways into one chain: the one that reaches furthest down, whichever came first.
+    #[tokio::test]
+    async fn a_reader_is_served_its_lowest_index() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, aid) = seated(&state, &log, "alice").await;
+        let (mut b, bid) = seated(&state, &log, "bob").await;
+        let f = Frame {
+            step: Some(row()),
+            buckets: vec![bucket(7, 0, aid, &[bid]), bucket(8, 0, aid, &[bid])],
+            seals: vec![seal(7, 0, 1), seal(8, 0, 0)],
+            wraps: vec![direct(bid, 1)],
+            ..Frame {
+                index: 1,
+                ..Frame::start(1)
+            }
+        };
+        assert!(stored(&put(&mut a, &log, f).await));
+        let k = &keys_of(&mut b, &log, aid, 1, None).await[0];
+        assert_eq!(k.seal.as_ref().map(|s| (s.bucket, s.index)), Some((8, 0)));
+        assert_eq!(k.steps.len(), 1, "and the walk from there");
+    }
+
+    /// A count reads every entry the writer kept: far from the quota, a post is not worth one.
+    #[tokio::test]
+    async fn a_post_far_from_the_quota_goes_on_the_last_count_and_a_key_write_counts_again() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, _) = seated(&state, &log, "alice").await;
+        assert!(stored(&put(&mut a, &log, Frame::start(1)).await));
+        assert!(filed(&post(&mut a, &log, 1, 0).await));
+        // Past the quota behind the count's back, which only a test can do
+        run(&state, "UPDATE voipc_writers SET key_bytes = 1048576000").await;
+        assert!(filed(&post(&mut a, &log, 1, 0).await), "no second count");
+        let r = put(&mut a, &log, Frame::start(2)).await;
+        assert!(refused_put(&r, "limit"), "{r:?}");
+        let r = post(&mut a, &log, 1, 0).await;
+        assert!(
+            matches!(&r, AccountReply::Error { reason, .. } if reason.contains("limit")),
+            "and what follows goes by the new count: {r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn near_the_quota_every_post_is_counted() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, _) = seated(&state, &log, "alice").await;
+        assert!(stored(&put(&mut a, &log, Frame::start(1)).await));
+        // 50 MB less half a megabyte, inside the margin
+        run(&state, "UPDATE voipc_writers SET key_bytes = 51904512").await;
+        assert!(filed(&post(&mut a, &log, 1, 0).await));
+        run(&state, "UPDATE voipc_writers SET key_bytes = 52428800").await;
+        let r = post(&mut a, &log, 1, 0).await;
+        assert!(
+            matches!(&r, AccountReply::Error { reason, .. } if reason.contains("limit")),
+            "{r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn seat_rows_count_at_half_weight_and_unfinished_chains_in_full() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, aid) = seated(&state, &log, "alice").await;
+        let (_b, bid) = seated(&state, &log, "bob").await;
+        let (_c, cid) = seated(&state, &log, "cat").await;
+        let key_bytes = "SELECT key_bytes FROM voipc_writers";
+        let open_bytes = "SELECT open_bytes FROM voipc_writers";
+        let seats = (ROW_BYTES * 2 + OWN_ROW_BYTES) as i64;
+        let list = (28 + 48) as i64;
+        let rest = 2 * ROW_BYTES as i64 + list;
+        let f = Frame {
+            buckets: vec![bucket(7, 0, aid, &[bid, cid])],
+            seals: vec![seal(7, 0, 0)],
+            last: false,
+            ..Frame::start(1)
+        };
+        assert!(stored(&put(&mut a, &log, f).await));
+        assert_eq!(
+            count(&state, key_bytes).await + count(&state, open_bytes).await,
+            seats + rest,
+            "in full while it is not finished"
+        );
+        let f = Frame {
+            last: true,
+            ..Frame::on(1, 0)
+        };
+        assert!(stored(&put(&mut a, &log, f).await));
+        assert_eq!(count(&state, key_bytes).await, seats / 2 + rest, "at half");
+        assert_eq!(count(&state, open_bytes).await, 0);
+
+        // It counts: at the quota a post and a put are refused
+        run(&state, "UPDATE voipc_writers SET key_bytes = 52428800").await;
+        let r = post(&mut a, &log, 1, 0).await;
+        assert!(
+            matches!(&r, AccountReply::Error { reason, .. } if reason.contains("limit")),
+            "{r:?}"
+        );
+        let r = put(&mut a, &log, Frame::start(2)).await;
+        assert!(refused_put(&r, "limit"), "{r:?}");
+        // The sweep brings a count back to what is there
+        run(
+            &state,
+            "UPDATE voipc_chains SET created_at = 0 WHERE chain = 1",
+        )
+        .await;
+        run(&state, "UPDATE voipc_writers SET last_post_hour = 0").await;
+        sweep(&state).await;
+        assert_eq!(count(&state, "SELECT COUNT(*) FROM voipc_chains").await, 0);
+        assert_eq!(
+            count(
+                &state,
+                "SELECT COALESCE(SUM(key_bytes), 0) FROM voipc_writers"
+            )
+            .await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unfinished_chain_goes_after_an_hour() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, aid) = seated(&state, &log, "alice").await;
+        let (mut b, bid) = seated(&state, &log, "bob").await;
+        let (mut c, cid) = seated(&state, &log, "cat").await;
+        sealed_chain(&mut a, &log, aid, &[bid, cid]).await;
+        assert!(filed(&post(&mut a, &log, 1, 0).await));
+        ask(&mut b, AccountRequest::LogLeave { conv: log.clone() }).await;
+        let f = Frame {
+            buckets: vec![rotated(7, 1, aid, &[cid], 0), bucket(8, 0, aid, &[cid])],
+            seals: vec![seal(7, 1, 0)],
+            last: false,
+            ..Frame::start(2)
+        };
+        assert!(stored(&put(&mut a, &log, f).await));
+        // Within the hour it is spared
+        sweep(&state).await;
+        assert_eq!(count(&state, "SELECT COUNT(*) FROM voipc_chains").await, 2);
+        assert_eq!(
+            count(&state, "SELECT COUNT(*) FROM voipc_seats WHERE version = 1").await,
+            2
+        );
+        assert!(count(&state, "SELECT open_bytes FROM voipc_writers").await > 0);
+
+        run(
+            &state,
+            &format!(
+                "UPDATE voipc_chains SET created_at = created_at - {} WHERE chain = 2",
+                2 * HOUR
+            ),
+        )
+        .await;
+        run(
+            &state,
+            &format!("UPDATE voipc_bucket_lists SET created_at = created_at - {} WHERE version = 1 OR bucket = 8", 2 * HOUR),
+        )
+        .await;
+        sweep(&state).await;
+        assert_eq!(count(&state, "SELECT COUNT(*) FROM voipc_chains").await, 1);
+        assert_eq!(count(&state, "SELECT COUNT(*) FROM voipc_seals").await, 1);
+        assert_eq!(
+            count(
+                &state,
+                "SELECT COUNT(*) FROM voipc_seats WHERE version = 1 OR bucket = 8"
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            count(&state, "SELECT COUNT(*) FROM voipc_bucket_links").await,
+            0
+        );
+        assert_eq!(
+            count(&state, "SELECT COUNT(*) FROM voipc_bucket_lists").await,
+            1
+        );
+        assert_eq!(
+            count(&state, "SELECT open_bytes FROM voipc_writers").await,
+            0
+        );
+        // cat's way in stayed: a chain never finished replaced nobody's row
+        let k = &keys_of(&mut c, &log, aid, 1, None).await[0];
+        assert!(k.seal.is_some() && k.seat.is_some());
+    }
+
+    #[tokio::test]
+    async fn leaving_and_rejoining_does_not_force_chains_faster_than_the_wait() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, aid) = seated(&state, &log, "alice").await;
+        let (mut b, bid) = seated(&state, &log, "bob").await;
+        sealed_chain(&mut a, &log, aid, &[bid]).await;
+        let rejoin = AccountRequest::LogJoin { conv: log.clone() };
+        let waits = |r: &AccountReply| matches!(r, AccountReply::Error { request, reason } if request == "LogJoin" && reason.contains("later"));
+
+        // Holding a key: leave, and the seat waits 10 minutes
+        ask(&mut b, AccountRequest::LogLeave { conv: log.clone() }).await;
+        assert!(waits(&ask(&mut b, rejoin.clone()).await));
+        run(
+            &state,
+            &format!("UPDATE voipc_left SET left_at = left_at - {}", 9 * 60),
+        )
+        .await;
+        assert!(waits(&ask(&mut b, rejoin.clone()).await));
+        run(
+            &state,
+            &format!("UPDATE voipc_left SET left_at = left_at - {}", 61),
+        )
+        .await;
+        assert!(matches!(
+            ask(&mut b, rejoin.clone()).await,
+            AccountReply::LogJoined { .. }
+        ));
+        // Again, doubled
+        ask(&mut b, AccountRequest::LogLeave { conv: log.clone() }).await;
+        run(
+            &state,
+            &format!("UPDATE voipc_left SET left_at = left_at - {}", 11 * 60),
+        )
+        .await;
+        assert!(waits(&ask(&mut b, rejoin.clone()).await), "20 minutes now");
+        run(
+            &state,
+            &format!("UPDATE voipc_left SET left_at = left_at - {}", 10 * 60),
+        )
+        .await;
+        assert!(matches!(
+            ask(&mut b, rejoin.clone()).await,
+            AccountReply::LogJoined { .. }
+        ));
+        // Per account, across logs
+        assert_eq!(count(&state, "SELECT strikes FROM voipc_reseats").await, 2);
+        // A silent follow waits the same
+        ask(&mut b, AccountRequest::LogLeave { conv: log.clone() }).await;
+        let r = ask(
+            &mut b,
+            AccountRequest::LogJoinMany {
+                convs: vec![log.clone()],
+            },
+        )
+        .await;
+        assert!(
+            matches!(&r, AccountReply::LogJoinedMany { joined, refused } if joined.is_empty() && *refused == [log.clone()]),
+            "{r:?}"
+        );
+        // A person who left holding nothing never waits
+        let (mut c, _) = seated(&state, &log, "cat").await;
+        ask(&mut c, AccountRequest::LogLeave { conv: log.clone() }).await;
+        assert!(matches!(
+            ask(&mut c, rejoin.clone()).await,
+            AccountReply::LogJoined { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_deleted_accounts_chain_ends_at_the_next_post() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, aid) = seated(&state, &log, "alice").await;
+        let (mut d, info, _) = register_with(&state, "dora").await;
+        lounge(&state, &mut d, &info.id).await;
+        ask(&mut d, AccountRequest::LogJoin { conv: log.clone() }).await;
+        sealed_chain(&mut a, &log, aid, &[info.id]).await;
+        assert!(filed(&post(&mut a, &log, 1, 0).await));
+        let relay = state.accounts.clone().unwrap();
+        let secret =
+            voipc_crypto::account::derive("correct horse battery", &relay.relay_id, "dora")
+                .auth_secret
+                .to_vec();
+        d.send(&ClientMessage::Account(AccountRequest::DeleteAccount {
+            secret,
+            totp: None,
+            recovery_code: None,
+        }))
+        .await;
+        d.expect("deleted", |m| {
+            matches!(m, ServerMessage::Account(AccountReply::AccountDeleted))
+        })
+        .await;
+        assert_eq!(
+            count(&state, "SELECT COUNT(*) FROM voipc_tombstones").await,
+            1
+        );
+        // The row stays, marked: nothing else says this chain has to end
+        assert_eq!(
+            count(
+                &state,
+                "SELECT COUNT(*) FROM voipc_seats WHERE dead = TRUE AND LENGTH(wrapped) = 0"
+            )
+            .await,
+            1
+        );
+        let r = post(&mut a, &log, 1, 0).await;
+        assert!(
+            matches!(&r, AccountReply::ChainRekey { new_chain: true, gone, .. } if gone == &[(info.id, 7)]),
+            "{r:?}"
+        );
+        // A sweep before that post changes nothing
+        sweep(&state).await;
+        let r = post(&mut a, &log, 1, 0).await;
+        assert!(
+            matches!(
+                &r,
+                AccountReply::ChainRekey {
+                    new_chain: true,
+                    ..
+                }
+            ),
+            "{r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deleted_accounts_frozen_rows_go_with_the_sweep() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, aid) = seated(&state, &log, "alice").await;
+        let (mut d, did) = seated(&state, &log, "dora").await;
+        let (_c, cid) = seated(&state, &log, "cat").await;
+        sealed_chain(&mut a, &log, aid, &[did, cid]).await;
+        assert!(filed(&post(&mut a, &log, 1, 0).await));
+        // dora leaves, and alice's next chain leaves a frozen row naming her
+        ask(&mut d, AccountRequest::LogLeave { conv: log.clone() }).await;
+        let f = Frame {
+            buckets: vec![rotated(7, 1, aid, &[cid], 0)],
+            seals: vec![seal(7, 1, 0)],
+            ..Frame::start(2)
+        };
+        assert!(stored(&put(&mut a, &log, f).await));
+        let frozen = format!(
+            "SELECT COUNT(*) FROM voipc_seats WHERE recipient = x'{}'",
+            hex::encode(did)
+        );
+        assert_eq!(count(&state, &frozen).await, 1);
+
+        // Her account goes while chain 1 still holds its entry, and only a tombstone finds it
+        run(
+            &state,
+            &format!(
+                "INSERT INTO voipc_tombstones (account, at) VALUES (x'{}', 1)",
+                hex::encode(did)
+            ),
+        )
+        .await;
+        sweep(&state).await;
+        assert_eq!(count(&state, &frozen).await, 0, "out of a copy from now on");
+        assert_eq!(
+            count(&state, "SELECT COUNT(*) FROM voipc_tombstones").await,
+            0,
+            "no row names it now"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tombstone_waits_for_a_chain_that_still_says_to_end() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, aid) = seated(&state, &log, "alice").await;
+        let (_d, did) = seated(&state, &log, "dora").await;
+        sealed_chain(&mut a, &log, aid, &[did]).await;
+        let stone = format!(
+            "INSERT INTO voipc_tombstones (account, at) VALUES (x'{}', 1)",
+            hex::encode(did)
+        );
+        run(&state, &stone).await;
+        sweep(&state).await;
+        assert_eq!(
+            count(
+                &state,
+                "SELECT COUNT(*) FROM voipc_seats WHERE version = 0 AND LENGTH(wrapped) = 60"
+            )
+            .await,
+            1,
+            "the newest chain's row stays until it has done its work"
+        );
+        assert_eq!(
+            count(&state, "SELECT COUNT(*) FROM voipc_tombstones").await,
+            1
+        );
+    }
+
+    /// Entries aged by hand: `(server_at, keep_until)` in ms from now.
+    async fn entry(
+        state: &Arc<ServerState>,
+        conv: &str,
+        who: [u8; 16],
+        epoch: u32,
+        at: i64,
+        until: i64,
+    ) {
+        let now = l4f_accounts::util::now() * 1000;
+        run(
+            state,
+            &format!(
+                "INSERT INTO voipc_log (conv, sender, epoch, server_at, keep_until, ct)
+                 VALUES ('{conv}', x'{}', {epoch}, {}, {}, x'00')",
+                hex::encode(who),
+                now + at,
+                now + until
+            ),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_flood_that_expires_leaves_older_posts_open() {
+        let (state, _db, log) = relay_kept(3, 256).await;
+        let (mut a, aid) = seated(&state, &log, "alice").await;
+        let (mut f, fid) = seated(&state, &log, "flo").await;
+        // Alice's chain: three posts well past the grace, a full window of them
+        assert!(stored(&put(&mut a, &log, Frame::start(1)).await));
+        for _ in 0..3 {
+            entry(&state, &log, aid, 1 << 12, -10 * DAY_MS, 300 * DAY_MS).await;
+        }
+        assert!(stored(&put(&mut f, &log, Frame::start(1)).await));
+        // A flood past the grace and alive now, on timers: settled, and gone within it
+        for _ in 0..6 {
+            entry(&state, &log, fid, 1 << 12, -5 * DAY_MS, HOUR * 1000).await;
+        }
+        // A timer of 25 h, posted just over the grace ago
+        for _ in 0..6 {
+            entry(&state, &log, fid, 1 << 12, -4 * DAY_MS, 25 * HOUR * 1000).await;
+        }
+        // And a flood standing less than the grace, with no timer
+        for _ in 0..6 {
+            entry(&state, &log, fid, 1 << 12, -DAY_MS, 300 * DAY_MS).await;
+        }
+        run(&state, "UPDATE voipc_chains SET created_at = 0").await;
+        sweep(&state).await;
+        let older = format!(
+            "SELECT COUNT(*) FROM voipc_log WHERE sender = x'{}'",
+            hex::encode(aid)
+        );
+        assert_eq!(count(&state, &older).await, 3, "no flood took them");
+        assert_eq!(
+            count(&state, &format!("SELECT COUNT(*) FROM voipc_chains c JOIN voipc_writers w ON w.id = c.writer WHERE w.owner = x'{}'", hex::encode(aid))).await,
+            1,
+            "nor their keys"
+        );
+        assert_eq!(
+            count(
+                &state,
+                "SELECT COUNT(*) FROM voipc_log_floors WHERE floor > 1"
+            )
+            .await,
+            0
+        );
+
+        // The control: a flood that stands the grace does take them
+        for _ in 0..3 {
+            entry(&state, &log, fid, 1 << 12, -4 * DAY_MS, 300 * DAY_MS).await;
+        }
+        sweep(&state).await;
+        assert_eq!(count(&state, &older).await, 0, "the price of any window");
+    }
+
+    #[tokio::test]
+    async fn text_below_the_floor_goes_and_a_read_starts_at_the_stored_floor() {
+        let (state, _db, log) = relay_kept(2, 256).await;
+        let (mut a, aid) = seated(&state, &log, "alice").await;
+        assert!(stored(&put(&mut a, &log, Frame::start(1)).await));
+        for _ in 0..5 {
+            entry(&state, &log, aid, 1 << 12, -10 * DAY_MS, 300 * DAY_MS).await;
+        }
+        sweep(&state).await;
+        assert_eq!(count(&state, "SELECT COUNT(*) FROM voipc_log").await, 2);
+        let floor = count(&state, "SELECT floor FROM voipc_log_floors").await;
+        assert_eq!(floor, count(&state, "SELECT MIN(seq) FROM voipc_log").await);
+
+        // A cursor below it is moved up, and said to be
+        let r = ask(
+            &mut a,
+            AccountRequest::ChainFetch {
+                conv: log.clone(),
+                after: 0,
+            },
+        )
+        .await;
+        assert!(
+            matches!(&r, AccountReply::ChainPage { entries, floor: f, .. } if entries.len() == 2 && *f == floor),
+            "{r:?}"
+        );
+        // The stored floor, not a count at each read: what a sweep left below it never shows
+        run(
+            &state,
+            &format!(
+                "INSERT INTO voipc_log (conv, seq, sender, epoch, server_at, keep_until, ct)
+                 VALUES ('{log}', 1, x'{}', 4096, 0, 9000000000000, x'00')",
+                hex::encode(aid)
+            ),
+        )
+        .await;
+        let r = ask(
+            &mut a,
+            AccountRequest::LogFetch {
+                conv: log.clone(),
+                after: 0,
+            },
+        )
+        .await;
+        assert!(
+            matches!(&r, AccountReply::LogPage { entries, .. } if entries.iter().all(|e| e.seq >= floor)),
+            "{r:?}"
+        );
+        // A floor never moves back: with what was above it gone, the window would reach
+        // down to a row left below it
+        run(
+            &state,
+            &format!(
+                "INSERT INTO voipc_log (conv, seq, sender, epoch, server_at, keep_until, ct)
+                 VALUES ('{log}', 2, x'{}', 4096, 0, 9000000000000, x'00')",
+                hex::encode(aid)
+            ),
+        )
+        .await;
+        run(
+            &state,
+            &format!("DELETE FROM voipc_log WHERE seq >= {floor}"),
+        )
+        .await;
+        sweep(&state).await;
+        assert_eq!(
+            count(&state, "SELECT floor FROM voipc_log_floors").await,
+            floor
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_conversations_are_exempt_from_the_floor_and_the_sweep() {
+        let (state, _db, log) = relay_kept(2, 256).await;
+        let (_a, aid) = seated(&state, &log, "alice").await;
+        let (mut b, bid) = seated(&state, &log, "bob").await;
+        let dm = voipc_protocol::conv::dm_conv(&aid, &bid);
+        for _ in 0..6 {
+            entry(&state, &dm, aid, 1, -10 * DAY_MS, 300 * DAY_MS).await;
+        }
+        sweep(&state).await;
+        assert_eq!(count(&state, "SELECT COUNT(*) FROM voipc_log").await, 6);
+        assert_eq!(
+            count(&state, "SELECT COUNT(*) FROM voipc_log_floors").await,
+            0
+        );
+        // Not even if a floor were somehow there
+        run(
+            &state,
+            &format!("INSERT INTO voipc_log_floors (conv, floor) VALUES ('{dm}', 9000000000000)"),
+        )
+        .await;
+        let r = ask(
+            &mut b,
+            AccountRequest::LogFetch {
+                conv: dm.clone(),
+                after: 0,
+            },
+        )
+        .await;
+        assert!(
+            matches!(&r, AccountReply::LogPage { entries, .. } if entries.len() == 6),
+            "{r:?}"
+        );
+        // And no filtered read of them: a page there is only `LogPage`
+        let r = ask(&mut b, AccountRequest::ChainFetch { conv: dm, after: 0 }).await;
+        assert!(matches!(r, AccountReply::Error { .. }), "{r:?}");
+    }
+
+    /// `kept_window`: the setting is what a tail read may reach; a browser asks for 500.
+    #[tokio::test]
+    async fn a_tail_reaches_back_to_the_window() {
+        let (state, _db, log) = relay_kept(10_000, 256).await;
+        let (mut a, aid) = seated(&state, &log, "alice").await;
+        assert!(stored(&put(&mut a, &log, Frame::start(1)).await));
+        for _ in 0..6000 {
+            entry(&state, &log, aid, 1 << 12, -DAY_MS, 300 * DAY_MS).await;
+        }
+        let first = count(&state, "SELECT MIN(seq) FROM voipc_log").await;
+        let r = ask(
+            &mut a,
+            AccountRequest::LogFetch {
+                conv: log.clone(),
+                after: -6000,
+            },
+        )
+        .await;
+        assert!(
+            matches!(&r, AccountReply::LogPage { entries, .. } if entries[0].seq == first),
+            "past the old 5000: {r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_sweep_keeps_a_chain_with_one_entry_in_the_window() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, aid) = seated(&state, &log, "alice").await;
+        let (_b, bid) = seated(&state, &log, "bob").await;
+        sealed_chain(&mut a, &log, aid, &[bid]).await;
+        let f = Frame {
+            seals: vec![seal(7, 0, 0)],
+            ..Frame::start(2)
+        };
+        assert!(stored(&put(&mut a, &log, f).await));
+        // Old enough to go, and each with one entry
+        run(&state, "UPDATE voipc_chains SET created_at = 0").await;
+        entry(&state, &log, aid, 1 << 12, -DAY_MS, 300 * DAY_MS).await;
+        entry(&state, &log, aid, 2 << 12, -DAY_MS, 300 * DAY_MS).await;
+        sweep(&state).await;
+        assert_eq!(
+            count(&state, "SELECT COUNT(*) FROM voipc_chains").await,
+            2,
+            "one entry keeps a chain"
+        );
+        assert_eq!(count(&state, "SELECT COUNT(*) FROM voipc_seals").await, 2);
+        // Chain 1's entry is gone: its keys go; the newest stays
+        run(&state, "DELETE FROM voipc_log WHERE epoch = 4096").await;
+        sweep(&state).await;
+        assert_eq!(
+            count(&state, "SELECT COUNT(*) FROM voipc_chains WHERE chain = 1").await,
+            0
+        );
+        assert_eq!(count(&state, "SELECT COUNT(*) FROM voipc_seals").await, 1);
+        assert_eq!(
+            count(&state, "SELECT COUNT(*) FROM voipc_chains WHERE chain = 2").await,
+            1
+        );
+        assert_eq!(
+            count(&state, "SELECT COUNT(*) FROM voipc_seats").await,
+            2,
+            "still sealed to"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_expired_chain_goes_with_the_sweep() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, aid) = seated(&state, &log, "alice").await;
+        assert!(stored(&put(&mut a, &log, Frame::start(1)).await));
+        assert!(stored(&put(&mut a, &log, Frame::start(2)).await));
+        run(&state, "UPDATE voipc_chains SET created_at = 0").await;
+        entry(&state, &log, aid, 1 << 12, -DAY_MS, 1000).await;
+        sweep(&state).await;
+        assert_eq!(
+            count(&state, "SELECT COUNT(*) FROM voipc_chains WHERE chain = 1").await,
+            1
+        );
+        run(&state, "UPDATE voipc_log SET keep_until = 1").await;
+        sweep(&state).await;
+        assert_eq!(count(&state, "SELECT COUNT(*) FROM voipc_log").await, 0);
+        assert_eq!(
+            count(&state, "SELECT COUNT(*) FROM voipc_chains WHERE chain = 1").await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_writers_newest_chain_outlasts_its_entries_for_thirty_days() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, aid) = seated(&state, &log, "alice").await;
+        let (_b, bid) = seated(&state, &log, "bob").await;
+        sealed_chain(&mut a, &log, aid, &[bid]).await;
+        run(&state, "UPDATE voipc_chains SET created_at = 0").await;
+        sweep(&state).await;
+        assert_eq!(
+            count(&state, "SELECT COUNT(*) FROM voipc_chains").await,
+            1,
+            "posted lately"
+        );
+        let hour = l4f_accounts::util::now() / 3600;
+        run(
+            &state,
+            &format!(
+                "UPDATE voipc_writers SET last_post_hour = {}",
+                hour - 31 * 24
+            ),
+        )
+        .await;
+        sweep(&state).await;
+        assert_eq!(count(&state, "SELECT COUNT(*) FROM voipc_chains").await, 0);
+        assert_eq!(
+            count(&state, "SELECT COUNT(*) FROM voipc_seats").await,
+            0,
+            "and its rows"
+        );
+        assert_eq!(
+            count(&state, "SELECT COUNT(*) FROM voipc_bucket_lists").await,
+            0
+        );
+        assert_eq!(
+            count(&state, "SELECT COUNT(*) FROM voipc_writers").await,
+            0,
+            "as if it never wrote"
+        );
+    }
+
+    #[tokio::test]
+    async fn chains_made_in_the_last_hour_are_spared() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, _) = seated(&state, &log, "alice").await;
+        assert!(stored(&put(&mut a, &log, Frame::start(1)).await));
+        run(&state, "UPDATE voipc_writers SET last_post_hour = 0").await;
+        sweep(&state).await;
+        assert_eq!(count(&state, "SELECT COUNT(*) FROM voipc_chains").await, 1);
+        run(&state, "UPDATE voipc_chains SET created_at = 0").await;
+        sweep(&state).await;
+        assert_eq!(count(&state, "SELECT COUNT(*) FROM voipc_chains").await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_link_stays_while_a_chain_below_it_is_alive() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, aid) = seated(&state, &log, "alice").await;
+        let sid = *state.account_sessions.get(&aid).unwrap();
+        grant_share(&state, sid).await;
+        // 1 <- 2 <- 3, with an entry on 1 only, and 4 unlinked and newest
+        assert!(stored(&put(&mut a, &log, Frame::start(1)).await));
+        for (chain, older) in [(2, 1), (3, 2)] {
+            let f = Frame {
+                link: Some((older, row())),
+                ..Frame::start(chain)
+            };
+            assert!(stored(&put(&mut a, &log, f).await));
+        }
+        assert!(stored(&put(&mut a, &log, Frame::start(4)).await));
+        run(&state, "UPDATE voipc_chains SET created_at = 0").await;
+        entry(&state, &log, aid, 1 << 12, -DAY_MS, 300 * DAY_MS).await;
+        sweep(&state).await;
+        assert_eq!(
+            count(&state, "SELECT COUNT(*) FROM voipc_chains WHERE chain <= 3").await,
+            3,
+            "2 and 3 have no entry, and a reader walks through them"
+        );
+        // Below it dead too: they all go
+        run(&state, "DELETE FROM voipc_log").await;
+        sweep(&state).await;
+        assert_eq!(
+            count(&state, "SELECT COUNT(*) FROM voipc_chains WHERE chain <= 3").await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deleted_chain_id_is_never_reused() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, _) = seated(&state, &log, "alice").await;
+        assert!(stored(&put(&mut a, &log, Frame::start(1)).await));
+        let id = count(&state, "SELECT id FROM voipc_chains").await;
+        run(&state, "DELETE FROM voipc_chains").await;
+        assert!(stored(&put(&mut a, &log, Frame::start(2)).await));
+        assert!(count(&state, "SELECT id FROM voipc_chains").await > id);
+    }
+
+    #[tokio::test]
+    async fn a_link_or_a_low_index_wrap_takes_the_right() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, aid) = seated(&state, &log, "alice").await;
+        let (_b, bid) = seated(&state, &log, "bob").await;
+        let (_c, cid) = seated(&state, &log, "cat").await;
+        assert!(stored(&put(&mut a, &log, Frame::start(1)).await));
+        let linked = |chain: u32| Frame {
+            link: Some((1, row())),
+            ..Frame::start(chain)
+        };
+        let low = || Frame {
+            wraps: vec![direct(bid, 0)],
+            ..Frame::on(1, 0)
+        };
+        let privilege = "privilege";
+        assert!(refused_put(&put(&mut a, &log, linked(2)).await, privilege));
+        assert!(refused_put(&put(&mut a, &log, low()).await, privilege));
+        // A new chain with no link gives nothing older: index 0 is nobody's privilege
+        let f = Frame {
+            wraps: vec![direct(cid, 0)],
+            ..Frame::start(2)
+        };
+        assert!(stored(&put(&mut a, &log, f).await));
+        // With it, both go
+        let sid = *state.account_sessions.get(&aid).unwrap();
+        grant_share(&state, sid).await;
+        assert!(stored(&put(&mut a, &log, linked(3)).await));
+        let f = Frame {
+            wraps: vec![direct(bid, 0)],
+            ..Frame::on(1, 0)
+        };
+        assert!(stored(&put(&mut a, &log, f).await));
+    }
+
+    #[tokio::test]
+    async fn non_sharers_get_no_pending() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, aid) = seated(&state, &log, "alice").await;
+        let (mut s, sid_acc) = seated(&state, &log, "sam").await;
+        assert!(stored(&put(&mut a, &log, Frame::start(1)).await));
+        let session = *state.account_sessions.get(&sid_acc).unwrap();
+        grant_share(&state, session).await;
+        s.send(&ClientMessage::SetHistorySharing { enabled: true })
+            .await;
+        assert!(stored(&put(&mut s, &log, Frame::start(1)).await));
+        // non_sharers_get_no_pending: alice is told nothing, sam is
+        let (mut j, jid) = register(&state, "joan").await;
+        lounge(&state, &mut j, &jid.id).await;
+        ask(&mut j, AccountRequest::LogJoin { conv: log.clone() }).await;
+        let pending = |owner: [u8; 16]| {
+            format!(
+                "SELECT COUNT(*) FROM voipc_pending WHERE owner = x'{}'",
+                hex::encode(owner)
+            )
+        };
+        assert_eq!(count(&state, &pending(aid)).await, 0);
+        assert_eq!(count(&state, &pending(sid_acc)).await, 1);
+        s.expect("LogPending", |m| {
+            matches!(m, ServerMessage::Account(AccountReply::LogPending { .. }))
+        })
+        .await;
+        // The flag at rest goes with the switch, and with the right while away
+        s.send(&ClientMessage::SetHistorySharing { enabled: false })
+            .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            count(
+                &state,
+                "SELECT COUNT(*) FROM voipc_writers WHERE shares = TRUE"
+            )
+            .await,
+            0
+        );
+        // A switch turned off on a device away from here: this session never said `true`,
+        // and its `false` at connect still reaches what is at rest
+        run(
+            &state,
+            &format!(
+                "UPDATE voipc_writers SET shares = TRUE WHERE owner = x'{}'",
+                hex::encode(sid_acc)
+            ),
+        )
+        .await;
+        s.send(&ClientMessage::SetHistorySharing { enabled: false })
+            .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            count(
+                &state,
+                "SELECT COUNT(*) FROM voipc_writers WHERE shares = TRUE"
+            )
+            .await,
+            0
+        );
+        run(&state, "UPDATE voipc_writers SET shares = TRUE").await;
+        crate::accounts::log::recheck_shares(state.accounts.as_ref().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            count(
+                &state,
+                "SELECT COUNT(*) FROM voipc_writers WHERE shares = TRUE"
+            )
+            .await,
+            0,
+            "no database row holds the privilege here"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_newcomer_is_sent_no_entry_it_cannot_open() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, aid) = seated(&state, &log, "alice").await;
+        let (mut b, bid) = seated(&state, &log, "bob").await;
+        sealed_chain(&mut a, &log, aid, &[bid]).await;
+        let conv = log.clone();
+        let mut last = 0;
+        for _ in 0..3 {
+            let AccountReply::LogAppended { seq, .. } = post(&mut a, &log, 1, 0).await else {
+                panic!()
+            };
+            last = seq;
+        }
+        let (mut c, cid) = seated(&state, &log, "cat").await;
+        // cat holds nothing: three looked at, none sent, and the cursor moves past them
+        let r = ask(
+            &mut c,
+            AccountRequest::ChainFetch {
+                conv: conv.clone(),
+                after: 0,
+            },
+        )
+        .await;
+        assert!(
+            matches!(&r, AccountReply::ChainPage { entries, skipped: 3, upto, more: false, .. } if entries.is_empty() && *upto == last),
+            "{r:?}"
+        );
+        // cat gets a row at index 1: entries at 0 are below it, one at 1 is sent
+        let f = Frame {
+            step: Some(row()),
+            wraps: vec![direct(cid, 1)],
+            ..Frame::on(1, 1)
+        };
+        assert!(stored(&put(&mut a, &log, f).await));
+        let AccountReply::LogAppended { seq, .. } = post(&mut a, &log, 1, 1).await else {
+            panic!()
+        };
+        let r = ask(
+            &mut c,
+            AccountRequest::ChainFetch {
+                conv: conv.clone(),
+                after: 0,
+            },
+        )
+        .await;
+        assert!(
+            matches!(&r, AccountReply::ChainPage { entries, skipped: 3, upto, .. } if entries.len() == 1 && entries[0].seq == seq && *upto == seq),
+            "{r:?}"
+        );
+        // bob holds index 0 by a seat: everything
+        let r = ask(
+            &mut b,
+            AccountRequest::ChainFetch {
+                conv: conv.clone(),
+                after: 0,
+            },
+        )
+        .await;
+        assert!(
+            matches!(&r, AccountReply::ChainPage { entries, skipped: 0, .. } if entries.len() == 4),
+            "{r:?}"
+        );
+        // Her own, always
+        let r = ask(
+            &mut a,
+            AccountRequest::ChainFetch {
+                conv: conv.clone(),
+                after: 0,
+            },
+        )
+        .await;
+        assert!(
+            matches!(&r, AccountReply::ChainPage { entries, skipped: 0, .. } if entries.len() == 4),
+            "{r:?}"
+        );
+        // A writer's owed answer keeps its entries coming: its key may yet arrive
+        let (mut j, jid) = seated(&state, &log, "joan").await;
+        run(
+            &state,
+            &format!(
+                "INSERT INTO voipc_pending (conv, owner, recipient, created_at) VALUES ('{log}', x'{}', x'{}', 1)",
+                hex::encode(aid),
+                hex::encode(jid)
+            ),
+        )
+        .await;
+        let r = ask(
+            &mut j,
+            AccountRequest::ChainFetch {
+                conv: conv.clone(),
+                after: 0,
+            },
+        )
+        .await;
+        assert!(
+            matches!(&r, AccountReply::ChainPage { entries, skipped: 0, owed, .. } if entries.len() == 4 && owed == &[aid]),
+            "{r:?}"
+        );
+    }
+
+    /// The attack on scope's low: only a row at index 0 on a chain of the run passes.
+    #[tokio::test]
+    async fn a_run_of_links_opens_for_a_start_and_never_for_a_later_state() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, aid) = seated(&state, &log, "alice").await;
+        let (mut z, zid) = seated(&state, &log, "zoe").await;
+        let (mut f, fid) = seated(&state, &log, "fred").await;
+        let (mut g, gid) = seated(&state, &log, "gina").await;
+        let sid = *state.account_sessions.get(&aid).unwrap();
+        grant_share(&state, sid).await;
+        // Chains 1, 2, 3 linked down. Entries on 1 and 2.
+        assert!(stored(&put(&mut a, &log, Frame::start(1)).await));
+        entry(&state, &log, aid, 1 << 12, -DAY_MS, 300 * DAY_MS).await;
+        let linked = Frame {
+            link: Some((1, row())),
+            ..Frame::start(2)
+        };
+        assert!(stored(&put(&mut a, &log, linked).await));
+        entry(&state, &log, aid, 2 << 12, -DAY_MS, 300 * DAY_MS).await;
+        // On 3: zoe holds the start by a seal; fred holds index 1 of it by a row, gina by a seal
+        let f3 = Frame {
+            link: Some((2, row())),
+            step: Some(row()),
+            buckets: vec![bucket(7, 0, aid, &[zid]), bucket(8, 0, aid, &[gid])],
+            seals: vec![seal(7, 0, 0), seal(8, 0, 1)],
+            wraps: vec![direct(fid, 1)],
+            ..Frame {
+                index: 1,
+                ..Frame::start(3)
+            }
+        };
+        assert!(stored(&put(&mut a, &log, f3).await));
+        let r = ask(
+            &mut z,
+            AccountRequest::ChainFetch {
+                conv: log.clone(),
+                after: 0,
+            },
+        )
+        .await;
+        assert!(
+            matches!(&r, AccountReply::ChainPage { entries, skipped: 0, .. } if entries.len() == 2),
+            "{r:?}"
+        );
+        for later in [&mut f, &mut g] {
+            let r = ask(
+                later,
+                AccountRequest::ChainFetch {
+                    conv: log.clone(),
+                    after: 0,
+                },
+            )
+            .await;
+            assert!(
+                matches!(&r, AccountReply::ChainPage { entries, skipped: 2, .. } if entries.is_empty()),
+                "{r:?}"
+            );
+        }
+
+        // What zoe asks for chain 1 brings the way down: from the chain she holds the start of
+        let keys = keys_of(&mut z, &log, aid, 1, None).await;
+        let chains: Vec<u32> = keys.iter().map(|k| k.chain).collect();
+        assert_eq!(chains, vec![3, 2, 1]);
+        assert!(keys[0].seal.is_some() && keys[0].link.as_ref().is_some_and(|l| l.0 == 2));
+        assert!(keys[1].seal.is_none() && keys[1].link.as_ref().is_some_and(|l| l.0 == 1));
+        assert!(keys[2].seal.is_none() && keys[2].link.is_none());
+        // fred's ask for it: nothing
+        let keys = keys_of(&mut f, &log, aid, 1, None).await;
+        assert_eq!(keys.len(), 1);
+        assert!(keys[0].direct.is_none() && keys[0].seal.is_none());
+        // With a state in hand, zoe walks on from it: steps and the link, nothing of hers
+        let keys = keys_of(&mut z, &log, aid, 3, Some(0)).await;
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].steps.len(), 1);
+        assert!(keys[0].link.is_some() && keys[0].seal.is_none() && keys[0].seat.is_none());
+        let keys = keys_of(&mut z, &log, aid, 3, Some(1)).await;
+        assert!(keys[0].steps.is_empty());
+    }
+
+    /// A quiet channel's run is a thousand chains: past a frame it comes in several asks,
+    /// and the answer is never too big for one.
+    #[tokio::test]
+    async fn a_long_run_of_links_comes_in_several_answers() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, aid) = seated(&state, &log, "alice").await;
+        let (mut z, zid) = seated(&state, &log, "zoe").await;
+        let sid = *state.account_sessions.get(&aid).unwrap();
+        grant_share(&state, sid).await;
+        assert!(stored(&put(&mut a, &log, Frame::start(1)).await));
+        run(&state, "UPDATE voipc_writers SET hour = 0").await;
+        let writer = count(&state, "SELECT id FROM voipc_writers").await;
+        for c in 2..=600 {
+            run(
+                &state,
+                &format!(
+                    "INSERT INTO voipc_chains (writer, chain, top, done, self_wrap, older, link, created_at)
+                     VALUES ({writer}, {c}, 0, TRUE, x'00', {}, zeroblob(60), 1)",
+                    c - 1
+                ),
+            )
+            .await;
+        }
+        run(&state, "UPDATE voipc_writers SET newest_chain = 600").await;
+        run(
+            &state,
+            &format!(
+                "INSERT INTO voipc_chain_wraps (writer, recipient, chain_id, idx, wrapped)
+                 SELECT {writer}, x'{}', id, 0, zeroblob(60) FROM voipc_chains WHERE chain = 600",
+                hex::encode(zid)
+            ),
+        )
+        .await;
+        let keys = keys_of(&mut z, &log, aid, 1, None).await;
+        assert_eq!(keys.len(), 256, "the top of it");
+        assert_eq!(keys[0].chain, 600);
+        assert!(keys[0].direct.is_some());
+        assert_eq!(keys[255].chain, 345);
+        assert!(keys.iter().all(|k| k.link.is_some()));
+        // And on from the last: the rest of the way is an ask a chain at a time
+        let keys = keys_of(&mut z, &log, aid, 344, Some(0)).await;
+        assert_eq!(keys[0].link.as_ref().map(|l| l.0), Some(343));
+    }
+
+    #[tokio::test]
+    async fn seats_by_following_stop_at_half_and_a_returning_account_writes_nothing() {
+        let (state, _db, log) = relay_kept(10, 4).await;
+        let (mut a, _) = seated(&state, &log, "alice").await;
+        let (mut b, bid) = register(&state, "bob").await;
+        let (mut c, cid) = register(&state, "cat").await;
+        let (mut d, did) = register(&state, "dan").await;
+        let many = |conv: &str| AccountRequest::LogJoinMany {
+            convs: vec![conv.to_string()],
+        };
+        // Not standing there, or no such log
+        let r = ask(&mut b, many(&log)).await;
+        assert!(
+            matches!(&r, AccountReply::LogJoinedMany { joined, .. } if joined.is_empty()),
+            "{r:?}"
+        );
+        let r = ask(&mut b, many("c:nothing")).await;
+        assert!(
+            matches!(&r, AccountReply::LogJoinedMany { refused, .. } if refused.len() == 1),
+            "{r:?}"
+        );
+        // Up to half of 4, alice included
+        lounge(&state, &mut b, &bid.id).await;
+        let r = ask(&mut b, many(&log)).await;
+        assert!(
+            matches!(&r, AccountReply::LogJoinedMany { joined, .. } if *joined == [log.clone()]),
+            "{r:?}"
+        );
+        lounge(&state, &mut c, &cid.id).await;
+        let r = ask(&mut c, many(&log)).await;
+        assert!(
+            matches!(&r, AccountReply::LogJoinedMany { refused, .. } if *refused == [log.clone()]),
+            "{r:?}"
+        );
+        // Asking takes it to the whole number
+        let r = ask(&mut c, AccountRequest::LogJoin { conv: log.clone() }).await;
+        assert!(matches!(r, AccountReply::LogJoined { .. }), "{r:?}");
+        lounge(&state, &mut d, &did.id).await;
+        let r = ask(&mut d, AccountRequest::LogJoin { conv: log.clone() }).await;
+        assert!(matches!(r, AccountReply::LogJoined { .. }), "{r:?}");
+        let (mut e, eid) = register(&state, "eve").await;
+        lounge(&state, &mut e, &eid.id).await;
+        let r = ask(&mut e, AccountRequest::LogJoin { conv: log.clone() }).await;
+        assert!(
+            matches!(&r, AccountReply::Error { reason, .. } if reason.contains("as many")),
+            "{r:?}"
+        );
+        // Seated already: joined, whatever the numbers
+        let r = ask(&mut a, many(&log)).await;
+        assert!(
+            matches!(&r, AccountReply::LogJoinedMany { joined, .. } if *joined == [log.clone()]),
+            "{r:?}"
+        );
+        // 0 is no limit
+        let (state, _db, log) = relay_kept(10, 0).await;
+        let (mut z, zid) = register(&state, "zoe").await;
+        lounge(&state, &mut z, &zid.id).await;
+        let r = ask(&mut z, many(&log)).await;
+        assert!(
+            matches!(&r, AccountReply::LogJoinedMany { joined, .. } if *joined == [log.clone()]),
+            "{r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_writer_reads_back_what_it_goes_on_from() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, aid) = seated(&state, &log, "alice").await;
+        let (_b, bid) = seated(&state, &log, "bob").await;
+        let (_c, cid) = seated(&state, &log, "cat").await;
+        sealed_chain(&mut a, &log, aid, &[bid, cid]).await;
+        let f = Frame {
+            step: Some(row()),
+            wraps: vec![],
+            ..Frame::on(1, 1)
+        };
+        assert!(refused_put(&put(&mut a, &log, f).await, "someone new"));
+        // Mid-rotation, on a chain not finished
+        let f = Frame {
+            buckets: vec![rotated(7, 1, aid, &[cid], 0)],
+            seals: vec![seal(7, 1, 0)],
+            last: false,
+            ..Frame::start(2)
+        };
+        assert!(stored(&put(&mut a, &log, f).await));
+
+        let r = ask(
+            &mut a,
+            AccountRequest::OwnChains {
+                conv: log.clone(),
+                before: None,
+            },
+        )
+        .await;
+        let AccountReply::OwnChains {
+            newest,
+            chains,
+            more,
+            ..
+        } = r
+        else {
+            panic!("{r:?}")
+        };
+        assert_eq!(newest, Some(1), "not until its last frame");
+        assert!(!more);
+        assert_eq!(
+            chains.iter().map(|c| (c.chain, c.done)).collect::<Vec<_>>(),
+            vec![(2, false), (1, true)]
+        );
+        assert_eq!(chains[1].self_wrap.len(), ROW_BYTES);
+
+        let r = ask(
+            &mut a,
+            AccountRequest::OwnBuckets {
+                conv: log.clone(),
+                after: None,
+            },
+        )
+        .await;
+        let AccountReply::OwnBuckets {
+            buckets,
+            more: false,
+            ..
+        } = r
+        else {
+            panic!("{r:?}")
+        };
+        let [OwnBucket {
+            bucket: 7,
+            version: 1,
+            seats: 1,
+            sealed: true,
+            own_row,
+        }] = &buckets[..]
+        else {
+            panic!("{buckets:?}")
+        };
+        assert_eq!(own_row.len(), OWN_ROW_BYTES);
+
+        let r = ask(
+            &mut a,
+            AccountRequest::BucketLists {
+                conv: log.clone(),
+                wanted: vec![(7, 0), (7, 1), (9, 0)],
+            },
+        )
+        .await;
+        assert!(
+            matches!(&r, AccountReply::BucketLists { lists, .. } if lists.len() == 2),
+            "{r:?}"
+        );
+        let r = ask(
+            &mut a,
+            AccountRequest::BucketLists {
+                conv: log.clone(),
+                wanted: vec![(7, 0); 33],
+            },
+        )
+        .await;
+        assert!(matches!(r, AccountReply::Error { .. }), "{r:?}");
+
+        // The proof of who held a chain's start: its seals, the links down to them, its rows
+        let r = ask(
+            &mut a,
+            AccountRequest::OwnChainRows {
+                conv: log.clone(),
+                chain: 1,
+                after: None,
+            },
+        )
+        .await;
+        let AccountReply::OwnChainRows {
+            seals,
+            direct,
+            links,
+            more: false,
+            ..
+        } = r
+        else {
+            panic!("{r:?}")
+        };
+        assert_eq!(seals.len(), 1);
+        assert!(direct.is_empty());
+        assert_eq!(
+            links.iter().map(|l| (l.0, l.1, l.2)).collect::<Vec<_>>(),
+            vec![(7, 1, 0)]
+        );
+
+        // None of it for anyone else's writer
+        let (mut d, _) = seated(&state, &log, "dan").await;
+        let r = ask(
+            &mut d,
+            AccountRequest::OwnChains {
+                conv: log.clone(),
+                before: None,
+            },
+        )
+        .await;
+        assert!(
+            matches!(&r, AccountReply::OwnChains { chains, .. } if chains.is_empty()),
+            "{r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn member_ids_come_a_page_at_a_time() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, aid) = seated(&state, &log, "alice").await;
+        let (_b, bid) = seated(&state, &log, "bob").await;
+        let r = ask(
+            &mut a,
+            AccountRequest::LogMemberIds {
+                conv: log.clone(),
+                after: None,
+            },
+        )
+        .await;
+        let AccountReply::LogMemberIdsFound {
+            mut ids,
+            more: false,
+            ..
+        } = r
+        else {
+            panic!("{r:?}")
+        };
+        ids.sort_unstable();
+        let mut want = vec![aid, bid];
+        want.sort_unstable();
+        assert_eq!(ids, want);
+        let r = ask(
+            &mut a,
+            AccountRequest::LogMemberIds {
+                conv: log.clone(),
+                after: Some(want[0]),
+            },
+        )
+        .await;
+        assert!(
+            matches!(&r, AccountReply::LogMemberIdsFound { ids, .. } if ids == &[want[1]]),
+            "{r:?}"
+        );
+        let (mut c, _) = register(&state, "cat").await;
+        let r = ask(
+            &mut c,
+            AccountRequest::LogMemberIds {
+                conv: log.clone(),
+                after: None,
+            },
+        )
+        .await;
+        assert!(matches!(r, AccountReply::Error { .. }), "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn a_row_of_any_other_length_is_refused() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, aid) = seated(&state, &log, "alice").await;
+        let (_b, bid) = seated(&state, &log, "bob").await;
+        let ecies = || vec![0xAB; 93];
+        let cases = [
+            Frame {
+                self_wrap: Some(ecies()),
+                ..Frame::start(1)
+            },
+            Frame {
+                step: Some(ecies()),
+                ..Frame::on(1, 1)
+            },
+            Frame {
+                link: Some((1, ecies())),
+                ..Frame::start(1)
+            },
+            Frame {
+                wraps: vec![ChainRow {
+                    recipient: bid,
+                    index: 0,
+                    wrapped: ecies(),
+                }],
+                ..Frame::start(1)
+            },
+            Frame {
+                buckets: vec![BucketIn {
+                    seats: vec![
+                        WrapIn {
+                            recipient: aid,
+                            wrapped: vec![0xEE; OWN_ROW_BYTES],
+                        },
+                        WrapIn {
+                            recipient: bid,
+                            wrapped: ecies(),
+                        },
+                    ],
+                    ..bucket(7, 0, aid, &[])
+                }],
+                ..Frame::start(1)
+            },
+            // The own row is the one that may be longer, and only it
+            Frame {
+                buckets: vec![BucketIn {
+                    seats: vec![
+                        WrapIn {
+                            recipient: aid,
+                            wrapped: row(),
+                        },
+                        WrapIn {
+                            recipient: bid,
+                            wrapped: row(),
+                        },
+                    ],
+                    ..bucket(7, 0, aid, &[])
+                }],
+                ..Frame::start(1)
+            },
+            // Without the writer's own row a device never gets the key back
+            Frame {
+                buckets: vec![BucketIn {
+                    seats: vec![WrapIn {
+                        recipient: bid,
+                        wrapped: row(),
+                    }],
+                    ..bucket(7, 0, aid, &[])
+                }],
+                ..Frame::start(1)
+            },
+            Frame {
+                seals: vec![ChainSeal {
+                    sealed: ecies(),
+                    ..seal(7, 0, 0)
+                }],
+                ..Frame::start(1)
+            },
+            // A wrap to ourselves is a self-wrap, or it is a state we did not wrap for us
+            Frame {
+                wraps: vec![direct(aid, 0)],
+                ..Frame::start(1)
+            },
+            // A list past what 64 seats seal to
+            Frame {
+                buckets: vec![BucketIn {
+                    list: vec![0; 28 + 24 * 65],
+                    ..bucket(7, 0, aid, &[])
+                }],
+                ..Frame::start(1)
+            },
+        ];
+        for f in cases {
+            assert!(refused_put(&put(&mut a, &log, f).await, "malformed"));
+        }
+        assert_eq!(count(&state, "SELECT COUNT(*) FROM voipc_chains").await, 0);
+    }
+
+    #[tokio::test]
+    async fn rows_reach_only_members() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, aid) = seated(&state, &log, "alice").await;
+        let (_b, bid) = seated(&state, &log, "bob").await;
+        let (_x, xid) = register(&state, "xavier").await;
+        let f = Frame {
+            wraps: vec![direct(xid.id, 0)],
+            ..Frame::start(1)
+        };
+        assert!(behind(&put(&mut a, &log, f).await));
+        let f = Frame {
+            buckets: vec![bucket(7, 0, aid, &[xid.id])],
+            ..Frame::start(1)
+        };
+        assert!(behind(&put(&mut a, &log, f).await));
+        assert_eq!(
+            count(&state, "SELECT COUNT(*) FROM voipc_chains").await,
+            0,
+            "all or nothing"
+        );
+        // A non-member's frame gets nothing filed, and a direct conversation has no chains
+        let (mut x, _) = register(&state, "xena").await;
+        let r = put(&mut x, &log, Frame::start(1)).await;
+        assert!(refused_put(&r, "not a conversation"), "{r:?}");
+        let dm = voipc_protocol::conv::dm_conv(&aid, &bid);
+        let r = put(&mut a, &dm, Frame::start(1)).await;
+        assert!(refused_put(&r, "not a channel"), "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn a_purge_takes_chains_buckets_and_rows() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, aid) = seated(&state, &log, "alice").await;
+        let (_b, bid) = seated(&state, &log, "bob").await;
+        sealed_chain(&mut a, &log, aid, &[bid]).await;
+        assert!(filed(&post(&mut a, &log, 1, 0).await));
+        let r = ask(
+            &mut a,
+            AccountRequest::LogPurge {
+                conv: Some(log.clone()),
+            },
+        )
+        .await;
+        assert!(
+            matches!(r, AccountReply::LogPurged { entries: 1, .. }),
+            "{r:?}"
+        );
+        for table in [
+            "voipc_writers",
+            "voipc_chains",
+            "voipc_seats",
+            "voipc_seals",
+            "voipc_bucket_lists",
+        ] {
+            assert_eq!(
+                count(&state, &format!("SELECT COUNT(*) FROM {table}")).await,
+                0,
+                "{table}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_new_chain_is_held_to_the_hours_budget() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, _) = seated(&state, &log, "alice").await;
+        assert!(stored(&put(&mut a, &log, Frame::start(1)).await));
+        let hour = l4f_accounts::util::now() / 3600;
+        run(
+            &state,
+            &format!("UPDATE voipc_writers SET hour = {hour}, new_this_hour = 60"),
+        )
+        .await;
+        let r = put(&mut a, &log, Frame::start(2)).await;
+        assert!(refused_put(&r, "Too many new keys"), "{r:?}");
+        run(
+            &state,
+            &format!("UPDATE voipc_writers SET hour = {}", hour - 1),
+        )
+        .await;
+        assert!(stored(&put(&mut a, &log, Frame::start(2)).await));
+        assert_eq!(
+            count(&state, "SELECT new_this_hour FROM voipc_writers").await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_joiner_answered_is_told_and_a_rotation_tells_nobody() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, aid) = seated(&state, &log, "alice").await;
+        let (mut b, bid) = seated(&state, &log, "bob").await;
+        let (mut c, cid) = seated(&state, &log, "cat").await;
+        run(
+            &state,
+            &format!(
+                "INSERT INTO voipc_pending (conv, owner, recipient, created_at) VALUES ('{log}', x'{}', x'{}', 1)",
+                hex::encode(aid),
+                hex::encode(bid)
+            ),
+        )
+        .await;
+        let f = Frame {
+            buckets: vec![bucket(7, 0, aid, &[bid, cid])],
+            seals: vec![seal(7, 0, 0)],
+            ..Frame::start(1)
+        };
+        assert!(stored(&put(&mut a, &log, f).await));
+        b.expect("news", |m| {
+            matches!(m, ServerMessage::Account(AccountReply::LogNews { .. }))
+        })
+        .await;
+        assert_eq!(count(&state, "SELECT COUNT(*) FROM voipc_pending").await, 0);
+        let quiet = tokio::time::timeout(Duration::from_millis(200), c.next()).await;
+        assert!(
+            !matches!(
+                quiet,
+                Ok(Some(ServerMessage::Account(AccountReply::LogNews { .. })))
+            ),
+            "{quiet:?}"
+        );
+    }
+
+    fn wait_of(owner: [u8; 16], who: [u8; 16], log: &str) -> String {
+        format!(
+            "INSERT INTO voipc_pending (conv, owner, recipient, created_at) VALUES ('{log}', x'{}', x'{}', 1)",
+            hex::encode(owner),
+            hex::encode(who)
+        )
+    }
+
+    /// A session that shares history.
+    async fn sharing(state: &Arc<ServerState>, c: &mut Client, id: [u8; 16]) {
+        let session = *state.account_sessions.get(&id).unwrap();
+        grant_share(state, session).await;
+        c.send(&ClientMessage::SetHistorySharing { enabled: true })
+            .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    async fn no_news(c: &mut Client) {
+        let quiet = tokio::time::timeout(Duration::from_millis(200), c.next()).await;
+        assert!(
+            !matches!(
+                quiet,
+                Ok(Some(ServerMessage::Account(AccountReply::LogNews { .. })))
+            ),
+            "{quiet:?}"
+        );
+    }
+
+    /// A sharer's answer comes in frames, one per chain. The wait ends at the last: a reader
+    /// told at the first reads past the chains with no row yet, and is told nothing again;
+    /// and a wait still on means the next `LogIndex` answers it again.
+    #[tokio::test]
+    async fn a_sharers_answer_ends_a_wait_only_at_its_last_frame() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, aid) = seated(&state, &log, "alice").await;
+        let (mut b, bid) = seated(&state, &log, "bob").await;
+        assert!(stored(&put(&mut a, &log, Frame::start(1)).await));
+        sharing(&state, &mut a, aid).await;
+        run(&state, &wait_of(aid, bid, &log)).await;
+        let waits = "SELECT COUNT(*) FROM voipc_pending";
+
+        let f = Frame {
+            wraps: vec![direct(bid, 0)],
+            ..Frame::on(1, 0)
+        };
+        assert!(stored(&put(&mut a, &log, f).await));
+        assert_eq!(count(&state, waits).await, 1, "a frame short of the last");
+        no_news(&mut b).await;
+        // Seated on a new chain, which is no answer from someone who shares: it owes what
+        // came before as well
+        let f = Frame {
+            buckets: vec![bucket(7, 0, aid, &[bid])],
+            seals: vec![seal(7, 0, 0)],
+            ..Frame::start(2)
+        };
+        assert!(stored(&put(&mut a, &log, f).await));
+        assert_eq!(count(&state, waits).await, 1, "a seat");
+        no_news(&mut b).await;
+
+        let f = Frame {
+            wraps: vec![direct(bid, 0)],
+            last: true,
+            ..Frame::on(2, 0)
+        };
+        assert!(stored(&put(&mut a, &log, f).await));
+        assert_eq!(count(&state, waits).await, 0);
+        b.expect("news", |m| {
+            matches!(m, ServerMessage::Account(AccountReply::LogNews { .. }))
+        })
+        .await;
+    }
+
+    /// Someone leaves while an answer goes out. That is not the writer's mistake to read
+    /// back from, and four of those gave up on everyone else's answer and on its posts.
+    #[tokio::test]
+    async fn rows_alone_to_someone_gone_are_dropped_and_the_rest_filed() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, aid) = seated(&state, &log, "alice").await;
+        let (_b, bid) = seated(&state, &log, "bob").await;
+        let (_x, xid) = register(&state, "xavier").await;
+        assert!(stored(&put(&mut a, &log, Frame::start(1)).await));
+        sharing(&state, &mut a, aid).await;
+        let f = Frame {
+            wraps: vec![direct(xid.id, 0), direct(bid, 0)],
+            ..Frame::on(1, 0)
+        };
+        assert!(stored(&put(&mut a, &log, f).await));
+        assert_eq!(
+            count(&state, "SELECT COUNT(*) FROM voipc_chain_wraps").await,
+            1,
+            "a row reaches only members"
+        );
+        // A step is another matter: it is held to who is new
+        let f = Frame {
+            step: Some(row()),
+            wraps: vec![direct(xid.id, 1)],
+            ..Frame::on(1, 1)
+        };
+        assert!(behind(&put(&mut a, &log, f).await));
+    }
+
+    /// Rows made while someone had no log key were blanks, however they look. A first key
+    /// makes them missing, or that writer's chain never gives them a real one.
+    #[tokio::test]
+    async fn a_first_log_key_makes_rows_under_none_missing() {
+        use voipc_crypto::log::LogKey;
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, _) = seated(&state, &log, "alice").await;
+        let (mut m, info, signed) = register_with(&state, "mallory").await;
+        lounge(&state, &mut m, &info.id).await;
+        ask(&mut m, AccountRequest::LogJoin { conv: log.clone() }).await;
+        let f = Frame {
+            wraps: vec![direct(info.id, 0)],
+            ..Frame::start(1)
+        };
+        assert!(stored(&put(&mut a, &log, f).await));
+        assert!(filed(&post(&mut a, &log, 1, 0).await));
+
+        let key = LogKey::generate();
+        let publish = AccountRequest::LogKeyPublish {
+            logkey: key.public(),
+            sig: key.endorse(&signed.identity),
+        };
+        assert!(matches!(
+            ask(&mut m, publish.clone()).await,
+            AccountReply::LogKeyStored
+        ));
+        let r = post(&mut a, &log, 1, 0).await;
+        assert!(
+            matches!(&r, AccountReply::ChainRekey { new_chain: false, missing, .. } if missing == &[info.id]),
+            "{r:?}"
+        );
+        // The same key again changes nothing, and a real row stays
+        let f = Frame {
+            step: Some(row()),
+            wraps: vec![direct(info.id, 1)],
+            ..Frame::on(1, 1)
+        };
+        assert!(stored(&put(&mut a, &log, f).await));
+        assert!(matches!(
+            ask(&mut m, publish).await,
+            AccountReply::LogKeyStored
+        ));
+        assert!(filed(&post(&mut a, &log, 1, 1).await));
+    }
+
+    /// A writer who has switched sharing off will not answer: nobody waits on them.
+    #[tokio::test]
+    async fn a_switch_turned_off_ends_every_wait_on_that_writer() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, aid) = seated(&state, &log, "alice").await;
+        let (_b, bid) = seated(&state, &log, "bob").await;
+        assert!(stored(&put(&mut a, &log, Frame::start(1)).await));
+        sharing(&state, &mut a, aid).await;
+        run(&state, &wait_of(aid, bid, &log)).await;
+        a.send(&ClientMessage::SetHistorySharing { enabled: false })
+            .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(count(&state, "SELECT COUNT(*) FROM voipc_pending").await, 0);
+    }
+
+    /// An old key on a channel is part of an answer to joiners, so it ends no wait and tells
+    /// nobody, and someone who left since is out of it.
+    #[tokio::test]
+    async fn an_old_key_on_a_channel_ends_no_wait() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, aid) = seated(&state, &log, "alice").await;
+        let (mut b, bid) = seated(&state, &log, "bob").await;
+        let (_x, xid) = register(&state, "xavier").await;
+        run(
+            &state,
+            &format!(
+                "INSERT INTO voipc_wraps (conv, owner, epoch, recipient, wrapped, created_at)
+                   VALUES ('{log}', x'{}', 5, x'{}', x'01', 1)",
+                hex::encode(aid),
+                hex::encode(aid)
+            ),
+        )
+        .await;
+        run(&state, &wait_of(aid, bid, &log)).await;
+        let wrap = |recipient: [u8; 16]| WrapIn {
+            recipient,
+            wrapped: vec![1; 93],
+        };
+        let r = ask(
+            &mut a,
+            AccountRequest::EpochPut {
+                conv: log.clone(),
+                epoch: 5,
+                wraps: vec![wrap(bid), wrap(xid.id)],
+            },
+        )
+        .await;
+        assert!(matches!(r, AccountReply::EpochStored { .. }), "{r:?}");
+        assert_eq!(count(&state, "SELECT COUNT(*) FROM voipc_wraps").await, 2);
+        assert_eq!(count(&state, "SELECT COUNT(*) FROM voipc_pending").await, 1);
+        no_news(&mut b).await;
+    }
+
+    #[tokio::test]
+    async fn direct_conversations_come_first_in_the_index_and_nothing_crowds_them_out() {
+        let (state, _db, log) = relay_kept(10, 256).await;
+        let (mut a, aid) = seated(&state, &log, "alice").await;
+        let (_b, bid) = seated(&state, &log, "bob").await;
+        let dm = voipc_protocol::conv::dm_conv(&aid, &bid);
+        entry(&state, &log, bid, 1, -1000, 300 * DAY_MS).await;
+        entry(&state, &dm, bid, 1, -1000, 300 * DAY_MS).await;
+        // Past the old limit of 512, in channels this account keeps
+        for i in 0..520 {
+            let conv = format!("c:{i:032x}");
+            run(&state, &format!("INSERT INTO voipc_members (conv, account, joined_at) VALUES ('{conv}', x'{}', 1)", hex::encode(aid))).await;
+            entry(&state, &conv, bid, 1, -1000, 300 * DAY_MS).await;
+        }
+        a.send(&ClientMessage::Account(AccountRequest::LogIndex))
+            .await;
+        let mut pages = Vec::new();
+        for _ in 0..2 {
+            let m = a
+                .expect("LogConvs", |m| {
+                    matches!(m, ServerMessage::Account(AccountReply::LogConvs { .. }))
+                })
+                .await;
+            let ServerMessage::Account(AccountReply::LogConvs { convs }) = m else {
+                unreachable!()
+            };
+            pages.push(convs);
+        }
+        assert_eq!(pages[0][0].0, dm, "first");
+        assert_eq!(pages[0].len(), 512);
+        assert_eq!(pages[1].len(), 10, "all of them, in several answers");
     }
 }

@@ -184,6 +184,19 @@ async function realKey(tab, key) {
 }
 
 /** A real mouse click: hit-tested, trusted, and subject to pointer capture. */
+/** Settings: the switch to share history, which starts off. Every tab here shares one
+ *  localStorage, so it moves them all. */
+async function shareSwitch(tab, on) {
+  const box = `[...document.querySelectorAll(".toggle-row")].find((r) => r.textContent.includes("Share recent channel chat"))?.querySelector("input")`;
+  await realClick(tab, ".settings-btn");
+  await waitFor(tab, `document.querySelector(".tab")`, 8_000);
+  await tab.evaluate(`[...document.querySelectorAll(".tab")].find((b) => b.textContent.trim() === "Privacy & data")?.click()`);
+  await waitFor(tab, box);
+  if ((await tab.evaluate(`${box}.checked`)) !== on) await tab.evaluate(`${box}.click()`);
+  await tab.evaluate(`document.querySelector(".panel .close-btn")?.click()`);
+  await sleep(300);
+}
+
 async function realClick(tab, selector) {
   await tab.toFront();
   const at = await tab.evaluate(centre(selector));
@@ -2562,6 +2575,7 @@ async function chatLane() {
   await editsLane();
   await emotesLane();
   await sleep(Math.max(0, letGo - Date.now()));
+  await shareSwitch(ann, true);
   const cat = await connect(`ui-fc-${n}`);
   await enter(cat);
   // The two messages come to cat as ann's copy of the channel's history
@@ -2584,6 +2598,8 @@ async function chatLane() {
   check("in a direct message too, its sender sends it again once the relay let go", await waitFor(dee,
     `${rowWith("load me once the relay let go")}?.querySelector(".file-card img")?.naturalWidth > 0`, 45_000).then(() => true, () => false),
     await dee.evaluate(`${rowWith("load me once the relay let go")}?.querySelector(".file-card")?.textContent ?? "no card"`));
+
+  await shareSwitch(ann, false);
 
   for (const [who, tab] of [["sender", ann], ["receiver", ben], ["late joiner", cat], ["direct partner", dee]]) {
     const fatal = tab.errors.filter((e) => !/Failed to load resource/.test(e));
@@ -2759,6 +2775,12 @@ async function editsLane() {
   await sleep(500);
   check("and a pin leads to its message", await ben.evaluate(`${rowWith("react to this one")}?.classList.contains("flash") ?? false`));
 
+  // ── Sharing starts off, and every tab here shares one localStorage, so one switch moves them all ──
+  const marks = `document.querySelectorAll(".user-list.modern .sharing-history").length`;
+  check("nobody shares until they turn it on", (await ann.evaluate(marks)) === 0);
+  await shareSwitch(ann, true);
+  check("on in one tab, the other tab shares too", await waitFor(ben, `${marks} >= 2`, 8_000).then(() => true, () => false), await ben.evaluate(marks));
+
   // ── Someone who joins later: the edit comes with the history, the delete never ──
   const cy = await connect(`ui-ec-${n}`);
   await openChannel(cy, ROOM, "dblclick");
@@ -2774,6 +2796,11 @@ async function editsLane() {
     await cy.send("Input.dispatchKeyEvent", { type, key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
   }
   await sleep(200);
+  await shareSwitch(ann, false);
+  check("off in one tab, the other tab stops too", await waitFor(cy, `${marks} === 0`, 8_000).then(() => true, () => false), await cy.evaluate(marks));
+  await say(ben, "and it stays off");
+  await sleep(300);
+  check("and no tab writes it back on", await ben.evaluate(`JSON.parse(localStorage.getItem("voipc.settings")).share_channel_history === false`));
 
   // ── Forward: a file, as it is, to a conversation it was never in ──
   const dir = mkdtempSync(join(tmpdir(), "voipc-ui-fwd-"));
@@ -3147,13 +3174,15 @@ async function accountsLane() {
   const safety = async (tab, other) => {
     const row = `[...document.querySelectorAll(".user .name")].find((e) => e.title === ${JSON.stringify(other)})`;
     await waitFor(tab, row, 15_000);
-    await sleep(1500); // the pre-key bundles, which carry the identities, follow the roster
-    await tab.evaluate(`(() => { const el = ${row}?.closest(".user"); if (!el) return false;
-      el.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, clientX: 40, clientY: 40 })); return true; })()`);
-    await sleep(300);
-    await tab.evaluate(`(() => { const b = [...document.querySelectorAll(".ctx-item")].find((e) => e.textContent.includes("Verify identity"));
-      if (!b) return false; b.click(); return true; })()`);
-    await waitFor(tab, `document.querySelector('.account-dialog[data-kind="safety"] .secret')`, 10_000).catch(() => {});
+    // Someone never met takes two: the first asks for their key, and says so
+    for (let i = 0; i < 3 && !(await tab.evaluate(`!!document.querySelector('.account-dialog[data-kind="safety"] .secret')`)); i++) {
+      await tab.evaluate(`(() => { const el = ${row}?.closest(".user"); if (!el) return false;
+        el.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, clientX: 40, clientY: 40 })); return true; })()`);
+      await sleep(300);
+      await tab.evaluate(`(() => { const b = [...document.querySelectorAll(".ctx-item")].find((e) => e.textContent.includes("Verify identity"));
+        if (!b) return false; b.click(); return true; })()`);
+      await waitFor(tab, `document.querySelector('.account-dialog[data-kind="safety"] .secret')`, 2_000).catch(() => {});
+    }
     const n = await tab.evaluate(`document.querySelector('.account-dialog[data-kind="safety"] .secret')?.textContent?.trim() ?? ""`);
     await tab.evaluate(click('.account-dialog[data-kind="safety"] .submit-btn'));
     return n;
@@ -3240,7 +3269,9 @@ async function accountsLane() {
   check("none of it counted as new", noUnread);
   await openKept(back);
   const keptBack = await reads(back, inKept);
-  await sleep(2500); // a member's hand-off offers it again meanwhile, under the id it had
+  // Nobody on this relay holds Share history, so no hand-off offers it again here:
+  // chat-rules.test.ts holds "a message offered twice is stored once"
+  await sleep(2500);
   const copies = await back.evaluate(`[...document.querySelectorAll(".msg-content")].filter((e) => e.textContent.includes(${JSON.stringify(inKept)})).length`);
   check("a channel's message comes back once, whoever else offers it", keptBack && copies === 1, `${copies} of: ${await texts(back)}`);
   check("and a second reload finds the same", await reload(back));
@@ -3277,7 +3308,8 @@ async function accountsLane() {
   await sayIn(back, dmNote);
   const dmKept = await waitFor(
     back,
-    `[...document.querySelectorAll(".history-marker")].some((e) => e.textContent.includes("kept there for when they are back"))`,
+    // This tab reloaded, so it has no session with them yet, and a bundle for someone gone says no more
+    `[...document.querySelectorAll(".history-marker")].some((e) => /kept there for when they are back|kept on the server for them/.test(e.textContent))`,
     15_000,
   ).then(() => true, () => false);
   check("a message to somebody who left is kept for them, and says so", dmKept, await markers(back));
@@ -3696,6 +3728,18 @@ if (PORT2) {
     "a 0.12 browser's settings are not set aside as unreadable",
     await old.evaluate(`localStorage.getItem("voipc.settings.unreadable") === null`),
   );
+  const noticed = `[...document.querySelectorAll(".toast-message")].some((t) => t.textContent.includes("Sharing with newcomers is off now"))`;
+  check("a 0.12 browser's saved switch goes off", await old.evaluate(`JSON.parse(localStorage.getItem("voipc.settings")).share_channel_history === false`));
+  check("with one notice", await waitFor(old, noticed, 8_000).then(() => true, () => false));
+  await sleep(500);
+  await old.send("Page.navigate", { url: `https://127.0.0.1:${PORT2}/` });
+  await waitFor(old, `document.querySelector(".skip-link") || document.querySelector(".connect-btn")`);
+  await sleep(1500);
+  check("and none after a reload", !(await old.evaluate(noticed)) && (await old.evaluate(`JSON.parse(localStorage.getItem("voipc.settings")).share_channel_history === false`)));
+  if (await old.evaluate(`!!document.querySelector(".skip-link")`)) {
+    await old.evaluate(click(".skip-link"));
+    await waitFor(old, `document.querySelector(".connect-btn")`);
+  }
   check(
     "a 0.12 browser's saved server is still offered",
     await old.evaluate(`[...document.querySelectorAll(".saved-server")].some((e) =>

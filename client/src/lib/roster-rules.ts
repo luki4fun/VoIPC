@@ -27,8 +27,12 @@ export function worthAsking(
   currentChannelId: number,
   admin: boolean,
   joinedTextChannelIds: ReadonlySet<number> = new Set(),
+  live = false,
 ): boolean {
   if (channel.channel_id === currentChannelId) return false;
+  // On the live path nothing asks about a text channel by itself: an ask says which one a
+  // person looks at. An open one's list is who is online, and the sweep keeps the others.
+  if (live && channel.text) return false;
   if (admin) return true;
   // A text channel we joined answers us as a member: the server asks whether
   // we are *in* the channel, not which one we stand in. Without this a text
@@ -69,6 +73,75 @@ export function trustRosterCount(
     channel.channel_id === currentChannelId ||
     worthAsking(channel, currentChannelId, admin, joinedTextChannelIds)
   );
+}
+
+/** Someone came to a channel or left one, as the broadcast said it. */
+export type RosterChange = { join: UserInfo } | { left: number; channel: number };
+
+/**
+ * A batch of comings and goings, in the order they came, over the rosters: what each
+ * changes, and by how much each channel's count moves. Someone already on the list is
+ * replaced and not counted twice, as a list and a broadcast are built separately. A join
+ * with no name or no id says only that the count moved: it is all this client may know.
+ */
+export function applyRosterChanges(
+  rosters: ReadonlyMap<number, UserInfo[]>,
+  changes: readonly RosterChange[],
+): { rosters: Map<number, UserInfo[]>; moved: Map<number, number> } {
+  const next = new Map(rosters);
+  const moved = new Map<number, number>();
+  const count = (channel: number, by: number) => moved.set(channel, (moved.get(channel) ?? 0) + by);
+  for (const change of changes) {
+    if ("join" in change) {
+      const u = change.join;
+      const list = next.get(u.channel_id);
+      if (!u.username || !u.user_id) {
+        count(u.channel_id, 1);
+      } else if (list?.some((x) => x.user_id === u.user_id)) {
+        next.set(u.channel_id, list.map((x) => (x.user_id === u.user_id ? u : x)));
+      } else {
+        next.set(u.channel_id, [...(list ?? []), u]);
+        count(u.channel_id, 1);
+      }
+    } else {
+      const list = next.get(change.channel);
+      if (list) next.set(change.channel, list.filter((x) => x.user_id !== change.left));
+      count(change.channel, -1);
+    }
+  }
+  return { rosters: next, moved };
+}
+
+/**
+ * Who is online in `rosters`, by id: General and the rooms, whose lists anyone may ask for.
+ * On the live path that is who may be reading an open text channel.
+ */
+export function onlineIn(
+  rosters: ReadonlyMap<number, UserInfo[]>,
+  channels: readonly Pick<ChannelInfo, "channel_id" | "text">[],
+  ownUsers: readonly UserInfo[],
+): Map<number, UserInfo> {
+  const text = new Set(channels.filter((c) => c.text).map((c) => c.channel_id));
+  const online = new Map<number, UserInfo>();
+  for (const [channelId, list] of rosters) {
+    if (text.has(channelId)) continue;
+    for (const u of list) online.set(u.user_id, u);
+  }
+  for (const u of ownUsers) online.set(u.user_id, u);
+  return online;
+}
+
+/** Who a channel's pane lists: on the live path everyone online for an open text channel,
+ *  where anyone may read, and otherwise that channel's own list. */
+export function listedHere(
+  channelId: number,
+  rosters: ReadonlyMap<number, UserInfo[]>,
+  currentChannelId: number,
+  ownUsers: UserInfo[],
+  channels: readonly Pick<ChannelInfo, "channel_id" | "text">[],
+  openText: boolean,
+): UserInfo[] {
+  return openText ? [...onlineIn(rosters, channels, ownUsers).values()] : rosterOf(channelId, rosters as Map<number, UserInfo[]>, currentChannelId, ownUsers);
 }
 
 /**

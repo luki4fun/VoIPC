@@ -44,6 +44,13 @@ export function resolveRejoin(
   return found;
 }
 
+/** The toast at a drop: "Connection lost" once, however the transport's words repeat it. */
+export function connectionLostLine(reason: string): string {
+  const rest = reason.replace(/^(connection lost:?\s*)+/i, "").trim();
+  if (!rest) return "Connection lost";
+  return rest.startsWith("(") ? `Connection lost ${rest}` : `Connection lost: ${rest}`;
+}
+
 /**
  * How long a reconnect waits before attempt `attempt` (1, 2, …): doubling to
  * at most 10 s, then spread over half to one and a half times that. Without

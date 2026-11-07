@@ -8,8 +8,10 @@
 type Cursors = Record<string, number>;
 
 export interface PageMemory {
-  /** The `LogMemory` this page's sessions go on from (JSON), or none. */
+  /** The `LogMemory` this page's sessions go on from (JSON), or none, without who was named. */
   json: string | null;
+  /** Who was named (`readers` and `named`, JSON), kept apart: log-named.ts. */
+  named: string | null;
   /** What earlier pages had read: frozen at page load. */
   seen: Cursors;
 }
@@ -24,11 +26,20 @@ function parse(json: string): (Record<string, unknown> & { cursors?: Cursors }) 
 }
 
 /** A fresh page, from what `localStorage` kept: no cursors to go on from, and
- *  everything else (who was named a reader, the vault's generations) as it was. */
-export function freshPage(stored: string | null): PageMemory {
+ *  everything else (the vault's generations) as it was, with who was named as
+ *  `named` holds it. A memory from before they moved holds them itself. */
+export function freshPage(stored: string | null, named: string | null = null): PageMemory {
   const memory = stored === null ? null : parse(stored);
-  if (!memory) return { json: null, seen: {} };
-  return { json: JSON.stringify({ ...memory, cursors: {} }), seen: memory.cursors ?? {} };
+  if (!memory) return { json: null, named, seen: {} };
+  const { readers, named: lists, ...rest } = memory;
+  const inside = readers || lists ? JSON.stringify({ readers: readers ?? {}, named: lists ?? {} }) : null;
+  return { json: JSON.stringify({ ...rest, cursors: {} }), named: named ?? inside, seen: memory.cursors ?? {} };
+}
+
+/** The whole `LogMemory` a session starts from. */
+export function wholeMemory(page: PageMemory): string | null {
+  if (!page.named) return page.json;
+  return JSON.stringify({ cursors: {}, ...parse(page.json ?? "{}"), ...parse(page.named) });
 }
 
 /** What `localStorage` keeps of a session's memory: per conversation the

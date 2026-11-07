@@ -37,6 +37,7 @@
   import { isWeb } from "../stores/platform.js";
   import { addNotification } from "../stores/notifications.js";
   import { KeyCapture, shadows } from "../keybind.js";
+  import { eachOnce } from "../stores/upsert.js";
   import {
     defaultDeviceName as defaultName,
     inputDevices,
@@ -329,7 +330,7 @@
         value={$inputDevice || defaultName($inputDevices)}
         onchange={(e) => pickInput(e.currentTarget.value)}
       >
-        {#each $inputDevices as device (device.name)}
+        {#each eachOnce($inputDevices, (d) => d.name) as device (device.name)}
           <option value={device.name}>{device.name}{device.is_default ? " (Default)" : ""}</option>
         {/each}
       </select>
@@ -360,7 +361,7 @@
         value={$outputDevice || defaultName($outputDevices)}
         onchange={(e) => pickOutput(e.currentTarget.value)}
       >
-        {#each $outputDevices as device (device.name)}
+        {#each eachOnce($outputDevices, (d) => d.name) as device (device.name)}
           <option value={device.name}>{device.name}{device.is_default ? " (Default)" : ""}</option>
         {/each}
       </select>
@@ -544,8 +545,8 @@
 
   .device {
     width: 100%;
-    padding: 8px;
-    background: var(--bg-primary);
+    padding: 8px 28px 8px 8px;
+    background-color: var(--bg-primary);
     color: var(--text-primary);
     border: 1px solid var(--border);
     border-radius: 4px;

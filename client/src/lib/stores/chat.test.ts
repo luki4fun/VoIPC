@@ -6,7 +6,9 @@ import assert from "node:assert/strict";
 import { get } from "svelte/store";
 
 await import("./node-stores.mjs");
+const { MAX_MESSAGES } = await import("../chat-rules.ts");
 const {
+  addChannelLineAtTop,
   addChannelMessage,
   addDmMessage,
   applyChannelEvent,
@@ -252,4 +254,16 @@ test("a report to someone away is filed under their row, not the open conversati
   addDmMessage(server, 1, 5, "erin", 1, { ...own, user_id: 5, username: "erin", id: "e1" });
   assert.equal(ensureAwayDm(server, "erin", "ee".repeat(16)), 5);
   assert.equal(get(dmConversations.peek(server)).find((c) => c.username === "erin")?.account, "ee".repeat(16));
+});
+
+test("a line at the top of a full channel pushes out the oldest, never the newest", () => {
+  const s = "linetop.example:9987";
+  const rows = Array.from({ length: MAX_MESSAGES }, (_, i) => ({ user_id: 1, username: "a", content: `m${i}`, timestamp: i + 1 }));
+  channelMessages.update((m) => new Map(m).set(chatKey(s, "full"), rows));
+  addChannelLineAtTop(s, "full", "Some earlier messages here can't be opened.");
+  const after = get(channelMessages).get(chatKey(s, "full"))!;
+  assert.equal(after.length, MAX_MESSAGES);
+  assert.equal(after[0].kind, "notice", "the line is on top");
+  assert.equal(after.at(-1)!.content, `m${MAX_MESSAGES - 1}`, "the newest row stays");
+  assert.equal(after[1].content, "m1", "the oldest went");
 });

@@ -367,6 +367,32 @@ pub struct AccountInfo {
     pub totp_enabled: bool,
 }
 
+/// The privilege to share history with newcomers, once its holder turns the switch on.
+pub const SHARE_HISTORY: &str = "voipc:share_history";
+/// The protocol that brought it: a relay before this has no such privilege to give.
+pub const SHARE_HISTORY_SINCE: u32 = 21;
+/// The protocol that brought the live path for text channels: an app asks for it at once
+/// on a relay at this or later, and runs the old key paths on anything older.
+pub const LIVE_PATH_SINCE: u32 = 21;
+/// The protocol that brought chains and buckets for a channel's kept messages: older relays
+/// keep theirs on a writer's epochs, as direct conversations do everywhere.
+pub const KEPT_CHAINS_SINCE: u32 = 21;
+/// The protocol that brought paged pins: `item.pins` says which pages there are, and the
+/// pages `pins.0` up to `PIN_PAGES` lie outside the sign-in frame. Older relays keep one item.
+pub const VAULT_PAGES_SINCE: u32 = 21;
+pub const PIN_PAGES: u16 = 56;
+
+/// Whether this connection's switch counts here. No accounts, or a relay too old to
+/// have the privilege: yes. Otherwise an account holding it. `scopes`: None for a guest.
+pub fn may_share_history(proto: u32, has_accounts: bool, scopes: Option<&[String]>) -> bool {
+    proto < SHARE_HISTORY_SINCE
+        || !has_accounts
+        || scopes.is_some_and(|held| {
+            held.iter()
+                .any(|s| s == "*" || s == "voipc:*" || s == SHARE_HISTORY)
+        })
+}
+
 // ── Server administration (protocol v16) ────────────────────────────────
 
 /// An account as the admin pages list it: no address, no e-mail.
@@ -474,8 +500,8 @@ pub struct Restriction {
 
 // ── The move from Discord (protocol v20) ────────────────────────────────
 
-/// A frame of an import is built under this, and checked: nothing else guards a client's
-/// frame (`encode_client_msg` has no limit; `try_decode_frame` ends the connection).
+/// A frame of an import is built under this, and checked: `encode_client_msg` refuses one
+/// past the limit, which would lose that frame, and `try_decode_frame` ends the connection.
 pub const IMPORT_FRAME_BYTES: usize = 48 * 1024;
 /// The most a message's text may be: Discord's 4,000 characters at four bytes each.
 pub const IMPORT_BODY_BYTES: usize = 16 * 1024;
@@ -1200,5 +1226,36 @@ mod tests {
         let bytes = postcard::to_allocvec(&info).unwrap();
         let decoded: UserInfo = postcard::from_bytes(&bytes).unwrap();
         assert!(!decoded.is_screen_sharing);
+    }
+
+    #[test]
+    fn may_share_history_table() {
+        let held = |s: &str| vec![s.to_string()];
+        let none: Vec<String> = Vec::new();
+        for (proto, accounts, scopes, want) in [
+            // Too old to have the privilege: the switch alone
+            (20, true, None, true),
+            (20, true, Some(none.clone()), true),
+            (20, false, None, true),
+            // No accounts: the switch alone
+            (21, false, None, true),
+            (21, false, Some(none.clone()), true),
+            // Accounts: a guest never, an account by what it holds
+            (21, true, None, false),
+            (21, true, Some(none.clone()), false),
+            (21, true, Some(held("voipc:kick")), false),
+            (21, true, Some(held(SHARE_HISTORY)), true),
+            (21, true, Some(held("*")), true),
+            (21, true, Some(held("voipc:*")), true),
+            (21, true, Some(held("voipc:share_historyx")), false),
+            (21, true, Some(held("voipcx:*")), false),
+            (22, true, None, false),
+        ] {
+            assert_eq!(
+                may_share_history(proto, accounts, scopes.as_deref()),
+                want,
+                "{proto} {accounts} {scopes:?}"
+            );
+        }
     }
 }

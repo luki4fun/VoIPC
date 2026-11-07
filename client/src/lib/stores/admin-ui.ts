@@ -19,6 +19,7 @@ import { mergeBanPage, type BanPage } from "../move-rules.js";
 import { mergeModRows, removalDone } from "../modlog-rules.js";
 import { addNotification } from "./notifications.js";
 import { scoped } from "./scoped.js";
+import { eachOnce } from "./upsert.js";
 import { PANEL_SCOPES } from "../scopes.js";
 import type { AdminReply, BanInfo } from "../types.js";
 import {
@@ -78,10 +79,12 @@ serverAddress.subscribe(() => {
 });
 
 // A relay before protocol 20 sends the whole list, and nothing at all past a frame's worth
-listenServer<{ bans: BanInfo[] }>("admin-bans", (server, data) => {
-  bans.of(server).set(data.bans);
-  banTotal.of(server).set(data.bans.length);
-});
+export function onAdminBans(server: string, data: { bans: BanInfo[] }): void {
+  const list = eachOnce(data.bans, (b) => b.id);
+  bans.of(server).set(list);
+  banTotal.of(server).set(list.length);
+}
+listenServer<{ bans: BanInfo[] }>("admin-bans", onAdminBans);
 listenServer<BanPage>("admin-bans-page", (server, data) => {
   const wanted = get(banSearch.of(server));
   if (data.search !== wanted) {
@@ -190,7 +193,7 @@ export function submitStepUp(code: string): void {
   void adminOp(op, code.trim(), server);
 }
 
-listenServer<unknown>("account-reply", (server, raw) => {
+export function onAdminReply(server: string, raw: unknown): void {
   const r = raw as { Admin?: AdminReply; Error?: { request: string; reason: string } };
   if (r.Error?.request === "Admin") {
     adminError.of(server).set(r.Error.reason);
@@ -213,13 +216,13 @@ listenServer<unknown>("account-reply", (server, raw) => {
   }
   if ("Users" in a) adminUsers.of(server).set(a.Users);
   else if ("User" in a) adminUser.of(server).set(a.User);
-  else if ("Groups" in a) adminGroups.of(server).set(a.Groups.groups);
-  else if ("Members" in a) adminMembers.of(server).set(a.Members);
-  else if ("Invites" in a) adminInvites.of(server).set(a.Invites.invites);
+  else if ("Groups" in a) adminGroups.of(server).set(eachOnce(a.Groups.groups, (g) => g.name).map((g) => ({ ...g, scopes: [...new Set(g.scopes)] })));
+  else if ("Members" in a) adminMembers.of(server).set({ ...a.Members, users: eachOnce(a.Members.users, (u) => u.name) });
+  else if ("Invites" in a) adminInvites.of(server).set(eachOnce(a.Invites.invites, (i) => i.id));
   else if ("InviteCode" in a) inviteCode.of(server).set(a.InviteCode.code);
-  else if ("InviteLinks" in a) adminInviteLinks.of(server).set(a.InviteLinks.links);
+  else if ("InviteLinks" in a) adminInviteLinks.of(server).set(eachOnce(a.InviteLinks.links, (l) => l.id));
   else if ("InviteLinkCode" in a) inviteLinkCode.of(server).set(a.InviteLinkCode.code);
-  else if ("Gate" in a) adminGate.of(server).set(a.Gate);
+  else if ("Gate" in a) adminGate.of(server).set({ ...a.Gate, groups: [...new Set(a.Gate.groups)] });
   else if ("PostsRemoved" in a) {
     removalWithCode.delete(server);
     stepUp.of(server).set(null);
@@ -235,4 +238,5 @@ listenServer<unknown>("account-reply", (server, raw) => {
       keep_days,
     }));
   }
-});
+}
+listenServer<unknown>("account-reply", onAdminReply);

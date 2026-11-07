@@ -52,6 +52,12 @@ export function moves(p: number | null): boolean {
   return p === null || p >= 20;
 }
 
+/** The live path (protocol 21): following a text channel is one frame and tells nobody, no
+ *  roster comes with it, and a writer's posts go only to whom it was told of. */
+export function livePath(p: number | null): boolean {
+  return p === null || p >= 21;
+}
+
 /** What the banner names as off on a relay of protocol `p`. */
 export function missing(p: number | null): string[] {
   if (p === null) return [];

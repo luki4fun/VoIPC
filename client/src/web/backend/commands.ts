@@ -8,7 +8,8 @@
 import { audio } from "./audio";
 import { video } from "./video";
 import { share } from "./share";
-import { getConfig, resetConfig, updateConfig } from "./config";
+import { getConfig, onShareMoved, resetConfig, updateConfig } from "./config";
+import { emit as emitEvent } from "./events";
 import * as session from "./session";
 import { forgetDevice, listDevices } from "./devices";
 import { wasm } from "./wasm";
@@ -87,6 +88,10 @@ function num(v: unknown, name: string): number {
 
 function u32(v: unknown, name: string): number {
   return typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= 0xffff_ffff ? v : fail(`invalid ${name}`);
+}
+
+function ids(v: unknown, name: string): number[] {
+  return Array.isArray(v) ? v.map((id) => u32(id, name)) : fail(`invalid ${name}`);
 }
 
 function bool(v: unknown, name: string): boolean {
@@ -177,6 +182,22 @@ function laneEffect(effect: unknown): string {
   return name;
 }
 
+/** The switch moved: every open server. None is not a failure: the flag goes out again on
+ *  the next connect, from the config already written. */
+function moveShare(on: boolean): void {
+  for (const s of session.allSessions()) {
+    // A switch that does not count here is no news to this relay
+    if (!on || s.mayShare()) s.sendControl({ SetHistorySharing: { enabled: on } });
+    // The same consent hands our older keys to who joins a channel's log.
+    s.account?.setShare(on);
+  }
+}
+
+onShareMoved((on) => {
+  moveShare(on);
+  emitEvent("share-switch", on);
+});
+
 const handlers: Record<string, Handler> = {
   // ── connection ──
   connect: ({ address, username, account }) => {
@@ -218,9 +239,17 @@ const handlers: Record<string, Handler> = {
     if (!s?.account) fail("No sign-in is waiting for that.");
     s.account.answerProvider(answer as ProviderAnswer);
   },
-  account_pair_answer: ({ server, pair, yes }) => {
+  account_pair_look: ({ server, pair }) => {
     const { s, account } = needAccount(server);
-    account.pairAnswer(s, pair as number, yes === true);
+    account.pairLook(s, pair as number);
+  },
+  account_pair_answer: ({ server, pair, code }) => {
+    const { s, account } = needAccount(server);
+    account.pairAnswer(s, pair as number, str(code, "code"));
+  },
+  account_pair_decline: ({ server, pair }) => {
+    const { s, account } = needAccount(server);
+    account.pairDecline(s, pair as number);
   },
   account_provider_start: ({ server, provider, link, password, totp, recovery }) => {
     const { s, account } = needAccount(server);
@@ -271,7 +300,10 @@ const handlers: Record<string, Handler> = {
       name: d.name,
       relay_id: toHex(d.relay_id),
     })),
-  forget_device: ({ server, name }) => forgetDevice(str(server, "server"), str(name, "name")),
+  forget_device: ({ server, name }) => {
+    session.forgetKept(str(server, "server"));
+    return forgetDevice(str(server, "server"), str(name, "name"));
+  },
   send_kept_dm: ({ server, account, content, ttlSecs, replyTo, thread, file, fwd, event }) =>
     need(server).sendKeptDm(
       str(account, "account"),
@@ -282,6 +314,10 @@ const handlers: Record<string, Handler> = {
   account_enter: ({ server, conv }) => {
     const { s, account } = needAccount(server);
     account.enter(s, str(conv, "conv"));
+  },
+  account_read_now: ({ server, conv }) => {
+    const { s, account } = needAccount(server);
+    account.readNow(s, str(conv, "conv"));
   },
   account_purge: ({ server, conv }) => {
     const { s, account } = needAccount(server);
@@ -311,7 +347,8 @@ const handlers: Record<string, Handler> = {
     if (!t.startsWith("otpauth://") || t.length > 512) fail("not an authenticator link");
     return wasm().qrSvg(t) ?? fail("could not draw the code");
   },
-  disconnect: ({ server }) => session.disconnect(str(server, "server")),
+  // A reconnect clearing the way, not a person leaving: what it kept is for what comes next.
+  disconnect: ({ server, keepSessions }) => session.disconnect(str(server, "server"), keepSessions === true),
   // A page load starts with no sessions anyway; this is here for the desktop
   // backend's sake, where a reloaded page can find connections still open.
   disconnect_all: async () => {
@@ -334,6 +371,13 @@ const handlers: Record<string, Handler> = {
   },
   leave_channel: ({ server, channelId }) =>
     need(server).sendControl({ LeaveChannel: { channel_id: u32(channelId, "channelId") } }),
+  join_text_channels: ({ server, channels, quiet }) =>
+    need(server).joinTextChannels(ids(channels, "channels"), ids(quiet, "quiet")),
+  set_quiet: ({ server, channels, quiet }) => need(server).setQuiet(ids(channels, "channels"), bool(quiet, "quiet")),
+  request_channel_page: ({ server, channelId, after }) =>
+    need(server).sendControl({ RequestChannelPage: { channel_id: u32(channelId, "channelId"), after: u32(after, "after") } }),
+  set_metered: ({ metered }) => session.setMetered(bool(metered, "metered")),
+  key_job_answer: ({ server, channelId, go }) => need(server).keyJobAnswer(u32(channelId, "channelId"), bool(go, "go")),
   create_channel: ({ server, name, password, proximity, anonymous, text }) => {
     const channelName = str(name, "name");
     if (channelName.length === 0 || byteLength(channelName) > 128) fail("channel name must be 1-128 characters");
@@ -543,26 +587,14 @@ const handlers: Record<string, Handler> = {
   },
   // The tab keeps files in its memory, at a size of its own (files.ts CACHE_CAP)
   set_file_cache_mb: () => fail("The browser's file cache has a fixed size"),
-  send_channel_history: ({ server, channelId, targetUserId, messages }) => {
+  send_channel_history: ({ server, channelId, targetUserId, messages, sealed }) => {
     if (!Array.isArray(messages)) fail("invalid messages");
-    need(server).sendChannelHistory(u32(channelId, "channelId"), u32(targetUserId, "targetUserId"), messages);
+    need(server).sendChannelHistory(u32(channelId, "channelId"), u32(targetUserId, "targetUserId"), messages, sealed === true);
   },
-  request_channel_history: ({ server, channelId, targetUserIds }) => {
-    if (!Array.isArray(targetUserIds)) fail("invalid targetUserIds");
-    need(server).requestChannelHistory(
-      u32(channelId, "channelId"),
-      targetUserIds.map((id) => u32(id, "targetUserIds")),
-    );
-  },
+  request_channel_history: ({ server, channelId, targetUserIds }) =>
+    need(server).requestChannelHistory(u32(channelId, "channelId"), ids(targetUserIds, "targetUserIds")),
   set_history_sharing: ({ enabled }) => {
-    // To every server, and none is not a failure: the flag goes out again on
-    // the next connect, from the config the settings toggle has already written.
-    const on = bool(enabled, "enabled");
-    for (const s of session.allSessions()) {
-      s.sendControl({ SetHistorySharing: { enabled: on } });
-      // The same consent hands our older keys to who joins a channel's log.
-      s.account?.setShare(on);
-    }
+    moveShare(bool(enabled, "enabled"));
   },
 
   // ── moderation (admin token session) ──
@@ -959,6 +991,9 @@ const handlers: Record<string, Handler> = {
           break;
         case "share_channel_history":
           c.share_channel_history = enabled;
+          break;
+        case "share_off_notice":
+          c.share_off_notice = enabled;
           break;
         default:
           fail(`Unknown config key: ${key}`);

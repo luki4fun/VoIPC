@@ -6,6 +6,7 @@
 // hold one.
 
 import { toHex } from "./hex.ts";
+import { eachOnce } from "./stores/upsert.ts";
 import type { BanInfo, ImportFacts, ImportOptions, ImportUndoCounts, ImportUndone, MoveAccount, MoveFilter, MoveRun, MoveState, PowerRow } from "./types.js";
 
 // ── Active bans, a page at a time ──
@@ -134,6 +135,19 @@ export const MOVE_FILTERS: readonly [MoveFilter, string][] = [
   ["Banned", "Banned"],
 ];
 
+/** Who was banned on Discord is `*`'s: the relay refuses that filter to anyone else. */
+export const moveFiltersFor = (star: boolean): readonly [MoveFilter, string][] =>
+  star ? MOVE_FILTERS : MOVE_FILTERS.filter(([value]) => value !== "Banned");
+
+/** What the question before deleting a channel says. Only `*` deletes one holding what came from
+ *  Discord, and the relay tells no one which do, so past `*` the button stays and the relay says no. */
+export function channelDeleteWords(moves: boolean, star: boolean): string {
+  if (!moves) return "It goes for everyone, with every message kept in it. This cannot be undone.";
+  return star
+    ? "It goes for everyone, with every message kept in it and anything imported into it from Discord. This cannot be undone."
+    : "It goes for everyone, with every message kept in it. This cannot be undone. One holding what came from Discord takes an admin: the server will say so.";
+}
+
 /** What the move knows of an account, for its row; null: nothing. */
 export function moveChip(state: MoveState): string | null {
   switch (state) {
@@ -150,13 +164,6 @@ export function moveChip(state: MoveState): string | null {
 
 /** A ban that came from Discord can be lifted by whoever is shown the id: `*` only. */
 export const canLiftBan = (r: Pick<MoveAccount, "state" | "dc_id">): boolean => r.state === "Banned" && !!r.dc_id;
-
-/** A key for each row, each once: a repeated key stops a keyed each and the panel with it. */
-function eachOnce<T>(rows: readonly T[], key: (row: T) => string): T[] {
-  const byKey = new Map<string, T>();
-  for (const row of rows) byKey.set(key(row), row);
-  return [...byKey.values()];
-}
 
 export const moveAccountKey = (row: Pick<MoveAccount, "user">): string => toHex(row.user.id);
 export const powerKey = (row: Pick<PowerRow, "account" | "group">): string => `${toHex(row.account)}|${row.group}`;

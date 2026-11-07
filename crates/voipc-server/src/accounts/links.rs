@@ -334,8 +334,10 @@ pub async fn register(
         .await;
     if let Some(group) = link.group {
         // Holding nothing, this use too: it may have been given power since
-        let empty =
-            matches!(relay.store().role_by_name(&group).await, Ok(Some(r)) if r.scopes.is_empty());
+        let empty = matches!(
+            relay.store().role_by_name(&group).await,
+            Ok(Some(r)) if super::no_power_over_anyone(&r.scopes)
+        );
         if empty {
             if let Err(e) = relay.accounts.grant_role_as_host(ctx, new, &group).await {
                 warn!("an invite link's starting group: {}", e.message());

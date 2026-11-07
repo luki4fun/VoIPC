@@ -351,6 +351,72 @@ pub enum ClientMessage {
     /// A page of the active bans, by the name a row shows (protocol v20), for the
     /// same privilege as `AdminListBans`. `ServerMessage::AdminBansPaged` answers.
     AdminBansPage { search: String, offset: u32 },
+
+    // ── Text channels on the live path (protocol v21) ────────────────
+    // Being in a channel is one frame, nobody is told, nobody holds a key until
+    // somebody writes, and a post goes only to people its writer has keyed.
+    /// Follow these text channels, in one frame, ids sorted. `channels` take posts; `quiet`
+    /// hold a seat and a mark, and no writer owes them a key. `ServerMessage::TextJoined`
+    /// answers.
+    JoinTextChannels {
+        channels: Vec<ChannelId>,
+        quiet: Vec<ChannelId>,
+    },
+    /// About to post: who do I owe my key? `restart`: everyone, for a new chain.
+    /// `ServerMessage::KeysOwed` answers, and from then on posts reach everyone named.
+    KeyCheck {
+        channel_id: ChannelId,
+        restart: bool,
+    },
+    /// Ask these followers, who have no session with me, to open one.
+    /// `ServerMessage::SessionAsked` goes to each.
+    OpenSessions {
+        channel_id: ChannelId,
+        targets: Vec<UserId>,
+    },
+    /// The first message of a session `to` asked me to open. Passed on only for that ask.
+    SessionHello {
+        to: UserId,
+        message_type: u8,
+        ciphertext: Vec<u8>,
+    },
+    /// My sender key, wrapped for each: `(target, message_type, ciphertext)`.
+    /// `ServerMessage::TextKeyReceived` goes to each.
+    DistributeSenderKeys {
+        channel_id: ChannelId,
+        keys: Vec<(UserId, u8, Vec<u8>)>,
+    },
+    /// A post from `from` came with no key, or its key failed. `reset`: drop our session
+    /// and ask me to open a new one.
+    KeyWanted {
+        channel_id: ChannelId,
+        from: UserId,
+        reset: bool,
+    },
+    /// A page of who is in a channel, from past `after` (0 from the start).
+    /// `ServerMessage::ChannelPage` answers.
+    RequestChannelPage {
+        channel_id: ChannelId,
+        after: UserId,
+    },
+    /// Take these followed channels whole, or quiet. Going quiet is no exit. Going whole
+    /// is answered by `ServerMessage::TextJoined`.
+    SetQuiet {
+        channels: Vec<ChannelId>,
+        quiet: bool,
+    },
+    /// New keys for whoever opens a session with me from now on: a signed pre-key and a
+    /// Kyber last-resort key, sent after each key job. Everything a responder used stays in
+    /// its memory otherwise, so a thief with recordings would open every wrap back to the
+    /// connection's start.
+    RenewSessionKeys {
+        signed_prekey_id: u32,
+        signed_prekey: Vec<u8>,
+        signed_prekey_signature: Vec<u8>,
+        kyber_prekey_id: u32,
+        kyber_prekey: Vec<u8>,
+        kyber_prekey_signature: Vec<u8>,
+    },
 }
 
 /// The client's side of an account sign-in, between `Authenticate` and
@@ -428,7 +494,7 @@ pub enum AuthContinue {
     PairStart {
         commitment: Vec<u8>,
     },
-    /// What `commitment` was over, once `AuthStep::PairNonce` came.
+    /// What `commitment` was over, once `AuthStep::PairNonce` came (one per request).
     PairReveal {
         ephemeral: Vec<u8>,
         blind: Vec<u8>,
@@ -576,12 +642,15 @@ pub enum AccountRequest {
         totp: Option<String>,
         recovery_code: Option<String>,
     },
-    /// This device's nonce for a pairing (`AccountReply::PairAsked`).
+    /// This device's answer to a pairing (`AccountReply::PairAsked`), once the person
+    /// agreed to look: a fresh X25519 public key, 32 raw bytes, which the code covers
+    /// and the wrap must come from (`voipc_crypto::pair`).
     PairNonce {
         pair: u64,
         nonce: Vec<u8>,
     },
-    /// The person compared the codes and said yes: the vault's key, wrapped.
+    /// The person typed the code the new device shows, and it is the code this device
+    /// worked out: the vault's key, wrapped from the key in `PairNonce`.
     PairApprove {
         pair: u64,
         wrapped: Vec<u8>,
@@ -616,6 +685,90 @@ pub enum AccountRequest {
     ArchiveMine {
         action: ArchiveAction,
         scope: ArchiveScope,
+    },
+    /// Which channels this session stands in have something from Discord (protocol v21):
+    /// asked once at connect, so opening a channel asks nothing.
+    ArchiveChannels,
+
+    // ── Kept channel messages on chains and buckets (protocol v21) ──
+    // `voipc_crypto::log` makes and opens all of it. Direct conversations stay on
+    // `EpochPut` and `LogFetch`.
+    /// Become a stored member of these channels in one frame, as a silent follow does.
+    /// Only those we stand in, and a log stops taking these at half of `kept_seats`.
+    /// `LogJoinedMany` answers; only writers who share hear of it.
+    LogJoinMany {
+        convs: Vec<String>,
+    },
+    /// Part of a chain of ours in a channel: one frame, one transaction. `epoch` is where
+    /// the chain stands after it. `ChainStored` answers, or `ChainRekey` if a seal here
+    /// would reach someone gone.
+    ChainPut {
+        conv: String,
+        epoch: u32,
+        /// A chain's first frame only: its start, for our other devices.
+        self_wrap: Option<Vec<u8>>,
+        /// Into `epoch`'s index from the one before.
+        step: Option<Vec<u8>>,
+        /// A chain's first frame only, and only with the right to share history:
+        /// `(older chain, link)`, which opens that chain's start.
+        link: Option<(u32, Vec<u8>)>,
+        wraps: Vec<ChainRow>,
+        /// Whole here: a version of a bucket never gets a row later.
+        buckets: Vec<BucketIn>,
+        seals: Vec<ChainSeal>,
+        /// The chain is whole: it is our newest from here on, and a post can go on it. On a
+        /// finished chain, with rows: the last frame of an answer to joiners, so the wait of
+        /// whom `wraps` names ends here (`LogNews`). A writer who does not share owes nobody
+        /// more, so any such frame ends every wait on them there.
+        last: bool,
+    },
+    /// The stored members of `conv` by id alone, a page at a time, past `after`.
+    /// `LogMemberIdsFound` answers.
+    LogMemberIds {
+        conv: String,
+        after: Option<[u8; 16]>,
+    },
+    /// Entries of a channel past `after`, only those we can open or may yet be given a
+    /// key to. A negative `after` starts at the newest `|after|`. `ChainPage` answers.
+    ChainFetch {
+        conv: String,
+        after: i64,
+    },
+    /// What opens the chains of the entries just read, and nothing else.
+    /// `AccountReply::WrapsPage` answers.
+    WrapsPage {
+        conv: String,
+        asks: Vec<ChainAsk>,
+    },
+    /// Our own chains in a channel, newest first, below `before`.
+    /// `AccountReply::OwnChains` answers.
+    OwnChains {
+        conv: String,
+        before: Option<u32>,
+    },
+    /// Our own buckets in a channel, a page at a time, past `after`.
+    /// `AccountReply::OwnBuckets` answers.
+    OwnBuckets {
+        conv: String,
+        after: Option<u64>,
+    },
+    /// Sealed lists of our own buckets, at most 32 at a time: `(bucket, version)`.
+    /// `AccountReply::BucketLists` answers.
+    BucketLists {
+        conv: String,
+        wanted: Vec<(u64, u32)>,
+    },
+    /// The rows of one of our own chains, for proving who held its start: never the
+    /// relay's word. `AccountReply::OwnChainRows` answers.
+    OwnChainRows {
+        conv: String,
+        chain: u32,
+        after: Option<[u8; 16]>,
+    },
+    /// One page of our pins (`pins.N`), which do not travel in the sign-in frame.
+    /// `AccountReply::VaultPageFound` answers; `VaultPut` writes it.
+    VaultPage {
+        k: String,
     },
 }
 
@@ -954,11 +1107,14 @@ pub enum AuthStep {
         challenge: Vec<u8>,
         blobs: Vec<VaultBlob>,
     },
-    /// The other device's nonce, for `AuthContinue::PairStart`.
+    /// The other device's answer, for `AuthContinue::PairStart`: its key's 32 raw
+    /// bytes. One per request; a second ends the sign-in.
     PairNonce { nonce: Vec<u8> },
-    /// The other device agreed: the vault's key, wrapped to the ephemeral key.
+    /// The other device took the code: the vault's key, wrapped to the ephemeral key
+    /// from the key in `PairNonce`. Nothing opens until the person says they typed it.
     PairWrapped { wrapped: Vec<u8> },
-    /// No device could, or would. `reason` says which.
+    /// No device could, or would. `reason` says which, in the words of
+    /// `PAIR_REFUSALS`: a client shows no others.
     PairRefused { reason: String },
 }
 
@@ -1085,7 +1241,8 @@ pub enum AccountReply {
         kind: ProviderKind,
     },
     /// A device that signed in through a provider asks for the vault's key.
-    /// Send a nonce (`PairNonce`); `PairRevealed` follows.
+    /// Ask the person whether to look, and on their yes answer (`PairNonce`), which
+    /// nothing else does; `PairRevealed` follows.
     PairAsked {
         pair: u64,
         commitment: Vec<u8>,
@@ -1127,6 +1284,103 @@ pub enum AccountReply {
         action: ArchiveAction,
         rows: u64,
     },
+    /// What `ArchiveChannels` asked (protocol v21).
+    ArchiveChannels {
+        channels: Vec<ChannelId>,
+    },
+
+    // ── Kept channel messages on chains and buckets (protocol v21) ──
+    /// What `LogJoinMany` asked. `refused`: not standing there, its log full for a silent
+    /// follow, or a wait after leaving it; one answer for all of them.
+    LogJoinedMany {
+        joined: Vec<String>,
+        refused: Vec<String>,
+    },
+    /// `ChainPut` filed. `behind`: nothing was; what we were building on is not what
+    /// the relay holds. Read `OwnChains` again.
+    ChainStored {
+        conv: String,
+        epoch: u32,
+        behind: bool,
+    },
+    /// Not filed. `new_chain`: start one, naming `missing` (members with no seat, up to
+    /// 2048) and rotating out of the buckets `gone` names (up to 1024): `(account, bucket)`
+    /// of whoever left, or holds an old log key there; bucket 0 for someone who had only a
+    /// row of their own. Otherwise, with `missing` (up to
+    /// 256; at 256 start a new chain instead): a fresh step, and a row to each. With
+    /// neither: re-read our own chains and send it again.
+    ChainRekey {
+        conv: String,
+        new_chain: bool,
+        missing: Vec<[u8; 16]>,
+        gone: Vec<([u8; 16], u64)>,
+    },
+    /// `more`: ask on past the last of these.
+    LogMemberIdsFound {
+        conv: String,
+        ids: Vec<[u8; 16]>,
+        more: bool,
+    },
+    /// What `ChainFetch` asked. `skipped`: entries left out of this page that we hold no
+    /// way to open. `upto`: where a cursor stands now, past those too. `floor`: the
+    /// lowest entry a channel still keeps; a cursor below it was moved up. `more`: ask
+    /// again from `upto`. `owed` as `LogPage`.
+    ChainPage {
+        conv: String,
+        entries: Vec<LogEntry>,
+        more: bool,
+        owed: Vec<[u8; 16]>,
+        skipped: u32,
+        upto: i64,
+        floor: i64,
+        /// How many entries a channel keeps here, for saying so when a cursor was moved up.
+        window: u32,
+    },
+    /// What `WrapsPage` asked. `served`: how many of the asks these answer; ask for the
+    /// rest again. A chain we reach down a run of links brings the chains above it first,
+    /// from the one we hold the start of. A run too long for one answer stops part way:
+    /// the asked chain is then not among them, and walking on is an ask with `from`.
+    WrapsPage {
+        conv: String,
+        keys: Vec<ChainKeys>,
+        served: u32,
+    },
+    /// `newest`: the chain a post goes on. `more`: ask on below the last of `chains`.
+    OwnChains {
+        conv: String,
+        newest: Option<u32>,
+        chains: Vec<OwnChain>,
+        more: bool,
+    },
+    /// `more`: ask on past the last of `buckets`.
+    OwnBuckets {
+        conv: String,
+        buckets: Vec<OwnBucket>,
+        more: bool,
+    },
+    /// `(bucket, version, sealed list)`, for those it still holds.
+    BucketLists {
+        conv: String,
+        lists: Vec<(u64, u32, Vec<u8>)>,
+    },
+    /// `links`: `(bucket, new, old, link)`, down to the versions of `seals`. `more`: ask
+    /// on past the last of `direct`.
+    OwnChainRows {
+        conv: String,
+        chain: u32,
+        seals: Vec<ChainSeal>,
+        direct: Vec<ChainRow>,
+        links: Vec<(u64, u32, u32, Vec<u8>)>,
+        more: bool,
+    },
+    /// What `VaultPage` asked. `None`: the relay has no such page.
+    VaultPageFound {
+        k: String,
+        blob: Option<VaultBlob>,
+    },
+    /// After a `LogIndex`: more joiners wait for our answer than one index carries. Asked
+    /// again once these are answered.
+    LogPendingMore,
 }
 
 /// Answers to `AdminOp`.
@@ -1326,6 +1580,87 @@ pub enum AdminReply {
 pub struct WrapIn {
     pub recipient: [u8; 16],
     pub wrapped: Vec<u8>,
+}
+
+/// A chain's state for one reader, at one index.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainRow {
+    pub recipient: [u8; 16],
+    pub index: u32,
+    pub wrapped: Vec<u8>,
+}
+
+/// A new bucket, or a new version of one, with everyone in it: their seat rows and our
+/// own, the sealed list, and from a new version the link down, `(old version, link)`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BucketIn {
+    pub bucket: u64,
+    pub version: u32,
+    pub list: Vec<u8>,
+    pub seats: Vec<WrapIn>,
+    pub down: Option<(u32, Vec<u8>)>,
+}
+
+/// A chain's state at `index`, sealed to everyone in one version of a bucket.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainSeal {
+    pub bucket: u64,
+    pub version: u32,
+    pub index: u32,
+    pub sealed: Vec<u8>,
+}
+
+/// One chain a reader wants to open. `from`: it holds a state there at this index, and
+/// needs only the steps up from it and the chain's link. `None`: it holds nothing yet.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainAsk {
+    pub owner: [u8; 16],
+    pub chain: u32,
+    pub from: Option<u32>,
+}
+
+/// What opens one chain for the reader asking, at most one state of each kind: a chain
+/// sealed to a hundred buckets of theirs costs them what one does.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainKeys {
+    pub owner: [u8; 16],
+    pub chain: u32,
+    /// The reader's own chain: its start, under the reader's own key.
+    pub self_wrap: Option<Vec<u8>>,
+    /// `(index, row)` of a state wrapped to the reader alone.
+    pub direct: Option<(u32, Vec<u8>)>,
+    /// The state sealed to a bucket the reader sits in.
+    pub seal: Option<ChainSeal>,
+    /// The reader's row in that bucket: `(version, row)`, at or above the seal's.
+    pub seat: Option<(u32, Vec<u8>)>,
+    /// From that version down to the seal's: `(new, old, link)`.
+    pub down: Vec<(u32, u32, Vec<u8>)>,
+    /// `(older chain, link)`.
+    pub link: Option<(u32, Vec<u8>)>,
+    /// `(index, step)`: the step into `index + 1`, from where the reader stands up.
+    pub steps: Vec<(u32, Vec<u8>)>,
+}
+
+/// One of our own chains, as `AccountReply::OwnChains` reads it back.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OwnChain {
+    pub chain: u32,
+    pub top: u32,
+    /// Its last frame came. A chain that stays unfinished goes within the hour.
+    pub done: bool,
+    pub self_wrap: Vec<u8>,
+    pub older: Option<u32>,
+}
+
+/// One of our own buckets at its newest version. `sealed`: the newest chain is sealed
+/// to it, so it is one to rotate and seal to next.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OwnBucket {
+    pub bucket: u64,
+    pub version: u32,
+    pub own_row: Vec<u8>,
+    pub seats: u32,
+    pub sealed: bool,
 }
 
 /// A wrapped epoch key for us, from `owner`.
@@ -1772,7 +2107,117 @@ pub enum ServerMessage {
         total: u32,
         bans: Vec<BanInfo>,
     },
+
+    // ── Text channels on the live path (protocol v21) ────────────────
+    /// What `JoinTextChannels`, a click into a text channel or going whole answers, or a
+    /// gate that came or went: `(channel_id, listen_only, gated, last_post_ms)`, 0 for no
+    /// post since this relay started. `refused`: not there, behind a gate, or only `*`
+    /// lets them in; one answer for all of them. A long answer is several of these.
+    TextJoined {
+        joined: Vec<(ChannelId, bool, bool, u64)>,
+        refused: Vec<ChannelId>,
+    },
+    /// What `KeyCheck` asked. `ids` are people a General or public-room list names;
+    /// `rows`, in full, are the others. `more`: another frame of them follows.
+    /// `refused`: this person may not post there now, and the post would be refused too.
+    KeysOwed {
+        channel_id: ChannelId,
+        ids: Vec<UserId>,
+        rows: Vec<UserInfo>,
+        more: bool,
+        refused: bool,
+    },
+    /// `from` is about to write to you and has no session with you: open one with this
+    /// bundle, and send `ClientMessage::SessionHello`. A hello alone names nobody.
+    SessionAsked {
+        channel_id: ChannelId,
+        from: UserId,
+        account: Option<[u8; 16]>,
+        name: String,
+        bundle: PreKeyBundleData,
+    },
+    /// A follower opened the session you asked for.
+    SessionHello {
+        from: UserId,
+        message_type: u8,
+        ciphertext: Vec<u8>,
+    },
+    /// A writer's sender key.
+    TextKeyReceived {
+        channel_id: ChannelId,
+        from: UserId,
+        account: Option<[u8; 16]>,
+        message_type: u8,
+        ciphertext: Vec<u8>,
+    },
+    /// `from` lacks your key here, or (`reset`) failed to read it.
+    KeyWanted {
+        channel_id: ChannelId,
+        from: UserId,
+        reset: bool,
+    },
+    /// What `RequestChannelPage` asked, or the rest of a roster too long for one frame. In a
+    /// text channel, `ids` and `rows` as `KeysOwed` has them; in a room, all `rows`.
+    /// `next`: the `after` to ask on from, 0 at the end. `total`: everyone it will list.
+    /// Nobody, for a channel that is not there or not for the asker's eyes.
+    ChannelPage {
+        channel_id: ChannelId,
+        ids: Vec<UserId>,
+        rows: Vec<UserInfo>,
+        next: UserId,
+        total: u32,
+    },
+    /// Quiet channels with news, each minute: `(channel_id, last_post_ms)`.
+    ChannelMarks { marks: Vec<(ChannelId, u64)> },
+    /// Out of a channel you may no longer enter, or that is going. Unlike `Kicked` it
+    /// leaves no mark: you follow it again when you may.
+    Evicted {
+        channel_id: ChannelId,
+        reason: String,
+    },
+    /// Someone you hold a key with is out of these channels: start a new chain. It names
+    /// nobody, and reaches only writers who keyed them.
+    ChannelExits { channels: Vec<ChannelId> },
+    /// A post in a text channel, with what a reader would otherwise read off a roster.
+    /// The flags are the relay's word, as a roster's are.
+    TextPost {
+        channel_id: ChannelId,
+        user_id: UserId,
+        username: String,
+        account: Option<[u8; 16]>,
+        is_admin: bool,
+        is_moderator: bool,
+        ciphertext: Vec<u8>,
+        timestamp: u64,
+    },
+    /// Part of a channel list too long for one frame, in order; a `ChannelList` is always a
+    /// whole one. `more`: and more after this.
+    ChannelListMore {
+        channels: Vec<ChannelInfo>,
+        more: bool,
+    },
+    /// `user_id` was put out of this gated or hand-joined channel, or left it: answer them
+    /// nothing from here on, whatever the last list said.
+    MemberGone {
+        channel_id: ChannelId,
+        user_id: UserId,
+    },
 }
+
+pub const PAIR_SAID_NO: &str = "Your other device said no.";
+pub const PAIR_NO_ANSWER: &str = "Your other device did not answer.";
+pub const PAIR_TOO_LATE: &str = "Your other device did not answer in time.";
+pub const PAIR_NOBODY_ONLINE: &str = "No other device of yours is online here.";
+pub const PAIR_TOO_MANY: &str = "Too many requests to your other device. Try again later.";
+/// All a client shows of `AuthStep::PairRefused`. A person in a pairing is looking for a
+/// code to type, so a relay picks among these and writes nothing of its own.
+pub const PAIR_REFUSALS: [&str; 5] = [
+    PAIR_SAID_NO,
+    PAIR_NO_ANSWER,
+    PAIR_TOO_LATE,
+    PAIR_NOBODY_ONLINE,
+    PAIR_TOO_MANY,
+];
 
 /// `FileRefused.code`, final for this hash: not in a conversation of the
 /// asker's (or no such conversation).

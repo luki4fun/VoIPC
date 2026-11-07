@@ -18,7 +18,7 @@ use voipc_protocol::codec::encode_server_msg;
 use voipc_protocol::messages::ServerMessage;
 use voipc_protocol::types::{Restriction, SessionId, UserId};
 
-use crate::accounts::{holds_power, modlog, Powers};
+use crate::accounts::{holds_power, modlog, without_share, Powers};
 use crate::bans::{addr_key, now_secs, Key};
 use crate::control::ControlTx;
 use crate::session::{admin_error, ban_reason, banned_by, handle_stop_screen_share, send_msg};
@@ -496,7 +496,8 @@ pub async fn handle(
     let target_scopes = target_scopes.unwrap_or_default();
     let spared = !by_admin
         && (is_admin
-            || (holds_power(&target_scopes) && !scope::covers(&actor_scopes, &target_scopes)));
+            || (holds_power(&target_scopes)
+                && !scope::covers(&actor_scopes, &without_share(&target_scopes))));
     if spared {
         admin_error(
             tx,

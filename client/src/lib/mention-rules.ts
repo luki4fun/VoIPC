@@ -5,7 +5,8 @@
 // time the conversation is read again. A stored copy, or history another member
 // hands over, never carries it, so nothing rings for what happened while away.
 
-import { mentionsName, parse } from "./markdown.ts";
+import { mentionNames, mentionsName, parse } from "./markdown.ts";
+import { shortName } from "./username.ts";
 
 /** `@&Mod Team` is that badge, and not `&Mod` followed by a word. */
 const longestFirst = (a: string, b: string) => b.length - a.length;
@@ -14,6 +15,18 @@ const longestFirst = (a: string, b: string) => b.length - a.length;
  *  for somebody's name, and the group behind it stays unnamed. */
 export function powerTokens(styles: readonly { badge: string }[]): string[] {
   return ["everyone", "here", ...[...new Set(styles.map((s) => `&${s.badge}`))].sort(longestFirst)];
+}
+
+/**
+ * The names of ours a message can ring on: the full one, and the short one where only we go
+ * by it (R2-11). Where the list is everyone online rather than who is in the channel
+ * (`everyoneOnline`), one stranger with the same short name would silence it in every
+ * channel at once, so then it rings for both of them.
+ */
+export function ownMentionNames(own: string, people: readonly string[], everyoneOnline: boolean): string[] {
+  const short = shortName(own);
+  if (everyoneOnline) return short === own ? [own] : [own, short];
+  return mentionNames([...people, own]).filter((n) => n === own || n === short);
 }
 
 /** The tokens that mean this person. */

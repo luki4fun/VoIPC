@@ -142,6 +142,14 @@ pub struct AccountsConfig {
     pub modlog_days: u32,
     /// Per account: the vault and stored messages together.
     pub quota_mb: u32,
+    /// How many messages a channel keeps: a copy goes for good once this many newer ones
+    /// have stood there three days and have three days left, so a flood cleaned up in time
+    /// takes nothing. Direct conversations have no such limit. Lower it on a big server: keys
+    /// grow with this, and lowering it later only takes more.
+    pub kept_window: u32,
+    /// How many accounts a channel keeps messages for: 0 for no limit. Half of them take a
+    /// seat by following; the rest by asking, or by a first post there.
+    pub kept_seats: u32,
     /// The master key (seals second-factor secrets). Made on first start,
     /// readable by the server's user only; `VOIPC_ACCOUNTS_KEY` wins over it.
     /// Back it up: without it nobody's two-factor codes work.
@@ -171,6 +179,8 @@ impl Default for AccountsConfig {
             retention_days: 365,
             modlog_days: 180,
             quota_mb: 50,
+            kept_window: 10_000,
+            kept_seats: 5000,
             key_file: "voipc-accounts.key".into(),
             public_url: String::new(),
             signups_per_hour: 60,
@@ -326,6 +336,9 @@ impl ServerConfig {
             }
             if self.accounts.retention_days == 0 {
                 return Err(anyhow!("[accounts] retention_days must be at least 1: with 0, a kept message expires as it arrives"));
+            }
+            if self.accounts.kept_window == 0 {
+                return Err(anyhow!("[accounts] kept_window must be at least 1: with 0, a channel has nothing to read back"));
             }
             if self.accounts.modlog_days == 0 {
                 return Err(anyhow!("[accounts] modlog_days must be at least 1: with 0, the sweep empties the moderation log"));
@@ -581,6 +594,18 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("retention_days"));
+        let window = parse("[accounts]\nmode = \"optional\"\nkept_window = 0");
+        assert!(window
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("kept_window"));
+        let defaults = parse("[accounts]\nmode = \"optional\"");
+        assert_eq!(defaults.accounts.kept_window, 10_000);
+        assert_eq!(defaults.accounts.kept_seats, 5000);
+        assert!(parse("[accounts]\nmode = \"optional\"\nkept_seats = 0")
+            .validate()
+            .is_ok());
         let off = parse("[accounts]\nquota_mb = 0");
         assert!(off.validate().is_ok(), "no accounts, no quota to mind");
         assert!(parse("max_users = 0").validate().is_err());

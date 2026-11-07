@@ -36,7 +36,9 @@
     setSelfMuted,
   } from "../stores/connection.js";
   import { testLabel, testSource } from "../spatial.js";
-  import { clearAllHistory } from "../stores/chat.js";
+  import { clearAllHistory, joinedTextChannelIds } from "../stores/chat.js";
+  import { setQuietMode, setWholeHere } from "../stores/quiet.js";
+  import { marksChannel, type QuietMode } from "../follow-rules.js";
   import { confirmAction } from "../stores/confirm.js";
   import { addNotification } from "../stores/notifications.js";
   import { isMobile, isWeb, volumeKeyPtt } from "../stores/platform.js";
@@ -60,15 +62,16 @@
   import { availableUpdate, checkForUpdate, checkUpdates, installUpdate, setCheckUpdates, updateBusy, updatesSupported } from "../stores/updates.js";
   import { protocolWarning, updateOffer } from "../update-rules.js";
   import { olderRelay } from "../stores/relay.js";
-  import { moves } from "../relay-rules.js";
+  import { livePath, moves } from "../relay-rules.js";
   import { mineLine } from "../archive-rules.js";
   import { importedCount, importedMine, importedMineAsk } from "../stores/imported.js";
   import { serverName } from "../stores/servers.js";
   import { saveOpenServers } from "../connect.js";
-  import { voice } from "../stores/channels.js";
-  import { account } from "../stores/account.js";
+  import { channels, voice } from "../stores/channels.js";
+  import { account, shareRight } from "../stores/account.js";
+  import { shareReachLine } from "../history-rules.js";
   import { blocked, unblock } from "../stores/blocks.js";
-  import { serverAddress } from "../stores/connection.js";
+  import { serverAddress, serverKey } from "../stores/connection.js";
   import { shortName } from "../username.js";
   import Icon from "./Icons.svelte";
   import PaletteEditor from "./PaletteEditor.svelte";
@@ -78,7 +81,7 @@
   import { get } from "svelte/store";
   import LayoutPreview from "./LayoutPreview.svelte";
   import { uiPrefs, updateUiPrefs } from "../stores/ui-prefs.js";
-  import { reducedMotion } from "../stores/emotes.js";
+  import { networkKnown, reducedMotion } from "../stores/emotes.js";
   import { buildHash, buildLine, buildTime } from "../build-info.js";
   import {
     CHAT_FONT_MAX,
@@ -107,6 +110,10 @@
   $effect(() => {
     if (activeTab === "privacy") void loadRemembered();
   });
+
+  // Quiet mode on the server on screen, and what it can pick from
+  const quietNow = $derived($uiPrefs.quiet_mode[serverKey($serverAddress)] ?? { mode: "off" as QuietMode, whole: [] });
+  const followedHere = $derived($channels.filter((c) => c.text && $joinedTextChannelIds.has(c.channel_id)));
 
   // What came from Discord that this account wrote, for the server on screen
   const askMine = $derived(activeTab === "privacy" && !!$account && moves($olderRelay?.protocol ?? null) && $connectionState === "connected");
@@ -663,6 +670,18 @@
     ...(!isWeb && sdkAvailable ? [{ id: "games" as Tab, label: "Games" }] : []),
     { id: "about", label: "About" },
   ]);
+  // Where the switch does nothing, among the servers that have said
+  const shareRights = shareRight.all();
+  const accounts = account.all();
+  const shareReach = $derived(
+    shareReachLine(
+      [...$shareRights].map(([id, may]) => ({
+        name: serverName(id, $savedServers),
+        may,
+        guest: !$accounts.get(id),
+      })),
+    ),
+  );
 </script>
 
 <div class="overlay" role="presentation" onclick={backdrop(onclose)}>
@@ -1259,9 +1278,35 @@
           />
           <span class="toggle-label">Share recent channel chat with newcomers</span>
           <span class="toggle-hint">
-            When someone joins a channel you are in, your client may hand them the last 50 messages it has there — end-to-end encrypted to that person only, never through the server in the clear. While this is on, the other people there can see that you are one of the members worth asking.
+            Off until you turn it on, on this device. Someone joining a channel you are in can ask your app for its recent messages there, which they see as your word, and can read what you kept there before they joined. End-to-end encrypted to that person. The others there can see you are worth asking. What you already gave stays given.
           </span>
+          {#if shareReach}
+            <span class="toggle-hint share-reach">{shareReach}</span>
+          {/if}
         </label>
+        {#if $connectionState === "connected" && livePath($olderRelay?.protocol ?? null)}
+          <div class="ptt-config">
+            <span class="hotkey-label">Quiet mode on this server</span>
+            <select aria-label="Quiet mode on this server" value={quietNow.mode} onchange={(e) => setQuietMode($serverAddress, (e.target as HTMLSelectElement).value as QuietMode)}>
+              <option value="off">Off</option>
+              {#if networkKnown() || quietNow.mode === "mobile"}<option value="mobile">On mobile data</option>{/if}
+              <option value="always">Always</option>
+            </select>
+          </div>
+          <span class="toggle-hint">
+            Only the channels you pick arrive here. The others show a ring when someone wrote, and you hear no mention from them until you open them. The server can see which ones you picked and when you open another. Direct messages still arrive.
+          </span>
+          {#if quietNow.mode !== "off"}
+            <div class="quiet-picks" role="group" aria-label="Channels that arrive here">
+              {#each followedHere as channel (channel.channel_id)}
+                <label class="toggle-row">
+                  <input type="checkbox" checked={marksChannel(quietNow.whole, channel)} onchange={(e) => setWholeHere($serverAddress, channel, (e.target as HTMLInputElement).checked)} />
+                  <span class="toggle-label">#{channel.name}</span>
+                </label>
+              {/each}
+            </div>
+          {/if}
+        {/if}
         <div class="ptt-config">
           <span class="hotkey-label">Conversations kept</span>
           <input

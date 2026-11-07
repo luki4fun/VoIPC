@@ -20,11 +20,14 @@
 //! - This path never replaces an identity, whatever the session's freshness says:
 //!   a code passing makes it fresh, and the code proves nothing about the vault.
 //!
-//! The code on the page is against somebody sending a person their own link. It
-//! is not perfect (they can send the code along), which is why a person who got
-//! this far has still opened nothing.
+//! The code on the page is against somebody sending a person their own link. Only
+//! the browser the provider sent back holds the page's key, so they cannot tap for
+//! that person. It is not perfect (they can say which code to tap, or ask for that
+//! page's address), which is why a person who got this far has still opened nothing.
 
+use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -43,12 +46,15 @@ use rand::Rng;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
-use voipc_protocol::messages::{AccountReply, AuthContinue, AuthStep, ServerMessage};
+use voipc_protocol::messages::{
+    AccountReply, AuthContinue, AuthStep, ServerMessage, PAIR_NOBODY_ONLINE, PAIR_NO_ANSWER,
+    PAIR_SAID_NO, PAIR_TOO_LATE, PAIR_TOO_MANY,
+};
 use voipc_protocol::types::{LinkedProvider, PowChallenge, ProviderKind, VaultBlob};
 
 use super::links;
 use super::{
-    next, refused, second_factor, step, unexpected, vault_item_ok, Relay, SignedIn, BUSY,
+    next, refused, second_factor, step, unexpected, vault_item_ok, Relay, SignedIn, BUSY, PINS_NS,
     RESET_KEY_LEN, SLOT_RESET, STEP_WAIT, VAULT_MAX_ITEMS, VAULT_NS, VAULT_TOTAL_BYTES,
 };
 use crate::state::{RateLimiter, ServerState};
@@ -60,10 +66,23 @@ pub const CONFIRM_PATH: &str = "/account/oauth/confirm";
 
 /// l4f's sealed flow expires after as long (`FLOW_SECS` in its `social.rs`).
 const FLOW_LIFE: Duration = Duration::from_secs(600);
-/// Open flows, all addresses. Each holds a few hundred bytes.
+/// Open flows, all addresses. Each holds a few hundred bytes. A full table makes
+/// room (`Flows::sweep`) and refuses nobody.
 const MAX_FLOWS: usize = 4096;
+/// Flows started per IPv6 /48, which holds 65 536 of the /64s `starts` counts:
+/// enough for a carrier's pool on a move day, a small share of `MAX_FLOWS`. Four
+/// /64s at full pace use it up, which costs only others on that /48.
+const SITE_BURST: f64 = 64.0;
+const SITE_REFILL: f64 = 1.0 / 10.0;
+/// The same per IPv6 /32, which holds 65 536 /48s and can be leased by one stranger.
+const BLOCK_BURST: f64 = 256.0;
+const BLOCK_REFILL: f64 = 1.0;
+/// Past this many limiters in a map, those whose budget is whole again go, at most
+/// once in `PRUNE_SECS`.
+const MAX_LIMITERS: usize = 4096;
+const PRUNE_SECS: u64 = 30;
 /// A person choosing what opens the account, and typing a 52-letter key.
-const CHOICE_WAIT: Duration = Duration::from_secs(300);
+pub(crate) const CHOICE_WAIT: Duration = Duration::from_secs(300);
 /// A person walking to their other device.
 const PAIR_WAIT: Duration = Duration::from_secs(120);
 /// What the app takes for "not yet" (`AuthStep::ProviderPending` says it first).
@@ -147,9 +166,11 @@ enum Outcome {
 enum Stage {
     /// The browser is at the provider.
     Open,
-    /// The provider sent it back with this; waiting for the person to tap.
+    /// The provider sent it back with this; waiting for the person to tap. The key
+    /// is in the page and goes with this code: whoever brought the code has it.
     Back {
         provider_code: String,
+        page_key: String,
     },
     /// Tapped; the provider is being asked. A second tap ends here.
     Asking,
@@ -158,8 +179,8 @@ enum Stage {
 
 struct Flow {
     kind: Kind,
-    /// l4f's sealed flow. It never leaves the relay: there is no browser cookie
-    /// to bind, which is what the code on the page stands in for.
+    /// l4f's sealed flow. It never leaves the relay: the browser is held by the
+    /// page's key instead (`Stage::Back`), which needs no cookie of its own.
     cookie: String,
     state: String,
     code: String,
@@ -168,6 +189,8 @@ struct Flow {
     purpose: Purpose,
     started: Instant,
     stage: Stage,
+    /// Who started it: an IPv6 /48, or an IPv4 address.
+    who: IpAddr,
 }
 
 /// The flows in progress.
@@ -178,6 +201,13 @@ pub struct Flows {
     /// Flows per address (`ConnLimits` key): each asks a provider nothing yet,
     /// but holds memory for ten minutes.
     starts: DashMap<IpAddr, RateLimiter>,
+    /// The same per /48 and per /32. Maps of their own: a /48's key is also the /64
+    /// key of its subnet 0.
+    site_starts: DashMap<IpAddr, RateLimiter>,
+    block_starts: DashMap<IpAddr, RateLimiter>,
+    /// When, in seconds, the limiters were last pruned and a full table last logged.
+    pruned: AtomicU64,
+    full_said: AtomicU64,
 }
 
 impl Flows {
@@ -187,7 +217,7 @@ impl Flows {
         Some(flow)
     }
 
-    /// Drops what timed out.
+    /// Drops what timed out, and makes room in a full table.
     ///
     /// shortcut: a sign-in nobody came back for leaves its l4f session to l4f's
     /// idle sweep, like one a crash left behind; ended here if that ever matters.
@@ -200,6 +230,91 @@ impl Flows {
             .collect();
         for ticket in stale {
             self.remove(&ticket);
+        }
+        if self.by_ticket.len() >= MAX_FLOWS {
+            let now = util::now_secs();
+            if now >= self.full_said.load(Ordering::Relaxed) + 60 {
+                self.full_said.store(now, Ordering::Relaxed);
+                warn!("{MAX_FLOWS} provider sign-ins open at once: dropping from whoever holds the most");
+            }
+        }
+        // Full: the oldest of whoever holds the most goes, whatever its stage. Sparing
+        // those not back yet would spare nothing an attacker wants, since one request
+        // makes any flow of theirs "back". Plain age would leave everyone about a minute
+        // against a flood from 2000 addresses; this leaves a person's one flow alone.
+        while self.by_ticket.len() >= MAX_FLOWS {
+            let mut held = HashMap::<IpAddr, usize>::new();
+            for f in self.by_ticket.iter() {
+                *held.entry(f.who).or_default() += 1;
+            }
+            let most = held.values().max().copied();
+            let oldest = self
+                .by_ticket
+                .iter()
+                .filter(|f| held.get(&f.who).copied() == most)
+                .min_by_key(|f| f.started)
+                .map(|f| *f.key());
+            let Some(ticket) = oldest else {
+                break;
+            };
+            self.remove(&ticket);
+        }
+    }
+
+    /// Whether `ip` may start a flow. Its /64 or IPv4 address has a budget, and its
+    /// IPv6 /48 and /32 have one too. IPv4 has no shared one (`site_key`): a carrier's
+    /// NAT or a community at an event is not one stranger.
+    fn admit(&self, ip: IpAddr) -> bool {
+        self.prune_limiters();
+        // Widest first, so a refused prefix grows the maps under it no further. Only
+        // looks: someone over their own limit must not spend their neighbours' budget.
+        let mut block = crate::block_key(ip).map(|key| {
+            self.block_starts
+                .entry(key)
+                .or_insert_with(|| RateLimiter::new(BLOCK_BURST, BLOCK_REFILL))
+        });
+        if block.as_mut().is_some_and(|b| !b.has_token()) {
+            return false;
+        }
+        let mut site = crate::site_key(ip).map(|key| {
+            self.site_starts
+                .entry(key)
+                .or_insert_with(|| RateLimiter::new(SITE_BURST, SITE_REFILL))
+        });
+        if site.as_mut().is_some_and(|b| !b.has_token()) {
+            return false;
+        }
+        let allowed = self
+            .starts
+            .entry(crate::limit_key(ip))
+            .or_insert_with(|| RateLimiter::new(10.0, 1.0 / 30.0))
+            .try_consume();
+        if allowed {
+            if let Some(b) = block.as_mut() {
+                b.try_consume();
+            }
+            if let Some(b) = site.as_mut() {
+                b.try_consume();
+            }
+        }
+        allowed
+    }
+
+    /// Like `token_guess_failed`: a budget that is whole again says nothing a new
+    /// entry would not. Timed like `take_connect_token`: each walk locks every shard on
+    /// the workers voice runs on, and frees nothing while budgets are still refilling.
+    fn prune_limiters(&self) {
+        let maps = [&self.starts, &self.site_starts, &self.block_starts];
+        if maps.iter().all(|m| m.len() <= MAX_LIMITERS) {
+            return;
+        }
+        let now = util::now_secs();
+        if now < self.pruned.load(Ordering::Relaxed) + PRUNE_SECS {
+            return;
+        }
+        self.pruned.store(now, Ordering::Relaxed);
+        for map in maps {
+            map.retain(|_, b| !b.is_full());
         }
     }
 }
@@ -241,19 +356,10 @@ impl Relay {
         user: Option<&User>,
         ip: IpAddr,
     ) -> Result<(String, String, [u8; 32]), String> {
-        let allowed = self
-            .providers
-            .starts
-            .entry(crate::limit_key(ip))
-            .or_insert_with(|| RateLimiter::new(10.0, 1.0 / 30.0))
-            .try_consume();
-        if !allowed {
+        if !self.providers.admit(ip) {
             return Err("Too many sign-ins from your address. Try again later.".into());
         }
         self.providers.sweep();
-        if self.providers.by_ticket.len() >= MAX_FLOWS {
-            return Err(BUSY.into());
-        }
         let kind = kind_of(kind);
         let (url, cookie) = self
             .accounts
@@ -278,6 +384,7 @@ impl Relay {
                 purpose,
                 started: Instant::now(),
                 stage: Stage::Open,
+                who: crate::site_key(ip).unwrap_or_else(|| crate::limit_key(ip)),
             },
         );
         Ok((url, code, ticket))
@@ -313,7 +420,7 @@ const PAGE_STYLE: &str = "body{font:18px system-ui,sans-serif;max-width:32rem;ma
     padding:0 1.5rem;background:#101215;color:#e8e8e6}\
     button{font:600 1.6rem ui-monospace,monospace;padding:.9rem 1.4rem;margin:.3rem;\
     border-radius:.6rem;border:1px solid #555;background:#1b1e23;color:inherit;cursor:pointer}\
-    p{line-height:1.5}";
+    button[name=none]{font:inherit}p{line-height:1.5}";
 
 fn page(status: StatusCode, title: &str, body: &str) -> Response<Full<Bytes>> {
     let html = format!(
@@ -380,7 +487,8 @@ fn percent_decode(s: &str) -> String {
 }
 
 /// `GET /account/oauth/<provider>/cb`: the provider sent the browser back. Asks
-/// the provider nothing yet: that waits for the person to tap the code.
+/// the provider nothing yet: that waits for the person to tap the code. The page's
+/// key goes only to a request bringing the provider's code.
 pub fn callback(state: &ServerState, path: &str, query: &str) -> Response<Full<Bytes>> {
     let Some(relay) = state.accounts.as_ref() else {
         return ended_page();
@@ -401,10 +509,18 @@ pub fn callback(state: &ServerState, path: &str, query: &str) -> Response<Full<B
     if slug != flow.kind.slug() || flow.started.elapsed() > FLOW_LIFE {
         return ended_page();
     }
-    match query_param(query, "code") {
-        Some(code) if matches!(flow.stage, Stage::Open) => {
+    match query_param(query, "code").map(percent_decode) {
+        // A reload, or one more fetch of the same address: the same page, key and all
+        Some(code)
+            if matches!(&flow.stage, Stage::Back { provider_code, .. }
+                if util::ct_eq(provider_code, &code)) => {}
+        // Back from the provider, or back again after approving once more. The key
+        // goes with this code and no other, so holding `state` never gets the key to
+        // a code somebody else brought.
+        Some(code) if matches!(flow.stage, Stage::Open | Stage::Back { .. }) => {
             flow.stage = Stage::Back {
-                provider_code: percent_decode(code),
+                provider_code: code,
+                page_key: util::b64u(&rand::random::<[u8; 32]>()),
             };
         }
         // Said no at the provider
@@ -416,12 +532,11 @@ pub fn callback(state: &ServerState, path: &str, query: &str) -> Response<Full<B
                 "<p>Nothing happened. You can close this page.</p>",
             );
         }
-        // A reload: the same page again
-        _ => {}
+        _ => return ended_page(),
     }
-    if !matches!(flow.stage, Stage::Back { .. }) {
+    let Stage::Back { page_key, .. } = &flow.stage else {
         return ended_page();
-    }
+    };
     let host = relay
         .accounts
         .host
@@ -442,10 +557,13 @@ pub fn callback(state: &ServerState, path: &str, query: &str) -> Response<Full<B
         &format!(
             "<p>Signing in to VoIPC on <b>{host}</b>. Tap the code your VoIPC app shows.</p>\
              <form method=\"post\" action=\"{CONFIRM_PATH}\">\
-             <input type=\"hidden\" name=\"state\" value=\"{oauth_state}\">{buttons}</form>\
+             <input type=\"hidden\" name=\"state\" value=\"{oauth_state}\">\
+             <input type=\"hidden\" name=\"key\" value=\"{key}\">{buttons}\
+             <button name=\"none\" value=\"1\">None of these</button></form>\
              <p>If you did not start this in your own app, close this page: someone may be \
              trying to sign in as you.</p>",
             oauth_state = html_attr(&flow.state),
+            key = html_attr(page_key),
         ),
     )
 }
@@ -467,6 +585,7 @@ pub async fn confirm(state: &Arc<ServerState>, body: &[u8], ip: IpAddr) -> Respo
         return ended_page();
     };
     let pick = query_param(&form, "pick").unwrap_or_default();
+    let key = query_param(&form, "key").unwrap_or_default();
     let Some(ticket) = relay.providers.by_state.get(oauth_state).map(|t| *t) else {
         return ended_page();
     };
@@ -474,9 +593,18 @@ pub async fn confirm(state: &Arc<ServerState>, body: &[u8], ip: IpAddr) -> Respo
         let Some(mut flow) = relay.providers.by_ticket.get_mut(&ticket) else {
             return ended_page();
         };
-        let Stage::Back { provider_code } = &flow.stage else {
+        let Stage::Back {
+            provider_code,
+            page_key,
+        } = &flow.stage
+        else {
             return ended_page();
         };
+        // Whoever started this holds the state and the code, and may not be the person
+        // at the provider. Changes nothing, and reads like a flow not back yet.
+        if !util::ct_eq(page_key, key) {
+            return ended_page();
+        }
         let provider_code = provider_code.clone();
         if flow.code != pick {
             // One tap. A wrong one is someone reading the page, not the app.
@@ -827,7 +955,11 @@ pub(crate) async fn claim(
     }
     let _one = relay.claiming.lock().await;
     if relay.identity(user).await.map_err(|_| gone())?.is_some() {
-        return Err("This account was opened just now, somewhere else.".into());
+        return Err(
+            "This account was opened just now, somewhere else. The key this device showed does \
+             not count: the one from the device where it opened does."
+                .into(),
+        );
     }
     // A vault is bound to the name it was made under, which the relay cannot read: one
     // made for a name since changed would look fine and never open. A sweep may also have
@@ -841,12 +973,20 @@ pub(crate) async fn claim(
     if now.username != name {
         return Err("This account's name changed just now. Sign in again.".into());
     }
+    // Whatever this account came to hold, it was not given to whoever is opening it. Ahead of
+    // anything written: a claim refused here leaves it as it was.
+    if let Err(e) = relay.hold_power(user).await {
+        warn!(user = %user.hex(), "a claim refused: {e:#}");
+        return Err(gone());
+    }
     // What a claim that died halfway left, which nobody could open
-    relay
-        .store()
-        .delete_blobs(user, VAULT_NS)
-        .await
-        .map_err(|_| gone())?;
+    for ns in [VAULT_NS, PINS_NS] {
+        relay
+            .store()
+            .delete_blobs(user, ns)
+            .await
+            .map_err(|_| gone())?;
+    }
     for b in vault {
         match relay
             .store()
@@ -1040,6 +1180,23 @@ pub struct PairLink {
     to_new: mpsc::Sender<PairEvent>,
 }
 
+/// The other device's next word, within `PAIR_WAIT`, listening to this device all
+/// the while: it sends nothing here, so a frame or a hang-up ends the pairing, and
+/// `pair` tells the other device at once. `read_frame` keeps its bytes in `buf`, so
+/// dropping it loses nothing.
+async fn pair_wait<S: AsyncRead + Unpin>(
+    events: &mut mpsc::Receiver<PairEvent>,
+    stream: &mut S,
+    buf: &mut BytesMut,
+) -> Result<Option<PairEvent>, String> {
+    tokio::select! {
+        event = tokio::time::timeout(PAIR_WAIT, events.recv()) => Ok(event.ok().flatten()),
+        _ = crate::session::read_frame(stream, buf, PAIR_WAIT + Duration::from_secs(1)) => {
+            Err("connection closed during sign-in".into())
+        }
+    }
+}
+
 /// Runs one pairing. `Ok` both when the key arrived and when the other device
 /// said no (`PairRefused`): what opens the account is the person's choice again.
 async fn pair<S: AsyncRead + AsyncWrite + Unpin>(
@@ -1057,31 +1214,47 @@ async fn pair<S: AsyncRead + AsyncWrite + Unpin>(
     // Each ask puts a question on the person's other device: a stranger holding
     // their provider account must not be able to wear them down.
     if !relay.spend_pair_ask(user) {
-        return refuse_pair(
-            stream,
-            "Too many requests to your other device. Try again later.",
-        )
-        .await;
+        return refuse_pair(stream, PAIR_TOO_MANY).await;
     }
+    // From here the ask has its limit above, so a refusal gives back what it used of the
+    // connection's answers: asks that time out must not leave too few for the one that
+    // goes through.
+    let before = *answers - 1;
     let other = state.account_sessions.get(&user.0).map(|s| *s);
     let Some(tx) = other.and_then(|id| state.sessions.get(&id).map(|s| s.control_tx.clone()))
     else {
-        return refuse_pair(stream, "No other device of yours is online here.").await;
+        *answers = before;
+        return refuse_pair(stream, PAIR_NOBODY_ONLINE).await;
     };
     // In 32 bits: the apps' front ends hold it as a JS number
     let pair = u64::from(rand::random::<u32>());
     let (to_new, mut events) = mpsc::channel(4);
-    relay.pairs.insert(pair, PairLink { user, to_new });
     let told = |reply: AccountReply| {
         crate::session::send_msg(&tx, &ServerMessage::Account(reply)).map_err(|_| ())
     };
+    // One at a time on the other device, which declines what comes behind an open ask.
+    // An ask still open here is from a device that died with no hang-up yet, or that
+    // this person gave up on: the new one takes over, and the old one hears it first.
+    let open: Vec<u64> = relay
+        .pairs
+        .iter()
+        .filter(|p| p.user == user)
+        .map(|p| *p.key())
+        .collect();
+    for ended in open {
+        relay.pairs.remove(&ended);
+        let _ = told(AccountReply::PairEnded { pair: ended });
+    }
+    relay.pairs.insert(pair, PairLink { user, to_new });
+    // `Some`: why the ask was refused
     let r = async {
         if told(AccountReply::PairAsked { pair, commitment }).is_err() {
-            return refuse_pair(stream, "Your other device did not answer.").await;
+            return Ok(Some(PAIR_NO_ANSWER));
         }
-        let nonce = match tokio::time::timeout(STEP_WAIT, events.recv()).await {
-            Ok(Some(PairEvent::Nonce(nonce))) => nonce,
-            _ => return refuse_pair(stream, "Your other device did not answer.").await,
+        let nonce = match pair_wait(&mut events, stream, buf).await? {
+            Some(PairEvent::Nonce(nonce)) => nonce,
+            Some(PairEvent::Declined) => return Ok(Some(PAIR_SAID_NO)),
+            _ => return Ok(Some(PAIR_NO_ANSWER)),
         };
         step(stream, AuthStep::PairNonce { nonce }).await?;
         let AuthContinue::PairReveal { ephemeral, blind } =
@@ -1096,22 +1269,27 @@ async fn pair<S: AsyncRead + AsyncWrite + Unpin>(
         })
         .is_err()
         {
-            return refuse_pair(stream, "Your other device did not answer.").await;
+            return Ok(Some(PAIR_NO_ANSWER));
         }
-        match tokio::time::timeout(PAIR_WAIT, events.recv()).await {
-            Ok(Some(PairEvent::Wrapped(wrapped))) => {
-                step(stream, AuthStep::PairWrapped { wrapped }).await
+        match pair_wait(&mut events, stream, buf).await? {
+            Some(PairEvent::Wrapped(wrapped)) => {
+                step(stream, AuthStep::PairWrapped { wrapped }).await?;
+                Ok(None)
             }
-            Ok(Some(PairEvent::Declined)) => {
-                refuse_pair(stream, "Your other device said no.").await
-            }
-            _ => refuse_pair(stream, "Your other device did not answer in time.").await,
+            Some(PairEvent::Declined) => Ok(Some(PAIR_SAID_NO)),
+            _ => Ok(Some(PAIR_TOO_LATE)),
         }
     }
     .await;
     relay.pairs.remove(&pair);
     let _ = told(AccountReply::PairEnded { pair });
-    r
+    match r? {
+        Some(reason) => {
+            *answers = before;
+            refuse_pair(stream, reason).await
+        }
+        None => Ok(()),
+    }
 }
 
 async fn refuse_pair<S: AsyncWrite + Unpin>(stream: &mut S, reason: &str) -> Result<(), String> {
@@ -1147,10 +1325,12 @@ impl Relay {
             .reset_2fa_as_host(ctx, user.id)
             .await
             .map_err(|e| e.message().to_string())?;
-        self.store()
-            .delete_blobs(user.id, VAULT_NS)
-            .await
-            .map_err(failed)?;
+        for ns in [VAULT_NS, PINS_NS] {
+            self.store()
+                .delete_blobs(user.id, ns)
+                .await
+                .map_err(failed)?;
+        }
         let id = &user.id.0[..];
         db!(self.store(), pool => {
             // Its log key went with the vault: nobody can wrap to it any more, and
@@ -1164,8 +1344,18 @@ impl Relay {
                 sqlx::query(q).bind(id).execute(pool).await.map_err(failed)?;
             }
         });
+        // Whoever held the old key is out at each writer's next post, the same as a leaver
+        super::log::walk(self.store(), &user.id.0)
+            .await
+            .map_err(|e| e.to_string())?;
         info!(user = %user.id.hex(), "account reclaimed from the shell");
         Ok(())
+    }
+
+    /// Pairings in progress.
+    #[cfg(test)]
+    pub(crate) fn pairs_open(&self) -> usize {
+        self.pairs.len()
     }
 
     /// Three asks, then one per ten minutes, per account.
@@ -1263,4 +1453,154 @@ pub(super) async fn unlink(
             Err(e) => refused("ProviderUnlink", e.message()),
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    fn in_site(site: u16, subnet: u16) -> IpAddr {
+        IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, site, subnet, 0, 0, 0, 1))
+    }
+
+    #[test]
+    fn someone_over_their_limit_does_not_spend_their_sites_budget() {
+        let flows = Flows::default();
+        let one = in_site(1, 1);
+        assert_eq!((0..30).filter(|_| flows.admit(one)).count(), 10);
+        let others = (2..200).filter(|n| flows.admit(in_site(1, *n))).count();
+        assert!((54..=56).contains(&others), "{others}");
+    }
+
+    #[test]
+    fn a_site_over_its_budget_does_not_spend_its_blocks() {
+        let flows = Flows::default();
+        let began = Instant::now();
+        let site = (0..1000).filter(|n| flows.admit(in_site(1, *n))).count();
+        assert!((64..=66).contains(&site), "{site}");
+        let others = (2..1000).filter(|s| flows.admit(in_site(*s, 0))).count();
+        let most = 192 + began.elapsed().as_secs() as usize + 2;
+        assert!((190..=most).contains(&others), "{others}");
+    }
+
+    /// Limiters no budget hangs on anymore go, and one still refilling stays, so the
+    /// prune hands no budget back.
+    #[test]
+    fn the_limiters_do_not_outlive_their_use() {
+        let flows = Flows::default();
+        let spent = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7));
+        assert_eq!((0..11).filter(|_| flows.admit(spent)).count(), 10);
+        fill_limiters(&flows);
+        assert!(flows.admit(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 8))));
+        assert!(limiters_at_most(&flows, MAX_LIMITERS));
+        assert!(!flows.admit(spent), "the prune handed its budget back");
+    }
+
+    /// The walk locks every shard and frees nothing while budgets refill, so a flood
+    /// past `MAX_LIMITERS` must not get it on every start.
+    #[test]
+    fn the_limiters_are_pruned_at_most_every_thirty_seconds() {
+        let flows = Flows::default();
+        let anyone = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 8));
+        fill_limiters(&flows);
+        assert!(flows.admit(anyone));
+        assert!(limiters_at_most(&flows, MAX_LIMITERS), "open at first");
+
+        fill_limiters(&flows);
+        assert!(flows.admit(anyone));
+        assert!(!limiters_at_most(&flows, MAX_LIMITERS), "too soon");
+
+        let past = util::now_secs() - PRUNE_SECS;
+        flows.pruned.store(past, Ordering::Relaxed);
+        assert!(flows.admit(anyone));
+        assert!(limiters_at_most(&flows, MAX_LIMITERS), "due again");
+    }
+
+    fn fill_limiters(flows: &Flows) {
+        for i in 0..5000u32 {
+            let key = IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + i));
+            for map in [&flows.starts, &flows.site_starts, &flows.block_starts] {
+                map.insert(key, RateLimiter::new(10.0, 1.0 / 30.0));
+            }
+        }
+    }
+
+    fn limiters_at_most(flows: &Flows, most: usize) -> bool {
+        [&flows.starts, &flows.site_starts, &flows.block_starts]
+            .iter()
+            .all(|m| m.len() <= most)
+    }
+
+    /// A flow started `age` seconds ago by `who`.
+    fn put_flow(flows: &Flows, who: u32, age: u64, stage: Stage) -> [u8; 32] {
+        let ticket: [u8; 32] = rand::random();
+        let state = util::b64u(&ticket);
+        flows.by_state.insert(state.clone(), ticket);
+        flows.by_ticket.insert(
+            ticket,
+            Flow {
+                kind: Kind::Discord,
+                cookie: String::new(),
+                state,
+                code: String::new(),
+                choices: Default::default(),
+                purpose: Purpose::SignIn,
+                started: Instant::now() - Duration::from_secs(age),
+                stage,
+                who: IpAddr::V4(Ipv4Addr::from(who)),
+            },
+        );
+        ticket
+    }
+
+    /// Two starts at the cap can both insert, and each pass would then only hold the
+    /// table where it stands.
+    #[test]
+    fn a_table_over_its_cap_comes_back_under_it() {
+        let flows = Flows::default();
+        for i in 0..MAX_FLOWS + 5 {
+            put_flow(&flows, i as u32, 0, Stage::Open);
+        }
+        flows.sweep();
+        assert_eq!(flows.by_ticket.len(), MAX_FLOWS - 1);
+        assert_eq!(flows.by_state.len(), MAX_FLOWS - 1);
+    }
+
+    /// Older flows of smaller holders stay, and being back from the provider, which
+    /// one request of the holder's own buys, spares nothing.
+    #[test]
+    fn a_full_table_takes_the_oldest_of_whoever_holds_the_most() {
+        let flows = Flows::default();
+        let lone = put_flow(&flows, 1, 500, Stage::Open);
+        let smaller = put_flow(&flows, 2, 400, Stage::Open);
+        for _ in 1..1000 {
+            put_flow(&flows, 2, 300, Stage::Open);
+        }
+        let back = Stage::Back {
+            provider_code: String::new(),
+            page_key: String::new(),
+        };
+        let oldest = put_flow(&flows, 3, 200, back);
+        let next = put_flow(&flows, 3, 100, Stage::Open);
+        while flows.by_ticket.len() < MAX_FLOWS {
+            put_flow(&flows, 3, 0, Stage::Open);
+        }
+        flows.sweep();
+        assert!(flows.by_ticket.contains_key(&lone));
+        assert!(flows.by_ticket.contains_key(&smaller));
+        assert!(!flows.by_ticket.contains_key(&oldest));
+        assert!(flows.by_ticket.contains_key(&next));
+    }
+
+    /// `sweep` runs on every start: a table with room loses nothing young.
+    #[test]
+    fn a_table_with_room_drops_only_what_timed_out() {
+        let flows = Flows::default();
+        let young = put_flow(&flows, 1, 500, Stage::Open);
+        let timed_out = put_flow(&flows, 1, 700, Stage::Open);
+        flows.sweep();
+        assert!(flows.by_ticket.contains_key(&young));
+        assert!(!flows.by_ticket.contains_key(&timed_out));
+    }
 }

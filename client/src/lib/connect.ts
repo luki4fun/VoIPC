@@ -11,7 +11,7 @@
 // mirrors it; closing the server that carries voice only lets go of the mirror.
 
 import { hasNsfwConsent } from "./stores/channel-ui.js";
-import { account as signedInAccount, dropPrompts } from "./stores/account.js";
+import { account as signedInAccount, dropPrompts, takeLook } from "./stores/account.js";
 import { isWeb } from "./stores/platform.js";
 import { derived, get, writable, type Readable } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
@@ -36,11 +36,16 @@ import {
 import { loadGuestBlocks } from "./stores/blocks.js";
 import { pendingInvites } from "./stores/invites.js";
 import { parseHostPort } from "./invite.js";
-import { addNotification } from "./stores/notifications.js";
+import { addNotification, removeNotification } from "./stores/notifications.js";
 import { pendingPokes } from "./stores/pokes.js";
 import { splitName, withTag } from "./username.js";
 import { clearRosters } from "./stores/rosters.js";
+import { clearSweeps } from "./stores/sweep.js";
+import { clearNoticing } from "./stores/noticing.js";
+import { clearQuiet } from "./stores/quiet.js";
 import { clearProfiles } from "./stores/profiles.js";
+import { forgetRings } from "./stores/marks.js";
+import { reopenAfterDrop } from "./stores/handoff.js";
 import { dropEmotes } from "./stores/emotes.js";
 import { dropKept, dropServer, scoped } from "./stores/scoped.js";
 import { lastOp, removalWithCode } from "./stores/admin-ops.js";
@@ -61,7 +66,7 @@ import {
   savedServers,
   type SavedServer,
 } from "./stores/settings.js";
-import { reconnectDelay, resolveRejoin } from "./rejoin-rules.js";
+import { connectionLostLine, reconnectDelay, resolveRejoin } from "./rejoin-rules.js";
 import type { ChannelInfo } from "./types.js";
 
 export { serverId };
@@ -460,6 +465,9 @@ export async function saveOpenServers(): Promise<void> {
  */
 export function resetServer(server: string): void {
   clearRosters(server);
+  clearSweeps(server);
+  clearNoticing(server);
+  clearQuiet(server);
   clearProfiles(server);
   dropEmotes(server);
   dropServer(server);
@@ -468,6 +476,13 @@ export function resetServer(server: string): void {
   lastOp.delete(server);
   removalWithCode.delete(server);
   dropPrompts(server);
+  if (takeLook(server)) {
+    addNotification(
+      `${fromServer(server)}the connection ended during a request for your key, so nothing was handed over. If that was not you, someone may be trying codes. If a new device now asks whether you typed the code, say no.`,
+      "warning",
+      0,
+    );
+  }
   clearServerUnread(server);
   if (get(voice)?.server === server) voice.set(null);
 }
@@ -480,6 +495,8 @@ function removeServer(server: string): void {
   releaseBrowserMarks(server);
   resetServer(server);
   dropKept(server);
+  forgetRings(server);
+  openAtDrop.delete(server);
   // The bot's token goes with the wizard that holds it. A cut keeps both, for a run to go on
   invoke("import_forget", { server }).catch(() => {});
   details.delete(server);
@@ -541,14 +558,32 @@ const reconnectRuns = new Map<string, { cancelled: boolean; voiceTaken: boolean 
  */
 const channelListWaiters = new Map<string, Array<(list: ChannelInfo[]) => void>>();
 
+/** The text channel on screen when a connection dropped, by name, for the next list. */
+const openAtDrop = new Map<string, string>();
+/** The toast each drop put up, which has said its piece once the server is back. */
+const lostToasts = new Map<string, number>();
+
+/** A connection dropped: said once, and taken down at the reconnect. */
+export function sayConnectionLost(server: string, reason: string): void {
+  lostToasts.set(server, addNotification(`${fromServer(server)}${connectionLostLine(reason)}`, "error"));
+}
+
 /** App.svelte's `channel-list` handler reports every list here. */
 export function channelListArrived(server: string, list: ChannelInfo[]): void {
+  const open = openAtDrop.get(server);
+  if (open !== undefined) {
+    openAtDrop.delete(server);
+    const [channel] = resolveRejoin([open], list, "text");
+    // What a reconnect will not bring back it does not put on screen either
+    const hasWayIn = !!channel && (!channel.nsfw || hasNsfwConsent(server)) && (!channel.has_password || channelPassword(server, channel.name) !== null);
+    if (hasWayIn) reopenAfterDrop(server, channel);
+  }
   const waiting = channelListWaiters.get(server) ?? [];
   channelListWaiters.delete(server);
   for (const waiter of waiting) waiter(list);
 }
 
-function nextChannelList(server: string, timeoutMs = 5000): Promise<ChannelInfo[]> {
+function nextChannelList(server: string, timeoutMs = 15_000): Promise<ChannelInfo[]> {
   return new Promise((resolve) => {
     const waiter = (list: ChannelInfo[]) => {
       clearTimeout(timer);
@@ -572,15 +607,16 @@ function nextChannelList(server: string, timeoutMs = 5000): Promise<ChannelInfo[
  * The server stays in the list the whole time, and its pane says so.
  *
  * `previous` is where the user was, by name: the voice channel (only if the
- * call was on this server) and the text channels they had open.
+ * call was on this server), the text channels they had open, and the one on screen.
  */
 export async function startReconnect(
   server: string,
-  previous: { voice: string; text: string[] },
+  previous: { voice: string; text: string[]; open?: string },
   initialError = "",
 ): Promise<void> {
   const d = details.get(server);
   if (!d || reconnectRuns.has(server)) return;
+  if (previous.open) openAtDrop.set(server, previous.open);
   reconnectInfo.of(server).set({ attempt: 0, error: initialError });
   const run = { cancelled: false, voiceTaken: false };
   reconnectRuns.set(server, run);
@@ -629,9 +665,10 @@ async function reconnectLoop(
       return;
     }
 
-    // Clean up stale connection state
+    // Clean up stale connection state. Not a person leaving: what its sessions
+    // were goes on to the connection this makes.
     try {
-      await invoke("disconnect", { server });
+      await invoke("disconnect", { server, keepSessions: true });
     } catch {
       // Ignore — may already be cleaned up
     }
@@ -664,6 +701,9 @@ async function reconnectLoop(
       connectionState.of(server).set("connected");
       info.set({ attempt: 0, error: "" });
       claimLegacyKeys(server);
+      const lost = lostToasts.get(server);
+      if (lost !== undefined) removeNotification(lost);
+      lostToasts.delete(server);
       addNotification(`${fromServer(server)}Reconnected to server`, "info");
 
       // Where to go back to is decided against the list *this* connection

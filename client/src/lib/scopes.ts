@@ -36,13 +36,22 @@ export function privilegeLabel(scope: string): string {
   return scope === "voipc:moderate" ? "Moderator" : (PRIVILEGES.find((p) => p.scope === scope)?.label ?? scope);
 }
 
+/** The privilege to share history with newcomers (`types.rs`). */
+export const SHARE_HISTORY = "voipc:share_history";
+
+/** Nothing, or only sharing what its holder holds: such a group acts on nobody, needs no
+ *  codes and may start a link (`no_power_over_anyone`). */
+export function noPowerOverAnyone(scopes: readonly string[]): boolean {
+  return scopes.every((s) => s === SHARE_HISTORY);
+}
+
 /** The privileges a group can hand out, in the order the group editor lists
  *  them. A group may hold others (from the server's shell): those show as
  *  they are named. `since`: the protocol that brought it, if newer than the
  *  group editor. */
 export const PRIVILEGES: readonly { scope: string; label: string; hint: string; since?: number }[] = [
   { scope: "*", label: "Everything (admin)", hint: "Every privilege, and the real names behind anonymous channels" },
-  { scope: "voipc:kick", label: "Kick", hint: "Kick people from the server and from any channel" },
+  { scope: "voipc:kick", label: "Kick", hint: "Kick people from the server and from any channel they can see" },
   { scope: "voipc:ban", label: "Ban", hint: "Ban people, by address and account, and remove the posts of someone banned" },
   { scope: "voipc:bans", label: "Ban list", hint: "See the ban list, lift bans, ban an account by name, and remove the posts of someone banned" },
   { scope: "voipc:restrict", label: "Restrict", hint: "Mute someone's voice or stop their channel posts for a while", since: 19 },
@@ -52,6 +61,7 @@ export const PRIVILEGES: readonly { scope: string; label: string; hint: string; 
   { scope: "voipc:channels", label: "Channels", hint: "Change the settings and gates of the channels they can see; post in announcement channels; invite people to a room they stand in" },
   { scope: "voipc:profiles", label: "Profiles", hint: "Clear the display name and picture of someone holding no more than they do", since: 18 },
   { scope: "voipc:mention_all", label: "Call on everybody", hint: "Use @everyone, @here and a group's @&badge", since: 18 },
+  { scope: SHARE_HISTORY, label: "Share history", hint: "May turn on sharing with newcomers: recent chat when asked, and what they kept before someone joined. Nobody starts sharing until they turn it on themselves. Power over no one, needs no codes, spares nobody from a kick. A modified app is not stopped", since: 21 },
   { scope: "voipc:emotes", label: "Emotes", hint: "Add, rename and remove the server's emotes and stickers" },
   { scope: "users:read", label: "See accounts", hint: "The account list, an account's groups and history" },
   { scope: "users:admin", label: "Manage accounts", hint: "Give and take groups, reset two-factor codes, make invites" },

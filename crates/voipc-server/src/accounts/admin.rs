@@ -1,7 +1,7 @@
 //! `AccountRequest::Admin` (1.7): users, groups (l4f roles) and their
 //! privileges (scopes), invites and channel gates, from the app. l4f checks
-//! every scope (`Actor`); this adds the step-up and what a change does to
-//! the people online.
+//! every scope (`Actor`), and the steps whose answers say what exists ask first
+//! (`need!`); this adds the step-up and what a change does to the people online.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -96,6 +96,15 @@ pub(super) async fn handle(
             }
         };
     }
+    // Power first: what these arms answer past here says which groups and unopened
+    // accounts exist. l4f checks again, with the target.
+    macro_rules! need {
+        ($scope:expr) => {
+            if !scope::allowed(&scopes, $scope) {
+                return Ok(no(Error::Forbidden));
+            }
+        };
+    }
     // A frame of a run: `*`, and the run is this session's. Gives the run's guild
     macro_rules! frame {
         ($run:expr) => {
@@ -108,6 +117,12 @@ pub(super) async fn handle(
     }
     match op {
         AdminOp::Users { search, offset } => {
+            // Who was banned on Discord is `*`'s. Whoever may not read this hears it from l4f
+            if scope::allowed(&scopes, "users:read") && !super::is_star(&scopes) {
+                return Ok(answered(
+                    super::placeholder::users_page(relay, search, offset).await,
+                ));
+            }
             let q = Some(search.trim()).filter(|s| !s.is_empty());
             match a.list_users(actor, q, PAGE, offset).await {
                 Ok((users, total)) => out(AdminReply::Users {
@@ -121,6 +136,7 @@ pub(super) async fn handle(
         }
         AdminOp::User { id } => Ok(user_reply(relay, actor, AccountId(id)).await),
         AdminOp::Grant { id, group } => {
+            need!("users:admin");
             if holds_power(relay, &group).await {
                 // It would go to whoever opens the account next
                 if relay.power_would_wait(AccountId(id)).await? {
@@ -140,10 +156,11 @@ pub(super) async fn handle(
             }
             // They may be away, where no session's scopes change
             super::refresh_chat_mods(state).await;
-            crate::gates::prune_logs(state).await;
+            crate::gates::prune_soon(state);
             Ok(user_reply(relay, actor, AccountId(id)).await)
         }
         AdminOp::Revoke { id, group } => {
+            need!("users:admin");
             let power = holds_power(relay, &group).await;
             if power {
                 step_up!();
@@ -154,7 +171,7 @@ pub(super) async fn handle(
             if let Some(sid) = online(state, &id) {
                 if power {
                     // l4f ended its sessions: the connection's too
-                    crate::session::force_disconnect(
+                    crate::session::eject(
                         state,
                         sid,
                         "Your groups on this server changed. Sign in again.",
@@ -165,10 +182,11 @@ pub(super) async fn handle(
                 }
             }
             super::refresh_chat_mods(state).await;
-            crate::gates::prune_logs(state).await;
+            crate::gates::prune_soon(state);
             Ok(user_reply(relay, actor, AccountId(id)).await)
         }
         AdminOp::Reset2fa { id } => {
+            need!("users:admin");
             step_up!();
             if let Err(e) = a.reset_2fa(ctx, actor, AccountId(id)).await {
                 return Ok(no(e));
@@ -185,8 +203,9 @@ pub(super) async fn handle(
         }
         AdminOp::Groups => Ok(groups_reply(relay, actor).await),
         AdminOp::GroupSave { create, group } => {
+            need!("roles:admin");
             if !create
-                && !group.scopes.is_empty()
+                && !super::no_power_over_anyone(&group.scopes)
                 && relay
                     .imported_groups
                     .contains_key(&group.name.trim().to_ascii_lowercase())
@@ -219,21 +238,31 @@ pub(super) async fn handle(
             }
             // Its holders' privileges and badges, wherever they are
             super::revalidate(state).await;
-            crate::gates::prune_logs(state).await;
+            crate::gates::prune_soon(state);
             crate::layout::send_styles_all(state).await;
             Ok(groups_reply(relay, actor).await)
         }
         AdminOp::GroupDelete { name } => {
+            need!("roles:admin");
             step_up!();
             // As `delete_role` reads it, or " CREW " would pass this and delete what a gate names
             let name = name.trim().to_ascii_lowercase();
-            if let Some(channel) = crate::gates::uses(state, &name).await {
-                return Ok(refused(
-                    "Admin",
-                    &format!(
-                        "#{channel} lets in or speaks by this group. Change that channel first."
-                    ),
-                ));
+            match crate::gates::uses(state, session_id, &name).await {
+                Some(Some(channel)) => {
+                    return Ok(refused(
+                        "Admin",
+                        &format!(
+                            "#{channel} lets in or speaks by this group. Change that channel first."
+                        ),
+                    ));
+                }
+                Some(None) => {
+                    return Ok(refused(
+                        "Admin",
+                        "A channel you cannot see lets in or speaks by this group. An admin can change it.",
+                    ));
+                }
+                None => {}
             }
             let from_a_role = relay.group_ledger_row(&name).await?;
             if let Err(e) = a.delete_role(ctx, actor, &name).await {
@@ -279,11 +308,15 @@ pub(super) async fn handle(
                 return Ok(refused("Admin", "You may not change profiles."));
             }
             let target = relay.store().user_scopes(AccountId(id)).await?;
-            if !scope::covers(&scopes, &target) {
+            if !scope::covers(&scopes, &super::without_share(&target)) {
                 return Ok(refused("Admin", "You may not change that account."));
             }
             if !name && !picture {
                 return Ok(refused("Admin", "That clears nothing."));
+            }
+            // Each goes to everyone connected, and writes a row
+            if !state.spend(session_id, |s| &mut s.state_change_rate) {
+                return Ok(refused("Admin", super::profile::TOO_FAST));
             }
             let cleared = match (name, picture) {
                 (true, true) => "name and picture",
@@ -320,7 +353,7 @@ pub(super) async fn handle(
                     "",
                 )
                 .await?;
-            super::profile::tell(state, relay, id).await;
+            super::profile::tell_everyone(state, relay, id).await;
             Ok(AccountReply::ProfileDone)
         }
         AdminOp::ServerProfileSet { name, description } => {
@@ -382,10 +415,10 @@ pub(super) async fn handle(
             let group = group.filter(|g| !g.trim().is_empty());
             if let Some(name) = &group {
                 let role = relay.store().role_by_name(name).await?;
-                if !role.is_some_and(|r| r.scopes.is_empty()) {
+                if !role.is_some_and(|r| super::no_power_over_anyone(&r.scopes)) {
                     return Ok(refused(
                         "Admin",
-                        "A link's starting group must hold no privileges: anyone with the link gets it.",
+                        "A link's starting group must hold no privileges, Share history aside: anyone with the link gets it.",
                     ));
                 }
             }
@@ -478,15 +511,23 @@ pub(super) async fn handle(
             Ok(groups_reply(relay, actor).await)
         }
         AdminOp::GroupMembers { name, offset } => {
-            match a.role_members(actor, &name, PAGE, offset).await {
-                Ok((users, total)) => out(AdminReply::Members {
-                    name,
-                    offset,
-                    total: total.clamp(0, u32::MAX as i64) as u32,
-                    users: users.iter().map(admin_user).collect(),
-                }),
-                Err(e) => Ok(no(e)),
-            }
+            // l4f first, for its refusals
+            let (users, total) = match a.role_members(actor, &name, PAGE, offset).await {
+                Ok(_) if !super::is_star(&scopes) => {
+                    match super::placeholder::members_not_banned(relay, &name, offset).await {
+                        Ok(page) => page,
+                        Err(e) => return Ok(answered(Err(e))),
+                    }
+                }
+                Ok((users, total)) => (users.iter().map(admin_user).collect(), total),
+                Err(e) => return Ok(no(e)),
+            };
+            out(AdminReply::Members {
+                name,
+                offset,
+                total: total.clamp(0, u32::MAX as i64) as u32,
+                users,
+            })
         }
         AdminOp::Invites => Ok(invites_reply(relay, actor).await),
         AdminOp::InviteNew { name, days } => {
@@ -567,6 +608,10 @@ pub(super) async fn handle(
         AdminOp::ChannelDelete { id } => {
             if !state.can(session_id, Powers::CHANNELS) {
                 return Ok(refused("Admin", "You may not change channels."));
+            }
+            if let Err(reason) = crate::layout::channel_delete_refusal(state, session_id, id).await
+            {
+                return Ok(refused("Admin", &reason));
             }
             // Everything kept in it goes: not a step for one stolen session
             step_up!();
@@ -789,7 +834,7 @@ pub(super) async fn handle(
                     told(state, relay, sid, who).await;
                 }
                 super::refresh_chat_mods(state).await;
-                crate::gates::prune_logs(state).await;
+                crate::gates::prune_soon(state);
             }
             super::placeholder::waiting_page(relay, 0).await
         }
@@ -1051,6 +1096,10 @@ async fn user_reply(relay: &Relay, actor: Actor<'_>, id: AccountId) -> AccountRe
         Ok(d) => d,
         Err(e) => return no(e),
     };
+    // After l4f's check: without `users:read` this id is answered as any other is
+    if !super::is_star(actor.scopes) && relay.banned_place(id).await.unwrap_or(true) {
+        return no(Error::NotFound);
+    }
     let mut names: HashMap<AccountId, Option<String>> = HashMap::new();
     let mut audit = Vec::new();
     for e in detail

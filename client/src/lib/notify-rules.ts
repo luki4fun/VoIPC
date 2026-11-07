@@ -6,13 +6,26 @@
 
 export type NotifyLevel = "all" | "mentions" | "nothing";
 
+/** Whether a person can see this page now, so a system notification would tell them nothing.
+ *  A WebView behind HOME goes on saying it has focus: only `hidden` tells. */
+export function pageInView(page: { hidden: boolean; hasFocus(): boolean }): boolean {
+  return !page.hidden && page.hasFocus();
+}
+
+/** Whether a pointer over a toast holds its clock: a mouse, which also says when it has left.
+ *  A tap says nothing of the kind, and the toast would stay until the next tap elsewhere. */
+export function holdsToast(pointerType: string): boolean {
+  return pointerType === "mouse";
+}
+
 /** Above this many members, a channel nobody chose a level for asks only for what
  *  is for you: a sound for each of a thousand people's messages is no use to anybody. */
 export const QUIET_ABOVE_MEMBERS = 50;
 
-/** The level chosen, or the one for a channel of this size. */
-export function levelOf(chosen: NotifyLevel | undefined, members: number): NotifyLevel {
-  return chosen ?? (members > QUIET_ABOVE_MEMBERS ? "mentions" : "all");
+/** The level chosen, or the one for a channel of this size. One the server asks everyone to
+ *  follow asks only for what is for you, whatever its size: nobody chose to hear all of it. */
+export function levelOf(chosen: NotifyLevel | undefined, members: number, autoFollowed = false): NotifyLevel {
+  return chosen ?? (autoFollowed || members > QUIET_ABOVE_MEMBERS ? "mentions" : "all");
 }
 
 export function nextLevel(level: NotifyLevel): NotifyLevel {

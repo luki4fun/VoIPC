@@ -47,6 +47,7 @@ import {
   notificationBody,
   receivedText,
   type EventIn,
+  placedByTime,
 } from "./chat-rules.ts";
 import type { ChatMessage } from "./types.ts";
 import { EMOJI_CATEGORIES, QUICK_REACTIONS } from "./emoji.ts";
@@ -1117,4 +1118,14 @@ test("a report mark survives toArchived and fromArchived", () => {
   const m: ChatMessage = { user_id: 5, username: "carla", content: "look", timestamp: 1, id: "r1", fwd: { name: "dan", at: 7, report } };
   const back = fromArchived(JSON.parse(JSON.stringify(toArchived(m))));
   assert.deepEqual(back.fwd, m.fwd);
+});
+
+test("a post held for its key goes in at its own time, and no further back than the hold", () => {
+  const row = (timestamp: number, content = "") => ({ user_id: 1, username: "a", content, timestamp }) as ChatMessage;
+  const list = [row(1000, "old"), row(50_000, "b"), row(60_000, "c")];
+  const at = (msg: ChatMessage, floor: number) => placedByTime(list, msg, floor).map((m) => m.timestamp);
+  assert.deepEqual(at(row(70_000), 10_000), [1000, 50_000, 60_000, 70_000], "newest goes last");
+  assert.deepEqual(at(row(55_000), 10_000), [1000, 50_000, 55_000, 60_000]);
+  assert.deepEqual(at(row(500), 10_000), [1000, 500, 50_000, 60_000], "the floor stops it");
+  assert.deepEqual(at(row(500), 100_000), [1000, 50_000, 60_000, 500], "nothing here within the hold: at the end, as it came");
 });

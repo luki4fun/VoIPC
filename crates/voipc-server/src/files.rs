@@ -1323,6 +1323,20 @@ impl FileStore {
         }
     }
 
+    /// `left`, for everyone in a place, in one pass.
+    pub(crate) fn place_gone(&self, place: &Place) {
+        let mut inner = self.lock();
+        for entry in inner.entries.values_mut() {
+            let (gone, kept): (Vec<Ticket>, Vec<Ticket>) = std::mem::take(&mut entry.readers)
+                .into_iter()
+                .partition(|t| t.place.as_ref() == Some(place));
+            entry.readers = kept;
+            for ticket in gone {
+                keep(&mut entry.spent, ticket);
+            }
+        }
+    }
+
     /// A ticket handed to a waiter who has left the conversation since.
     fn withdraw(&self, hash: [u8; 32], session: SessionId) {
         if let Some(entry) = self.lock().entries.get_mut(&hash) {
@@ -2032,6 +2046,13 @@ pub(crate) async fn handle_cancel(state: &Arc<ServerState>, session_id: SessionI
 pub(crate) fn left_channel(state: &ServerState, session_id: SessionId, channel_id: ChannelId) {
     if let Some(store) = state.files.as_ref() {
         store.left(session_id, &Place::Channel(channel_id));
+    }
+}
+
+/// A channel goes, and everyone with it at once (`layout::channel_gone`).
+pub(crate) fn channel_gone(state: &ServerState, channel_id: ChannelId) {
+    if let Some(store) = state.files.as_ref() {
+        store.place_gone(&Place::Channel(channel_id));
     }
 }
 
@@ -3901,6 +3922,28 @@ mod tests {
         let (there, _) = read_ticket(&store.fetch(hash, other, (B, IP_B), now), B);
         store.left(B, &CH);
         assert!(matches!(store.get(hash, &here, None, now).await, Get::Gone));
+        assert!(matches!(
+            store.get(hash, &there, None, now).await,
+            Get::Bytes { .. }
+        ));
+    }
+
+    // A channel that goes takes every ticket handed out there, whoever holds it, in the
+    // one pass an undo of hundreds of channels can afford.
+    #[tokio::test]
+    async fn a_channel_that_goes_ends_everyones_tickets_there() {
+        let (store, _dir) = store(|_| {});
+        let now = Instant::now();
+        let (bytes, hash) = blob(3000, 51);
+        let other = Place::Channel(8);
+        upload_all(&store, hash, &bytes, CH, (A, IP_A), now).await;
+        store.upload(hash, other.clone(), 3000, (A, IP_A), now);
+        let (b, _) = read_ticket(&store.fetch(hash, CH, (B, IP_B), now), B);
+        let (c, _) = read_ticket(&store.fetch(hash, CH, (C, IP_C), now), C);
+        let (there, _) = read_ticket(&store.fetch(hash, other, (B, IP_B), now), B);
+        store.place_gone(&CH);
+        assert!(matches!(store.get(hash, &b, None, now).await, Get::Gone));
+        assert!(matches!(store.get(hash, &c, None, now).await, Get::Gone));
         assert!(matches!(
             store.get(hash, &there, None, now).await,
             Get::Bytes { .. }

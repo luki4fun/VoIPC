@@ -36,9 +36,11 @@ import {
 import { isAdmin, serverAddress, userId, voiceIsAdmin } from "./connection.js";
 import { can } from "./powers.js";
 import { olderRelay } from "./relay.js";
-import { channelRosters } from "./rosters.js";
+import { channelRosters, textSeats } from "./rosters.js";
 import { speakingUsers, users, visibleMembers } from "./users.js";
-import { rosterOf, summonOffered } from "../roster-rules.js";
+import { listedHere, rosterOf, summonOffered } from "../roster-rules.js";
+import { goesByList } from "../follow-rules.js";
+import { livePath } from "../relay-rules.js";
 import type { ChannelInfo, ChatMessage, UserInfo } from "../types.js";
 
 /**
@@ -103,6 +105,20 @@ export const visibleChannels: Readable<ChannelInfo[]> = derived(
   [channels, can, currentChannelId],
   ([$channels, $can, $current]) =>
     $channels.filter((c) => c.channel_id !== 0 && (!c.hidden || $can("voipc:channels") || c.channel_id === $current)),
+);
+
+/** On screen is a text channel with no list of its own: anyone online may read it, so they
+ *  are who the pane lists, and nothing asked the relay about it. */
+export const openTextHere: Readable<boolean> = derived(
+  [displayChannel, displayChannelId, isPreviewing, textSeats, olderRelay],
+  ([$channel, $id, $previewing, $seats, $older]) =>
+    !$previewing && !!$channel?.text && livePath($older?.protocol ?? null) && !goesByList($channel, $seats.get($id)?.gated),
+);
+
+/** Who is listed for the channel on screen, a preview aside. */
+export const displayRoster: Readable<UserInfo[]> = derived(
+  [displayChannelId, channelRosters, currentChannelId, users, channels, openTextHere],
+  ([$id, $rosters, $current, $users, $channels, $open]) => listedHere($id, $rosters, $current, $users, $channels, $open),
 );
 
 /** This channel hides its roster from us. Admins always see it. */
@@ -184,10 +200,7 @@ export const displayUsers: Readable<UserInfo[]> = derived(
   [
     isPreviewing,
     previewUsers,
-    displayChannelId,
-    channelRosters,
-    currentChannelId,
-    users,
+    displayRoster,
     userId,
     recentSpeakers,
     hideMembers,
@@ -196,20 +209,14 @@ export const displayUsers: Readable<UserInfo[]> = derived(
   ([
     $previewing,
     $previewUsers,
-    $displayId,
-    $rosters,
-    $current,
-    $users,
+    $roster,
     $userId,
     $recent,
     $hide,
     $viewingVoice,
   ]) =>
     visibleMembers(
-      // A text channel's members are its own: `rosterOf` hands back the
-      // pushed list for the channel we stand in and the asked-for one
-      // otherwise, which is exactly the distinction here.
-      $previewing ? $previewUsers : rosterOf($displayId, $rosters, $current, $users),
+      $previewing ? $previewUsers : $roster,
       $userId,
       // Speakers are ids from the call's server; on another one they are
       // somebody else's numbers.
@@ -242,9 +249,9 @@ export const callMembers: Readable<UserInfo[]> = derived(
  * they are the member list then, and listing them twice says nothing.
  */
 export const idleUsers: Readable<UserInfo[]> = derived(
-  [displayChannelId, channelRosters, currentChannelId, users],
-  ([$displayId, $rosters, $current, $users]) =>
-    $displayId === 0 ? [] : rosterOf(0, $rosters, $current, $users),
+  [displayChannelId, channelRosters, currentChannelId, users, openTextHere],
+  ([$displayId, $rosters, $current, $users, $open]) =>
+    $displayId === 0 || $open ? [] : rosterOf(0, $rosters, $current, $users),
 );
 
 /** Creator of the channel we are actually in — what invites are gated on. */
@@ -259,7 +266,7 @@ export const isCurrentChannelCreator: Readable<boolean> = derived(
 );
 
 /** Channel kick: the creator in their own channel, anyone with `voipc:kick`
- *  in any channel. */
+ *  in any channel they can see. */
 export const canKick: Readable<boolean> = derived(
   [displayChannelId, isPreviewing, displayChannelCreatorId, userId, can],
   ([$id, $previewing, $creator, $userId, $can]) =>

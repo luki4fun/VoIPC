@@ -12,7 +12,28 @@
   import { invoke } from "@tauri-apps/api/core";
   import type { UnlistenFn } from "@tauri-apps/api/event";
   import { listenServer, fromServer } from "../connect.js";
-  import { account, accountHex, accountPrompt, closePrompt, relayAccounts, showPrompt, type AccountPrompt } from "../stores/account.js";
+  import {
+    account,
+    accountHex,
+    accountPrompt,
+    armsSlowly,
+    closePrompt,
+    codesTurnedOn,
+    dropPair,
+    lookedAt,
+    lookOver,
+    pairCodeCame,
+    providerDone,
+    providerPage,
+    providerRefused,
+    providerStarted,
+    relayAccounts,
+    shareRight,
+    setupRefused,
+    setupSent,
+    showPrompt,
+    type AccountPrompt,
+  } from "../stores/account.js";
   import { privilegeLabel } from "../scopes.js";
   import {
     applyChannelEvent,
@@ -26,7 +47,7 @@
   import { onAccountBlocks } from "../stores/blocks.js";
   import { channels, currentChannelId } from "../stores/channels.js";
   import { shareChannelHistory } from "../stores/settings.js";
-  import { channelRosters, currentRosterOf } from "../stores/rosters.js";
+  import { channelRosters, currentRosterOf, onlineById } from "../stores/rosters.js";
   import { users } from "../stores/users.js";
   import { isWeb } from "../stores/platform.js";
   import { chatEvent, expiryFor } from "../chat-rules.js";
@@ -37,6 +58,7 @@
   import { PROVE_FIRST, community, moves, newRecoveryKey } from "../relay-rules.js";
   import { makeProfilePicture } from "../image-prep.js";
   import { askProfile, profiles, setDisplayName, setProfilePicture } from "../stores/profiles.js";
+  import { saysItsOwnRefusal } from "../stores/imported.js";
   import { shortName } from "../username.js";
   import { olderRelay } from "../stores/relay.js";
   import type { AccountInfo, RelayAccounts } from "../types.js";
@@ -64,6 +86,38 @@
   let setupToProve: Extract<AccountPrompt, { kind: "totp-setup" }> | null = null;
   let qr = $state("");
   let copied = $state(false);
+  /** Whether this prompt's yes is live (`armsSlowly`). */
+  let armed = $state(false);
+  let wasPairAsk = false;
+  // On every change of the prompt object, whatever its kind: a double click on the
+  // last prompt's button must not land here.
+  $effect(() => {
+    const p = $accountPrompt;
+    armed = false;
+    // A code typed before a wrong one, or at another prompt, is no answer here,
+    // and one typed here is no answer at what waited behind it
+    if (p?.kind === "pair-ask" || wasPairAsk) code = "";
+    wasPairAsk = p?.kind === "pair-ask";
+    if (!armsSlowly(p)) return;
+    const timer = setTimeout(() => (armed = true), 1500);
+    return () => clearTimeout(timer);
+  });
+  /** The dialog's box, which stays when one prompt takes over from another. */
+  let box = $state<HTMLElement>();
+  let kindShown: string | undefined;
+  // The focused button goes with the old prompt and the focus falls to the page, where
+  // Escape never arrives: actions/dialog.ts listens on the box. In a microtask, as the new
+  // prompt's own autofocus keeps the focus it took. A new box has dialog.ts to do this.
+  $effect(() => {
+    const kind = $accountPrompt?.kind;
+    if (kind && kindShown && kind !== kindShown) {
+      queueMicrotask(() => {
+        if (box && !box.contains(document.activeElement)) (box.querySelector<HTMLElement>("[autofocus]") ?? box).focus();
+      });
+    }
+    kindShown = kind;
+  });
+
   /** A new recovery key on its way: shown once the relay says it is in
    *  force (`RecoveryKeyChanged`), never before, and dropped on an error. */
   let pendingKey: { server: string; key: string } | null = null;
@@ -81,7 +135,9 @@
    *  came first (recovery key, codes) to be out of the way. */
   const cloudNext: string[] = [];
   let cloudChoice = $state(false);
-  let shareChoice = $state(true);
+  let shareChoice = $state(false);
+  /** Whether the switch counts on each server: no box where it does not. */
+  const shareRights = shareRight.all();
 
   function askCloud(server: string) {
     if (!get(relayAccounts.peek(server))?.cloud || !get(account.peek(server))) return;
@@ -124,7 +180,8 @@
     try {
       await invoke("account_set_prefs", { server, prefs: { cloud: keep, asked: true } });
       account.of(server).update((a) => (a ? { ...a, cloud: keep } : a));
-      if (shareChoice !== get(shareChannelHistory)) setShare(shareChoice);
+      // A box that was not there cannot change a switch shared with every server
+      if (get(shareRight.peek(server)) && shareChoice !== get(shareChannelHistory)) setShare(shareChoice);
       if (keep) enterLogs(server);
       closePrompt();
     } catch (e) {
@@ -135,7 +192,8 @@
   }
 
   function reset() {
-    code = "";
+    // What is being typed at the old device's question stays: nothing else replaces it
+    if (get(accountPrompt)?.kind !== "pair-ask") code = "";
     oldPassword = "";
     newPassword = "";
     newPassword2 = "";
@@ -157,6 +215,7 @@
   onMount(() => {
     unlisten.push(
       listenServer<RelayAccounts>("relay-accounts", (server, data) => relayAccounts.of(server).set(data)),
+      listenServer<{ may: boolean }>("share-right", (server, data) => shareRight.of(server).set(data.may)),
       listenServer<{
         name: string;
         relay_id: string;
@@ -195,26 +254,49 @@
         providerName = d.suggestion;
         showPrompt({ kind: "provider-name", server, suggestion: d.suggestion, problem: d.problem });
       }),
-      listenServer<{ name: string; claim: boolean; has_password: boolean; problem: string }>("account-provider-choice", (server, d) => {
+      listenServer<{ name: string; claim: boolean; has_password: boolean; problem: string; known_as: string }>("account-provider-choice", (server, d) => {
         const now = get(accountPrompt);
         if (now?.kind === "pair-wait" && now.server === server) closePrompt(now);
         reset();
         recoveryText = "";
         claimAsked = false;
-        showPrompt({ kind: "provider-choice", server, name: d.name, claim: d.claim, hasPassword: d.has_password, problem: d.problem });
+        showPrompt({ kind: "provider-choice", server, name: d.name, claim: d.claim, hasPassword: d.has_password, problem: d.problem, knownAs: d.known_as });
       }),
-      // This device, which asked: the code to compare on the other one.
-      listenServer<string>("account-pair-code", (server, code) => {
-        const now = get(accountPrompt);
-        if (now?.kind === "pair-wait" && now.server === server) accountPrompt.set({ ...now, code });
+      // A first vault's key, before anything of it leaves this device.
+      listenServer<{ key: string }>("account-provider-key", (server, d) => {
+        reset();
+        showPrompt({ kind: "provider-key", server, key: d.key });
       }),
-      // Another device asks this one, and the person must compare before anything leaves.
-      listenServer<{ pair: number; code: string }>("account-pair-ask", (server, d) => {
-        showPrompt({ kind: "pair-ask", server, pair: d.pair, code: d.code });
+      // This device, which asked: the code to type on the other one.
+      listenServer<string>("account-pair-code", pairCodeCame),
+      // This device again: the other one's answer opens, and nothing opens without this yes.
+      listenServer<{ code: string; known_as: string }>("account-pair-same", (server, d) => {
+        showPrompt({ kind: "pair-same", server, code: d.code, knownAs: d.known_as });
       }),
-      listenServer<{ pair: number }>("account-pair-ended", (server, d) => {
-        const now = get(accountPrompt);
-        if (now?.kind === "pair-ask" && now.server === server && now.pair === d.pair) closePrompt(now);
+      // Another device asks this one: nothing leaves before the person agrees to look.
+      listenServer<{ pair: number }>("account-pair-look", (server, d) => {
+        showPrompt({ kind: "pair-look", server, pair: d.pair });
+      }),
+      // They agreed, and the new device's code is what opens the rest.
+      listenServer<{ pair: number; left: number; retry: boolean }>("account-pair-ask", (server, d) => {
+        showPrompt({ kind: "pair-ask", server, pair: d.pair, left: d.left, retry: d.retry });
+      }),
+      listenServer<{ pair: number; looked?: boolean; typing?: boolean; wrong?: boolean; handed?: boolean }>("account-pair-ended", (server, d) => {
+        dropPair(server, d.pair);
+        lookOver(server);
+        if (d.looked) {
+          addNotification(`${fromServer(server)}the new device went away before showing a code. If that was not you, someone may be trying codes.`, "warning", 0);
+        } else if (d.typing) {
+          addNotification(`${fromServer(server)}the request for your key ended before your code went in, so nothing was handed over. If a new device now asks whether you typed the code, say no.`, "warning", 0);
+        } else if (d.wrong) {
+          addNotification(`${fromServer(server)}that was not the code the new device showed, so nothing was handed over. Someone may be in between, or one app needs an update.`, "error", 0);
+        } else if (d.handed) {
+          // Until they dismiss it: the new device asks about this very sentence
+          addNotification(`${fromServer(server)}the code was right. The new device has the key, and if it goes on, this one signs out here.`, "info", 0);
+        }
+      }),
+      listenServer<unknown>("account-pair-limit", (server) => {
+        addNotification(`${fromServer(server)}more requests for the key to your messages came, and are being refused for now. If that is not you, change your provider account's password.`, "warning", 0);
       }),
       listenServer<unknown>("account-reply", (server, reply) => onReply(server, reply)),
       // The stored log of a direct conversation: what was written while one of us was away.
@@ -234,6 +316,7 @@
       }>("stored-dm", (server, m) => {
         const me = get(account.peek(server));
         if (!me) return;
+        askProfile(server, m.peer_account);
         fileStoredDm(
           server,
           m,
@@ -273,7 +356,7 @@
         const writer = t.from_me ? accountHex(me.info.id) : t.account;
         // Theirs only where the name is theirs: the relay's name for an account
         const ch = get(channels.peek(server)).find((c) => c.log === t.conv);
-        const people = [...(ch ? currentRosterOf(server, ch.channel_id) : []), ...get(users.peek(server))];
+        const people = [...(ch ? currentRosterOf(server, ch.channel_id) : []), ...onlineById(server).values()];
         const online = t.from_me
           ? undefined
           : people.find((u) => u.username === t.name && !!u.account && accountHex(u.account) === t.account);
@@ -296,6 +379,14 @@
       // A vault item this device will not use as the server holds it (and so
       // never saves over this session).
       listenServer<{ item: string; problem: string }>("vault-problem", (server, d) => {
+        if (d.problem === "withheld") {
+          addNotification(
+            `${fromServer(server)}Security warning: the server has not handed over the list of people's keys that you pinned. Until it does, direct messages, calls and history wait, and it may be keeping that list back on purpose.`,
+            "error",
+            0,
+          );
+          return;
+        }
         const what =
           d.item === "item.pins"
             ? "the identities you pinned"
@@ -311,7 +402,9 @@
               ? "came back older than this device saw them: the server may be rolling them back"
               : d.problem === "missing"
                 ? "are missing, though this device saw them before: the server may be withholding them"
-                : "could not be read";
+                : d.problem === "hidden"
+                  ? "are kept in a way this server's older version cannot hand back"
+                  : "could not be read";
         const warn = d.item === "item.pins" ? ". People you meet now are not checked against them." : ".";
         addNotification(`${fromServer(server)}Security warning: ${what} ${why}${warn}`, "error", 0);
       }),
@@ -333,18 +426,16 @@
         break;
       }
       case "TotpEnabled":
-        reset();
-        showPrompt({ kind: "recovery-codes", server, codes: body.recovery_codes });
+        if (codesTurnedOn(server, body.recovery_codes)) reset();
         break;
       case "Providers":
-        providers = { offered: body.offered, linked: body.linked, hasPassword: body.has_password };
+        providers = { offered: [...new Set<string>(body.offered)], linked: body.linked, hasPassword: body.has_password };
         break;
       case "ProviderBrowser":
-        if (prompt?.kind === "provider-confirm" && prompt.server === server) closePrompt(prompt);
-        reset();
-        showPrompt({ kind: "provider-page", server, url: body.url, code: body.code });
+        if (providerPage(server, body.url, body.code)) reset();
         break;
       case "ProviderDone": {
+        if (!providerDone(server)) break;
         const now = get(accountPrompt);
         if (now?.kind === "provider-page" && now.server === server) closePrompt(now);
         reset();
@@ -400,8 +491,11 @@
       case "Error":
         // The admin panel's own (admin-ui.ts)
         if (body.request === "Admin") break;
+        if (saysItsOwnRefusal(body.request)) break;
         if (body.request === "RecoveryKeyNew" && pendingKey?.server === server) pendingKey = null;
         if (body.request === "RecoveryKeyNew" && keyChangedOn === server) keyChangedOn = null;
+        if (body.request === "TotpEnable") setupRefused(server);
+        if (body.request === "ProviderStart") providerRefused(server);
         if (
           prompt &&
           prompt.server === server &&
@@ -494,13 +588,44 @@
     closePrompt();
   }
 
-  async function answerPair(yes: boolean) {
+  /** "First time here", with the key on screen and written down: the claim goes. */
+  function keySaved() {
     const p = get(accountPrompt);
-    if (!p || p.kind !== "pair-ask") return;
+    if (!p || p.kind !== "provider-key") return;
     closePrompt(p);
-    await invoke("account_pair_answer", { server: p.server, pair: p.pair, yes }).catch((e) =>
+    void answerProvider(p.server, { kind: "keysaved" });
+  }
+
+  function answerSame(yes: boolean) {
+    const p = get(accountPrompt);
+    if (!p || p.kind !== "pair-same") return;
+    closePrompt(p);
+    void answerProvider(p.server, { kind: "same", yes });
+  }
+
+  async function answerLook() {
+    const p = get(accountPrompt);
+    if (!p || p.kind !== "pair-look") return;
+    closePrompt(p);
+    lookedAt(p.server);
+    await invoke("account_pair_look", { server: p.server, pair: p.pair }).catch((e) => addNotification(String(e), "warning"));
+  }
+
+  /** The session compares it, and answers `account-pair-ask` again or `account-pair-ended`. */
+  async function answerPair() {
+    const p = get(accountPrompt);
+    if (!p || p.kind !== "pair-ask" || !/^\d{6}$/.test(code.trim())) return;
+    await invoke("account_pair_answer", { server: p.server, pair: p.pair, code: code.trim() }).catch((e) =>
       addNotification(String(e), "warning"),
     );
+  }
+
+  async function declinePair() {
+    const p = get(accountPrompt);
+    if (!p || (p.kind !== "pair-look" && p.kind !== "pair-ask")) return;
+    closePrompt(p);
+    lookOver(p.server);
+    await invoke("account_pair_decline", { server: p.server, pair: p.pair }).catch((e) => addNotification(String(e), "warning"));
   }
 
   /** A provider link, a proof with a provider, or an unlink. */
@@ -523,8 +648,12 @@
     try {
       // The answers come as account-reply (onReply)
       if (action === "unlink") await invoke("account_provider_unlink", proof);
-      else await invoke("account_provider_start", { ...proof, link: action === "link" });
+      else {
+        providerStarted(server);
+        await invoke("account_provider_start", { ...proof, link: action === "link" });
+      }
     } catch (e) {
+      providerRefused(server);
       error = String(e);
       busy = false;
     }
@@ -580,12 +709,14 @@
     }
     busy = true;
     error = "";
+    setupSent(p.server);
     try {
       await invoke("account_request", {
         server: p.server,
         request: { TotpEnable: { sealed: p.sealed, code: code.trim() } },
       });
     } catch (e) {
+      setupRefused(p.server);
       error = String(e);
       busy = false;
     }
@@ -700,7 +831,7 @@
   function escapeFor(kind: string): (() => void) | undefined {
     if (busy) return undefined;
     if (kind === "totp") return cancelTotp;
-    if (["provider-name", "provider-choice"].includes(kind)) return cancelProvider;
+    if (["provider-name", "provider-choice", "provider-key", "pair-wait", "pair-same"].includes(kind)) return cancelProvider;
     if (kind === "provider-page") return closeProviderPage;
     if (["totp-setup", "safety", "account", "delete", "password", "recovery-new", "provider-confirm"].includes(kind)) return () => closePrompt();
     return undefined;
@@ -714,7 +845,7 @@
 {#if $accountPrompt}
   {@const p = $accountPrompt}
   <div class="overlay">
-    <div class="dialog account-dialog" data-kind={p.kind} use:dialog={{ onclose: escapeFor(p.kind) }}>
+    <div class="dialog account-dialog" data-kind={p.kind} bind:this={box} use:dialog={{ onclose: escapeFor(p.kind) }}>
       {#if p.kind === "totp"}
         <h2>Two-factor code</h2>
         <p class="hint">
@@ -766,6 +897,12 @@
           <button type="button" class="submit-btn btn btn-primary" onclick={submitProviderName} disabled={!providerName.trim()}>Go on</button>
         </div>
       {:else if p.kind === "provider-choice"}
+        {#if p.knownAs}
+          <p class="hint">
+            <strong>This device knows you here as {p.knownAs}, not as {p.name}.</strong> If you meant that account, cancel:
+            this server may be offering you another one.
+          </p>
+        {/if}
         {#if p.claim}
           <h2>{fromServer(p.server)}Open {p.name}</h2>
           <p class="hint">
@@ -816,26 +953,84 @@
             <button type="button" class="submit-btn btn btn-primary" onclick={() => chooseProvider({ kind: "recovery", key: recoveryText.trim() })} disabled={!recoveryText.trim()}>Unlock</button>
           </div>
         {/if}
+      {:else if p.kind === "provider-key"}
+        <h2>{fromServer(p.server)}Your recovery key</h2>
+        <p class="hint">
+          Write it down. It is what opens this account on a new device, and nothing replaces it. The account opens when you
+          go on. If an earlier try showed you another key, the key from the device where the account opened counts.
+        </p>
+        <code class="secret">{p.key}</code>
+        <button type="button" class="secondary" onclick={() => copy(p.key)}>{copied ? "Copied" : "Copy"}</button>
+        <div class="buttons">
+          <button type="button" class="secondary" onclick={cancelProvider}>Cancel</button>
+          <button type="button" class="submit-btn btn btn-primary" onclick={keySaved} disabled={!armed}>I have written it down</button>
+        </div>
       {:else if p.kind === "pair-wait"}
         <h2>{fromServer(p.server)}Check your other device</h2>
         {#if p.code}
-          <p class="hint">Approve this device there if it shows the same code.</p>
+          <p class="hint">Type this code on your other device.</p>
           <code class="secret">{p.code}</code>
-          <p class="hint">Once approved, this device takes over and the other one signs out here.</p>
+          <p class="hint">Once it says the code was right, this device takes over and the other one signs out here.</p>
         {:else}
-          <p class="hint">Asking your other device…</p>
+          <p class="hint">It asks whether this is you. Say yes there, and a code to type shows here.</p>
         {/if}
+        <div class="buttons">
+          <button type="button" class="secondary" onclick={cancelProvider}>Cancel</button>
+        </div>
+      {:else if p.kind === "pair-same"}
+        <h2>{fromServer(p.server)}Did you type this code?</h2>
+        {#if p.knownAs}
+          <p class="hint"><strong>This device knows you here as {p.knownAs}.</strong> If you meant that account, say no.</p>
+        {/if}
+        <p class="hint">Your other device answered. Did you type this code on it, and did it say the code was right?</p>
+        <code class="secret">{p.code}</code>
+        <p class="hint">If you typed nothing there, or it did not say that, say no: this server may be offering a vault of its own.</p>
+        <div class="buttons">
+          <button type="button" class="secondary" onclick={() => answerSame(false)}>No</button>
+          <button type="button" class="submit-btn btn btn-primary" onclick={() => answerSame(true)} disabled={!armed}>Yes, I typed it</button>
+        </div>
+      {:else if p.kind === "pair-look"}
+        <h2>{fromServer(p.server)}A new device asks for your key</h2>
+        <p class="hint">
+          Someone signed in as you through your provider and asks this device for the key to your messages. Is that you?
+        </p>
+        <p class="hint">If it is not you, say no and change your provider account's password.</p>
+        <div class="buttons">
+          <button type="button" class="secondary" onclick={declinePair}>No</button>
+          <button type="button" class="submit-btn btn btn-primary" onclick={answerLook} disabled={!armed}>It is me</button>
+        </div>
       {:else if p.kind === "pair-ask"}
         <h2>{fromServer(p.server)}Approve a new device?</h2>
         <p class="hint">
-          Someone signed in as you through your provider and asks this device for the key to your messages. Say yes only if
-          it is you, and that device shows this code. Approving signs this device out here.
+          Type the code the new device shows. This device does not show it: it works the code out itself and compares. If the
+          new device shows no code, or it is not you, say no. Approving signs this device out here.
         </p>
-        <code class="secret">{p.code}</code>
-        <p class="hint">If it is not you, say no and change your provider account's password.</p>
+        <p class="hint">
+          <strong>The code stands alone in the new device's window "Check your other device".</strong> A code in an error, a
+          message, a notice or another dialog is not it, whoever seems to send it: say no.
+        </p>
+        <div class="field">
+          <label for="acct-pair-code">Code on the new device</label>
+          <!-- svelte-ignore a11y_autofocus -->
+          <input
+            id="acct-pair-code"
+            type="text"
+            inputmode="numeric"
+            autocomplete="off"
+            autofocus
+            bind:value={code}
+            placeholder="123456"
+            onkeydown={(e) => e.key === "Enter" && answerPair()}
+          />
+        </div>
+        {#if p.retry}
+          <div class="error" role="alert">
+            That is not the code. {p.left === 1 ? "One try left" : `${p.left} tries left`}, then this device says no.
+          </div>
+        {/if}
         <div class="buttons">
-          <button type="button" class="secondary" onclick={() => answerPair(false)}>No</button>
-          <button type="button" class="submit-btn btn btn-primary" onclick={() => answerPair(true)}>It is me, the codes match</button>
+          <button type="button" class="secondary" onclick={declinePair}>No</button>
+          <button type="button" class="submit-btn btn btn-primary" onclick={answerPair} disabled={!/^\d{6}$/.test(code.trim())}>It is me, hand over the key</button>
         </div>
       {:else if p.kind === "provider-page"}
         <h2>Your code: {p.code}</h2>
@@ -943,10 +1138,15 @@
           Kept messages are signed by you, so the people they are for can prove you wrote them, and whoever gets into
           your account later can read them.
         </p>
-        <label class="check">
-          <input type="checkbox" bind:checked={shareChoice} disabled={busy} />
-          <span>Let people who join a channel later read what I wrote there before</span>
-        </label>
+        {#if $shareRights.get(p.server)}
+          <label class="check">
+            <input type="checkbox" bind:checked={shareChoice} disabled={busy} />
+            <span>Share with people who join a channel later</span>
+          </label>
+          <p class="hint small">
+            They can read what you keep there from before they joined, and ask your app for recent chat, which they see as your word. Off, they read from when they joined. One switch for all your servers, also in Settings → Privacy & data.
+          </p>
+        {/if}
         {#if error}<div class="error" role="alert">{error}</div>{/if}
         <div class="buttons">
           <button type="button" class="secondary" onclick={() => submitCloud(p.server, false)} disabled={busy}>

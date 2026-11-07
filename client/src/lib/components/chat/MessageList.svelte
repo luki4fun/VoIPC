@@ -498,7 +498,12 @@
 
 {#each messages as msg, i (rowKey(msg))}
   {#if !isRow(msg)}
-    <div class="history-marker"><span>{msg.content}</span></div>
+    <div class="history-marker">
+      <span>{msg.content}</span>
+      {#if msg.names}
+        <details class="named-all"><summary>Show all</summary>{msg.names.join(", ")}</details>
+      {/if}
+    </div>
   {:else}
     {#if startsDay(i)}
       <div class="day-divider" role="separator"><span>{dayLabel(msg.timestamp, today)}</span></div>
@@ -818,6 +823,16 @@
     content: "";
     flex: 1;
     border-top: 1px solid var(--border);
+  }
+
+  .named-all {
+    text-transform: none;
+    letter-spacing: normal;
+  }
+
+  .named-all summary {
+    cursor: pointer;
+    text-decoration: underline;
   }
 
   .attachment-placeholder {

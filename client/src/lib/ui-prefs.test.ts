@@ -232,3 +232,21 @@ test("a damaged blocked list costs that list, never the app", () => {
   const many = Object.fromEntries([...new Array(300).keys()].map((i) => [`g:${i}`, `${i}`]));
   assert.equal(Object.keys(sanitizeUiPrefs({ blocked: { "h:1": many } }).blocked["h:1"]).length, 200);
 });
+
+test("three hundred left marks survive a round trip", () => {
+  const list = Array.from({ length: 300 }, (_, i) => `c${i}`);
+  assert.equal(sanitizeUiPrefs({ left_text_channels: { "a.example:9987": list } }).left_text_channels["a.example:9987"].length, 300);
+});
+
+test("read positions keep only numbers, and named readers only strings", () => {
+  const p = sanitizeUiPrefs({
+    read_marks: { "a.example:9987": { "c:1": 5000, "c:2": "soon", "c:3": -1 }, "b.example:9987": "nope" },
+    readers_named: { "a.example:9987": { "c:1": ["aa", 7, "bb"], "c:2": "nope" } },
+    gates_seen: { "a.example:9987": ["c:1", 3] },
+    opened_channels: "nope",
+  });
+  assert.deepEqual(p.read_marks, { "a.example:9987": { "c:1": 5000 } });
+  assert.deepEqual(p.readers_named, { "a.example:9987": { "c:1": ["aa", "bb"] } });
+  assert.deepEqual(p.gates_seen, { "a.example:9987": ["c:1"] });
+  assert.deepEqual(p.opened_channels, {});
+});

@@ -34,7 +34,12 @@
     isCulled,
     isPreviewing,
     displayChannel,
+    openTextHere,
   } from "../../stores/roster.js";
+  import { olderRelay } from "../../stores/relay.js";
+  import { livePath } from "../../relay-rules.js";
+  import { refreshList } from "../../stores/sweep.js";
+  import { serverAddress } from "../../stores/scoped.js";
   import { openShare, openUserMenu } from "../../stores/user-menu.js";
   import { memberMenu } from "../../actions/member-menu.js";
   import { badgeStyle, badgesInOrder, sectionsOf } from "../../member-sections.js";
@@ -51,7 +56,7 @@
   // are in none — the pane shows it when we are in no voice channel here and
   // have no other channel open.
   const restLabel = $derived(
-    $displayChannelId === 0
+    $displayChannelId === 0 || $openTextHere
       ? "Online"
       : $isPreviewing || $displayChannel?.text
         ? `In #${$displayChannelName}`
@@ -62,6 +67,8 @@
     ...sectionsOf(rest, $groupStyles, restLabel),
   ]);
   const idleGroups = $derived(sectionsOf($idleUsers, $groupStyles, "Online"));
+  /** A channel whose list comes by the sweep, so it is as old as that. */
+  const byList = $derived(!$isPreviewing && !!$displayChannel?.text && !$openTextHere && livePath($olderRelay?.protocol ?? null));
 
   function menu(user: UserInfo, e: MouseEvent, idle: boolean) {
     e.preventDefault();
@@ -73,6 +80,11 @@
 <aside class="user-list modern">
   {#if $hideMembers && !$isPreviewing}
     <div class="hidden-note">Members are hidden here — people appear while they speak</div>
+  {:else if byList}
+    <div class="hidden-note">
+      Who is here, up to ten minutes ago.
+      <button class="refresh-list" title="Asks now, which tells the server this is the channel you are looking at" onclick={() => refreshList($serverAddress, $displayChannelId)}>Refresh</button>
+    </div>
   {/if}
 
   <div class="users">
@@ -131,7 +143,7 @@
         >
       {/each}
       {#if user.shares_history}
-        <span class="sharing-history" title="Shares recent chat with newcomers"><Icon name="history" size={12} /></span>
+        <span class="sharing-history" role="img" title="Shares history with newcomers" aria-label="Shares history with newcomers"><Icon name="history" size={12} /></span>
       {/if}
       {#if $blockedMember(user)}
         <span class="blocked-mark" title="You blocked this person"><Icon name="ban" size={12} /></span>
@@ -179,6 +191,18 @@
     min-width: 140px;
     flex-shrink: 0;
     background: var(--bg-secondary);
+  }
+
+  .refresh-list {
+    display: block;
+    margin-top: 4px;
+    padding: 0;
+    border: none;
+    background: none;
+    color: var(--accent);
+    font: inherit;
+    cursor: pointer;
+    text-decoration: underline;
   }
 
   .hidden-note {

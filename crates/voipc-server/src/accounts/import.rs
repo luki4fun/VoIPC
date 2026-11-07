@@ -19,7 +19,6 @@ use l4f_accounts::store::Store;
 use l4f_accounts::util;
 use tokio::sync::MutexGuard;
 use tracing::warn;
-use voipc_protocol::codec::encode_server_msg;
 use voipc_protocol::messages::{AccountReply, AdminReply, ServerMessage};
 use voipc_protocol::types::{
     ImportFacts, ImportOptions, ImportUndoCounts, ProviderKind, SessionId,
@@ -538,7 +537,7 @@ pub(super) async fn facts(
     let db_file = relay.db_file();
     let (unfinished, options) = relay.runs_for_facts().await?;
     let channels = state.channel_list().await;
-    let list = encode_server_msg(&ServerMessage::ChannelList { channels })?;
+    let list = postcard::to_allocvec(&channels)?;
     let running = state
         .import
         .lock()
@@ -561,7 +560,9 @@ pub(super) async fn facts(
         takes_guests: !relay.required,
         accounts: accounts.clamp(0, i64::from(u32::MAX)) as u32,
         channel_list_bytes: list.len() as u32,
-        channel_list_limit: crate::layout::LIST_LIMIT as u32,
+        // None here: a list too long for one frame comes in several (`send_channel_list`).
+        // An older relay names its one frame, and the importer fits a list to that.
+        channel_list_limit: u32::MAX,
         categories: state.layout.read().await.categories.len() as u32,
         max_categories: crate::layout::MAX_CATEGORIES as u32,
         emotes: state.emotes.as_ref().map_or(0, |e| e.count()) as u32,
@@ -778,7 +779,8 @@ pub(super) async fn end(
         }
     }
     placeholder::load(relay).await?;
-    crate::gates::prune_logs(state).await;
+    crate::gates::prune_soon(state);
+    relay.archive_held_changed().await;
     // Which also tells everybody who holds what now
     super::revalidate(state).await;
     crate::layout::send_styles_all(state).await;
@@ -1061,7 +1063,7 @@ pub(super) async fn undo(
     // In one go: Discord gives a server 250 roles, so twins and all this is no long list. One
     // kept stays in the ledger, so that the next run takes it up instead of making its twin.
     for (name, twin) in relay.undo_groups(run).await? {
-        if crate::gates::uses(state, &name).await.is_some() {
+        if crate::gates::uses(state, session_id, &name).await.is_some() {
             done.groups_kept.push(name);
             continue;
         }
@@ -1075,7 +1077,8 @@ pub(super) async fn undo(
     }
     relay.undo_ledger_drop(run).await?;
     placeholder::load(relay).await?;
-    crate::gates::prune_logs(state).await;
+    crate::gates::prune_soon(state);
+    relay.archive_held_changed().await;
     // Which also tells everybody who holds what now
     super::revalidate(state).await;
     crate::layout::send_styles_all(state).await;

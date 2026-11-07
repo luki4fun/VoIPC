@@ -4,6 +4,7 @@
   // `AccountRequest::Admin`; the relay checks the privilege behind it.
   // Its look (sections, fields, lists, check lists) is AdminDialogs.svelte's.
 
+  import { noPowerOverAnyone } from "../scopes.js";
   import { onMount, untrack } from "svelte";
   import {
     adminGroups,
@@ -18,17 +19,21 @@
     clearShown,
     inviteCode,
   } from "../stores/admin-ui.js";
-  import { relayAccounts } from "../stores/account.js";
+  import { account, relayAccounts } from "../stores/account.js";
+  import { profiles } from "../stores/profiles.js";
+  import { clearProfile } from "../stores/user-menu.js";
   import { can } from "../stores/powers.js";
   import { confirmAction } from "../stores/confirm.js";
   import { olderRelay } from "../stores/relay.js";
   import { serverAddress } from "../stores/scoped.js";
   import { community, moves } from "../relay-rules.js";
-  import { canLiftBan, expiryText, moveAccountKey, moveAccounts as cleanAccounts, moveChip, MOVE_FILTERS, ownPage } from "../move-rules.js";
+  import { canLiftBan, expiryText, moveAccountKey, moveAccounts as cleanAccounts, moveChip, moveFiltersFor, ownPage } from "../move-rules.js";
   import { excludeOne, importerAsking, moveAccountsPage, moveWizard } from "../stores/move.js";
   import { buildJoinLink, splitAddress } from "../invite.js";
   import { addNotification } from "../stores/notifications.js";
+  import { toHex } from "../hex.js";
   import Icon from "./Icons.svelte";
+  import MemberName from "./MemberName.svelte";
   import type { AdminUser, MoveAccount, MoveFilter } from "../types.js";
 
   const PAGE = 50;
@@ -57,6 +62,7 @@
     enable: "Unsuspended",
     account_delete: "Account deleted",
     rename: "Name changed",
+    profile_reset: "Display name or picture cleared",
   };
 
   /** With what the move knows of each account; on an older relay, and while the importer
@@ -144,6 +150,21 @@
     if (ok) await banAccount(d.user.name, "", 0);
   }
 
+  // The menu's own conditions, less the live row, plus something to clear: someone who has
+  // gone has no row to open that menu on. The relay refuses who holds more, as it does a Grant here
+  const shownProfile = $derived($adminUser ? $profiles.get(toHex($adminUser.user.id)) : undefined);
+  const mayClear = $derived(
+    $can("voipc:profiles") && !!$account && community($olderRelay?.protocol ?? null) && !!(shownProfile?.name || shownProfile?.picture),
+  );
+
+  async function clearName() {
+    const d = $adminUser;
+    if (!d) return;
+    const server = $serverAddress;
+    // Requests on a connection are answered in order: this read brings the new history line
+    if (await clearProfile(d.user.id, server)) adminRead({ User: { id: d.user.id } }, server);
+  }
+
   function newInvite() {
     void adminOp({ InviteNew: { name: inviteFor.trim() || null, days: inviteDays } });
     inviteFor = "";
@@ -167,12 +188,12 @@
   const groups = $derived(($adminGroups ?? []).filter((g) => g.name !== "user"));
   const closed = $derived($relayAccounts?.registration === "Closed");
 
-  /** How a new link is made. Its group holds no privileges: the relay checks. */
+  /** How a new link is made. Its group holds no power over anyone: the relay checks. */
   let linkUses = $state(1000);
   let linkDays = $state(30);
   let linkGroup = $state<string | null>(null);
   const showsLinks = $derived(community($olderRelay?.protocol ?? null) && !closed);
-  const startGroups = $derived(groups.filter((g) => g.scopes.length === 0));
+  const startGroups = $derived(groups.filter((g) => noPowerOverAnyone(g.scopes)));
   const linkShown = $derived.by(() => {
     const at = splitAddress($serverAddress);
     return $inviteLinkCode && at ? buildJoinLink(at.host, at.port, $inviteLinkCode) : null;
@@ -193,7 +214,7 @@
     <Icon name="arrow-left" size={16} /> All accounts
   </button>
   <section class="section">
-    <div class="section-title">{d.user.name}</div>
+    <div class="section-title"><MemberName username={d.user.name} account={d.user.id} /></div>
     <p class="admin-hint">
       Account since {day(d.user.created_at)} · two-factor codes {d.user.totp ? "on" : "off"}
     </p>
@@ -216,7 +237,9 @@
               <span class="check-hint">
                 {!g.scopes.length
                   ? "No privileges"
-                  : d.groups.includes(g.name) && !d.user.totp
+                  : noPowerOverAnyone(g.scopes)
+                    ? "Can share history, if they turn it on"
+                    : d.groups.includes(g.name) && !d.user.totp
                     ? "Its privileges wait for two-factor codes"
                     : "Hands out privileges"}
               </span>
@@ -227,8 +250,11 @@
     </ul>
     <p class="admin-hint">Taking away a group with privileges signs the account out; a remembered device signs it in again.</p>
   </section>
-  {#if $can("users:admin") || $can("voipc:bans")}
-    <div class="form-actions">
+  {#if $can("users:admin") || $can("voipc:bans") || mayClear}
+    <div class="form-actions account-actions">
+      {#if mayClear}
+        <button type="button" class="btn btn-danger-outline clear-profile" onclick={clearName}>Clear display name and picture</button>
+      {/if}
       {#if $can("users:admin")}
         <button type="button" class="btn btn-danger-outline" onclick={reset2fa}>Reset two-factor codes</button>
       {/if}
@@ -260,7 +286,7 @@
       <input class="admin-input grow" type="search" placeholder="Search by name" aria-label="Search accounts" bind:value={search} />
       {#if paged}
         <select class="admin-select move-filter" aria-label="Which accounts" bind:value={filter} onchange={() => list()}>
-          {#each MOVE_FILTERS as [value, label] (value)}
+          {#each moveFiltersFor($can("*")) as [value, label] (value)}
             <option {value}>{label}</option>
           {/each}
         </select>
@@ -424,6 +450,11 @@
 {/if}
 
 <style>
+  /* Three long buttons do not fit a phone */
+  .account-actions {
+    flex-wrap: wrap;
+  }
+
   .liftable {
     display: flex;
     align-items: center;

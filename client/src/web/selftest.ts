@@ -131,6 +131,8 @@ export async function run(params: URLSearchParams): Promise<void> {
   let textJoined = false;
   let textEarlySent = false;
   let textChatSent = false;
+  /** When someone else was first seen in the text channel. */
+  let textPeerSeen = 0;
   /** Who else is in the text channel, so the talker writes once somebody reads. */
   const textPeers = new Set<number>();
   // What App.svelte would hand to a newcomer, per channel: a member of several
@@ -198,7 +200,7 @@ export async function run(params: URLSearchParams): Promise<void> {
     "media-key-missing", "user-speaking", "channel-chat-message", "direct-chat-message",
     "latency-update", "connection-lost", "channel-error", "audio-device-error",
     "identity-key-changed", "poke-received", "admin-status", "admin-error",
-    "server-disconnected", "channel-history-requested", "channel-history-received",
+    "server-disconnected", "channel-history-requested", "channel-history-received", "channel-users",
     "screenshare-started", "screenshare-stopped", "watching-screenshare",
     "stopped-watching-screenshare", "screenshare-error", "screenshare-frame",
     "viewer-count-changed",
@@ -232,13 +234,16 @@ export async function run(params: URLSearchParams): Promise<void> {
           for (const u of p.users) users.set(u.user_id, u);
         }
       }
+      // Nobody is told who follows a text channel: the talker looks, in its loop below
+      if (ev === "channel-users") {
+        const p = e.payload as { channel_id: number; users: UserInfo[] };
+        if (p.channel_id === textChannelId) {
+          for (const u of p.users) if (u.user_id !== myUserId) textPeers.add(u.user_id);
+        }
+      }
       if (ev === "user-joined") {
         const u = e.payload as UserInfo;
-        if (isTextChannel(u.channel_id)) {
-          if (u.channel_id === textChannelId) textPeers.add(u.user_id);
-        } else {
-          users.set(u.user_id, u);
-        }
+        if (!isTextChannel(u.channel_id)) users.set(u.user_id, u);
       }
       if (ev === "admin-status") {
         const p = e.payload as { user_id: number; is_admin: boolean };
@@ -277,12 +282,13 @@ export async function run(params: URLSearchParams): Promise<void> {
       }
       if (ev === "channel-history-requested") {
         // The UI's job in the real app: answer with that channel's recent chat
-        const p = e.payload as { channel_id: number; from_user_id: number };
+        const p = e.payload as { channel_id: number; from_user_id: number; sealed?: boolean };
         invoke("send_channel_history", {
           server,
           channelId: p.channel_id,
           targetUserId: p.from_user_id,
           messages: historyOf(p.channel_id).slice(-50),
+          sealed: p.sealed ?? false,
         }).catch((err) => log("error", { message: `history: ${String(err)}` }));
       }
       if (ev === "user-left" && textChannelId !== 0) {
@@ -293,6 +299,8 @@ export async function run(params: URLSearchParams): Promise<void> {
   }
 
   try {
+    // The hand-off these runs exercise takes the switch, which starts off
+    await invoke("set_config_bool", { key: "share_channel_history", value: true });
     const userId = await invoke<number>("connect", {
       address: server,
       username: name,
@@ -416,6 +424,9 @@ export async function run(params: URLSearchParams): Promise<void> {
         try {
           await invoke("join_channel", { server, channelId: textChannelId, password: null });
           log("text-channel-joined", { channel: textChannelName, channel_id: textChannelId });
+          // What the first opening of a channel does in the app: nothing asks by itself
+          const others = [...users.keys()].filter((id) => id !== myUserId);
+          await invoke("request_channel_history", { server, channelId: textChannelId, targetUserIds: others });
         } catch (e) {
           log("error", { message: `text join: ${String(e)}` });
         }
@@ -424,7 +435,15 @@ export async function run(params: URLSearchParams): Promise<void> {
 
     // Both sides write once the other is in there, which is what proves the
     // key exchange worked in both directions.
-    if (textChannelId !== 0 && !textChatSent && textPeers.size > 0) {
+    if (textChannelId !== 0 && textPeers.size === 0) {
+      invoke("request_channel_users", { server, channelId: textChannelId }).catch((err) =>
+        log("error", { message: `text users: ${String(err)}` }),
+      );
+    }
+    // A writer asks who came at most every two seconds, and someone who came since gets
+    // the post after: past that, as nobody on a screen hurries.
+    if (textPeers.size > 0 && textPeerSeen === 0) textPeerSeen = Date.now();
+    if (textChannelId !== 0 && !textChatSent && textPeerSeen !== 0 && Date.now() - textPeerSeen > 2500) {
       textChatSent = true;
       try {
         await invoke("send_channel_message", {

@@ -49,6 +49,13 @@ const MAX_KEM_KEY_BYTES: usize = 1569;
 /// asked for more (`PreKeysLow`). Once per crossing, so it cannot be used to
 /// make a client spin.
 const PREKEYS_LOW: usize = 10;
+/// A post on the live path, at most: all the client will show of one, and all a kept copy
+/// of it may be (`accounts/log.rs`). One goes to everyone online, whatever it weighs.
+const MAX_TEXT_POST: usize = crate::accounts::log::MAX_ENTRY;
+/// The longest direct message echoed to its sender.
+const MAX_DM_ECHO: usize = 1024;
+/// What channels may fill one list's frame, less what goes around them.
+const CHANNELS_FRAME_BYTES: usize = 60 * 1024;
 
 /// A character no user or channel name may contain: control characters, and
 /// the ones that print as nothing or reorder what follows them — with those,
@@ -182,12 +189,7 @@ pub async fn handle_connection<S>(
 
     // Send channel list
     let channel_list = state.channel_list_for(session_id).await;
-    let _ = send_msg(
-        &tx,
-        &ServerMessage::ChannelList {
-            channels: channel_list,
-        },
-    );
+    send_channel_list(&tx, channel_list);
     crate::layout::send(&state, session_id).await;
     if let Some(emotes) = &state.emotes {
         let _ = send_msg(&tx, &emotes.list());
@@ -799,6 +801,7 @@ where
         force_disconnect(state, session_id, &why).await;
     }
     crate::restrict::admit(state, session_id);
+    crate::gates::prune_own(state, session_id).await;
     // The bridge can start routing this session's media now
     let _ = sid_tx.send(session_id);
 
@@ -940,6 +943,125 @@ async fn handle_message(
         ClientMessage::LeaveChannel { channel_id } => {
             handle_leave_text_channel(state, user_id, session_id, channel_id, tx).await?;
         }
+        // One token however many: it tells nobody, which is what the budget pays for
+        ClientMessage::JoinTextChannels { channels, quiet } => {
+            if state.spend(session_id, |s| &mut s.join_rate) {
+                state
+                    .follow_text_channels(user_id, &channels, &quiet, tx)
+                    .await;
+            } else {
+                channel_error(tx, "joining and leaving too fast, slow down").await;
+            }
+        }
+        ClientMessage::SetQuiet { channels, quiet } => {
+            if state.spend(session_id, |s| &mut s.join_rate) {
+                state.set_quiet(user_id, &channels, quiet, tx).await;
+            } else {
+                channel_error(tx, "joining and leaving too fast, slow down").await;
+            }
+        }
+        ClientMessage::KeyCheck {
+            channel_id,
+            restart,
+        } => {
+            handle_key_check(state, user_id, session_id, channel_id, restart, tx).await;
+        }
+        ClientMessage::OpenSessions {
+            channel_id,
+            targets,
+        } => {
+            handle_open_sessions(state, user_id, session_id, channel_id, targets, tx).await;
+        }
+        ClientMessage::SessionHello {
+            to,
+            message_type,
+            ciphertext,
+        } => {
+            if relayable(&ciphertext, tx).await {
+                handle_session_hello(state, user_id, session_id, to, message_type, ciphertext);
+            }
+        }
+        ClientMessage::DistributeSenderKeys { channel_id, keys } => {
+            handle_distribute_sender_keys(state, user_id, session_id, channel_id, keys).await;
+        }
+        ClientMessage::RenewSessionKeys {
+            signed_prekey_id,
+            signed_prekey,
+            signed_prekey_signature,
+            kyber_prekey_id,
+            kyber_prekey,
+            kyber_prekey_signature,
+        } => {
+            // The bounds a bundle at authentication passes
+            let fits = signed_prekey.len() <= MAX_KEY_BYTES
+                && signed_prekey_signature.len() <= MAX_SIGNATURE_BYTES
+                && kyber_prekey.len() <= MAX_KEM_KEY_BYTES
+                && kyber_prekey_signature.len() <= MAX_SIGNATURE_BYTES;
+            if fits && state.spend(session_id, |s| &mut s.renew_keys_rate) {
+                if let Some(b) = state
+                    .sessions
+                    .get_mut(&session_id)
+                    .as_deref_mut()
+                    .and_then(|s| s.bundle.as_mut())
+                {
+                    b.signed_prekey_id = signed_prekey_id;
+                    b.signed_prekey = signed_prekey;
+                    b.signed_prekey_signature = signed_prekey_signature;
+                    b.kyber_prekey_id = kyber_prekey_id;
+                    b.kyber_prekey = kyber_prekey;
+                    b.kyber_prekey_signature = kyber_prekey_signature;
+                }
+            }
+        }
+        ClientMessage::KeyWanted {
+            channel_id,
+            from,
+            reset,
+        } => {
+            let whole = state
+                .channels
+                .read()
+                .await
+                .get(&channel_id)
+                .is_some_and(|c| c.follow.joined.contains_key(&from));
+            if whole && may_relay_key(state, session_id, user_id, channel_id, from).await {
+                if let Some(session) = state.sessions.get(&from) {
+                    let _ = send_msg(
+                        &session.control_tx,
+                        &ServerMessage::KeyWanted {
+                            channel_id,
+                            from: user_id,
+                            reset,
+                        },
+                    );
+                }
+            }
+        }
+        // The same rule as `RequestChannelUsers`, and no log: a gated list asked for says
+        // which channel a person is looking at
+        ClientMessage::RequestChannelPage { channel_id, after } => {
+            // Silent: an honest app stays under it, and an empty page would read as nobody here
+            if !state.spend(session_id, |s| &mut s.roster_rate) {
+                return Ok(());
+            }
+            let allowed = state.is_channel_public_or_member(channel_id, user_id).await
+                || state.is_admin(session_id);
+            let (ids, rows, next, total) = if allowed {
+                state.channel_page(channel_id, session_id, after).await
+            } else {
+                (Vec::new(), Vec::new(), 0, 0)
+            };
+            let _ = send_msg(
+                tx,
+                &ServerMessage::ChannelPage {
+                    channel_id,
+                    ids,
+                    rows,
+                    next,
+                    total,
+                },
+            );
+        }
         ClientMessage::CreateChannel {
             name,
             password,
@@ -992,15 +1114,32 @@ async fn handle_message(
             // server — so a client re-sending its state on reconnect, or
             // toggling a switch back and forth, must not cost a fan-out each
             // time.
+            //
+            // Where there are accounts it takes the privilege too (`may_share_history`
+            // says the same for the app): a `true` without it changes nothing here.
             let changed = state
                 .sessions
                 .get_mut(&session_id)
                 .map(|mut s| {
-                    let changed = s.shares_history != enabled;
-                    s.shares_history = enabled;
-                    changed
+                    let on = enabled
+                        && (state.accounts.is_none() || crate::accounts::holds_share_history(&s));
+                    let changed = s.shares_history != on;
+                    s.shares_history = on;
+                    changed.then_some(on)
                 })
-                .unwrap_or(false);
+                .unwrap_or(None);
+            // Kept at rest too, even with nothing changed here: a switch turned off
+            // on a device away from this relay reaches it as this `false` at connect
+            let at_rest = state
+                .sessions
+                .get(&session_id)
+                .and_then(|s| s.account.as_ref().map(|a| (a.user.id.0, s.shares_history)));
+            if let (Some(relay), Some((account, on))) = (state.accounts.as_ref(), at_rest) {
+                if let Err(e) = crate::accounts::log::set_shares(relay.store(), &account, on).await
+                {
+                    tracing::warn!("keeping who shares: {e:#}");
+                }
+            }
             // To everyone, unlike mute and deafen, and including the sender.
             // Everyone, because a text channel's subscribers are standing in
             // voice channels of their own, so "this channel" is not a place
@@ -1008,7 +1147,7 @@ async fn handle_message(
             // in their own member list has to show what everyone else sees —
             // the mute flag not being echoed is exactly what made that one
             // disagree with itself.
-            if changed {
+            if let Some(enabled) = changed {
                 broadcast_to_all(
                     state,
                     &ServerMessage::UserHistorySharing { user_id, enabled },
@@ -1037,7 +1176,7 @@ async fn handle_message(
         }
         ClientMessage::RequestChannelList => {
             let channels = state.channel_list_for(session_id).await;
-            let _ = send_msg(tx, &ServerMessage::ChannelList { channels });
+            send_channel_list(tx, channels);
             crate::layout::send(state, session_id).await;
         }
         ClientMessage::Ping { timestamp } => {
@@ -1134,6 +1273,9 @@ async fn handle_message(
             let _ = send_msg(tx, &ServerMessage::ReportTakers { takers });
         }
         ClientMessage::RequestChannelUsers { channel_id } => {
+            if !state.spend(session_id, |s| &mut s.roster_rate) {
+                return Ok(());
+            }
             let allowed = state.is_channel_public_or_member(channel_id, user_id).await
                 || state.is_admin(session_id);
             let users = if allowed {
@@ -1141,7 +1283,9 @@ async fn handle_message(
             } else {
                 vec![]
             };
-            let _ = send_msg(tx, &ServerMessage::ChannelUsers { channel_id, users });
+            send_roster(tx, channel_id, users, |channel_id, users| {
+                ServerMessage::ChannelUsers { channel_id, users }
+            });
         }
         ClientMessage::SendInvite {
             channel_id,
@@ -1619,7 +1763,9 @@ async fn handle_join_channel(
 
     // A password for a channel from channels.json is checked against its hash
     // here, before the channel lock (Argon2 is slow)
-    let checked = state.channel_password_attempt(channel_id, password).await;
+    let checked = state
+        .channel_password_attempt(channel_id, user_id, password)
+        .await;
     let password = checked.as_deref().map(|p| p.as_str());
 
     // A text channel is a subscription, not a move: the user keeps the voice
@@ -1630,17 +1776,12 @@ async fn handle_join_channel(
     // makes a repeated join a no-op.
     if state.is_text_channel(channel_id).await {
         match state.join_text_channel(user_id, channel_id, password).await {
-            Ok(joined) => {
-                // Even a repeated join answers with the roster: a client that
-                // lost track asks again rather than going without one.
-                let users = state.users_in_channel_for(channel_id, session_id).await;
-                let _ = send_msg(tx, &ServerMessage::UserList { channel_id, users });
-                tell_listen_only(state, session_id, channel_id, tx);
-
-                if joined {
-                    let user_info = user_info_for(state, user_id, session_id, channel_id);
-                    broadcast_user_joined(state, user_info).await;
-                }
+            // Nobody is told and no roster comes: the admission was this, and following it
+            // is one more frame's work
+            Ok(_) => {
+                state
+                    .follow_text_channels(user_id, &[channel_id], &[], tx)
+                    .await;
             }
             Err(e) => {
                 channel_error(tx, e.to_string()).await;
@@ -1690,19 +1831,13 @@ async fn handle_join_channel(
         warn!(user_id, "join failed after validation: {}", e);
         let _ = state.join_channel(user_id, session_id, 0, None).await;
         let users = state.users_in_channel_for(0, session_id).await;
-        let _ = send_msg(
-            tx,
-            &ServerMessage::UserList {
-                channel_id: 0,
-                users,
-            },
-        );
+        send_roster(tx, 0, users, user_list);
         return Ok(());
     }
 
     // Send user list for the new channel to the joining user
     let users = state.users_in_channel_for(channel_id, session_id).await;
-    let _ = send_msg(tx, &ServerMessage::UserList { channel_id, users });
+    send_roster(tx, channel_id, users, user_list);
     tell_listen_only(state, session_id, channel_id, tx);
 
     // Media keys are generated by clients and exchanged over pairwise Signal
@@ -1714,6 +1849,77 @@ async fn handle_join_channel(
     broadcast_user_joined(state, user_info).await;
 
     Ok(())
+}
+
+fn user_list(channel_id: ChannelId, users: Vec<UserInfo>) -> ServerMessage {
+    ServerMessage::UserList { channel_id, users }
+}
+
+/// A roster to one person: what a frame holds, in id order, as `first`, and any more behind
+/// it as `ChannelPage`s. Past some 800 rows the old way was no list at all.
+fn send_roster(
+    tx: &ControlTx,
+    channel_id: ChannelId,
+    mut users: Vec<UserInfo>,
+    first: fn(ChannelId, Vec<UserInfo>) -> ServerMessage,
+) {
+    users.sort_unstable_by_key(|u| u.user_id);
+    let total = users.len() as u32;
+    let (head, mut rest) = crate::state::cut_rows(users);
+    let _ = send_msg(tx, &first(channel_id, head));
+    while !rest.is_empty() {
+        let (rows, more) = crate::state::cut_rows(rest);
+        let next = if more.is_empty() {
+            0
+        } else {
+            rows.last().map_or(0, |u| u.user_id)
+        };
+        let _ = send_msg(
+            tx,
+            &ServerMessage::ChannelPage {
+                channel_id,
+                ids: Vec::new(),
+                rows,
+                next,
+                total,
+            },
+        );
+        rest = more;
+    }
+}
+
+/// The channel list: in one `ChannelList` while it fits, and past that all of it as
+/// `ChannelListMore`, so a `ChannelList` is always the whole list.
+pub(crate) fn send_channel_list(tx: &ControlTx, channels: Vec<ChannelInfo>) {
+    let whole = ServerMessage::ChannelList { channels };
+    if let Ok(data) = encode_server_msg(&whole) {
+        let _ = tx.try_send(data);
+        return;
+    }
+    let ServerMessage::ChannelList { channels } = whole else {
+        return;
+    };
+    let mut frames: Vec<Vec<ChannelInfo>> = vec![Vec::new()];
+    let mut bytes = 0;
+    for channel in channels {
+        let cost = postcard::to_allocvec(&channel).map_or(0, |b| b.len());
+        if bytes + cost > CHANNELS_FRAME_BYTES {
+            frames.push(Vec::new());
+            bytes = 0;
+        }
+        bytes += cost;
+        if let Some(frame) = frames.last_mut() {
+            frame.push(channel);
+        }
+    }
+    let last = frames.len() - 1;
+    for (i, channels) in frames.into_iter().enumerate() {
+        let msg = ServerMessage::ChannelListMore {
+            channels,
+            more: i < last,
+        };
+        let _ = send_msg(tx, &msg);
+    }
 }
 
 /// A join into a channel where its gate lets them only listen says so: the
@@ -1803,7 +2009,14 @@ async fn handle_leave_text_channel(
             // for them (1.0, D10)
             crate::accounts::out_of_log(state, channel_id, session_id).await;
             crate::files::left_channel(state, session_id, channel_id);
-            broadcast_user_left(state, user_id, channel_id, None).await;
+            let _ = send_msg(
+                tx,
+                &ServerMessage::UserLeft {
+                    user_id,
+                    channel_id,
+                },
+            );
+            member_gone(state, channel_id, user_id).await;
             if remaining == 0 {
                 start_channel_delete_timer(state, channel_id).await;
             }
@@ -1813,6 +2026,32 @@ async fn handle_leave_text_channel(
         }
     }
     Ok(())
+}
+
+/// `user_id` is out of a channel where a device asks who is here: it answers them nothing
+/// from now on, whatever its last list says. To its followers, and only where a list exists
+/// to go stale: in an open channel anyone online may read anyway.
+async fn member_gone(state: &ServerState, channel_id: ChannelId, user_id: UserId) {
+    let txs: Vec<ControlTx> = {
+        let channels = state.channels.read().await;
+        let Some(channel) = channels.get(&channel_id).filter(|c| c.tells_who_left()) else {
+            return;
+        };
+        let followers = channel.follow.joined.keys();
+        followers
+            .chain(channel.follow.quiet.keys())
+            .filter_map(|uid| Some(state.sessions.get(uid)?.control_tx.clone()))
+            .collect()
+    };
+    let msg = ServerMessage::MemberGone {
+        channel_id,
+        user_id,
+    };
+    if let Ok(data) = encode_server_msg(&msg) {
+        for tx in txs {
+            let _ = tx.try_send(data.clone());
+        }
+    }
 }
 
 /// Announce a join to everyone but the joiner, each recipient getting the
@@ -1841,15 +2080,20 @@ async fn broadcast_user(state: &Arc<ServerState>, user: UserInfo, updated: bool)
         if session.user_id == user.user_id || !crate::gates::passes(session, &roster.gate) {
             continue;
         }
-        if updated && !(roster.knows_them(session.user_id) || session.is_admin) {
-            continue;
-        }
         // Two different questions. The name goes to the channel's own people
         // only, always has, and that is what keeps a move between an anonymous
         // channel and an ordinary one from handing outsiders both names for
         // one person. The *id* is the narrower rule below: a channel that
         // hides its members hides them here too.
-        let username = if roster.knows_them(session.user_id) || session.is_admin {
+        //
+        // A public room is told by name to everyone inside its gate: anyone may ask its
+        // list, and every app would, so a blank protected nothing and each join cost an
+        // ask. A bare id in `KeysOwed` leans on this.
+        let told_name = roster.knows_them(session.user_id) || roster.public;
+        if updated && !(told_name || session.is_admin) {
+            continue;
+        }
+        let username = if told_name || session.is_admin {
             crate::state::pick_name(&real, &alias, session.is_admin)
         } else {
             // The client only renders this for its own channel anyway
@@ -1858,7 +2102,7 @@ async fn broadcast_user(state: &Arc<ServerState>, user: UserInfo, updated: bool)
         let may_name = roster.may_name(session.user_id, user.user_id) || session.is_admin;
         let account = crate::state::account_shown(
             user.account,
-            roster.knows_them(session.user_id) && alias.is_none(),
+            told_name && alias.is_none(),
             session.is_admin,
         );
         let info = UserInfo {
@@ -1926,6 +2170,8 @@ async fn broadcast_user_left(
 struct RosterAudience {
     members: std::collections::HashSet<UserId>,
     private: bool,
+    /// A room whose list anyone inside its gate may ask for.
+    public: bool,
     /// The groups that see the channel at all (`ChannelGate::groups`).
     gate: Vec<String>,
 }
@@ -1965,11 +2211,16 @@ async fn roster_audience(state: &ServerState, channel_id: ChannelId) -> RosterAu
         Some(channel) => RosterAudience {
             members: channel.members.clone(),
             private: channel.info.hide_members || channel.password.is_some(),
+            public: !channel.info.text
+                && !channel.info.anonymous
+                && !channel.info.hide_members
+                && channel.password.is_none(),
             gate: channel.gate.groups.clone(),
         },
         None => RosterAudience {
             members: Default::default(),
             private: false,
+            public: false,
             gate: Vec::new(),
         },
     }
@@ -2225,10 +2476,7 @@ async fn resend_user_list(state: &Arc<ServerState>, channel_id: ChannelId) {
     for sid in members {
         let users = state.users_in_channel_for(channel_id, sid).await;
         if let Some(session) = state.sessions.get(&sid) {
-            let _ = send_msg(
-                &session.control_tx,
-                &ServerMessage::UserList { channel_id, users },
-            );
+            send_roster(&session.control_tx, channel_id, users, user_list);
         }
     }
 }
@@ -2242,6 +2490,11 @@ async fn handle_kick_user(
     target_id: UserId,
     tx: &ControlTx,
 ) -> Result<()> {
+    // Nobody reaches into a channel they cannot see, by id either
+    if !state.may_reach(requester_session_id, channel_id).await {
+        channel_error(tx, "channel does not exist").await;
+        return Ok(());
+    }
     let admin = state.is_admin(requester_session_id);
     let moderates = state.can(requester_session_id, Powers::KICK);
     // A moderator moderates people, not the ones who moderate (but still
@@ -2311,6 +2564,7 @@ async fn handle_kick_user(
                 remaining_count,
                 moved,
                 is_text,
+                false,
                 reason.into(),
             )
             .await;
@@ -2333,9 +2587,14 @@ async fn after_kick(
     remaining_count: usize,
     moved: bool,
     is_text: bool,
+    evicted: bool,
     reason: String,
 ) {
-    crate::accounts::out_of_log(state, channel_id, target_session_id).await;
+    if evicted {
+        crate::accounts::gated_out_of_log(state, channel_id, target_session_id).await;
+    } else {
+        crate::accounts::out_of_log(state, channel_id, target_session_id).await;
+    }
     crate::files::left_channel(state, target_session_id, channel_id);
     // Same teardown as leave/disconnect: otherwise a kicked viewer
     // keeps receiving the share's video and a kicked sharer leaves
@@ -2344,18 +2603,33 @@ async fn after_kick(
         cleanup_and_notify_screen_shares(state, target_id, target_session_id, channel_id).await;
     }
 
-    // Notify the kicked user
+    // Notify the kicked user. A kick leaves a mark and they stay out, and a lost gate leaves
+    // none: they follow it again if they win it back.
     if let Some(session) = state.sessions.get(&target_session_id) {
-        let _ = send_msg(
-            &session.control_tx,
-            &ServerMessage::Kicked { channel_id, reason },
-        );
+        let msg = if evicted {
+            ServerMessage::Evicted { channel_id, reason }
+        } else {
+            ServerMessage::Kicked { channel_id, reason }
+        };
+        let _ = send_msg(&session.control_tx, &msg);
     }
 
-    // Broadcast UserLeft to everyone, the leaver included: for a
-    // text channel that broadcast is what drops the subscription on
-    // their side, and they always learn about themselves.
-    broadcast_user_left(state, target_id, channel_id, None).await;
+    if is_text {
+        if let Some(session) = state.sessions.get(&target_session_id) {
+            let _ = send_msg(
+                &session.control_tx,
+                &ServerMessage::UserLeft {
+                    user_id: target_id,
+                    channel_id,
+                },
+            );
+        }
+        member_gone(state, channel_id, target_id).await;
+    } else {
+        // Broadcast UserLeft to everyone, the leaver included: they always learn about
+        // themselves.
+        broadcast_user_left(state, target_id, channel_id, None).await;
+    }
 
     // `kick_user` moved them to General under the channel lock; out of
     // a text channel nobody moves. Not told if they have moved on
@@ -2369,13 +2643,7 @@ async fn after_kick(
         let general_users = state.users_in_channel_for(0, target_session_id).await;
 
         if let Some(session) = state.sessions.get(&target_session_id) {
-            let _ = send_msg(
-                &session.control_tx,
-                &ServerMessage::UserList {
-                    channel_id: 0,
-                    users: general_users,
-                },
-            );
+            send_roster(&session.control_tx, 0, general_users, user_list);
         }
 
         // Broadcast UserJoined (to General) to everyone
@@ -2405,6 +2673,7 @@ pub(crate) async fn evict(state: &Arc<ServerState>, channel_id: ChannelId, targe
             remaining,
             moved,
             is_text,
+            true,
             "You no longer have access to this channel".into(),
         )
         .await;
@@ -2744,6 +3013,15 @@ pub(crate) async fn force_disconnect(state: &ServerState, session_id: SessionId,
     close.notify_one();
 }
 
+/// `force_disconnect` for someone put out, not someone who simply goes: whoever keyed them
+/// starts a new chain. (A device's changed password or another sign-in tells nobody.)
+pub(crate) async fn eject(state: &ServerState, session_id: SessionId, reason: &str) {
+    if let Some(mut session) = state.sessions.get_mut(&session_id) {
+        session.ejected = true;
+    }
+    force_disconnect(state, session_id, reason).await;
+}
+
 /// Who a ban says banned: the account's name, or the admin token's holder.
 pub(crate) fn banned_by(state: &ServerState, session_id: SessionId) -> String {
     state
@@ -2814,7 +3092,7 @@ async fn handle_admin_kick(
             return;
         }
         info!(admin = admin_user_id, target = target_id, "admin kick");
-        force_disconnect(
+        eject(
             state,
             target_sid,
             &format!("You were kicked from this server: {reason}"),
@@ -2877,7 +3155,7 @@ async fn handle_admin_kick(
     );
     // The one banned goes whatever their role; then whoever else the ban
     // covers (their address, but not a role holder there)
-    force_disconnect(
+    eject(
         state,
         target_sid,
         &format!("You were banned from this server: {reason}"),
@@ -3078,12 +3356,10 @@ async fn handle_send_channel_history(
     if !both_in_channel(state, channel_id, from_user_id, target_user_id).await {
         return;
     }
-    // Recent chat handed to a newcomer is speech too
-    if state
-        .sessions
-        .get(&from_session_id)
-        .is_some_and(|s| s.listen_only.contains(&channel_id) || s.silence.text())
-    {
+    // Recent chat handed to a newcomer is speech too, and only someone who shares offers it
+    if state.sessions.get(&from_session_id).is_some_and(|s| {
+        !s.shares_history || s.listen_only.contains(&channel_id) || s.silence.text()
+    }) {
         return;
     }
     // An archive carries the names its owner stored, inside the ciphertext
@@ -3384,30 +3660,29 @@ async fn handle_request_prekey_bundle(
     target_user_id: UserId,
     tx: &ControlTx,
 ) -> Result<()> {
+    let msg = match take_bundle(state, target_user_id) {
+        Some(bundle) => ServerMessage::PreKeyBundle {
+            user_id: target_user_id,
+            bundle,
+        },
+        None => ServerMessage::PreKeyBundleUnavailable {
+            user_id: target_user_id,
+        },
+    };
+    let _ = send_msg(tx, &msg);
+    Ok(())
+}
+
+/// One bundle of `owner`'s, spending one of their one-time pre-keys, which they are told
+/// to refill as the pool runs low. `None`: they are gone, or brought none.
+fn take_bundle(state: &ServerState, owner: UserId) -> Option<PreKeyBundleData> {
     let (bundle, running_low) = {
-        let mut session = match state.sessions.get_mut(&target_user_id) {
-            Some(s) => s,
-            None => {
-                let _ = send_msg(
-                    tx,
-                    &ServerMessage::PreKeyBundleUnavailable {
-                        user_id: target_user_id,
-                    },
-                );
-                return Ok(());
-            }
-        };
+        let mut session = state.sessions.get_mut(&owner)?;
 
         // Need the identity key and a bundle at minimum
         let (Some(identity_key), Some(b)) = (session.identity_key.clone(), session.bundle.as_mut())
         else {
-            let _ = send_msg(
-                tx,
-                &ServerMessage::PreKeyBundleUnavailable {
-                    user_id: target_user_id,
-                },
-            );
-            return Ok(());
+            return None;
         };
 
         // Pop one one-time pre-key (consumed by the requester). Any of them
@@ -3438,16 +3713,7 @@ async fn handle_request_prekey_bundle(
             },
         );
     }
-
-    let _ = send_msg(
-        tx,
-        &ServerMessage::PreKeyBundle {
-            user_id: target_user_id,
-            bundle,
-        },
-    );
-
-    Ok(())
+    Some(bundle)
 }
 
 /// Handle uploaded pre-keys — replenish the user's one-time pre-key supply.
@@ -3531,10 +3797,13 @@ async fn handle_encrypted_direct_message(
         );
     }
 
-    // Always echo back to sender regardless of delivery success, under the
-    // name the sender themselves goes by
-    let own = crate::state::pick_name(&real, &alias, state.is_admin(from_session_id));
-    let _ = send_msg(tx, &message(own));
+    // Echo back to sender regardless of delivery success, under the name the sender
+    // themselves goes by. Their app shows its own copy and reads none of this: past a
+    // short one it is a sealed history answer coming back up to 48 KiB for nothing.
+    if ciphertext.len() <= MAX_DM_ECHO {
+        let own = crate::state::pick_name(&real, &alias, state.is_admin(from_session_id));
+        let _ = send_msg(tx, &message(own));
+    }
 
     Ok(())
 }
@@ -3550,6 +3819,23 @@ async fn handle_encrypted_channel_message(
 ) -> Result<()> {
     if state.sessions.get(&session_id).is_none() {
         return Ok(());
+    }
+
+    let text = state.is_text_channel(channel_id).await;
+    if text {
+        if ciphertext.len() > MAX_TEXT_POST {
+            channel_error(tx, "message too large").await;
+            return Ok(());
+        }
+        let bytes = ciphertext.len() as f64;
+        let budget = state
+            .sessions
+            .get_mut(&session_id)
+            .is_some_and(|mut s| s.post_bytes_rate.try_consume_n(bytes));
+        if !budget {
+            channel_error(tx, "sending too fast, slow down").await;
+            return Ok(());
+        }
     }
 
     // The same rules hold the channel's stored log to (accounts.rs LogAppend).
@@ -3570,6 +3856,14 @@ async fn handle_encrypted_channel_message(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
+
+    if text {
+        post_to_keyed(
+            state, user_id, session_id, channel_id, ciphertext, timestamp,
+        )
+        .await;
+        return Ok(());
+    }
 
     // Encrypted channel messages go to channel members except the sender
     // (sender can't decrypt their own sender key ciphertext), each under the
@@ -3601,6 +3895,341 @@ async fn handle_encrypted_channel_message(
     }
 
     Ok(())
+}
+
+/// A post on the live path: to whoever its writer has been told of, so a key is always ahead
+/// of its message. With what a reader would read off a roster, and the same bytes to each:
+/// a text channel has no pseudonyms.
+async fn post_to_keyed(
+    state: &ServerState,
+    user_id: UserId,
+    session_id: SessionId,
+    channel_id: ChannelId,
+    ciphertext: Vec<u8>,
+    timestamp: u64,
+) {
+    let readers: Vec<ControlTx> = {
+        let channels = state.channels.read().await;
+        let Some(channel) = channels.get(&channel_id) else {
+            return;
+        };
+        channel
+            .follow
+            .last_post_ms
+            .store(timestamp, std::sync::atomic::Ordering::Relaxed);
+        channel
+            .follow
+            .readers_of(user_id)
+            .into_iter()
+            .filter_map(|uid| Some(state.sessions.get(&uid)?.control_tx.clone()))
+            .collect()
+    };
+    let Some(msg) = state
+        .sessions
+        .get(&session_id)
+        .map(|s| ServerMessage::TextPost {
+            channel_id,
+            user_id,
+            username: s.username.clone(),
+            account: s.account_id(),
+            is_admin: s.is_admin,
+            is_moderator: s.powers.has(Powers::CHANNELS),
+            ciphertext,
+            timestamp,
+        })
+    else {
+        return;
+    };
+    if let Ok(data) = encode_server_msg(&msg) {
+        for tx in readers {
+            let _ = tx.try_send(data.clone());
+        }
+    }
+}
+
+/// A writer asks whom it owes its key before a post. Someone who may not post wraps
+/// nothing, and hears so here as well as why: their post is waiting on this answer.
+async fn handle_key_check(
+    state: &Arc<ServerState>,
+    user_id: UserId,
+    session_id: SessionId,
+    channel_id: ChannelId,
+    restart: bool,
+    tx: &ControlTx,
+) {
+    let refused = || ServerMessage::KeysOwed {
+        channel_id,
+        ids: Vec::new(),
+        rows: Vec::new(),
+        more: false,
+        refused: true,
+    };
+    if !state.spend(session_id, |s| &mut s.key_check_rate) {
+        channel_error(tx, "sending too fast, slow down").await;
+        let _ = send_msg(tx, &refused());
+        return;
+    }
+    if let Err(reason) = state
+        .post_rules(
+            session_id,
+            user_id,
+            channel_id,
+            crate::state::PostStamp::Check,
+        )
+        .await
+    {
+        channel_error(tx, reason).await;
+        let _ = send_msg(tx, &refused());
+        return;
+    }
+    let Some(frames) = state.keys_owed(channel_id, user_id, restart).await else {
+        let _ = send_msg(tx, &refused());
+        return;
+    };
+    if frames.is_empty() {
+        let _ = send_msg(
+            tx,
+            &ServerMessage::KeysOwed {
+                channel_id,
+                ids: Vec::new(),
+                rows: Vec::new(),
+                more: false,
+                refused: false,
+            },
+        );
+        return;
+    }
+    let last = frames.len() - 1;
+    for (i, (ids, rows)) in frames.into_iter().enumerate() {
+        let _ = send_msg(
+            tx,
+            &ServerMessage::KeysOwed {
+                channel_id,
+                ids,
+                rows,
+                more: i < last,
+                refused: false,
+            },
+        );
+    }
+}
+
+/// The reader opens the session: each of these followers gets the writer's bundle and is
+/// asked to. Only someone whole: a quiet member is owed no key, and uploads nothing for one.
+/// Each costs the writer a bundle token and a one-time key, and notes the pair, which is
+/// the one thing a hello may then answer. Past the budget the rest are just not asked: the
+/// writer tries them again, and a reader who never hears gets a ring.
+async fn handle_open_sessions(
+    state: &Arc<ServerState>,
+    user_id: UserId,
+    session_id: SessionId,
+    channel_id: ChannelId,
+    targets: Vec<UserId>,
+    tx: &ControlTx,
+) {
+    if let Err(reason) = state
+        .post_rules(
+            session_id,
+            user_id,
+            channel_id,
+            crate::state::PostStamp::Keys,
+        )
+        .await
+    {
+        channel_error(tx, reason).await;
+        return;
+    }
+    let targets: Vec<UserId> = {
+        let channels = state.channels.read().await;
+        let Some(channel) = channels.get(&channel_id) else {
+            return;
+        };
+        targets
+            .into_iter()
+            .filter(|t| *t != user_id && channel.follow.joined.contains_key(t))
+            .collect()
+    };
+    let Some((account, name)) = state
+        .sessions
+        .get(&session_id)
+        .map(|s| (s.account_id(), s.username.clone()))
+    else {
+        return;
+    };
+    for target in targets {
+        if !state.sessions.contains_key(&target) {
+            continue;
+        }
+        if !state.spend(session_id, |s| &mut s.prekey_bundle_rate) {
+            debug!(user_id, "session opening rate limit exceeded");
+            return;
+        }
+        let Some(bundle) = take_bundle(state, user_id) else {
+            return;
+        };
+        if let Some(mut reader) = state.sessions.get_mut(&target) {
+            reader.session_asked.insert(user_id);
+            let _ = send_msg(
+                &reader.control_tx,
+                &ServerMessage::SessionAsked {
+                    channel_id,
+                    from: user_id,
+                    account,
+                    name: name.clone(),
+                    bundle,
+                },
+            );
+        }
+    }
+}
+
+/// A follower's first message of a session it was asked to open. Goes only for that ask,
+/// which it uses up: otherwise it is a way to make anyone decrypt a post-quantum handshake.
+fn handle_session_hello(
+    state: &ServerState,
+    user_id: UserId,
+    session_id: SessionId,
+    to: UserId,
+    message_type: u8,
+    ciphertext: Vec<u8>,
+) {
+    let asked = state
+        .sessions
+        .get_mut(&session_id)
+        .is_some_and(|mut s| s.session_asked.remove(&to));
+    if !asked {
+        debug!(user_id, "a session hello nobody asked for: dropped");
+        return;
+    }
+    if let Some(writer) = state.sessions.get(&to) {
+        let _ = send_msg(
+            &writer.control_tx,
+            &ServerMessage::SessionHello {
+                from: user_id,
+                message_type,
+                ciphertext,
+            },
+        );
+    }
+}
+
+/// A writer's sender key, wrapped for each of these: each target checked against one view
+/// of the channel, and against the writer's budget for them, which is what
+/// `DistributeSenderKey` does one frame at a time.
+async fn handle_distribute_sender_keys(
+    state: &Arc<ServerState>,
+    user_id: UserId,
+    session_id: SessionId,
+    channel_id: ChannelId,
+    keys: Vec<(UserId, u8, Vec<u8>)>,
+) {
+    let keys: Vec<(UserId, u8, Vec<u8>)> = {
+        let channels = state.channels.read().await;
+        let Some(channel) = channels
+            .get(&channel_id)
+            .filter(|c| c.info.text && c.members.contains(&user_id))
+        else {
+            return;
+        };
+        keys.into_iter()
+            .filter(|(target, _, ciphertext)| {
+                channel.follow.joined.contains_key(target)
+                    && ciphertext.len() <= MAX_RELAY_CIPHERTEXT
+            })
+            .collect()
+    };
+    let (keys, account) = {
+        let Some(mut session) = state.sessions.get_mut(&session_id) else {
+            return;
+        };
+        let keys: Vec<_> = keys
+            .into_iter()
+            .filter(|(target, _, _)| session.may_relay_key_to(*target))
+            .collect();
+        (keys, session.account_id())
+    };
+    for (target, message_type, ciphertext) in keys {
+        if let Some(session) = state.sessions.get(&target) {
+            let _ = send_msg(
+                &session.control_tx,
+                &ServerMessage::TextKeyReceived {
+                    channel_id,
+                    from: user_id,
+                    account,
+                    message_type,
+                    ciphertext,
+                },
+            );
+        }
+    }
+}
+
+/// How often exits go out. A ban across 300 channels is then one frame per writer.
+pub(crate) const EXITS_EVERY_SECS: u64 = 1;
+/// How often a quiet channel's news goes out.
+pub(crate) const MARKS_EVERY_SECS: u64 = 60;
+
+/// The exits queued since the last tick, each to the writer it concerns.
+pub(crate) fn send_exits(state: &ServerState) {
+    let due: Vec<UserId> = state.exits_due.iter().map(|e| *e.key()).collect();
+    for writer in due {
+        let Some((_, channels)) = state.exits_due.remove(&writer) else {
+            continue;
+        };
+        let Some(session) = state.sessions.get(&writer) else {
+            continue;
+        };
+        let channels: Vec<ChannelId> = channels.into_iter().collect();
+        for channels in channels.chunks(10_000) {
+            let _ = send_msg(
+                &session.control_tx,
+                &ServerMessage::ChannelExits {
+                    channels: channels.to_vec(),
+                },
+            );
+        }
+    }
+}
+
+/// Quiet channels with a post since `since`, each to whoever is quiet there, only those.
+/// A push, so a mark shows nothing about when an app is in front. When this ran, for the next.
+pub(crate) async fn send_marks(state: &ServerState, since: u64) -> u64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let mut marks: std::collections::HashMap<UserId, Vec<(ChannelId, u64)>> = Default::default();
+    {
+        let channels = state.channels.read().await;
+        for channel in channels.values() {
+            let at = channel
+                .follow
+                .last_post_ms
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if at == 0 || at < since {
+                continue;
+            }
+            for uid in channel.follow.quiet.keys() {
+                marks
+                    .entry(*uid)
+                    .or_default()
+                    .push((channel.info.channel_id, at));
+            }
+        }
+    }
+    for (uid, marks) in marks {
+        if let Some(session) = state.sessions.get(&uid) {
+            for marks in marks.chunks(4000) {
+                let _ = send_msg(
+                    &session.control_tx,
+                    &ServerMessage::ChannelMarks {
+                        marks: marks.to_vec(),
+                    },
+                );
+            }
+        }
+    }
+    now
 }
 
 /// Relay a sender key to the target user. Admission — both ends in the
@@ -3670,9 +4299,8 @@ async fn cleanup_session(state: &Arc<ServerState>, user_id: UserId, session_id: 
     }
 
     // Text subscriptions go first: they are not the channel the session names,
-    // so nothing else would ever clear them.
+    // so nothing else would ever clear them. It tells nobody.
     for (text_channel_id, remaining) in state.leave_all_text_channels(user_id).await {
-        broadcast_user_left(state, user_id, text_channel_id, Some(user_id)).await;
         if remaining == 0 {
             start_channel_delete_timer(state, text_channel_id).await;
         }
@@ -3799,7 +4427,11 @@ async fn start_channel_delete_timer(state: &Arc<ServerState>, channel_id: Channe
 /// Serialized once rather than once per recipient: this is the widest fan-out
 /// the server has — every join, leave and channel change goes through it — and
 /// it runs while holding a shard of the session map.
-async fn broadcast_to_all(state: &ServerState, msg: &ServerMessage, exclude_user: Option<UserId>) {
+pub(crate) async fn broadcast_to_all(
+    state: &ServerState,
+    msg: &ServerMessage,
+    exclude_user: Option<UserId>,
+) {
     let Ok(data) = encode_server_msg(msg) else {
         return;
     };

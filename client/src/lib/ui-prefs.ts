@@ -89,8 +89,9 @@ export interface UiPrefs {
    * A server can ask every client to join a text channel on connect
    * (`auto_join`), which would otherwise undo leaving it at the next
    * reconnect. This is the client's memory of that decision, and the reason
-   * the server never joins anybody itself. By name rather than id, because a
-   * user-created channel's id is not stable across a server restart.
+   * the server never joins anybody itself. By name and by the channel's log rather
+   * than id, because a user-created channel's id is not stable across a server
+   * restart, and a name can change while someone is away.
    */
   left_text_channels: Record<string, string[]>;
   /**
@@ -112,6 +113,28 @@ export interface UiPrefs {
   channel_notify: Record<string, "all" | "mentions" | "nothing">;
   /** Categories folded in the sidebar, by `"host:port"`. */
   folded_categories: Record<string, number[]>;
+  /**
+   * Where this person read each followed channel, by `"host:port"` and then the
+   * channel's log or name, in the relay's clock (`marks-rules.ts`).
+   */
+  read_marks: Record<string, Record<string, number>>;
+  /** Channels ever opened on this device, by `"host:port"`: the others keep fewer messages. */
+  opened_channels: Record<string, string[]>;
+  /** Channels this device saw with a gate, by `"host:port"`, by log and by name: one seen
+   *  without it now is said. In a local pref, so a relay cannot make it forget. */
+  gates_seen: Record<string, string[]>;
+  /**
+   * Who this device told its person can read what they write in a channel with a list, by
+   * `"host:port"` and then the channel's log or name: each is named once ever.
+   */
+  readers_named: Record<string, Record<string, string[]>>;
+  /**
+   * Quiet mode, by `"host:port"`: whether it holds, and the channels that still arrive here by
+   * log or name. Here and never in the vault or on the server: only this person turns it on.
+   */
+  quiet_mode: Record<string, { mode: "off" | "mobile" | "always"; whole: string[] }>;
+  /** The newest protocol each relay spoke to this device, by `"host:port"`. */
+  newest_protocol: Record<string, number>;
   /** Servers whose welcome channel, if any, was offered on this device. */
   welcomed: string[];
   /**
@@ -203,6 +226,12 @@ export function defaultUiPrefs(): UiPrefs {
     dm_timers: {},
     channel_notify: {},
     folded_categories: {},
+    read_marks: {},
+    opened_channels: {},
+    gates_seen: {},
+    readers_named: {},
+    newest_protocol: {},
+    quiet_mode: {},
     welcomed: [],
     nsfw_ok: [],
     discord_bot_gone: [],
@@ -216,7 +245,8 @@ export function defaultUiPrefs(): UiPrefs {
 
 /** How many servers, and how many channels each, this remembers. */
 const LEFT_MAX_SERVERS = 50;
-const LEFT_MAX_PER_SERVER = 100;
+const LEFT_MAX_PER_SERVER = 2500;
+const READERS_MAX_PER_CHANNEL = 5000;
 
 // Both caps keep the *end* of the list, because `rememberLeft` appends: the
 // newest leave is the one the user just made, and dropping that is how somebody
@@ -247,6 +277,34 @@ function foldedCategories(raw: unknown): Record<string, number[]> {
     if (!Array.isArray(ids)) continue;
     const list = ids.filter((i): i is number => Number.isInteger(i));
     if (list.length > 0) out[server] = [...new Set(list)];
+  }
+  return out;
+}
+
+/** `{ server: { channel: value } }`, keeping only what `value` takes, with a bound on servers. */
+function perChannel<T>(raw: unknown, value: (v: unknown) => T | undefined): Record<string, Record<string, T>> {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return {};
+  const out: Record<string, Record<string, T>> = {};
+  for (const [server, inner] of Object.entries(raw).slice(-LEFT_MAX_SERVERS)) {
+    if (typeof inner !== "object" || inner === null || Array.isArray(inner)) continue;
+    const kept: Record<string, T> = {};
+    for (const [name, v] of Object.entries(inner).slice(-LEFT_MAX_PER_SERVER)) {
+      const taken = value(v);
+      if (taken !== undefined) kept[name] = taken;
+    }
+    if (Object.keys(kept).length > 0) out[server] = kept;
+  }
+  return out;
+}
+
+function quietModes(raw: unknown): UiPrefs["quiet_mode"] {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return {};
+  const out: UiPrefs["quiet_mode"] = {};
+  for (const [server, v] of Object.entries(raw).slice(-LEFT_MAX_SERVERS)) {
+    const row = v as { mode?: unknown; whole?: unknown };
+    if (row?.mode !== "off" && row?.mode !== "mobile" && row?.mode !== "always") continue;
+    const whole = Array.isArray(row.whole) ? row.whole.filter((n): n is string => typeof n === "string") : [];
+    out[server] = { mode: row.mode, whole: whole.slice(-LEFT_MAX_PER_SERVER) };
   }
   return out;
 }
@@ -414,6 +472,18 @@ export function sanitizeUiPrefs(raw: unknown): UiPrefs {
     dm_timers: dmTimers(r.dm_timers),
     channel_notify: channelNotify(r.channel_notify),
     folded_categories: foldedCategories(r.folded_categories),
+    read_marks: perChannel(r.read_marks, (v) => (typeof v === "number" && Number.isFinite(v) && v > 0 ? v : undefined)),
+    opened_channels: leftTextChannels(r.opened_channels),
+    gates_seen: leftTextChannels(r.gates_seen),
+    readers_named: perChannel(r.readers_named, (v) =>
+      Array.isArray(v) ? v.filter((x): x is string => typeof x === "string").slice(-READERS_MAX_PER_CHANNEL) : undefined,
+    ),
+    quiet_mode: quietModes(r.quiet_mode),
+    newest_protocol: Object.fromEntries(
+      Object.entries(typeof r.newest_protocol === "object" && r.newest_protocol !== null ? r.newest_protocol : {})
+        .filter((e): e is [string, number] => Number.isInteger(e[1]))
+        .slice(-LEFT_MAX_SERVERS),
+    ),
     welcomed: nsfwOk(r.welcomed),
     nsfw_ok: nsfwOk(r.nsfw_ok),
     discord_bot_gone: nsfwOk(r.discord_bot_gone),

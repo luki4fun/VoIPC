@@ -241,6 +241,9 @@ async fn sign_in(
             ServerMessage::ChannelList { channels: list } => {
                 channels = list.into_iter().map(|c| (c.name, c.text)).collect();
             }
+            ServerMessage::ChannelListMore { channels: list, .. } => {
+                channels.extend(list.into_iter().map(|c| (c.name, c.text)));
+            }
             ServerMessage::EmoteList { emotes: list, .. } => {
                 emotes = list.into_iter().map(|e| e.name).collect();
             }

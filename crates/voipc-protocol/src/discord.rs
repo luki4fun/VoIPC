@@ -46,9 +46,9 @@ pub const CREATE_GUILD_EXPRESSIONS: u64 = 1 << 43;
 pub const PIN_MESSAGES: u64 = 1 << 51;
 pub const BYPASS_SLOWMODE: u64 = 1 << 52;
 
-/// Every privilege there is, one by one, which is what ADMINISTRATOR comes to: never `*`
-/// and no wildcard, since `*` also sees behind anonymous channels. A test in the relay
-/// holds this to what it registers.
+/// Every privilege there is but sharing history, which only an admin applies, one by one,
+/// which is what ADMINISTRATOR comes to: never `*` and no wildcard, since `*` also sees
+/// behind anonymous channels. A test in the relay holds this to what it registers.
 pub const FINE_SCOPES: &[&str] = &[
     "roles:admin",
     "users:admin",
@@ -148,6 +148,14 @@ mod tests {
 
     /// The owner's map, row by row, with today's bit values written out so that a typo
     /// in a constant cannot agree with itself.
+    #[test]
+    fn administrator_never_brings_share_history() {
+        assert!(!FINE_SCOPES.contains(&crate::types::SHARE_HISTORY));
+        assert!(!scopes_of(ADMINISTRATOR).contains(&crate::types::SHARE_HISTORY));
+        assert!(!scopes_of(!ADMINISTRATOR).contains(&crate::types::SHARE_HISTORY));
+        assert!(!scopes_of(u64::MAX).contains(&crate::types::SHARE_HISTORY));
+    }
+
     #[test]
     fn each_row_of_the_table() {
         let rows: &[(u64, &[&str])] = &[

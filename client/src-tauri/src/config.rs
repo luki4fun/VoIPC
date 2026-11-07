@@ -165,8 +165,15 @@ pub struct AppConfig {
     // QoL
     pub sounds: SoundSettings,
     pub auto_connect: bool,
-    /// Answer newcomers' requests for recent channel chat (E2E, pairwise).
+    /// Answer newcomers' requests for recent channel chat (E2E, pairwise), and give
+    /// who joins a channel's log our older keys. Off until turned on, per device.
     pub share_channel_history: bool,
+    /// The one reset of that switch has run (`share_off_once`). `true` for a new
+    /// install, and a file from before it reads `false`.
+    #[serde(default)]
+    pub share_off_once: bool,
+    /// That reset turned a saved `true` off: one notice is owed.
+    pub share_off_notice: bool,
 
     // Appearance
     /// Everything the UI remembers about how it looks: which layout, which
@@ -265,7 +272,9 @@ impl Default for AppConfig {
             sdk_transmit_allowed: false,
             sounds: SoundSettings::default(),
             auto_connect: false,
-            share_channel_history: true,
+            share_channel_history: false,
+            share_off_once: true,
+            share_off_notice: false,
             // Null, not `{}`: "nothing has been chosen yet" is the state the
             // whole appearance blob starts in, and an empty object would be
             // indistinguishable from a user who reset every preference. What
@@ -359,17 +368,42 @@ pub fn resolve_chat_history_path(config: &AppConfig) -> PathBuf {
 /// (`settings.json.unreadable-<unix>`): the next save would otherwise replace
 /// it, and with it the remembered servers and relay ids.
 pub fn load_config() -> AppConfig {
-    let path = config_path();
-    match std::fs::read_to_string(&path) {
+    load_config_at(&config_path())
+}
+
+/// The switch used to start on and be ticked in the copies question, so a saved `true`
+/// cannot say whether anyone chose it. Once, for everyone: off, with a notice if it was
+/// on. Whether anything changed.
+fn share_off_once(config: &mut AppConfig) -> bool {
+    if config.share_off_once {
+        return false;
+    }
+    config.share_off_notice = config.share_channel_history;
+    config.share_channel_history = false;
+    config.share_off_once = true;
+    true
+}
+
+pub(crate) fn load_config_at(path: &std::path::Path) -> AppConfig {
+    match std::fs::read_to_string(path) {
         Ok(contents) => {
-            match serde_json::from_str(&contents) {
-                Ok(config) => config,
+            match serde_json::from_str::<AppConfig>(&contents) {
+                Ok(mut config) => {
+                    if share_off_once(&mut config) {
+                        // Not saved over a newer format: it runs again next time, which
+                        // only keeps the switch off
+                        if let Err(e) = save_config_at(path, &config) {
+                            tracing::warn!("Could not keep the settings: {e}");
+                        }
+                    }
+                    config
+                }
                 Err(e) => {
                     let secs = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map_or(0, |d| d.as_secs());
                     let aside = path.with_file_name(format!("settings.json.unreadable-{secs}"));
-                    let kept = std::fs::rename(&path, &aside);
+                    let kept = std::fs::rename(path, &aside);
                     tracing::warn!("Failed to parse {}: {e} — using defaults (the file is kept as {}: {kept:?})", path.display(), aside.display());
                     AppConfig::default()
                 }
@@ -409,7 +443,10 @@ pub fn write_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> 
 
 /// Save config to disk atomically.
 pub fn save_config(config: &AppConfig) -> Result<(), String> {
-    let path = config_path();
+    save_config_at(&config_path(), config)
+}
+
+fn save_config_at(path: &std::path::Path, config: &AppConfig) -> Result<(), String> {
     if config.format > SETTINGS_FORMAT {
         return Err(
             "Settings were saved by a newer VoIPC: changes are not saved by this one".into(),
@@ -421,7 +458,7 @@ pub fn save_config(config: &AppConfig) -> Result<(), String> {
     // finite becomes `null`, which then fails the whole parse.
     serde_json::from_str::<AppConfig>(&json)
         .map_err(|e| format!("Refusing to save settings that would not load again: {e}"))?;
-    write_atomic(&path, json.as_bytes())
+    write_atomic(path, json.as_bytes())
         .map_err(|e| format!("Failed to write {}: {e}", path.display()))
 }
 
@@ -572,5 +609,67 @@ mod tests {
             "order is the opening order"
         );
         assert!(back.open_servers[1].accept_self_signed);
+    }
+
+    /// A settings file of its own, read as a start would.
+    fn start_with(name: &str, contents: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("voipc-share-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_fresh_install_starts_off_and_owes_no_notice() {
+        let config = AppConfig::default();
+        assert!(!config.share_channel_history);
+        assert!(config.share_off_once && !config.share_off_notice);
+        let dir = std::env::temp_dir().join(format!("voipc-share-{}-none", std::process::id()));
+        let config = load_config_at(&dir.join("settings.json"));
+        assert!(!config.share_channel_history && !config.share_off_notice);
+        assert!(!dir.join("settings.json").exists(), "nothing to keep yet");
+    }
+
+    #[test]
+    fn a_saved_true_goes_off_once_with_one_notice() {
+        let path = start_with("true", r#"{ "share_channel_history": true }"#);
+        let config = load_config_at(&path);
+        assert!(!config.share_channel_history && config.share_off_notice);
+        // Kept: the next start owes nothing new, and the notice waits until it is shown
+        let again = load_config_at(&path);
+        assert!(!again.share_channel_history && again.share_off_notice && again.share_off_once);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_saved_false_stays_off_with_no_notice() {
+        let path = start_with("false", r#"{ "share_channel_history": false }"#);
+        let config = load_config_at(&path);
+        assert!(!config.share_channel_history && !config.share_off_notice);
+        assert!(config.share_off_once);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// The one that would make it a nuisance.
+    #[test]
+    fn turned_on_after_the_reset_stays_on() {
+        let path = start_with("on", r#"{ "share_channel_history": true }"#);
+        let mut config = load_config_at(&path);
+        config.share_channel_history = true;
+        config.share_off_notice = false;
+        save_config_at(&path, &config).unwrap();
+        let again = load_config_at(&path);
+        assert!(again.share_channel_history && !again.share_off_notice);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_file_from_a_newer_format_is_read_off_and_not_written_over() {
+        let text = r#"{ "share_channel_history": true, "format": 999 }"#;
+        let path = start_with("newer", text);
+        assert!(!load_config_at(&path).share_channel_history);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }

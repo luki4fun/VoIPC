@@ -19,3 +19,11 @@ export function upsertById<T>(list: T[], item: T, id: (v: T) => number): { list:
     added: !known,
   };
 }
+
+/** A list as the relay sent it, each key once: a repeat keeps its first place and its last row,
+ *  like `upsertById`. Whatever a keyed each draws goes through here first. */
+export function eachOnce<T>(rows: readonly T[], key: (row: T) => string | number): T[] {
+  const byKey = new Map<string | number, T>();
+  for (const row of rows) byKey.set(key(row), row);
+  return [...byKey.values()];
+}

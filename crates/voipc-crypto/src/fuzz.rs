@@ -40,6 +40,31 @@ pub fn fuzz_log(data: &[u8]) {
     let _ = log::open_entry(&[7; 32], "c:fuzz", &[1; 16], 1, sender_logkey, sealed);
     let _ = log::unwrap(&own, data, "c:fuzz", &[1; 16], 1, &[2; 16]);
     let _ = log::self_unwrap(&own, data, "c:fuzz", &[2; 16], 1);
+
+    let chain = log::Chain {
+        conv: "c:fuzz",
+        owner: &[1; 16],
+        chain: 1,
+    };
+    let bucket = log::Bucket {
+        conv: "c:fuzz",
+        owner: &[1; 16],
+        id: 1,
+        version: 2,
+    };
+    let key = [7; 32];
+    let _ = log::open_chain_entry(&key, "c:fuzz", &[1; 16], 1, sender_logkey, sealed);
+    let _ = log::self_open_state(&own, data, "c:fuzz", &[2; 16], 1);
+    let _ = chain.follow(0, &key, data);
+    let _ = chain.open_link(&key, 0, data);
+    let _ = bucket.open_own_row(&own, data);
+    let _ = bucket.open_list(&own, data, &[0; 32]);
+    let _ = bucket.open_seal(&key, 1, 0, data);
+    let _ = bucket.open_link_down(&key, 1, data);
+    if let Some(peer) = log::StaticKey::new(&own, sender_logkey) {
+        let _ = peer.open_seat(sealed, bucket, &[2; 16]);
+        let _ = peer.open_state(sealed, "c:fuzz", &[1; 16], 1, &[2; 16]);
+    }
 }
 
 /// Vault blobs as the relay hands them out: a slot opened with a fixed vault

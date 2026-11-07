@@ -1071,7 +1071,7 @@ async fn drive<T: Transport + 'static, L: RelayLink, E: EmoteSink>(
     let delta = !here.cursors.is_empty();
     // And what Discord says now: a dry-run kept for an hour, or through a cut, says what was
     let read = &plan::as_it_is_now(api, dry_run).await?;
-    let (choices, closed_since) = plan::without_closed_since(dry_run, read, &here, &job.choices);
+    let (choices, closed_since) = plan::without_closed_since(dry_run, read, &job.choices);
     let layout = plan::layout(read, &here, &choices);
     *report = layout.report();
     report.notes.extend(closed_since);
@@ -2873,16 +2873,51 @@ mod tests {
         assert!(s.relay.sent_rows(fixture::LOUNGE, None).is_empty());
     }
 
-    /// A gate here, set by hand or by a run: the relay takes it, and it is what guards the rows.
+    /// The tick was for it open. A cursor does not change that: it is only the relay's word.
     #[tokio::test(start_paused = true)]
-    async fn a_channel_with_a_gate_here_goes_on_when_it_closes_there() {
+    async fn a_channel_closed_since_the_dry_run_stays_off_whatever_the_relay_says_of_it() {
         let mut s = scene().await;
         s.relay.cursors = vec![(fixture::LOUNGE, 1)];
         s.mock.deny_everyone(fixture::LOUNGE, VIEW_CHANNEL);
         let out = run_it(&mut s).await;
+        assert!(s.relay.sent_rows(fixture::LOUNGE, None).is_empty());
+        let text = out.report.end_screen().join("\n");
+        assert!(text.contains("#lounge: closed on Discord"), "{text}");
+    }
+
+    /// The control: ticked with the dry-run showing it closed, the tick is for that, and the gate
+    /// here, set by hand or by a run, is what guards the rows.
+    #[tokio::test(start_paused = true)]
+    async fn a_channel_ticked_closed_goes_on_behind_its_gate_here() {
+        let mock = fixture::mock();
+        mock.deny_everyone(fixture::LOUNGE, VIEW_CHANNEL);
+        let mut s = scene_of(mock).await;
+        s.relay.cursors = vec![(fixture::LOUNGE, 1)];
+        assert!(!s.choices.messages_on.contains(&fixture::LOUNGE));
+        s.choices.messages_on.insert(fixture::LOUNGE);
+        let out = run_it(&mut s).await;
         assert!(!s.relay.sent_rows(fixture::LOUNGE, None).is_empty());
         let text = out.report.end_screen().join("\n");
         assert!(!text.contains("#lounge: closed on Discord"), "{text}");
+    }
+
+    /// What a hostile relay would ask for: a cursor on a channel the operator never ticked.
+    #[tokio::test(start_paused = true)]
+    async fn a_private_channel_with_a_cursor_sends_nothing_without_its_tick() {
+        let mut s = scene().await;
+        s.relay.cursors = vec![(fixture::STAFF, 1)];
+        let mut here = fixture::here();
+        here.cursors.insert(fixture::STAFF, 1);
+        s.choices = default_choices(&s.read, &here);
+        s.choices.options.acknowledged = true;
+        run_it(&mut s).await;
+        assert!(s.relay.sent_rows(fixture::STAFF, None).is_empty());
+        // The control: ticked, its rows go
+        let mut s = scene().await;
+        s.relay.cursors = vec![(fixture::STAFF, 1)];
+        s.choices.messages_on.insert(fixture::STAFF);
+        run_it(&mut s).await;
+        assert!(!s.relay.sent_rows(fixture::STAFF, None).is_empty());
     }
 
     /// Presses Stop on the way through the emotes: the channels have gone by then.

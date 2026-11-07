@@ -600,6 +600,66 @@ pub fn open_history_payload(
     }
 }
 
+/// The key that marks a direct message as a hand-off, inside its plaintext.
+const SEALED_MARK: &str = "handoff";
+
+/// A history hand-off carried as a direct message (protocol 21): the relay sees "R wrote
+/// to S", and not for which channel, nor that it is one until a large answer.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Sealed {
+    /// Send me this channel's recent chat.
+    Ask { channel_id: u32 },
+    /// What you asked for, bound to its channel as `history_payload` binds it.
+    Answer {
+        channel_id: u32,
+        messages: Vec<serde_json::Value>,
+    },
+    /// Marked, and not readable here: it shows nowhere either way.
+    Unreadable,
+}
+
+/// The ask's plaintext.
+pub fn sealed_ask(channel_id: u32) -> Vec<u8> {
+    serde_json::json!({ SEALED_MARK: "ask", "v": HISTORY_V, "channel": channel_id })
+        .to_string()
+        .into_bytes()
+}
+
+/// The answer's plaintext.
+pub fn sealed_answer(channel_id: u32, messages: &serde_json::Value) -> Vec<u8> {
+    serde_json::json!({ SEALED_MARK: "answer", "v": HISTORY_V, "channel": channel_id, "messages": messages })
+        .to_string()
+        .into_bytes()
+}
+
+/// A direct message's plaintext, if it is a hand-off. Asked before `open_envelope`, which
+/// would show one as text. `None`: an ordinary message.
+pub fn open_sealed(plaintext: &[u8]) -> Option<Sealed> {
+    let serde_json::Value::Object(map) = serde_json::from_slice(plaintext).ok()? else {
+        return None;
+    };
+    let kind = map.get(SEALED_MARK)?;
+    let channel_id = map
+        .get("channel")
+        .and_then(|v| v.as_u64())
+        .and_then(|c| u32::try_from(c).ok());
+    let newer = map
+        .get("v")
+        .and_then(|v| v.as_u64())
+        .is_none_or(|v| v > HISTORY_V);
+    Some(match (kind.as_str(), channel_id, newer) {
+        (Some("ask"), Some(channel_id), false) => Sealed::Ask { channel_id },
+        (Some("answer"), Some(channel_id), false) => match map.get("messages") {
+            Some(serde_json::Value::Array(messages)) => Sealed::Answer {
+                channel_id,
+                messages: messages.clone(),
+            },
+            _ => Sealed::Unreadable,
+        },
+        _ => Sealed::Unreadable,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -638,6 +698,45 @@ mod tests {
             "today's still read"
         );
         assert!(open_history_payload(1, br#"{"v":4,"channel":1,"messages":[]}"#).is_err());
+    }
+
+    /// A hand-off never reaches `open_envelope`, where it would be a line of JSON on
+    /// screen. The control: everything an ordinary message can be stays one.
+    #[test]
+    fn a_marked_direct_message_shows_no_line_and_keeps_no_copy() {
+        assert_eq!(
+            open_sealed(&sealed_ask(7)),
+            Some(Sealed::Ask { channel_id: 7 })
+        );
+        let messages = serde_json::json!([{ "id": "a", "text": "hi" }]);
+        match open_sealed(&sealed_answer(7, &messages)) {
+            Some(Sealed::Answer {
+                channel_id: 7,
+                messages,
+            }) => assert_eq!(messages.len(), 1),
+            other => panic!("{other:?}"),
+        }
+        for unreadable in [
+            br#"{"handoff":"ask"}"#.as_slice(),
+            br#"{"handoff":"ask","v":99,"channel":7}"#,
+            br#"{"handoff":"ask","v":3,"channel":-1}"#,
+            br#"{"handoff":"ask","v":3,"channel":99999999999}"#,
+            br#"{"handoff":"answer","v":3,"channel":7}"#,
+            br#"{"handoff":"answer","v":3,"channel":7,"messages":{}}"#,
+            br#"{"handoff":"what","v":3,"channel":7}"#,
+            br#"{"handoff":7,"v":3,"channel":7}"#,
+        ] {
+            assert_eq!(open_sealed(unreadable), Some(Sealed::Unreadable));
+        }
+        for ordinary in [
+            envelope("id", "hello", None),
+            envelope("id", r#"{"handoff":"ask","v":3,"channel":7}"#, None),
+            b"plain text".to_vec(),
+            b"{\"text\":\"not ours\"}".to_vec(),
+            b"[1,2]".to_vec(),
+        ] {
+            assert_eq!(open_sealed(&ordinary), None);
+        }
     }
 
     #[test]

@@ -169,9 +169,10 @@
 <section class="section move-power">
   <div class="section-title">Waiting for your OK</div>
   <p class="admin-hint">
-    What they could do on Discord, held back until you say yes. Check with them outside Discord first: anyone holding that
-    Discord account has claimed this. Whoever you OK with this can give it to others. Managing channels includes deleting
-    one with a code, and that takes its whole archive for good.
+    What they could do on Discord, or a group their account held before it was opened, held back until you say yes. Check
+    with them outside Discord first: anyone holding that Discord account has claimed this. Whoever you OK with this can give
+    it to others. Managing channels includes deleting one with a code, but not one holding what came from Discord: that
+    takes an admin.
   </p>
   {#if $powerPage?.rows.length}
     {@const page = $powerPage}
@@ -362,14 +363,22 @@
     flex-wrap: wrap;
   }
 
-  /* A Discord id does not fit beside two long buttons */
-  .waiting-row {
+  /* A Discord id does not fit beside two long buttons, and a group's powers are read whole before an OK */
+  .waiting-row,
+  .power-row {
     flex-wrap: wrap;
     justify-content: flex-end;
   }
 
-  .list-item.waiting-row .row-text {
+  .list-item.waiting-row .row-text,
+  .list-item.power-row .row-text {
     flex: 1 1 100%;
+  }
+
+  .list-item.power-row .row-name,
+  .list-item.power-row .row-meta {
+    white-space: normal;
+    overflow-wrap: anywhere;
   }
 
   .report-counts {

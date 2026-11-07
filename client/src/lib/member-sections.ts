@@ -53,7 +53,9 @@ export function sectionsOf<T extends { badges?: string[] }>(
     if (top === Infinity) {
       others.push(m);
     } else {
-      held.set(top, [...(held.get(top) ?? []), m]);
+      const section = held.get(top);
+      if (section) section.push(m);
+      else held.set(top, [m]);
     }
   }
   const out: MemberSection<T>[] = [...held.keys()]

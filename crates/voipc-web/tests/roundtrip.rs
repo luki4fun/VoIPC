@@ -455,3 +455,318 @@ fn a_label_and_an_event_cross_from_js_as_json_text() {
         )
     );
 }
+
+// ── The live path, through what the page holds ───────────────────────────
+
+mod live {
+    use serde_json::{json, Value};
+    use voipc_crypto::{envelope, open_sealed, LiveOut, Sealed};
+    use voipc_protocol::messages::{ClientMessage, ServerMessage};
+    use voipc_protocol::types::UserInfo;
+    use voipc_web::signal::SignalCore;
+
+    const CH: u32 = 7;
+    const NOW: u64 = 1_000_000;
+
+    fn row(user_id: u32, account: Option<[u8; 16]>) -> UserInfo {
+        UserInfo {
+            user_id,
+            username: format!("user{user_id}"),
+            channel_id: 0,
+            is_muted: false,
+            is_deafened: false,
+            is_screen_sharing: false,
+            is_admin: false,
+            shares_history: true,
+            account,
+            is_moderator: false,
+            badges: Vec::new(),
+        }
+    }
+
+    /// Someone on the live path, following the one channel.
+    fn follower(id: u32) -> SignalCore {
+        let mut c = SignalCore::new().unwrap();
+        joined(&mut c, id);
+        c
+    }
+
+    fn joined(c: &mut SignalCore, id: u32) {
+        c.set_own_user_id(id);
+        c.keying.live_start(NOW);
+        let out = c.live_frame(
+            0,
+            &ServerMessage::TextJoined {
+                joined: vec![(CH, false, false, 0)],
+                refused: vec![],
+            },
+            NOW,
+        );
+        assert_eq!(out.entered, vec![CH], "a new one, for its log");
+        assert_eq!(out.emit[0].0, "text-joined");
+    }
+
+    fn keys_owed(rows: Vec<UserInfo>) -> ServerMessage {
+        ServerMessage::KeysOwed {
+            channel_id: CH,
+            ids: vec![],
+            rows,
+            more: false,
+            refused: false,
+        }
+    }
+
+    /// A post, as the relay hands it on.
+    fn post_to_reader(frame: &ClientMessage, from: u32) -> ServerMessage {
+        let ClientMessage::SendEncryptedChannelMessage { ciphertext, .. } = frame else {
+            panic!("{frame:?}");
+        };
+        ServerMessage::TextPost {
+            channel_id: CH,
+            user_id: from,
+            username: format!("user{from}"),
+            account: None,
+            is_admin: false,
+            is_moderator: false,
+            ciphertext: ciphertext.clone(),
+            timestamp: NOW,
+        }
+    }
+
+    fn shown(out: &LiveOut) -> Vec<String> {
+        out.emit
+            .iter()
+            .filter(|(name, _)| *name == "channel-chat-message")
+            .map(|(_, p)| p["content"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// Posted, checked, held: then the session a reader opens, and the key behind the post.
+    #[test]
+    fn a_post_goes_first_the_reader_opens_and_the_key_follows() {
+        let (mut w, mut r) = (follower(1), follower(2));
+
+        let out = w.live_post(CH, envelope("m1", "hello", None), NOW).unwrap();
+        assert!(matches!(
+            out.send[..],
+            [ClientMessage::KeyCheck {
+                channel_id: CH,
+                restart: true
+            }]
+        ));
+        let out = w.live_frame(0, &keys_owed(vec![row(2, None)]), NOW);
+        assert_eq!(out.send.len(), 1, "the post, before any key");
+        assert!(out.work);
+        let held = r.live_frame(0, &post_to_reader(&out.send[0], 1), NOW);
+        assert!(held.emit.is_empty(), "nothing shows until it opens");
+
+        let Some(ClientMessage::OpenSessions { targets, .. }) = w.live_next_frame(NOW, false)
+        else {
+            panic!("the reader opens the session");
+        };
+        assert_eq!(targets, vec![2]);
+        let hello = r.live_frame(
+            0,
+            &ServerMessage::SessionAsked {
+                channel_id: CH,
+                from: 1,
+                account: None,
+                name: "user1".into(),
+                bundle: w.bundle().unwrap().prekey_bundle,
+            },
+            NOW,
+        );
+        assert_eq!(hello.made, vec![1]);
+        let [ClientMessage::SessionHello {
+            message_type,
+            ciphertext,
+            ..
+        }] = &hello.send[..]
+        else {
+            panic!("{:?}", hello.send);
+        };
+        let out = w.live_frame(
+            0,
+            &ServerMessage::SessionHello {
+                from: 2,
+                message_type: *message_type,
+                ciphertext: ciphertext.clone(),
+            },
+            NOW,
+        );
+        assert_eq!(out.made, vec![2]);
+        assert!(out.work);
+        let Some(ClientMessage::DistributeSenderKeys { keys, .. }) = w.live_next_frame(NOW, false)
+        else {
+            panic!("the key, after the hello");
+        };
+        let (_, message_type, ciphertext) = keys.into_iter().next().unwrap();
+        let out = r.live_frame(
+            0,
+            &ServerMessage::TextKeyReceived {
+                channel_id: CH,
+                from: 1,
+                account: None,
+                message_type,
+                ciphertext,
+            },
+            NOW,
+        );
+        assert_eq!(shown(&out), vec!["hello"], "the held post opens");
+    }
+
+    /// A session opened through a writer's ask.
+    fn open(writer: &mut SignalCore, writer_id: u32, reader: &mut SignalCore, reader_id: u32) {
+        let hello = reader.live_frame(
+            0,
+            &ServerMessage::SessionAsked {
+                channel_id: CH,
+                from: writer_id,
+                account: None,
+                name: "w".into(),
+                bundle: writer.bundle().unwrap().prekey_bundle,
+            },
+            NOW,
+        );
+        let [ClientMessage::SessionHello {
+            message_type,
+            ciphertext,
+            ..
+        }] = &hello.send[..]
+        else {
+            panic!("no hello: {:?}", hello.send);
+        };
+        writer.live_frame(
+            0,
+            &ServerMessage::SessionHello {
+                from: reader_id,
+                message_type: *message_type,
+                ciphertext: ciphertext.clone(),
+            },
+            NOW,
+        );
+    }
+
+    #[test]
+    fn a_browser_in_a_call_makes_eight_wraps_at_a_time() {
+        let mut w = follower(1);
+        let mut readers: Vec<(u32, SignalCore)> = (10..19).map(|id| (id, follower(id))).collect();
+        w.live_post(CH, envelope("m1", "hello", None), NOW).unwrap();
+        w.live_frame(
+            0,
+            &keys_owed(readers.iter().map(|(id, _)| row(*id, None)).collect()),
+            NOW,
+        );
+        assert!(matches!(
+            w.live_next_frame(NOW, true),
+            Some(ClientMessage::OpenSessions { .. })
+        ));
+        for (id, r) in &mut readers {
+            open(&mut w, 1, r, *id);
+        }
+        let sizes: Vec<usize> = std::iter::from_fn(|| match w.live_next_frame(NOW, true) {
+            Some(ClientMessage::DistributeSenderKeys { keys, .. }) => Some(keys.len()),
+            _ => None,
+        })
+        .collect();
+        assert_eq!(sizes, vec![8, 1]);
+    }
+
+    #[test]
+    fn a_session_kept_from_before_wraps_at_once() {
+        const ACCOUNT: [u8; 16] = [9; 16];
+        let (mut w, mut r) = (follower(1), follower(2));
+        w.live_post(CH, envelope("m1", "first", None), NOW).unwrap();
+        w.live_frame(0, &keys_owed(vec![row(2, Some(ACCOUNT))]), NOW);
+        w.live_next_frame(NOW, false);
+        open(&mut w, 1, &mut r, 2);
+        assert!(matches!(
+            w.live_next_frame(NOW, false),
+            Some(ClientMessage::DistributeSenderKeys { .. })
+        ));
+
+        // The same device on its next connection: a new id for the writer, same memory
+        let kept = w.live_keep_sessions(NOW);
+        assert_eq!(kept.len(), 1, "an account's session goes on");
+        let mut again = follower(5);
+        again.keying.live_adopt_kept(kept);
+
+        again
+            .live_post(CH, envelope("m2", "second", None), NOW + 1)
+            .unwrap();
+        again.live_frame(0, &keys_owed(vec![row(2, Some(ACCOUNT))]), NOW + 1);
+        assert!(
+            matches!(
+                again.live_next_frame(NOW + 1, false),
+                Some(ClientMessage::DistributeSenderKeys { .. })
+            ),
+            "a wrap, with no one asked to open"
+        );
+        // Moved in under their id for a key's sake: their pin still has the last word
+        assert!(again.live_drop_kept_session(2), "it read as a kept session");
+        assert!(!again.live_drop_kept_session(2), "and it is gone");
+    }
+
+    #[test]
+    fn a_guest_keeps_no_session_for_the_next_connection() {
+        let (mut w, mut r) = (follower(1), follower(2));
+        w.live_post(CH, envelope("m1", "first", None), NOW).unwrap();
+        w.live_frame(0, &keys_owed(vec![row(2, None)]), NOW);
+        w.live_next_frame(NOW, false);
+        open(&mut w, 1, &mut r, 2);
+        assert!(w.live_keep_sessions(NOW).is_empty());
+    }
+
+    /// An ask and its answer: both pass the relay as direct messages, and are known for what
+    /// they are before anything could show them.
+    #[test]
+    fn a_hand_off_is_sealed_both_ways_and_an_answer_nobody_asked_for_is_not_wanted() {
+        let (mut asker, mut sharer) = (follower(1), follower(2));
+        asker.live_note_rows(&[row(2, None)]);
+        open(&mut sharer, 2, &mut asker, 1);
+
+        assert_eq!(asker.keying.live_ask_history(CH, &[2], NOW), vec![2]);
+        let Some(ClientMessage::SendEncryptedDirectMessage {
+            target_user_id: 2,
+            ciphertext,
+            message_type,
+        }) = asker.live_next_frame(NOW + 2_000, false)
+        else {
+            panic!("the ask");
+        };
+        let opened = sharer.decrypt(1, &ciphertext, message_type).unwrap();
+        assert_eq!(open_sealed(&opened), Some(Sealed::Ask { channel_id: CH }));
+
+        let messages: Value = json!([{ "content": "older", "timestamp": 1 }]);
+        let ClientMessage::SendEncryptedDirectMessage {
+            ciphertext,
+            message_type,
+            ..
+        } = sharer.live_seal_answer(CH, 1, &messages, NOW).unwrap()
+        else {
+            panic!("the answer");
+        };
+        let opened = asker.decrypt(2, &ciphertext, message_type).unwrap();
+        let Some(Sealed::Answer {
+            channel_id,
+            messages: back,
+        }) = open_sealed(&opened)
+        else {
+            panic!("not sealed");
+        };
+        assert_eq!(channel_id, CH);
+        assert_eq!(back[0]["content"], "older");
+        assert!(asker.keying.live_answer_wanted(CH, 2, NOW + 2_000));
+        assert!(
+            !asker.keying.live_answer_wanted(CH, 2, NOW + 2_000),
+            "one answer per ask"
+        );
+        assert!(!asker.keying.live_answer_wanted(CH, 3, NOW + 2_000));
+    }
+
+    /// An ordinary direct message is no hand-off, and stays text.
+    #[test]
+    fn an_ordinary_direct_message_is_not_taken_for_a_hand_off() {
+        assert_eq!(open_sealed(&envelope("m1", "hello", None)), None);
+    }
+}

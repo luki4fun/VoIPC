@@ -19,8 +19,6 @@ export interface SignalClient {
   bundle(): { identity_key: number[]; prekey_bundle: PreKeyBundleData };
   /** Our user id from Authenticated: every pairwise message is bound to it. */
   setOwnUserId(userId: number): void;
-  /** More one-time pre-keys for UploadPreKeys, answering PreKeysLow. */
-  morePrekeys(): { id: number; public_key: number[] }[];
   /** PQXDH with a peer's bundle (as decoded from ServerMessage.PreKeyBundle.bundle). */
   establishSession(userId: number, bundle: PreKeyBundleData): void;
   encrypt(userId: number, plaintext: Uint8Array): { ciphertext: Uint8Array; message_type: number };
@@ -42,14 +40,11 @@ export interface SignalClient {
   sharesChannelWith(ownChannel: number, channelId: number, userId: number): boolean;
   isMember(channelId: number, userId: number): boolean;
   isTextChannel(channelId: number): boolean;
-  textChannels(): Uint32Array;
   setMembers(channelId: number, userIds: Uint32Array): void;
   addMember(channelId: number, userId: number): void;
   dropMember(channelId: number, userId: number): void;
   /** Everybody in the channel except us. */
   othersIn(channelId: number, ownUserId: number): Uint32Array;
-  /** Subscribe to a text channel; `true` if it is new to us. */
-  joinTextChannel(channelId: number): boolean;
   resetChannel(ownUserId: number, channelId: number): void;
   forgetChannel(ownUserId: number, channelId: number): void;
   noteStale(channelId: number): void;
@@ -70,9 +65,95 @@ export interface SignalClient {
   /** The lowest remaining member: who mints the channel's next media key. */
   mediaKeyMinter(channelId: number): number | undefined;
 
+  // Text channels: voipc_crypto::channel_state's live path, written once for both backends.
+  // The page sends and emits what `LiveOut` says, as network.rs does.
+  liveStart(): void;
+  liveSetMetered(metered: boolean): void;
+  liveSetQuiet(channels: Uint32Array, quiet: boolean): void;
+  /** Takes over what an earlier connection of this account kept. */
+  liveAdoptKept(kept: KeptSessions): void;
+  /** What this connection hands to the next: before `free`, which takes the stores. */
+  liveKeepSessions(): KeptSessions;
+  /** The pages of pins are out: no key job until `livePinsIn`. */
+  liveWaitForPins(): void;
+  /** They came in: what waited for them. */
+  livePinsIn(ownChannel: number): LiveOut;
+  /** The rows of a list: those it is news of, with the identity their session runs on. */
+  liveNoteRows(users: unknown): { user_id: number; identity: number[] | null }[];
+  /** A frame of the live path, as its postcard bytes. */
+  liveFrame(ownChannel: number, payload: Uint8Array): LiveOut;
+  /** A post in a text channel, as `envelope` packed it. Throws why it cannot go. */
+  livePost(channelId: number, payload: Uint8Array): LiveOut;
+  /** Each second. */
+  liveTick(): LiveOut;
+  /** The next key frame's postcard bytes, if one may go now. */
+  liveNextFrame(inCall: boolean): Uint8Array | undefined;
+  liveHasWork(): boolean;
+  /** A session with this user that both ends hold came up. */
+  liveSessionUp(userId: number): void;
+  /** A kept session whose peer's key disagrees with their pin goes. */
+  liveDropKeptSession(userId: number): boolean;
+  liveNoBundle(userId: number): void;
+  /** Ask for a channel's recent chat, sealed. Of `targets`, who was picked. */
+  liveAskHistory(channelId: number, targets: Uint32Array): Uint32Array;
+  /** An answer sealed in the session the ask came through, as postcard bytes. */
+  liveSealAnswer(channelId: number, target: number, messagesJson: string): Uint8Array;
+  /** Whether an answer from `from` is one we asked for, which it uses up. */
+  liveAnswerWanted(channelId: number, from: number): boolean;
+  /** A plain ask went for this channel (the new-member wait refuses a sealed one). */
+  liveNoteAsked(channelId: number, from: number): void;
+  /** Whether the relay's "not delivered" is about a hand-off, which nobody is to see. */
+  liveUndeliveredWasSealed(target: number): boolean;
+  /** A person's answer to `key-job-ask`. */
+  liveAnswerJob(channelId: number, go: boolean): LiveOut;
+  /** Whether the pages of pins are still out. */
+  livePinsOut(): boolean;
+  /** Whether this frame, as its postcard bytes, is held until they are in. */
+  liveHoldsFrame(payload: Uint8Array): boolean;
+  /** A bundle came: whether the live path has something to send over a session with them. */
+  liveBundleWanted(userId: number, ownRoom: number): boolean;
+  /** The connection ends: the posts that waited, per channel. */
+  liveEnd(): { channel_id: number; expired: number }[];
+
   free(): void;
   [Symbol.dispose](): void;
 }
+
+/** What the page does after a call on the live path (voipc_crypto::LiveOut). */
+export interface LiveOut {
+  /** Postcard bytes of each frame to send. */
+  send: Uint8Array[];
+  /** Front-end events, to emit as they are. */
+  emit: { name: string; payload: unknown }[];
+  /** People seen for the first time, or under another account: for the pin check. */
+  seen: { user_id: number; account: number[] | null; name: string; identity: number[] | null }[];
+  /** An identity someone showed, for the pin check: a bundle's. */
+  check: { user_id: number; key: number[] }[];
+  /** A direct message may use a session with these now. */
+  made: Uint32Array;
+  /** And no longer with these. */
+  gone: Uint32Array;
+  /** Text channels newly followed: their logs are ours to keep. */
+  entered: Uint32Array;
+  /** Text channels with a gate, and accounts met in one: for what their pins may take up. */
+  gated: Uint32Array;
+  gated_people: number[][];
+  /** `liveNextFrame` has something to send. */
+  work: boolean;
+}
+
+/** Sessions with accounts, between one connection and the next. */
+export interface KeptSessions {
+  free(): void;
+}
+
+/** An account's pins, between one connection and the next. */
+export interface KeptPins {
+  free(): void;
+}
+
+/** A direct message that is really a history hand-off (voipc_crypto::Sealed). */
+export type Sealed = { ask: number } | { answer: number; messages: unknown[] } | { unreadable: true };
 
 /**
  * The media keys held for the channel we are in: the one we encrypt with, the
@@ -197,8 +278,9 @@ export type SignInStep = {
   resetDone?: true;
   providerPending?: true;
   providerSignup?: { suggestion: string; problem: string };
-  providerChoice?: { name: string; claim: boolean; has_password: boolean };
+  providerChoice?: { name: string; claim: boolean; has_password: boolean; known_as: string };
   pairCode?: string;
+  pairSame?: { code: string; known_as: string };
   pairRefused?: string;
 };
 
@@ -222,15 +304,22 @@ export interface AccountSignIn {
   keys(prekeyBundle: PreKeyBundleData): Uint8Array;
   totp(code: string): Uint8Array;
   recovery(code: string): Uint8Array;
-  /** The accounts this browser remembers on this relay. */
-  rememberedHere(names: string[]): void;
+  /** The accounts this browser remembers on this relay, with their vault keys. */
+  rememberedHere(known: [string, number[]][]): void;
   /** The name for `providerSignup`. Runs the proof of work. */
   providerSignup(name: string): Uint8Array;
+  /** "First time here": the recovery key's text, to show before anything goes. */
+  providerClaimKey(): string;
+  /** The person has seen the key: the claim goes. */
   providerClaim(): SignInStep[];
   /** The recovery key as shown; throws why not, and the choice stays open. */
   providerRecovery(key: string): SignInStep[];
+  /** From the ask until the person's answer: the relay's words stay off the screen. */
+  midPairing(): boolean;
   /** Ask another device of this account: the payload to send. */
   pairStart(): Uint8Array;
+  /** The answer to `pairSame`; throws why a no ends the sign-in. */
+  pairSame(yes: boolean): SignInStep[];
   /** After Authenticated: where this browser kept the log's read cursors. */
   finish(): { relay_id: Uint8Array; name: string };
   /** After finish: the account's session, from the AccountInfo in
@@ -248,8 +337,9 @@ export interface AccountActions {
   emit: { name: string; payload: unknown }[];
   /** The relay remembers this browser now: keep its key (devices.ts). */
   remember?: { relay_id: number[]; name: string; device_id: number[]; device_key: number[]; dek: number[] };
-  /** The log's read cursors moved: `voipc.cursors.<key>` keeps this JSON (log-memory.ts). */
-  memory?: { key: string; json: string };
+  /** The log's read cursors moved: `voipc.cursors.<key>` keeps this JSON (log-memory.ts).
+   *  `named`: who was named, when that moved, kept apart (log-named.ts). */
+  memory?: { key: string; json: string; named?: string };
 }
 
 /** What follows a sign-in — the stored log, the pins, remembering this
@@ -274,6 +364,24 @@ export interface AccountSession {
   outgoingChannel(log: string, envelope: Uint8Array, sentAt: number, ttlSecs?: number | null): AccountActions;
   /** In a channel with log `conv`: keep it, and read what it kept. */
   enter(conv: string): AccountActions;
+  readNow(conv: string): AccountActions;
+  enterMany(convs: string[]): AccountActions;
+  memberGone(conv: string, userId: number): void;
+  /** What an earlier connection of this account kept, before `pinsIn`. */
+  adoptPins(kept: KeptPins): void;
+  keepPins(): KeptPins | undefined;
+  /** Whether the pages of pins are in; if not, the page holds the key jobs. */
+  pinsIn(): boolean;
+  /** Once, when pages that were out have come in. */
+  takePinsIn(): boolean;
+  /** Whatever pins were not saved yet, now: the person is leaving. */
+  flushPins(): AccountActions;
+  pinsSaved(): boolean;
+  noteDirect(userId: number): void;
+  noteGatedPeople(accounts: number[][]): void;
+  noteGatedLog(conv: string): void;
+  /** The person opened their safety number: their pin is kept, and goes now. */
+  verified(userId: number): AccountActions;
   /** Out of channel log `conv`; with `tell`, asks the relay to take us out. */
   leave(conv: string, tell: boolean): AccountActions;
   /** Delete what this account wrote to the stored logs, in `conv` or (null) everywhere. */
@@ -283,17 +391,27 @@ export interface AccountSession {
   /** Link a provider, or prove it's you with one you have linked. */
   providerStart(kind: string, link: boolean, master: Uint8Array | null, totp?: string | null, recovery?: string | null): AccountActions;
   providerUnlink(kind: string, master: Uint8Array | null, totp?: string | null, recovery?: string | null): AccountActions;
-  /** The person's answer to `account-pair-ask`. */
-  pairAnswer(pair: number, yes: boolean): AccountActions;
+  /** The person agreed to look at `account-pair-look`. */
+  pairLook(pair: number): AccountActions;
+  /** What the person typed at `account-pair-ask`: the session compares it. */
+  pairAnswer(pair: number, code: string): AccountActions;
+  /** The person said no, at either question. */
+  pairDecline(pair: number): AccountActions;
   /** Whether a DM to this user that did not arrive is kept for them all the same. */
   keptFor(userId: number): boolean;
+  /** One person a live frame named, as a row of a roster does. */
+  notePerson(userId: number, account: Uint8Array | undefined, name: string): AccountActions;
+  /** The account this session is of: what kept sessions go by. */
+  accountId(): Uint8Array;
   /** Throws why there is none. `live`: the key the session with them runs on. */
+  isAccount(userId: number): boolean;
   safetyNumber(userId: number, ownKey: Uint8Array, live?: Uint8Array): string;
   cloud(): boolean;
   asked(): boolean;
   setPrefs(cloud: boolean, asked: boolean): AccountActions;
   setBlocked(key: string, label: string, on: boolean): AccountActions;
   setShare(share: boolean): void;
+  mayShare(): boolean;
   /** The PBKDF2 salt for this account's passwords. */
   kdfSalt(): string;
   /** A new password, from the stretched old and new ones. */
@@ -366,6 +484,7 @@ export function checkOpenInput(size: number, blob: Uint8Array): void {
 
 export interface WasmApi {
   protocolVersion(): number;
+  guestMayShare(hasAccounts: boolean): boolean;
   appVersion(): string;
   /** postcard bytes of a ClientMessage, WITHOUT the u32 length prefix. */
   encodeClientMsg(msg: unknown): Uint8Array;
@@ -397,6 +516,7 @@ export interface WasmApi {
   pickHistorySources(sharers: Uint32Array): Uint32Array;
   /** Control messages a second one connection may send (we stay under it). */
   controlMsgsPerSec(): number;
+  pinHeldMost(): number;
   /** A fresh message id: 16 random bytes, hex. */
   newMessageId(): string;
   /** Pack a message with its id, its destruction timer in seconds where the
@@ -422,6 +542,8 @@ export interface WasmApi {
   /** The messages as JSON text. Throws when the payload names a different
    *  channel than the server said it arrived in. */
   openHistoryPayload(channelId: number, payload: Uint8Array): string;
+  /** A direct message's plaintext, if it is a hand-off, before anything could show it. */
+  openSealed(plaintext: Uint8Array): Sealed | undefined;
   /**
    * Seals a file under a fresh key: a key commitment, then AES-256-GCM over
    * 64 KiB chunks. With `compress`, it is deflated first where that saves a
@@ -506,6 +628,7 @@ export async function loadWasm(): Promise<WasmApi> {
   compiled = module;
   api = {
     protocolVersion: () => mod.protocolVersion(),
+    guestMayShare: (hasAccounts) => mod.guestMayShare(hasAccounts),
     appVersion: () => mod.appVersion(),
     encodeClientMsg: (m) => mod.encodeClientMsg(m),
     decodeServerMsg: (b) => mod.decodeServerMsg(b),
@@ -521,6 +644,7 @@ export async function loadWasm(): Promise<WasmApi> {
     maxRelayCiphertext: () => mod.maxRelayCiphertext(),
     pickHistorySources: (s) => mod.pickHistorySources(s),
     controlMsgsPerSec: () => mod.controlMsgsPerSec(),
+    pinHeldMost: () => mod.pinHeldMost(),
     newMessageId: () => mod.newMessageId(),
     envelope: (id, text, ttlSecs, refs) =>
       mod.envelope(
@@ -536,6 +660,7 @@ export async function loadWasm(): Promise<WasmApi> {
     openEnvelope: (p) => mod.openEnvelope(p),
     historyPayload: (c, m) => mod.historyPayload(c, m),
     openHistoryPayload: (c, p) => mod.openHistoryPayload(c, p),
+    openSealed: (p) => mod.openSealed(p),
     sealFile: (p, c) => {
       checkSealInput(p);
       return mod.sealFile(p, c);

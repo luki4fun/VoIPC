@@ -259,6 +259,18 @@ async function settle(tab) {
   throw new Error(`the first-connect questions did not end: ${up}\n--- page: ${(await tab.evaluate(`document.body.innerText`)).replace(/\s+/g, " ").slice(0, 600)}`);
 }
 
+/** Settings: the switch to share history, which starts off. */
+async function turnOnSharing(tab) {
+  const box = `[...document.querySelectorAll(".toggle-row")].find((r) => r.textContent.includes("Share recent channel chat"))?.querySelector("input")`;
+  await tab.evaluate(`document.querySelector(".settings-btn").click()`);
+  await waitFor(tab, byText(".tabs .tab", "Privacy"));
+  await tab.evaluate(`${byText(".tabs .tab", "Privacy")}.click()`);
+  await waitFor(tab, box);
+  if (!(await tab.evaluate(`${box}.checked`))) await tab.evaluate(`${box}.click()`);
+  await tab.evaluate(`document.querySelector(".panel .close-btn").click()`);
+  await sleep(300);
+}
+
 async function createAccount(tab, name) {
   await tab.evaluate(`document.querySelector(".mode-switch.small button:nth-child(2)").click()`);
   await waitFor(tab, `document.querySelector("#account-password2")`);
@@ -395,6 +407,18 @@ async function lane() {
   // The moderation log. bobby moderates; carla holds the ban list and not the log;
   // erin the log and nothing else; dan is the one acted on.
   const stepUp = stepUpWith(ann, secret);
+
+  // No group holds Share history until an admin gives it. Here every account gets it, and
+  // whoever a section needs to hand something on then turns the switch on.
+  check("nor Share history", await ann.evaluate(`${ticked("voipc:share_history")} === false`));
+  await ann.evaluate(`${byText(".group-form button", "Cancel")}.click()`);
+  await waitFor(ann, groupRow("user"));
+  await ann.evaluate(`${groupRow("user")}.click()`);
+  await waitFor(ann, `document.querySelector('.admin-dialog input[data-scope="voipc:share_history"]')`);
+  await ann.evaluate(`document.querySelector('.admin-dialog input[data-scope="voipc:share_history"]').click()`);
+  await ann.evaluate(`document.querySelector('.group-form button[type="submit"]').click()`);
+  await stepUp();
+  await waitFor(ann, groupRow("user"));
   const two = await browser(PORT + 101);
   const bob = await openDialog(two);
   await createAccount(bob, "bobby");
@@ -552,7 +576,7 @@ async function lane() {
   };
   const marked = (name) => `${memberRow(name)}?.querySelector(".blocked-mark")`;
   const folds = `document.querySelectorAll(".msg-folded").length`;
-  const unreadOn = (name) => `(() => { const row = ${byText(".channel-list.modern .channels.text .channel", name)}; return row?.querySelector(".channel-unread")?.textContent.trim() ?? ""; })()`;
+  const unreadOn = (name) => `(() => { const row = ${byText(".channel-list.modern .channels.text .channel", name)}; return row?.querySelector(".channel-unread")?.textContent.trim() ?? (row?.querySelector(".channel-dot") ? "dot" : ""); })()`;
   const dmRow = (name) => `[...document.querySelectorAll(".dm-entry")].find((d) => d.textContent.includes(${JSON.stringify(name)}))`;
   const invited = `document.querySelector(".invite")`;
   const poked = `document.querySelector(".poke")`;
@@ -597,7 +621,8 @@ async function lane() {
   await sleep(1500);
   check("a blocked person's message counts for nothing", (await fay.evaluate(unreadOn("lobby-chat"))) === "", await fay.evaluate(unreadOn("lobby-chat")));
   await say(han, "hana says hello");
-  check("anyone else's does", await seen(fay, `${unreadOn("lobby-chat")} === "1"`), await pageText(fay));
+  // A dot: a channel the server asks everyone to follow counts only what is for you
+  check("anyone else's does", await seen(fay, `${unreadOn("lobby-chat")} === "dot"`), await pageText(fay));
   await openChat(fay, "lobby-chat");
 
   // A direct message: delivered and kept, with no row, no count and no notice for gus
@@ -715,6 +740,7 @@ async function lane() {
   // gus-notes as he writes there and leaves, so only he holds it (written to nobody it
   // would wait, and go out live to the next to join). A guest has no kept copies: her
   // join asks him, and unblocked the same ask brings it
+  await turnOnSharing(gus);
   await gus.evaluate(`document.querySelector('button[title="Create channel"]').click()`);
   await waitFor(gus, `document.querySelector(".create-form")`);
   await gus.evaluate(setInput(".create-form input[type=text]", "gus-notes"));
@@ -734,7 +760,7 @@ async function lane() {
   await say(gus, "only gus holds this");
   await waitFor(fay, lastMessage("only gus holds this"), 30_000);
   await fay.evaluate(`${notesRow}.parentElement.querySelector('.settings-icon[title^="Leave this channel"]').click()`);
-  await waitFor(gus, `${notesRow}.querySelector(".user-count")?.textContent.trim() === "1"`);
+  await waitFor(gus, `!${memberRow("fay")}`);
   await waitFor(han, notesRow);
   await han.evaluate(`${notesRow}.click()`);
   await waitFor(han, `document.querySelector(".join-text-btn")`);
@@ -807,7 +833,7 @@ async function lane() {
   check("the compose box gives way on ivy's screen", await seen(ivy, heldFooter), await pageText(ivy));
   check("and it is gone", await ivy.evaluate(`!${composer}`));
   const footer = await ivy.evaluate(`${heldFooter}?.textContent ?? ""`);
-  check("saying by whom, until when and why", /Timed out by @bobby until \d/.test(footer) && footer.includes("shouting in the lobby"), footer);
+  check("saying by whom, until when and why", /Timed out by @bobby until (\w+ \d+ )?\d/.test(footer) && footer.includes("shouting in the lobby"), footer);
   check("ivy is told", await seen(ivy, `window.__toasts.some((t) => t.includes("Timed out by @bobby"))`), await ivy.evaluate(`JSON.stringify(window.__toasts)`));
   check("the moderator sees the mark", await seen(bob, restrictedMark("ivy")), await pageText(bob));
   check("ivy sees it on her own row", await seen(ivy, restrictedMark("ivy")));
@@ -820,7 +846,7 @@ async function lane() {
   };
   check("a moderator reads the reason", seenBy.bobby.includes("shouting in the lobby"), seenBy.bobby);
   check("the person does", seenBy.ivy.includes("shouting in the lobby"), seenBy.ivy);
-  check("anyone else sees who and until when", /Timed out by @bobby until \d/.test(seenBy.hana), seenBy.hana);
+  check("anyone else sees who and until when", /Timed out by @bobby until (\w+ \d+ )?\d/.test(seenBy.hana), seenBy.hana);
   check("and not why", !seenBy.hana.includes("shouting"), seenBy.hana);
   check("the moderator's compose box stays", await bob.evaluate(`!!${composer} && !${heldFooter}`));
   check("and hana's", await han.evaluate(`!!${composer} && !${heldFooter}`));
@@ -1108,6 +1134,8 @@ async function lane() {
 
   // What a member hands a newcomer leaves out what was hidden: hana has no stored log,
   // so all she gets is what ivy and bobby answer with
+  await turnOnSharing(ivy);
+  await turnOnSharing(bob);
   await ivy.evaluate(`document.querySelector('button[title="Create channel"]').click()`);
   await waitFor(ivy, `document.querySelector(".create-form")`);
   await ivy.evaluate(setInput(".create-form input[type=text]", "ivy-notes"));
@@ -1339,6 +1367,7 @@ async function lane() {
   await openChat(fay, "lobby-chat");
   check("a member back from it reads the rest", await stored(fay, "ivy answers ned"), await pageText(fay));
   check("not what was removed", !(await says(fay, "ned sells pills")), await pageText(fay));
+  for (const tab of [ann, car, fay]) await turnOnSharing(tab);
   await connectGuest(han, "hana");
   await openChat(han, "lobby-chat");
   // Whoever answers is made to hand on a copy no honest app would: she has no other way

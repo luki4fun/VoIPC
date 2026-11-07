@@ -11,7 +11,7 @@
   import { olderRelay } from "../stores/relay.js";
   import { badgeStyle, colorOf, hexOf, pillStyle } from "../member-sections.js";
   import { community } from "../relay-rules.js";
-  import { privilegeLabel, privilegesOn } from "../scopes.js";
+  import { privilegeLabel, privilegesOn, SHARE_HISTORY } from "../scopes.js";
   import Icon from "./Icons.svelte";
   import type { GroupInfo } from "../types.js";
 
@@ -200,7 +200,7 @@
     {/if}
     <div class="section">
       <div class="section-title">Privileges</div>
-      <p class="admin-hint">They apply once a member has set up two-factor codes. A group without any is still a group: for its badge, and for the channels that let it in.</p>
+      <p class="admin-hint">They apply once a member has set up two-factor codes{#if choices.some((p) => p.scope === SHARE_HISTORY)}, except Share history, which applies at once{/if}. A group without any is still a group: for its badge, and for the channels that let it in.</p>
       <ul class="check-list">
         {#each choices as p (p.scope)}
           {@const covered = everything && p.scope !== "*"}
@@ -221,6 +221,9 @@
           </li>
         {/each}
       </ul>
+      {#if g.builtin && g.name === "user" && g.scopes.includes(SHARE_HISTORY)}
+        <p class="admin-hint">Every account here may then share, each once they turn it on themselves.</p>
+      {/if}
     </div>
     {#if mayEdit}
       <div class="form-actions">

@@ -9,8 +9,9 @@
 import { toHex } from "../../lib/hex";
 import { getConfig } from "./config";
 import { cursorStorageKey, findDevice, listDevices, saveDevice } from "./devices";
-import { freshPage, keepMemory, markReplay, type PageMemory } from "./log-memory";
-import { wasm, type AccountActions, type AccountMethod, type AccountSession, type AccountSignIn, type SignInStep, type SignalClient } from "./wasm";
+import { freshPage, keepMemory, markReplay, wholeMemory, type PageMemory } from "./log-memory";
+import { loadNamed, namedOf, saveNamed } from "./log-named";
+import { wasm, type AccountActions, type AccountMethod, type AccountSession, type AccountSignIn, type KeptPins, type SignInStep, type SignalClient } from "./wasm";
 
 /** How the front end wants a connection to sign in. */
 export type AccountArgs =
@@ -26,7 +27,9 @@ export type ProviderAnswer =
   | { kind: "claim" }
   | { kind: "recovery"; key: string }
   | { kind: "pair" }
-  | { kind: "password" };
+  | { kind: "password" }
+  | { kind: "same"; yes: boolean }
+  | { kind: "keysaved" };
 
 /** What this ends with when the person chose their password; the name follows. */
 const USE_PASSWORD = "Sign in with your password: ";
@@ -86,6 +89,8 @@ export interface AccountHost {
   /** The account's identity replaces the placeholder the session was made with. */
   replaceSignal(client: SignalClient): void;
   failAuth(e: Error): void;
+  /** Starts the sign-in's clock over, with this long to go. */
+  authWait(ms: number): void;
 }
 
 /** What this browser keeps of an account's stored log (how far it read, who
@@ -113,19 +118,40 @@ function writeCursors(key: string, json: string): void {
 const pageMemory = new Map<string, PageMemory>();
 
 type TotpAnswer = { code: string; recovery: boolean } | null;
-type ProviderChoice = { name: string; claim: boolean; has_password: boolean; problem: string };
+type ProviderChoice = { name: string; claim: boolean; has_password: boolean; known_as: string; problem: string };
 type Body = Record<string, unknown>;
 
 const TOTP_WAIT_MS = 115_000;
 /** The relay waits five minutes for a person; this a little less. */
 const PROVIDER_WAIT_MS = 290_000;
+/** How long the relay may stay quiet at one step of a sign-in: it waits up to two minutes
+ *  for a person, at a code or at the other device. Per step, as a whole sign-in with a
+ *  pairing takes far longer. While a prompt is up, its own wait counts. */
+export const ACCOUNT_STEP_MS = 150_000;
 /** `AccountSession.tick`. */
 const TICK_MS = 2_000;
+
+/** What a sign-in reads. */
+const SIGN_IN_FRAMES = ["Authenticated", "AuthError", "Refused", "AuthStep"];
+
+/** Whether a frame goes on to the session's handler, past what the sign-in read of it. A
+ *  relay can run its own side of a pairing, so it knows the code the old device wants, and
+ *  each handler puts its words on screen. So before Authenticated only the sign-in's own
+ *  frames count, as on the desktop, and during a pairing not a refusal either: its version
+ *  text would reach the update panel, and the machine has ended the sign-in in its own words. */
+export function frameGoesOn(msg: unknown, signedIn: boolean, midPairing: boolean): boolean {
+  if (signedIn) return true;
+  const tag = typeof msg === "string" ? msg : Object.keys(msg as object)[0];
+  if (tag === "Refused" && midPairing) return false;
+  return SIGN_IN_FRAMES.includes(tag);
+}
 
 export class AccountDriver {
   private signIn: AccountSignIn | null;
   private totpWaiter: ((a: TotpAnswer) => void) | null = null;
   private providerWaiter: ((a: ProviderAnswer | null) => void) | null = null;
+  /** Ends a sign-in waiting for the other device: no prompt is up to answer then. */
+  private pairWait: (() => void) | null = null;
   /** What the person is asked at a provider's sign-in, kept for asking again. */
   private choice: ProviderChoice | null = null;
   private asked = 0;
@@ -134,17 +160,19 @@ export class AccountDriver {
   private memory: PageMemory | null = null;
   private ticker: ReturnType<typeof setInterval> | null = null;
 
-  private constructor(
-    signIn: AccountSignIn,
-    private readonly passwordBased: boolean,
-    /** For the `stretch` step; none for a device-key sign-in. */
-    private readonly password: string | null,
-  ) {
+  private readonly passwordBased: boolean;
+  /** For the `stretch` step; none for a device-key sign-in. */
+  private readonly password: string | null;
+
+  private constructor(signIn: AccountSignIn, passwordBased: boolean, password: string | null) {
     this.signIn = signIn;
+    this.passwordBased = passwordBased;
+    this.password = password;
   }
 
   /** Throws why it cannot start (a bad name, no remembered device). */
   static async create(server: string, username: string, args: AccountArgs): Promise<AccountDriver> {
+    await loadNamed();
     const api = wasm();
     // A provider's answer decides the account
     const name = args.kind === "provider" ? "" : api.normalizeAccountName(username);
@@ -168,9 +196,14 @@ export class AccountDriver {
     );
     if (args.kind === "provider") {
       const devices = await listDevices();
-      signIn.rememberedHere(devices.filter((d) => d.server === server).map((d) => d.name));
+      signIn.rememberedHere(devices.filter((d) => d.server === server).map((d) => [d.name, d.dek]));
     }
     return new AccountDriver(signIn, args.kind !== "device", args.kind === "device" || args.kind === "provider" ? null : args.password);
+  }
+
+  /** `AccountSignIn.midPairing`, and false once the sign-in is over. */
+  get midPairing(): boolean {
+    return this.signIn?.midPairing() ?? false;
   }
 
   /** The Authenticate payload. */
@@ -183,6 +216,7 @@ export class AccountDriver {
   onPayload(host: AccountHost, payload: Uint8Array): void {
     const signIn = this.signIn;
     if (!signIn) return;
+    host.authWait(ACCOUNT_STEP_MS);
     try {
       this.steps(host, signIn, signIn.step(payload));
     } catch (e) {
@@ -213,7 +247,11 @@ export class AccountDriver {
         void this.askChoice(host, signIn);
       } else if (s.pairCode) {
         host.emit("account-pair-code", s.pairCode);
+      } else if (s.pairSame) {
+        this.pairWait = null;
+        void this.askSame(host, signIn, s.pairSame);
       } else if (s.pairRefused) {
+        this.pairWait = null;
         if (this.choice) this.choice.problem = s.pairRefused;
         void this.askChoice(host, signIn);
       }
@@ -223,10 +261,12 @@ export class AccountDriver {
   /** Asks the front end and waits for `answerProvider`. */
   private askProvider(host: AccountHost, event: string, payload: unknown): Promise<ProviderAnswer | null> {
     return new Promise((resolve) => {
+      host.authWait(PROVIDER_WAIT_MS + 1_000);
       const timer = setTimeout(() => resolve(null), PROVIDER_WAIT_MS);
       this.providerWaiter = (a) => {
         clearTimeout(timer);
         this.providerWaiter = null;
+        host.authWait(ACCOUNT_STEP_MS);
         resolve(a);
       };
       host.emit(event, payload);
@@ -247,6 +287,21 @@ export class AccountDriver {
     }
   }
 
+  /** The other device's answer opens: did they type the code there? Only a yes opens it. */
+  private async askSame(host: AccountHost, signIn: AccountSignIn, ask: { code: string; known_as: string }): Promise<void> {
+    const answer = await this.askProvider(host, "account-pair-same", ask);
+    if (this.signIn !== signIn) return;
+    if (answer?.kind !== "same") {
+      host.failAuth(new Error("Nothing was chosen in time."));
+      return;
+    }
+    try {
+      this.steps(host, signIn, signIn.pairSame(answer.yes));
+    } catch (e) {
+      host.failAuth(e instanceof Error ? e : new Error(String(e)));
+    }
+  }
+
   /** What opens the account, as the person says (account.rs `choose`). */
   private async askChoice(host: AccountHost, signIn: AccountSignIn): Promise<void> {
     for (;;) {
@@ -254,11 +309,19 @@ export class AccountDriver {
       if (this.signIn !== signIn) return;
       try {
         switch (answer?.kind) {
-          case "claim":
+          case "claim": {
+            const saved = await this.askProvider(host, "account-provider-key", { key: signIn.providerClaimKey() });
+            if (this.signIn !== signIn) return;
+            if (saved?.kind !== "keysaved") {
+              host.failAuth(new Error("Nothing was chosen in time."));
+              return;
+            }
             this.steps(host, signIn, signIn.providerClaim());
             return;
+          }
           case "pair":
             host.sendRaw(signIn.pairStart());
+            this.pairWait = () => host.failAuth(new Error("Sign-in cancelled."));
             return;
           case "password":
             host.failAuth(new Error(`${USE_PASSWORD}${this.choice?.name ?? ""}`));
@@ -283,15 +346,26 @@ export class AccountDriver {
     }
   }
 
-  /** The person's answer to `account-provider-signup` or `account-provider-choice`. */
+  /** The person's answer to what a provider's sign-in asks: `account-provider-signup`,
+   *  `account-provider-choice`, `account-provider-key` or `account-pair-same`. */
   answerProvider(answer: ProviderAnswer): void {
     if (!this.providerWaiter) throw new Error("No sign-in is waiting for that.");
     this.providerWaiter(answer);
   }
 
-  /** The person's answer to `account-pair-ask`. */
-  pairAnswer(host: AccountHost, pair: number, yes: boolean): void {
-    if (this.session) this.run(host, this.session.pairAnswer(pair, yes));
+  /** The person agreed to look at `account-pair-look`. */
+  pairLook(host: AccountHost, pair: number): void {
+    if (this.session) this.run(host, this.session.pairLook(pair));
+  }
+
+  /** What the person typed at `account-pair-ask`: the session compares it. */
+  pairAnswer(host: AccountHost, pair: number, code: string): void {
+    if (this.session) this.run(host, this.session.pairAnswer(pair, code));
+  }
+
+  /** The person said no, at either question. */
+  pairDecline(host: AccountHost, pair: number): void {
+    if (this.session) this.run(host, this.session.pairDecline(pair));
   }
 
   /** A password stretched, or null for an account without one. */
@@ -353,6 +427,7 @@ export class AccountDriver {
   cancel(): void {
     this.totpWaiter?.(null);
     this.providerWaiter?.(null);
+    this.pairWait?.();
   }
 
   /** After Authenticated, with its `account` (AccountInfo). */
@@ -362,10 +437,11 @@ export class AccountDriver {
     const done = signIn.finish();
     if (relayIds()[host.server] !== toHex(done.relay_id)) setRelayId(host.server, toHex(done.relay_id));
     const key = cursorStorageKey(done.relay_id, done.name);
-    const memory = pageMemory.get(key) ?? freshPage(readCursors(key));
+    const memory = pageMemory.get(key) ?? freshPage(readCursors(key), namedOf(key));
+    if (memory.named && !namedOf(key)) saveNamed(key, memory.named);
     pageMemory.set(key, memory);
     this.memory = memory;
-    const { session, actions } = signIn.startSession(info, memory.json, getConfig().share_channel_history, this.passwordBased);
+    const { session, actions } = signIn.startSession(info, wholeMemory(memory), getConfig().share_channel_history, this.passwordBased);
     signIn.free();
     this.signIn = null;
     this.session = session;
@@ -388,6 +464,7 @@ export class AccountDriver {
     this.ticker = null;
     this.totpWaiter?.(null);
     this.providerWaiter?.(null);
+    this.pairWait = null;
     this.signIn?.free();
     this.signIn = null;
     this.session?.free();
@@ -404,7 +481,12 @@ export class AccountDriver {
     }
     if (a.memory && this.memory) {
       this.memory.json = a.memory.json;
-      writeCursors(`voipc.cursors.${a.memory.key}`, keepMemory(a.memory.json, this.memory.seen));
+      const key = `voipc.cursors.${a.memory.key}`;
+      writeCursors(key, keepMemory(a.memory.json, this.memory.seen));
+      if (a.memory.named) {
+        this.memory.named = a.memory.named;
+        saveNamed(key, a.memory.named);
+      }
     }
   }
 
@@ -433,9 +515,29 @@ export class AccountDriver {
     }
   }
 
-  /** An identity `userId` showed: in a pre-key bundle, or a session they opened. */
-  checkIdentity(host: AccountHost, userId: number, key: ArrayLike<number>): void {
-    if (this.session) this.run(host, this.session.checkIdentity(userId, Uint8Array.from(key)));
+  /** One person a live frame named, as a row of a roster does. Never throws, for the same
+   *  reason: what the frame carries must still be shown. */
+  notePerson(host: AccountHost, userId: number, account: ArrayLike<number> | null, name: string): void {
+    try {
+      if (this.session) this.run(host, this.session.notePerson(userId, account ? Uint8Array.from(account) : undefined, name));
+    } catch (e) {
+      console.warn("could not note who that was:", e);
+    }
+  }
+
+  /** An identity `userId` showed: in a pre-key bundle, or a session they opened. Whether
+   *  it disagrees with their pin. */
+  checkIdentity(host: AccountHost, userId: number, key: ArrayLike<number>): boolean {
+    if (!this.session) return false;
+    const a = this.session.checkIdentity(userId, Uint8Array.from(key));
+    const warned = a.emit.some((e) => e.name === "identity-key-changed");
+    this.run(host, a);
+    return warned;
+  }
+
+  /** The account this is, once signed in: what kept sessions go by. */
+  accountHex(): string | null {
+    return this.session ? toHex(this.session.accountId()) : null;
   }
 
   /** A direct message to `userId`, kept for them too when cloud copies are on. */
@@ -455,8 +557,65 @@ export class AccountDriver {
   }
 
   /** In a channel with log `conv`: keep it, and read what it kept. */
+  readNow(host: AccountHost, conv: string): void {
+    if (this.session) this.run(host, this.session.readNow(conv));
+  }
+
   enter(host: AccountHost, conv: string): void {
     if (this.session) this.run(host, this.session.enter(conv));
+  }
+
+  /** In these channels' logs, newly followed: keep them in one frame, and read them. */
+  enterMany(host: AccountHost, convs: string[]): void {
+    if (this.session && convs.length > 0) this.run(host, this.session.enterMany(convs));
+  }
+
+  /** `userId` left channel log `conv`, or was put out of it: our chain there ends at our next post. */
+  memberGone(conv: string, userId: number): void {
+    this.session?.memberGone(conv, userId);
+  }
+
+  adoptPins(kept: KeptPins): void {
+    this.session?.adoptPins(kept);
+  }
+
+  keepPins(): KeptPins | undefined {
+    return this.session?.keepPins();
+  }
+
+  pinsIn(): boolean {
+    return this.session?.pinsIn() ?? true;
+  }
+
+  takePinsIn(): boolean {
+    return this.session?.takePinsIn() ?? false;
+  }
+
+  /** A person is leaving: what pins were not saved yet go, and a moment for their answers,
+   *  since the index follows the pages (network.rs `save_pins`). */
+  async savePins(host: AccountHost): Promise<void> {
+    if (!this.session) return;
+    this.run(host, this.session.flushPins());
+    for (let i = 0; i < 20 && this.session && !this.session.pinsSaved(); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
+
+  noteDirect(userId: number): void {
+    this.session?.noteDirect(userId);
+  }
+
+  noteGatedPeople(accounts: number[][]): void {
+    if (accounts.length > 0) this.session?.noteGatedPeople(accounts);
+  }
+
+  noteGatedLog(conv: string): void {
+    this.session?.noteGatedLog(conv);
+  }
+
+  /** The person opened their safety number: their pin is kept, and goes now. */
+  verified(host: AccountHost, userId: number): void {
+    if (this.session) this.run(host, this.session.verified(userId));
   }
 
   /** Delete what this account wrote to the stored logs, in `conv` or everywhere. */
@@ -481,6 +640,11 @@ export class AccountDriver {
     return this.session?.keptFor(userId) ?? false;
   }
 
+  /** Whether a list has said which account `userId` is. */
+  isAccount(userId: number): boolean {
+    return this.session?.isAccount(userId) ?? false;
+  }
+
   /** The safety number with `userId`; `live` is the key the session with them runs on. */
   safetyNumber(userId: number, ownKey: number[], live?: Uint8Array): string {
     if (!this.session) throw new Error("Sign in to an account to verify people");
@@ -489,6 +653,10 @@ export class AccountDriver {
 
   setShare(on: boolean): void {
     this.session?.setShare(on);
+  }
+
+  mayShare(): boolean {
+    return this.session?.mayShare() ?? false;
   }
 
   /** A new password: the current one, and a code where the account has codes

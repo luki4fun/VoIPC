@@ -6,17 +6,19 @@
 //! used to hold these rules in two copies, and the copies drifted.
 
 use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex, PoisonError};
 
+use libsignal_protocol::KeyPair;
 use serde_json::{json, Value};
 use voipc_protocol::conv::{hex, unhex16};
 use voipc_protocol::messages::{AccountReply, AccountRequest, ClientMessage};
-use voipc_protocol::types::{AccountInfo, ProviderKind, ReportTaker, UserInfo};
+use voipc_protocol::types::{may_share_history, AccountInfo, ProviderKind, ReportTaker, UserInfo};
 use zeroize::Zeroizing;
 
 use crate::account::{
     derive_from_master, kdf_salt, recovery_text, reset_key, DeviceEnrol, PinCheck, SignedIn, Vault,
 };
-use crate::sync::{AccountSync, Event, LogMemory, Prefs};
+use crate::sync::{AccountSync, Event, KeptPins, LogMemory, Prefs};
 
 /// A device the relay remembers now: what signs this account in there next
 /// time, without the password. The host keeps it in its own vault.
@@ -41,6 +43,8 @@ pub struct Actions {
     /// Keep this for the next run, under this key (`memory_key`): the log's
     /// read cursors moved.
     pub memory: Option<(String, LogMemory)>,
+    /// Who it names as readers moved since it last said: a host that keeps that apart.
+    pub memory_named: bool,
 }
 
 impl Actions {
@@ -50,10 +54,31 @@ impl Actions {
             ..Default::default()
         }
     }
+
+    fn absorb(&mut self, other: Actions) {
+        self.send.extend(other.send);
+        self.emit.extend(other.emit);
+        self.memory = other.memory.or(self.memory.take());
+        self.memory_named |= other.memory_named;
+    }
 }
+
+/// A pin decision that came before the pages of pins did.
+enum PinWait {
+    Identity(u32, Vec<u8>),
+    Guest(u32, String),
+}
+
+/// Decisions held at most, while a relay sits on the pages.
+const PIN_WAIT_MOST: usize = 65_536;
 
 pub struct AccountSession {
     sync: AccountSync,
+    /// The relay's protocol, for `may_share_history`.
+    proto: u32,
+    /// The device's switch, and whether it counts here: `sync` shares by both.
+    switch: bool,
+    right: bool,
     me: [u8; 16],
     relay_id: [u8; 16],
     name: String,
@@ -74,29 +99,112 @@ pub struct AccountSession {
     tombstones: std::collections::HashSet<String>,
     /// A new device asking for the vault's key, until the person answers.
     pairing: Option<Pairing>,
+    /// What waits for the pages of pins, and whether they were out when the host looked.
+    pin_wait: Vec<PinWait>,
+    pins_out: bool,
 }
 
 /// A pairing this device was asked for (`crate::pair`).
 struct Pairing {
     pair: u64,
     commitment: Vec<u8>,
-    nonce: Vec<u8>,
+    /// Once the person agreed to look: the key this device answered with, and its
+    /// raw bytes as they went out.
+    key: Option<(KeyPair, Vec<u8>)>,
     /// Once revealed and checked: what the DEK would be wrapped to.
     ephemeral: Option<Vec<u8>>,
+    /// Wrong codes typed so far.
+    wrong: u32,
+    /// When this step began (ms). One nobody ended goes from `tick`.
+    since: u64,
+}
+
+impl Pairing {
+    /// `account-pair-ended`. `looked`: this device's key went out and no reveal came,
+    /// which is how someone trying codes looks from here. `typing`: the field for the
+    /// code went away with nothing handed over, which must not pass for the code
+    /// being taken while the new device asks about that.
+    fn ended(&self) -> (&'static str, Value) {
+        (
+            "account-pair-ended",
+            json!({
+                "pair": self.pair,
+                "looked": self.key.is_some() && self.ephemeral.is_none(),
+                "typing": self.ephemeral.is_some(),
+            }),
+        )
+    }
+}
+
+/// A step of a pairing nobody ended: the relay's wait for a person, and a margin.
+const PAIR_EXPIRY_MS: u64 = 130_000;
+/// How often a wrong code may be typed again before this device says no.
+const PAIR_RETRIES: u32 = 3;
+/// The relay's numbers (`spend_pair_ask` there), which bind only an honest relay.
+const PAIR_ASKS: f64 = 3.0;
+const PAIR_ASK_MS: f64 = 600_000.0;
+
+#[derive(Debug, PartialEq)]
+enum PairBudget {
+    /// Ask the person.
+    Ask,
+    /// No more for now, and they have not heard so.
+    SpentNow,
+    Spent,
+}
+
+/// What is left of a relay's asks on this device.
+struct PairAsks {
+    left: f64,
+    /// When `left` was counted (ms).
+    at: u64,
+    told: bool,
+}
+
+/// Per relay, for the whole run and not one session: a relay could otherwise start
+/// over by dropping the connection.
+static PAIR_BUDGETS: LazyLock<Mutex<HashMap<[u8; 16], PairAsks>>> = LazyLock::new(Default::default);
+
+fn spend_pair_ask(relay: [u8; 16], now: u64) -> PairBudget {
+    let mut budgets = PAIR_BUDGETS.lock().unwrap_or_else(PoisonError::into_inner);
+    let asks = budgets.entry(relay).or_insert(PairAsks {
+        left: PAIR_ASKS,
+        at: now,
+        told: false,
+    });
+    asks.left = (asks.left + now.saturating_sub(asks.at) as f64 / PAIR_ASK_MS).min(PAIR_ASKS);
+    asks.at = now;
+    if asks.left >= 1.0 {
+        asks.left -= 1.0;
+        asks.told = false;
+        PairBudget::Ask
+    } else if std::mem::replace(&mut asks.told, true) {
+        PairBudget::Spent
+    } else {
+        PairBudget::SpentNow
+    }
+}
+
+fn pair_declined(pair: u64) -> ClientMessage {
+    ClientMessage::Account(AccountRequest::PairDecline { pair })
 }
 
 impl AccountSession {
     /// After `Authenticated`: what the sign-in left, the account it is, what
-    /// this device kept of the log last time, and whether joiners of a
-    /// channel's log get our older keys. Tells the front end it signed in.
+    /// this device kept of the log last time, the device's switch for sharing
+    /// with joiners, and the relay's protocol. Tells the front end it signed in,
+    /// and whether the switch counts here.
     pub fn start(
         signed: SignedIn,
         info: &AccountInfo,
         memory: LogMemory,
-        share: bool,
+        switch: bool,
         password_based: bool,
+        proto: u32,
     ) -> (AccountSession, Actions) {
-        let (sync, first) = AccountSync::start(&signed, info.id, memory, share);
+        let right = may_share_history(proto, true, Some(&info.scopes));
+        let (mut sync, first) = AccountSync::start(&signed, info.id, memory, switch && right);
+        sync.set_protocol(proto);
         let signed_in = json!({
             "name": signed.name,
             "relay_id": hex(&signed.relay_id),
@@ -107,6 +215,9 @@ impl AccountSession {
         });
         let s = AccountSession {
             sync,
+            proto,
+            switch,
+            right,
             me: info.id,
             relay_id: signed.relay_id,
             dek: Zeroizing::new(signed.vault.dek()),
@@ -119,11 +230,16 @@ impl AccountSession {
             roster: HashMap::new(),
             tombstones: Default::default(),
             pairing: None,
+            pin_wait: Vec::new(),
+            pins_out: false,
         };
         (
             s,
             Actions {
-                emit: vec![("account-signed-in", signed_in)],
+                emit: vec![
+                    ("account-signed-in", signed_in),
+                    ("share-right", json!({ "may": right })),
+                ],
                 ..Default::default()
             },
         )
@@ -133,7 +249,8 @@ impl AccountSession {
     /// find it): what the sync asks first, then the second-factor setup a role
     /// waits for, or else remembering this device.
     pub fn after_connect(&mut self) -> Actions {
-        let mut a = Actions::sending(std::mem::take(&mut self.first));
+        let mut a = Actions::sending(self.sync.pins_first());
+        a.send.append(&mut self.first);
         if self.needs_2fa {
             a.send
                 .push(ClientMessage::Account(AccountRequest::TotpSetup));
@@ -148,6 +265,16 @@ impl AccountSession {
         let (send, events) = self.sync.tick();
         let mut a = Actions::sending(send);
         self.events(events, &mut a);
+        self.pins_came_in(&mut a);
+        // A relay gone quiet must neither hold a question up nor bar the next one
+        let now = crate::time::now_millis();
+        if let Some(p) = self
+            .pairing
+            .take_if(|p| now.saturating_sub(p.since) > PAIR_EXPIRY_MS)
+        {
+            a.send.push(pair_declined(p.pair));
+            a.emit.push(p.ended());
+        }
         a
     }
 
@@ -161,26 +288,87 @@ impl AccountSession {
         a.send.push(ask);
     }
 
-    /// The person's answer to `account-pair-ask`. Only after they compared the
-    /// codes does the vault's key leave this device, and only to the key that
-    /// was committed to before this device's nonce was known.
-    pub fn pair_answer(&mut self, pair: u64, yes: bool) -> Actions {
-        let Some(p) = self.pairing.take_if(|p| p.pair == pair) else {
+    /// The person agreed to look at `account-pair-look`. Only now does anything go
+    /// out: a fresh key, which the relay could not know when the new device committed.
+    pub fn pair_look(&mut self, pair: u64) -> Actions {
+        let Some(p) = self
+            .pairing
+            .as_mut()
+            .filter(|p| p.pair == pair && p.key.is_none())
+        else {
             return Actions::default();
         };
-        let wrapped = p.ephemeral.as_ref().filter(|_| yes).and_then(|ephemeral| {
-            crate::pair::wrap_dek(
-                ephemeral,
-                &self.dek,
-                &self.relay_id,
-                &self.name,
-                &p.commitment,
-            )
-        });
-        Actions::sending(vec![ClientMessage::Account(match wrapped {
-            Some(wrapped) => AccountRequest::PairApprove { pair, wrapped },
-            None => AccountRequest::PairDecline { pair },
+        let (own, nonce) = crate::pair::answer_key();
+        p.key = Some((own, nonce.clone()));
+        p.since = crate::time::now_millis();
+        Actions::sending(vec![ClientMessage::Account(AccountRequest::PairNonce {
+            pair,
+            nonce,
         })])
+    }
+
+    /// The person said no, at either question.
+    pub fn pair_decline(&mut self, pair: u64) -> Actions {
+        match self.pairing.take_if(|p| p.pair == pair) {
+            Some(_) => Actions::sending(vec![pair_declined(pair)]),
+            None => Actions::default(),
+        }
+    }
+
+    /// What the person typed at `account-pair-ask`. The vault's key leaves this
+    /// device only if it is the code worked out here, and only to the key that was
+    /// committed to before this device's key was known. A wrong one costs a retry,
+    /// and past those this device says no and warns: someone may be in between.
+    pub fn pair_answer(&mut self, pair: u64, typed: &str) -> Actions {
+        let Some(p) = self.pairing.as_mut().filter(|p| p.pair == pair) else {
+            return Actions::default();
+        };
+        let (Some((own, answer)), Some(ephemeral)) = (&p.key, &p.ephemeral) else {
+            return Actions::default();
+        };
+        let typed = typed.trim().replace(' ', "");
+        if typed != crate::pair::code(&p.commitment, answer, ephemeral) {
+            p.wrong += 1;
+            if p.wrong <= PAIR_RETRIES {
+                let left = PAIR_RETRIES + 1 - p.wrong;
+                return Actions {
+                    emit: vec![(
+                        "account-pair-ask",
+                        json!({ "pair": pair, "left": left, "retry": true }),
+                    )],
+                    ..Default::default()
+                };
+            }
+            self.pairing = None;
+            return Actions {
+                send: vec![pair_declined(pair)],
+                emit: vec![("account-pair-ended", json!({ "pair": pair, "wrong": true }))],
+                ..Default::default()
+            };
+        }
+        let wrapped = crate::pair::wrap_dek(
+            own,
+            ephemeral,
+            &self.dek,
+            &self.relay_id,
+            &self.name,
+            &p.commitment,
+        );
+        self.pairing = None;
+        match wrapped {
+            Some(wrapped) => Actions {
+                send: vec![ClientMessage::Account(AccountRequest::PairApprove {
+                    pair,
+                    wrapped,
+                })],
+                emit: vec![(
+                    "account-pair-ended",
+                    json!({ "pair": pair, "handed": true }),
+                )],
+                ..Default::default()
+            },
+            None => Actions::sending(vec![pair_declined(pair)]),
+        }
     }
 
     /// The pairing replies. `None`: not one.
@@ -189,48 +377,68 @@ impl AccountSession {
             AccountReply::PairAsked { pair, commitment } => {
                 // One at a time: the person is looking at the first.
                 if self.pairing.is_some() {
-                    return Some(Actions::sending(vec![ClientMessage::Account(
-                        AccountRequest::PairDecline { pair: *pair },
-                    )]));
+                    return Some(Actions::sending(vec![pair_declined(*pair)]));
                 }
-                let nonce = crate::aead::random::<{ crate::pair::NONCE_LEN }>().to_vec();
+                let now = crate::time::now_millis();
+                match spend_pair_ask(self.relay_id, now) {
+                    PairBudget::Ask => {}
+                    PairBudget::SpentNow => {
+                        return Some(Actions {
+                            send: vec![pair_declined(*pair)],
+                            emit: vec![("account-pair-limit", json!({}))],
+                            ..Default::default()
+                        })
+                    }
+                    PairBudget::Spent => return Some(Actions::sending(vec![pair_declined(*pair)])),
+                }
                 self.pairing = Some(Pairing {
                     pair: *pair,
                     commitment: commitment.clone(),
-                    nonce: nonce.clone(),
+                    key: None,
                     ephemeral: None,
+                    wrong: 0,
+                    since: now,
                 });
-                Some(Actions::sending(vec![ClientMessage::Account(
-                    AccountRequest::PairNonce { pair: *pair, nonce },
-                )]))
+                Some(Actions {
+                    emit: vec![("account-pair-look", json!({ "pair": pair }))],
+                    ..Default::default()
+                })
             }
             AccountReply::PairRevealed {
                 pair,
                 ephemeral,
                 blind,
             } => {
-                let p = self.pairing.as_mut().filter(|p| p.pair == *pair)?;
+                // Not before the look, and not twice: that would change the code
+                let p = self
+                    .pairing
+                    .as_mut()
+                    .filter(|p| p.pair == *pair && p.key.is_some() && p.ephemeral.is_none())?;
                 if !crate::pair::reveal_ok(&p.commitment, ephemeral, blind) {
                     // Not the key it committed to: somebody is in the middle.
+                    let ended = p.ended();
                     self.pairing = None;
-                    return Some(Actions::sending(vec![ClientMessage::Account(
-                        AccountRequest::PairDecline { pair: *pair },
-                    )]));
+                    return Some(Actions {
+                        send: vec![pair_declined(*pair)],
+                        emit: vec![ended],
+                        ..Default::default()
+                    });
                 }
-                let code = crate::pair::code(&p.commitment, &p.nonce, ephemeral);
                 p.ephemeral = Some(ephemeral.clone());
+                p.since = crate::time::now_millis();
+                let left = PAIR_RETRIES + 1;
                 Some(Actions {
                     emit: vec![(
                         "account-pair-ask",
-                        serde_json::json!({ "pair": pair, "code": code }),
+                        json!({ "pair": pair, "left": left, "retry": false }),
                     )],
                     ..Default::default()
                 })
             }
             AccountReply::PairEnded { pair } => {
-                self.pairing.take_if(|p| p.pair == *pair)?;
+                let p = self.pairing.take_if(|p| p.pair == *pair)?;
                 Some(Actions {
-                    emit: vec![("account-pair-ended", serde_json::json!({ "pair": pair }))],
+                    emit: vec![p.ended()],
                     ..Default::default()
                 })
             }
@@ -295,6 +503,7 @@ impl AccountSession {
         if let Some((send, events)) = self.sync.on_reply(reply) {
             let mut a = Actions::sending(send);
             self.events(events, &mut a);
+            self.pins_came_in(&mut a);
             return a;
         }
         let mut a = Actions::default();
@@ -331,6 +540,17 @@ impl AccountSession {
                 if !info.needs_2fa && self.password_based && !self.remembered {
                     self.start_enrol(&mut a);
                 }
+                let right = may_share_history(self.proto, true, Some(&info.scopes));
+                if right != self.right {
+                    self.right = right;
+                    self.sync.set_share(self.switch && right);
+                    a.emit.push(("share-right", json!({ "may": right })));
+                    // The relay clears the flag by itself, and never sets it
+                    if right && self.switch {
+                        a.send
+                            .push(ClientMessage::SetHistorySharing { enabled: true });
+                    }
+                }
             }
             AccountReply::Error { request, .. } if request.starts_with("Device") => {
                 self.enrol = None
@@ -361,6 +581,81 @@ impl AccountSession {
         a
     }
 
+    /// The pages are in: the decisions that waited for them.
+    fn pins_came_in(&mut self, a: &mut Actions) {
+        if self.pin_wait.is_empty() || !self.sync.pins_in() {
+            return;
+        }
+        for wait in std::mem::take(&mut self.pin_wait) {
+            a.absorb(match wait {
+                PinWait::Identity(user_id, key) => self.check_identity(user_id, &key),
+                PinWait::Guest(user_id, name) => self.note_person(user_id, None, &name),
+            });
+        }
+    }
+
+    /// Takes over what an earlier connection of this account kept (`keep_pins`), before the
+    /// host asks `pins_in`.
+    pub fn adopt_pins(&mut self, kept: KeptPins) {
+        self.sync.adopt_pins(kept);
+    }
+
+    /// What this connection hands the next, in memory: an app that stays up reads again only
+    /// the pages whose generation moved.
+    pub fn keep_pins(&self) -> Option<KeptPins> {
+        self.sync.keep_pins()
+    }
+
+    /// Whether the pages of pins are in. If not, the host holds the live path's key jobs,
+    /// and asks `take_pins_in` after each reply.
+    pub fn pins_in(&mut self) -> bool {
+        let pins_in = self.sync.pins_in();
+        self.pins_out |= !pins_in;
+        pins_in
+    }
+
+    /// `true` once, when pages that were out have come in: the key jobs go on.
+    pub fn take_pins_in(&mut self) -> bool {
+        self.sync.pins_in() && std::mem::take(&mut self.pins_out)
+    }
+
+    /// Whatever pins were not saved yet, now: the person is leaving (`AccountSync::flush_pins`).
+    pub fn flush_pins(&mut self) -> Actions {
+        Actions::sending(self.sync.flush_pins())
+    }
+
+    /// Whether all of that is stored: a sign-out waits a moment for it.
+    pub fn pins_saved(&self) -> bool {
+        self.sync.pins_saved()
+    }
+
+    /// A direct message came from `user_id`: their pin keeps the half open channels cannot fill.
+    pub fn note_direct(&mut self, user_id: u32) {
+        if let Some((account, _)) = self.roster.get(&user_id) {
+            self.sync.reserve_pin(*account);
+        }
+    }
+
+    /// Accounts met in a gated channel: the same.
+    pub fn note_gated_people(&mut self, accounts: &[[u8; 16]]) {
+        for account in accounts {
+            self.sync.reserve_pin(*account);
+        }
+    }
+
+    /// A channel log with a gate: who is met in it counts as in `note_gated_people`.
+    pub fn note_gated_log(&mut self, conv: &str) {
+        self.sync.note_gated_log(conv);
+    }
+
+    /// The person opened `user_id`'s safety number: their pin is kept, and goes now.
+    pub fn verified(&mut self, user_id: u32) -> Actions {
+        match self.roster.get(&user_id) {
+            Some((account, _)) => Actions::sending(self.sync.verified_pin(*account)),
+            None => Actions::default(),
+        }
+    }
+
     fn events(&mut self, events: Vec<Event>, a: &mut Actions) {
         let mut read = self.sync.take_memory_changed();
         for e in events {
@@ -376,6 +671,7 @@ impl AccountSession {
         }
         if read {
             a.memory = Some((self.memory_key(), self.sync.memory()));
+            a.memory_named = self.sync.take_named_changed();
         }
     }
 
@@ -410,25 +706,57 @@ impl AccountSession {
     pub fn note_roster(&mut self, users: &[UserInfo]) -> Actions {
         let mut a = Actions::default();
         for u in users {
-            match u.account {
-                Some(account) => {
-                    self.roster.insert(u.user_id, (account, u.username.clone()));
-                }
-                None if self.sync.knows_name(&u.username) => {
-                    a.emit.push((
-                        "identity-key-changed",
-                        json!({ "user_id": u.user_id, "name": u.username, "as_guest": true }),
-                    ));
-                }
-                None => {}
-            }
+            a.emit
+                .extend(self.note_person(u.user_id, u.account, &u.username).emit);
         }
         a
+    }
+
+    /// One person, as a row of a roster does: on the live path a post, a session ask or
+    /// `KeysOwed` may be the first anyone says of them, and an id off the roster goes
+    /// unchecked against the pins.
+    pub fn note_person(&mut self, user_id: u32, account: Option<[u8; 16]>, name: &str) -> Actions {
+        let mut a = Actions::default();
+        match account {
+            Some(account) => {
+                self.roster.insert(user_id, (account, name.to_string()));
+            }
+            None if !self.sync.pins_in() => {
+                if self.pin_wait.len() < PIN_WAIT_MOST {
+                    self.pin_wait
+                        .push(PinWait::Guest(user_id, name.to_string()));
+                }
+            }
+            None if self.sync.knows_name(name) => {
+                a.emit.push((
+                    "identity-key-changed",
+                    json!({ "user_id": user_id, "name": name, "as_guest": true }),
+                ));
+            }
+            None => {}
+        }
+        a
+    }
+
+    /// The account signed in on this connection: what its kept sessions go by, with the server.
+    pub fn account_id(&self) -> [u8; 16] {
+        self.me
+    }
+
+    /// The account the rosters say `user_id` is.
+    pub fn account_of(&self, user_id: u32) -> Option<[u8; 16]> {
+        self.roster.get(&user_id).map(|(account, _)| *account)
     }
 
     /// An identity `user_id` showed — in a pre-key bundle, or in a session
     /// they opened (`VoipcIdentityStore::take_seen`) — against the pins.
     pub fn check_identity(&mut self, user_id: u32, key: &[u8]) -> Actions {
+        if !self.sync.pins_in() {
+            if self.pin_wait.len() < PIN_WAIT_MOST {
+                self.pin_wait.push(PinWait::Identity(user_id, key.to_vec()));
+            }
+            return Actions::default();
+        }
         let Some((account, name)) = self.roster.get(&user_id).cloned() else {
             return Actions::default();
         };
@@ -449,9 +777,10 @@ impl AccountSession {
         sent_at: u64,
         ttl_secs: Option<u32>,
     ) -> Actions {
-        match self.roster.get(&user_id) {
-            Some((peer, _)) => {
-                Actions::sending(self.sync.send_dm(*peer, envelope, sent_at, ttl_secs))
+        match self.roster.get(&user_id).map(|(peer, _)| *peer) {
+            Some(peer) => {
+                self.sync.reserve_pin(peer);
+                Actions::sending(self.sync.send_dm(peer, envelope, sent_at, ttl_secs))
             }
             None => Actions::default(),
         }
@@ -509,6 +838,22 @@ impl AccountSession {
         Actions::sending(self.sync.enter(conv))
     }
 
+    /// A channel that slept came on screen: read what was kept meanwhile.
+    pub fn read_now(&mut self, conv: &str) -> Actions {
+        Actions::sending(self.sync.read_now(conv))
+    }
+
+    /// In these channels' logs, newly followed: keep them in one frame, and read them.
+    pub fn enter_many(&mut self, convs: &[String]) -> Actions {
+        Actions::sending(self.sync.enter_many(convs))
+    }
+
+    /// `user_id` left channel log `conv`, or was put out of it (`MemberGone`).
+    pub fn member_gone(&mut self, conv: &str, user_id: u32) {
+        let account = self.roster.get(&user_id).map(|(account, _)| *account);
+        self.sync.member_gone(conv, account);
+    }
+
     /// Whether a direct message to `user_id` that did not arrive is kept for
     /// them all the same (`DirectMessageUndelivered`).
     /// Out of channel log `conv` (`AccountSync::leave`).
@@ -533,6 +878,9 @@ impl AccountSession {
             .roster
             .get(&user_id)
             .ok_or("They are not signed in to an account")?;
+        if !self.sync.pins_in() {
+            return Err("Still reading who you have met here. Try again in a moment.".into());
+        }
         let pinned = self
             .sync
             .pinned(peer)
@@ -665,8 +1013,15 @@ impl AccountSession {
         Ok(a)
     }
 
-    pub fn set_share(&mut self, share: bool) {
-        self.sync.set_share(share);
+    /// The device's switch moved.
+    pub fn set_share(&mut self, switch: bool) {
+        self.switch = switch;
+        self.sync.set_share(switch && self.right);
+    }
+
+    /// Whether the switch counts on this connection.
+    pub fn may_share(&self) -> bool {
+        self.right
     }
 
     /// Where the host keeps `Actions::memory` (and finds it for `start`).
@@ -720,28 +1075,116 @@ mod tests {
             LogMemory::default(),
             false,
             password_based,
+            voipc_protocol::codec::PROTOCOL_VERSION,
         )
     }
 
-    /// This device's side of a pairing, from the ask to the wrapped key.
-    fn asked(s: &mut AccountSession, new: &crate::pair::PairRequest) -> Vec<u8> {
-        let a = s.on_reply(&AccountReply::PairAsked {
-            pair: 5,
-            commitment: new.commitment().to_vec(),
-        });
-        let [ClientMessage::Account(AccountRequest::PairNonce { pair: 5, nonce })] = &a.send[..]
-        else {
-            panic!("no nonce: {:?}", a.send)
+    /// A session on a relay of its own: the ask budget goes by relay, for the whole run.
+    fn fresh() -> AccountSession {
+        let relay = crate::aead::random::<16>();
+        let signed = SignedIn {
+            relay_id: relay,
+            name: "me".into(),
+            vault: Vault::create(relay, "me"),
+            identity: IdentityKeyPair::generate(&mut crate::rng()),
+            recovery: None,
+            blobs: Vec::new(),
         };
-        assert!(a.emit.is_empty(), "nothing to ask the person yet");
+        AccountSession::start(
+            signed,
+            &info(false),
+            LogMemory::default(),
+            false,
+            true,
+            voipc_protocol::codec::PROTOCOL_VERSION,
+        )
+        .0
+    }
+
+    fn asked_msg(pair: u64, new: &crate::pair::PairRequest) -> AccountReply {
+        AccountReply::PairAsked {
+            pair,
+            commitment: new.commitment().to_vec(),
+        }
+    }
+
+    /// Up to the person's yes to looking: the key that went out.
+    fn looked(s: &mut AccountSession, pair: u64, new: &crate::pair::PairRequest) -> Vec<u8> {
+        s.on_reply(&asked_msg(pair, new));
+        let a = s.pair_look(pair);
+        let [ClientMessage::Account(AccountRequest::PairNonce { nonce, .. })] = &a.send[..] else {
+            panic!("no answer: {:?}", a.send)
+        };
         nonce.clone()
     }
 
+    /// Up to the prompt that wants the code typed: the code the new device shows.
+    fn at_the_code(
+        s: &mut AccountSession,
+        pair: u64,
+        new: &mut crate::pair::PairRequest,
+    ) -> String {
+        let raw = looked(s, pair, new);
+        let shown = new.take_answer(&raw).unwrap();
+        let (ephemeral, blind) = new.reveal();
+        let a = s.on_reply(&AccountReply::PairRevealed {
+            pair,
+            ephemeral,
+            blind,
+        });
+        assert!(a.send.is_empty(), "nothing leaves before the person types");
+        assert_eq!(a.emit[0].0, "account-pair-ask");
+        shown
+    }
+
+    fn declined(a: &Actions, pair: u64) -> bool {
+        matches!(&a.send[..], [ClientMessage::Account(AccountRequest::PairDecline { pair: p })] if *p == pair)
+    }
+
+    /// W1-8: an answer that goes out unseen lets a relay retry until a code matches.
     #[test]
-    fn the_vault_key_goes_only_to_the_committed_key_and_only_on_a_yes() {
-        let (mut s, _) = session(true, false);
+    fn no_answer_leaves_before_the_person_agrees_to_look() {
+        let mut s = fresh();
         let new = crate::pair::PairRequest::new();
-        let nonce = asked(&mut s, &new);
+        let a = s.on_reply(&asked_msg(5, &new));
+        assert!(
+            a.send.is_empty(),
+            "sent before the person agreed: {:?}",
+            a.send
+        );
+        assert_eq!(a.emit[0].0, "account-pair-look");
+        assert_eq!(a.emit[0].1["pair"], 5);
+        let a = s.pair_look(5);
+        assert!(
+            matches!(
+                &a.send[..],
+                [ClientMessage::Account(AccountRequest::PairNonce {
+                    pair: 5,
+                    ..
+                })]
+            ),
+            "{:?}",
+            a.send
+        );
+        assert!(s.pair_look(5).send.is_empty(), "one answer per ask");
+        assert!(s.pair_look(6).send.is_empty(), "and only to this ask");
+    }
+
+    #[test]
+    fn a_no_to_looking_declines() {
+        let mut s = fresh();
+        let new = crate::pair::PairRequest::new();
+        s.on_reply(&asked_msg(5, &new));
+        assert!(declined(&s.pair_decline(5), 5));
+        assert!(s.pair_look(5).send.is_empty(), "it is over");
+        assert!(s.pair_decline(5).send.is_empty());
+    }
+
+    #[test]
+    fn a_reveal_before_the_look_shows_nothing() {
+        let mut s = fresh();
+        let new = crate::pair::PairRequest::new();
+        s.on_reply(&asked_msg(5, &new));
         let (ephemeral, blind) = new.reveal();
         let a = s.on_reply(&AccountReply::PairRevealed {
             pair: 5,
@@ -749,82 +1192,361 @@ mod tests {
             blind,
         });
         assert!(
-            a.send.is_empty(),
-            "nothing leaves before the person says so"
+            !a.emit.iter().any(|(n, _)| *n == "account-pair-ask"),
+            "asked"
         );
+        assert!(a.send.is_empty());
+    }
+
+    /// The old device never shows the code: a stale or fake prompt has nothing to agree to.
+    #[test]
+    fn the_old_device_asks_for_the_code_and_does_not_show_it() {
+        let mut s = fresh();
+        let mut new = crate::pair::PairRequest::new();
+        let raw = looked(&mut s, 5, &new);
+        let shown = new.take_answer(&raw).unwrap();
+        let (ephemeral, blind) = new.reveal();
+        let a = s.on_reply(&AccountReply::PairRevealed {
+            pair: 5,
+            ephemeral,
+            blind,
+        });
         let (name, payload) = &a.emit[0];
         assert_eq!(*name, "account-pair-ask");
-        assert_eq!(
-            payload["code"],
-            new.code(&nonce),
-            "both devices show the same"
+        assert!(
+            !payload.to_string().contains(&shown),
+            "the code is on the old device's screen: {payload}"
         );
+    }
 
-        let a = s.pair_answer(5, true);
+    #[test]
+    fn the_vault_key_goes_only_on_the_code_the_new_device_shows() {
+        let mut s = fresh();
+        let mut new = crate::pair::PairRequest::new();
+        let shown = at_the_code(&mut s, 5, &mut new);
+        let wrong = if shown == "000000" {
+            "000001"
+        } else {
+            "000000"
+        };
+        let a = s.pair_answer(5, wrong);
+        assert!(
+            a.send.is_empty(),
+            "a wrong code handed something over: {:?}",
+            a.send
+        );
+        // Spaces are no typo
+        let a = s.pair_answer(5, &format!(" {} {} ", &shown[..3], &shown[3..]));
         let [ClientMessage::Account(AccountRequest::PairApprove { pair: 5, wrapped })] =
             &a.send[..]
         else {
             panic!("no key: {:?}", a.send)
         };
-        assert_eq!(new.open(wrapped, &RELAY, "me"), Some(*s.dek));
-        assert!(s.pair_answer(5, true).send.is_empty(), "answered once");
+        assert_eq!(new.open(wrapped, &s.relay_id, "me"), Some(*s.dek));
+        assert!(s.pair_answer(5, &shown).send.is_empty(), "answered once");
     }
 
+    /// W1-3: the code covers this key, so the wrap has to come from it.
     #[test]
-    fn a_no_or_a_swapped_key_hands_nothing_over() {
-        let (mut s, _) = session(true, false);
-        let new = crate::pair::PairRequest::new();
-        asked(&mut s, &new);
+    fn the_wrap_comes_from_the_key_that_answered() {
+        let mut s = fresh();
+        let mut new = crate::pair::PairRequest::new();
+        let raw = looked(&mut s, 5, &new);
+        let shown = new.take_answer(&raw).unwrap();
         let (ephemeral, blind) = new.reveal();
         s.on_reply(&AccountReply::PairRevealed {
             pair: 5,
             ephemeral,
             blind,
         });
-        let a = s.pair_answer(5, false);
+        let a = s.pair_answer(5, &shown);
+        let [ClientMessage::Account(AccountRequest::PairApprove { wrapped, .. })] = &a.send[..]
+        else {
+            panic!("no key: {:?}", a.send)
+        };
+        assert_eq!(&wrapped[1..33], &raw[..]);
+    }
+
+    /// The owner's rule: a typo may be retried three times, and then it says no
+    /// and warns, with nothing handed over.
+    #[test]
+    fn three_retries_of_a_wrong_code_then_it_declines_and_warns() {
+        let mut s = fresh();
+        let mut new = crate::pair::PairRequest::new();
+        let shown = at_the_code(&mut s, 5, &mut new);
+        let wrong = if shown == "000000" {
+            "000001"
+        } else {
+            "000000"
+        };
+        for left in [3, 2, 1] {
+            let a = s.pair_answer(5, wrong);
+            assert!(a.send.is_empty(), "{:?}", a.send);
+            assert_eq!(a.emit[0].0, "account-pair-ask", "asked again");
+            assert_eq!(a.emit[0].1["left"], left);
+            assert_eq!(a.emit[0].1["pair"], 5);
+        }
+        let a = s.pair_answer(5, wrong);
+        assert!(declined(&a, 5), "{:?}", a.send);
+        assert_eq!(a.emit[0].0, "account-pair-ended");
+        assert_eq!(a.emit[0].1["wrong"], true, "the person is warned");
+        assert!(
+            s.pair_answer(5, &shown).send.is_empty(),
+            "too late for the right one"
+        );
+    }
+
+    /// The control for the rule above: the last retry can still be the right code.
+    #[test]
+    fn the_right_code_on_the_last_retry_still_counts() {
+        let mut s = fresh();
+        let mut new = crate::pair::PairRequest::new();
+        let shown = at_the_code(&mut s, 5, &mut new);
+        let wrong = if shown == "000000" {
+            "000001"
+        } else {
+            "000000"
+        };
+        for _ in 0..3 {
+            s.pair_answer(5, wrong);
+        }
+        let a = s.pair_answer(5, &shown);
         assert!(matches!(
             &a.send[..],
-            [ClientMessage::Account(AccountRequest::PairDecline {
-                pair: 5
+            [ClientMessage::Account(AccountRequest::PairApprove {
+                pair: 5,
+                ..
             })]
         ));
+        assert_eq!(a.emit[0].0, "account-pair-ended", "the prompt closes");
+        assert_eq!(a.emit[0].1["handed"], true);
+    }
 
+    #[test]
+    fn a_no_at_the_code_declines() {
+        let mut s = fresh();
+        let mut new = crate::pair::PairRequest::new();
+        at_the_code(&mut s, 5, &mut new);
+        assert!(declined(&s.pair_decline(5), 5));
+    }
+
+    /// The attack: a prompt left over from a pairing that ended, answered when a
+    /// new one holds the same id, with the relay's key behind it.
+    #[test]
+    fn a_prompt_for_an_ended_pairing_cannot_answer_the_next() {
+        let mut s = fresh();
+        let mut honest = crate::pair::PairRequest::new();
+        let shown = at_the_code(&mut s, 5, &mut honest);
+        s.on_reply(&AccountReply::PairEnded { pair: 5 });
+        let mut relays = crate::pair::PairRequest::new();
+        at_the_code(&mut s, 5, &mut relays);
+        let a = s.pair_answer(5, &shown);
+        assert!(
+            a.send.is_empty(),
+            "the new device's code opened the relay's ask: {:?}",
+            a.send
+        );
+    }
+
+    #[test]
+    fn a_swapped_key_is_declined_and_the_person_told() {
+        let mut s = fresh();
+        let new = crate::pair::PairRequest::new();
+        looked(&mut s, 5, &new);
         // A relay revealing a key of its own under the commitment it was shown
-        asked(&mut s, &new);
         let (theirs, blind) = crate::pair::PairRequest::new().reveal();
         let a = s.on_reply(&AccountReply::PairRevealed {
             pair: 5,
             ephemeral: theirs,
             blind,
         });
-        assert!(a.emit.is_empty(), "the person is not even asked");
+        assert!(declined(&a, 5), "{:?}", a.send);
+        assert_eq!(
+            a.emit[0].0, "account-pair-ended",
+            "the miss is not invisible"
+        );
+        assert_eq!(a.emit[0].1["looked"], true);
+        assert!(s.pair_answer(5, "000000").send.is_empty());
+    }
+
+    #[test]
+    fn a_second_reveal_changes_nothing() {
+        let mut s = fresh();
+        let mut new = crate::pair::PairRequest::new();
+        let shown = at_the_code(&mut s, 5, &mut new);
+        let (ephemeral, blind) = new.reveal();
+        let a = s.on_reply(&AccountReply::PairRevealed {
+            pair: 5,
+            ephemeral,
+            blind,
+        });
+        assert!(!a.emit.iter().any(|(n, _)| *n == "account-pair-ask"));
         assert!(matches!(
-            &a.send[..],
-            [ClientMessage::Account(AccountRequest::PairDecline {
-                pair: 5
-            })]
+            &s.pair_answer(5, &shown).send[..],
+            [ClientMessage::Account(AccountRequest::PairApprove { .. })]
         ));
-        assert!(s.pair_answer(5, true).send.is_empty());
     }
 
     #[test]
     fn a_second_ask_waits_its_turn_and_an_ended_one_goes() {
-        let (mut s, _) = session(true, false);
+        let mut s = fresh();
         let new = crate::pair::PairRequest::new();
-        asked(&mut s, &new);
-        let a = s.on_reply(&AccountReply::PairAsked {
-            pair: 6,
-            commitment: new.commitment().to_vec(),
-        });
-        assert!(matches!(
-            &a.send[..],
-            [ClientMessage::Account(AccountRequest::PairDecline {
-                pair: 6
-            })]
-        ));
+        looked(&mut s, 5, &new);
+        let a = s.on_reply(&asked_msg(6, &new));
+        assert!(declined(&a, 6), "{:?}", a.send);
+        assert!(a.emit.is_empty(), "no prompt for it");
         let a = s.on_reply(&AccountReply::PairEnded { pair: 5 });
         assert_eq!(a.emit[0].0, "account-pair-ended");
-        asked(&mut s, &new);
+        assert_eq!(
+            a.emit[0].1["looked"], true,
+            "a key was out and no code followed"
+        );
+        looked(&mut s, 7, &new);
+    }
+
+    #[test]
+    fn an_ask_that_ends_unlooked_warns_of_nothing() {
+        let mut s = fresh();
+        let new = crate::pair::PairRequest::new();
+        s.on_reply(&asked_msg(5, &new));
+        let a = s.on_reply(&AccountReply::PairEnded { pair: 5 });
+        assert_eq!(a.emit[0].1["looked"], false, "nothing was out");
+        assert_eq!(a.emit[0].1["typing"], false);
+    }
+
+    /// A relay can take the field away just as it asks the new device whether the code
+    /// took: going quietly, that looks like the code being taken. So it is said.
+    #[test]
+    fn an_ask_that_ends_at_the_code_says_nothing_was_handed_over() {
+        let mut s = fresh();
+        let mut new = crate::pair::PairRequest::new();
+        at_the_code(&mut s, 6, &mut new);
+        let a = s.on_reply(&AccountReply::PairEnded { pair: 6 });
+        assert_eq!(a.emit[0].0, "account-pair-ended");
+        assert_eq!(a.emit[0].1["looked"], false, "the code came");
+        assert_eq!(a.emit[0].1["typing"], true);
+        // And the same when nobody ended it
+        let mut new = crate::pair::PairRequest::new();
+        at_the_code(&mut s, 7, &mut new);
+        s.pairing.as_mut().unwrap().since -= PAIR_EXPIRY_MS + 1;
+        let a = s.tick();
+        let (_, ended) = a
+            .emit
+            .iter()
+            .find(|(n, _)| *n == "account-pair-ended")
+            .expect("it never expired");
+        assert_eq!(ended["typing"], true);
+    }
+
+    /// The control: the honest end of a pairing brings no such warning.
+    #[test]
+    fn a_handed_key_is_no_ask_ended_at_the_code() {
+        let mut s = fresh();
+        let mut new = crate::pair::PairRequest::new();
+        let shown = at_the_code(&mut s, 6, &mut new);
+        let a = s.pair_answer(6, &shown);
+        assert_eq!(a.emit[0].1["handed"], true);
+        assert!(a.emit[0].1["typing"].is_null());
+        // The relay's own `PairEnded` follows it, and has nothing left to end
+        let a = s.on_reply(&AccountReply::PairEnded { pair: 6 });
+        assert!(!a.emit.iter().any(|(n, _)| *n == "account-pair-ended"));
+    }
+
+    /// "Asking again after a death fails within a second": an ask whose new device
+    /// died with no `PairEnded` kept the next one declined, for good.
+    #[test]
+    fn an_ask_nobody_ended_goes_from_tick_and_the_next_is_heard() {
+        let mut s = fresh();
+        let new = crate::pair::PairRequest::new();
+        s.on_reply(&asked_msg(5, &new));
+        assert!(
+            !s.tick()
+                .emit
+                .iter()
+                .any(|(n, _)| *n == "account-pair-ended"),
+            "not yet"
+        );
+        assert!(declined(&s.on_reply(&asked_msg(6, &new)), 6), "still open");
+        s.pairing.as_mut().unwrap().since -= PAIR_EXPIRY_MS + 1;
+        let a = s.tick();
+        let (_, ended) = a
+            .emit
+            .iter()
+            .find(|(n, _)| *n == "account-pair-ended")
+            .expect("it never expired");
+        assert_eq!(ended["pair"], 5);
+        assert_eq!(ended["looked"], false);
+        let a = s.on_reply(&asked_msg(7, &new));
+        assert_eq!(
+            a.emit[0].0, "account-pair-look",
+            "the next ask reaches the person"
+        );
+    }
+
+    /// A key out with no reveal behind it: someone may be trying codes. It must
+    /// not go unseen when the relay simply stays silent.
+    #[test]
+    fn a_look_held_with_no_reveal_expires_and_warns() {
+        let mut s = fresh();
+        let new = crate::pair::PairRequest::new();
+        looked(&mut s, 5, &new);
+        s.pairing.as_mut().unwrap().since -= PAIR_EXPIRY_MS + 1;
+        let a = s.tick();
+        let (_, ended) = a
+            .emit
+            .iter()
+            .find(|(n, _)| *n == "account-pair-ended")
+            .expect("it never expired");
+        assert_eq!(ended["looked"], true);
+    }
+
+    /// The relay's limit binds an honest relay only. Past this one a hostile relay
+    /// gets a no and no prompt, so the window stays usable.
+    #[test]
+    fn asks_past_the_budget_are_declined_with_one_notice() {
+        let mut s = fresh();
+        let new = crate::pair::PairRequest::new();
+        for pair in 1..=3 {
+            let a = s.on_reply(&asked_msg(pair, &new));
+            assert_eq!(a.emit[0].0, "account-pair-look", "ask {pair}");
+            assert!(declined(&s.pair_decline(pair), pair));
+        }
+        let a = s.on_reply(&asked_msg(4, &new));
+        assert!(declined(&a, 4), "{:?}", a.send);
+        assert_eq!(a.emit.len(), 1, "one notice");
+        assert_eq!(a.emit[0].0, "account-pair-limit");
+        let a = s.on_reply(&asked_msg(5, &new));
+        assert!(declined(&a, 5));
+        assert!(a.emit.is_empty(), "and only one");
+        assert!(s.pair_look(5).send.is_empty(), "no prompt stands behind it");
+    }
+
+    /// Per relay and past a reconnect, with its own clock: a new session is no new budget.
+    #[test]
+    fn the_budget_outlives_the_connection_and_refills_one_per_ten_minutes() {
+        let relay = crate::aead::random::<16>();
+        let t = 1_000_000_000_000u64;
+        for _ in 0..3 {
+            assert_eq!(spend_pair_ask(relay, t), PairBudget::Ask);
+        }
+        assert_eq!(spend_pair_ask(relay, t), PairBudget::SpentNow);
+        assert_eq!(spend_pair_ask(relay, t + 1), PairBudget::Spent);
+        assert_eq!(
+            spend_pair_ask(relay, t + 599_000),
+            PairBudget::Spent,
+            "not yet"
+        );
+        assert_eq!(
+            spend_pair_ask(relay, t + 601_000),
+            PairBudget::Ask,
+            "one back"
+        );
+        assert_eq!(spend_pair_ask(relay, t + 601_001), PairBudget::SpentNow);
+        assert_eq!(
+            spend_pair_ask(crate::aead::random::<16>(), t),
+            PairBudget::Ask,
+            "another relay has its own"
+        );
     }
 
     fn sends(a: &Actions, what: &str) -> usize {
@@ -850,6 +1572,215 @@ mod tests {
             is_moderator: false,
             badges: vec![],
         }
+    }
+
+    // ── Sharing with joiners: the switch and the right, on a real `AccountSync` ──
+
+    const SHARE: &str = voipc_protocol::types::SHARE_HISTORY;
+
+    fn held(scopes: &[&str]) -> AccountInfo {
+        AccountInfo {
+            scopes: scopes.iter().map(|s| s.to_string()).collect(),
+            ..info(false)
+        }
+    }
+
+    /// A session that wrote in `CONV` under a key of its own, so it has older keys to give.
+    fn writer(switch: bool, scopes: &[&str], proto: u32) -> (AccountSession, Actions) {
+        let relay = crate::aead::random::<16>();
+        let vault = Vault::create(relay, "me");
+        let logkey = crate::log::LogKey::generate();
+        let blobs = vec![voipc_protocol::types::VaultBlob {
+            version: 1,
+            ..vault.seal_item(crate::sync::ITEM_LOGKEY, 1, &logkey.to_bytes())
+        }];
+        let signed = SignedIn {
+            relay_id: relay,
+            name: "me".into(),
+            vault,
+            identity: IdentityKeyPair::generate(&mut crate::rng()),
+            recovery: None,
+            blobs,
+        };
+        let (mut s, started) = AccountSession::start(
+            signed,
+            &held(scopes),
+            LogMemory::default(),
+            switch,
+            true,
+            proto,
+        );
+        s.set_prefs(Prefs {
+            cloud: true,
+            asked: true,
+        });
+        s.on_reply(&AccountReply::LogJoined {
+            conv: CONV.to_string(),
+        });
+        s.on_reply(&AccountReply::Wraps {
+            conv: CONV.to_string(),
+            wraps: Vec::new(),
+        });
+        s.sync
+            .send_channel(CONV, crate::envelope::envelope("m", "hello", None), 1, None);
+        // Nobody else is a member yet: the key that goes out is for ourselves
+        if proto >= voipc_protocol::types::KEPT_CHAINS_SINCE {
+            s.on_reply(&AccountReply::OwnChains {
+                conv: CONV.to_string(),
+                newest: None,
+                chains: Vec::new(),
+                more: false,
+            });
+            s.on_reply(&AccountReply::OwnBuckets {
+                conv: CONV.to_string(),
+                buckets: Vec::new(),
+                more: false,
+            });
+            s.on_reply(&AccountReply::LogMemberIdsFound {
+                conv: CONV.to_string(),
+                ids: Vec::new(),
+                more: false,
+            });
+            s.on_reply(&AccountReply::ChainStored {
+                conv: CONV.to_string(),
+                epoch: 1 << 12,
+                behind: false,
+            });
+        } else {
+            s.on_reply(&AccountReply::LogMembersFound {
+                conv: CONV.to_string(),
+                members: Vec::new(),
+            });
+        }
+        (s, started)
+    }
+
+    const CONV: &str = "c:1";
+
+    /// Someone joins the channel's log: does this writer hand over its older keys?
+    fn gives_older_keys(s: &mut AccountSession) -> bool {
+        let identity = IdentityKeyPair::generate(&mut crate::rng());
+        let logkey = crate::log::LogKey::generate();
+        let joiner = [0x55; 16];
+        s.on_reply(&AccountReply::LogPending {
+            conv: CONV.to_string(),
+            joiners: vec![joiner],
+        });
+        let a = s.on_reply(&AccountReply::LogKeysFound {
+            keys: vec![voipc_protocol::messages::LogKeyInfo {
+                account: joiner,
+                name: "newcomer".into(),
+                identity: identity.public_key().serialize().to_vec(),
+                logkey: logkey.public(),
+                sig: logkey.endorse(&identity),
+            }],
+        });
+        let put = |m: &ClientMessage, older: bool| {
+            matches!(
+                m,
+                ClientMessage::Account(AccountRequest::ChainPut { step, wraps, .. })
+                    if !wraps.is_empty() && step.is_none() == older
+            )
+        };
+        let given = sends(&a, "EpochPut") > 0 || a.send.iter().any(|m| put(m, true));
+        assert!(
+            given || sends(&a, "LogMembers") > 0 || a.send.iter().any(|m| put(m, false)),
+            "the control: it did answer, with a new key or a fresh step: {:?}",
+            a.send
+        );
+        given
+    }
+
+    fn told_right(a: &Actions) -> Vec<bool> {
+        a.emit
+            .iter()
+            .filter(|(n, _)| *n == "share-right")
+            .map(|(_, v)| v["may"].as_bool().unwrap())
+            .collect()
+    }
+
+    fn flag_sent(a: &Actions) -> Vec<bool> {
+        a.send
+            .iter()
+            .filter_map(|m| match m {
+                ClientMessage::SetHistorySharing { enabled } => Some(*enabled),
+                _ => None,
+            })
+            .collect()
+    }
+
+    const NOW: u32 = voipc_protocol::types::SHARE_HISTORY_SINCE;
+
+    #[test]
+    fn older_keys_go_by_switch_and_right() {
+        for (switch, scopes, want) in [
+            (true, &[SHARE][..], true),
+            (true, &["*"], true),
+            (false, &[SHARE], false),
+            (true, &[], false),
+            (false, &[], false),
+        ] {
+            let (mut s, started) = writer(switch, scopes, NOW);
+            assert_eq!(gives_older_keys(&mut s), want, "{switch} {scopes:?}");
+            assert_eq!(told_right(&started), [!scopes.is_empty()], "{scopes:?}");
+        }
+    }
+
+    #[test]
+    fn losing_the_privilege_stops_older_keys_at_once() {
+        let (mut s, _) = writer(true, &[SHARE], NOW);
+        assert!(s.may_share());
+        let a = s.on_reply(&AccountReply::Info(held(&[])));
+        assert_eq!(told_right(&a), [false]);
+        assert!(flag_sent(&a).is_empty(), "the relay cleared it itself");
+        assert!(!s.may_share());
+        assert!(!gives_older_keys(&mut s));
+    }
+
+    #[test]
+    fn gaining_the_privilege_with_the_switch_on_says_so() {
+        let (mut s, _) = writer(true, &[], NOW);
+        assert!(!gives_older_keys(&mut s));
+        let (mut s, _) = writer(true, &[], NOW);
+        let a = s.on_reply(&AccountReply::Info(held(&[SHARE])));
+        assert_eq!(told_right(&a), [true]);
+        assert_eq!(flag_sent(&a), [true], "only the app ever asks for the flag");
+        assert!(gives_older_keys(&mut s));
+        let a = s.on_reply(&AccountReply::Info(held(&[SHARE])));
+        assert!(
+            told_right(&a).is_empty() && flag_sent(&a).is_empty(),
+            "no change"
+        );
+
+        // The control: with the switch off the relay hears nothing, and nothing is offered
+        let (mut s, _) = writer(false, &[], NOW);
+        let a = s.on_reply(&AccountReply::Info(held(&[SHARE])));
+        assert_eq!(told_right(&a), [true]);
+        assert!(flag_sent(&a).is_empty());
+        assert!(!gives_older_keys(&mut s));
+    }
+
+    #[test]
+    fn an_older_relay_goes_by_the_switch_alone() {
+        let (mut s, started) = writer(true, &[], NOW - 1);
+        assert_eq!(told_right(&started), [true]);
+        assert!(gives_older_keys(&mut s));
+        let (mut s, _) = writer(false, &[], NOW - 1);
+        assert!(!gives_older_keys(&mut s));
+    }
+
+    /// One server's account cannot be switched into sharing by a change meant for all.
+    #[test]
+    fn a_set_share_with_no_right_stays_off() {
+        let (mut s, _) = writer(false, &[], NOW);
+        s.set_share(true);
+        assert!(!gives_older_keys(&mut s));
+        let (mut s, _) = writer(false, &[SHARE], NOW);
+        s.set_share(true);
+        assert!(gives_older_keys(&mut s));
+        let (mut s, _) = writer(true, &[SHARE], NOW);
+        s.set_share(false);
+        assert!(!gives_older_keys(&mut s));
     }
 
     /// A conversation's tombstone goes only after the relay purged it: sent
@@ -1059,6 +1990,49 @@ mod tests {
         assert!(s.safety_number(7, &k1, None).is_err(), "not an account");
     }
 
+    /// A relay inventing an id for a pinned person, on the live path, where no roster has
+    /// to name them: the post itself feeds the check.
+    #[test]
+    fn a_post_under_a_pinned_name_with_another_key_warns() {
+        let (mut s, _) = session(false, false);
+        let (k1, k2) = (vec![1u8; 33], vec![2u8; 33]);
+        s.note_person(5, Some([5; 16]), "bob");
+        assert!(s.check_identity(5, &k1).emit.is_empty());
+        // Off the roster, an identity goes unchecked: why a first sight is checked at all
+        assert!(s.check_identity(9999, &k2).emit.is_empty());
+        s.note_person(9999, Some([5; 16]), "bob");
+        let a = s.check_identity(9999, &k2);
+        assert_eq!(a.emit.len(), 1);
+        assert_eq!(a.emit[0].0, "identity-key-changed");
+        assert_eq!(a.emit[0].1["user_id"], 9999);
+    }
+
+    #[test]
+    fn a_known_name_as_a_guest_in_a_post_warns() {
+        let (mut s, _) = session(false, false);
+        s.note_person(5, Some([5; 16]), "bob");
+        s.check_identity(5, &[1u8; 33]);
+        let a = s.note_person(9999, None, "bob");
+        assert_eq!(a.emit.len(), 1);
+        assert_eq!(a.emit[0].1["as_guest"], true);
+        // The control: a name nobody knows
+        assert!(s.note_person(9998, None, "stranger").emit.is_empty());
+    }
+
+    #[test]
+    fn a_keys_owed_target_is_checked_against_the_pins() {
+        let (mut s, _) = session(false, false);
+        let (k1, k2) = (vec![1u8; 33], vec![2u8; 33]);
+        s.note_person(5, Some([5; 16]), "bob");
+        s.check_identity(5, &k1);
+        // A hello for an id only `KeysOwed` named, as a row: noted, then checked
+        s.note_roster(&[user(6, [5; 16], "bob")]);
+        assert!(s.check_identity(6, &k1).emit.is_empty(), "the pinned key");
+        assert_eq!(s.check_identity(6, &k2).emit.len(), 1);
+        assert_eq!(s.account_of(6), Some([5; 16]));
+        assert_eq!(s.account_of(7), None);
+    }
+
     #[test]
     fn copies_go_where_an_account_is_and_cloud_copies_are_on() {
         let (mut s, _) = session(false, false);
@@ -1089,6 +2063,81 @@ mod tests {
         );
         assert!(s.kept_dm("zz", b"x".to_vec(), 1, None, false).is_err());
         assert_eq!(s.memory_key(), memory_key(&RELAY, "me"));
+    }
+
+    /// What the rosters and sessions show while the pages of pins are out waits, as a whole
+    /// sign-in's worth of them may. Then it is decided against them, and the host hears the
+    /// key jobs may go on, once.
+    #[test]
+    fn identities_wait_for_the_pages_of_pins() {
+        let vault = Vault::create(RELAY, "me");
+        // `item.pins` as an index of one page, which a build reads by its format
+        let index = postcard::to_allocvec(&vec![1u64]).unwrap();
+        let blobs = vec![vault.seal_item_as(crate::account::ITEM_PINS, 2, 2, &index)];
+        let dek = vault.dek();
+        let signed = SignedIn {
+            relay_id: RELAY,
+            name: "me".into(),
+            vault,
+            identity: IdentityKeyPair::generate(&mut crate::rng()),
+            recovery: None,
+            blobs,
+        };
+        let (mut s, _) = AccountSession::start(
+            signed,
+            &info(false),
+            LogMemory::default(),
+            false,
+            false,
+            voipc_protocol::codec::PROTOCOL_VERSION,
+        );
+        assert!(!s.pins_in());
+        assert!(!s.take_pins_in(), "still out");
+        let a = s.after_connect();
+        assert_eq!(sends(&a, "VaultPage"), 1);
+
+        let (k1, k2) = (vec![1u8; 33], vec![2u8; 33]);
+        s.note_person(5, Some([5; 16]), "bobby");
+        assert!(s.check_identity(5, &k2).emit.is_empty(), "before its pin");
+        assert!(
+            s.note_person(6, None, "bobby").emit.is_empty(),
+            "as a guest"
+        );
+        assert!(s.safety_number(5, &k1, None).is_err());
+
+        let vault = Vault::from_dek(RELAY, "me", dek);
+        let mut pins = crate::account::Pins::default();
+        pins.check(&[5; 16], "bobby", &k1);
+        let page = vault.seal_item("pins.0", 1, &pins.to_bytes());
+        let a = s.on_reply(&AccountReply::VaultPageFound {
+            k: "pins.0".into(),
+            blob: Some(page),
+        });
+        assert!(s.take_pins_in());
+        assert!(!s.take_pins_in(), "once");
+        let told: Vec<&Value> = a
+            .emit
+            .iter()
+            .filter(|(name, _)| *name == "identity-key-changed")
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(told.len(), 2, "{told:?}");
+        assert_eq!(told[0]["user_id"], 5);
+        assert_eq!(told[1]["as_guest"], true);
+    }
+
+    /// Who the person writes to keeps the half open channels cannot fill, whichever way the
+    /// words went; a safety number opened saves at once.
+    #[test]
+    fn a_direct_conversation_and_a_gated_channel_claim_the_reserved_half() {
+        let (mut s, _) = session(false, false);
+        s.note_person(5, Some([5; 16]), "bobby");
+        s.note_direct(5);
+        s.note_gated_people(&[[6; 16]]);
+        s.outgoing_dm(5, b"x".to_vec(), 1, None);
+        assert!(s.check_identity(5, &[1u8; 33]).send.is_empty(), "coalesced");
+        let a = s.verified(5);
+        assert_eq!(sends(&a, "VaultPut"), 1, "{:?}", a.send);
     }
 
     /// The front end starts from the list and hears each change from here, on

@@ -188,7 +188,8 @@ async fn handle_request(
     resp
 }
 
-/// The person tapped a code on a provider's page: a state and a three-digit pick.
+/// The person tapped a code on a provider's page: a state, the page's key and a
+/// three-digit pick.
 const MAX_CONFIRM_BODY: usize = 1024;
 
 async fn provider_confirm(

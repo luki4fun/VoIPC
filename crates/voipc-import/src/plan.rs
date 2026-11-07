@@ -336,15 +336,9 @@ pub async fn as_it_is_now<T: Transport>(api: &Api<T>, read: &Read) -> Result<Rea
 }
 
 /// The choices with the messages off of each channel Discord closed since the dry-run showed it
-/// open: nobody ticked that history. A new dry-run shows it as it is, for a tick then. A channel
-/// the relay has goes by its gate there instead, as `start_of` has it, unless only its history
-/// was closed, which the relay cannot see.
-pub fn without_closed_since(
-    dry_run: &Read,
-    now: &Read,
-    here: &Here,
-    choices: &Choices,
-) -> (Choices, Vec<Note>) {
+/// open: nobody ticked that history, whatever the relay says of the channel. A new dry-run shows
+/// it as it is, for a tick then.
+pub fn without_closed_since(dry_run: &Read, now: &Read, choices: &Choices) -> (Choices, Vec<Note>) {
     let mut choices = choices.clone();
     let mut notes = Vec::new();
     if !effective(&choices.options).messages {
@@ -363,8 +357,7 @@ pub fn without_closed_since(
             continue;
         };
         let (before, after) = (gates::gates_of(&then, old), gates::gates_of(&server, ch));
-        let private = after.private && !before.private && !here.cursors.contains_key(&ch.id);
-        if private || (after.history_off && !before.history_off) {
+        if (after.private && !before.private) || (after.history_off && !before.history_off) {
             choices.messages_on.remove(&ch.id);
             notes.push(Note::screen(
                 "closed_since",
@@ -699,7 +692,9 @@ fn start_of(
         } else {
             "Off last time.".to_string()
         })
-    } else if private.private && high.is_none() {
+    } else if private.private {
+        // On every run, cursor or not: how far it was read is the relay's word, which must not
+        // stand in for the operator's tick. `Go on` keeps the ticks it was given in `job`.
         Some(private.private_why.clone())
     } else if private.history_off {
         // A cursor does not settle this one: closing the history alone leaves `see` open, so
@@ -1040,7 +1035,8 @@ fn plan_emotes(
 }
 
 /// What the toggles start at: as last time, and every one on the first time. The tick for
-/// what copying people's messages means is always given again.
+/// what copying people's messages means is always given again. So is Anonymise, on: "last time"
+/// is the relay's word, and of the toggles only this one lowers someone else's privacy.
 pub fn default_options(here: &Here) -> ImportOptions {
     let mut options = here.facts.last_options.clone().unwrap_or(ImportOptions {
         channels: true,
@@ -1057,6 +1053,7 @@ pub fn default_options(here: &Here) -> ImportOptions {
         acknowledged: false,
     });
     options.acknowledged = false;
+    options.anonymise = true;
     options
 }
 
@@ -2210,6 +2207,38 @@ mod tests {
         assert_eq!(row.messages_why, "Off last time.");
     }
 
+    /// How far a channel was read is the relay's word, and a private one's history takes the
+    /// operator's tick: naming a cursor must not give it.
+    #[tokio::test(start_paused = true)]
+    async fn a_private_channel_starts_off_whatever_the_relay_says_of_it() {
+        let read = read_fixture().await;
+        for cursor in [1, 5, i64::MAX as u64] {
+            let mut here = fixture::here();
+            here.cursors.insert(fixture::STAFF, cursor);
+            here.cursors.insert(fixture::LOUNGE, cursor);
+            let choices = default_choices(&read, &here);
+            assert!(!choices.messages_on.contains(&fixture::STAFF), "{cursor}");
+            let plan = build(&read, &here);
+            let row = plan
+                .channels
+                .iter()
+                .find(|c| c.id == fixture::STAFF.to_string())
+                .unwrap();
+            assert!(!row.messages_on, "{cursor}");
+            assert_eq!(row.messages_why, row.private_why, "{cursor}");
+            let made = layout(&read, &here, &choices);
+            assert!(!planned(&made, fixture::STAFF).walk, "{cursor}");
+            let threads = made.threads_of(&read, &Names::default());
+            assert!(threads.iter().all(|t| t.parent != fixture::STAFF));
+            // The controls: an open one starts on, and with the tick this one is walked
+            assert!(choices.messages_on.contains(&fixture::LOUNGE), "{cursor}");
+            let mut ticked = choices.clone();
+            ticked.messages_on.insert(fixture::STAFF);
+            let made = layout(&read, &here, &ticked);
+            assert!(planned(&made, fixture::STAFF).walk, "{cursor}");
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn messages_off_stays_off_on_a_delta() {
         let read = read_fixture().await;
@@ -2233,8 +2262,8 @@ mod tests {
         assert_eq!(row.messages_why, "Off last time.");
         // The control: a neighbour that was walked stays on
         assert!(choices.messages_on.contains(&fixture::LOUNGE));
-        // A private channel ticked last time is walked now too: it holds a cursor
-        assert!(choices.messages_on.contains(&fixture::STAFF));
+        // A private channel ticked last time starts off: its cursor is only the relay's word
+        assert!(!choices.messages_on.contains(&fixture::STAFF));
         // Walked and found empty is `high` 1, which is not 0
         here.cursors.insert(fixture::GENERAL, 1);
         assert!(default_choices(&read, &here)
@@ -2931,10 +2960,13 @@ mod tests {
         let mut last = default_options(&here);
         last.bans = false;
         last.acknowledged = true;
+        last.anonymise = false;
         here.facts.last_options = Some(last);
         let options = default_options(&here);
         assert!(!options.bans);
         assert!(!options.acknowledged);
+        // Of them only this lowers someone else's privacy, on the relay's word
+        assert!(options.anonymise);
     }
 
     #[tokio::test(start_paused = true)]

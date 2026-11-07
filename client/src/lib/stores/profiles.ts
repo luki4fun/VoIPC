@@ -1,5 +1,6 @@
-// Display names and pictures (1.9), by account: asked for as rows come on screen,
-// at a pace the relay's `profile_rate` allows, and told again when one changes.
+// Display names and pictures (1.9), by account: names asked for once at connect for everyone
+// on this device, then as they first appear, pictures as rows come on screen, all at a pace the
+// relay's `profile_rate` allows, and told again when one changes.
 //
 // A picture here is only ever the sanitizer's PNG. What a relay sends is somebody
 // else's file, and goes through `prepareEmote` before anything may draw it.
@@ -76,6 +77,21 @@ export function askProfile(server: string, account: string): void {
   a.asked.add(account);
   a.accounts.add(account);
   start(server, a);
+}
+
+/**
+ * Many at once, in an order of their own: a page of these says who is on this device, not in
+ * which channel, as their names asked when drawn would.
+ */
+export function askProfiles(server: string, accounts: Iterable<string>): void {
+  if (!server) return;
+  const a = asker(server);
+  for (const account of [...new Set(accounts)].sort()) {
+    if (a.asked.has(account)) continue;
+    a.asked.add(account);
+    a.accounts.add(account);
+  }
+  if (a.accounts.size > 0) start(server, a);
 }
 
 export function askPicture(server: string, hash: string): void {

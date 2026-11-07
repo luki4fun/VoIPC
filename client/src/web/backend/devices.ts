@@ -9,6 +9,7 @@
 // README says so.
 
 import { browserMarksKey } from "../../lib/dm-rules";
+import { forgetNamed } from "./log-named";
 import { toHex } from "../../lib/hex";
 
 export interface DeviceRecord {
@@ -115,6 +116,7 @@ export async function forgetDevice(server: string, name: string): Promise<void> 
   // What it read there, and who it named as readers, goes with it.
   if (known) {
     try {
+      forgetNamed(cursorStorageKey(known.relay_id, name));
       localStorage.removeItem(cursorStorageKey(known.relay_id, name));
       localStorage.removeItem(browserMarksKey(server, name));
     } catch {

@@ -150,6 +150,8 @@ export interface ChatMessage {
    * (a future attachment type) renders as a placeholder and is never re-shared.
    */
   kind?: string;
+  /** On a notice naming more people than it shows: all of them. Nobody is only a number. */
+  names?: string[];
   /**
    * When this message is to be deleted, as a Unix millisecond timestamp.
    * Absent for a message with no destruction timer.

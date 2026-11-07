@@ -5,6 +5,8 @@ import { join } from "node:path";
 import {
   ACKNOWLEDGEMENT,
   MOVE_FILTERS,
+  moveFiltersFor,
+  channelDeleteWords,
   canLiftBan,
   NO_UNDO,
   POLICY_URL,
@@ -184,6 +186,18 @@ test("the filter names each state, and a chip goes with what the move knows", ()
   assert.equal(moveChip("Waiting"), "Waiting to sign in");
   assert.equal(moveChip("Claimed"), "Signed in");
   assert.equal(moveChip("Banned"), "Banned on Discord");
+});
+
+test("the Banned filter is for `*` alone", () => {
+  assert.deepEqual(moveFiltersFor(true).map(([v]) => v), ["All", "Waiting", "Claimed", "Banned"]);
+  assert.deepEqual(moveFiltersFor(false).map(([v]) => v), ["All", "Waiting", "Claimed"]);
+});
+
+test("the question before deleting a channel says who may", () => {
+  assert.match(channelDeleteWords(true, false), /takes an admin/);
+  assert.doesNotMatch(channelDeleteWords(true, false), /anything imported/);
+  assert.match(channelDeleteWords(true, true), /anything imported into it from Discord/);
+  assert.doesNotMatch(channelDeleteWords(false, true), /Discord/);
 });
 
 test("a run says what it is", () => {
@@ -555,4 +569,37 @@ test("the guide prints the acknowledgement word for word, and links the same pol
   const guide = readFileSync(join(import.meta.dirname, "../../../docs/MOVING.md"), "utf8");
   assert.ok(guide.includes(ACKNOWLEDGEMENT));
   assert.ok(guide.includes(POLICY_URL));
+});
+
+test("the guides say what the move and the relay's copies really do", () => {
+  const read = (file: string) => readFileSync(join(import.meta.dirname, "../../..", file), "utf8");
+  // The guides wrap mid-sentence: an old sentence over two lines would pass as gone
+  const flat = (text: string) => text.replace(/\s+/g, " ");
+  const [moving, operating, accounts, threats, readme] = ["docs/MOVING.md", "docs/OPERATING.md", "docs/ACCOUNTS.md", "docs/THREAT-MODEL.md", "README.md"].map(read);
+
+  // The notice's own fence, so words elsewhere in the guide cannot pass for it
+  const notice = flat(moving.slice(moving.indexOf("## Tell your members first")).split("```")[1]);
+  for (const words of ["join dates", "roles", "banned", "names you"]) assert.ok(notice.includes(words), words);
+
+  assert.ok(moving.slice(moving.indexOf("## When you are done")).includes("before-import"));
+  assert.ok(flat(moving).includes("Restoring a copy forgets"));
+  assert.ok(flat(moving).includes("what they wrote, not what others wrote about them"));
+  const timer = operating.slice(operating.indexOf("voipc-backup.service")).split("```")[0];
+  assert.match(timer, /before-/, "the sample timer takes the relay's copies too");
+
+  const guides = [moving, operating, accounts, readme].map(flat).join(" ");
+  for (const gone of ["holds them until it ages out", "until they age out", "still holds their posts until it ages out", "The full list is in the README", "What it kept is gone"]) {
+    assert.ok(!guides.includes(gone), gone);
+  }
+
+  // Exactly these two lines, so a rewording cannot pass by leaving the test nothing to check
+  const promises = readme.split("\n").filter((l) => /never\*\* stores readable|No server-side message logs/.test(l));
+  assert.equal(promises.length, 2);
+  for (const line of promises) assert.ok(line.includes("Discord"), line);
+
+  const kept = readme.slice(readme.indexOf("### What a server with accounts keeps"), readme.indexOf("### What your device stores"));
+  for (const words of ["display name", "provider's id", "join date"]) assert.ok(kept.includes(words), words);
+
+  const row = threats.split("\n").find((l) => l.includes("about who holds privileges"));
+  assert.ok(row?.includes("holders_are_told_on_change_and_to_whoever_arrives"), "who may call on everybody is told");
 });

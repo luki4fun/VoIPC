@@ -16,6 +16,7 @@
 
 use serde_reflection::{Tracer, TracerConfig};
 use voipc_protocol::codec::{encode_client_msg, encode_server_msg, MAX_MSG_SIZE, PROTOCOL_VERSION};
+use voipc_protocol::error::ProtocolError;
 use voipc_protocol::messages::*;
 use voipc_protocol::types::*;
 use voipc_protocol::video::{ScreenShareAudioPacket, VideoPacket};
@@ -240,7 +241,7 @@ fn the_longest_imported_row_fits_a_frame_and_a_page() {
         ],
     };
     let frame = |rows: Vec<ImportMessage>| {
-        encode_client_msg(&ClientMessage::Account(AccountRequest::Admin {
+        let encoded = encode_client_msg(&ClientMessage::Account(AccountRequest::Admin {
             op: AdminOp::ImportMessages {
                 run: i64::MAX,
                 channel: u64::MAX,
@@ -249,9 +250,12 @@ fn the_longest_imported_row_fits_a_frame_and_a_page() {
                 rows,
             },
             code: None,
-        }))
-        .unwrap()
-        .len()
+        }));
+        match encoded {
+            Ok(frame) => frame.len(),
+            Err(ProtocolError::MessageTooLarge(len)) => len,
+            Err(e) => panic!("{e}"),
+        }
     };
     assert!(frame(vec![row.clone()]) < IMPORT_FRAME_BYTES);
     assert!(IMPORT_FRAME_BYTES < MAX_MSG_SIZE as usize);

@@ -565,9 +565,10 @@ async function comeWithDiscord(cdpPort, id, name, { says = name, rename = "" } =
   await tab.evaluate(`document.querySelector('${dialogOf("provider-choice")} .submit-btn').click()`);
   await waitFor(tab, `document.querySelector('${dialogOf("provider-choice")}')?.innerText.includes("used this account before")`);
   await tab.evaluate(`document.querySelector('${dialogOf("provider-choice")} .submit-btn').click()`);
-  await waitFor(tab, `document.querySelector('${dialogOf("recovery")}')`, 60_000);
-  check("a recovery key is shown", await tab.evaluate(`!!document.querySelector('${dialogOf("recovery")}')`));
-  await tab.evaluate(`document.querySelector('${dialogOf("recovery")} .submit-btn').click()`);
+  // Its yes goes live a moment after it shows
+  await waitFor(tab, `document.querySelector('${dialogOf("provider-key")} .submit-btn:enabled')`, 60_000);
+  check("a recovery key is shown", await tab.evaluate(`!!document.querySelector('${dialogOf("provider-key")} .secret')`));
+  await tab.evaluate(`document.querySelector('${dialogOf("provider-key")} .submit-btn').click()`);
   await settle(tab);
   return tab;
 }
@@ -713,6 +714,31 @@ async function lane() {
   check("the dashboard says one has signed in", await seen(ann, `/^1 of/.test(document.querySelector(".move-status .move-line")?.textContent ?? "")`), await panelText(ann));
   check("dan's row can be answered now", await seen(ann, `[...document.querySelectorAll(".power-row")].find((r) => r.textContent.includes("danny") && r.querySelector(".power-ok"))`), await panelText(ann));
   check("the OK list warns", (await panelText(ann)).includes("Check with them outside Discord first"));
+  check("and says what else waits", (await panelText(ann)).includes("or a group their account held before it was opened"), await panelText(ann));
+  check("and that an archive's channel takes an admin to delete", (await panelText(ann)).includes("but not one holding what came from Discord"), await panelText(ann));
+  // A touch screen has no tooltip: what an OK hands out is read whole, at a phone's width
+  await ann.send("Emulation.setDeviceMetricsOverride", { width: 360, height: 800, deviceScaleFactor: 1, mobile: false });
+  await sleep(500);
+  const onPhone = await ann.evaluate(`(() => {
+    const rows = [...document.querySelectorAll(".power-row")].filter((r) => r.textContent.includes("danny") && r.querySelector(".power-ok"));
+    if (!rows.length) return null;
+    const row = rows.sort((a, b) => b.querySelector(".row-meta").title.length - a.querySelector(".row-meta").title.length)[0];
+    const meta = row.querySelector(".row-meta");
+    const look = getComputedStyle(meta);
+    const ok = row.querySelector(".power-ok").getBoundingClientRect();
+    return {
+      fits: meta.scrollWidth <= meta.clientWidth,
+      lines: meta.getBoundingClientRect().height / (parseFloat(look.lineHeight) || parseFloat(look.fontSize) * 1.2),
+      labels: meta.textContent.split(",").length,
+      scopes: meta.title.split(",").length,
+      okInside: ok.left >= 0 && ok.right <= innerWidth,
+    };
+  })()`);
+  check("the OK list shows a group's powers whole on a phone", !!onPhone && onPhone.fits && onPhone.labels === onPhone.scopes, JSON.stringify(onPhone));
+  check("long enough to have been cut before", !!onPhone && onPhone.lines > 1.5, JSON.stringify(onPhone));
+  check("and its OK stands on screen", !!onPhone && onPhone.okInside, JSON.stringify(onPhone));
+  await ann.send("Emulation.setDeviceMetricsOverride", { width: 1280, height: 900, deviceScaleFactor: 1, mobile: false });
+  await sleep(300);
 
   // ── Who cannot see what: eva, cal, a guest ──────────────────────────────
   const four = await browser(PORT + 103);
@@ -729,9 +755,26 @@ async function lane() {
   const six = await browser(PORT + 105);
   const cal = await comeWithDiscord(six, CAL, "cal");
 
-  // A preview reads nothing: the button and the fetch both wait for standing in the channel
-  const beforePreview = await fetchesSent(cal);
+  // Moved text channels are followed with no click, but for a gate someone passes only as `*`
+  const isFollowed = (name) => `(${channelRow(name)} && !${channelRow(name)}.classList.contains("unjoined"))`;
+  check("a claimed member follows a moved channel with no click", await seen(cal, isFollowed("lounge")), await cal.evaluate(`${channelRow("lounge")}?.outerHTML ?? "no row"`));
+  check("and through his gate, #staff", await seen(dan, isFollowed("staff")), await dan.evaluate(`${channelRow("staff")}?.outerHTML ?? "no row"`));
+  check("annika, who passes it only as `*`, is not pulled in", await seen(ann, `${channelRow("staff")}?.classList.contains("unjoined")`), await ann.evaluate(`${channelRow("staff")}?.outerHTML ?? "no row"`));
+
+  // And the row lights by itself: a dot for a post, with nothing asked and nothing clicked
+  await openChannel(dan, "lounge");
+  await openChannel(eva, "general");
+  await sleep(2500);
+  await type(eva, ".input-bar .chat-input", "a word in general");
+  await key(eva, "Enter", 13);
+  check("a post lights a followed channel's row, with no click", await seen(dan, `!!${channelRow("general")}?.querySelector(".channel-dot, .channel-unread")`, 60_000), await dan.evaluate(`${channelRow("general")}?.outerHTML ?? "no row"`));
+
+  // A preview reads nothing: the button and the fetch both wait for standing in the channel.
+  // So it takes having left one first.
   await waitFor(cal, channelRow("lounge"));
+  await cal.evaluate(`${channelRow("lounge")}.parentElement.querySelector('.settings-icon[title^="Leave this channel"]').click(); 0`);
+  await waitFor(cal, `${channelRow("lounge")}?.classList.contains("unjoined")`);
+  const beforePreview = await fetchesSent(cal);
   await mouse(cal, channelRow("lounge"), "#lounge, a preview");
   check("a preview offers to join", await seen(cal, `document.querySelector(".join-text-btn:not(.archive-open)")`), await pageText(cal));
   await sleep(800);
@@ -740,7 +783,7 @@ async function lane() {
   await click(cal, ".join-text-btn:not(.archive-open)");
   check("joined: the empty state's line and its button", await seen(cal, `document.querySelector(".archive-open")?.textContent.includes("History from Discord")`), await pageText(cal));
   check("and the header's", await cal.evaluate(`!!document.querySelector(".archive-btn")`));
-  check("that took a fetch", (await fetchesSent(cal)) > beforePreview);
+  check("that took no fetch: the list of what holds one said so", (await fetchesSent(cal)) === beforePreview);
 
   // A modified app asks for all of it by number. What it stands in answers; a gate answers as
   // an unknown channel does. The first of these is what shows the rest are not vacuous
@@ -982,6 +1025,37 @@ async function lane() {
 
   // ── The operator's menu on a row, and its code ──────────────────────────
   // The panel-less prompt asks
+  // Past `*`: a moderator who may read the list does not see who was banned on Discord, and deletes no archive
+  if (!(await ann.evaluate(`!!document.querySelector(".admin-tabs")`))) await openPanel(ann);
+  await tabTo(ann, "Groups");
+  await waitFor(ann, byText(".admin-dialog button", "New group"));
+  await mouse(ann, byText(".admin-dialog button", "New group"), "New group");
+  await waitFor(ann, q('.admin-dialog input[aria-label="Group name"]'));
+  await ann.evaluate(setInput('.admin-dialog input[aria-label="Group name"]', "readers"));
+  await ann.evaluate(`document.querySelector('.admin-dialog input[data-scope="users:read"]').click()`);
+  await ann.evaluate(`document.querySelector('.group-form button[type="submit"]').click()`);
+  await giveCodeIfAsked(ann, secret);
+  await waitFor(ann, `[...document.querySelectorAll(".admin-dialog .list-row .row-name")].some((n) => n.textContent.startsWith("readers"))`);
+  const readers = await run(SERVER, ["-c", "server.toml", "admin", "grant", "bobby", "readers"], { env });
+  check("the shell gives bobby a group that reads the list", readers.status === 0, readers.stderr);
+  const hugoWaits = await run(SERVER, ["-c", "server.toml", "admin", "grant", "hugo", "readers"], { env });
+  check("the shell says it waits, on an account nobody opened", hugoWaits.status === 0 && hugoWaits.stdout.includes("It waits for an admin's OK once the account is opened."), hugoWaits.stdout + hugoWaits.stderr);
+  await reloaded(bob);
+  await openPanel(bob);
+  await tabTo(bob, "Users");
+  await waitFor(bob, q(".admin-dialog .move-filter"));
+  check("a moderator is not offered the Banned filter", await bob.evaluate(`![...document.querySelectorAll(".admin-dialog .move-filter option")].some((o) => o.value === "Banned")`), await panelText(bob));
+  check("nor shown who was banned", await seen(bob, `document.querySelector(".move-chip[data-state='Waiting']")`) && (await bob.evaluate(`!document.querySelector(".move-chip[data-state='Banned']")`)), await panelText(bob));
+  await tabTo(bob, "Channels");
+  const holdingRow = `document.querySelector('.admin-dialog .row[data-channel="general"]')`;
+  await waitFor(bob, holdingRow);
+  await mouse(bob, `[...${holdingRow}.querySelectorAll("button")].find((b) => b.textContent.trim() === "Delete")`, "Delete #general");
+  await waitFor(bob, byText(".confirm-dialog button, [class*=confirm] button", "Delete it"), 10_000);
+  check("the question says one holding what came takes an admin", (await pageText(bob)).includes("One holding what came from Discord takes an admin"), await pageText(bob));
+  await confirmDialog(bob, "Delete it");
+  check("the relay says no, and asks for no code", await seen(bob, `document.querySelector(".admin-error")?.textContent.includes("only an admin can delete it")`) && (await bob.evaluate(`!document.querySelector('.admin-dialog input[aria-label="Two-factor code"]') && !document.querySelector(".step-up-dialog input")`)), await panelText(bob));
+  check("and the channel stands", await bob.evaluate(`!!${holdingRow}`), await panelText(bob));
+  await bob.evaluate(`document.querySelector(".admin-dialog .admin-close")?.click(); 0`);
   await reloaded(ann);
   await openChannel(ann, "lounge");
   check("annika has the button too", await seen(ann, q(".archive-btn")));
@@ -1028,7 +1102,8 @@ async function lane() {
   check("gone from those still to sign in", await seen(ann, `![...document.querySelectorAll(".waiting-row .row-name")].some((n) => n.textContent === ${JSON.stringify(heldName)})`), heldName);
   await mouse(ann, `document.querySelector(".excluded-row .let-back")`, "Let back in");
   check("let back in", await seen(ann, `!document.querySelector(".excluded-row")`), await panelText(ann));
-  await click(ann, ".waiting-row .move-leave");
+  // bea by her id: rows of one second stand in the order of their random account ids, and frank's posts are for further down
+  await mouse(ann, `[...document.querySelectorAll(".waiting-row")].find((r) => r.textContent.includes("1190000000000001003")).querySelector(".move-leave")`, "bea's Leave out");
   await confirmDialog(ann, "Leave out and delete");
   check("left out: says their posts go", await seen(ann, byText(".excluded-row .row-meta", "Left out")), await panelText(ann));
   await mouse(ann, `document.querySelector(".excluded-row .let-back")`, "Let back in, after an erase");
@@ -1245,7 +1320,7 @@ async function lane() {
   await click(ann, ".wizard-begin");
   await giveCodeIfAsked(ann, secret, "On SQLite the server makes a copy first");
   check("the run goes, with its progress", await seen(ann, q(".wizard-progress"), 30_000), await panelText(ann));
-  if (!POSTGRES) check("the backup's path is shown", await seen(ann, q(".wizard-backup-path"), 3000) || (await panelText(ann)).includes("copy of the database"), await panelText(ann));
+  if (!POSTGRES) check("the backup's path is shown, and that it stays until deleted", await seen(ann, `document.querySelector(".wizard-backup-path")?.textContent.includes("It stays until you delete it")`, 3000) || (await panelText(ann)).includes("It stays until you delete it"), await panelText(ann));
   check("Discord's wait shows", await seen(ann, `window.__waitSeen`, 8000), await panelText(ann));
   check("it ends", await seen(ann, byText(".wizard-ended", "Done."), 15_000), await panelText(ann));
   check("the end screen says to remove the bot", (await panelText(ann)).includes("Now remove the bot.") && (await panelText(ann)).includes("do not keep the new one"));

@@ -8,6 +8,7 @@ import { get, writable } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
 
 import { adminOp } from "./admin-ops.js";
+import { attachDm } from "./chat.js";
 import { currentChannelId, voice } from "./channels.js";
 import { serverAddress, userId } from "./connection.js";
 import { addNotification } from "./notifications.js";
@@ -83,6 +84,20 @@ export async function kickUser(targetUserId: number, name = "them"): Promise<voi
   }
 }
 
+/** Asked first. Cleared, the person may pick another: there is nothing to take back.
+ *  The server is the one on screen now: the view may move while the question is up.
+ *  Whether it was said yes to. */
+export async function clearProfile(id: number[], server = get(serverAddress)): Promise<boolean> {
+  const yes = await confirmAction({
+    title: "Clear this person's display name and picture?",
+    body: "They can pick others.",
+    confirm: "Clear them",
+    danger: true,
+  });
+  if (yes) await adminOp({ ProfileReset: { id, name: true, picture: true } }, null, server);
+  return yes;
+}
+
 export async function inviteUser(targetUserId: number): Promise<void> {
   try {
     await invoke("send_invite", {
@@ -138,6 +153,8 @@ export async function sendPoke(): Promise<void> {
   if (!target) return;
   const message = get(pokeMessage);
   cancelPoke();
+  // Our own copy files under whom it is for, with no conversation open to say it
+  attachDm(target.server, target.username, target.userId);
   try {
     await invoke("send_poke", { server: target.server, targetUserId: target.userId, message });
   } catch (e) {

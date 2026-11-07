@@ -10,7 +10,7 @@
 //! already decided. Who opens what, and what they search for, is new knowledge for the relay:
 //! it goes in no log, no counter and no row.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -58,6 +58,9 @@ const SHOW_THOSE_FIRST: &str = "This is hidden with the rest of yours here. Show
 const WISHES_FULL: &str = "Hide or delete everything of yours here instead.";
 const SEARCH_BUSY: &str = "The server is busy searching. Try again in a moment.";
 
+/// How long what `archive_held` read holds. An import's end and an undo drop it, and their last
+/// frame sends the layout, on which every app online asks again.
+const HELD_KEPT: Duration = Duration::from_secs(60);
 /// Rows a page holds at most.
 const PAGE_ROWS: usize = 200;
 /// And bytes: a reply over a frame is not sent at all.
@@ -247,6 +250,62 @@ impl Relay {
         Ok(row.unwrap_or(false))
     }
 
+    /// From now on what this channel keeps counts as private. One way, as the column says.
+    pub(crate) async fn archive_private_set(&self, conv: &str) -> Result<()> {
+        db!(self.store(), pool => {
+            sqlx::query("UPDATE voipc_channels SET archive_private = $1 WHERE conv = $2")
+                .bind(true)
+                .bind(conv)
+                .execute(pool)
+                .await?;
+        });
+        Ok(())
+    }
+
+    /// Whether this channel's key names a Discord channel with rows under it, hidden or wordless
+    /// ones too. One made in the app has a random uid, and so none.
+    pub(crate) async fn holds_archive(&self, conv: &str) -> Result<bool> {
+        match dc_channel(conv) {
+            Some(channel) => self.channel_holds_rows(channel).await,
+            None => Ok(false),
+        }
+    }
+
+    async fn channel_holds_rows(&self, channel: i64) -> Result<bool> {
+        let row: Option<i64> = db!(self.store(), pool => {
+            sqlx::query_scalar("SELECT channel FROM voipc_archive WHERE channel = $1 LIMIT 1")
+                .bind(channel)
+                .fetch_optional(pool)
+                .await?
+        });
+        Ok(row.is_some())
+    }
+
+    /// Which of these Discord channels hold rows. Read at most once a minute however many
+    /// connect at once: a relay's restart is everyone asking in the same few seconds.
+    async fn archive_held(&self, all: Vec<i64>) -> Result<Arc<HashSet<i64>>> {
+        let mut held = self.archive_held.lock().await;
+        if let Some((at, set)) = held.as_ref() {
+            if at.elapsed() < HELD_KEPT {
+                return Ok(set.clone());
+            }
+        }
+        let mut set = HashSet::new();
+        for channel in all {
+            if self.channel_holds_rows(channel).await? {
+                set.insert(channel);
+            }
+        }
+        let set = Arc::new(set);
+        *held = Some((Instant::now(), set.clone()));
+        Ok(set)
+    }
+
+    /// An import ended or was undone: which channels hold rows is read afresh.
+    pub(super) async fn archive_held_changed(&self) {
+        *self.archive_held.lock().await = None;
+    }
+
     /// What people said about rows changed: it holds from here on, and the rows go soon.
     pub(super) async fn archive_changed(&self) -> Result<()> {
         load(self).await?;
@@ -315,7 +374,7 @@ pub(crate) async fn may_file(
         .values()
         .find(|c| c.gate_key == conv)
     {
-        Some(c) => c.gate.groups.is_empty(),
+        Some(c) => crate::gates::open_to_all(&c.gate.groups),
         None => return Ok(Err("That channel was removed here.")),
     };
     if !relay.cloud {
@@ -614,7 +673,7 @@ pub(crate) fn dc_channel(gate_key: &str) -> Option<i64> {
 }
 
 /// Whether this session may read a channel's archive: it stands in it now. Not
-/// `voipc_members`: that list is opt-in and capped at 256, and reading an archive must not
+/// `voipc_members`: that list is opt-in and capped by `kept_seats`, and reading an archive must not
 /// be. Not `info.log` either, which is blank in an anonymous channel, in one hiding its
 /// members and with `cloud` off. One answer for a gated channel and for none at all.
 /// `None`: refused. `Some(None)`: may read, and it has no archive. `Some(Some(id))`: read that.
@@ -632,6 +691,49 @@ async fn readable(
     let c = channels.get(&channel_id)?;
     (c.members.contains(&uid) && !c.info.anonymous && state.passes(session_id, &c.gate.groups))
         .then(|| dc_channel(&c.gate_key))
+}
+
+/// `AccountRequest::ArchiveChannels`: of the channels this session stands in and may read,
+/// which hold anything. Asked at connect, at a join and as an import ends, so that opening one
+/// asks the relay nothing.
+pub(super) async fn channels(
+    state: &ServerState,
+    relay: &Relay,
+    session_id: SessionId,
+) -> Result<AccountReply> {
+    let Some(uid) = state
+        .sessions
+        .get(&session_id)
+        .filter(|s| s.account.is_some())
+        .map(|s| s.user_id)
+    else {
+        return Ok(refused("ArchiveChannels", JOIN_FIRST));
+    };
+    let (all, theirs) = {
+        let channels = state.channels.read().await;
+        let all: Vec<i64> = channels
+            .values()
+            .filter_map(|c| dc_channel(&c.gate_key))
+            .collect();
+        let theirs: Vec<(ChannelId, i64)> = channels
+            .values()
+            .filter(|c| {
+                c.members.contains(&uid)
+                    && !c.info.anonymous
+                    && state.passes(session_id, &c.gate.groups)
+            })
+            .filter_map(|c| Some((c.info.channel_id, dc_channel(&c.gate_key)?)))
+            .collect();
+        (all, theirs)
+    };
+    let held = relay.archive_held(all).await?;
+    Ok(AccountReply::ArchiveChannels {
+        channels: theirs
+            .into_iter()
+            .filter(|(_, dc)| held.contains(dc))
+            .map(|(id, _)| id)
+            .collect(),
+    })
 }
 
 /// The Discord ids this account has linked: what makes a row its own. A name proves nothing.

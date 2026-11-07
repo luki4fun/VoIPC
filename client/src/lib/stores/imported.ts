@@ -26,6 +26,9 @@ import {
 } from "../archive-rules.js";
 import { fromServer, listenServer } from "../connect.js";
 import { lastOp } from "./admin-ops.js";
+import { account } from "./account.js";
+import { livePath } from "../relay-rules.js";
+import { olderRelay } from "./relay.js";
 import { addNotification } from "./notifications.js";
 import { scoped } from "./scoped.js";
 import type { AdminReply, ArchiveAction, ArchiveRow, ArchiveScope } from "../types.js";
@@ -125,7 +128,7 @@ function pushed(v: ImportedView): ImportedView | null {
   return depth(v) >= VIEW_DEPTH ? withoutOldest(v) : v;
 }
 
-function request(server: string, body: object, failed: (e: string) => void = () => {}): void {
+function request(server: string, body: object | string, failed: (e: string) => void = () => {}): void {
   invoke("account_request", { server, request: body }).catch((e: unknown) => failed(String(e)));
 }
 
@@ -154,12 +157,31 @@ export function probeImported(server: string, channel: number): void {
   });
 }
 
+const listAsks = new Map<string, ReturnType<typeof setTimeout>>();
+
+/**
+ * Which channels this connection stands in hold an archive, all at once (protocol 21): so
+ * opening one tells the relay nothing, as a first page on opening did. It answers for what
+ * this session is in now, so a join asks again, a few together as one.
+ */
+export function askArchiveChannels(server: string): void {
+  if (listAsks.has(server) || !get(account.peek(server))) return;
+  listAsks.set(
+    server,
+    setTimeout(() => {
+      listAsks.delete(server);
+      request(server, "ArchiveChannels");
+    }, 250),
+  );
+}
+
 /** An import ended or was undone: what was learned of channels no longer holds. */
 export function importedChanged(server: string): void {
   asked.of(server).set(new Set());
   probing.of(server).set(new Set());
   importedHas.of(server).set(new Set());
   importedRound.of(server).update((n) => n + 1);
+  if (livePath(get(olderRelay.peek(server))?.protocol ?? null)) askArchiveChannels(server);
 }
 
 export function openImported(server: string, channel: number): void {
@@ -418,6 +440,12 @@ function onAdminDeleted(server: string): void {
   }
 }
 
+/** A refusal of one of these is said where it was asked (`onRefused`), or not at all: the app
+ *  asks some of them on its own, and a toast would be about nothing the person did. */
+export function saysItsOwnRefusal(request: string): boolean {
+  return request.startsWith("Archive");
+}
+
 function onRefused(server: string, request: string, reason: string): void {
   if (request === "ArchiveFetch") {
     // Asked again next time this channel comes on screen
@@ -453,12 +481,14 @@ export function onImportedReply(server: string, raw: unknown): void {
     ArchivePage?: Page;
     ArchiveHits?: Hits;
     ArchiveMineDone?: { action: ArchiveAction; rows: number };
+    ArchiveChannels?: { channels: number[] };
     Admin?: AdminReply;
     Error?: { request: string; reason: string };
   };
   if (r.ArchivePage) onPage(server, r.ArchivePage);
   else if (r.ArchiveHits) onHits(server, r.ArchiveHits);
   else if (r.ArchiveMineDone) onMineDone(server, r.ArchiveMineDone);
+  else if (r.ArchiveChannels) importedHas.of(server).set(new Set(r.ArchiveChannels.channels));
   else if (r.Error) onRefused(server, r.Error.request, r.Error.reason);
   else if (typeof r.Admin === "object" && r.Admin && "ArchiveDeleted" in r.Admin) {
     addNotification(`${fromServer(server)}${archiveDeletedLine(r.Admin.ArchiveDeleted.rows)}`, "info");

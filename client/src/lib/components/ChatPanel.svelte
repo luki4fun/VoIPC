@@ -39,9 +39,8 @@
   import { fetchFile, fileLimits, sendFile } from "../files.js";
   import { linkFacts, mentionNames as mentionNamesOf, plainText } from "../markdown.js";
   import { powerTokens } from "../mention-rules.js";
-  import { community, moderation, moves } from "../relay-rules.js";
+  import { community, livePath, moderation, moves } from "../relay-rules.js";
   import { groupStyles } from "../stores/channels.js";
-  import { rosterOf } from "../roster-rules.js";
   import { awayHint, liveIdOf, reach, writeToId } from "../dm-rules.js";
   import { prepare } from "../image-prep.js";
   import { sealedLen } from "../file-rules.js";
@@ -88,11 +87,16 @@
     unhurriedOn,
   } from "../stores/channel-ui.js";
   import { canManage, needsNsfwConsent, postBlock, slowModeLabel } from "../channel-post-rules.js";
+  import { marksChannel } from "../follow-rules.js";
   import { modNote } from "../stores/admin-ops.js";
   import { allowed } from "../scopes.js";
   import { currentChannelId } from "../stores/channels.js";
-  import { displayChannelId, isPreviewing, shownMessages } from "../stores/roster.js";
-  import { channelRosters } from "../stores/rosters.js";
+  import { displayChannelId, displayRoster, isPreviewing, shownMessages } from "../stores/roster.js";
+  import { channelRosters, goneFrom, textSeats } from "../stores/rosters.js";
+  import { askSharers, channelOpened, handOffs } from "../stores/handoff.js";
+  import { channelRings } from "../stores/marks.js";
+  import { emptyLine, ringLine, sharersIn } from "../history-rules.js";
+  import { ownMentionNames } from "../mention-rules.js";
   import Icon from "./Icons.svelte";
   import Composer from "./chat/Composer.svelte";
   import MessageList, { HIDE_ONLINE_ONLY, type MessageActions } from "./chat/MessageList.svelte";
@@ -286,7 +290,8 @@
   const archiveReadable = $derived(moves($olderRelay?.protocol ?? null) && !!$account && canSendChannelMessage && !gated);
   $effect(() => {
     void $importedRound;
-    if (archiveReadable) probeImported($serverAddress, $displayChannelId);
+    // A relay of the live path says at connect, and opening asks nothing there
+    if (archiveReadable && !livePath($olderRelay?.protocol ?? null)) probeImported($serverAddress, $displayChannelId);
   });
   const archiveHere = $derived(archiveReadable && $importedHas.has($displayChannelId));
   function openArchive() {
@@ -351,7 +356,7 @@
       ? ""
       : (isDmMode
           ? [$activeDmUsername]
-          : rosterOf($displayChannelId, $channelRosters, $currentChannelId, $users).map((u) => u.username)
+          : $displayRoster.map((u) => u.username)
         ).join("\n"),
   );
   const mentionable = $derived(mentionKey ? mentionKey.split("\n") : []);
@@ -361,7 +366,7 @@
   const myNames = $derived(
     !$username || anonymousHere
       ? []
-      : mentionNamesOf([...mentionable, $username]).filter((n) => n === $username || n === shortName($username)),
+      : ownMentionNames($username, mentionable, !!effectiveChannel?.text && livePath($olderRelay?.protocol ?? null)),
   );
   /** Who the message box offers after an `@`: everybody but us. */
   // Once each: an account from before `here` was reserved would otherwise be offered
@@ -468,30 +473,64 @@
     });
   }
 
-  // Who in this channel would answer a request for its recent chat. The
-  // automatic ask happens once, when joining; this is what the user can do
+  // Who in this channel would answer a request for its recent chat, on the list
+  // that counts for it. A first opening asks some; this is what the user can do
   // afterwards — having cleared the channel by accident, or because somebody
   // who was away then is here now.
-  let historySharers = $derived(
-    ($channelRosters.get($displayChannelId) ?? []).filter(
-      (u) => u.shares_history && u.user_id !== $userId,
-    ),
-  );
+  let historySharers = $derived(anonymousHere ? [] : sharersIn($displayRoster, $userId, $goneFrom.get($displayChannelId)));
   let canResync = $derived(!$isPreviewing && !isLobby && !isDmMode && historySharers.length > 0);
 
   async function resyncHistory() {
     const server = $serverAddress;
-    const names = historySharers.map((u) => shortName(u.username)).join(", ");
+    const channelId = $displayChannelId;
+    const sharers = historySharers;
     try {
       // Deliberate, so it also takes back a deletion: asking is how you undo
       // having cleared a channel, and nothing else reopens that door.
       forgetClearedBefore(server, channelName);
-      await invoke("request_channel_history", {
-        server,
-        channelId: $displayChannelId,
-        targetUserIds: historySharers.map((u) => u.user_id),
-      });
+      // Only a few are picked, and those are who it says
+      const asked = await askSharers(server, channelId, sharers.map((u) => u.user_id));
+      const names = sharers.filter((u) => asked.includes(u.user_id)).map((u) => shortName(u.username)).join(", ");
       addNotification(`Asked ${names} for #${channelName}'s recent chat`, "info", 3000);
+    } catch (e) {
+      addNotification(`Could not ask for history: ${e}`, "error");
+    }
+  }
+
+  // ── What an empty channel knows, and a ring ──────────────────────────────
+
+  const followedHere = $derived(!isDmMode && !$isPreviewing && !gated && !!effectiveChannel?.text && $joinedTextChannelIds.has($displayChannelId));
+  // A live relay: asks and rings are this app's to make. Older ones ask at the join themselves.
+  const liveHere = $derived(livePath($olderRelay?.protocol ?? null));
+  const handOff = $derived($handOffs.get($displayChannelId));
+  const leftToAsk = $derived(followedHere ? historySharers.filter((u) => !handOff?.asked.has(u.user_id)) : []);
+  const askState = $derived({
+    asking: !!handOff?.asking,
+    asked: handOff?.asked.size ?? 0,
+    left: leftToAsk.length,
+    leftName: leftToAsk.length === 1 ? shortName(leftToAsk[0].username) : null,
+  });
+  const nothingHere = $derived(
+    emptyLine({
+      direct: isDmMode,
+      previewing: $isPreviewing,
+      ...askState,
+      wrote: ($textSeats.get($displayChannelId)?.lastPost ?? 0) > 0,
+      seat: followedHere && !!effectiveChannel?.log && !!$account?.cloud,
+    }),
+  );
+  const ring = $derived(!isDmMode && $channelRings.has($displayChannelId) ? ringLine(askState) : null);
+
+  $effect(() => {
+    if (!followedHere || !liveHere) return;
+    const [server, id] = [$serverAddress, $displayChannelId];
+    untrack(() => channelOpened(server, id));
+  });
+
+  async function askLeft() {
+    const server = $serverAddress;
+    try {
+      await askSharers(server, $displayChannelId, leftToAsk.map((u) => u.user_id));
     } catch (e) {
       addNotification(`Could not ask for history: ${e}`, "error");
     }
@@ -1183,7 +1222,7 @@
         class="resync-btn"
         class:first={displayMessages.length === 0 || isLobby}
         onclick={resyncHistory}
-        title="Ask {historySharers.map((u) => shortName(u.username)).join(', ')} for recent messages"
+        title="Ask for recent messages"
         aria-label="Ask for recent messages"
       ><Icon name="history" size={16} /></button>
     {/if}
@@ -1337,10 +1376,12 @@
       <div class="empty-state">This channel is password protected. Join to view messages.</div>
     {:else if displayMessages.length === 0}
       <div class="empty-state">
-        {#if isDmMode}
-          No messages yet. Say hi!
-        {:else}
-          No messages yet.{#if $isPreviewing}&nbsp;Messages will appear here in real-time.{:else}&nbsp;Start the conversation!{/if}
+        {ring ? ring.line : nothingHere.line}
+        {#if (ring ?? nothingHere).button}
+          <p class="archive-empty"><button class="join-text-btn" onclick={askLeft}>{(ring ?? nothingHere).button}</button></p>
+        {/if}
+        {#if nothingHere.under}
+          <p class="archive-empty">{nothingHere.under}</p>
         {/if}
         {#if archiveHere}
           <p class="archive-empty"><button class="join-text-btn archive-open" onclick={openArchive}>History from Discord is here</button></p>
@@ -1376,6 +1417,13 @@
       {/if}
     {/if}
   </div>
+
+  {#if ring && displayMessages.length > 0}
+    <div class="preview-footer ring-line" role="status">
+      {ring.line}
+      {#if ring.button}<button class="join-text-btn" onclick={askLeft}>{ring.button}</button>{/if}
+    </div>
+  {/if}
 
   {#if isDmMode && dmReach === "readonly"}
     <div class="preview-footer post-block">
@@ -1429,7 +1477,7 @@
   {:else if effectiveChannel?.text}
     <div class="preview-footer">
       <button class="join-text-btn" onclick={() => joinTextChannel(effectiveChannel!)}>
-        {#if $leftTextChannelNames.has(channelName)}
+        {#if marksChannel($leftTextChannelNames, effectiveChannel)}
           Rejoin #{channelName} — you left this channel
         {:else}
           Join #{channelName} to write here

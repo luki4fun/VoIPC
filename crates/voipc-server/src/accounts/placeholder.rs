@@ -11,6 +11,9 @@
 //!
 //! What counts is `claimed_at`, never whether an identity row is there: `admin reclaim`
 //! takes that away from an account someone did open.
+//!
+//! Any other group with privileges an account of the move holds when someone opens it waits
+//! too, however it came to hold it: `hold_power`, at the claim and at `admin reclaim`.
 
 use std::collections::{HashMap, HashSet};
 
@@ -19,7 +22,7 @@ use l4f_accounts::model::{AccountId, Credential, NewUser, Role, UserStatus};
 use l4f_accounts::oauth::Kind;
 use l4f_accounts::scope;
 use l4f_accounts::service::{Actor, Ctx, Error, Host, RoleForm};
-use l4f_accounts::store::{CreateUserError, Store};
+use l4f_accounts::store::{CreateUserError, Store, WriteError};
 use l4f_accounts::util;
 use tracing::warn;
 use voipc_protocol::codec::encode_server_msg;
@@ -366,10 +369,23 @@ impl Relay {
         Ok(n > 0)
     }
 
+    /// A row of the move's for someone banned on Discord.
+    pub(super) async fn banned_place(&self, id: AccountId) -> Result<bool> {
+        let n: i64 = db!(self.store(), pool => {
+            sqlx::query_scalar(
+                "SELECT CAST(COUNT(*) AS BIGINT) FROM voipc_placeholders WHERE account = $1 AND banned = TRUE",
+            )
+            .bind(&id.0[..])
+            .fetch_one(pool)
+            .await?
+        });
+        Ok(n > 0)
+    }
+
     /// Whether power given to this account now would go to whoever opens it next: one of
     /// the move's nobody has opened, or that `admin reclaim` put back. Here, and only for
     /// power, a missing identity counts: an OK given in between is not for them.
-    pub(super) async fn power_would_wait(&self, id: AccountId) -> Result<bool> {
+    pub async fn power_would_wait(&self, id: AccountId) -> Result<bool> {
         let n: i64 = db!(self.store(), pool => {
             sqlx::query_scalar(
                 "SELECT CAST(COUNT(*) AS BIGINT) FROM voipc_placeholders p
@@ -763,29 +779,51 @@ impl Relay {
         Ok(row.and_then(|(role, name)| Some((account_of(&role)?, name))))
     }
 
+    /// Every group with privileges an account of the move's holds goes to waiting: whoever
+    /// opens it may be anyone. An account the move does not know keeps its groups. By its
+    /// scopes, not `holds_power`, which skips reports, the log and mentioning everyone; a group
+    /// holding only Share history gives nothing over anyone, and gates may name it. `user`
+    /// stays, since it goes to every account, moved or not. `Err`, in words for whoever can act
+    /// on them: it holds the last `*`, and nothing changed.
+    pub(super) async fn hold_power(&self, id: AccountId) -> Result<()> {
+        if self.placeholder_dc_id(id).await?.is_none() {
+            return Ok(());
+        }
+        let mut held: Vec<Role> = self.store().user_roles(id).await?;
+        held.retain(|r| !super::no_power_over_anyone(&r.scopes) && r.name != "user");
+        // `*` first: a last-admin refusal then comes before anything has changed
+        held.sort_by_key(|r| !super::is_star(&r.scopes));
+        for role in held {
+            // Revoked first: a crash loses a hold, and never leaves power on
+            match self.store().revoke_role(id, role.id).await {
+                Ok(_) => {}
+                Err(WriteError::LastAdmin) => {
+                    return Err(anyhow!(
+                        "{} holds the last admin group here: give it to another account first.",
+                        role.name
+                    ));
+                }
+                Err(e) => return Err(anyhow!("taking back a held-back group: {e:?}")),
+            }
+            self.waiting_put(id, role.id).await?;
+            self.store()
+                .audit(
+                    Some(id),
+                    None,
+                    "role_revoke",
+                    &format!("{}: waits for an admin's OK", role.name),
+                    "",
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Back to waiting, for an account of the move's that `admin reclaim` wipes. Someone
     /// else may hold that Discord login next, and what the owner said OK to was for the
-    /// person before. An account the move does not know keeps its groups.
+    /// person before.
     pub(super) async fn power_back_to_waiting(&self, id: AccountId) -> Result<()> {
-        let held: Vec<Vec<u8>> = db!(self.store(), pool => {
-            sqlx::query_scalar(
-                "SELECT g.role FROM voipc_import_groups g
-                 JOIN acct_user_roles ur ON ur.role_id = g.role
-                 JOIN voipc_placeholders p ON p.account = ur.user_id
-                 WHERE ur.user_id = $1 AND g.power = $2",
-            )
-            .bind(&id.0[..])
-            .bind(true)
-            .fetch_all(pool)
-            .await?
-        });
-        for role in held.iter().filter_map(|r| account_of(r)) {
-            self.waiting_put(id, role).await?;
-            self.store()
-                .revoke_role(id, role)
-                .await
-                .map_err(|e| anyhow!("taking back a held-back group: {e:?}"))?;
-        }
+        self.hold_power(id).await?;
         // The next to open it may be someone else: tenure does not carry over
         db!(self.store(), pool => {
             sqlx::query("UPDATE voipc_placeholders SET joined_at = NULL WHERE account = $1")
@@ -1007,7 +1045,8 @@ pub(super) async fn roles(
             .collect();
         match ledger.twin.get(&r.dc_id).and_then(|id| held.get(&id.0)) {
             Some(twin) => {
-                if twin.scopes != scopes {
+                // Discord never says Share history: an admin added it, and it is no change
+                if super::without_share(&twin.scopes) != scopes {
                     power_changed.push(twin.name.clone());
                 }
             }
@@ -1094,14 +1133,14 @@ pub(super) async fn members(
 ) -> Result<AdminReply> {
     let kind = Kind::Discord.credential_kind();
     let mut ledger = relay.ledger(guild).await?;
-    // Members only ever get a group holding nothing. One that has come to hold something,
-    // past `AdminOp::GroupSave`'s refusal, is for the owner to give
+    // Members only ever get a group holding nothing over anyone. One that has come to hold
+    // more, past `AdminOp::GroupSave`'s refusal, is for the owner to give
     let no_power: HashSet<[u8; 16]> = relay
         .store()
         .roles()
         .await?
         .into_iter()
-        .filter(|r| r.scopes.is_empty())
+        .filter(|r| super::no_power_over_anyone(&r.scopes))
         .map(|r| r.id.0)
         .collect();
     ledger.plain.retain(|_, role| no_power.contains(&role.0));
@@ -1503,23 +1542,15 @@ fn like_pattern(search: &str) -> String {
     pattern
 }
 
-/// `AdminOp::MoveAccounts`: a Discord id goes only to `star`. `AdminUser` and its op stay as
-/// they are, which would need a row for every older protocol.
-pub(super) async fn move_accounts(
+/// A page of one of `accounts_query!`'s pairs of statements, with the total.
+async fn account_rows(
     relay: &Relay,
-    star: bool,
-    search: String,
+    (select, count): (&'static str, &'static str),
+    search: &str,
     offset: u32,
-    filter: MoveFilter,
-) -> Result<AccountReply> {
-    let (select, count) = match filter {
-        MoveFilter::All => accounts_query!(""),
-        MoveFilter::Waiting => accounts_query!("AND p.claimed_at IS NULL AND p.banned = FALSE"),
-        MoveFilter::Claimed => accounts_query!("AND p.claimed_at IS NOT NULL"),
-        MoveFilter::Banned => accounts_query!("AND p.banned = TRUE"),
-    };
-    let like = like_pattern(&search);
-    let (rows, total): (Vec<AccountRow>, i64) = db!(relay.store(), pool => {
+) -> Result<(Vec<AccountRow>, i64)> {
+    let like = like_pattern(search);
+    Ok(db!(relay.store(), pool => {
         (
             sqlx::query_as(select)
                 .bind(&like)
@@ -1529,7 +1560,35 @@ pub(super) async fn move_accounts(
                 .await?,
             sqlx::query_scalar(count).bind(&like).fetch_one(pool).await?,
         )
-    });
+    }))
+}
+
+/// `AdminOp::MoveAccounts`: a Discord id goes only to `star`, and so does who was banned there,
+/// by the mark and never by the name. `AdminUser` and its op stay as they are, which would need
+/// a row for every older protocol.
+pub(super) async fn move_accounts(
+    relay: &Relay,
+    star: bool,
+    search: String,
+    offset: u32,
+    filter: MoveFilter,
+) -> Result<AccountReply> {
+    let statements = match (filter, star) {
+        (MoveFilter::Banned, false) => {
+            return Ok(refused(
+                "Admin",
+                "Only an admin may see who was banned on Discord.",
+            ));
+        }
+        (MoveFilter::All, true) => accounts_query!(""),
+        (MoveFilter::All, false) => accounts_query!("AND (p.banned IS NULL OR p.banned = FALSE)"),
+        (MoveFilter::Waiting, _) => {
+            accounts_query!("AND p.claimed_at IS NULL AND p.banned = FALSE")
+        }
+        (MoveFilter::Claimed, _) => accounts_query!("AND p.claimed_at IS NOT NULL"),
+        (MoveFilter::Banned, true) => accounts_query!("AND p.banned = TRUE"),
+    };
+    let (rows, total) = account_rows(relay, statements, &search, offset).await?;
     let wait = i64::from(relay.unclaimed_days).saturating_mul(86_400);
     let rows = rows
         .into_iter()
@@ -1569,6 +1628,81 @@ pub(super) async fn move_accounts(
         total: total.clamp(0, i64::from(u32::MAX)) as u32,
         rows,
     }))
+}
+
+/// `AdminOp::Users` past `*`: the list less those banned on Discord. What is typed looks at the
+/// name only, as `move_accounts` does: this app asks that op, and only an older one asks this.
+pub(super) async fn users_page(relay: &Relay, search: String, offset: u32) -> Result<AccountReply> {
+    let statements = accounts_query!("AND (p.banned IS NULL OR p.banned = FALSE)");
+    let (rows, total) = account_rows(relay, statements, &search, offset).await?;
+    Ok(AccountReply::Admin(AdminReply::Users {
+        search,
+        offset,
+        total: total.clamp(0, i64::from(u32::MAX)) as u32,
+        users: rows
+            .into_iter()
+            .filter_map(|(id, name, totp, created_at, ..)| {
+                Some(AdminUser {
+                    id: account_of(&id)?.0,
+                    name,
+                    totp,
+                    created_at,
+                })
+            })
+            .collect(),
+    }))
+}
+
+/// `AdminOp::GroupMembers` past `*`: a banned row holds `user` and keeps its plain groups.
+/// l4f has said the group exists and that this may be read.
+pub(super) async fn members_not_banned(
+    relay: &Relay,
+    group: &str,
+    offset: u32,
+) -> Result<(Vec<AdminUser>, i64)> {
+    let group = group.trim().to_ascii_lowercase();
+    let Some(role) = relay.store().role_by_name(&group).await? else {
+        return Ok((Vec::new(), 0));
+    };
+    type MemberRow = (Vec<u8>, String, bool, i64);
+    let (rows, total): (Vec<MemberRow>, i64) = db!(relay.store(), pool => {
+        (
+            sqlx::query_as(
+                "SELECT u.id, u.username, u.totp_enc IS NOT NULL, CAST(u.created_at AS BIGINT)
+                 FROM acct_users u
+                 JOIN acct_user_roles ur ON ur.user_id = u.id
+                 LEFT JOIN voipc_placeholders p ON p.account = u.id
+                 WHERE ur.role_id = $1 AND (p.banned IS NULL OR p.banned = FALSE)
+                 ORDER BY u.username LIMIT $2 OFFSET $3",
+            )
+            .bind(&role.id.0[..])
+            .bind(ACCOUNTS_PAGE)
+            .bind(i64::from(offset))
+            .fetch_all(pool)
+            .await?,
+            sqlx::query_scalar(
+                "SELECT CAST(COUNT(*) AS BIGINT)
+                 FROM acct_user_roles ur
+                 LEFT JOIN voipc_placeholders p ON p.account = ur.user_id
+                 WHERE ur.role_id = $1 AND (p.banned IS NULL OR p.banned = FALSE)",
+            )
+            .bind(&role.id.0[..])
+            .fetch_one(pool)
+            .await?,
+        )
+    });
+    let users = rows
+        .into_iter()
+        .filter_map(|(id, name, totp, created_at)| {
+            Some(AdminUser {
+                id: account_of(&id)?.0,
+                name,
+                totp,
+                created_at,
+            })
+        })
+        .collect();
+    Ok((users, total))
 }
 
 /// `AdminOp::MoveStatus`: what the dashboard shows, the newest runs first.
@@ -1701,7 +1835,6 @@ pub(super) async fn waiting_page(relay: &Relay, offset: u32) -> Result<AccountRe
             .and_then(|(_, z)| <[u8; 16]>::try_from(z.as_slice()).ok())
             .and_then(|z| roles.get(&z))
             .and_then(|z| z.badge.clone())
-            .unwrap_or_default()
     };
     let rows = rows
         .into_iter()
@@ -1713,7 +1846,9 @@ pub(super) async fn waiting_page(relay: &Relay, offset: u32) -> Result<AccountRe
                 name,
                 claimed: opened == 1,
                 group: twin.name.clone(),
-                badge: badge_of_twin(&role),
+                badge: badge_of_twin(&role)
+                    .or_else(|| twin.badge.clone())
+                    .unwrap_or_default(),
                 scopes: twin.scopes.clone(),
             })
         })

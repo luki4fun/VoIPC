@@ -10,8 +10,8 @@
 
 import { emit as emitEvent } from "./events";
 import { getConfig } from "./config";
-import { loadWasm, wasm, type MediaKeys, type MessageRefs, type PreKeyBundleData, type SignalClient } from "./wasm";
-import { AccountDriver, type AccountArgs, type AccountHost } from "./account";
+import { loadWasm, wasm, type KeptPins, type KeptSessions, type LiveOut, type MediaKeys, type MessageRefs, type PreKeyBundleData, type Sealed, type SignalClient } from "./wasm";
+import { ACCOUNT_STEP_MS, AccountDriver, frameGoesOn, type AccountArgs, type AccountHost } from "./account";
 import { connect as openTransport, type Transport } from "./transport";
 import type { SessionContext } from "./types";
 import type { ChannelInfo } from "../../lib/types";
@@ -24,19 +24,24 @@ import { Files, originOf, sanitizeImage } from "./files";
 import { Emotes, emoteLimitsOf } from "./emotes";
 import { motionOf } from "./media";
 import { postsMarks } from "./posts-marks";
+import { asksBundles, ChannelListParts, KeptByAccount, LivePump } from "./live";
 
 /** Bound for the authentication response (network.rs CONNECT_TIMEOUT). */
 const AUTH_TIMEOUT_MS = 10_000;
-/** An account sign-in waits on a person typing a code (the relay allows two minutes). */
-const ACCOUNT_AUTH_TIMEOUT_MS = 150_000;
 /** Datagram keepalive period: measures RTT (a dead QUIC path closes the transport). */
 const KEEPALIVE_MS = 10_000;
+/** The live path's clock (`ChannelKeying::live_tick`). */
+const LIVE_TICK_MS = 1_000;
 /** Queued chat messages older than this are dropped instead of sent. */
 const PENDING_MESSAGE_TTL_MS = 60_000;
 /** voipc_protocol::voice::VOICE_HEADER_SIZE */
 const VOICE_HEADER_SIZE = 9;
 
-type PendingTarget = { kind: "channel"; channelId: number } | { kind: "direct"; targetUserId: number };
+type PendingTarget =
+  | { kind: "channel"; channelId: number }
+  | { kind: "direct"; targetUserId: number }
+  // On the live path nothing opens a session with someone before there is something to say
+  | { kind: "poke"; targetUserId: number };
 
 /** A message waiting for encryption to become available (app_state.rs PendingMessage). */
 interface PendingMessage {
@@ -101,6 +106,11 @@ const VOICE_ASK_TTL_MS = 10_000;
 
 /** Live sessions by server id: the exact `address` the UI connected with. */
 const sessions = new Map<string, Session>();
+/** What an account's last connection to a server kept for its next. */
+const keptSessions = new KeptByAccount<KeptSessions>();
+const keptPins = new KeptByAccount<KeptPins>();
+/** On mobile data, as the front end last said. */
+let metered = false;
 /**
  * Connects to one server run one after another (network.rs connect_lock);
  * per id, so a server that takes its full auth timeout holds up no other.
@@ -128,6 +138,22 @@ export function sessionOrSigningIn(server: string): Session | null {
   return sessions.get(server) ?? signingIn.get(server) ?? null;
 }
 
+// A test build's way to hand a session a frame no honest relay sends (test-provider.mjs),
+// to see which frames came and what went, and to cut a link (test-community.mjs).
+const heard: [string, number | undefined][] = [];
+const said: unknown[] = [];
+if (__SELFTEST__) {
+  const page = window as unknown as { __voipc_frame: unknown; __voipc_heard: unknown; __voipc_said: unknown; __voipc_cut: unknown };
+  page.__voipc_said = said;
+  page.__voipc_frame = (server: string, payload: number[]) => {
+    const bytes = Uint8Array.from(payload);
+    sessionOrSigningIn(server)?.onControl(bytes);
+    return wasm().decodeServerMsg(bytes);
+  };
+  page.__voipc_heard = heard;
+  page.__voipc_cut = (server: string) => sessionFor(server)?.onTransportClosed("a test cut the link");
+}
+
 /** The session whose voice channel we are in, or null. */
 export function voiceSession(): Session | null {
   return voiceOwner;
@@ -149,9 +175,25 @@ export function connect(address: string, username: string, account?: AccountArgs
 }
 
 /** Idempotent, and an id we are not connected to is fine: sends Disconnect,
- *  closes the transport and drops all Signal state of that one server. */
-export async function disconnect(server: string): Promise<void> {
+ *  closes the transport and drops all Signal state of that one server.
+ *  `keepSessions`: a reconnect clearing the way, not a person leaving. */
+export async function disconnect(server: string, keepSessions = false): Promise<void> {
+  // A person leaving: new pins go now, or they would be new again next time
+  if (!keepSessions) await sessions.get(server)?.savePins();
   await sessions.get(server)?.end(true);
+  if (!keepSessions) forgetKept(server);
+}
+
+/** What accounts kept here goes: a person's leave, or a device forgotten. */
+export function forgetKept(server: string): void {
+  keptSessions.forget(server);
+  keptPins.forget(server);
+}
+
+/** On mobile data or not: a large key job asks first, and fewer sessions open at once. */
+export function setMetered(on: boolean): void {
+  metered = on;
+  for (const s of sessions.values()) s.signal.liveSetMetered(on);
 }
 
 /** Hand the media modules to `s`, detaching them from the previous owner. */
@@ -213,7 +255,7 @@ async function doConnect(address: string, username: string, account?: AccountArg
       onVideoPacket: (bytes) => session.onVideoPacket(bytes),
       onClosed: (reason) => session.onTransportClosed(reason),
     });
-    const authenticated = session.awaitAuthentication(driver ? ACCOUNT_AUTH_TIMEOUT_MS : AUTH_TIMEOUT_MS);
+    const authenticated = session.awaitAuthentication(driver ? ACCOUNT_STEP_MS : AUTH_TIMEOUT_MS);
     if (driver) {
       session.sendRaw(driver.first());
     } else {
@@ -301,11 +343,17 @@ export class Session implements SessionContext, AccountHost {
    *  before it so a re-key does not silence packets already in flight. */
   readonly mediaKeys: MediaKeys;
   userId = 0;
+  /** Whether a guest's switch counts here. An account's session keeps its own. */
+  private guestMayShare = false;
   transport: Transport | null = null;
   /** The sharer we are watching (0 = none). */
   watchingUserId = 0;
   /** The channel list as last received — the source of each channel's proximity mode. */
   private channels: ChannelInfo[] = [];
+  /** A list too long for one frame, until its last. */
+  private readonly channelParts = new ChannelListParts<ChannelInfo>();
+  /** Frames that wait for the pages of pins (`voipc_crypto::waits_for_pins`), in order. */
+  private pinHeld: { msg: unknown; payload: Uint8Array }[] = [];
 
   // Pairwise session tracking (app_state.rs SignalState). Keys are user ids.
   private readonly establishedSessions = new Set<number>();
@@ -322,16 +370,32 @@ export class Session implements SessionContext, AccountHost {
   /** Same rule for our own share's frames and screen audio (SHARE_FRAME_ID / SHARE_AUDIO_SEQ). */
   private videoFrameId = 0;
   private screenAudioSequence = 0;
-  private auth: { resolve(): void; reject(e: Error): void } | null = null;
+  private auth: { resolve(): void; reject(e: Error): void; wait(ms: number): void } | null = null;
+  /** Authenticated came and was taken: until then only the sign-in's frames count (`frameGoesOn`). */
+  private signedIn = false;
   /** The account this connection signs in to; null for a guest. */
   account: AccountDriver | null = null;
   /** This connection's file transfers, from Authenticated on (files.ts). */
   files: Files | null = null;
   emotes: Emotes | null = null;
-  /** The safety number with `userId` (account_session.rs safety_number). */
+  /** The safety number with `userId` (account_session.rs safety_number). Nobody has met
+   *  anyone until they write, and Verify is to work with anyone online: a person's own
+   *  click, so their bundle is asked for, and comes through the pin check. */
   safetyNumber(userId: number): string {
     if (!this.account) throw new Error("Sign in to an account to verify people");
-    return this.account.safetyNumber(userId, this.signal.bundle().identity_key, this.signal.identityOf(userId));
+    const live = this.signal.identityOf(userId);
+    try {
+      const number = this.account.safetyNumber(userId, this.signal.bundle().identity_key, live);
+      this.account.verified(this, userId);
+      return number;
+    } catch (e) {
+      if (live !== undefined || !this.account.isAccount(userId)) throw e;
+      if (!this.pendingSessions.has(userId)) {
+        this.pendingSessions.add(userId);
+        this.sendControl({ RequestPreKeyBundle: { target_user_id: userId } });
+      }
+      throw new Error("Asked for their key. Try again in a moment.");
+    }
   }
 
   /** The identities the Signal stores took in for the last message, against
@@ -339,7 +403,10 @@ export class Session implements SessionContext, AccountHost {
    *  connection, so a guest's list does not grow. */
   private checkSeen(): void {
     const seen = this.signal.takeSeen();
-    for (const { user_id, key } of seen) this.account?.checkIdentity(this, user_id, key);
+    for (const { user_id, key } of seen) {
+      // A session kept from before that disagrees with the pin is no use to anyone
+      if (this.account?.checkIdentity(this, user_id, key)) this.signal.liveDropKeptSession(user_id);
+    }
   }
 
   /** A pairwise decrypt, with the identity it took in (a session the peer
@@ -354,6 +421,20 @@ export class Session implements SessionContext, AccountHost {
     }
   }
   private keepalive: ReturnType<typeof setInterval> | undefined;
+  private liveClock: ReturnType<typeof setInterval> | undefined;
+  /** Key frames, one in the queue at a time (live.ts). */
+  private readonly live = new LivePump({
+    nextFrame: (inCall) => this.signal.liveNextFrame(inCall),
+    send: (frame) => this.sendRaw(frame),
+    queued: () => this.controlQueue.length + (this.transport?.controlBacklog() ?? 0),
+    inCall: () => this.inCall(),
+    // A wrap in a session kept from before names its peer's identity only now
+    checked: () => this.checkSeen(),
+    over: () => this.ended,
+  });
+  /** The new-member wait holds our direct messages, so a sealed ask would be refused:
+   *  history is asked by the plain frames meanwhile. */
+  private directHeld = false;
   /** Control messages waiting for the budget; see `drainControl`. */
   private readonly controlQueue: Uint8Array[] = [];
   /**
@@ -388,6 +469,11 @@ export class Session implements SessionContext, AccountHost {
   /** Voice is on, on any server (files.ts paces transfers then). */
   inCall(): boolean {
     return voiceOwner !== null;
+  }
+
+  /** Whether the switch to share history counts on this connection. */
+  mayShare(): boolean {
+    return this.account ? this.account.mayShare() : this.guestMayShare;
   }
 
   /** A per-connection event: the payload it always had, tagged with its server. */
@@ -456,8 +542,15 @@ export class Session implements SessionContext, AccountHost {
     this.auth?.reject(e);
   }
 
+  authWait(ms: number): void {
+    this.auth?.wait(ms);
+    // A moment past that clock, whose reason is the one to show
+    this.transport?.allowQuiet(ms + 1_000);
+  }
+
   sendControl(msg: unknown): void {
     if (!this.transport) return;
+    if (__SELFTEST__) said.push(msg);
     let payload: Uint8Array;
     try {
       payload = wasm().encodeClientMsg(msg);
@@ -508,15 +601,21 @@ export class Session implements SessionContext, AccountHost {
 
   awaitAuthentication(timeoutMs = AUTH_TIMEOUT_MS): Promise<void> {
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
+      const expired = () => {
         this.auth = null;
         this.account?.cancel();
         reject(new Error("Timed out waiting for the authentication response"));
-      }, timeoutMs);
+      };
+      let timer = setTimeout(expired, timeoutMs);
       this.auth = {
+        wait: (ms) => {
+          clearTimeout(timer);
+          timer = setTimeout(expired, ms);
+        },
         resolve: () => {
           clearTimeout(timer);
           this.auth = null;
+          this.transport?.allowQuiet(0);
           resolve();
         },
         reject: (e) => {
@@ -540,8 +639,10 @@ export class Session implements SessionContext, AccountHost {
     if (audio.muted) this.sendControl({ SetMuted: { muted: true } });
     if (audio.deafened) this.sendControl({ SetDeafened: { deafened: true } });
     // ...and whether we answer requests for recent chat, so the people here
-    // can see who asking would reach.
-    if (getConfig().share_channel_history) this.sendControl({ SetHistorySharing: { enabled: true } });
+    // can see who asking would reach. A switch that does not count here reads as
+    // off: the relay is not told it is on.
+    this.sendControl({ SetHistorySharing: { enabled: getConfig().share_channel_history && this.mayShare() } });
+    this.liveClock = setInterval(() => this.liveTick(), LIVE_TICK_MS);
 
     // RTT probe only: media and control share one QUIC connection, so a dead
     // path surfaces as connection-lost instead of a separate watchdog.
@@ -559,6 +660,7 @@ export class Session implements SessionContext, AccountHost {
     this.ended = true;
     if (sessions.get(this.server) === this) sessions.delete(this.server);
     clearInterval(this.keepalive);
+    clearInterval(this.liveClock);
     this.files?.close();
     this.emotes?.close();
     if (voiceOwner === this) detachVoice();
@@ -580,8 +682,26 @@ export class Session implements SessionContext, AccountHost {
     this.controlQueue.length = 0;
     if (this.transport) await this.transport.close();
     this.mediaKeys.free();
+    // Posts that waited showed as sent. By name: the page has forgotten this connection's ids
+    for (const { channel_id, expired } of this.signal.liveEnd()) {
+      const name = this.channels.find((c) => c.channel_id === channel_id)?.name;
+      this.emit("channel-undelivered", { channel_id, expired, name });
+    }
+    // An account's sessions, for its next connection to this server (network.rs
+    // `keep_sessions`). A guest has nothing to go by, and nothing goes on.
+    const account = this.signedIn ? this.account?.accountHex() : null;
+    if (account) {
+      keptSessions.put(this.server, account, this.signal.liveKeepSessions());
+      const pins = this.account?.keepPins();
+      if (pins) keptPins.put(this.server, account, pins);
+    }
     this.signal.free();
     this.account?.dispose();
+  }
+
+  /** What pins were not saved yet, before a person's leave ends this. */
+  async savePins(): Promise<void> {
+    await this.account?.savePins(this);
   }
 
   onTransportClosed(reason: string): void {
@@ -606,12 +726,24 @@ export class Session implements SessionContext, AccountHost {
       console.warn("failed to decode server message:", e);
       return;
     }
+    if (!frameGoesOn(msg, this.signedIn, this.account?.midPairing ?? false)) return;
+    if (__SELFTEST__) {
+      const [tag, b] = typeof msg === "string" ? [msg, null] : Object.entries(msg as Record<string, Body>)[0];
+      heard.push([tag, b?.channel_id ?? b?.user?.channel_id]);
+    }
+    if (this.signedIn && this.signal.liveHoldsFrame(payload)) {
+      if (this.pinHeld.length >= wasm().pinHeldMost()) this.pinHeld.shift();
+      this.pinHeld.push({ msg, payload });
+      return;
+    }
     try {
-      this.handleServerMessage(msg);
+      this.handleServerMessage(msg, payload);
     } catch (e) {
       console.error("server message handler failed:", e);
     }
     this.checkSeen();
+    // A session a queued ask waited for may have come up
+    if (!this.ended && this.signal.liveHasWork()) this.live.wake();
   }
 
   onVideoPacket(bytes: Uint8Array): void {
@@ -667,7 +799,7 @@ export class Session implements SessionContext, AccountHost {
   }
 
   /** network.rs handle_server_message. */
-  private handleServerMessage(msg: unknown): void {
+  private handleServerMessage(msg: unknown, payload: Uint8Array): void {
     let tag: string;
     let b: Body = {};
     if (typeof msg === "string") {
@@ -684,6 +816,8 @@ export class Session implements SessionContext, AccountHost {
         this.sessionId = b.session_id;
         // libsignal binds both parties' ids into every pairwise message
         this.signal.setOwnUserId(b.user_id);
+        this.signal.liveStart();
+        this.signal.liveSetMetered(metered);
         this.files = new Files(this, originOf(this.server), b.files ? Number(b.files.max_bytes) : null, b.files ? motionOf(b.files) : null);
         this.emotes = new Emotes(
           this,
@@ -697,6 +831,11 @@ export class Session implements SessionContext, AccountHost {
           "emote-limits",
           b.emotes ? emoteLimitsOf(b.emotes) : null,
         );
+        if (!this.account) {
+          // A guest holds no privileges, so where there are accounts their switch does not count
+          this.guestMayShare = wasm().guestMayShare(!!b.accounts);
+          this.emit("share-right", { may: this.guestMayShare });
+        }
         if (b.accounts) this.emit("relay-accounts", b.accounts);
         // An account sign-in ends signed in to that account, or not at all
         // (account.rs sign_in waits for exactly this).
@@ -709,11 +848,20 @@ export class Session implements SessionContext, AccountHost {
             this.account.onAuthenticated(this, b.account);
             // A provider's sign-in only knows now who it is
             this.username = b.account.name;
+            // What the last connection of this account here kept. A guest keeps nothing.
+            const hex = this.account.accountHex() ?? "";
+            const kept = keptSessions.take(this.server, hex);
+            if (kept) this.signal.liveAdoptKept(kept);
+            const pins = keptPins.take(this.server, hex);
+            if (pins) this.account.adoptPins(pins);
+            // No key job until what it checks against is here
+            if (!this.account.pinsIn()) this.signal.liveWaitForPins();
           } catch (e) {
             this.failAuth(e instanceof Error ? e : new Error(String(e)));
             break;
           }
         }
+        this.signedIn = true;
         this.auth?.resolve();
         break;
       case "AuthStep":
@@ -725,6 +873,18 @@ export class Session implements SessionContext, AccountHost {
         break;
       case "Account":
         this.account?.onReply(this, b);
+        // The pages of pins came in: the key jobs that waited for them, then the rest
+        if (this.account?.takePinsIn()) {
+          this.runLive(this.signal.livePinsIn(this.channelId));
+          for (const held of this.pinHeld.splice(0)) {
+            try {
+              this.handleServerMessage(held.msg, held.payload);
+            } catch (e) {
+              console.error("a frame that waited for the pins failed:", e);
+            }
+            this.checkSeen();
+          }
+        }
         break;
       case "AuthError":
         this.auth?.reject(new Error(`Authentication failed: ${b.reason}`));
@@ -756,9 +916,12 @@ export class Session implements SessionContext, AccountHost {
       case "MyBadges":
         this.emit("my-badges", b.badges);
         break;
-      case "Restrictions":
+      case "Restrictions": {
+        const own = (b.list as { user_id: number; direct: boolean }[]).find((row) => row.user_id === this.userId);
+        if (own) this.directHeld = own.direct;
         this.emit("restrictions", { list: b.list });
         break;
+      }
       case "ChatMods":
         this.emit("chat-mods", { mods: b.mods });
         break;
@@ -780,8 +943,18 @@ export class Session implements SessionContext, AccountHost {
         this.channels = [...b.channels];
         this.emit("channel-list", b.channels);
         break;
+      // A list too long for one frame. The front end hears it at its end, whole, so a reader
+      // of `channel-list` needs to know of no frames.
+      case "ChannelListMore": {
+        const whole = this.channelParts.take(b.channels as ChannelInfo[], b.more);
+        if (whole) {
+          this.channels = [...whole];
+          this.emit("channel-list", whole);
+        }
+        break;
+      }
       case "UserList": {
-        this.account?.noteRoster(this, b.users);
+        this.noteRows(b.users);
         // In a channel with a log: keep it (with cloud copies on), and read
         // what it kept since last time.
         const log = this.channels.find((c) => c.channel_id === b.channel_id)?.log;
@@ -790,20 +963,11 @@ export class Session implements SessionContext, AccountHost {
         break;
       }
       case "UserJoined": {
-        this.account?.noteRoster(this, [b.user]);
-        // Pairwise sessions are needed in every channel (DMs, pokes)
-        if (b.user.user_id !== this.userId) this.requestPrekeyBundlesForUsers([b.user]);
-        // Somebody joined a channel we are in. Nobody else hands them our
-        // sender key: a text channel does not move us, so we get no UserList
-        // of our own, and waiting for them to key us first only works while
-        // they hold no session with us (network.rs UserJoined).
-        // Not channel 0: that is where everybody not in voice stands, with
-        // no chat and no media to key.
-        if (
-          b.user.user_id !== this.userId &&
-          b.user.channel_id !== 0 &&
-          this.signal.inChannel(this.channelId, b.user.channel_id)
-        ) {
+        this.noteRows([b.user]);
+        // Somebody joined the room we stand in: a key dance to do. A text channel's key
+        // goes to who a check named, never because a relay said someone joined.
+        if (b.user.user_id !== this.userId && asksBundles(b.user.channel_id, this.channelId)) {
+          this.requestPrekeyBundlesForUsers([b.user]);
           this.signal.addMember(b.user.channel_id, b.user.user_id);
           if (this.establishedSessions.has(b.user.user_id)) {
             this.distributeSenderKeyToUser(b.user.channel_id, b.user.user_id);
@@ -813,7 +977,7 @@ export class Session implements SessionContext, AccountHost {
         break;
       }
       case "UserUpdated":
-        this.account?.noteRoster(this, [b.user]);
+        this.noteRows([b.user]);
         this.emit("user-updated", b.user);
         break;
       case "ListenOnly":
@@ -834,10 +998,6 @@ export class Session implements SessionContext, AccountHost {
             // (1.0, D10), and a rejoin keeps it again
             const log = this.channels.find((c) => c.channel_id === b.channel_id)?.log;
             if (log) this.account?.leave(this, log, false);
-          } else if (this.signal.isTextChannel(b.channel_id)) {
-            // They keep the chain key they were given; our next message here
-            // starts a fresh one they cannot read.
-            this.signal.noteStale(b.channel_id);
           }
           this.emit("user-left", { user_id: uid, channel_id: b.channel_id });
           break;
@@ -911,7 +1071,7 @@ export class Session implements SessionContext, AccountHost {
       case "ChannelUsers":
         // Who is which account, also of people in rooms we are not in: a
         // direct message to them is kept only if we know.
-        this.account?.noteRoster(this, b.users);
+        this.noteRows(b.users);
         this.emit("channel-users", { channel_id: b.channel_id, users: b.users });
         break;
       case "InviteReceived":
@@ -974,22 +1134,46 @@ export class Session implements SessionContext, AccountHost {
         this.account?.checkIdentity(this, b.user_id, b.bundle.identity_key);
         this.onPrekeyBundle(b.user_id, b.bundle);
         break;
+      // The live path's frames: `ChannelKeying` says what each comes to. During a key job
+      // `PreKeysLow` waits for its end: a refill per 50 hellos is a fifth on top of its upload.
       case "PreKeysLow":
-        // The relay has handed out most of our one-time pre-keys
-        this.sendControl({ UploadPreKeys: { prekeys: this.signal.morePrekeys() } });
+      case "TextJoined":
+      case "KeysOwed":
+      case "SessionAsked":
+      case "SessionHello":
+      case "TextKeyReceived":
+      case "KeyWanted":
+      case "ChannelPage":
+      case "ChannelMarks":
+      case "Evicted":
+      case "ChannelExits":
+      case "TextPost":
+        this.liveFrame(payload);
         break;
+      case "MemberGone": {
+        // Our chain there ends at our next post, whatever the relay says after this.
+        const log = this.channels.find((c) => c.channel_id === b.channel_id)?.log;
+        if (log) this.account?.memberGone(log, b.user_id);
+        this.liveFrame(payload);
+        break;
+      }
       case "PreKeyBundleUnavailable": {
         // Remove from pending so we don't loop
         this.pendingSessions.delete(b.user_id);
+        this.signal.liveNoBundle(b.user_id);
         // What waited for that session is going nowhere, and looks sent. It
         // need not mean they left: the request may be what was refused.
         const before = this.pendingMessages.length;
-        this.pendingMessages = this.pendingMessages.filter((m) => !(m.target.kind === "direct" && m.target.targetUserId === b.user_id));
+        this.pendingMessages = this.pendingMessages.filter(
+          (m) => !((m.target.kind === "direct" || m.target.kind === "poke") && m.target.targetUserId === b.user_id),
+        );
         const expired = before - this.pendingMessages.length;
         if (expired > 0) this.emit("dm-undelivered", { user_id: b.user_id, expired, kept: this.account?.keptFor(b.user_id) ?? false });
         break;
       }
       case "DirectMessageUndelivered":
+        // About a hand-off: nobody wrote anything to anyone
+        if (this.signal.liveUndeliveredWasSealed(b.target_user_id)) break;
         // Between two accounts with cloud copies on, it went into the stored log
         // as well (sendDirectMessage): they read it when they are back.
         this.emit("dm-undelivered", {
@@ -1072,6 +1256,59 @@ export class Session implements SessionContext, AccountHost {
     }
   }
 
+  /** The rows of a list: who is which account, for the pins, and a bare id in `KeysOwed`
+   *  goes by these. A first sight is checked against the pins. */
+  private noteRows(users: unknown[]): void {
+    this.account?.noteRoster(this, users);
+    try {
+      for (const row of this.signal.liveNoteRows(users)) {
+        if (row.identity) this.account?.checkIdentity(this, row.user_id, row.identity);
+      }
+    } catch (e) {
+      console.warn("could not read a list's rows:", e);
+    }
+  }
+
+  /** One frame of the live path, through `ChannelKeying`, and whatever it says to do. */
+  private liveFrame(payload: Uint8Array): void {
+    const out = this.signal.liveFrame(this.channelId, payload);
+    // Channels newly followed: keep their logs, all in one frame, and read what they kept.
+    const logOf = (channelId: number) => this.channels.find((c) => c.channel_id === channelId)?.log;
+    for (const channelId of out.gated) {
+      const log = logOf(channelId);
+      if (log) this.account?.noteGatedLog(log);
+    }
+    const logs = [...out.entered].map(logOf);
+    this.account?.enterMany(this, logs.filter((log): log is string => !!log));
+    this.runLive(out);
+  }
+
+  /** What the live path asked for: the pins checked first, then its frames and events
+   *  (network.rs run_live). */
+  private runLive(out: LiveOut): void {
+    this.account?.noteGatedPeople(out.gated_people);
+    for (const seen of out.seen) {
+      this.account?.notePerson(this, seen.user_id, seen.account, seen.name);
+      if (seen.identity) this.account?.checkIdentity(this, seen.user_id, seen.identity);
+    }
+    for (const { user_id, key } of out.check) this.account?.checkIdentity(this, user_id, key);
+    for (const frame of out.send) this.sendRaw(frame);
+    for (const { name, payload } of out.emit) this.emit(name, payload);
+    for (const userId of out.made) this.markEstablished(userId);
+    for (const userId of out.gone) this.establishedSessions.delete(userId);
+    if (out.work) this.live.wake();
+  }
+
+  /** A second's work: posts and rounds that ran out, and old session keys going. */
+  private liveTick(): void {
+    if (this.ended) return;
+    try {
+      this.runLive(this.signal.liveTick());
+    } catch (e) {
+      console.warn("the live path's tick failed:", e);
+    }
+  }
+
   /** The members of a roster worth asking for recent chat: the ones who say
    *  they share it, ourselves excluded, and of those the few the shared
    *  picker chooses (channel_state.rs history_sources). */
@@ -1089,25 +1326,9 @@ export class Session implements SessionContext, AccountHost {
 
   private onUserList(channelId: number, users: { user_id: number; shares_history?: boolean }[]): void {
     // A text channel is a subscription, not a move: nothing below applies —
-    // no media key, no room, no share, and we stay where we stand.
+    // no media key, no room, no share, and we stay where we stand. No key work
+    // starts from a list either: only who it names, and only so it can be drawn.
     if (this.isTextChannel(channelId)) {
-      const newly = this.signal.joinTextChannel(channelId);
-      // Who a sender key may go to here, and who one may come from — both
-      // directions ask (distributeSenderKeyToUser, onSenderKeyReceived).
-      this.signal.setMembers(channelId, Uint32Array.from(users.map((u) => u.user_id)));
-      if (newly) {
-        this.signal.resetChannel(this.userId, channelId);
-        this.signal.wantHistoryFrom(channelId, this.historySources(users));
-      }
-      this.requestPrekeyBundlesForUsers(users);
-      // A voice channel gets its sender keys through the join dance; here
-      // nobody moved, so we key up with the members we already have a session
-      // with ourselves.
-      for (const user of users) {
-        if (user.user_id !== this.userId && this.establishedSessions.has(user.user_id)) {
-          this.distributeSenderKeyToUser(channelId, user.user_id);
-        }
-      }
       this.emit("user-list", { channel_id: channelId, users });
       return;
     }
@@ -1144,7 +1365,8 @@ export class Session implements SessionContext, AccountHost {
       // or we generate one if alone (below, once the user list is known)
       this.mediaKeys.clear();
       this.signal.resetChannel(this.userId, channelId);
-      this.signal.wantHistoryFrom(channelId, this.historySources(users));
+      const anonymous = this.channels.find((c) => c.channel_id === channelId)?.anonymous;
+      this.signal.wantHistoryFrom(channelId, anonymous ? new Uint32Array() : this.historySources(users));
       if (this.watchingUserId !== 0) {
         this.watchingUserId = 0;
         this.sendControl("StopWatchingScreenShare");
@@ -1166,8 +1388,9 @@ export class Session implements SessionContext, AccountHost {
       detachVoice();
     }
 
-    // Pairwise sessions are needed in every channel (DMs, pokes), not just for channel chat
-    this.requestPrekeyBundlesForUsers(users);
+    // Only a room has a key dance to do; General's list costs nothing, and anyone in it
+    // gets a session when there is something to say to them.
+    if (asksBundles(channelId, channelId)) this.requestPrekeyBundlesForUsers(users);
 
     // Media keys never touch the server: the first member generates one,
     // everyone else receives it from a member over a pairwise Signal session
@@ -1202,8 +1425,21 @@ export class Session implements SessionContext, AccountHost {
     }
   }
 
-  /** Establish the pairwise session, then hand over our sender key (and media key) for the current channel. */
+  /** Establish the pairwise session, then hand over our sender key (and media key) for the room we stand in. */
   private onPrekeyBundle(remoteUserId: number, bundle: PreKeyBundleData): void {
+    const queued = this.pendingMessages.some(
+      (m) =>
+        (m.target.kind === "direct" || m.target.kind === "poke") &&
+        m.target.targetUserId === remoteUserId &&
+        Date.now() - m.queuedAt < PENDING_MESSAGE_TTL_MS,
+    );
+    if (!queued && !this.signal.liveBundleWanted(remoteUserId, this.channelId)) {
+      // Verify's, or what it was for has run out: its identity is what counted, and went past
+      // the pins. Nothing to send means no session (`live_bundle_wanted`).
+      this.pendingSessions.delete(remoteUserId);
+      this.drainPendingDms(remoteUserId);
+      return;
+    }
     try {
       this.signal.establishSession(remoteUserId, bundle);
     } catch (e) {
@@ -1211,16 +1447,10 @@ export class Session implements SessionContext, AccountHost {
       this.pendingSessions.delete(remoteUserId);
       return;
     }
-    this.pendingSessions.delete(remoteUserId);
-    this.establishedSessions.add(remoteUserId);
+    this.markEstablished(remoteUserId);
 
-    this.drainPendingDms(remoteUserId);
-
-    // The channel we stand in and every text channel we are in; the server
-    // drops a distribution for a channel either of us is not in.
-    for (const channelId of [this.channelId, ...this.signal.textChannels()]) {
-      if (channelId !== 0) this.distributeSenderKeyToUser(channelId, remoteUserId);
-    }
+    // A text channel's key goes to who a check named, and a session opening names nobody
+    if (this.channelId !== 0) this.distributeSenderKeyToUser(this.channelId, remoteUserId);
   }
 
   private distributeSenderKeyToUser(channelId: number, targetUserId: number): void {
@@ -1370,8 +1600,14 @@ export class Session implements SessionContext, AccountHost {
     }
   }
 
-  /** Recent channel chat for a newcomer, pairwise-encrypted (commands.rs send_channel_history). */
-  sendChannelHistory(channelId: number, targetUserId: number, messages: unknown[]): void {
+  /** Recent channel chat for a newcomer, pairwise-encrypted (commands.rs send_channel_history).
+   *  `sealed`: the ask came as a direct message, so the answer goes the same way. */
+  sendChannelHistory(channelId: number, targetUserId: number, messages: unknown[], sealed: boolean): void {
+    if (this.signal.livePinsOut()) throw new Error("the pins are not in yet");
+    if (sealed) {
+      this.sendRaw(this.signal.liveSealAnswer(channelId, targetUserId, JSON.stringify(messages)));
+      return;
+    }
     // The channel travels inside the ciphertext, not only on the envelope the
     // server writes (envelope.rs history_payload).
     const payload = wasm().historyPayload(channelId, JSON.stringify(messages));
@@ -1391,8 +1627,12 @@ export class Session implements SessionContext, AccountHost {
   ): void {
     // A conversation from somebody the roster does not put in that channel
     // with us is not history, it is an injection: we would file it, show it
-    // and hand it to the next newcomer as `shared`.
-    if (!this.signal.sharesChannelWith(this.channelId, channelId, fromUserId)) {
+    // and hand it to the next newcomer as `shared`. No roster says who is in a
+    // text channel: there it has to be somebody we asked, lately.
+    const welcome = this.signal.isTextChannel(channelId)
+      ? this.signal.liveAnswerWanted(channelId, fromUserId)
+      : this.signal.sharesChannelWith(this.channelId, channelId, fromUserId);
+    if (!welcome) {
       console.warn(`channel history from ${fromUserId} for channel ${channelId}: not a member, dropped`);
       return;
     }
@@ -1416,6 +1656,7 @@ export class Session implements SessionContext, AccountHost {
   private markEstablished(userId: number): void {
     this.establishedSessions.add(userId);
     this.pendingSessions.delete(userId);
+    this.signal.liveSessionUp(userId);
     // The session they opened is the one what we queued for them waited for
     this.drainPendingDms(userId);
   }
@@ -1427,14 +1668,14 @@ export class Session implements SessionContext, AccountHost {
   private takePending(
     matches: (t: PendingTarget) => boolean,
     undelivered: [string, Record<string, number>],
-  ): { id: string; content: string; ttlSecs?: number; refs?: MessageRefs }[] {
+  ): { target: PendingTarget; id: string; content: string; ttlSecs?: number; refs?: MessageRefs }[] {
     const now = Date.now();
-    const send: { id: string; content: string; ttlSecs?: number; refs?: MessageRefs }[] = [];
+    const send: { target: PendingTarget; id: string; content: string; ttlSecs?: number; refs?: MessageRefs }[] = [];
     const remaining: PendingMessage[] = [];
     let expired = 0;
     for (const m of this.pendingMessages) {
       if (!matches(m.target)) remaining.push(m);
-      else if (now - m.queuedAt < PENDING_MESSAGE_TTL_MS) send.push({ id: m.id, content: m.content, ttlSecs: m.ttlSecs, refs: m.refs });
+      else if (now - m.queuedAt < PENDING_MESSAGE_TTL_MS) send.push({ target: m.target, id: m.id, content: m.content, ttlSecs: m.ttlSecs, refs: m.refs });
       else expired++;
     }
     if (expired > 0) {
@@ -1446,11 +1687,16 @@ export class Session implements SessionContext, AccountHost {
   }
 
   private drainPendingDms(targetUserId: number): void {
-    for (const { id, content, ttlSecs, refs } of this.takePending((t) => t.kind === "direct" && t.targetUserId === targetUserId, [
+    const waiting = this.takePending((t) => (t.kind === "direct" || t.kind === "poke") && t.targetUserId === targetUserId, [
       "dm-undelivered",
       { user_id: targetUserId },
-    ])) {
+    ]);
+    for (const { target, id, content, ttlSecs, refs } of waiting) {
       try {
+        if (target.kind === "poke") {
+          this.sendPokeNow(targetUserId, content);
+          continue;
+        }
         const { ciphertext, message_type } = this.signal.encrypt(
           targetUserId,
           wasm().envelope(id, content, ttlSecs, refs),
@@ -1502,6 +1748,14 @@ export class Session implements SessionContext, AccountHost {
     try {
       const plaintext = this.decrypt(fromUserId, ciphertext, messageType);
       if (messageType === 1) this.markEstablished(fromUserId);
+      // A history hand-off, before anything could show it: no line, no toast, no copy,
+      // and no window flashing at the person who was only asked.
+      const sealed = wasm().openSealed(plaintext);
+      if (sealed) {
+        this.routeSealed(sealed, fromUserId, fromUsername);
+        return;
+      }
+      this.account?.noteDirect(fromUserId);
       // A DM carries the same envelope a channel message does since 0.9.0;
       // anything else reads as the text itself.
       const { id, text, ttl_secs, reply_to, thread, file, fwd, event: done } = wasm().openEnvelope(plaintext);
@@ -1512,6 +1766,22 @@ export class Session implements SessionContext, AccountHost {
         ...event,
         content: "[encrypted message — decryption failed]",
         decryption_failed: true,
+      });
+    }
+  }
+
+  /** A hand-off that came as a direct message, into what the relay-checked frames come to.
+   *  An ask goes to the front end, whose one rule decides (`answersHandOff`); an answer is
+   *  taken only from someone we asked. */
+  private routeSealed(sealed: Sealed, fromUserId: number, fromUsername: string): void {
+    if ("ask" in sealed) {
+      this.emit("channel-history-requested", { channel_id: sealed.ask, from_user_id: fromUserId, sealed: true });
+    } else if ("answer" in sealed && this.signal.liveAnswerWanted(sealed.answer, fromUserId)) {
+      this.emit("channel-history-received", {
+        channel_id: sealed.answer,
+        from_user_id: fromUserId,
+        from_username: fromUsername,
+        messages: sealed.messages,
       });
     }
   }
@@ -1615,17 +1885,24 @@ export class Session implements SessionContext, AccountHost {
     this.watchingUserId = 0;
   }
 
-  /** Poke: pairwise-encrypted; fails without a Signal session to the target. */
+  private sendPokeNow(targetUserId: number, message: string): void {
+    const { ciphertext, message_type } = this.signal.encrypt(targetUserId, utf8.encode(message));
+    this.sendControl({ SendPoke: { target_user_id: targetUserId, ciphertext, message_type } });
+  }
+
+  /** Poke: pairwise-encrypted. Nothing opened a session with them yet, and one kept from
+   *  before is a key's alone: it waits, as a direct message does, for one both ends hold. */
   sendPoke(targetUserId: number, message: string): void {
-    let encrypted: { ciphertext: Uint8Array; message_type: number };
-    try {
-      encrypted = this.signal.encrypt(targetUserId, utf8.encode(message));
-    } catch (e) {
-      throw new Error(`poke encryption failed: ${errorText(e)}`);
+    if (this.establishedSessions.has(targetUserId)) {
+      try {
+        this.sendPokeNow(targetUserId, message);
+      } catch (e) {
+        throw new Error(`poke encryption failed: ${errorText(e)}`);
+      }
+    } else {
+      this.pendingMessages.push({ target: { kind: "poke", targetUserId }, id: "", content: message, queuedAt: Date.now() });
+      this.requestPrekeyBundlesForUsers([{ user_id: targetUserId }]);
     }
-    this.sendControl({
-      SendPoke: { target_user_id: targetUserId, ciphertext: encrypted.ciphertext, message_type: encrypted.message_type },
-    });
     // Emit the poke as a local DM for the sender's chat history
     if (message !== "") {
       this.emit("direct-chat-message", {
@@ -1680,18 +1957,6 @@ export class Session implements SessionContext, AccountHost {
     // whether or not anybody is here to read it now.
     const log = this.channels.find((c) => c.channel_id === channelId)?.log;
     if (log) this.account?.outgoingChannel(this, log, wasm().envelope(messageId, content, ttlSecs, refs), ttlSecs);
-    let ciphertext: Uint8Array | null = null;
-    if (this.signal.anyoneHoldsOurKey(channelId)) {
-      try {
-        ciphertext = this.signal.groupEncrypt(
-          this.userId,
-          channelId,
-          wasm().envelope(messageId, content, ttlSecs, refs),
-        );
-      } catch (e) {
-        console.info("group encryption not ready, queueing message:", e);
-      }
-    }
     const event = {
       channel_id: channelId,
       user_id: this.userId,
@@ -1706,6 +1971,26 @@ export class Session implements SessionContext, AccountHost {
       fwd: refs?.fwd ?? null,
       event: refs?.event ?? null,
     };
+    // In a text channel the keys follow the post (`ChannelKeying::live_post`). Our own row
+    // shows it as sent: the check and the keys are the app's to do, and
+    // `channel-undelivered` says so if they cannot be.
+    if (this.isTextChannel(channelId)) {
+      this.runLive(this.signal.livePost(channelId, wasm().envelope(messageId, content, ttlSecs, refs)));
+      this.emit("channel-chat-message", { ...event, encrypted: true });
+      return;
+    }
+    let ciphertext: Uint8Array | null = null;
+    if (this.signal.anyoneHoldsOurKey(channelId)) {
+      try {
+        ciphertext = this.signal.groupEncrypt(
+          this.userId,
+          channelId,
+          wasm().envelope(messageId, content, ttlSecs, refs),
+        );
+      } catch (e) {
+        console.info("group encryption not ready, queueing message:", e);
+      }
+    }
     if (ciphertext) {
       this.sendControl({ SendEncryptedChannelMessage: { channel_id: channelId, ciphertext } });
       // The server excludes us from the encrypted broadcast: show it locally
@@ -1720,9 +2005,20 @@ export class Session implements SessionContext, AccountHost {
   /**
    * Ask named members for a channel's recent chat (commands.rs
    * request_channel_history): the user asking again, after clearing a channel
-   * by accident or because somebody who was away is here now.
+   * by accident or because somebody who was away is here now. Who was asked.
    */
-  requestChannelHistory(channelId: number, targetUserIds: number[]): void {
+  requestChannelHistory(channelId: number, targetUserIds: number[]): number[] {
+    if (this.channels.find((c) => c.channel_id === channelId)?.anonymous) throw new Error("an anonymous channel shares no history");
+    const text = this.isTextChannel(channelId);
+    // Sealed: the relay sees "R wrote to S", not for which channel. It goes when a session
+    // both ends hold is up, opened for it if need be. Under the new-member wait a direct
+    // message is refused, so there the plain frames below ask whoever already has a session.
+    if (text && !this.directHeld) {
+      const asked = this.signal.liveAskHistory(channelId, Uint32Array.from(targetUserIds));
+      if (asked.length === 0) throw new Error("nobody here can share that history yet");
+      this.live.wake();
+      return [...asked];
+    }
     // A pairwise session is all an answer needs — history travels over that,
     // not over the channel's group key, and asking for the group key here
     // would block the one repair a member has when keying went wrong.
@@ -1730,8 +2026,30 @@ export class Session implements SessionContext, AccountHost {
     const targets = wasm().pickHistorySources(reachable);
     if (targets.length === 0) throw new Error("nobody here can share that history yet");
     for (const target_user_id of targets) {
+      if (text) this.signal.liveNoteAsked(channelId, target_user_id);
       this.sendControl({ RequestChannelHistory: { channel_id: channelId, target_user_id } });
     }
+    return [...targets];
+  }
+
+  /** Follow these text channels, whole or quiet, in one frame. It tells nobody, and a gate or
+   *  a channel that is not there comes back in `TextJoined`'s `refused`, in the same words. */
+  joinTextChannels(channels: number[], quiet: number[]): void {
+    const sorted = (ids: number[]) => [...new Set(ids)].sort((a, b) => a - b);
+    this.signal.liveSetQuiet(Uint32Array.from(quiet), true);
+    this.sendControl({ JoinTextChannels: { channels: sorted(channels), quiet: sorted(quiet) } });
+  }
+
+  /** Take followed channels whole or quiet: going quiet is no exit, and whole again is
+   *  answered like a join. */
+  setQuiet(channels: number[], quiet: boolean): void {
+    this.signal.liveSetQuiet(Uint32Array.from(channels), quiet);
+    this.sendControl({ SetQuiet: { channels, quiet } });
+  }
+
+  /** A person's answer to `key-job-ask`: go on with it, or drop what waits behind it. */
+  keyJobAnswer(channelId: number, go: boolean): void {
+    this.runLive(this.signal.liveAnswerJob(channelId, go));
   }
 
   /** Pairwise-encrypted DM; queued until the Signal session exists. */

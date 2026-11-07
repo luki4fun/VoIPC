@@ -27,6 +27,9 @@ use load_common::{connect, enc, next_message, Connected};
 use voipc_protocol::messages::{ClientMessage, ServerMessage};
 use voipc_protocol::voice::VoicePacket;
 
+/// Names of its own, so it can run beside `community_load`.
+const COMMUNITY_LOAD_INDEXES: usize = 100_000;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     rustls::crypto::ring::default_provider()
@@ -105,7 +108,7 @@ async fn run_client(
         session_id,
         proto,
         ..
-    } = connect(index, server).await?;
+    } = connect(index + COMMUNITY_LOAD_INDEXES, server).await?;
 
     // ── Channel setup: client 0 creates (or reuses) the load channel ──
     let channel_id = if index == 0 {
@@ -126,7 +129,8 @@ async fn run_client(
                 ServerMessage::ChannelCreated { channel } if channel.name == "LoadTest" => {
                     break channel.channel_id
                 }
-                ServerMessage::ChannelList { channels } => {
+                ServerMessage::ChannelList { channels }
+                | ServerMessage::ChannelListMore { channels, .. } => {
                     if let Some(c) = channels.iter().find(|c| c.name == "LoadTest") {
                         existing = Some(c.channel_id);
                     }

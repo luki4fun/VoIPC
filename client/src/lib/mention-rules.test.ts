@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { callsOn, hasPower, powerTokens, tokensForMe } from "./mention-rules.ts";
+import { callsOn, hasPower, ownMentionNames, powerTokens, tokensForMe } from "./mention-rules.ts";
 
 const styles = [{ badge: "Mod" }, { badge: "Head Mod" }, { badge: "Mod" }];
 const holder = { holder: true, isAdmin: false };
@@ -51,4 +51,11 @@ test("only a holder, an admin, and never where people have no names", () => {
   assert.ok(!hasPower("@everyone", { holder: false, isAdmin: false }, open, all));
   assert.ok(!hasPower("@everyone", holder, { anonymous: true }, all));
   assert.ok(!hasPower("no token", holder, open, all));
+});
+
+test("our short name rings where only we go by it, and for both where the list is everyone online", () => {
+  assert.deepEqual(ownMentionNames("alex#1234", ["bob#0001"], false).sort(), ["alex", "alex#1234"]);
+  assert.deepEqual(ownMentionNames("alex#1234", ["alex#0000", "bob#0001"], false), ["alex#1234"], "the channel's own list");
+  assert.deepEqual(ownMentionNames("alex#1234", [], true).sort(), ["alex", "alex#1234"], "whoever else is online");
+  assert.deepEqual(ownMentionNames("alex", [], true), ["alex"], "a name with no tag is one name");
 });

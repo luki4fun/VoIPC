@@ -6,6 +6,8 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import {
   CONTRAST_PAIRS,
   DEFAULT_PALETTE_ID,
@@ -172,4 +174,27 @@ test("the Android resource files' comments are valid XML", async () => {
       }
     }
   }
+});
+
+// app.css draws every select's chevron, and has to name it again for a light palette with a
+// stronger rule. A component's `background:` loses to that rule on the image alone, and resets
+// its size and place: in the light theme the chevron repeats across the whole field.
+test("a select's own rule sets background-color, never the shorthand", () => {
+  const dir = join(import.meta.dirname, "components");
+  const sources = readdirSync(dir, { recursive: true, encoding: "utf8" })
+    .filter((f) => f.endsWith(".svelte"))
+    .map((f) => [f, readFileSync(join(dir, f), "utf8")]);
+  const classes = new Set(
+    sources.flatMap(([, text]) => [...text.matchAll(/<select\b[^>]*?\bclass="([^"]*)"/g)].flatMap((m) => m[1].split(/\s+/))),
+  );
+  assert.ok(classes.has("device"), "the scan finds the first-run microphone select");
+  const found: string[] = [];
+  for (const [file, text] of sources) {
+    const css = /<style[^>]*>([\s\S]*)<\/style>/.exec(text)?.[1] ?? "";
+    for (const [, selector, body] of css.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+      const onSelect = /\bselect\b/.test(selector) || [...classes].some((c) => new RegExp(`\\.${c}(?![\\w-])`).test(selector));
+      if (onSelect && /(^|[;\s])background\s*:/.test(body)) found.push(`${file}: ${selector.trim()}`);
+    }
+  }
+  assert.deepEqual(found, []);
 });

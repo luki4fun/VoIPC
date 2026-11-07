@@ -15,7 +15,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::codec::{decode_server_msg, encode_client_msg, frame, PROTOCOL_VERSION};
+use crate::codec::{decode_server_msg, encode_client_msg, frame, MAX_MSG_SIZE, PROTOCOL_VERSION};
 use crate::error::ProtocolError;
 use crate::messages::{AccountRequest, AdminOp, AuthContinue, ClientMessage, ServerMessage};
 use crate::types::*;
@@ -235,6 +235,18 @@ pub const RESHAPED: &[(u32, Side, u32, &str)] = &[
         46,
         "AccountReply and AdminReply: the import and archive replies never come from it",
     ),
+    (
+        20,
+        Side::Client,
+        41,
+        "AccountRequest::ArchiveChannels and the kept frames are refused",
+    ),
+    (
+        20,
+        Side::Server,
+        46,
+        "AccountReply: ArchiveChannels and the kept frames never come from it",
+    ),
 ];
 
 /// How many messages each side had at a protocol: an index at or past it is
@@ -247,6 +259,7 @@ fn client_messages(proto: u32) -> u32 {
         15..=17 => 50,
         18 => 52,
         19 => 54,
+        20 => 55,
         _ => u32::MAX,
     }
 }
@@ -269,6 +282,15 @@ pub fn encode_client_msg_for(
     msg: &ClientMessage,
     proto: u32,
 ) -> Result<Vec<Vec<u8>>, ProtocolError> {
+    let frames = frames_for(msg, proto)?;
+    // An older shape takes another road here than `encode_client_msg`, past its check
+    match frames.iter().find(|f| f.len() > 4 + MAX_MSG_SIZE as usize) {
+        Some(f) => Err(ProtocolError::MessageTooLarge(f.len() - 4)),
+        None => Ok(frames),
+    }
+}
+
+fn frames_for(msg: &ClientMessage, proto: u32) -> Result<Vec<Vec<u8>>, ProtocolError> {
     if proto >= PROTOCOL_VERSION {
         return Ok(vec![encode_client_msg(msg)?]);
     }
@@ -388,6 +410,19 @@ pub fn encode_client_msg_for(
             | AccountRequest::ArchiveSearch { .. }
             | AccountRequest::ArchiveMine { .. },
         ) if proto < 20 => Err(ProtocolError::NotOnThisRelay(proto)),
+        ClientMessage::Account(
+            AccountRequest::ArchiveChannels
+            | AccountRequest::LogJoinMany { .. }
+            | AccountRequest::ChainPut { .. }
+            | AccountRequest::LogMemberIds { .. }
+            | AccountRequest::ChainFetch { .. }
+            | AccountRequest::WrapsPage { .. }
+            | AccountRequest::OwnChains { .. }
+            | AccountRequest::OwnBuckets { .. }
+            | AccountRequest::BucketLists { .. }
+            | AccountRequest::OwnChainRows { .. }
+            | AccountRequest::VaultPage { .. },
+        ) if proto < 21 => Err(ProtocolError::NotOnThisRelay(proto)),
         ClientMessage::EmoteAdd { emote } if proto == 14 => old(postcard::to_allocvec(&(
             EMOTE_ADD,
             EmoteAdd14 {
@@ -1182,6 +1217,156 @@ mod tests {
                 code: None,
             }),
             19,
+        )
+        .is_ok());
+    }
+
+    /// The live path's frames, and what an older relay does with them: it never hears of
+    /// them, and an app knows at the frame it would have sent. `Account` is a message every
+    /// relay knows, so its one request needs an arm of its own.
+    #[test]
+    fn an_older_relay_never_hears_of_the_live_path() {
+        let frames = [
+            ClientMessage::JoinTextChannels {
+                channels: vec![1],
+                quiet: vec![],
+            },
+            ClientMessage::KeyCheck {
+                channel_id: 1,
+                restart: true,
+            },
+            ClientMessage::OpenSessions {
+                channel_id: 1,
+                targets: vec![2],
+            },
+            ClientMessage::SessionHello {
+                to: 2,
+                message_type: 3,
+                ciphertext: vec![0],
+            },
+            ClientMessage::DistributeSenderKeys {
+                channel_id: 1,
+                keys: vec![(2, 2, vec![0])],
+            },
+            ClientMessage::KeyWanted {
+                channel_id: 1,
+                from: 2,
+                reset: false,
+            },
+            ClientMessage::RequestChannelPage {
+                channel_id: 1,
+                after: 0,
+            },
+            ClientMessage::SetQuiet {
+                channels: vec![1],
+                quiet: true,
+            },
+            ClientMessage::RenewSessionKeys {
+                signed_prekey_id: 2,
+                signed_prekey: vec![0],
+                signed_prekey_signature: vec![0],
+                kyber_prekey_id: 2,
+                kyber_prekey: vec![0],
+                kyber_prekey_signature: vec![0],
+            },
+            ClientMessage::Account(AccountRequest::ArchiveChannels),
+        ];
+        for msg in frames {
+            for v in OLDEST_RELAY_PROTOCOL..21 {
+                assert!(
+                    matches!(encode_client_msg_for(&msg, v), Err(ProtocolError::NotOnThisRelay(p)) if p == v),
+                    "{msg:?} at {v}"
+                );
+            }
+            assert_eq!(
+                encode_client_msg_for(&msg, 21).unwrap(),
+                vec![encode_client_msg(&msg).unwrap()]
+            );
+        }
+        // Today's frames for the same acts still go there
+        assert!(encode_client_msg_for(
+            &ClientMessage::JoinChannel {
+                channel_id: 1,
+                password: None,
+            },
+            20,
+        )
+        .is_ok());
+    }
+
+    /// The kept path's frames: a channel writer on an older relay stays on `EpochPut`.
+    #[test]
+    fn an_older_relay_never_hears_of_the_kept_path() {
+        let conv = || "c:0".to_string();
+        let frames = [
+            AccountRequest::LogJoinMany {
+                convs: vec![conv()],
+            },
+            AccountRequest::ChainPut {
+                conv: conv(),
+                epoch: 1 << 12,
+                self_wrap: Some(vec![0; 60]),
+                step: None,
+                link: None,
+                wraps: vec![],
+                buckets: vec![],
+                seals: vec![],
+                last: true,
+            },
+            AccountRequest::LogMemberIds {
+                conv: conv(),
+                after: None,
+            },
+            AccountRequest::ChainFetch {
+                conv: conv(),
+                after: -500,
+            },
+            AccountRequest::WrapsPage {
+                conv: conv(),
+                asks: vec![],
+            },
+            AccountRequest::OwnChains {
+                conv: conv(),
+                before: None,
+            },
+            AccountRequest::OwnBuckets {
+                conv: conv(),
+                after: None,
+            },
+            AccountRequest::BucketLists {
+                conv: conv(),
+                wanted: vec![],
+            },
+            AccountRequest::OwnChainRows {
+                conv: conv(),
+                chain: 1,
+                after: None,
+            },
+            AccountRequest::VaultPage {
+                k: "pins.0".to_string(),
+            },
+        ];
+        for req in frames {
+            let msg = ClientMessage::Account(req);
+            for v in OLDEST_RELAY_PROTOCOL..21 {
+                assert!(
+                    matches!(encode_client_msg_for(&msg, v), Err(ProtocolError::NotOnThisRelay(p)) if p == v),
+                    "{msg:?} at {v}"
+                );
+            }
+            assert_eq!(
+                encode_client_msg_for(&msg, 21).unwrap(),
+                vec![encode_client_msg(&msg).unwrap()]
+            );
+        }
+        // What stays for them: the epoch path, and direct conversations everywhere
+        assert!(encode_client_msg_for(
+            &ClientMessage::Account(AccountRequest::EpochPut {
+                conv: conv(),
+                epoch: 1,
+                wraps: vec![],
+            }),
+            20,
         )
         .is_ok());
     }

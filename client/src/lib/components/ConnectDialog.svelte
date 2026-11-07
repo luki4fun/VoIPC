@@ -22,10 +22,11 @@
   import { pendingInvite, pendingJoin, serverAddress } from "../stores/connection.js";
   import { parseInviteLink, parseJoinLink } from "../invite.js";
   import { DOWNLOAD_PAGE, RESET_DONE, USE_PASSWORD, connectTo, serverId, showConnectDialog, signInAgain, updateNeeded, type AccountSignIn } from "../connect.js";
-  import { randomTag, splitName, withTag } from "../username.js";
+  import { isAccountName, randomTag, splitName, withTag } from "../username.js";
   import { availableUpdate, checkForUpdate, checkUpdates, installUpdate, updateBusy, updatesSupported } from "../stores/updates.js";
   import { updateFits } from "../update-rules.js";
   import { voice } from "../stores/channels.js";
+  import { chatUnlocked } from "../stores/chat.js";
   import { forgetEmotes } from "../stores/emotes.js";
 
   // Invite link pasted here: takes host/port from it and joins the channel
@@ -65,6 +66,12 @@
   /** The four digits after the name. Random unless the user picks them. */
   let tag = $state(splitName($lastUsername).tag || randomTag());
   let error = $state("");
+  let errorEl = $state<HTMLElement | undefined>();
+  // At the window's first size an error can sit below the fold of this dialog, and
+  // a person just sees the form come back.
+  $effect(() => {
+    if (error) errorEl?.scrollIntoView({ block: "nearest" });
+  });
   let connecting = $state(false);
   let selfSigned = $state($lastAcceptSelfSigned);
   let remember = $state($rememberConnection);
@@ -121,6 +128,8 @@
 
   $effect(() => {
     const [h, p, n, m] = [host, port, name, mode];
+    // The list lives in the vault, so a form drawn behind its gate asks too early
+    void $chatUnlocked;
     if (m !== "account" || !h || !n) {
       remembered = false;
       return;
@@ -146,7 +155,7 @@
     if (m !== "account" || !h.trim() || !p) return;
     const t = setTimeout(() => {
       invoke<{ providers: string[] }>("account_provider_ask", { address: serverId(h, p), ask: { kind: "providers" } })
-        .then((r) => (providers = r.providers))
+        .then((r) => (providers = [...new Set(r.providers)]))
         .catch(() => {});
     }, 500);
     return () => clearTimeout(t);
@@ -245,6 +254,7 @@
     const parts = splitName(u);
     name = parts.name;
     tag = parts.tag || tag;
+    if (isAccountName(u)) mode = "account";
     selfSigned = ss;
     remember = r;
   });
@@ -610,7 +620,7 @@
         </div>
       {/if}
       <div class="field">
-        <label for="account-password">{accountAction === "reset" ? "New password" : "Password"}{#if accountAction === "signin" && remembered} (not needed on this device){/if}</label>
+        <label for="account-password">{accountAction === "reset" ? "New password" : "Password"}{#if accountAction === "signin" && remembered}{" (not needed on this device)"}{/if}</label>
         <input
           id="account-password"
           type="password"
@@ -730,7 +740,7 @@
         {/if}
       </div>
     {:else if error}
-      <div class="error" role="alert">{error}</div>
+      <div class="error" role="alert" bind:this={errorEl}>{error}</div>
       {#if pinRejected && !isWeb}
         <button
           type="button"

@@ -8,14 +8,18 @@
   import { adminOp } from "../stores/admin-ui.js";
   import { serverAddress } from "../stores/connection.js";
   import { confirmAction } from "../stores/confirm.js";
+  import { can } from "../stores/powers.js";
   import { olderRelay } from "../stores/relay.js";
   import { moves } from "../relay-rules.js";
+  import { channelDeleteWords } from "../move-rules.js";
   import { movedBy, movedInCategory } from "../channel-groups.js";
   import Icon from "./Icons.svelte";
   import type { ChannelPlace } from "../types.js";
 
   let newName = $state("");
   let newText = $state(true);
+  /** Apps follow it by themselves, as following costs nothing until someone writes. */
+  let newFollowed = $state(true);
   let newCategory = $state<number | null>(null);
   let categoryName = $state("");
   /** The channel being renamed. */
@@ -34,9 +38,18 @@
     const name = newName.trim();
     if (!name) return;
     void adminOp({
-      ChannelSave: { id: null, name, description: "", text: newText, auto_join: false, category: newCategory, gate: null },
+      ChannelSave: { id: null, name, description: "", text: newText, auto_join: newText && newFollowed, category: newCategory, gate: null },
     });
     newName = "";
+  }
+
+  function toggleFollowed(id: number) {
+    const c = info(id);
+    if (!c) return;
+    const category = $channelLayout.channels.find((p) => p.channel_id === id)?.category ?? null;
+    void adminOp({
+      ChannelSave: { id, name: c.name, description: c.description, text: c.text, auto_join: !c.auto_join, category, gate: null },
+    });
   }
 
   function saveEdit() {
@@ -56,9 +69,7 @@
     const server = $serverAddress;
     const yes = await confirmAction({
       title: `Delete #${name}?`,
-      body: moves($olderRelay?.protocol ?? null)
-        ? "It goes for everyone, with every message kept in it and anything imported into it from Discord. This cannot be undone."
-        : "It goes for everyone, with every message kept in it. This cannot be undone.",
+      body: channelDeleteWords(moves($olderRelay?.protocol ?? null), $can("*")),
       confirm: "Delete it",
       danger: true,
     });
@@ -110,6 +121,7 @@
           {c.name}
           {#if place.welcome}<span class="pill">welcome</span>{/if}
           {#if !place.kept}<span class="pill" title="From channels.json: only that file renames or removes it">file</span>{/if}
+          {#if !place.kept && c.text && c.auto_join}<span class="pill" title="Apps follow it by themselves. From channels.json: only that file changes this">auto-join</span>{/if}
         </span>
         <select
           class="admin-select"
@@ -136,6 +148,14 @@
             onclick={() => adminOp({ WelcomeSet: { channel_id: place.welcome ? null : place.channel_id } })}
           >{place.welcome ? "Not the welcome" : "Make welcome"}</button>
         {/if}
+        {#if place.kept && c.text && !c.has_password}
+          <button
+            type="button"
+            class="btn btn-ghost"
+            title={c.auto_join ? "Apps follow it from the first connect. Turning this off makes nobody leave: their next connect just does not follow it." : "Apps follow it from the first connect, with nobody told. Whoever left it stays out."}
+            onclick={() => toggleFollowed(place.channel_id)}
+          >{c.auto_join ? "Joins by itself" : "Joined by hand"}</button>
+        {/if}
         {#if place.kept}
           <button type="button" class="btn btn-ghost" onclick={() => (editing = { id: place.channel_id, name: c.name, description: c.description })}>Edit</button>
           <button type="button" class="btn btn-ghost danger" onclick={() => remove(place.channel_id)}>Delete</button>
@@ -154,6 +174,11 @@
       <option value={true}>Text</option>
       <option value={false}>Voice</option>
     </select>
+    {#if newText}
+      <label class="check-row" title="Apps follow it from the first connect, with nobody told. Whoever leaves it stays out.">
+        <input type="checkbox" aria-label="Joins by itself" bind:checked={newFollowed} /> Joins by itself
+      </label>
+    {/if}
     <select class="admin-select" aria-label="Category" bind:value={newCategory}>
       <option value={null}>No category</option>
       {#each $channelLayout.categories as cat (cat.id)}

@@ -12,7 +12,7 @@ nobody checks, so a new one comes with its test.
 
 **1.x keeps:**
 - A relay admits a client exactly when their `PROTOCOL_VERSION` is equal (12 in 1.0, 13 in
-  1.3, 14 in 1.4, 15 in 1.5, 16 in 1.7, 17 in 1.8, 18 in 1.9, 19 in 1.10, 20 in 1.11). The app version is informational only.
+  1.3, 14 in 1.4, 15 in 1.5, 16 in 1.7, 17 in 1.8, 18 in 1.9, 19 in 1.10, 21 in 1.11, 20 in its rc.1 only). The app version is informational only.
 - **Since 1.6, an app talks to relays from its own protocol down to `OLDEST_RELAY_PROTOCOL`**
   (`crates/voipc-protocol/src/compat.rs`; 12 in 1.6 to 1.11), never fewer than three protocols back.
   It asks with its own; a relay of an older protocol refuses with its own (below), and the app
@@ -21,6 +21,7 @@ nobody checks, so a new one comes with its test.
 
   | Relay | What a 1.11 app does not offer there |
   |---|---|
+  | 1.11.0-rc.1 (20) | the *Share history* privilege: there the switch alone decides |
   | 1.10 (19) | the move from Discord and its archive |
   | 1.9 (18) | mute and timeouts, a wait for new members, hiding messages, removing a banned member's posts, summons, the moderation log, reports |
   | 1.8 (17) | channels made in the app, categories, a welcome channel, group colours and order, display names, profile pictures, a server's name and icon, invite links, `@everyone`, `@here` and `@&badge` |
@@ -147,12 +148,14 @@ storage, the accounts database, the kept-message log and its crypto labels.
 - An upgrade moves data forward and never loses any. The desktop history keeps a one-time
   copy of the older file, named after its format, the first time a newer version opens it:
   `chat_history.bin.v4` when 1.0 opens a 0.12 file, `chat_history.bin.v5` when 1.3.1 opens a
-  1.0 one (1.1 and 1.2 wrote the same format as 1.0, and were never released on their own).
+  1.0 one (1.1 and 1.2 wrote the same format as 1.0, and were never released on their own),
+  `chat_history.bin.v6` when 1.11 opens one from before it.
   Clearing or deleting the history in the app removes these copies too.
 - Shipped database migrations are append-only and never edited.
 - The crypto labels are frozen: `voipc-vault-item/v1|`, `voipc-log/v1|`, `voipc-wrap/v1|`,
-  `voipc-channel/v1|`, the HKDF infos and the AADs. A new scheme gets a new label beside the
-  old one, and the old one stays readable.
+  `voipc-channel/v1|`, and from protocol 21 `voipc-log/v2|`, `voipc-wrap/v2|`, `voipc-chain/v1/`,
+  `voipc-seat/v1|`, `voipc-list/v1|`, `voipc-seal/v1|`, `voipc-vlink/v1|`, the HKDF infos and the
+  AADs. A new scheme gets a new label beside the old one, and the old one stays readable.
 
 **An older build on newer data** refuses it and never writes over it:
 
@@ -166,6 +169,11 @@ storage, the accounts database, the kept-message log and its crypto labels.
 | accounts database | sqlx refuses a database with migrations it does not know |
 
 A downgrade is not supported, but it is safe: nothing is destroyed.
+
+**`item.pins` at format 2** is an index of pages (`pins.N`, protocol 21), and the only item sealed at it: a build from before
+leaves it alone with "newer", and every other item stays at format 1, so such a build still reads those. The old single item
+reads at every version and folds into pages at its first connect to a relay at 21. A relay at 20 or older keeps the single item,
+and an index there says pins are out of reach, since that relay has no frame for a page.
 
 **A new vault item** needs no protocol and no new `ITEM_FORMAT`: `VaultPut` takes any name on every relay down to 12,
 and an older app leaves an item it does not know alone. So what an account newly keeps goes in an item of its own

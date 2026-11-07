@@ -13,7 +13,6 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use tracing::{error, warn};
-use voipc_protocol::codec::encode_server_msg;
 use voipc_protocol::messages::ServerMessage;
 use voipc_protocol::types::{
     ChannelCategory, ChannelGate, ChannelId, ChannelInfo, ChannelPlace, ImportCategory,
@@ -29,14 +28,9 @@ use crate::control::ControlTx;
 use crate::session::send_msg;
 use crate::state::{Channel, ServerState};
 
-/// One message holds the whole channel list, and one that does not fit is not
-/// sent: everybody would arrive at a server with no channels.
-pub(crate) const LIST_LIMIT: usize = 60 * 1024;
 const GONE: &str = "Something went wrong. Please try again.";
 const NOT_THE_APPS: &str = "This channel comes from channels.json: change it there.";
 const NAME_TAKEN: &str = "a channel with that name already exists";
-const NO_ROOM: &str =
-    "One channel list cannot hold another channel: shorten some descriptions or remove one.";
 const BAD_CATEGORY: &str = "A category's name is 1 to 64 characters, none of them invisible.";
 const PRIVATE_NOW: &str = "Private on Discord now and open here. Give it a gate, then run again.";
 /// Categories a server may have. With its channels' places they fit one message
@@ -115,16 +109,6 @@ pub async fn load(state: &ServerState, kept: KeptRows, apps: &[String]) {
         for c in channels.values_mut() {
             c.kept = apps.contains(&c.gate_key);
         }
-        while list_len(channels.values().map(|c| &c.info)) > LIST_LIMIT {
-            let newest = channels
-                .values()
-                .filter(|c| c.kept)
-                .max_by_key(|c| layout.places.get(&c.gate_key).map_or(0, |p| p.position))
-                .map(|c| (c.info.channel_id, c.info.name.clone()));
-            let Some((id, name)) = newest else { break };
-            error!(channel = %name, "more channels than one list holds: left out until there is room");
-            channels.remove(&id);
-        }
     }
     *state.layout.write().await = layout;
 }
@@ -164,9 +148,14 @@ fn category_view(
     }
 }
 
-fn list_len<'a>(infos: impl Iterator<Item = &'a ChannelInfo>) -> usize {
-    let channels: Vec<ChannelInfo> = infos.cloned().collect();
-    encode_server_msg(&ServerMessage::ChannelList { channels }).map_or(usize::MAX, |b| b.len())
+/// One more channel to budget for, on sessions already here too: a limiter keeps the burst
+/// it was made with, so theirs start again, or the new channel's first keys could be refused.
+fn one_more_channel(state: &ServerState) {
+    state.channel_budget.fetch_add(1, Ordering::Relaxed);
+    for mut s in state.sessions.iter_mut() {
+        s.key_relay_burst += 1.0;
+        s.key_relay_rate.clear();
+    }
 }
 
 /// What `session_id` may know of the order: the persistent channels they see, in
@@ -455,9 +444,6 @@ async fn channel_create(
         if name_taken(&channels, &entry.name.to_lowercase(), text, None) {
             return Err(NAME_TAKEN.into());
         }
-        if list_len(channels.values().map(|c| &c.info).chain([&info])) > LIST_LIMIT {
-            return Err(NO_ROOM.into());
-        }
         channels.insert(channel_id, channel);
     }
     let position = next_position(state).await;
@@ -476,7 +462,7 @@ async fn channel_create(
         let _ = relay.channel_purge(&conv).await;
         return Err(GONE.into());
     }
-    state.channel_budget.fetch_add(1, Ordering::Relaxed);
+    one_more_channel(state);
     state
         .layout
         .write()
@@ -537,16 +523,6 @@ async fn channel_edit(
         after.name = wanted.name.clone();
         after.description = wanted.description.clone();
         after.auto_join = wanted.auto_join;
-        let others = channels
-            .values()
-            .filter(|c| c.info.channel_id != channel_id)
-            .map(|c| &c.info);
-        if list_len(others.chain([&after])) > LIST_LIMIT {
-            return Err(
-                "One channel list cannot hold that: shorten some descriptions or remove a channel."
-                    .into(),
-            );
-        }
         let mut entry = channels
             .get(&channel_id)
             .map(Channel::to_entry)
@@ -656,6 +632,9 @@ async fn import_channel(
         max_users: row.max_users,
         screen_share: row.screen_share,
         text: row.text,
+        // A member's app follows it from the first connect, and a gate still decides who
+        // may. A later run leaves a channel it already made, so an untick stays.
+        auto_join: row.text,
         announce: row.announce && row.text,
         slow_mode_secs: row.slow_mode_secs.min(MAX_SLOW_MODE_SECS),
         nsfw: row.nsfw,
@@ -708,10 +687,6 @@ async fn import_channel(
         if name_taken(&channels, &entry.name.to_lowercase(), entry.text, None) {
             return Ok(Err(NAME_TAKEN.into()));
         }
-        // Past this the next start would leave channels out (`load`)
-        if list_len(channels.values().map(|c| &c.info).chain([&info])) > LIST_LIMIT {
-            return Ok(Err(NO_ROOM.into()));
-        }
         channels.insert(channel_id, channel);
     }
     let position = next_position(state).await;
@@ -723,7 +698,7 @@ async fn import_channel(
         state.channels.write().await.remove(&channel_id);
         return Err(e);
     }
-    state.channel_budget.fetch_add(1, Ordering::Relaxed);
+    one_more_channel(state);
     state
         .layout
         .write()
@@ -748,6 +723,8 @@ async fn import_channel(
 /// hand survives a delta, and one deleted here stays deleted and is named, so nobody walks it.
 /// So is one Discord closed since while it is open here: its new messages would be for
 /// everyone. Nothing is stored for that, since a brief closure there must not block it for good.
+/// One closed there and gated here counts as private from now on: that gate is all that keeps
+/// its new messages from everyone.
 pub async fn import_channels(
     state: &ServerState,
     relay: &Relay,
@@ -770,11 +747,14 @@ pub async fn import_channels(
                 .await
                 .values()
                 .find(|c| c.gate_key == *conv)
-                .map(|c| c.gate.groups.is_empty());
+                .map(|c| crate::gates::open_to_all(&c.gate.groups));
             match open {
                 None => refused.push((row.dc_id, "Removed here.".to_string())),
                 Some(true) if row.see != ImportGate::Open => {
                     refused.push((row.dc_id, PRIVATE_NOW.to_string()));
+                }
+                Some(false) if row.see != ImportGate::Open => {
+                    relay.archive_private_set(conv).await?;
                 }
                 Some(_) => {}
             }
@@ -849,6 +829,32 @@ pub async fn import_categories(
     Ok(refused)
 }
 
+/// Why this session may not delete this channel, if so. Before the code is asked for: nothing
+/// asks for what it will refuse. What came from Discord goes with the channel, and no later run
+/// brings it back, so that is `*`'s, as `ArchiveDelete` is.
+pub async fn channel_delete_refusal(
+    state: &ServerState,
+    session_id: SessionId,
+    channel_id: ChannelId,
+) -> Result<(), String> {
+    let relay = state.accounts.as_ref().ok_or(GONE)?;
+    let (_, _, kept, conv) = reachable(state, session_id, channel_id).await?;
+    if !kept {
+        return Err(NOT_THE_APPS.into());
+    }
+    if !state.is_admin(session_id)
+        && relay
+            .holds_archive(&conv)
+            .await
+            .map_err(|_| GONE.to_string())?
+    {
+        return Err(
+            "This channel holds what came from Discord: only an admin can delete it.".into(),
+        );
+    }
+    Ok(())
+}
+
 /// A channel made in the app goes, with everything kept in it.
 pub async fn channel_delete(
     state: &Arc<ServerState>,
@@ -856,10 +862,8 @@ pub async fn channel_delete(
     channel_id: ChannelId,
 ) -> Result<(), String> {
     let relay = state.accounts.clone().ok_or(GONE)?;
-    let (info, gate, kept, conv) = reachable(state, session_id, channel_id).await?;
-    if !kept {
-        return Err(NOT_THE_APPS.into());
-    }
+    channel_delete_refusal(state, session_id, channel_id).await?;
+    let (info, gate, _, conv) = reachable(state, session_id, channel_id).await?;
     let row = crate::accounts::modlog::Entry {
         action: "channel_delete",
         channel_key: &conv,
@@ -898,10 +902,34 @@ async fn channel_gone(
     state.channel_budget.fetch_sub(1, Ordering::Relaxed);
     // Its rows are gone: nothing may write them back, and nobody new gets in while
     // those here are put out. (A group nobody holds: only `*` passes it.)
-    if let Some(c) = state.channels.write().await.get_mut(&channel_id) {
-        c.kept = false;
-        c.gate.groups = vec!["\u{0}being deleted".into()];
+    //
+    // Whoever follows on the live path goes under this one write: the one `ChannelDeleted`
+    // below is all they hear, with no mark and no toast. An undo takes 300 channels at
+    // 2000 people, which one eviction each would make 600,000 writes and as many queries.
+    let followers: Vec<_> = match state.channels.write().await.get_mut(&channel_id) {
+        Some(c) => {
+            c.kept = false;
+            c.gate.groups = vec!["\u{0}being deleted".into()];
+            let follow = std::mem::take(&mut c.follow);
+            let out: Vec<_> = follow
+                .joined
+                .keys()
+                .chain(follow.quiet.keys())
+                .copied()
+                .collect();
+            for uid in &out {
+                c.members.remove(uid);
+            }
+            out
+        }
+        None => Vec::new(),
+    };
+    for uid in followers {
+        if let Some(mut s) = state.sessions.get_mut(&uid) {
+            s.listen_only.remove(&channel_id);
+        }
     }
+    crate::files::channel_gone(state, channel_id);
     // Someone joining meanwhile is put out the next time round
     for _ in 0..8 {
         let members: Vec<_> = {

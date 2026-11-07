@@ -101,6 +101,22 @@ fn a_0_12_settings_file_loads_and_saves_every_key_back() {
     );
 }
 
+/// Reading keeps every key, as above. A start then turns the switch off, once.
+#[test]
+fn a_0_12_settings_file_goes_off_once_through_load() {
+    let text = std::fs::read_to_string(fixture("settings.json")).unwrap();
+    let want: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(want["share_channel_history"], true, "what 0.12 wrote");
+    let dir = std::env::temp_dir().join(format!("voipc-fixture-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("settings.json");
+    std::fs::write(&path, &text).unwrap();
+    let config = crate::config::load_config_at(&path);
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert!(!config.share_channel_history && config.share_off_notice);
+    assert!(config.share_off_once);
+}
+
 #[test]
 fn a_0_12_pin_file_keeps_every_pin() {
     let pins =

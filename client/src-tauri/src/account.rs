@@ -9,6 +9,7 @@
 //! over in the local archive.
 
 use std::sync::{Arc, PoisonError};
+use std::time::Duration;
 
 use bytes::BytesMut;
 use serde::{Deserialize, Serialize};
@@ -33,6 +34,9 @@ use crate::app_state::{AppState, SignalState};
 use crate::crypto::DeviceRecord;
 use crate::network::emit_server;
 use crate::transport::CONNECT_TIMEOUT;
+
+/// While the relay waits for the other device: its own wait for a person, and a margin.
+const PAIR_READ_WAIT: Duration = Duration::from_secs(125);
 
 /// What a guest is told by a relay that takes none. connect.ts looks for it.
 pub const ACCOUNT_REQUIRED: &str = "This server needs an account: sign in or create one.";
@@ -75,6 +79,10 @@ pub enum ProviderAnswer {
     Pair,
     /// Sign in with the password instead.
     Password,
+    /// Whether they typed the code on their other device (`account-pair-same`).
+    Same { yes: bool },
+    /// The first vault's key is written down (`account-provider-key`).
+    KeySaved,
 }
 
 /// What this ends with when the person chose their password; the name follows.
@@ -127,7 +135,7 @@ pub async fn account_provider_ask(
     .await?;
     let mut buf = BytesMut::with_capacity(1024);
     loop {
-        let msg = read(&mut link.control_recv, &mut buf, proto).await?;
+        let msg = read(&mut link.control_recv, &mut buf, proto, CONNECT_TIMEOUT).await?;
         // An older relay has no providers
         if crate::network::older_relay(&msg, proto).is_some() {
             return Ok(serde_json::json!({ "providers": [] }));
@@ -152,7 +160,8 @@ pub async fn account_provider_ask(
     }
 }
 
-/// The person's answer to `account-provider-signup` or `account-provider-choice`.
+/// The person's answer to what a provider's sign-in asks: `account-provider-signup`,
+/// `account-provider-choice`, `account-provider-key` or `account-pair-same`.
 #[tauri::command]
 pub async fn account_provider_answer(
     state: State<'_, AppState>,
@@ -172,18 +181,48 @@ pub async fn account_provider_answer(
     }
 }
 
-/// The person's answer to `account-pair-ask`, after comparing the codes.
+/// The person agreed to look at `account-pair-look`.
+#[tauri::command]
+pub async fn account_pair_look(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+    server: String,
+    pair: u64,
+) -> Result<(), String> {
+    let connections = state.connections.read().await;
+    let (connection, link) = signed_in(&connections, &server)?;
+    let a = link.session().pair_look(pair);
+    run(&app, &server, &connection.tcp_tx, a).await;
+    Ok(())
+}
+
+/// What the person typed at `account-pair-ask`: the session compares it.
 #[tauri::command]
 pub async fn account_pair_answer(
     state: State<'_, AppState>,
     app: tauri::AppHandle,
     server: String,
     pair: u64,
-    yes: bool,
+    code: String,
 ) -> Result<(), String> {
     let connections = state.connections.read().await;
     let (connection, link) = signed_in(&connections, &server)?;
-    let a = link.session().pair_answer(pair, yes);
+    let a = link.session().pair_answer(pair, &code);
+    run(&app, &server, &connection.tcp_tx, a).await;
+    Ok(())
+}
+
+/// The person said no, at `account-pair-look` or `account-pair-ask`.
+#[tauri::command]
+pub async fn account_pair_decline(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+    server: String,
+    pair: u64,
+) -> Result<(), String> {
+    let connections = state.connections.read().await;
+    let (connection, link) = signed_in(&connections, &server)?;
+    let a = link.session().pair_decline(pair);
     run(&app, &server, &connection.tcp_tx, a).await;
     Ok(())
 }
@@ -309,10 +348,32 @@ async fn write<S: AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// How long one read of a sign-in may wait. The relay sends nothing while the other
+/// device waits for a person, so the usual bound would end every pairing.
+fn read_wait(machine: &SignIn) -> Duration {
+    if machine.pairing() {
+        PAIR_READ_WAIT
+    } else {
+        CONNECT_TIMEOUT
+    }
+}
+
+/// `work`, unless `account_cancel` drops the other end of `cancel` first.
+async fn or_cancelled<T>(
+    work: impl std::future::Future<Output = Result<T, String>>,
+    cancel: oneshot::Receiver<ProviderAnswer>,
+) -> Result<T, String> {
+    tokio::select! {
+        done = work => done,
+        _ = cancel => Err("Sign-in cancelled.".into()),
+    }
+}
+
 async fn read<R: AsyncRead + Unpin>(
     recv: &mut R,
     buf: &mut BytesMut,
     proto: u32,
+    wait: Duration,
 ) -> Result<ServerMessage, String> {
     loop {
         if let Some(payload) =
@@ -321,7 +382,7 @@ async fn read<R: AsyncRead + Unpin>(
             return decode_server_msg_from(&payload, proto)
                 .map_err(|e| format!("Failed to decode response: {e}"));
         }
-        let n = tokio::time::timeout(CONNECT_TIMEOUT, recv.read_buf(buf))
+        let n = tokio::time::timeout(wait, recv.read_buf(buf))
             .await
             .map_err(|_| "Timed out waiting for the server during sign-in".to_string())?
             .map_err(|e| format!("Failed to read from the server: {e}"))?;
@@ -423,7 +484,7 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
         .devices
         .iter()
         .filter(|d| d.server == server)
-        .map(|d| d.name.clone())
+        .map(|d| (d.name.clone(), d.dek))
         .collect();
     machine.remembered_here(remembered);
     write(send, &first, proto).await?;
@@ -432,7 +493,25 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
     // What the person is asked at a provider's sign-in, kept for asking again
     let mut choice: Option<serde_json::Value> = None;
     let (user_id, session_id, info, files, emotes) = loop {
-        let msg = read(recv, buf, proto).await?;
+        let wait = read_wait(&machine);
+        let msg = if machine.pairing() {
+            // No prompt is waiting here, so nothing else could hear a Cancel
+            let (tx, rx) = oneshot::channel();
+            state
+                .provider_answers
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(server.to_string(), tx);
+            let msg = or_cancelled(read(recv, buf, proto, wait), rx).await;
+            state
+                .provider_answers
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(server);
+            msg?
+        } else {
+            read(recv, buf, proto, wait).await?
+        };
         if let ServerMessage::Authenticated {
             user_id,
             session_id,
@@ -447,11 +526,15 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
             }
             break (user_id, session_id, info, files, emotes);
         }
-        // Before `note_refusal`: an older relay is no reason to offer an update
-        if let Some(older) = crate::network::older_relay(&msg, proto) {
-            return Err(older);
+        // During a pairing the machine answers a refusal in its own words: the update
+        // panel would show the version text the relay wrote.
+        if !machine.mid_pairing() {
+            // Before `note_refusal`: an older relay is no reason to offer an update
+            if let Some(older) = crate::network::older_relay(&msg, proto) {
+                return Err(older);
+            }
+            crate::network::note_refusal(app, server, &msg);
         }
-        crate::network::note_refusal(app, server, &msg);
         // The password's stretching runs here: half a second of CPU, kept
         // off the other tasks on this worker.
         let mut steps: std::collections::VecDeque<Step> =
@@ -501,9 +584,11 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
                     name,
                     claim,
                     has_password,
+                    known_as,
                 } => {
                     choice = Some(serde_json::json!({
                         "name": name, "claim": claim, "has_password": has_password, "problem": "",
+                        "known_as": known_as,
                     }));
                     steps.extend(
                         choose(state, app, server, &mut machine, send, proto, &mut choice).await?,
@@ -511,6 +596,15 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
                 }
                 Step::PairCode { code } => {
                     emit_server(app, server, "account-pair-code", code);
+                }
+                Step::PairSame { code, known_as } => {
+                    let payload = serde_json::json!({ "code": code, "known_as": known_as });
+                    let ProviderAnswer::Same { yes } =
+                        ask_provider(state, app, server, "account-pair-same", payload).await?
+                    else {
+                        return Err("unexpected sign-in step".into());
+                    };
+                    steps.extend(machine.pair_same(yes)?);
                 }
                 Step::PairRefused { reason } => {
                     if let Some(c) = choice.as_mut() {
@@ -547,7 +641,8 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
     // handing them the channel's history in person.
     let share = state.config().share_channel_history;
     info!(server, account = %signed.name, "signed in to account");
-    let (session, started) = AccountSession::start(signed, &info, memory, share, password_based);
+    let (session, started) =
+        AccountSession::start(signed, &info, memory, share, password_based, proto);
     // Nothing to send yet (the sync's first asks wait for `after_connect`);
     // the front end hears it signed in, its choices along with it.
     for (name, payload) in started.emit {
@@ -578,7 +673,15 @@ async fn choose<S: AsyncWrite + Unpin>(
     loop {
         let payload = choice.clone().ok_or("unexpected sign-in step")?;
         match ask_provider(state, app, server, "account-provider-choice", payload).await? {
-            ProviderAnswer::Claim => return machine.provider_claim(),
+            ProviderAnswer::Claim => {
+                let payload = serde_json::json!({ "key": machine.provider_claim_key()? });
+                let ProviderAnswer::KeySaved =
+                    ask_provider(state, app, server, "account-provider-key", payload).await?
+                else {
+                    return Err("unexpected sign-in step".into());
+                };
+                return machine.provider_claim();
+            }
             ProviderAnswer::Pair => {
                 write(send, &machine.pair_start()?, proto).await?;
                 return Ok(Vec::new());
@@ -607,7 +710,9 @@ async fn choose<S: AsyncWrite + Unpin>(
                     }
                 }
             }
-            ProviderAnswer::Name { .. } => return Err("unexpected sign-in step".into()),
+            ProviderAnswer::Name { .. }
+            | ProviderAnswer::Same { .. }
+            | ProviderAnswer::KeySaved => return Err("unexpected sign-in step".into()),
         }
     }
 }
@@ -652,6 +757,27 @@ pub async fn after_connect(
     run(app, server, tcp_tx, a).await;
 }
 
+/// A person is leaving: what pins were not saved yet go, and a moment for their answers,
+/// since the index follows the pages. Past that a page is saved and its index is not, which
+/// the next sign-in reads as it should.
+pub async fn save_pins(
+    app: &tauri::AppHandle,
+    server: &str,
+    connection: &crate::app_state::ActiveConnection,
+) {
+    let Some(link) = &connection.account else {
+        return;
+    };
+    let a = link.session().flush_pins();
+    run(app, server, &connection.tcp_tx, a).await;
+    for _ in 0..20 {
+        if link.session().pins_saved() || connection.tcp_tx.is_closed() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 /// `AccountSession::tick` every couple of seconds, for as long as the
 /// connection lasts.
 pub async fn tick_task(
@@ -693,7 +819,17 @@ pub async fn check_seen(
     let Some(link) = link else { return };
     for (user_id, key) in seen {
         let a = link.session().check_identity(user_id, &key);
+        let warned = a
+            .emit
+            .iter()
+            .any(|(name, _)| *name == "identity-key-changed");
         run(app, server, tcp_tx, a).await;
+        // A session kept from before that disagrees with the pin is no use to anyone
+        if warned {
+            crate::app_state::with_keys(signal, |stores, keying| {
+                keying.live_drop_kept_session(stores, user_id)
+            });
+        }
     }
 }
 
@@ -853,6 +989,21 @@ pub async fn account_enter(
     Ok(())
 }
 
+/// A channel that slept came on screen: read what was kept there meanwhile.
+#[tauri::command]
+pub async fn account_read_now(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+    server: String,
+    conv: String,
+) -> Result<(), String> {
+    let connections = state.connections.read().await;
+    let (connection, link) = signed_in(&connections, &server)?;
+    let a = link.session().read_now(&conv);
+    run(&app, &server, &connection.tcp_tx, a).await;
+    Ok(())
+}
+
 /// Delete what this account wrote to the stored logs: in `conv`, with a
 /// tombstone for the readers' copies, or (None) everywhere. `LogPurged`
 /// answers as `account-reply`.
@@ -955,6 +1106,7 @@ pub async fn account_block(
 #[tauri::command]
 pub async fn safety_number(
     state: State<'_, AppState>,
+    app: tauri::AppHandle,
     server: String,
     user_id: u32,
 ) -> Result<String, String> {
@@ -977,6 +1129,32 @@ pub async fn safety_number(
     let number = link
         .session()
         .safety_number(user_id, &own_key, live.as_deref());
+    if number.is_ok() {
+        let a = link.session().verified(user_id);
+        run(&app, &server, &connection.tcp_tx, a).await;
+    }
+    // On the live path nobody has met anyone until they write, and Verify is to work with
+    // anyone online. A person's own click: their bundle comes through the pin check.
+    if number.is_err()
+        && live.is_none()
+        && link.session().account_of(user_id).is_some()
+        && connection.tcp_tx.proto() >= voipc_protocol::types::LIVE_PATH_SINCE
+    {
+        let ask = connection
+            .signal
+            .lock()
+            .map_err(|e| e.to_string())?
+            .pending_sessions
+            .insert(user_id);
+        if ask {
+            connection
+                .tcp_tx
+                .send(&ClientMessage::RequestPreKeyBundle {
+                    target_user_id: user_id,
+                })?;
+        }
+        return Err("Asked for their key. Try again in a moment.".into());
+    }
     number
 }
 
@@ -1144,6 +1322,7 @@ pub async fn forget_device(
     server: String,
     name: String,
 ) -> Result<(), String> {
+    state.forget_kept(&server);
     let mut chat = state.chat.write().await;
     // What it read there, and who it named as readers, goes with it.
     let relays: Vec<[u8; 16]> = chat
@@ -1161,4 +1340,156 @@ pub async fn forget_device(
         .retain(|d| !(d.server == server && d.name == name));
     chat.dirty = true;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use voipc_protocol::codec::{encode_server_msg, PROTOCOL_VERSION};
+
+    /// A machine that asked its other device, as the relay leaves it waiting.
+    fn pairing() -> SignIn {
+        let (mut m, _) = SignIn::start(
+            "",
+            Method::Provider {
+                ticket: vec![],
+                invite: None,
+            },
+            PROTOCOL_VERSION,
+            "test",
+        );
+        m.on_message(&ServerMessage::AuthStep(AuthStep::ProviderSigned {
+            relay_id: [1; 16],
+            name: "luki".into(),
+            claim: false,
+            has_password: false,
+            challenge: vec![0; 32],
+            blobs: Vec::new(),
+        }))
+        .unwrap();
+        m.pair_start().unwrap();
+        m
+    }
+
+    fn nonce() -> ServerMessage {
+        ServerMessage::AuthStep(AuthStep::PairNonce {
+            nonce: voipc_crypto::pair::answer_key().1,
+        })
+    }
+
+    /// Measured on Linux, Android and Windows: the sign-in died about 10 s after
+    /// asking the other device, since the relay says nothing while a person walks over.
+    #[tokio::test(start_paused = true)]
+    async fn eleven_silent_seconds_end_no_pairing() {
+        let (mut relay, mut recv) = tokio::io::duplex(4096);
+        let wait = read_wait(&pairing());
+        let reader = tokio::spawn(async move {
+            let mut buf = BytesMut::new();
+            read(&mut recv, &mut buf, PROTOCOL_VERSION, wait).await
+        });
+        tokio::time::sleep(Duration::from_secs(11)).await;
+        assert!(!reader.is_finished(), "{:?}", reader.await);
+        relay
+            .write_all(&encode_server_msg(&nonce()).unwrap())
+            .await
+            .unwrap();
+        let msg = reader.await.unwrap().unwrap();
+        assert!(matches!(
+            msg,
+            ServerMessage::AuthStep(AuthStep::PairNonce { .. })
+        ));
+    }
+
+    /// The control: outside a pairing the usual bound holds, so a dead relay is noticed.
+    #[tokio::test(start_paused = true)]
+    async fn outside_a_pairing_a_silent_relay_still_times_out() {
+        let (_relay, mut recv) = tokio::io::duplex(4096);
+        let (mut m, _) = SignIn::start(
+            "",
+            Method::Provider {
+                ticket: vec![],
+                invite: None,
+            },
+            PROTOCOL_VERSION,
+            "test",
+        );
+        let wait = read_wait(&m);
+        let mut buf = BytesMut::new();
+        let err = read(&mut recv, &mut buf, PROTOCOL_VERSION, wait)
+            .await
+            .unwrap_err();
+        assert!(err.contains("Timed out"), "{err}");
+
+        // And after a refused pairing, the wait is back to the usual one
+        m = pairing();
+        m.on_message(&ServerMessage::AuthStep(AuthStep::PairRefused {
+            reason: "no".into(),
+        }))
+        .unwrap();
+        assert_eq!(read_wait(&m), CONNECT_TIMEOUT);
+    }
+
+    /// The pairing's own bound, past the relay's two minutes.
+    #[tokio::test(start_paused = true)]
+    async fn a_pairing_wait_has_an_end_past_the_relays() {
+        let (_relay, mut recv) = tokio::io::duplex(4096);
+        let wait = read_wait(&pairing());
+        let mut buf = BytesMut::new();
+        let started = tokio::time::Instant::now();
+        let err = read(&mut recv, &mut buf, PROTOCOL_VERSION, wait)
+            .await
+            .unwrap_err();
+        assert!(err.contains("Timed out"), "{err}");
+        assert!(started.elapsed() > Duration::from_secs(120));
+    }
+
+    /// W3-11: a Cancel on the new device has to reach this read: nothing else runs.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_reaches_a_pairing_wait() {
+        let (_relay, mut recv) = tokio::io::duplex(4096);
+        let (tx, rx) = oneshot::channel();
+        let wait = read_wait(&pairing());
+        let reader = tokio::spawn(async move {
+            let mut buf = BytesMut::new();
+            or_cancelled(read(&mut recv, &mut buf, PROTOCOL_VERSION, wait), rx).await
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(!reader.is_finished());
+        drop(tx);
+        assert_eq!(
+            reader.await.unwrap().unwrap_err(),
+            "Sign-in cancelled.",
+            "as an answer given up on is"
+        );
+    }
+
+    /// The control: an answer that comes first wins, with the Cancel unused.
+    #[tokio::test]
+    async fn an_answer_goes_through_or_cancelled() {
+        let (mut relay, mut recv) = tokio::io::duplex(4096);
+        let (_tx, rx) = oneshot::channel();
+        relay
+            .write_all(&encode_server_msg(&nonce()).unwrap())
+            .await
+            .unwrap();
+        let mut buf = BytesMut::new();
+        let msg = or_cancelled(
+            read(&mut recv, &mut buf, PROTOCOL_VERSION, PAIR_READ_WAIT),
+            rx,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            msg,
+            ServerMessage::AuthStep(AuthStep::PairNonce { .. })
+        ));
+    }
+
+    #[test]
+    fn the_new_answers_read_as_the_front_end_sends_them() {
+        let same: ProviderAnswer = serde_json::from_str(r#"{"kind":"same","yes":true}"#).unwrap();
+        assert!(matches!(same, ProviderAnswer::Same { yes: true }));
+        let saved: ProviderAnswer = serde_json::from_str(r#"{"kind":"keysaved"}"#).unwrap();
+        assert!(matches!(saved, ProviderAnswer::KeySaved));
+    }
 }

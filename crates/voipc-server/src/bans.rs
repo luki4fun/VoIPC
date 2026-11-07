@@ -382,7 +382,7 @@ pub async fn enforce(state: &Arc<ServerState>, skip: Option<u32>) {
         })
         .collect();
     for (sid, why) in covered {
-        crate::session::force_disconnect(state, sid, &why).await;
+        crate::session::eject(state, sid, &why).await;
     }
 }
 

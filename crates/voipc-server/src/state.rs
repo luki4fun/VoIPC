@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -11,6 +11,7 @@ use tokio::sync::{mpsc, RwLock};
 use tracing::warn;
 use zeroize::Zeroizing;
 
+use voipc_protocol::messages::ServerMessage;
 use voipc_protocol::types::*;
 
 use crate::channels::{ChannelEntry, MAX_SLOW_MODE_SECS};
@@ -59,6 +60,16 @@ impl RateLimiter {
         }
         allowed
     }
+
+    /// `try_consume`, for a budget counted in something other than messages.
+    pub fn try_consume_n(&mut self, n: f64) -> bool {
+        self.has_token();
+        let allowed = self.tokens >= n;
+        if allowed {
+            self.tokens -= n;
+        }
+        allowed
+    }
 }
 
 /// Per-user session state held by the server.
@@ -88,6 +99,12 @@ pub struct UserSession {
     pub scope_written: u64,
     /// The relay account this connection signed in with; `None` for a guest.
     pub account: Option<AccountSession>,
+    /// Put out by a moderator or the server, not gone by itself: their disconnect is an
+    /// exit, and whoever keyed them starts a new chain (`session::eject`).
+    pub ejected: bool,
+    /// Writers who asked this follower to open a session (`OpenSessions`) and have had no
+    /// hello: a `SessionHello` goes only to one of these, once.
+    pub session_asked: HashSet<UserId>,
     /// This user answers requests for recent channel chat. Told to the server
     /// only so a member list can show who asking would reach; the server has
     /// always seen the requests themselves go past.
@@ -188,6 +205,16 @@ pub struct UserSession {
     pub(crate) key_relay_burst: f64,
     /// Rate limiter for channel creation.
     pub create_channel_rate: RateLimiter,
+    /// `KeyCheck`s: one before each post that needs one, and it can list everybody.
+    pub key_check_rate: RateLimiter,
+    /// Asking who is in a channel: each answer builds and sorts the list, and can be
+    /// megabytes. One per channel in a burst, which a sweep takes, and more for long lists.
+    pub roster_rate: RateLimiter,
+    /// Bytes of text channel posts: a post goes to everyone online, whatever it weighs.
+    pub post_bytes_rate: RateLimiter,
+    /// `RenewSessionKeys`: stored, told to nobody, and one a key job at most from an honest
+    /// app, whose old keys go a minute later, so an honest one must not hit this.
+    pub renew_keys_rate: RateLimiter,
     /// Rate limiter for pre-key uploads.
     pub prekey_rate: RateLimiter,
     /// Rate limiter for pre-key bundle requests (each consumes a target's one-time key).
@@ -304,6 +331,8 @@ impl UserSession {
             scope_read: 0,
             scope_written: 0,
             account: None,
+            ejected: false,
+            session_asked: HashSet::new(),
             shares_history: false,
             admin_login_failures: 0,
             close: Default::default(),
@@ -366,6 +395,10 @@ impl UserSession {
             key_relay_rate: HashMap::new(),
             key_relay_burst: channel_budget as f64 + 8.0,
             create_channel_rate: RateLimiter::new(1.0, 0.2),
+            key_check_rate: RateLimiter::new(channel_budget as f64 + 8.0, 5.0),
+            roster_rate: RateLimiter::new(channel_budget as f64 + 8.0, 5.0),
+            post_bytes_rate: RateLimiter::new(64.0 * 1024.0, 4.0 * 1024.0),
+            renew_keys_rate: RateLimiter::new(8.0, 1.0),
             prekey_rate: RateLimiter::new(1.0, 0.2),
             // One bundle per person on the server, in a burst, because that is
             // what arriving costs: a pairwise session with everybody, for DMs
@@ -379,6 +412,32 @@ impl UserSession {
             watching_screenshare: None,
             identity_key: None,
             bundle: None,
+        }
+    }
+
+    /// This member as a row of `channel_id`'s list.
+    fn row_in(
+        &self,
+        channel_id: ChannelId,
+        username: String,
+        account: Option<[u8; 16]>,
+    ) -> UserInfo {
+        UserInfo {
+            user_id: self.user_id,
+            username,
+            // The channel being listed, not the one the member stands
+            // in: for a text channel those differ, and handing out the
+            // voice room would tie an anonymous channel's pseudonym to
+            // a roster where the same person appears under their name.
+            channel_id,
+            is_muted: self.is_muted,
+            is_deafened: self.is_deafened,
+            is_screen_sharing: self.is_screen_sharing,
+            is_admin: self.is_admin,
+            shares_history: self.shares_history,
+            account,
+            is_moderator: self.powers.has(crate::accounts::Powers::CHANNELS),
+            badges: self.badges_with(account),
         }
     }
 
@@ -414,6 +473,112 @@ pub struct ScreenShareSession {
     pub codec: VideoCodec,
 }
 
+/// A follower's place in a text channel's count (`Follow`).
+#[derive(Clone, Copy)]
+pub struct Seat {
+    /// A writer whose `keyed` has not reached this owes them a key, and sends them no post.
+    pub at: u64,
+    /// Their first stamp since coming in. A writer who keyed them holds on to that through
+    /// quiet and back, so an exit goes by this one.
+    pub first: u64,
+}
+
+/// A quiet follower nobody ever keyed: no writer's `keyed` reaches this.
+const NEVER_WHOLE: u64 = u64::MAX;
+
+/// Who follows a text channel on the live path (protocol v21), and how far each writer has
+/// named them. In memory only. Everyone here is in `Channel::members` too, which gates,
+/// post rules and files go by.
+#[derive(Default)]
+pub struct Follow {
+    /// Taking posts.
+    pub joined: HashMap<UserId, Seat>,
+    /// Holding a seat and a mark, with no post and no key: their first stamp.
+    pub quiet: HashMap<UserId, u64>,
+    /// Writer -> the last stamp they have been told of. A post goes up to here.
+    pub keyed: HashMap<UserId, u64>,
+    /// The last stamp given.
+    pub last_join: u64,
+    /// When the last post passed, for marks. Set without a write lock, 0 since a restart.
+    pub last_post_ms: AtomicU64,
+}
+
+impl Follow {
+    /// Takes `user` whole or quiet. Nothing changes for someone already that, so a repeated
+    /// join owes nobody anything.
+    pub fn set(&mut self, user: UserId, quiet: bool) {
+        let first = self
+            .joined
+            .get(&user)
+            .map(|s| s.first)
+            .or_else(|| self.quiet.get(&user).copied());
+        if quiet {
+            self.joined.remove(&user);
+            self.quiet.insert(user, first.unwrap_or(NEVER_WHOLE));
+        } else if !self.joined.contains_key(&user) {
+            self.quiet.remove(&user);
+            self.last_join += 1;
+            let at = self.last_join;
+            let first = first.unwrap_or(at).min(at);
+            self.joined.insert(user, Seat { at, first });
+        }
+    }
+
+    pub fn holds(&self, user: UserId) -> bool {
+        self.joined.contains_key(&user) || self.quiet.contains_key(&user)
+    }
+
+    /// Out, as a follower and as a writer: the stamp their exit goes by.
+    fn remove(&mut self, user: UserId) -> Option<u64> {
+        self.keyed.remove(&user);
+        self.joined
+            .remove(&user)
+            .map(|s| s.first)
+            .or_else(|| self.quiet.remove(&user))
+    }
+
+    /// Whom `writer` owes a key, in id order, and the stamp that takes them to.
+    pub fn owed(&self, writer: UserId, restart: bool) -> (Vec<UserId>, u64) {
+        let upto = self.last_join;
+        let from = if restart {
+            0
+        } else {
+            self.keyed.get(&writer).copied().unwrap_or(0)
+        };
+        if from >= upto {
+            return (Vec::new(), upto);
+        }
+        let mut ids: Vec<UserId> = self
+            .joined
+            .iter()
+            .filter(|(u, s)| **u != writer && s.at > from)
+            .map(|(u, _)| *u)
+            .collect();
+        ids.sort_unstable();
+        (ids, upto)
+    }
+
+    /// Who reads a post by `writer`.
+    pub fn readers_of(&self, writer: UserId) -> Vec<UserId> {
+        let Some(&upto) = self.keyed.get(&writer) else {
+            return Vec::new();
+        };
+        self.joined
+            .iter()
+            .filter(|(u, s)| **u != writer && s.at <= upto)
+            .map(|(u, _)| *u)
+            .collect()
+    }
+
+    /// The writers an exit by a follower with this first stamp reaches.
+    fn who_keyed(&self, first: u64) -> impl Iterator<Item = UserId> + '_ {
+        self.keyed
+            .iter()
+            .filter(move |(_, upto)| **upto >= first)
+            .map(|(w, _)| *w)
+    }
+}
+
 /// A channel/room on the server.
 pub struct Channel {
     pub info: ChannelInfo,
@@ -445,9 +610,32 @@ pub struct Channel {
     pub gate_key: String,
     /// Made in the app (`crate::layout`): a row of `voipc_channels`, not of the file.
     pub kept: bool,
+    /// Who follows it on the live path, if it is a text channel.
+    pub follow: Follow,
 }
 
 impl Channel {
+    /// Whether a list of groups keeps people out.
+    pub fn gated(&self) -> bool {
+        !self.gate.groups.is_empty()
+    }
+
+    /// Where a device asks who is here, so a person's going is pushed to it: a gate, or one
+    /// joined by hand. Elsewhere anyone online may read anyway.
+    pub fn tells_who_left(&self) -> bool {
+        self.info.text && (self.gated() || !self.info.auto_join || self.password.is_some())
+    }
+
+    /// A `TextJoined` row, for a follower who listens only or not.
+    pub fn seat_row(&self, listen_only: bool) -> (ChannelId, bool, bool, u64) {
+        (
+            self.info.channel_id,
+            listen_only,
+            self.gated(),
+            self.follow.last_post_ms.load(Ordering::Relaxed),
+        )
+    }
+
     /// A persistent channel, as an entry says. `logs`: this relay keeps messages.
     pub fn from_entry(
         entry: &ChannelEntry,
@@ -510,6 +698,7 @@ impl Channel {
             gate: ChannelGate::default(),
             gate_key: entry.log_conv(),
             kept: false,
+            follow: Follow::default(),
         };
         channel.refresh_log();
         channel
@@ -561,6 +750,40 @@ impl Channel {
             self.log_conv.clone()
         };
     }
+}
+
+/// Whether everyone with an app holds who stands in this room, as a list they asked for or
+/// the joins since: so a bare id tells them who it is.
+fn list_is_public(channel: &Channel) -> bool {
+    !channel.info.text
+        && !channel.info.anonymous
+        && !channel.info.hide_members
+        && channel.password.is_none()
+        && !channel.gated()
+}
+
+/// What a page of people may fill: a frame, less what goes around it.
+const PAGE_BYTES: usize = 60 * 1024;
+/// What a bare id costs a page at most.
+const ID_BYTES: usize = 5;
+
+/// What a row costs a page at most: its ids and flags, and its strings.
+fn row_bytes(row: &UserInfo) -> usize {
+    48 + row.username.len() + row.badges.iter().map(|b| b.len() + 5).sum::<usize>()
+}
+
+/// As many of `rows` as a page holds, and the rest.
+pub fn cut_rows(mut rows: Vec<UserInfo>) -> (Vec<UserInfo>, Vec<UserInfo>) {
+    let mut bytes = 0;
+    let fit = rows
+        .iter()
+        .position(|r| {
+            bytes += row_bytes(r);
+            bytes > PAGE_BYTES
+        })
+        .unwrap_or(rows.len());
+    let rest = rows.split_off(fit.max(1).min(rows.len()));
+    (rows, rest)
 }
 
 /// The one admission decision. Returns whether an invite is what let them in —
@@ -745,6 +968,10 @@ pub struct ServerState {
     /// When a guest at each address (`limit_key`) was first and last seen, while the
     /// wait for new members is on.
     pub guest_clocks: DashMap<IpAddr, crate::restrict::GuestClock>,
+    /// Writers to tell on the next tick that someone they keyed is out of these channels
+    /// (`session::send_exits`).
+    pub prune_asks: crate::gates::PruneAsks,
+    pub exits_due: DashMap<UserId, HashSet<ChannelId>>,
     /// Every account holding a privilege (`accounts::read_chat_mods`), as clients
     /// were last told. Stays empty on a relay without accounts.
     pub chat_mods: RwLock<Vec<voipc_protocol::types::ChatMod>>,
@@ -788,6 +1015,13 @@ pub struct ServerState {
 pub enum PostStamp {
     Live,
     Kept,
+    /// Would a live post pass now? Starts no clock (`KeyCheck`).
+    Check,
+    /// Would a kept copy pass now? Starts no clock: what it comes to is up to the log.
+    KeptCheck,
+    /// May they hand out a key here? A check without slow mode: keys go out behind a post
+    /// that has just started its clock (`OpenSessions`).
+    Keys,
 }
 
 /// Who slow mode holds back: an account across every connection it makes (a
@@ -796,6 +1030,41 @@ pub enum PostStamp {
 pub enum Poster {
     Account([u8; 16]),
     Session(SessionId),
+}
+
+/// `TextJoined`, in as many frames as it takes, and at least one: the answer is also how an
+/// app knows it was heard.
+/// A client's list of channels in order, each once.
+fn each_once(ids: &[ChannelId]) -> Vec<ChannelId> {
+    let mut ids = ids.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+fn send_text_joined(
+    tx: &ControlTx,
+    joined: Vec<(ChannelId, bool, bool, u64)>,
+    mut refused: Vec<ChannelId>,
+) {
+    // In one order: what no gate was asked about comes first otherwise, and that says which
+    // of them are channels someone cannot see
+    refused.sort_unstable();
+    // A row is at most 17 bytes, an id 5, and a frame holds 64 KiB
+    let mut rows = joined.chunks(3000);
+    let mut out = refused.chunks(10_000);
+    loop {
+        let _ = crate::session::send_msg(
+            tx,
+            &ServerMessage::TextJoined {
+                joined: rows.next().unwrap_or_default().to_vec(),
+                refused: out.next().unwrap_or_default().to_vec(),
+            },
+        );
+        if rows.len() == 0 && out.len() == 0 {
+            return;
+        }
+    }
 }
 
 impl ServerState {
@@ -860,6 +1129,7 @@ impl ServerState {
                 gate: ChannelGate::default(),
                 gate_key: String::new(),
                 kept: false,
+                follow: Follow::default(),
             },
         );
 
@@ -903,6 +1173,8 @@ impl ServerState {
             bans: DashMap::new(),
             restrictions: DashMap::new(),
             guest_clocks: DashMap::new(),
+            prune_asks: Default::default(),
+            exits_due: DashMap::new(),
             chat_mods: RwLock::new(Vec::new()),
             ban_salt: rand::random(),
             bans_file: None,
@@ -988,6 +1260,9 @@ impl ServerState {
         if announce {
             return Err(format!("only moderators can post in #{name}"));
         }
+        if stamp == PostStamp::Keys {
+            return Ok(());
+        }
         // A hide is a post the relay cannot tell from any other, and slow mode
         // must not hold back taking something down
         if self
@@ -1001,12 +1276,20 @@ impl ServerState {
             Some(a) => Poster::Account(a),
             None => Poster::Session(session_id),
         };
-        let key = (channel_id, poster, stamp);
+        let clock = match stamp {
+            PostStamp::Check => PostStamp::Live,
+            PostStamp::KeptCheck => PostStamp::Kept,
+            other => other,
+        };
+        let key = (channel_id, poster, clock);
         let now = Instant::now();
         if let Some(wait) =
             slow_mode_wait(self.post_marks.get(&key).map(|t| *t), now, slow_mode_secs)
         {
             return Err(format!("slow mode in #{name}: wait {wait} s"));
+        }
+        if matches!(stamp, PostStamp::Check | PostStamp::KeptCheck) {
+            return Ok(());
         }
         // Nothing older than the longest slow mode can still hold anybody back.
         let longest = std::time::Duration::from_secs(MAX_SLOW_MODE_SECS.into());
@@ -1145,23 +1428,7 @@ impl ServerState {
                 };
                 // Never under a pseudonym: it would name the account.
                 let account = account_shown(session.account_id(), !anonymous, false);
-                Some(UserInfo {
-                    user_id: session.user_id,
-                    username,
-                    // The channel being listed, not the one the member stands
-                    // in: for a text channel those differ, and handing out the
-                    // voice room would tie an anonymous channel's pseudonym to
-                    // a roster where the same person appears under their name.
-                    channel_id,
-                    is_muted: session.is_muted,
-                    is_deafened: session.is_deafened,
-                    is_screen_sharing: session.is_screen_sharing,
-                    is_admin: session.is_admin,
-                    shares_history: session.shares_history,
-                    account,
-                    is_moderator: session.powers.has(crate::accounts::Powers::CHANNELS),
-                    badges: session.badges_with(account),
-                })
+                Some(session.row_in(channel_id, username, account))
             })
             .collect()
     }
@@ -1184,10 +1451,15 @@ impl ServerState {
     pub async fn channel_password_attempt(
         &self,
         channel_id: ChannelId,
+        user_id: UserId,
         attempt: Option<&str>,
     ) -> Option<Zeroizing<String>> {
         let attempt = Zeroizing::new(attempt?.to_string());
         let stored = match self.channels.read().await.get(&channel_id) {
+            // Outside its gate it is not there: nothing to hash, and nothing that could match
+            Some(c) if c.persistent && !self.passes(user_id, &c.gate.groups) => {
+                return Some(Zeroizing::new(String::new()));
+            }
             Some(c) if c.persistent => c.password.clone(),
             _ => None,
         };
@@ -1389,6 +1661,249 @@ impl ServerState {
         Ok(true)
     }
 
+    /// Follows these text channels, whole or quiet, in one write of the channel map, and
+    /// answers under it, so nothing about them overtakes the answer. It tells nobody else.
+    /// Each passes the admission a join does, with no password; an id it fails, a voice room
+    /// or nothing at all is `refused`, in the same words. Past a gate only `*` opens, it is
+    /// refused too: a person walks into that by a click, never their app.
+    pub async fn follow_text_channels(
+        &self,
+        user_id: UserId,
+        whole: &[ChannelId],
+        quiet: &[ChannelId],
+        tx: &ControlTx,
+    ) {
+        // Every room's voice queues behind the write lock, and one frame names some 60,000
+        // ids. Only text channels there are get that far, each once, so it holds for no more
+        // than the server has. No count cuts the rest off, which would tell a guest how many
+        // channels there are, hidden ones too: they go back as refused, about as long as asked.
+        let quiet = each_once(quiet);
+        let mut whole = each_once(whole);
+        whole.retain(|id| quiet.binary_search(id).is_err());
+        let mut refused = Vec::new();
+        let (whole, quiet) = {
+            let channels = self.channels.read().await;
+            let mut real = |ids: Vec<ChannelId>| -> Vec<ChannelId> {
+                let (real, rest) = ids
+                    .into_iter()
+                    .partition(|id| channels.get(id).is_some_and(|c| c.info.text));
+                refused.extend::<Vec<ChannelId>>(rest);
+                real
+            };
+            (real(whole), real(quiet))
+        };
+        if whole.is_empty() && quiet.is_empty() {
+            send_text_joined(tx, Vec::new(), refused);
+            return;
+        }
+        let mut channels = self.channels.write().await;
+        let Some(mut session) = self.sessions.get_mut(&user_id) else {
+            return;
+        };
+        let mut joined = Vec::new();
+        let asked = whole
+            .iter()
+            .map(|id| (*id, false))
+            .chain(quiet.iter().map(|id| (*id, true)));
+        for (channel_id, go_quiet) in asked {
+            let Some(channel) = channels.get_mut(&channel_id).filter(|c| c.info.text) else {
+                refused.push(channel_id);
+                continue;
+            };
+            if !channel.members.contains(&user_id) {
+                let passes = crate::gates::passes_without_star(&session, &channel.gate.groups);
+                match check_admission(channel, user_id, None, passes) {
+                    Ok(invited) => {
+                        if invited {
+                            channel.end_invite(user_id);
+                        }
+                    }
+                    Err(_) => {
+                        refused.push(channel_id);
+                        continue;
+                    }
+                }
+                if let Some(timer) = channel.delete_timer.take() {
+                    timer.abort();
+                }
+                channel.members.insert(user_id);
+                channel.info.user_count = channel.members.len() as u32;
+            }
+            channel.follow.set(user_id, go_quiet);
+            let listen = !crate::gates::passes(&session, &channel.gate.speakers);
+            crate::gates::mark(&mut session.listen_only, channel_id, listen);
+            joined.push(channel.seat_row(listen));
+        }
+        drop(session);
+        send_text_joined(tx, joined, refused);
+    }
+
+    /// Takes followed channels whole or quiet. Going quiet is no exit: nobody rotates, and
+    /// the first stamp stays. Going whole is a new stamp, so writers name them at their next
+    /// post, and is answered. An id this session does not follow changes nothing.
+    pub async fn set_quiet(&self, user_id: UserId, ids: &[ChannelId], quiet: bool, tx: &ControlTx) {
+        // As `follow_text_channels`: only what they follow reaches the write lock, each once
+        let (ids, mut refused): (Vec<ChannelId>, Vec<ChannelId>) = {
+            let channels = self.channels.read().await;
+            each_once(ids)
+                .into_iter()
+                .partition(|id| channels.get(id).is_some_and(|c| c.follow.holds(user_id)))
+        };
+        if ids.is_empty() {
+            if !quiet {
+                send_text_joined(tx, Vec::new(), refused);
+            }
+            return;
+        }
+        let mut channels = self.channels.write().await;
+        let mut joined = Vec::new();
+        for channel_id in ids {
+            match channels
+                .get_mut(&channel_id)
+                .filter(|c| c.follow.holds(user_id))
+            {
+                Some(channel) => {
+                    channel.follow.set(user_id, quiet);
+                    let listen = self
+                        .sessions
+                        .get(&user_id)
+                        .is_some_and(|s| s.listen_only.contains(&channel_id));
+                    joined.push(channel.seat_row(listen));
+                }
+                None => refused.push(channel_id),
+            }
+        }
+        if !quiet {
+            send_text_joined(tx, joined, refused);
+        }
+    }
+
+    /// Who `writer` owes a key in `channel_id`, as `KeysOwed` frames carry them: `(ids,
+    /// rows)`. From here on their posts reach everyone named. `None`: not a text channel.
+    pub async fn keys_owed(
+        &self,
+        channel_id: ChannelId,
+        writer: UserId,
+        restart: bool,
+    ) -> Option<Vec<(Vec<UserId>, Vec<UserInfo>)>> {
+        // Walked under the read lock, which voice shares; the map is written after, and a
+        // join in between has a later stamp, so it is owed next time.
+        let (frames, upto, known) = {
+            let channels = self.channels.read().await;
+            let channel = channels.get(&channel_id).filter(|c| c.info.text)?;
+            let (ids, upto) = channel.follow.owed(writer, restart);
+            let known = channel
+                .follow
+                .keyed
+                .get(&writer)
+                .is_some_and(|k| *k >= upto);
+            let mut frames = Vec::new();
+            let mut left = ids.as_slice();
+            while !left.is_empty() {
+                let (bare, rows, used) = self.member_frame(&channels, channel_id, left);
+                frames.push((bare, rows));
+                left = &left[used..];
+            }
+            (frames, upto, known)
+        };
+        if !known {
+            if let Some(channel) = self.channels.write().await.get_mut(&channel_id) {
+                if channel.members.contains(&writer) {
+                    let keyed = channel.follow.keyed.entry(writer).or_insert(0);
+                    *keyed = upto.max(*keyed);
+                }
+            }
+        }
+        Some(frames)
+    }
+
+    /// As much of `ids` as a frame holds: a bare id for someone a public list names, a row
+    /// for anyone else. How many of `ids` that used up.
+    fn member_frame(
+        &self,
+        channels: &HashMap<ChannelId, Channel>,
+        channel_id: ChannelId,
+        ids: &[UserId],
+    ) -> (Vec<UserId>, Vec<UserInfo>, usize) {
+        let (mut bare, mut rows, mut bytes) = (Vec::new(), Vec::new(), 0);
+        for (used, uid) in ids.iter().enumerate() {
+            let Some(session) = self.sessions.get(uid) else {
+                continue;
+            };
+            let public = channels
+                .get(&session.channel_id)
+                .is_some_and(list_is_public);
+            let row = (!public).then(|| {
+                // A text channel never has a pseudonym: this name is the one it has always
+                // told its members.
+                let account = account_shown(session.account_id(), true, false);
+                session.row_in(channel_id, session.username.clone(), account)
+            });
+            bytes += row.as_ref().map_or(ID_BYTES, row_bytes);
+            if bytes > PAGE_BYTES && used > 0 {
+                return (bare, rows, used);
+            }
+            match row {
+                Some(row) => rows.push(row),
+                None => bare.push(*uid),
+            }
+        }
+        (bare, rows, ids.len())
+    }
+
+    /// One page of who is in a channel, from past `after`, for `viewer`, whose asking has been
+    /// allowed: `(ids, rows, next, total)`.
+    pub async fn channel_page(
+        &self,
+        channel_id: ChannelId,
+        viewer: SessionId,
+        after: UserId,
+    ) -> (Vec<UserId>, Vec<UserInfo>, UserId, u32) {
+        let text = {
+            let channels = self.channels.read().await;
+            match channels.get(&channel_id).filter(|c| c.info.text) {
+                Some(channel) => {
+                    let mut all: Vec<UserId> = channel
+                        .members
+                        .iter()
+                        .copied()
+                        .filter(|uid| self.sessions.contains_key(uid))
+                        .collect();
+                    all.sort_unstable();
+                    let total = all.len() as u32;
+                    let from = all.partition_point(|uid| *uid <= after);
+                    let left = &all[from..];
+                    let (ids, rows, used) = self.member_frame(&channels, channel_id, left);
+                    let next = if used < left.len() { left[used - 1] } else { 0 };
+                    Some((ids, rows, next, total))
+                }
+                None => None,
+            }
+        };
+        if let Some(page) = text {
+            return page;
+        }
+        let mut users = self.users_in_channel_for(channel_id, viewer).await;
+        let total = users.len() as u32;
+        users.retain(|u| u.user_id > after);
+        users.sort_unstable_by_key(|u| u.user_id);
+        let (rows, rest) = cut_rows(users);
+        let next = if rest.is_empty() {
+            0
+        } else {
+            rows.last().map_or(0, |u| u.user_id)
+        };
+        (Vec::new(), rows, next, total)
+    }
+
+    /// Puts an exit from `channel_id` on the next tick for the writers who keyed that
+    /// follower (`session::send_exits`). The channel lock is what keeps it in step.
+    fn exit_due(&self, channel_id: ChannelId, follow: &Follow, first: u64) {
+        for writer in follow.who_keyed(first) {
+            self.exits_due.entry(writer).or_default().insert(channel_id);
+        }
+    }
+
     /// Unsubscribe a user from a text channel. Returns the remaining member
     /// count, or `None` if they were not in it (or it is not a text channel).
     pub async fn leave_text_channel(
@@ -1403,12 +1918,17 @@ impl ServerState {
         }
         channel.info.user_count = channel.members.len() as u32;
         channel.pseudonyms.remove(&user_id);
+        if let Some(first) = channel.follow.remove(user_id) {
+            self.exit_due(channel_id, &channel.follow, first);
+        }
         Some(channel.members.len())
     }
 
     /// Drop every text subscription a user holds (on disconnect).
     /// Returns each channel left and how many members it has left.
     pub async fn leave_all_text_channels(&self, user_id: UserId) -> Vec<(ChannelId, usize)> {
+        // Going offline tells no one: a chain's age covers it. Being put out does.
+        let ejected = self.sessions.get(&user_id).is_some_and(|s| s.ejected);
         let mut channels = self.channels.write().await;
         let mut left = Vec::new();
         for channel in channels.values_mut() {
@@ -1417,6 +1937,11 @@ impl ServerState {
             }
             channel.info.user_count = channel.members.len() as u32;
             channel.pseudonyms.remove(&user_id);
+            if let Some(first) = channel.follow.remove(user_id) {
+                if ejected {
+                    self.exit_due(channel.info.channel_id, &channel.follow, first);
+                }
+            }
             left.push((channel.info.channel_id, channel.members.len()));
         }
         left
@@ -1494,6 +2019,7 @@ impl ServerState {
         // long-lived session has ever shared a channel with.
         for mut other in self.sessions.iter_mut() {
             other.key_relay_rate.remove(&session.user_id);
+            other.session_asked.remove(&session.user_id);
         }
 
         Some(session)
@@ -1591,6 +2117,7 @@ impl ServerState {
                 gate: ChannelGate::default(),
                 gate_key: String::new(),
                 kept: false,
+                follow: Follow::default(),
             },
         );
 
@@ -1984,6 +2511,9 @@ impl ServerState {
         channel.members.remove(&target_id);
         channel.info.user_count = channel.members.len() as u32;
         channel.pseudonyms.remove(&target_id);
+        if let Some(first) = channel.follow.remove(target_id) {
+            self.exit_due(channel_id, &channel.follow, first);
+        }
 
         let target_session_id = self
             .sessions
@@ -2573,6 +3103,7 @@ pub(crate) mod test_support {
             gate: ChannelGate::default(),
             gate_key: String::new(),
             kept: false,
+            follow: Follow::default(),
         });
         for &(user_id, session_id) in users {
             channel.members.insert(user_id);
@@ -3764,8 +4295,8 @@ mod tests {
             .as_ref()
             .unwrap()
             .starts_with("$argon2id$"));
-        let right = state.channel_password_attempt(1, Some("pw")).await;
-        let wrong = state.channel_password_attempt(1, Some("nope")).await;
+        let right = state.channel_password_attempt(1, 5, Some("pw")).await;
+        let wrong = state.channel_password_attempt(1, 5, Some("nope")).await;
         let channels = state.channels.read().await;
         assert!(
             check_admission(&channels[&1], 5, right.as_deref().map(|p| p.as_str()), true).is_ok()
@@ -3776,6 +4307,57 @@ mod tests {
         assert!(
             check_admission(&channels[&1], 5, Some("pw"), true).is_err(),
             "only an attempt checked against the hash gets in"
+        );
+    }
+
+    /// Outside its gate a channel is not there, so working out a hash for it would tell it from
+    /// one that is not there by how long the answer takes. Both turns taken: whatever waits for
+    /// a turn cannot finish.
+    #[tokio::test]
+    async fn outside_a_gate_no_password_is_hashed() {
+        let state = ServerState::new(
+            &ServerConfig::default(),
+            ServerSettings::default(),
+            vec![ChannelEntry {
+                name: "Lounge".into(),
+                ..Default::default()
+            }],
+            "t".into(),
+        );
+        assert!(state
+            .set_channel_password(1, 9, Some("pw".into()), true)
+            .await
+            .unwrap()
+            .is_some());
+        let _turns = state.channel_kdf.acquire_many(2).await.unwrap();
+        let wait = std::time::Duration::from_millis(200);
+        assert!(
+            tokio::time::timeout(wait, state.channel_password_attempt(1, 5, Some("pw")))
+                .await
+                .is_err(),
+            "the control: with no gate it waits for its turn"
+        );
+        state
+            .channels
+            .write()
+            .await
+            .get_mut(&1)
+            .unwrap()
+            .gate
+            .groups = vec!["crew".into()];
+        let attempt = tokio::time::timeout(wait, state.channel_password_attempt(1, 5, Some("pw")))
+            .await
+            .expect("nothing to wait for");
+        let channels = state.channels.read().await;
+        assert!(
+            check_admission(
+                &channels[&1],
+                5,
+                attempt.as_deref().map(|p| p.as_str()),
+                true
+            )
+            .is_err(),
+            "what comes back matches nothing, should a grant land in between"
         );
     }
 

@@ -39,15 +39,20 @@
     activeDmUsername,
     activeTextChannelId,
     channelUnread,
+    chatKey,
     closeDmRow,
     dmList,
     joinedTextChannelIds,
     openDm,
     unreadPerChannel,
+    unseenChannels,
   } from "../../stores/chat.js";
+  import { channelRings } from "../../stores/marks.js";
+  import { rowMark } from "../../marks-rules.js";
   import { ago, awayHint, liveIdOf, reach, writeToId } from "../../dm-rules.js";
   import { notificationBody } from "../../chat-rules.js";
   import { levelTitle } from "../../notify-rules.js";
+  import { marksChannel } from "../../follow-rules.js";
   import { groupChannels, shownOf, type ChannelGroup } from "../../channel-groups.js";
   import { uiPrefs } from "../../stores/ui-prefs.js";
   import {
@@ -107,27 +112,35 @@
   }
 </script>
 
-{#snippet notifyButton(channel: { name: string; user_count: number })}
+{#snippet notifyButton(channel: ChannelInfo)}
   <!-- `$uiPrefs` first: the store it reads does not make this reactive by itself. -->
-  {@const level = $uiPrefs && channelNotify($serverAddress, channel.name, channel.user_count)}
+  {@const level = $uiPrefs && channelNotify($serverAddress, channel)}
   <button
     class="settings-icon"
     title={levelTitle(level)}
     aria-label={levelTitle(level)}
-    onclick={() => cycleChannelNotify($serverAddress, channel.name, channel.user_count)}
+    onclick={() => cycleChannelNotify($serverAddress, channel)}
   ><Icon name={level === "nothing" ? "bell-off" : "bell"} size={14} /></button>
 {/snippet}
 
 {#snippet textRow(channel: ChannelInfo)}
         {@const subscribed = $joinedTextChannelIds.has(channel.channel_id)}
-        {@const left = !subscribed && $leftTextChannelNames.has(channel.name)}
+        {@const left = !subscribed && marksChannel($leftTextChannelNames, channel)}
         {@const unread = channelUnread($unreadPerChannel, $serverAddress, channel.name)}
+        {@const mark = $uiPrefs && rowMark({
+          left,
+          level: channelNotify($serverAddress, channel),
+          unread,
+          unseen: $unseenChannels.has(chatKey($serverAddress, channel.name)),
+          ring: $channelRings.get(channel.channel_id) === "lit",
+        })}
         <div class="channel-row">
         <button
           class="channel"
           class:has-actions={subscribed || canEditChannel(channel)}
           class:active={$activeTextChannelId === channel.channel_id}
           class:unjoined={!subscribed}
+          class:has-news={mark === "dot" || mark === "count"}
           class:left
           onclick={() => selectChannel(channel)}
           title={subscribed ? undefined : "Click to read it; joining is a button in the chat pane"}
@@ -138,15 +151,16 @@
           {#if left}
             <span class="proximity-tag" title="You left this channel — click to read, rejoin to write">left</span>
           {/if}
-          {#if !(channel.hide_members && !$isAdmin)}
-            <span class="user-count">{channel.user_count}</span>
-          {/if}
           {#if channel.has_password}
             <span class="channel-icon"><Icon name="lock" size={14} /></span>
           {/if}
           <ChannelTags {channel} />
-          {#if unread > 0}
+          {#if mark === "count"}
             <span class="channel-unread">{unread}</span>
+          {:else if mark === "dot"}
+            <span class="channel-dot" role="img" aria-label="New messages" title="New messages"></span>
+          {:else if mark === "ring"}
+            <span class="channel-ring" role="img" aria-label="Someone wrote here while you were away" title="Someone wrote here while you were away. It may not be here."></span>
           {/if}
         </button>
         {#if subscribed || canEditChannel(channel)}
@@ -302,6 +316,8 @@
         <span class="sidebar-title">{group.category.name}</span>
         {#if folded && unreadIn(group) > 0}
           <span class="channel-unread">{unreadIn(group)}</span>
+        {:else if folded && group.text.some((c) => $unseenChannels.has(chatKey($serverAddress, c.name)))}
+          <span class="channel-dot" role="img" aria-label="New messages"></span>
         {/if}
       </button>
     {/if}
@@ -538,6 +554,30 @@
   .category-arrow.folded {
     transform: rotate(-90deg);
   }
+  /* Something new and no count: the row says so, and the dot is there for who sees no bold */
+  .channel.has-news {
+    color: var(--text-primary);
+    font-weight: 600;
+  }
+
+  .channel-dot,
+  .channel-ring {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  .channel-dot {
+    background: var(--text-primary);
+  }
+
+  /* Hollow: only that someone wrote, and what they wrote may not be here */
+  .channel-ring {
+    border: 1.5px solid var(--text-secondary);
+    box-sizing: border-box;
+  }
+
   .channel-unread {
     min-width: 16px;
     padding: 0 5px;

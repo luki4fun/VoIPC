@@ -268,7 +268,7 @@
       A private channel's history needs its own tick. Its name and topic go regardless; Leave out to keep them off. A channel's messages off covers its threads too.
     </p>
     {#if plan.delta}
-      <p class="admin-hint wizard-again">A channel that came before starts on again unless you leave it out each time.</p>
+      <p class="admin-hint wizard-again">A channel that came before starts on again unless you leave it out each time. A private one starts off: tick it each run.</p>
     {/if}
     <ul class="list wizard-channels">
       {#each plan.channels as ch (ch.id)}
@@ -366,7 +366,7 @@
   {:else if w.step === "running"}
     {@const p = w.progress}
     {#if w.resumed}<p class="admin-hint">Going on from where the last run stopped.</p>{/if}
-    {#if w.backup}<p class="admin-hint wizard-backup-path">The copy of the database: <code>{w.backup}</code></p>{/if}
+    {#if w.backup}<p class="admin-hint wizard-backup-path">The copy of the database: <code>{w.backup}</code>. It stays until you delete it. Delete it when you know the move went well.</p>{/if}
     <p class="move-line wizard-progress" role="status">{p ? progressLine(p) : "Starting"}</p>
     {#if p && p.total > 0}
       <progress max={p.total} value={p.done} aria-label="How far it has got"></progress>

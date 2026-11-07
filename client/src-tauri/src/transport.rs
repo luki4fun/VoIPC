@@ -410,6 +410,10 @@ const TUNNEL_CONTROL_BUFFER: usize = 1024 * 1024;
 /// Nothing at all from the server for this long ends the tunnel. Its pongs
 /// answer our keepalive ping every 10 s (network.rs `latency_task`).
 const TUNNEL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// The same before the first pong. No ping runs during a sign-in, and the relay says
+/// nothing while a person decides (five minutes at most): the sign-in's reads have
+/// their own bound.
+const TUNNEL_SIGN_IN_IDLE: Duration = Duration::from_secs(310);
 
 /// The client end of the TCP fallback: one TLS stream carrying the
 /// WebSocket, read and written by two tasks of its own, so the control
@@ -674,6 +678,7 @@ async fn tunnel_reader<R: AsyncRead + Unpin>(
     let mut decoder = Decoder::new(false, TUNNEL_MAX_MESSAGE);
     decoder.feed(&leftover);
     let mut chunk = vec![0u8; 16 * 1024];
+    let mut idle = TUNNEL_SIGN_IN_IDLE;
     loop {
         loop {
             match decoder.next() {
@@ -684,9 +689,11 @@ async fn tunnel_reader<R: AsyncRead + Unpin>(
                         }
                     }
                     Some(0x13 | 0x14) => {
+                        idle = TUNNEL_IDLE_TIMEOUT;
                         let _ = video.try_send(data);
                     }
                     Some(_) => {
+                        idle = TUNNEL_IDLE_TIMEOUT;
                         let _ = datagrams.try_send(Bytes::from(data));
                     }
                     None => {}
@@ -704,7 +711,7 @@ async fn tunnel_reader<R: AsyncRead + Unpin>(
                 }
             }
         }
-        match tokio::time::timeout(TUNNEL_IDLE_TIMEOUT, tls.read(&mut chunk)).await {
+        match tokio::time::timeout(idle, tls.read(&mut chunk)).await {
             Ok(Ok(n)) if n > 0 => decoder.feed(&chunk[..n]),
             Ok(Ok(_)) => {
                 info!("the server closed the TCP connection");
@@ -715,7 +722,7 @@ async fn tunnel_reader<R: AsyncRead + Unpin>(
                 return;
             }
             Err(_) => {
-                info!("nothing from the server for {TUNNEL_IDLE_TIMEOUT:?}, giving the tunnel up");
+                info!("nothing from the server for {idle:?}, giving the tunnel up");
                 return;
             }
         }
@@ -1387,5 +1394,54 @@ mod tests {
         let mut rest = Vec::new();
         control_recv.read_to_end(&mut rest).await.unwrap();
         assert!(rest.is_empty());
+    }
+
+    /// One server message on the tunnel, as a server writes it.
+    async fn server_says<W: AsyncWrite + Unpin>(server: &mut W, parts: &[&[u8]]) {
+        let mut wire = Vec::new();
+        ws::encode_frame(&mut wire, ws::OP_BINARY, parts, None);
+        server.write_all(&wire).await.unwrap();
+    }
+
+    /// The relay says nothing while a person walks to their other device or holds a
+    /// prompt, and nothing keeps a tunnel talking before the sign-in is through. It
+    /// gave up after 30 s of that, and the sign-in read a closed connection.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_tunnel_lives_through_a_persons_wait() {
+        let (ours, mut server) = tokio::io::duplex(1 << 20);
+        let mut link = start_tunnel(ours, Vec::new());
+        // The relay's longest wait (`CHOICE_WAIT`), after a first word from it
+        server_says(&mut server, &[&[0x00], b"first"]).await;
+        let mut word = [0u8; 5];
+        link.control_recv.read_exact(&mut word).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(299)).await;
+        server_says(&mut server, &[&[0x00], b"later"]).await;
+        link.control_recv
+            .read_exact(&mut word)
+            .await
+            .expect("the tunnel gave up on a person");
+        assert_eq!(&word, b"later");
+    }
+
+    /// The control: past the sign-in the pongs flow, and a silent server is a dead one.
+    #[tokio::test(start_paused = true)]
+    async fn once_the_pongs_flow_a_silent_server_ends_the_tunnel() {
+        let (ours, mut server) = tokio::io::duplex(1 << 20);
+        let Link {
+            conn,
+            control_send: _control_send,
+            mut control_recv,
+        } = start_tunnel(ours, Vec::new());
+        let Conn::Tunnel(mut tunnel) = conn else {
+            unreachable!("start_tunnel builds a tunnel")
+        };
+        let mut datagrams_in = tunnel.datagrams_in.take().unwrap();
+        server_says(&mut server, &[&[0x05, 1]]).await;
+        datagrams_in.recv().await.unwrap();
+        let started = tokio::time::Instant::now();
+        let mut rest = Vec::new();
+        control_recv.read_to_end(&mut rest).await.unwrap();
+        assert!(rest.is_empty());
+        assert!(started.elapsed() <= TUNNEL_IDLE_TIMEOUT + Duration::from_secs(1));
     }
 }

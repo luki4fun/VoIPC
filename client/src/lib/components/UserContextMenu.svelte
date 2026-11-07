@@ -29,6 +29,7 @@
     adminRemovePosts,
     cancelAdminAction,
     cancelPoke,
+    clearProfile,
     closeUserMenu,
     confirmAdminAction,
     inviteUser,
@@ -45,14 +46,13 @@
   } from "../stores/user-menu.js";
   import Icon from "./Icons.svelte";
   import MemberName from "./MemberName.svelte";
-  import { adminError, adminOp, stepUp, stepUpCancelled, stepUpSays } from "../stores/admin-ops.js";
+  import { adminError, stepUp, stepUpCancelled, stepUpSays } from "../stores/admin-ops.js";
   import { showAdminPanel, submitStepUp } from "../stores/admin-ui.js";
   import { account, relayAccounts } from "../stores/account.js";
   import { olderRelay } from "../stores/relay.js";
   import { community, moderation, moves } from "../relay-rules.js";
   import { removalHint, removalWindows } from "../modlog-rules.js";
   import { restrictions } from "../stores/restrictions.js";
-  import { confirmAction } from "../stores/confirm.js";
   import { splitName, shortName } from "../username.js";
   import { invoke } from "@tauri-apps/api/core";
   import { account as ownAccount, showPrompt } from "../stores/account.js";
@@ -119,19 +119,6 @@
       e.preventDefault();
       confirmAdminAction();
     }
-  }
-
-  /** Cleared, the person may pick another: there is nothing to take back. */
-  async function clearProfile(id: number[]) {
-    // The server on screen now: the view may move while the question is up
-    const server = $serverAddress;
-    const yes = await confirmAction({
-      title: "Clear this person's display name and picture?",
-      body: "They can pick others.",
-      confirm: "Clear them",
-      danger: true,
-    });
-    if (yes) void adminOp({ ProfileReset: { id, name: true, picture: true } }, null, server);
   }
 
   // The panel asks for itself; from the ban dialog it may be shut, and for a moderator

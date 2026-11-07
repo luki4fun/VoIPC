@@ -1,6 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { QUIET_ABOVE_MEMBERS, arrival, levelOf, nextLevel } from "./notify-rules.ts";
+import { QUIET_ABOVE_MEMBERS, arrival, holdsToast, levelOf, nextLevel, pageInView } from "./notify-rules.ts";
+
+test("a channel the server asks everyone to follow asks only for what is for you, whatever its size", () => {
+  assert.equal(levelOf(undefined, 3, true), "mentions");
+  assert.equal(levelOf(undefined, 3, false), "all", "the control: one joined by hand");
+  assert.equal(levelOf("all", 3, true), "all", "their own choice stands");
+});
 
 const other = { mine: false, onScreen: false, forMe: false };
 const forMe = { ...other, forMe: true };
@@ -39,4 +45,18 @@ test("what I am looking at neither counts nor sounds, and may still notify a win
 
 test("my own message makes no sound, and tells me nothing", () => {
   assert.deepEqual(arrival("all", { mine: true, onScreen: false, forMe: false }), { count: true, sound: false, os: false });
+});
+
+test("the page counts as in view only if it is both shown and focused", () => {
+  const page = (hidden: boolean, focused: boolean) => ({ hidden, hasFocus: () => focused });
+  assert.equal(pageInView(page(false, true)), true);
+  assert.equal(pageInView(page(true, true)), false, "a WebView behind HOME says it has focus");
+  assert.equal(pageInView(page(false, false)), false, "another window has it");
+  assert.equal(pageInView(page(true, false)), false);
+});
+
+test("only a mouse holds a toast's clock", () => {
+  assert.equal(holdsToast("mouse"), true);
+  assert.equal(holdsToast("touch"), false, "a tap gives no leave");
+  assert.equal(holdsToast("pen"), false);
 });

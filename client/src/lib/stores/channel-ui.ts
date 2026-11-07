@@ -14,7 +14,8 @@
 import { derived, get, writable, type Readable, type Writable } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
 import { levelOf, nextLevel, type NotifyLevel } from "../notify-rules.js";
-import { adminOps } from "../relay-rules.js";
+import { adminOps, livePath } from "../relay-rules.js";
+import { marksChannel, toFollow } from "../follow-rules.js";
 
 import { channelLayout, channels, currentChannelId, previewChannelId, previewUsers, voiceServer } from "./channels.js";
 import {
@@ -39,7 +40,9 @@ import {
   renameChannelChat,
 } from "./chat.js";
 import { openServers } from "./servers.js";
-import { currentRosterOf } from "./rosters.js";
+import { currentRosterOf, onlineById } from "./rosters.js";
+import { refreshList } from "./sweep.js";
+import { quietOf } from "./quiet.js";
 import { users } from "./users.js";
 import { shortName } from "../username.js";
 import type { Actor, ChatPlace } from "../chat-rules.js";
@@ -55,7 +58,7 @@ import { buildInviteLink, splitAddress } from "../invite.js";
 import { canManage, canManageAs, hideRight, needsNsfwConsent, type Me } from "../channel-post-rules.js";
 import { moderation } from "../relay-rules.js";
 import type { ProximityMode } from "../spatial.js";
-import type { ChannelGate, ChannelInfo, ChatMessage } from "../types.js";
+import type { ChannelGate, ChannelInfo, ChatMessage, UserInfo } from "../types.js";
 
 // ── Create ─────────────────────────────────────────────────────────────────
 
@@ -169,7 +172,11 @@ export async function joinChannel(channelId: number, hasPassword: boolean): Prom
     await invoke("join_channel", { server, channelId, password: null });
     // Asking to be in a text channel undoes having walked out of it. Only a
     // text channel: the list is of names, and a voice room may share one.
-    if (isTextChannel(server, channelId)) forgetLeft(server, channelId);
+    if (isTextChannel(server, channelId)) {
+      forgetLeft(server, channelId);
+      // Their own act, so it says nothing the join did not: who else is there
+      if (livePath(get(olderRelay.peek(server))?.protocol ?? null)) refreshList(server, channelId);
+    }
     // Into a voice room: its chat, not a text channel left open before
     // (`displayChannelId` prefers that one once the preview ends)
     else activeTextChannelId.of(server).set(null);
@@ -285,53 +292,66 @@ export async function leaveTextChannel(channelId: number): Promise<void> {
  * The auto-joins already asked for on each connection. It goes with the
  * connection (`dropServer`), so a reconnect asks again.
  *
- * The caller is an effect over the channel list, and the list is rewritten
- * every time a roster reply reconciles a member count — so on connect it
- * re-fires once per reply, while `joinedTextChannelIds` is still empty because
- * the server has not answered the first join yet. Every auto-join channel is
- * then asked for again on every pass: twenty redundant joins out of a budget of
- * fifty a second, each one a global broadcast on the server.
+ * The caller is an effect over the channel list, which fires on every change of it,
+ * while `joinedTextChannelIds` is still empty because the server has not answered
+ * yet. Each pass asks only for what is new here.
  */
 const autoJoinAsked = scoped<Set<number>>(() => new Set());
 
 /**
- * Join the text channels a server asks every client into.
- *
- * Skipped for one the user left, and for a password-protected one — we hold no
- * password to offer, and a prompt nobody asked for on every connect is worse
- * than joining it by hand. Skipped, too, for one marked 18+ until the user has
- * said they are: nobody is put in such a channel without having been asked.
+ * Follow the text channels a server asks every client into, in one frame that tells
+ * nobody, however many there are (`toFollow` says which). A gate that keeps this person
+ * out, or lets them in only for holding `*`, comes back in `TextJoined`'s `refused`.
+ * A relay before the live path answers joins one by one, each a broadcast.
  */
 export function autoJoinTextChannels(server: string, list: ChannelInfo[]): void {
   const joined = get(joinedTextChannelIds.peek(server));
-  const asked = get(autoJoinAsked.peek(server));
-  const consented = hasNsfwConsent(server);
-  for (const channel of list) {
-    if (!channel.text || !channel.auto_join) continue;
-    if (channel.has_password || joined.has(channel.channel_id)) continue;
-    if (needsNsfwConsent(channel, consented)) continue;
-    if (asked.has(channel.channel_id) || isLeft(server, channel.name)) continue;
-    asked.add(channel.channel_id);
-    invoke("join_channel", { server, channelId: channel.channel_id, password: null }).catch(
-      (e: unknown) => {
-        // Put it back, so the next pass tries again: re-firing was also the
-        // safety net for a join sent a moment too early, and only the ones
-        // that went through should stop it.
-        asked.delete(channel.channel_id);
-        console.error("Failed to auto-join text channel:", e);
-      },
-    );
+  const asked = get(autoJoinAsked.of(server));
+  const wanted = toFollow(list, {
+    sent: new Set([...asked, ...joined]),
+    left: (c) => isLeft(server, c),
+    consented: hasNsfwConsent(server),
+  });
+  if (wanted.length === 0) return;
+  for (const id of wanted) asked.add(id);
+  // Put back, so the next pass tries again: only what went through should stop it
+  const undo = (ids: number[], e: unknown) => {
+    for (const id of ids) asked.delete(id);
+    console.error("Failed to auto-join text channels:", e);
+  };
+  if (livePath(get(olderRelay.peek(server))?.protocol ?? null)) {
+    const quiet = quietOf(server, wanted);
+    const whole = wanted.filter((id) => !quiet.includes(id));
+    invoke("join_text_channels", { server, channels: whole, quiet }).catch((e: unknown) => undo(wanted, e));
+    return;
   }
+  for (const channelId of wanted) {
+    invoke("join_channel", { server, channelId, password: null }).catch((e: unknown) => undo([channelId], e));
+  }
+}
+
+/** The channel is gone, or gone from what they may see: its id may come back, and if it does
+ *  it is wanted again. */
+export function forgetAutoJoinAsk(server: string, channelId: number): void {
+  get(autoJoinAsked.of(server)).delete(channelId);
+}
+
+/** Kicked out of a text channel: as if they had walked out, so they stay out until they click. */
+export function markKicked(server: string, channelId: number): void {
+  if (!isTextChannel(server, channelId)) return;
+  get(autoJoinAsked.of(server)).add(channelId);
+  rememberLeft(server, channelId);
 }
 
 // ── The list of text channels this user walked out of ──────────────────────
 //
-// Kept per server, by name: a user-created channel's id is not stable across a
-// restart, and two servers' `#general` are not the same room.
+// Kept per server, by name and by log: a user-created channel's id is not stable
+// across a restart, a name can change while someone is away, and two servers'
+// `#general` are not the same room.
 
 /**
- * The names on this server's list, for the sidebars to draw the difference
- * between a channel nobody ever joined and one this user walked out of.
+ * What this server's list holds, for the sidebars to draw the difference between
+ * a channel nobody ever joined and one this user walked out of (`marksChannel`).
  */
 export const leftTextChannelNames: Readable<Set<string>> = derived(
   [uiPrefs, serverAddress],
@@ -339,9 +359,9 @@ export const leftTextChannelNames: Readable<Set<string>> = derived(
     new Set($address ? ($prefs.left_text_channels[serverKey($address)] ?? []) : []),
 );
 
-export function isLeft(server: string, channelName: string): boolean {
+export function isLeft(server: string, channel: Pick<ChannelInfo, "log" | "name">): boolean {
   const key = serverKey(server);
-  return !!key && (get(uiPrefs).left_text_channels[key] ?? []).includes(channelName);
+  return !!key && marksChannel(get(uiPrefs).left_text_channels[key] ?? [], channel);
 }
 
 // ── Destruction timers ─────────────────────────────────────────────────────
@@ -426,19 +446,22 @@ export function channelRenamed(server: string, from: string, to: string): void {
   });
 }
 
+/** The channel, as far as its notifications go. */
+type NotifyChannel = Pick<ChannelInfo, "name" | "user_count" | "auto_join" | "text">;
+
 /** What this channel's messages may do to this person (`notify-rules.ts`). */
-export function channelNotify(server: string, name: string, members: number): NotifyLevel {
+export function channelNotify(server: string, channel: NotifyChannel): NotifyLevel {
   const key = serverKey(server);
-  return levelOf(key ? get(uiPrefs).channel_notify[`${key}/${name}`] : undefined, members);
+  return levelOf(key ? get(uiPrefs).channel_notify[`${key}/${channel.name}`] : undefined, channel.user_count, channel.text && channel.auto_join);
 }
 
 /** The next level, kept for this channel from then on. */
-export function cycleChannelNotify(server: string, name: string, members: number): void {
+export function cycleChannelNotify(server: string, channel: NotifyChannel): void {
   const key = serverKey(server);
   if (!key) return;
-  const level = nextLevel(channelNotify(server, name, members));
+  const level = nextLevel(channelNotify(server, channel));
   updateUiPrefs((p) => {
-    p.channel_notify[`${key}/${name}`] = level;
+    p.channel_notify[`${key}/${channel.name}`] = level;
   });
 }
 
@@ -453,23 +476,24 @@ export function isTextChannel(server: string, channelId: number): boolean {
 
 function rememberLeft(server: string, channelId: number): void {
   const key = serverKey(server);
-  const name = channelName(server, channelId);
-  if (!key || !name) return;
+  const channel = get(channels.peek(server)).find((c) => c.channel_id === channelId);
+  if (!key || !channel) return;
+  const marks = [channel.name, ...(channel.log ? [channel.log] : [])];
   updateUiPrefs((p) => {
     const list = p.left_text_channels[key] ?? [];
-    if (!list.includes(name)) p.left_text_channels[key] = [...list, name];
+    p.left_text_channels[key] = [...list, ...marks.filter((m) => !list.includes(m))];
   });
 }
 
 /** Undo having walked out of a text channel: it auto-joins again. */
 export function forgetLeft(server: string, channelId: number): void {
   const key = serverKey(server);
-  const name = channelName(server, channelId);
-  if (!key || !name) return;
+  const channel = get(channels.peek(server)).find((c) => c.channel_id === channelId);
+  if (!key || !channel) return;
   updateUiPrefs((p) => {
     const list = p.left_text_channels[key];
-    if (!list?.includes(name)) return;
-    const next = list.filter((n) => n !== name);
+    if (!list || !marksChannel(list, channel)) return;
+    const next = list.filter((n) => n !== channel.name && n !== channel.log);
     if (next.length > 0) p.left_text_channels[key] = next;
     else delete p.left_text_channels[key];
   });
@@ -501,6 +525,8 @@ export function giveNsfwConsent(server: string): void {
   updateUiPrefs((p) => {
     if (!p.nsfw_ok.includes(key)) p.nsfw_ok = [...p.nsfw_ok, key];
   });
+  // What only waited for this; the list has not changed, so nothing else would ask
+  autoJoinTextChannels(server, get(channels.peek(server)));
 }
 
 /** The open consent dialog: which channel, and what to do on a yes. */
@@ -549,20 +575,25 @@ export const me: Readable<Me> = derived([userId, isAdmin, can], ([$id, $admin, $
   isModerator: $can("voipc:channels"),
 }));
 
+/** Someone on that channel's list, or on any list of who is online: a text channel has no
+ *  list of its own on the live path, and a moderator posting from elsewhere still is one. */
+function onlineRow(server: string, channelId: number, uid: number): UserInfo | undefined {
+  return currentRosterOf(server, channelId).find((u) => u.user_id === uid) ?? onlineById(server).get(uid);
+}
+
+/** What a post on the live path says of its writer, as a roster row would. */
+export type PostFlags = Pick<UserInfo, "user_id" | "is_admin" | "is_moderator">;
+
 /**
- * Whether `uid` is one of channel `channelId`'s managers on `server`, by the
- * roster's roles now: what a pin is checked against. Ourselves as `me` is
- * (an admin by token too); anyone else as the user list has them, and
+ * Whether `uid` is one of channel `channelId`'s managers on `server`, by what its post
+ * says of them, or else the roster's roles now: what a pin is checked against. Ourselves
+ * as `me` is (an admin by token too); anyone else as the user list has them, and
  * nobody it does not list.
  */
-export function managesChannel(server: string, channelId: number, uid: number): boolean {
+export function managesChannel(server: string, channelId: number, uid: number, post?: PostFlags): boolean {
   const ch = get(channels.peek(server)).find((c) => c.channel_id === channelId);
   if (!ch) return false;
-  // That channel's people first: `users` is only the voice room we stand in, and
-  // a moderator posting from outside it is still a moderator
-  const entry =
-    currentRosterOf(server, channelId).find((u) => u.user_id === uid) ??
-    get(users.peek(server)).find((u) => u.user_id === uid);
+  const entry = post ?? onlineRow(server, channelId, uid);
   if (uid !== get(userId.peek(server))) return canManageAs(ch, entry);
   return canManage(ch, { userId: uid, isAdmin: get(isAdmin.peek(server)), isModerator: canOn(server, "voipc:channels") });
 }
@@ -576,16 +607,14 @@ export function managesChannel(server: string, channelId: number, uid: number): 
  * A relay lying here gets a named fake moderator and one extra click: a hide
  * destroys nothing.
  */
-export function hideCheck(server: string, channelId: number, by: Actor): ((m: ChatMessage) => boolean) | undefined {
+export function hideCheck(server: string, channelId: number, by: Actor, post?: PostFlags): ((m: ChatMessage) => boolean) | undefined {
   const ch = get(channels.peek(server)).find((c) => c.channel_id === channelId);
   if (!ch || !moderation(get(olderRelay.peek(server))?.protocol ?? null)) return undefined;
   const mods = get(chatMods.peek(server));
   const listed = by.account ? mods.get(by.account) : undefined;
   // Not 0, which is both someone away and us before `connect` has answered
   const mine = by.user_id !== 0 && by.user_id === get(userId.peek(server));
-  const row =
-    currentRosterOf(server, channelId).find((u) => u.user_id === by.user_id) ??
-    get(users.peek(server)).find((u) => u.user_id === by.user_id);
+  const row = post ?? onlineRow(server, channelId, by.user_id);
   const hider = {
     hide: !!listed?.hide || (mine && canOn(server, "voipc:hide")),
     admin: !!listed?.admin || (mine && get(isAdmin.peek(server))) || !!row?.is_admin,
@@ -633,7 +662,10 @@ export async function submitPasswordJoin(): Promise<void> {
     await invoke("join_channel", { server, channelId, password: password || null });
     const channel = get(channels.peek(server)).find((c) => c.channel_id === channelId);
     if (channel && password) rememberChannelPassword(server, channel.name, password);
-    if (channel?.text) forgetLeft(server, channelId);
+    if (channel?.text) {
+      forgetLeft(server, channelId);
+      if (livePath(get(olderRelay.peek(server))?.protocol ?? null)) refreshList(server, channelId);
+    }
     cancelPasswordPrompt();
     // A text channel was picked to be read: show it, now that we are in it
     if (channel?.text) openJoinedTextChannel(server, channelId, channel.name);

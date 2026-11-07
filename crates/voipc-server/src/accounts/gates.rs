@@ -1,6 +1,8 @@
 //! `voipc_gates`: the database half of `crate::gates`, and its stored-log
 //! members.
 
+use std::collections::hash_map::{Entry, HashMap};
+
 use anyhow::Result;
 use l4f_accounts::model::AccountId;
 use l4f_accounts::store::Store;
@@ -10,6 +12,22 @@ use super::{is_star, log, Relay};
 
 fn split(list: &str) -> Vec<String> {
     list.split_whitespace().map(String::from).collect()
+}
+
+/// What gates ask of an account, signed in or not.
+pub enum Held {
+    /// `*`.
+    Everything,
+    Groups(Vec<String>),
+}
+
+impl Held {
+    fn passes(&self, groups: &[String]) -> bool {
+        match self {
+            Held::Everything => true,
+            Held::Groups(held) => held.iter().any(|g| groups.contains(g)),
+        }
+    }
 }
 
 impl Relay {
@@ -53,29 +71,51 @@ impl Relay {
         Ok(())
     }
 
-    /// Whether an account, signed in or not, passes `groups` now.
-    pub async fn passes_offline(&self, account: AccountId, groups: &[String]) -> Result<bool> {
+    async fn held_by(&self, account: AccountId) -> Result<Held> {
         let Some(user) = self.store().user_by_id(account).await? else {
-            return Ok(false);
+            return Ok(Held::Groups(Vec::new()));
         };
         let scopes = self.accounts.effective_scopes(&user).await?;
         if is_star(&scopes) {
-            return Ok(true);
+            return Ok(Held::Everything);
         }
-        let standing = self.standing(&user, &scopes).await?;
-        Ok(standing.groups.iter().any(|g| groups.contains(g)))
+        Ok(Held::Groups(self.standing(&user, &scopes).await?.groups))
     }
 
-    /// The stored members of `conv` outside `groups`, out of it.
-    pub async fn prune_log(&self, conv: &str, groups: &[String]) -> Result<()> {
+    /// The stored members of `conv` outside `groups`, out of it. `decided` is shared across a
+    /// pass: most of the same accounts sit in every gated log, and each is four queries.
+    pub async fn prune_log(
+        &self,
+        conv: &str,
+        groups: &[String],
+        decided: &mut HashMap<[u8; 16], Held>,
+    ) -> Result<()> {
         let members: Vec<Vec<u8>> = members_of(self.store(), conv).await?;
         for m in members {
             let Ok(id) = <[u8; 16]>::try_from(m.as_slice()) else {
                 continue;
             };
-            if !self.passes_offline(AccountId(id), groups).await? {
-                log::remove(self.store(), conv, &id).await?;
+            let held = match decided.entry(id) {
+                Entry::Occupied(e) => e.into_mut(),
+                Entry::Vacant(e) => e.insert(self.held_by(AccountId(id)).await?),
+            };
+            if !held.passes(groups) {
+                log::unseat(self.store(), conv, &id).await?;
             }
+        }
+        Ok(())
+    }
+
+    /// `account` out of those of `convs` it holds a seat in.
+    pub async fn out_of_logs(&self, account: &[u8; 16], convs: &[String]) -> Result<()> {
+        let seats: Vec<String> = db!(self.store(), pool => {
+            sqlx::query_scalar("SELECT conv FROM voipc_members WHERE account = $1")
+                .bind(&account[..])
+                .fetch_all(pool)
+                .await?
+        });
+        for conv in seats.iter().filter(|s| convs.contains(s)) {
+            log::unseat(self.store(), conv, account).await?;
         }
         Ok(())
     }

@@ -676,9 +676,18 @@ fn decrement(map: &DashMap<IpAddr, u32>, key: IpAddr) {
 
 /// An IPv6 address's /48, the usual size of one site's allocation; `None` for
 /// IPv4, where a shared prefix is as often a carrier's NAT as one site.
-fn site_key(ip: IpAddr) -> Option<IpAddr> {
+pub(crate) fn site_key(ip: IpAddr) -> Option<IpAddr> {
     match ip.to_canonical() {
         IpAddr::V6(v6) => Some(IpAddr::V6((u128::from(v6) & !((1u128 << 80) - 1)).into())),
+        IpAddr::V4(_) => None,
+    }
+}
+
+/// An IPv6 address's /32, the usual size of what one network holds and leases out;
+/// `None` for IPv4, as `site_key`.
+pub(crate) fn block_key(ip: IpAddr) -> Option<IpAddr> {
+    match ip.to_canonical() {
+        IpAddr::V6(v6) => Some(IpAddr::V6((u128::from(v6) & !((1u128 << 96) - 1)).into())),
         IpAddr::V4(_) => None,
     }
 }
@@ -733,6 +742,15 @@ async fn run_command(config: &ServerConfig, command: Command) -> Result<()> {
                     "{} now holds {role}; its rights apply once the account has two-factor codes.",
                     user.username
                 );
+                let name = role.trim().to_ascii_lowercase();
+                if relay.power_would_wait(user.id).await?
+                    && store
+                        .role_by_name(&name)
+                        .await?
+                        .is_some_and(|r| !r.scopes.is_empty())
+                {
+                    println!("It waits for an admin's OK once the account is opened.");
+                }
             } else {
                 println!("{} already holds {role}.", user.username);
             }
@@ -780,6 +798,9 @@ async fn run_command(config: &ServerConfig, command: Command) -> Result<()> {
                 "{}: vault and identity wiped, signed out everywhere. The next sign-in through a provider opens it anew, and whoever knew this account is warned.",
                 user.username
             );
+            if relay.power_would_wait(user.id).await? {
+                println!("Groups with privileges wait for an admin's OK.");
+            }
         }
         Command::Admin(AdminCommand::Invite { name, days }) => {
             // Closed: only an admin makes accounts, each for a name it picked.
@@ -1144,17 +1165,22 @@ async fn main() -> Result<()> {
             restrict::tick(&ticking, bans::now_secs()).await;
         }
     });
-    // Every client gets the channel list in one frame. Too many channels with
-    // long descriptions and it cannot be sent, and clients see no channels at
-    // all: say so now instead (1.0 audit H1-06)
-    let list = voipc_protocol::codec::encode_server_msg(
-        &voipc_protocol::messages::ServerMessage::ChannelList {
-            channels: state.channel_list().await,
-        },
-    );
-    if list.as_ref().map_or(true, |b| b.len() > 60 * 1024) {
-        anyhow::bail!("channels.json describes more channels than fit in one channel list (60 KiB): shorten descriptions or remove channels");
-    }
+    // Exits each second, so a ban across many channels is one frame per writer; quiet
+    // channels' news each minute. Neither asks for anything while there is none.
+    let ticking = state.clone();
+    tokio::spawn(async move {
+        let mut every = tokio::time::interval(Duration::from_secs(session::EXITS_EVERY_SECS));
+        let mut marks_since = 0;
+        let mut ticks = 0;
+        loop {
+            every.tick().await;
+            session::send_exits(&ticking);
+            ticks += 1;
+            if ticks % (session::MARKS_EVERY_SECS / session::EXITS_EVERY_SECS) == 0 {
+                marks_since = session::send_marks(&ticking, marks_since).await;
+            }
+        }
+    });
     if state.accounts.is_some() {
         accounts::locked_logs_at_boot(&state)
             .await
@@ -1180,7 +1206,6 @@ async fn main() -> Result<()> {
         loop {
             every.tick().await;
             accounts::revalidate(&watched).await;
-            gates::prune_logs(&watched).await;
             restrict::prune_clocks(&watched, bans::now_secs());
             match bans::load(&watched).await {
                 Ok(()) => bans::enforce(&watched, None).await,
@@ -1188,6 +1213,19 @@ async fn main() -> Result<()> {
             }
         }
     });
+
+    // What the shell changed for someone away, who no session's scopes tell of
+    if state.accounts.is_some() {
+        let pruned = state.clone();
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(Duration::from_secs(3600));
+            every.tick().await;
+            loop {
+                every.tick().await;
+                gates::prune_soon(&pruned);
+            }
+        });
+    }
 
     // Bind TCP listener
     let tcp_addr = config.bind_addr(config.tcp_port)?;
@@ -1501,6 +1539,22 @@ mod tests {
             limit_key(v6("2001:db8:1:2::1")),
             limit_key(v6("2001:db8:1:3::1"))
         );
+    }
+
+    #[test]
+    fn a_site_is_a_48_and_a_block_a_32_and_ipv4_has_neither() {
+        let v6 = |s: &str| IpAddr::V6(s.parse().unwrap());
+        assert_eq!(site_key(v6("2001:db8:1:ffff::9")), Some(v6("2001:db8:1::")));
+        assert_ne!(site_key(v6("2001:db8:1::1")), site_key(v6("2001:db8:2::1")));
+        assert_eq!(block_key(v6("2001:db8:ffff:1::9")), Some(v6("2001:db8::")));
+        assert_ne!(block_key(v6("2001:db8::1")), block_key(v6("2001:db9::1")));
+        for ipv4 in [
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7)),
+            v6("::ffff:192.0.2.7"),
+        ] {
+            assert_eq!(site_key(ipv4), None);
+            assert_eq!(block_key(ipv4), None);
+        }
     }
 
     /// S-028: connects racing for one site's last pre slots (different /64s

@@ -4,7 +4,8 @@
 //!
 //! Asked for by account and told to the people whose rosters show that account:
 //! a channel that hides its members, or names them by alias, shows no account,
-//! so nobody can put a display name to one of its rows.
+//! so nobody can put a display name to one of its rows. A moderator's clear goes
+//! to everyone wherever the account stands, since old rows may be on anyone's screen.
 //!
 //! The relay never decodes a picture. It checks what kind of file it says it is
 //! and how big; every client sanitizes what it receives before showing it.
@@ -31,7 +32,7 @@ use crate::state::ServerState;
 
 type Row = (Vec<u8>, Option<String>, Option<Vec<u8>>);
 
-const TOO_FAST: &str = "That was a lot of changes. Give it a moment.";
+pub(super) const TOO_FAST: &str = "That was a lot of changes. Give it a moment.";
 const SRV_NAME: &str = "srv_name";
 const SRV_DESCRIPTION: &str = "srv_description";
 const SRV_ICON: &str = "srv_icon";
@@ -389,6 +390,19 @@ pub async fn tell(state: &ServerState, relay: &Relay, account: [u8; 16]) {
         if audience.contains(&s.user_id) {
             let _ = send_msg(&s.control_tx, &msg);
         }
+    }
+}
+
+/// A moderator's clear, to everyone connected, also when the account has gone. Going
+/// to all, it says nothing of where that account stands, and `ProfilesGet` already
+/// answers anyone about any id.
+pub async fn tell_everyone(state: &ServerState, relay: &Relay, account: [u8; 16]) {
+    match relay.profiles(&[account]).await {
+        Ok(profiles) => {
+            let msg = ServerMessage::Profiles { profiles };
+            crate::session::broadcast_to_all(state, &msg, None).await;
+        }
+        Err(e) => warn!("reading a profile: {e:#}"),
     }
 }
 

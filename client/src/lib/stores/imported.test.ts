@@ -9,6 +9,7 @@ import { get } from "svelte/store";
 
 const { invoked } = await import("./node-stores.mjs");
 const {
+  saysItsOwnRefusal,
   closeImported,
   importedBack,
   importedChanged,
@@ -587,6 +588,13 @@ test("Settings' count, and the refusal for no linked Discord", () => {
   assert.match(get(importedMine.peek(S)).refused, /^Link your Discord/);
 });
 
+test("an archive ask's refusal gets no toast of its own, and anything else still does", () => {
+  assert.equal(saysItsOwnRefusal("ArchiveMine"), true, "Settings' count, asked with no click");
+  assert.equal(saysItsOwnRefusal("ArchiveFetch"), true);
+  assert.equal(saysItsOwnRefusal("ArchiveChannels"), true);
+  assert.equal(saysItsOwnRefusal("PasswordChange"), false);
+});
+
 test("Hide all counts again afterwards", () => {
   fresh();
   importedMineAsk(S, "Hide", "Everything");
@@ -662,4 +670,16 @@ test("nothing of it reaches the chat, or storage", () => {
   // The file itself: no storage, and neither of the chat's own stores
   const source = readFileSync(join(import.meta.dirname, "imported.ts"), "utf8").replace(/^\s*(\/\/|\*|\/\*).*$/gm, "");
   assert.doesNotMatch(source, /localStorage|indexedDB|channelMessages|populateFromArchive|chat\.archive|uiPrefs|updateUiPrefs|from "\.\/chat/);
+});
+
+test("the live path's list says at connect which channels hold an archive, and opening asks nothing", () => {
+  fresh();
+  invoked().length = 0;
+  onImportedReply(S, { ArchiveChannels: { channels: [CHANNEL, CHANNEL + 1] } });
+  assert.deepEqual([...get(importedHas.peek(S))], [CHANNEL, CHANNEL + 1]);
+  onImportedReply(S, { ArchiveChannels: { channels: [] } });
+  assert.equal(get(importedHas.peek(S)).size, 0, "what it answers now is all of it");
+  assert.equal(asks().length, 0);
+  onImportedReply(S, { Error: { request: "ArchiveChannels", reason: "no" } });
+  assert.equal(asks().length, 0, "a refusal asks nothing again");
 });
