@@ -416,8 +416,10 @@ elif [ "$BROWSER_ALICE" = chromium ] || [ "$BROWSER_BOB" = chromium ]; then
     "the move from Discord, in real browsers" "the move lane"
   # exec: the job's pid has to be node itself, which the EXIT trap can stop.
   # TMPDIR: profiles and downloads go with $WORK.
+  # RELAY_LOG: a lane that starts its own relay logs it there, at debug, so a failure can say
+  # what the relay refused or ended at that moment (lane_verdict)
   # shellcheck disable=SC2086
-  run_lane() { CHROME="$CHROME" TMPDIR="$WORK" exec node "$SCRIPT_DIR/"${lane_args[$1]}; }
+  run_lane() { RELAY_LOG="$WORK/$1-relay.log" RUST_LOG="${RUST_LOG:-voipc_server=debug}" CHROME="$CHROME" TMPDIR="$WORK" exec node "$SCRIPT_DIR/"${lane_args[$1]}; }
   # A lane has ended: its verdict, and on a failure what it said goes to fails.txt
   lane_verdict() { # name exit-status
     if [ "$2" = 0 ]; then
@@ -425,6 +427,10 @@ elif [ "$BROWSER_ALICE" = chromium ] || [ "$BROWSER_BOB" = chromium ]; then
     else
       echo "FAIL ${lane_failed[$1]}" | tee -a "$WORK/fails.txt"
       { grep '^FAIL' "$WORK/$1.txt"; grep -v '^PASS\|^FAIL' "$WORK/$1.txt" | tail -n 15; } >> "$WORK/fails.txt" || true
+      if [ -s "$WORK/$1-relay.log" ]; then
+        echo "--- $1's relay: what it refused, ended or warned of"
+        sed 's/\x1b\[[0-9;]*m//g' "$WORK/$1-relay.log" | grep -E 'WARN|ERROR|rejecting|refusing|connection ended' | tail -n 40 || true
+      fi
       fail=1
     fi
     if [ "$1" = ui ]; then kill "${ui_browsers[@]}" 2>/dev/null || true; fi

@@ -20,7 +20,7 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { createHmac } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, openSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -133,7 +133,9 @@ writeFileSync(join(WORK, "channels.json"), JSON.stringify([{ name: "lobby-chat",
 const env = { ...process.env, VOIPC_OAUTH_DISCORD_ID: "client", VOIPC_OAUTH_DISCORD_SECRET: "secret", VOIPC_OAUTH_TEST_BASE: providerBase };
 let relay = null;
 function startRelay() {
-  relay = spawn(SERVER, ["-c", "server.toml", "--channels", "channels.json"], { cwd: WORK, env, stdio: ["ignore", "ignore", "inherit"] });
+  // RELAY_LOG=<file>: the relay's log there, for a run that needs to see why
+  const log = process.env.RELAY_LOG ? openSync(process.env.RELAY_LOG, "a") : "ignore";
+  relay = spawn(SERVER, ["-c", "server.toml", "--channels", "channels.json"], { cwd: WORK, env, stdio: ["ignore", log, "inherit"] });
   children.push(relay);
 }
 startRelay();
@@ -257,14 +259,26 @@ async function newTab(cdpPort) {
   let id = 0;
   const pending = new Map();
   const errors = [];
+  // A page error about a file that did not load says why it did not, from the network's side
+  const urls = new Map();
+  const failed = [];
   ws.onmessage = (m) => {
     const msg = JSON.parse(m.data);
     if (msg.id && pending.has(msg.id)) {
       pending.get(msg.id)(msg);
       pending.delete(msg.id);
+    } else if (msg.method === "Network.requestWillBeSent") {
+      urls.set(msg.params.requestId, msg.params.request.url);
+    } else if (msg.method === "Network.loadingFinished") {
+      urls.delete(msg.params.requestId);
+    } else if (msg.method === "Network.loadingFailed") {
+      failed.push(`${new Date().toISOString().slice(11, 23)} ${msg.params.errorText}${msg.params.canceled ? " (canceled)" : ""} ${urls.get(msg.params.requestId) ?? ""}`);
+      urls.delete(msg.params.requestId);
+      failed.splice(0, failed.length - 8);
     } else if (msg.method === "Runtime.exceptionThrown") {
       const d = msg.params.exceptionDetails;
-      errors.push(`${d.text} ${d.exception?.description ?? ""}`);
+      const why = /dynamically imported module|preload CSS/.test(`${d.exception?.description}`) ? ` [failed loads: ${failed.join("; ")}]` : "";
+      errors.push(`${d.text} ${d.exception?.description ?? ""}${why}`);
     } else if (msg.method === "Runtime.consoleAPICalled" && msg.params.type === "error") {
       errors.push(`console: ${msg.params.args.map((a) => a.value ?? a.description).join(" ")}`);
     }
@@ -285,6 +299,7 @@ async function newTab(cdpPort) {
     return r.result?.result?.value;
   };
   await send("Runtime.enable");
+  await send("Network.enable");
   await send("Page.enable");
   await send("DOM.enable");
   await send("Page.addScriptToEvaluateOnNewDocument", { source: WIRE });
@@ -378,9 +393,11 @@ async function reachDialog(tab, path = "/", port = PORT) {
   const before = tab.errors.length;
   await tab.send("Page.navigate", { url: `https://127.0.0.1:${port}${path}` });
   if (await seen(tab, shown, 25_000)) return;
+  // The blank first page this retry is for: what it said, with why its files did not load, goes
+  // to the log rather than to the page's own checks
+  const blank = tab.errors.splice(before);
+  console.log(`NOTE a first page load stayed blank and is tried again${blank.length ? `; it said: ${blank.join(" | ")}` : ""}`);
   await tab.send("Page.navigate", { url: `https://127.0.0.1:${port}${path}` });
-  // The load given up on dies mid-fetch, and says so: that is this lane's doing, not the page's
-  tab.errors.splice(before);
   await waitFor(tab, shown, 60_000);
 }
 async function pastAudioStep(tab) {
@@ -1098,17 +1115,17 @@ async function lane() {
   await openPanel(ann);
   await tabTo(ann, "Discord move");
   check("still to sign in, with its two actions", await seen(ann, `document.querySelector(".waiting-row .move-leave") && document.querySelector(".waiting-row .move-hold")`), await panelText(ann));
-  const heldName = await ann.evaluate(`document.querySelector(".waiting-row .row-name").textContent`);
-  await click(ann, ".waiting-row .move-hold");
+  // Not bea, whom Leave out takes below, nor frank, whose posts are for further down: a held account
+  // goes, and comes back only with the next import. Rows of one second stand in the order of their
+  // random account ids, so the first row is anyone's.
+  const holdRow = `[...document.querySelectorAll(".waiting-row")].find((r) => !r.textContent.includes("1190000000000001003") && !r.textContent.includes(${JSON.stringify(FRANK)}))`;
+  const heldName = await ann.evaluate(`${holdRow}.querySelector(".row-name").textContent`);
+  await mouse(ann, `${holdRow}.querySelector(".move-hold")`, "Hold for now");
   await confirmDialog(ann, "Hold for now");
   check("held: on the list, its posts staying", await seen(ann, byText(".excluded-row .row-meta", "Held for now")), await panelText(ann));
   check("gone from those still to sign in", await seen(ann, `![...document.querySelectorAll(".waiting-row .row-name")].some((n) => n.textContent === ${JSON.stringify(heldName)})`), heldName);
   await mouse(ann, `document.querySelector(".excluded-row .let-back")`, "Let back in");
   check("let back in", await seen(ann, `!document.querySelector(".excluded-row")`), await panelText(ann));
-  // bea by her id: rows of one second stand in the order of their random account ids, and frank's posts are for further down.
-  // If she was the one held, her row is back only once the list has come again.
-  const beaRow = `[...document.querySelectorAll(".waiting-row")].find((r) => r.textContent.includes("1190000000000001003"))`;
-  await waitFor(ann, `!!${beaRow}`, 30_000);
   await mouse(ann, `[...document.querySelectorAll(".waiting-row")].find((r) => r.textContent.includes("1190000000000001003")).querySelector(".move-leave")`, "bea's Leave out");
   await confirmDialog(ann, "Leave out and delete");
   check("left out: says their posts go", await seen(ann, byText(".excluded-row .row-meta", "Left out")), await panelText(ann));

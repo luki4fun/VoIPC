@@ -19,7 +19,7 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { createHmac } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, openSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -90,7 +90,8 @@ writeFileSync(
 const relay = spawn(
   join(ROOT, "target/release/voipc-server"),
   ["-c", "server.toml", "--admin-token", TOKEN, "--channels", "channels.json"],
-  { cwd: WORK, stdio: ["ignore", "ignore", "inherit"] },
+  // RELAY_LOG=<file>: the relay's log there, for a run that needs to see why
+  { cwd: WORK, stdio: ["ignore", process.env.RELAY_LOG ? openSync(process.env.RELAY_LOG, "a") : "ignore", "inherit"] },
 );
 children.push(relay);
 // A second, empty server: to a client two ports on one host are two servers. Its own
@@ -133,14 +134,26 @@ async function newTab(cdpPort) {
   let id = 0;
   const pending = new Map();
   const errors = [];
+  // A page error about a file that did not load says why it did not, from the network's side
+  const urls = new Map();
+  const failed = [];
   ws.onmessage = (m) => {
     const msg = JSON.parse(m.data);
     if (msg.id && pending.has(msg.id)) {
       pending.get(msg.id)(msg);
       pending.delete(msg.id);
+    } else if (msg.method === "Network.requestWillBeSent") {
+      urls.set(msg.params.requestId, msg.params.request.url);
+    } else if (msg.method === "Network.loadingFinished") {
+      urls.delete(msg.params.requestId);
+    } else if (msg.method === "Network.loadingFailed") {
+      failed.push(`${new Date().toISOString().slice(11, 23)} ${msg.params.errorText}${msg.params.canceled ? " (canceled)" : ""} ${urls.get(msg.params.requestId) ?? ""}`);
+      urls.delete(msg.params.requestId);
+      failed.splice(0, failed.length - 8);
     } else if (msg.method === "Runtime.exceptionThrown") {
       const d = msg.params.exceptionDetails;
-      errors.push(`${d.text} ${d.exception?.description ?? ""}`);
+      const why = /dynamically imported module|preload CSS/.test(`${d.exception?.description}`) ? ` [failed loads: ${failed.join("; ")}]` : "";
+      errors.push(`${d.text} ${d.exception?.description ?? ""}${why}`);
     }
   };
   const send = (method, params = {}) =>
@@ -159,6 +172,7 @@ async function newTab(cdpPort) {
     return r.result?.result?.value;
   };
   await send("Runtime.enable");
+  await send("Network.enable");
   await send("Page.enable");
   await send("DOM.enable");
   await send("Emulation.setDeviceMetricsOverride", { width: 1280, height: 900, deviceScaleFactor: 1, mobile: false });
@@ -206,9 +220,11 @@ async function reachDialog(tab) {
   const before = tab.errors.length;
   await tab.send("Page.navigate", { url: `${ORIGIN}/` });
   if (await waitFor(tab, shown).then(() => true, () => false)) return;
+  // The blank first page this retry is for: what it said, with why its files did not load, goes
+  // to the log rather than to the page's own checks
+  const blank = tab.errors.splice(before);
+  console.log(`NOTE a first page load stayed blank and is tried again${blank.length ? `; it said: ${blank.join(" | ")}` : ""}`);
   await tab.send("Page.navigate", { url: `${ORIGIN}/` });
-  // The load given up on dies mid-fetch, and says so: that is this lane's doing, not the page's
-  tab.errors.splice(before);
   await waitFor(tab, shown, 60_000);
 }
 
