@@ -599,7 +599,6 @@ const WRAP_BYTES: usize = 176;
 const OPENS_A_FRAME: usize = 256;
 const OPEN_WAIT_MS: u64 = 1_000;
 const WRAP_FRAME_BYTES: usize = 56 * 1024;
-const CHECK_EVERY_MS: u64 = 2_000;
 const HOLD_MS: u64 = 60_000;
 const HELLO_BURST: f64 = 128.0;
 const HELLOS_A_SECOND: f64 = 2.0;
@@ -747,7 +746,6 @@ struct WriterChannel {
     named: HashSet<u32>,
     exited: bool,
     check_out: bool,
-    last_check: u64,
     owed: Vec<u32>,
     waiting: VecDeque<u64>,
     job_up: u64,
@@ -792,27 +790,19 @@ impl WriterState {
             return None;
         }
         let restart = w.over(now);
-        if restart || now.saturating_sub(w.last_check) >= CHECK_EVERY_MS {
-            if restart {
-                w.started = None;
-                w.named.clear();
-                w.exited = false;
-                w.chain += 1;
-                w.job_up = 0;
-                tally.add(|t| &t.new_chains);
-            }
-            w.check_out = true;
-            w.last_check = now;
-            w.waiting.push_back(now);
-            return Some(ClientMessage::KeyCheck {
-                channel_id,
-                restart,
-            });
+        if restart {
+            w.started = None;
+            w.named.clear();
+            w.exited = false;
+            w.chain += 1;
+            w.job_up = 0;
+            tally.add(|t| &t.new_chains);
         }
-        tally.add(|t| &t.posts_up);
-        Some(ClientMessage::SendEncryptedChannelMessage {
+        w.check_out = true;
+        w.waiting.push_back(now);
+        Some(ClientMessage::KeyCheck {
             channel_id,
-            ciphertext: dummy_post(now, w.chain),
+            restart,
         })
     }
 

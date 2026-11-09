@@ -73,19 +73,36 @@ const FRAME_RECORDER = `(() => {
 })()`;
 
 /**
- * The frames a tab with `frames: true` read in the last `ms`: counts by type, then the live
- * path's own frames in order with how long ago. Empty when the tab records none.
+ * The frames a tab with `frames: true` read since its page loaded (or in the last `ms`):
+ * counts by type, then the live path's own frames in order with how long ago, then what the
+ * page last said on its console. Since the load, not a window: a wait of 90 s that runs out
+ * starts after the post it waits for, and a 30 s window showed only keepalives (run
+ * 42696335107). Empty when the tab records none.
  */
-export async function frameSummary(tab, ms = 30_000) {
+export async function frameSummary(tab, ms = null) {
+  const since = ms === null ? 0 : `Date.now() - ${ms}`;
   // null, not none: a tab without the recorder must not read as one that heard nothing
-  const got = await tab.evaluate(`window.__frames ? JSON.stringify(window.__frames.filter(([t]) => t >= Date.now() - ${ms}).map(([t, i]) => [Date.now() - t, i])) : "null"`).then(JSON.parse, () => null);
+  const got = await tab.evaluate(`window.__frames ? JSON.stringify(window.__frames.filter(([t]) => t >= ${since}).map(([t, i]) => [Date.now() - t, i])) : "null"`).then(JSON.parse, () => null);
   if (!got) return "";
   const name = (i) => FRAME_NAMES[i] ?? `#${i}`;
   const counts = {};
   for (const [, i] of got) counts[name(i)] = (counts[name(i)] ?? 0) + 1;
-  const live = got.filter(([, i]) => i >= 73 && i <= 85).slice(-24).map(([ago, i]) => `${name(i)} -${(ago / 1000).toFixed(1)}s`);
-  return `--- frames read in the last ${ms / 1000}s (${got.length}): ${Object.entries(counts).map(([k, n]) => `${k}×${n}`).join(", ") || "none"}`
-    + (live.length ? `\n--- live path, oldest first: ${live.join(", ")}` : "");
+  const live = got.filter(([, i]) => i >= 73 && i <= 85).slice(-40).map(([ago, i]) => `${name(i)} -${(ago / 1000).toFixed(1)}s`);
+  // A test build also logs, by name, what the session took in and what it sent since the
+  // load (session.ts __voipc_heard, __voipc_said): whether it joined, answered an ask, wanted a key
+  const tags = await tab
+    .evaluate(`window.__voipc_heard ? JSON.stringify({ heard: window.__voipc_heard.map(([t]) => t), sent: window.__voipc_said.map((m) => typeof m === "string" ? m : Object.keys(m ?? {})[0]) }) : "null"`)
+    .then(JSON.parse, () => null);
+  const tally = (list) => {
+    const n = {};
+    for (const t of list) if (t !== "Ping" && t !== "Pong") n[t] = (n[t] ?? 0) + 1;
+    return Object.entries(n).map(([k, c]) => `${k}×${c}`).join(", ") || "none";
+  };
+  const said = tab.net?.said ?? [];
+  return `--- frames read ${ms === null ? "since the page loaded" : `in the last ${ms / 1000}s`} (${got.length}): ${Object.entries(counts).map(([k, n]) => `${k}×${n}`).join(", ") || "none"}`
+    + (live.length ? `\n--- live path, oldest first: ${live.join(", ")}` : "")
+    + (tags ? `\n--- the session took in: ${tally(tags.heard)}\n--- and sent: ${tally(tags.sent)}` : "")
+    + (said.length ? `\n--- the page last said: ${said.join(" | ").slice(-2000)}` : "");
 }
 
 /**
@@ -139,7 +156,8 @@ export async function openTab(cdpPort, opts = {}) {
   const pending = new Map();
   const errors = [];
   // In a plain object, so a lane's wrapper ({ ...tab }) still sees the live state
-  const net = { open: new Map(), failed: [], navigation: null };
+  // `said`: the page's last console warnings and errors, counted or not, for a report
+  const net = { open: new Map(), failed: [], navigation: null, said: [] };
   const foreign = (url) => ownCodeOnly && !!url && !/^https?:/.test(url);
   const where = (at) => (detailed && at ? ` @${at.url}:${at.lineNumber + 1}` : "");
   const preview = (o) =>
@@ -174,7 +192,12 @@ export async function openTab(cdpPort, opts = {}) {
         ? ` [failed loads: ${net.failed.join("; ")}]`
         : "";
       errors.push(`${`${d.text ?? ""} ${d.exception?.description ?? ""} ${preview(d.exception)}`.trim()}${where(at)}${why}`);
-    } else if (msg.method === "Runtime.consoleAPICalled" && p.type === "error" && consoleErrors) {
+    }
+    if (msg.method === "Runtime.consoleAPICalled" && (p.type === "error" || p.type === "warning")) {
+      net.said.push(`${clock()} ${p.type}: ${p.args.map((a) => a.value ?? a.description ?? "").join(" ").slice(0, 300)}`);
+      net.said.splice(0, net.said.length - 16);
+    }
+    if (msg.method === "Runtime.consoleAPICalled" && p.type === "error" && consoleErrors) {
       const at = p.stackTrace?.callFrames?.[0];
       if (foreign(at?.url)) return;
       // test-ui's lines never had the prefix, test-move's always did

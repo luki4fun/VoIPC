@@ -340,7 +340,9 @@ pub fn pick_history_sources(sharers: &[u32]) -> HashSet<u32> {
 // somebody writes. Before a post a writer asks whom it owes (`KeyCheck`), makes one sender
 // key message at the current position, holds it with the set just named (a round), sends
 // the post, and only then hands the key out: those it has a session with at once, the rest
-// by asking them to open one. A reader holds a post it has no key for.
+// by asking them to open one. A reader holds a post it has no key for. Every post asks, or
+// posts that wait behind one ask: someone who came a moment after a check is told of only by
+// the next, and no later key opens what went before it (CI run 42696335107).
 //
 // All of it is here, so a frame does the same in both backends: the host passes each frame
 // to `live_frame`, a post to `live_post`, and a second's tick to `live_tick`, sends what
@@ -350,8 +352,6 @@ pub fn pick_history_sources(sharers: &[u32]) -> HashSet<u32> {
 /// How long a round answers a late hello or `KeyWanted` from the position it was named at,
 /// which is what opens the post that went before its key. As long as a reader holds a post.
 const ROUND_LIFE_MS: u64 = 60_000;
-/// A post after this long asks first who came meanwhile.
-const CHECK_EVERY_MS: u64 = 2_000;
 /// A check unanswered this long drops the posts behind it, and says so.
 const CHECK_WAIT_MS: u64 = 10_000;
 /// A chain ends at its next post once this old, by the writer's own count of whom it named,
@@ -501,7 +501,6 @@ struct Writing {
     rounds: Vec<Round>,
     /// Someone it reached is out. It ends at the next post `exit_gap` allows.
     exited: bool,
-    last_check: u64,
     /// A check is out: since when, and whether it asked for everyone.
     check_out: Option<(u64, bool)>,
     /// Who the frames of its answer named so far.
@@ -839,9 +838,9 @@ impl ChannelKeying {
         out
     }
 
-    /// A post in a text channel. It goes now, or behind the check this starts, or behind
-    /// the check already out. Its own row shows it as sent either way. `payload` is what
-    /// the envelope holds.
+    /// A post in a text channel. It goes behind the check this starts, or behind the check
+    /// already out. Its own row shows it as sent either way. `payload` is what the envelope
+    /// holds.
     pub fn live_post(
         &mut self,
         stores: &mut SignalStores,
@@ -866,7 +865,6 @@ impl ChannelKeying {
             group::forget_own_sender_key(stores, own, channel_id);
             w.end_chain();
             w.check_out = Some((now, true));
-            w.last_check = now;
             w.waiting.push_back(payload);
             out.send.push(ClientMessage::KeyCheck {
                 channel_id,
@@ -874,18 +872,13 @@ impl ChannelKeying {
             });
             return Ok(out);
         }
-        if now.saturating_sub(w.last_check) >= CHECK_EVERY_MS {
-            let restart = std::mem::take(&mut w.retell);
-            w.check_out = Some((now, restart));
-            w.last_check = now;
-            w.waiting.push_back(payload);
-            out.send.push(ClientMessage::KeyCheck {
-                channel_id,
-                restart,
-            });
-            return Ok(out);
-        }
-        out.send.push(post_frame(stores, channel_id, &payload)?);
+        let restart = std::mem::take(&mut w.retell);
+        w.check_out = Some((now, restart));
+        w.waiting.push_back(payload);
+        out.send.push(ClientMessage::KeyCheck {
+            channel_id,
+            restart,
+        });
         Ok(out)
     }
 
@@ -2793,6 +2786,23 @@ mod tests {
             assert_eq!(net.devices[&12].wrote(is_hello), 0);
         }
 
+        /// A reader back, or new, just after a writer's check reads the writer's next post,
+        /// however soon it comes: a post reaches only whom its writer has been told of, and a
+        /// later key cannot open an earlier post. CI run 42696335107: fay, back from a reload
+        /// 0.1 s after annika's and bobby's last checks, never saw their posts 1.1 s later.
+        #[test]
+        fn a_reader_back_just_after_a_check_reads_the_next_post() {
+            let mut net = Net::with(&[1, 2]);
+            net.post(1, "first");
+            net.pump();
+            net.reconnect(2, 12, false);
+            net.devices.get_mut(&12).unwrap().k.join_text(CH);
+            net.now += 1_000;
+            net.post(1, "second");
+            net.pump();
+            assert_eq!(net.devices[&12].shown(), vec!["second"]);
+        }
+
         /// A guest has no account to be found by: a new id is someone new.
         #[test]
         fn a_guest_back_under_a_new_id_is_someone_new() {
@@ -2916,7 +2926,7 @@ mod tests {
                 .unwrap();
             net.add(3, Some([3; 16]));
             net.list_everyone();
-            net.now += CHECK_EVERY_MS;
+            net.now += 2_000;
             net.post(1, "after");
             net.pump();
             assert_eq!(net.devices[&3].shown(), vec!["after"]);
@@ -2952,7 +2962,7 @@ mod tests {
             assert_eq!(net.devices[&1].shown(), vec!["from two"]);
             assert_eq!(net.devices[&2].shown(), vec!["from one"]);
             // And what follows on either side still opens
-            net.now += CHECK_EVERY_MS;
+            net.now += 2_000;
             net.post(1, "again from one");
             net.post(2, "again from two");
             net.pump();
@@ -3025,7 +3035,7 @@ mod tests {
                 "it too went before the key"
             );
             assert_eq!(d.events("channel-ring"), 2);
-            net.now += CHECK_EVERY_MS;
+            net.now += 2_000;
             net.post(1, "after the key");
             net.pump();
             assert_eq!(net.devices[&2].shown(), vec!["after the key"]);
@@ -3038,7 +3048,7 @@ mod tests {
             let mut net = Net::with(&[1, 2]);
             net.post(1, "first");
             net.pump();
-            net.now += 2 * CHECK_EVERY_MS;
+            net.now += 4_000;
             // The reader restarted: same id here, nothing kept
             net.reconnect(2, 2, false);
             net.devices
@@ -3286,12 +3296,12 @@ mod tests {
             assert_eq!(opened, vec![2]);
             assert_eq!(w.events("key-warning"), 0, "the lists may be on their way");
             // Still nobody's after asking again: now it is said
-            net.now += CHECK_EVERY_MS;
+            net.now += 2_000;
             net.post(1, "again");
             net.pump();
             assert_eq!(net.devices[&1].events("key-warning"), 1);
             // Once, not per post
-            net.now += CHECK_EVERY_MS;
+            net.now += 2_000;
             net.post(1, "and again");
             net.pump();
             assert_eq!(net.devices[&1].events("key-warning"), 1);
@@ -3454,7 +3464,7 @@ mod tests {
             net.pump();
             assert_eq!(net.devices[&2].shown(), vec!["first"]);
             // Someone new, as a check on a stalling link is answered too late
-            net.now += CHECK_EVERY_MS;
+            net.now += 2_000;
             net.add(3, Some([3; 16]));
             net.list_everyone();
             let now = net.now;
@@ -3497,7 +3507,7 @@ mod tests {
                 "a reader who had it is not disturbed"
             );
             // Back to the usual after one
-            net.now += CHECK_EVERY_MS;
+            net.now += 2_000;
             net.post(1, "third");
             assert!(matches!(
                 net.devices[&1].sent.last().unwrap(),
@@ -3515,11 +3525,11 @@ mod tests {
                 |net: &Net| net.devices[&1].wrote(is_wraps) + net.devices[&1].wrote(is_open);
             let before = wraps(&net);
             net.refuses_checks = true;
-            net.now += CHECK_EVERY_MS;
+            net.now += 2_000;
             net.post(1, "refused");
             net.pump();
             net.refuses_checks = false;
-            net.now += CHECK_EVERY_MS;
+            net.now += 2_000;
             net.post(1, "again");
             assert!(matches!(
                 net.devices[&1].sent.last().unwrap(),
@@ -3555,7 +3565,7 @@ mod tests {
             let out = d.k.live_answer_job(&mut d.stores, CH, false, now);
             net.apply(1, out);
             net.also_names.clear();
-            net.now += CHECK_EVERY_MS;
+            net.now += 2_000;
             net.post(1, "cheaper");
             assert!(matches!(
                 net.devices[&1].sent.last().unwrap(),
@@ -3576,7 +3586,7 @@ mod tests {
             assert_eq!(net.devices[&1].events("key-warning"), 0, "too early to say");
             assert!(net.devices[&3].shown().is_empty());
             net.list_everyone();
-            net.now += CHECK_EVERY_MS;
+            net.now += 2_000;
             net.post(1, "later");
             assert!(matches!(
                 net.devices[&1].sent.last().unwrap(),
@@ -3871,7 +3881,7 @@ mod tests {
             raw_post(&mut net, 2, 1, sealed_elsewhere(1));
             net.pump();
             assert_eq!(net.devices[&2].k.live.held.len(), 1);
-            net.now += CHECK_EVERY_MS;
+            net.now += 2_000;
             net.post(1, "second");
             net.pump();
             assert_eq!(net.devices[&2].shown(), vec!["first", "second"]);
