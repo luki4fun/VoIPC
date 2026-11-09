@@ -11,11 +11,12 @@
 // No dependencies. Needs openssl and chromium (CHROME=/path/to/chrome).
 
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, openSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { loadPage, openTab, sleep, startChromium, waitFor } from "./test-cdp.mjs";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.argv[2] ?? 49990);
@@ -24,7 +25,6 @@ const ORIGIN = `https://127.0.0.1:${PORT}`;
 const WORK = mkdtempSync(join(tmpdir(), "voipc-provider-"));
 const children = [];
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let failures = 0;
 function check(what, ok, detail = "") {
   console.log(`${ok ? "PASS" : "FAIL"} ${what}${!ok && detail ? ` — ${detail}` : ""}`);
@@ -92,78 +92,19 @@ const relay = spawn(join(ROOT, "target/release/voipc-server"), ["-c", "server.to
     VOIPC_OAUTH_DISCORD_SECRET: "secret",
     VOIPC_OAUTH_TEST_BASE: providerBase,
   },
-  stdio: ["ignore", "ignore", "inherit"],
+  // RELAY_LOG=<file>: the relay's log there, for a run that needs to see why (test-web.sh sets it)
+  stdio: ["ignore", process.env.RELAY_LOG ? openSync(process.env.RELAY_LOG, "a") : "ignore", "inherit"],
 });
 children.push(relay);
 await sleep(1500);
 
 // ── Browsers, each its own device ─────────────────────────────────────────
 
-async function browser(cdpPort) {
-  const c = spawn(
-    CHROME,
-    ["--headless=new", "--no-sandbox", "--ignore-certificate-errors", `--remote-debugging-port=${cdpPort}`,
-     `--user-data-dir=${join(WORK, `profile-${cdpPort}`)}`, "about:blank"],
-    { stdio: "ignore" },
-  );
-  children.push(c);
-  for (let i = 0; i < 60; i++) {
-    if (await fetch(`http://127.0.0.1:${cdpPort}/json/version`).then((r) => r.ok, () => false)) return cdpPort;
-    await sleep(250);
-  }
-  throw new Error("chromium did not come up");
-}
-
-async function newTab(cdpPort) {
-  const res = await fetch(`http://127.0.0.1:${cdpPort}/json/new?about:blank`, { method: "PUT" });
-  const ws = new WebSocket((await res.json()).webSocketDebuggerUrl);
-  await new Promise((resolve, reject) => {
-    ws.onopen = resolve;
-    ws.onerror = reject;
-  });
-  let id = 0;
-  const pending = new Map();
-  const errors = [];
-  ws.onmessage = (m) => {
-    const msg = JSON.parse(m.data);
-    if (msg.id && pending.has(msg.id)) {
-      pending.get(msg.id)(msg);
-      pending.delete(msg.id);
-    } else if (msg.method === "Runtime.exceptionThrown") {
-      const d = msg.params.exceptionDetails;
-      errors.push(`${d.text} ${d.exception?.description ?? ""}`);
-    }
-  };
-  const send = (method, params = {}) =>
-    new Promise((resolve, reject) => {
-      const i = ++id;
-      const timer = setTimeout(() => reject(new Error(`CDP timed out: ${method}`)), 30_000);
-      pending.set(i, (msg) => {
-        clearTimeout(timer);
-        resolve(msg);
-      });
-      ws.send(JSON.stringify({ id: i, method, params }));
-    });
-  const evaluate = async (expression) => {
-    const r = await send("Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true });
-    if (r.result?.exceptionDetails) throw new Error(`evaluate: ${JSON.stringify(r.result.exceptionDetails).slice(0, 300)}`);
-    return r.result?.result?.value;
-  };
-  await send("Runtime.enable");
-  await send("Page.enable");
-  await send("Emulation.setDeviceMetricsOverride", { width: 1280, height: 900, deviceScaleFactor: 1, mobile: false });
-  return { send, evaluate, errors };
-}
-
-async function waitFor(tab, expression, timeoutMs = 25_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (await tab.evaluate(`!!(${expression})`)) return;
-    await sleep(150);
-  }
-  const text = await tab.evaluate(`document.body?.innerText?.slice(0, 500) ?? ""`).catch(() => "");
-  throw new Error(`timed out waiting for ${expression}\n--- page: ${text.replace(/\s+/g, " ")}`);
-}
+const browser = async (cdpPort) => {
+  await startChromium({ chrome: CHROME, work: WORK, cdpPort, children });
+  return cdpPort;
+};
+const newTab = (cdpPort) => openTab(cdpPort);
 
 const setInput = (selector, value) =>
   `(() => { const el = document.querySelector(${JSON.stringify(selector)}); if (!el) return false;
@@ -180,8 +121,7 @@ const dialogOf = (kind) => `.account-dialog[data-kind="${kind}"]`;
  *  `window.open` noted instead of opening anything. */
 async function openDialog(cdpPort) {
   const tab = await newTab(cdpPort);
-  await tab.send("Page.navigate", { url: `${ORIGIN}/` });
-  await waitFor(tab, `document.querySelector(".skip-link") || document.querySelector(".connect-btn")`);
+  await loadPage(tab, `${ORIGIN}/`, `document.querySelector(".skip-link") || document.querySelector(".connect-btn")`);
   if (await tab.evaluate(`!!document.querySelector(".skip-link")`)) {
     await tab.evaluate(`document.querySelector(".skip-link").click()`);
     await waitFor(tab, `document.querySelector(".connect-btn")`);

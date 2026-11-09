@@ -23,6 +23,7 @@ import { mkdirSync, mkdtempSync, openSync, rmSync, writeFileSync } from "node:fs
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { loadPage, openTab, seen, sleep, startChromium, waitFor } from "./test-cdp.mjs";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.argv[2] ?? 49992);
@@ -33,7 +34,6 @@ const TOKEN = "e2e-admin-token-0001";
 const PASSWORD = "correct-horse-battery-1";
 const children = [];
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let failures = 0;
 function check(what, ok, detail = "") {
   console.log(`${ok ? "PASS" : "FAIL"} ${what}${!ok && detail ? ` — ${detail}` : ""}`);
@@ -108,89 +108,14 @@ await sleep(1500);
 
 // ── Browsers, each its own device ─────────────────────────────────────────
 
-async function browser(cdpPort) {
-  const c = spawn(
-    CHROME,
-    ["--headless=new", "--no-sandbox", "--ignore-certificate-errors", `--remote-debugging-port=${cdpPort}`,
-     "--use-fake-device-for-media-stream", "--use-fake-ui-for-media-stream", "--autoplay-policy=no-user-gesture-required",
-     `--user-data-dir=${join(WORK, `profile-${cdpPort}`)}`, "about:blank"],
-    { stdio: "ignore" },
-  );
-  children.push(c);
-  for (let i = 0; i < 60; i++) {
-    if (await fetch(`http://127.0.0.1:${cdpPort}/json/version`).then((r) => r.ok, () => false)) return cdpPort;
-    await sleep(250);
-  }
-  throw new Error("chromium did not come up");
-}
-
-async function newTab(cdpPort) {
-  const res = await fetch(`http://127.0.0.1:${cdpPort}/json/new?about:blank`, { method: "PUT" });
-  const ws = new WebSocket((await res.json()).webSocketDebuggerUrl);
-  await new Promise((resolve, reject) => {
-    ws.onopen = resolve;
-    ws.onerror = reject;
+const browser = async (cdpPort) => {
+  await startChromium({
+    chrome: CHROME, work: WORK, cdpPort, children,
+    args: ["--use-fake-device-for-media-stream", "--use-fake-ui-for-media-stream", "--autoplay-policy=no-user-gesture-required"],
   });
-  let id = 0;
-  const pending = new Map();
-  const errors = [];
-  // A page error about a file that did not load says why it did not, from the network's side
-  const urls = new Map();
-  const failed = [];
-  ws.onmessage = (m) => {
-    const msg = JSON.parse(m.data);
-    if (msg.id && pending.has(msg.id)) {
-      pending.get(msg.id)(msg);
-      pending.delete(msg.id);
-    } else if (msg.method === "Network.requestWillBeSent") {
-      urls.set(msg.params.requestId, msg.params.request.url);
-    } else if (msg.method === "Network.loadingFinished") {
-      urls.delete(msg.params.requestId);
-    } else if (msg.method === "Network.loadingFailed") {
-      failed.push(`${new Date().toISOString().slice(11, 23)} ${msg.params.errorText}${msg.params.canceled ? " (canceled)" : ""} ${urls.get(msg.params.requestId) ?? ""}`);
-      urls.delete(msg.params.requestId);
-      failed.splice(0, failed.length - 8);
-    } else if (msg.method === "Runtime.exceptionThrown") {
-      const d = msg.params.exceptionDetails;
-      const why = /dynamically imported module|preload CSS/.test(`${d.exception?.description}`) ? ` [failed loads: ${failed.join("; ")}]` : "";
-      errors.push(`${d.text} ${d.exception?.description ?? ""}${why}`);
-    }
-  };
-  const send = (method, params = {}) =>
-    new Promise((resolve, reject) => {
-      const i = ++id;
-      const timer = setTimeout(() => reject(new Error(`CDP timed out: ${method}`)), 30_000);
-      pending.set(i, (msg) => {
-        clearTimeout(timer);
-        resolve(msg);
-      });
-      ws.send(JSON.stringify({ id: i, method, params }));
-    });
-  const evaluate = async (expression) => {
-    const r = await send("Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true });
-    if (r.result?.exceptionDetails) throw new Error(`evaluate: ${JSON.stringify(r.result.exceptionDetails).slice(0, 300)}`);
-    return r.result?.result?.value;
-  };
-  await send("Runtime.enable");
-  await send("Network.enable");
-  await send("Page.enable");
-  await send("DOM.enable");
-  await send("Emulation.setDeviceMetricsOverride", { width: 1280, height: 900, deviceScaleFactor: 1, mobile: false });
-  return { send, evaluate, errors };
-}
-
-async function waitFor(tab, expression, timeoutMs = 25_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (await tab.evaluate(`!!(${expression})`)) return;
-    await sleep(150);
-  }
-  const text = await tab.evaluate(`document.body?.innerText?.slice(0, 600) ?? ""`).catch(() => "");
-  throw new Error(`timed out waiting for ${expression}\n--- page: ${text.replace(/\s+/g, " ")}`);
-}
-
-const seen = (tab, expression, timeoutMs = 15_000) =>
-  waitFor(tab, expression, timeoutMs).then(() => true, () => false);
+  return cdpPort;
+};
+const newTab = (cdpPort) => openTab(cdpPort, { dom: true });
 
 const setInput = (selector, value) =>
   `(() => { const el = document.querySelector(${JSON.stringify(selector)}); if (!el) return false;
@@ -214,19 +139,10 @@ const totpAt = (b32, step) => {
   return String((h.readUInt32BE(o) & 0x7fffffff) % 1_000_000).padStart(6, "0");
 };
 
-/** The relay's page up. A browser just started on a busy runner can leave its first page blank. */
-async function reachDialog(tab) {
-  const shown = `document.querySelector(".skip-link") || document.querySelector(".connect-btn")`;
-  const before = tab.errors.length;
-  await tab.send("Page.navigate", { url: `${ORIGIN}/` });
-  if (await waitFor(tab, shown).then(() => true, () => false)) return;
-  // The blank first page this retry is for: what it said, with why its files did not load, goes
-  // to the log rather than to the page's own checks
-  const blank = tab.errors.splice(before);
-  console.log(`NOTE a first page load stayed blank and is tried again${blank.length ? `; it said: ${blank.join(" | ")}` : ""}`);
-  await tab.send("Page.navigate", { url: `${ORIGIN}/` });
-  await waitFor(tab, shown, 60_000);
-}
+/** The relay's page up. A browser just started on a busy runner can leave its first page blank:
+ *  that is logged with its diagnosis (NOTE) and tried once more. */
+const reachDialog = (tab) =>
+  loadPage(tab, `${ORIGIN}/`, `document.querySelector(".skip-link") || document.querySelector(".connect-btn")`, { retry: true });
 
 /** The connect dialog on the relay's own page, its Account tab open. */
 async function openDialog(cdpPort) {

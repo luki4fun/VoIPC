@@ -14,6 +14,17 @@ on:
   pull_request:
     paths-ignore: ['**/*.md', 'docs/**', 'website/**', '.impeccable/**', 'Dockerfile.relay']
   workflow_call:
+    # soak.yml: many copies of the browser jobs at once, and nothing else. Every other
+    # caller (the release gate) and every other event gets one copy of everything.
+    inputs:
+      copies:
+        description: The copies of each browser part, as a JSON list of numbers
+        type: string
+        default: '[1]'
+      browser-only:
+        description: Run the browser jobs alone
+        type: boolean
+        default: false
 
 # Nothing here writes. Without this a push event's token gets the repository's
 # default permissions, which may include write.
@@ -30,6 +41,7 @@ concurrency:
 jobs:
   rust:
     name: Rust
+    if: ${{ !inputs.browser-only }}
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
@@ -114,6 +126,7 @@ jobs:
   # deliberate toolchain bump, fixed in the same change.
   lint:
     name: Lint
+    if: ${{ !inputs.browser-only }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -188,6 +201,7 @@ jobs:
   # a code change, and a pull request should not turn red for it.
   deny:
     name: cargo-deny
+    if: ${{ !inputs.browser-only }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
@@ -233,7 +247,8 @@ jobs:
           done
 
   browser:
-    name: Browser end-to-end (${{ matrix.part }})
+    # A copy's number only in a soak: the pull-request checks keep the names they have
+    name: Browser end-to-end (${{ matrix.part }}${{ inputs.browser-only && format(' #{0}', matrix.copy) || '' }})
     runs-on: ubuntu-24.04
     # Four parts side by side: the two lanes that run test-ui.mjs, the quick lanes
     # (under a minute each) and the relay on Postgres. One job ran the first three
@@ -244,6 +259,7 @@ jobs:
       fail-fast: false
       matrix:
         part: [quic, udp-blocked, lanes, postgres]
+        copy: ${{ fromJSON(inputs.copies || '[1]') }}
     # The image has both, and test-web.sh would pick `chromium` first — but that
     # one is an unbranded snapshot build (no proprietary codecs), so the browser
     # sharer quietly falls back to VP9 and no lane exercises the H.264 path that
@@ -251,6 +267,8 @@ jobs:
     # people running this client actually have.
     env:
       CHROME: /usr/bin/google-chrome
+      # test-web.sh copies every lane's output and relay log here; a red job uploads them
+      KEEP_LOGS: ${{ github.workspace }}/browser-logs
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         # No token left in .git/config for build scripts to find
@@ -404,6 +422,7 @@ jobs:
         if: matrix.part == 'postgres'
         run: |
           sudo systemctl start postgresql.service
+          mkdir -p "$KEEP_LOGS"   # where the lanes below write their relay logs
           sudo -u postgres psql -c "CREATE ROLE voipc SUPERUSER LOGIN PASSWORD 'voipc'"
           for name in tests community moderation move; do
             PGPASSWORD=voipc createdb -h 127.0.0.1 -U voipc "$name"
@@ -419,22 +438,43 @@ jobs:
         if: ${{ !cancelled() && matrix.part == 'postgres' }}
         timeout-minutes: 10
         run: bash tools/ci-run.sh "community lane on Postgres" node test-community.mjs 29400
-        env: { COMMUNITY_DATABASE: 'postgres://voipc:voipc@127.0.0.1:5432/community' }
+        env:
+          COMMUNITY_DATABASE: 'postgres://voipc:voipc@127.0.0.1:5432/community'
+          RELAY_LOG: ${{ github.workspace }}/browser-logs/postgres-community-relay.log
+          RUST_LOG: voipc_server=debug
       - name: Moderation lane on Postgres
         if: ${{ !cancelled() && matrix.part == 'postgres' }}
         timeout-minutes: 15
         run: bash tools/ci-run.sh "moderation lane on Postgres" node test-moderation.mjs 29600
-        env: { MODERATION_DATABASE: 'postgres://voipc:voipc@127.0.0.1:5432/moderation' }
+        env:
+          MODERATION_DATABASE: 'postgres://voipc:voipc@127.0.0.1:5432/moderation'
+          RELAY_LOG: ${{ github.workspace }}/browser-logs/postgres-moderation-relay.log
+          RUST_LOG: voipc_server=debug
       - name: Move lane on Postgres
         if: ${{ !cancelled() && matrix.part == 'postgres' }}
         timeout-minutes: 15
         run: bash tools/ci-run.sh "move lane on Postgres" node test-move.mjs 29800
-        env: { MOVE_DATABASE: 'postgres://voipc:voipc@127.0.0.1:5432/move' }
+        env:
+          MOVE_DATABASE: 'postgres://voipc:voipc@127.0.0.1:5432/move'
+          RELAY_LOG: ${{ github.workspace }}/browser-logs/postgres-move-relay.log
+          RUST_LOG: voipc_server=debug
+
+      # What the lanes said and their relays logged, for a red job: a timeout's diagnosis
+      # names the requests a page was waiting on, and the relay log what it refused then
+      - name: Lane logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: browser-logs-${{ matrix.part }}-${{ matrix.copy }}
+          path: ${{ github.workspace }}/browser-logs
+          if-no-files-found: ignore
+          retention-days: 7
 
   # The Windows and Android builds compile on every pull request, not first
   # in a release run. cargo check only, with the caches release.yml uses.
   cross:
     name: Windows and Android cargo check
+    if: ${{ !inputs.browser-only }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:

@@ -25,6 +25,7 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { loadPage, openTab, seen, sleep, startChromium, waitFor } from "./test-cdp.mjs";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.argv[2] ?? 49993);
@@ -49,7 +50,6 @@ const FRANK = "1190000000000001005";
 const rowOf = (id) => `#archive-${id}`;
 const WELCOME = rowOf("1200000000000005001"); // dan's, pinned, what v2/resend.json sends again
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let failures = 0;
 function check(what, ok, detail = "") {
   console.log(`${ok ? "PASS" : "FAIL"} ${what}${!ok && detail ? ` — ${String(detail).slice(0, 600)}` : ""}`);
@@ -186,19 +186,12 @@ await sleep(2000);
 
 const browsers = new Map();
 async function browser(cdpPort) {
-  const c = spawn(
-    CHROME,
-    ["--headless=new", "--no-sandbox", "--ignore-certificate-errors", `--remote-debugging-port=${cdpPort}`,
-     "--use-fake-device-for-media-stream", "--use-fake-ui-for-media-stream", `--user-data-dir=${join(WORK, `profile-${cdpPort}`)}`, "about:blank"],
-    { stdio: "ignore" },
-  );
-  children.push(c);
+  const c = await startChromium({
+    chrome: CHROME, work: WORK, cdpPort, children,
+    args: ["--use-fake-device-for-media-stream", "--use-fake-ui-for-media-stream"],
+  });
   browsers.set(cdpPort, c);
-  for (let i = 0; i < 60; i++) {
-    if (await fetch(`http://127.0.0.1:${cdpPort}/json/version`).then((r) => r.ok, () => false)) return cdpPort;
-    await sleep(250);
-  }
-  throw new Error("chromium did not come up");
+  return cdpPort;
 }
 
 // What every page does on the control stream, seen from outside the app. `__sent` holds which
@@ -248,75 +241,7 @@ async function forgeFetches(tab) {
   return tab.evaluate(`window.__heard`);
 }
 
-async function newTab(cdpPort) {
-  const res = await fetch(`http://127.0.0.1:${cdpPort}/json/new?about:blank`, { method: "PUT" });
-  const target = await res.json();
-  const ws = new WebSocket(target.webSocketDebuggerUrl);
-  await new Promise((resolve, reject) => {
-    ws.onopen = resolve;
-    ws.onerror = reject;
-  });
-  let id = 0;
-  const pending = new Map();
-  const errors = [];
-  // A page error about a file that did not load says why it did not, from the network's side
-  const urls = new Map();
-  const failed = [];
-  ws.onmessage = (m) => {
-    const msg = JSON.parse(m.data);
-    if (msg.id && pending.has(msg.id)) {
-      pending.get(msg.id)(msg);
-      pending.delete(msg.id);
-    } else if (msg.method === "Network.requestWillBeSent") {
-      urls.set(msg.params.requestId, msg.params.request.url);
-    } else if (msg.method === "Network.loadingFinished") {
-      urls.delete(msg.params.requestId);
-    } else if (msg.method === "Network.loadingFailed") {
-      failed.push(`${new Date().toISOString().slice(11, 23)} ${msg.params.errorText}${msg.params.canceled ? " (canceled)" : ""} ${urls.get(msg.params.requestId) ?? ""}`);
-      urls.delete(msg.params.requestId);
-      failed.splice(0, failed.length - 8);
-    } else if (msg.method === "Runtime.exceptionThrown") {
-      const d = msg.params.exceptionDetails;
-      const why = /dynamically imported module|preload CSS/.test(`${d.exception?.description}`) ? ` [failed loads: ${failed.join("; ")}]` : "";
-      errors.push(`${d.text} ${d.exception?.description ?? ""}${why}`);
-    } else if (msg.method === "Runtime.consoleAPICalled" && msg.params.type === "error") {
-      errors.push(`console: ${msg.params.args.map((a) => a.value ?? a.description).join(" ")}`);
-    }
-  };
-  const send = (method, params = {}) =>
-    new Promise((resolve, reject) => {
-      const i = ++id;
-      const timer = setTimeout(() => reject(new Error(`CDP timed out: ${method}`)), 30_000);
-      pending.set(i, (msg) => {
-        clearTimeout(timer);
-        resolve(msg);
-      });
-      ws.send(JSON.stringify({ id: i, method, params }));
-    });
-  const evaluate = async (expression) => {
-    const r = await send("Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true });
-    if (r.result?.exceptionDetails) throw new Error(`evaluate: ${JSON.stringify(r.result.exceptionDetails).slice(0, 300)}`);
-    return r.result?.result?.value;
-  };
-  await send("Runtime.enable");
-  await send("Network.enable");
-  await send("Page.enable");
-  await send("DOM.enable");
-  await send("Page.addScriptToEvaluateOnNewDocument", { source: WIRE });
-  await send("Emulation.setDeviceMetricsOverride", { width: 1280, height: 900, deviceScaleFactor: 1, mobile: false });
-  return { send, evaluate, errors, activate: () => fetch(`http://127.0.0.1:${cdpPort}/json/activate/${target.id}`) };
-}
-
-async function waitFor(tab, expression, timeoutMs = 25_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (await tab.evaluate(`!!(${expression})`)) return;
-    await sleep(150);
-  }
-  const text = await tab.evaluate(`document.body?.innerText?.slice(0, 900) ?? ""`).catch(() => "");
-  throw new Error(`timed out waiting for ${expression}\n--- page: ${text.replace(/\s+/g, " ")}`);
-}
-const seen = (tab, expression, timeoutMs = 15_000) => waitFor(tab, expression, timeoutMs).then(() => true, () => false);
+const newTab = (cdpPort) => openTab(cdpPort, { console: true, dom: true, onNewDocument: WIRE });
 
 const setInput = (selector, value) =>
   `(() => { const el = document.querySelector(${JSON.stringify(selector)}); if (!el) return false; el.value = ${JSON.stringify(value)}; el.dispatchEvent(new Event("input", { bubbles: true })); el.dispatchEvent(new Event("change", { bubbles: true })); return true; })()`;
@@ -387,19 +312,10 @@ const pickBy = (tab, selector, value) =>
 
 // ── Coming in ─────────────────────────────────────────────────────────────
 
-/** The relay's page, up to the sign-in form: a browser just started can take two goes. */
-async function reachDialog(tab, path = "/", port = PORT) {
-  const shown = `document.querySelector(".skip-link") || document.querySelector(".connect-btn")`;
-  const before = tab.errors.length;
-  await tab.send("Page.navigate", { url: `https://127.0.0.1:${port}${path}` });
-  if (await seen(tab, shown, 25_000)) return;
-  // The blank first page this retry is for: what it said, with why its files did not load, goes
-  // to the log rather than to the page's own checks
-  const blank = tab.errors.splice(before);
-  console.log(`NOTE a first page load stayed blank and is tried again${blank.length ? `; it said: ${blank.join(" | ")}` : ""}`);
-  await tab.send("Page.navigate", { url: `https://127.0.0.1:${port}${path}` });
-  await waitFor(tab, shown, 60_000);
-}
+/** The relay's page, up to the sign-in form: a browser just started can take two goes. The
+ *  first, if it stayed blank, is logged with its diagnosis (NOTE). */
+const reachDialog = (tab, path = "/", port = PORT) =>
+  loadPage(tab, `https://127.0.0.1:${port}${path}`, `document.querySelector(".skip-link") || document.querySelector(".connect-btn")`, { retry: true });
 async function pastAudioStep(tab) {
   if (await tab.evaluate(`!!document.querySelector(".skip-link")`)) {
     await tab.evaluate(`document.querySelector(".skip-link").click()`);

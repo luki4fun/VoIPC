@@ -25,6 +25,7 @@ import { createHmac } from "node:crypto";
 import { mkdtempSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { openTab, sleep, waitFor as waitUntil } from "./test-cdp.mjs";
 
 const PORT = process.argv[2] ?? "19987";
 const CDP = process.argv[3] ?? "9222";
@@ -39,7 +40,6 @@ const CHANNEL = `ui-${process.pid % 10000}`;
 /** The text channel test-web.sh's channels.json asks every client into. */
 const AUTO_JOIN_CHANNEL = "lobby-chat";
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let failures = 0;
 
 function check(description, ok, detail = "") {
@@ -55,60 +55,12 @@ function check(description, ok, detail = "") {
 const inFront = new Map();
 
 async function newTab(cdp = CDP) {
-  const res = await fetch(`http://127.0.0.1:${cdp}/json/new?about:blank`, { method: "PUT" });
-  const info = await res.json();
-  const ws = new WebSocket(info.webSocketDebuggerUrl);
-  await new Promise((resolve, reject) => {
-    ws.onopen = resolve;
-    ws.onerror = reject;
-  });
-  let id = 0;
-  const pending = new Map();
-  const errors = [];
-  ws.onmessage = (m) => {
-    const msg = JSON.parse(m.data);
-    if (msg.id && pending.has(msg.id)) {
-      pending.get(msg.id)(msg);
-      pending.delete(msg.id);
-      return;
-    }
-    // Only the page's own code counts. Chrome's built-in component scripts run
-    // in the page too (content-utils.js, "Attempting to use a disconnected port
-    // object" while a screen is shared) and report into the same console.
-    const foreign = (url) => !!url && !/^https?:/.test(url);
-    const where = (at) => (at ? ` @${at.url}:${at.lineNumber + 1}` : "");
-    const preview = (o) =>
-      o?.preview ? JSON.stringify(Object.fromEntries(o.preview.properties.map((x) => [x.name, x.value]))) : "";
-    if (msg.method === "Runtime.exceptionThrown") {
-      // A rejection with a plain object describes itself as "Object": its
-      // preview and where it was thrown are what make the report readable
-      const d = msg.params.exceptionDetails;
-      const at = d.stackTrace?.callFrames?.[0] ?? (d.url ? { url: d.url, lineNumber: d.lineNumber ?? 0 } : null);
-      if (foreign(at?.url)) return;
-      errors.push(`${d.text ?? ""} ${d.exception?.description ?? ""} ${preview(d.exception)}`.trim() + where(at));
-    }
-    if (msg.method === "Runtime.consoleAPICalled" && msg.params.type === "error") {
-      const at = msg.params.stackTrace?.callFrames?.[0];
-      if (foreign(at?.url)) return;
-      errors.push(msg.params.args.map((a) => a.value ?? (preview(a) || a.description) ?? "").join(" ") + where(at));
-    }
-  };
-  // Every call gets a deadline. Input.dispatchTouchEvent waits on the renderer
-  // and simply never answers if the page cannot process the event, which turned
-  // one refused touch into a fifteen-minute suite that ended in a bare 124.
-  const sendNow = (method, params = {}, timeoutMs = 30_000) =>
-    new Promise((resolve, reject) => {
-      const i = ++id;
-      const timer = setTimeout(() => {
-        pending.delete(i);
-        reject(new Error(`CDP timed out after ${timeoutMs}ms: ${method}`));
-      }, timeoutMs);
-      pending.set(i, (msg) => {
-        clearTimeout(timer);
-        resolve(msg);
-      });
-      ws.send(JSON.stringify({ id: i, method, params }));
-    });
+  // Only the page's own code counts: Chrome's built-in component scripts run in the page
+  // too (content-utils.js, "Attempting to use a disconnected port object" while a screen
+  // is shared) and report into the same console (ownCodeOnly). Headless Chromium defaults
+  // to 800x600; the mixer's layout is designed for the width the app actually runs at, and
+  // elements below the fold get coordinates the input events cannot reach.
+  const base = await openTab(cdp, { console: true, ownCodeOnly: true, detailed: true, viewport: { width: 1280, height: 800 } });
   // Trusted input goes to the tab in front, as a person's would. Chromium draws no
   // other tab of a window, and a mouse move waits for a frame: 5 s each behind it,
   // whatever the flags. The tab it leaves stays hidden, so a sharer in the
@@ -117,44 +69,23 @@ async function newTab(cdp = CDP) {
   // call two frames a second.
   const send = async (method, params, timeoutMs) => {
     if (method.startsWith("Input.")) await toFront();
-    return sendNow(method, params, timeoutMs);
+    return base.send(method, params, timeoutMs);
   };
   // Separately for what reads where to click first: a tab coming forward lays out
   // what it held back, so that is true only after a frame.
   const toFront = async () => {
     if (inFront.get(cdp) === tab) return;
     inFront.set(cdp, tab);
-    await sendNow("Page.bringToFront");
-    await evaluate(`new Promise((done) => { requestAnimationFrame(done); setTimeout(done, 1000); })`);
+    await base.send("Page.bringToFront");
+    await base.evaluate(`new Promise((done) => { requestAnimationFrame(done); setTimeout(done, 1000); })`);
   };
-  const evaluate = async (expression) => {
-    const r = await send("Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true });
-    if (r.result?.exceptionDetails) {
-      throw new Error(`evaluate failed: ${JSON.stringify(r.result.exceptionDetails).slice(0, 300)}`);
-    }
-    return r.result?.result?.value;
-  };
-  await send("Runtime.enable");
-  await send("Page.enable");
-  // Headless Chromium defaults to 800x600; the mixer's layout is designed for
-  // the width the app actually runs at, and elements below the fold get
-  // coordinates the input events cannot reach.
-  await send("Emulation.setDeviceMetricsOverride", {
-    width: 1280, height: 800, deviceScaleFactor: 1, mobile: false,
-  });
-  const tab = { send, evaluate, errors, toFront };
+  const tab = { ...base, send, toFront };
   inFront.set(cdp, tab); // a new tab opens in front
   return tab;
 }
 
-async function waitFor(tab, expression, timeoutMs = 20_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (await tab.evaluate(`!!(${expression})`)) return true;
-    await sleep(150);
-  }
-  throw new Error(`timed out waiting for ${expression}`);
-}
+/** test-cdp's waitFor, with this lane's 20 s: on running out it says what the page was doing. */
+const waitFor = (tab, expression, timeoutMs = 20_000) => waitUntil(tab, expression, timeoutMs);
 
 const setInput = (selector, value) =>
   `(() => { const el = document.querySelector(${JSON.stringify(selector)}); if (!el) return false;

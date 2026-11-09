@@ -81,6 +81,15 @@ on_exit() {
         if [ -n "${WORK:-}" ] && [ -s "$WORK/$f" ]; then echo "--- $f"; tail -n 15 "$WORK/$f"; fi
       done)" || true
   fi
+  # KEEP_LOGS=<dir>: every lane's output and relay log copied there first, for a CI job to
+  # upload (the soak workflow, and any red browser job)
+  # A directory per run: a CI job runs this several times, and the names repeat.
+  if [ -n "${KEEP_LOGS:-}" ] && [ -n "${WORK:-}" ]; then
+    local kept
+    kept="$KEEP_LOGS/test-web-$(date +%H%M%S)-$$"
+    mkdir -p "$kept" 2>/dev/null &&
+      find "$WORK" -maxdepth 1 -type f \( -name '*.txt' -o -name '*.log' \) -exec cp {} "$kept/" \; 2>/dev/null || true
+  fi
   if [ -n "${WORK:-}" ]; then rm -rf "$WORK" 2>/dev/null || true; fi
 }
 set -E
@@ -422,11 +431,24 @@ elif [ "$BROWSER_ALICE" = chromium ] || [ "$BROWSER_BOB" = chromium ]; then
   run_lane() { RELAY_LOG="$WORK/$1-relay.log" RUST_LOG="${RUST_LOG:-voipc_server=debug}" CHROME="$CHROME" TMPDIR="$WORK" exec node "$SCRIPT_DIR/"${lane_args[$1]}; }
   # A lane has ended: its verdict, and on a failure what it said goes to fails.txt
   lane_verdict() { # name exit-status
+    # On every run, green too: connections and QUIC sessions (web.rs logs those as sessions)
+    # the lane's relay refused, and first loads that stayed blank and were tried again. A near
+    # miss shows here before it fails a run.
+    local refused=0 blank=0
+    if [ -s "$WORK/$1-relay.log" ]; then
+      refused=$(sed 's/\x1b\[[0-9;]*m//g' "$WORK/$1-relay.log" | grep -cE 'rejecting (connection|session)' || true)
+    fi
+    blank=$(grep -c '^NOTE a first page load stayed blank' "$WORK/$1.txt" 2>/dev/null || true)
+    echo "--- $1: relay refused ${refused:-0} connection(s) or session(s), ${blank:-0} blank first load(s) tried again"
+    if [ "${refused:-0}" != 0 ]; then
+      sed 's/\x1b\[[0-9;]*m//g' "$WORK/$1-relay.log" | grep -E 'rejecting (connection|session)' | sed -E 's/.*rejecting (connection|session): /\1: /' | sort | uniq -c
+    fi
     if [ "$2" = 0 ]; then
       echo "PASS ${lane_passed[$1]}"
     else
       echo "FAIL ${lane_failed[$1]}" | tee -a "$WORK/fails.txt"
-      { grep '^FAIL' "$WORK/$1.txt"; grep -v '^PASS\|^FAIL' "$WORK/$1.txt" | tail -n 15; } >> "$WORK/fails.txt" || true
+      # 40: a timeout's diagnosis (test-cdp.mjs diagnose) is several lines of its own
+      { grep '^FAIL' "$WORK/$1.txt"; grep -v '^PASS\|^FAIL' "$WORK/$1.txt" | tail -n 40; } >> "$WORK/fails.txt" || true
       if [ -s "$WORK/$1-relay.log" ]; then
         echo "--- $1's relay: what it refused, ended or warned of"
         sed 's/\x1b\[[0-9;]*m//g' "$WORK/$1-relay.log" | grep -E 'WARN|ERROR|rejecting|refusing|connection ended' | tail -n 40 || true
