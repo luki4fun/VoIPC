@@ -180,7 +180,7 @@ async function serverMenu(tab, label, { real = true, timeoutMs = 5_000 } = {}) {
   for (;;) {
     if (!(await tab.evaluate(`!!document.querySelector(".server-header .menu")`))) {
       await tab.evaluate(click(".server-header .header-btn"));
-      await waitFor(tab, `document.querySelector(".server-header .menu")`, 5_000).catch(() => {});
+      await probe(tab, `document.querySelector(".server-header .menu")`, 5_000);
     }
     const k = await tab.evaluate(`${items}.map((e) => e.textContent.trim()).findIndex(${pick}) + 1`);
     if (k > 0) {
@@ -431,7 +431,7 @@ await sleep(300);
 check("an avatar is drawn in the room", await alice.evaluate(`document.querySelectorAll(".avatar").length >= 1`));
 // The room is a full-window activity, over the header the mixer button is in
 await alice.evaluate(click('button[title="Close the virtual room"]'));
-await waitFor(alice, `!document.querySelector(".room")`, 5_000).catch(() => {});
+await probe(alice, `!document.querySelector(".room")`, 5_000);
 
 // 3. The second client joins the same channel (double click, as a user would)
 await bob.evaluate(
@@ -893,7 +893,7 @@ check(
   await realClick(alice, ".settings-btn");
   await waitFor(alice, tab("About"));
   await alice.evaluate(`${tab("About")}.click()`);
-  await waitFor(alice, `document.querySelector("details.notices summary")`, 5_000).catch(() => {});
+  await probe(alice, `document.querySelector("details.notices summary")`, 5_000);
   await realClick(alice, "details.notices summary");
   const notices = await waitFor(alice, `document.querySelector(".notices-text")?.textContent.length > 1000`, 10_000).then(() => true, () => false);
   check("About shows the third-party notices", notices,
@@ -1479,7 +1479,7 @@ check(
 
   const other = `${twin}#${tag}`;
   const row = `[...document.querySelectorAll(".user .name")].find((e) => e.title === ${JSON.stringify(other)})`;
-  await waitFor(first, row).catch(() => {});
+  await probe(first, row, 20_000);
   check(
     "the list shows the name without its tag",
     (await first.evaluate(`${row}?.textContent.trim() ?? ""`)) === twin,
@@ -1499,7 +1499,7 @@ check(
     `(() => { const b = [...document.querySelectorAll(".ctx-item")].find((e) => /direct message/i.test(e.textContent));
        if (!b) return false; b.click(); return true; })()`,
   );
-  await waitFor(first, `document.querySelector(".input-bar .chat-input")`).catch(() => {});
+  await probe(first, `document.querySelector(".input-bar .chat-input")`, 20_000);
   const say = (text) =>
     first.evaluate(`(() => { const input = document.querySelector(".input-bar .chat-input"); if (!input) return false;
       input.value = ${JSON.stringify(text)}; input.dispatchEvent(new Event("input", { bubbles: true }));
@@ -1520,7 +1520,7 @@ check(
   check("with no complaint", !(await first.evaluate(notDelivered)));
 
   await serverMenu(second, "Disconnect");
-  await waitFor(first, `!${row}`).catch(() => {});
+  await probe(first, `!${row}`, 20_000);
   await say("are you still there?");
   let told = false;
   try {
@@ -1602,14 +1602,14 @@ check(
     `(() => { const el = [...document.querySelectorAll(".channel")].find((e) => e.querySelector(".channel-name")?.textContent === ${JSON.stringify(SHOW)});
        if (!el) return false; el.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })); return true; })()`,
   );
-  await waitFor(guest, `document.querySelector(".voice-panel")`).catch(() => {});
+  await probe(guest, `document.querySelector(".voice-panel")`, 20_000);
   await sleep(1500);
 
   // ── Member rows ──
   const rowOf = (who) =>
     `[...document.querySelectorAll(".user-list.modern .users .user")].find((e) => e.querySelector(".name")?.title.startsWith(${JSON.stringify(who)}))`;
   const ownRow = `[...document.querySelectorAll(".user-list.modern .users .user")].find((e) => e.querySelector(".you"))`;
-  await waitFor(host, rowOf(`ui-guest-${n}`)).catch(() => {});
+  await probe(host, rowOf(`ui-guest-${n}`), 20_000);
   check(
     "a member row with a menu shows the pointer",
     (await host.evaluate(`getComputedStyle(${rowOf(`ui-guest-${n}`)}).cursor`)) === "pointer",
@@ -1649,7 +1649,7 @@ check(
     navigator.mediaDevices.getDisplayMedia = async () => stream;
     return true; })()`);
   await realClick(host, ".voice-panel .share-btn");
-  await waitFor(host, `document.querySelector(".start-btn")`, 8_000).catch(() => {});
+  await probe(host, `document.querySelector(".start-btn")`, 8_000);
   await realClick(host, ".start-btn");
   let previewPlays = false;
   try {
@@ -1665,7 +1665,7 @@ check(
   );
 
   // ── One click to watch, and the chat beside it ──
-  await waitFor(guest, `document.querySelector(".channel-list.modern button.live-tag.watch")`).catch(() => {});
+  await probe(guest, `document.querySelector(".channel-list.modern button.live-tag.watch")`, 20_000);
   await realClick(guest, ".channel-list.modern button.live-tag.watch");
   let watching = false;
   try {
@@ -1774,14 +1774,14 @@ check(
     setInterval(() => { f++; ctx.fillStyle = "hsl(" + (f * 7) % 360 + ", 60%, 40%)"; ctx.fillRect(0, 0, 320, 180); }, 66);
     navigator.mediaDevices.getDisplayMedia = async () => canvas.captureStream(15); return true; })()`);
   await realClick(guest, '.share-btn[title="Share your screen"]');
-  await waitFor(guest, `document.querySelector(".start-btn")`, 8_000).catch(() => {});
+  await probe(guest, `document.querySelector(".start-btn")`, 8_000);
   await realClick(guest, ".start-btn");
   const ownShare = await waitFor(guest, `document.querySelector(".share-btn.active")`, 10_000).then(() => true, () => false);
   await realClick(host, ".voice-panel .share-btn");
-  await waitFor(host, `document.querySelector(".start-btn")`, 8_000).catch(() => {});
+  await probe(host, `document.querySelector(".start-btn")`, 8_000);
   await realClick(host, ".start-btn");
   const hostWatch = `.users .user:has(.name[title^="ui-host-${n}"]) button.watch-btn`;
-  await waitFor(guest, `document.querySelector(${JSON.stringify(hostWatch)})`, 10_000).catch(() => {});
+  await probe(guest, `document.querySelector(${JSON.stringify(hostWatch)})`, 10_000);
   await guest.evaluate(`(() => { window.__probe = VideoDecoder.isConfigSupported;
     VideoDecoder.isConfigSupported = async (config) => ({ supported: false, config }); return true; })()`);
   // A DOM click: our own share's preview floats over the member list's corner
@@ -1846,7 +1846,7 @@ check(
   await sleep(500);
   check("Cancel leaves you out of voice", asked && !(await no.evaluate(`!!document.querySelector(".confirm")`)) && !(await no.evaluate(inVoice)));
   const yes = await byInvite(`ui-inv2-${n}`, SHOW);
-  await waitFor(yes, `${confirmTitle}.startsWith("Join voice")`, 10_000).catch(() => {});
+  await probe(yes, `${confirmTitle}.startsWith("Join voice")`, 10_000);
   await yes.evaluate(`[...document.querySelectorAll(".confirm button")].find((b) => b.textContent.trim() === "Join voice")?.click()`);
   await answerFirstRun(yes, "seated");
   check("Join voice seats you in it", await waitFor(yes, `${inVoice} && [...document.querySelectorAll(".channel.active .channel-name")].some((e) => e.textContent === ${JSON.stringify(SHOW)})`, 10_000)
@@ -1885,7 +1885,7 @@ async function chatLane() {
     `(() => { const el = [...document.querySelectorAll(".channel")].find((e) => e.querySelector(".channel-name")?.textContent === ${JSON.stringify(ROOM)});
        if (!el) return false; el.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })); return true; })()`,
   );
-  await waitFor(ben, `document.querySelector(".input-bar .chat-input")`).catch(() => {});
+  await probe(ben, `document.querySelector(".input-bar .chat-input")`, 20_000);
   await sleep(1500);
 
   const say = (tab, text, where = ".chat-main") =>
@@ -2139,7 +2139,7 @@ async function chatLane() {
 
   // ── Search, here and everywhere ──
   await ann.evaluate(`document.querySelector(".search-btn")?.click()`);
-  await waitFor(ann, `document.querySelector(".search-pane .search-input")`, 5_000).catch(() => {});
+  await probe(ann, `document.querySelector(".search-pane .search-input")`, 5_000);
   await ann.evaluate(setInput(".search-pane .search-input", "BOLD"));
   await sleep(300);
   check("search finds a message, whatever its case", await ann.evaluate(
@@ -2149,7 +2149,7 @@ async function chatLane() {
   check("picking a result goes to the message", await ann.evaluate(
     `!document.querySelector(".search-pane") && (${rowWith("bold move")}?.classList.contains("flash") ?? false)`));
   await ann.evaluate(`document.querySelector(".search-btn")?.click()`);
-  await waitFor(ann, `document.querySelector(".search-pane .search-input")`, 5_000).catch(() => {});
+  await probe(ann, `document.querySelector(".search-pane .search-input")`, 5_000);
   await ann.evaluate(`[...document.querySelectorAll(".search-pane .scope")].find((b) => /everywhere/i.test(b.textContent))?.click()`);
   await ann.evaluate(setInput(".search-pane .search-input", "inside the thread"));
   await sleep(300);
@@ -2171,7 +2171,7 @@ async function chatLane() {
   const settings = async (set) => {
     await ann.evaluate(`(() => { const row = [...document.querySelectorAll(".channel")].find((e) => e.querySelector(".channel-name")?.textContent === ${JSON.stringify(ROOM)});
       row?.parentElement?.querySelector('[title="Channel settings"]')?.dispatchEvent(new MouseEvent("click", { bubbles: true })); return true; })()`);
-    await waitFor(ann, `document.querySelector('select[data-opt="message-ttl"]')`, 5_000).catch(() => {});
+    await probe(ann, `document.querySelector('select[data-opt="message-ttl"]')`, 5_000);
     await ann.evaluate(set);
     await ann.evaluate(`document.querySelector('select[data-opt="message-ttl"]')?.closest("form")?.querySelector(".create-btn")?.dispatchEvent(new MouseEvent("click", { bubbles: true }))`);
     await sleep(1200);
@@ -2179,7 +2179,7 @@ async function chatLane() {
   const timer = (words) => `(() => { const el = document.querySelector('select[data-opt="message-ttl"]');
     el.selectedIndex = [...el.options].findIndex((o) => o.textContent.includes(${JSON.stringify(words)}));
     el.dispatchEvent(new Event("change", { bubbles: true })); })()`;
-  const timerShown = (words) => waitFor(ann, `document.querySelector(".chat-header .ttl-label")?.textContent.includes(${JSON.stringify(words)})`, 10_000).catch(() => {});
+  const timerShown = (words) => probe(ann, `document.querySelector(".chat-header .ttl-label")?.textContent.includes(${JSON.stringify(words)})`, 10_000);
 
   // ── An edit lives no longer than what is left of its message (R3-06) ──
   // It carries the new text, and in a kept log it must not outlast the
@@ -2201,7 +2201,7 @@ async function chatLane() {
     t.value = "short-lived words, edited"; t.dispatchEvent(new Event("input", { bubbles: true })); t.focus(); return true; })()`);
   await ann.send("Input.dispatchKeyEvent", { type: "keyDown", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, text: "\r" });
   await ann.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
-  await waitFor(ben, `${rowWith("short-lived words, edited")}?.querySelector(".edited")`, 10_000).catch(() => {});
+  await probe(ben, `${rowWith("short-lived words, edited")}?.querySelector(".edited")`, 10_000);
   const edits = await ben.evaluate(`window.__events.filter((e) => e.event?.kind === "edit")`);
   check("an edit's timer is what is left of its message's, not the channel's longer one",
     edits.length === 1 && edits[0].ttl > 0 && edits[0].ttl <= 300, JSON.stringify(edits));
@@ -2211,7 +2211,7 @@ async function chatLane() {
   // What the pane hides is not searched either: here, nor everywhere
   const search = async (scope, words) => {
     await ben.evaluate(`document.querySelector(".search-pane") || document.querySelector(".chat-main .search-btn, .search-btn")?.click()`);
-    await waitFor(ben, `document.querySelector(".search-pane .search-input")`, 5_000).catch(() => {});
+    await probe(ben, `document.querySelector(".search-pane .search-input")`, 5_000);
     await ben.evaluate(`[...document.querySelectorAll(".search-pane .scope")].find((b) => b.textContent.trim() === ${JSON.stringify(scope)})?.click()`);
     await ben.evaluate(setInput(".search-pane .search-input", words));
     await sleep(600);
@@ -2259,7 +2259,7 @@ async function chatLane() {
          if (!el) return false; el.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })); return true; })()`,
     );
   await enter(ben);
-  await waitFor(ben, `document.querySelector(".chat-main .input-bar .chat-input")`).catch(() => {});
+  await probe(ben, `document.querySelector(".chat-main .input-bar .chat-input")`, 20_000);
   await sleep(1500);
 
   const say = (tab, text) =>
@@ -2295,7 +2295,7 @@ async function chatLane() {
 
   // ── A photo, compressed by default ──
   await attach(ann, picture("image/jpeg", "photo.jpg"));
-  await waitFor(ann, `document.querySelector(".file-chip .chip-mode")`, 5_000).catch(() => {});
+  await probe(ann, `document.querySelector(".file-chip .chip-mode")`, 5_000);
   check("a photo is staged as a chip, compressed, with the original one press away", await ann.evaluate(
     `(() => { const m = document.querySelector(".file-chip .chip-mode"); return !!m && m.textContent.trim() === "Original (1:1)" && m.getAttribute("aria-pressed") === "false"; })()`));
   await say(ann, "look at this");
@@ -2317,13 +2317,13 @@ async function chatLane() {
 
   // ── The original, exactly ──
   await attach(ann, picture("image/jpeg", "orig.jpg"));
-  await waitFor(ann, `document.querySelector(".file-chip .chip-mode")`, 5_000).catch(() => {});
+  await probe(ann, `document.querySelector(".file-chip .chip-mode")`, 5_000);
   await ann.evaluate(`document.querySelector(".file-chip .chip-mode")?.click()`);
   const sent = await ann.evaluate(pixels("window.__f"));
   await say(ann, "the original");
-  await waitFor(ben, `${rowWith("the original")}?.querySelector(".file-card")`, 20_000).catch(() => {});
+  await probe(ben, `${rowWith("the original")}?.querySelector(".file-card")`, 20_000);
   await press(ben, "the original", "Load");
-  await waitFor(ben, `${rowWith("the original")}?.querySelector(".file-card img")?.naturalWidth > 0`, 20_000).catch(() => {});
+  await probe(ben, `${rowWith("the original")}?.querySelector(".file-card img")?.naturalWidth > 0`, 20_000);
   // Shown, it is the sanitizer's PNG of it (a decoder of its own, so not the
   // sender's very pixels); saved, it is the file itself, byte for byte
   const shownSize = await ben.evaluate(`(() => { const i = ${rowWith("the original")}?.querySelector(".file-card img"); return i ? i.naturalWidth + "x" + i.naturalHeight : null; })()`);
@@ -2345,7 +2345,7 @@ async function chatLane() {
   const notes = "a line of somebody's notes, again and again\n".repeat(500);
   await attach(ben, text("notes.txt", notes));
   await say(ben, "my notes");
-  await waitFor(ann, `${rowWith("my notes")}?.querySelector(".file-card")`, 20_000).catch(() => {});
+  await probe(ann, `${rowWith("my notes")}?.querySelector(".file-card")`, 20_000);
   check("a file that is not a picture gets a plain card, with no Load", await ann.evaluate(
     `(() => { const c = ${rowWith("my notes")}?.querySelector(".file-card"); return !!c && !c.classList.contains("media") &&
        ![...c.querySelectorAll("button")].some((b) => b.textContent.includes("Load")); })()`));
@@ -2363,7 +2363,7 @@ async function chatLane() {
   // and Load, and loaded, its bytes say it is no picture
   await attach(ben, text("pic.png", "<svg xmlns='http://www.w3.org/2000/svg' onload='window.__ran=1'><script>window.__ran=1</script></svg>", "image/png"));
   await say(ben, "a picture, it says");
-  await waitFor(ann, `${rowWith("a picture, it says")}?.querySelector(".file-card")`, 20_000).catch(() => {});
+  await probe(ann, `${rowWith("a picture, it says")}?.querySelector(".file-card")`, 20_000);
   await press(ann, "a picture, it says", "Load");
   const refused = await waitFor(ann, `${rowWith("a picture, it says")}?.querySelector(".file-note")`, 20_000).then(() => true, () => false);
   check("a page claimed as a picture is loaded, then never shown, only offered to save", refused && (await ann.evaluate(
@@ -2410,7 +2410,7 @@ async function chatLane() {
   check("Remove copy takes a file off this tab, and the space it took", removed && (await usedNow(ann)) !== before, `${before} → ${await usedNow(ann)}`);
   const fetchedBefore = await fetched(ann);
   await fmPress(ann, "orig.jpg", "Show");
-  await waitFor(ann, `${fmRow("orig.jpg")}?.querySelector(".file-card")`, 5_000).catch(() => {});
+  await probe(ann, `${fmRow("orig.jpg")}?.querySelector(".file-card")`, 5_000);
   await ann.evaluate(`[...(${fmRow("orig.jpg")})?.querySelectorAll(".file-card button") ?? []].find((b) => b.textContent.trim() === "Load")?.click()`);
   const local = await waitFor(ann, `${fmRow("orig.jpg")}?.querySelector(".file-card img")?.naturalWidth > 0`, 10_000).then(() => true, () => false);
   check("a row opens the chat's card, and Load draws it from this tab's copy", local && (await fetched(ann)) === fetchedBefore);
@@ -2428,18 +2428,18 @@ async function chatLane() {
   const dee = await connect(`ui-fd-${n}`);
   await enter(dee);
   const deeRow = `[...document.querySelectorAll(".user .name")].find((e) => e.title.startsWith(${JSON.stringify(`ui-fd-${n}#`)}))`;
-  await waitFor(ann, deeRow).catch(() => {});
+  await probe(ann, deeRow, 20_000);
   await ann.evaluate(`(() => { const el = ${deeRow}?.closest(".user"); if (!el) return false;
     el.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, clientX: 40, clientY: 40 })); return true; })()`);
   await sleep(300);
   await ann.evaluate(`[...document.querySelectorAll(".ctx-item")].find((e) => /direct message/i.test(e.textContent))?.click()`);
-  await waitFor(ann, `document.querySelector(".chat-main .input-bar .chat-input")?.placeholder.includes("ui-fd-")`, 5_000).catch(() => {});
+  await probe(ann, `document.querySelector(".chat-main .input-bar .chat-input")?.placeholder.includes("ui-fd-")`, 5_000);
   await say(ann, "hi dee");
   const annEntry = `[...document.querySelectorAll(".dm-entry")].find((e) => e.textContent.includes("ui-fa-${n}"))`;
-  await waitFor(dee, annEntry, 15_000).catch(() => {});
+  await probe(dee, annEntry, 15_000);
   // dee goes to a room of its own, then reads the conversation there
   await dee.evaluate(click('button[title="Create channel"]'));
-  await waitFor(dee, `document.querySelector(".create-form")`).catch(() => {});
+  await probe(dee, `document.querySelector(".create-form")`, 20_000);
   await dee.evaluate(setInput(".create-form input[type=text]", `elsewhere-${n}`));
   await dee.evaluate(click(".create-form .create-btn"));
   const parted = await waitFor(ann, `!${deeRow}`, 10_000).then(() => true, () => false);
@@ -2450,28 +2450,28 @@ async function chatLane() {
   for (const [file, words] of [["dm.png", "for dee, elsewhere"], ["dm-row.png", "open me from Settings"], ["dm-later.png", "load me once the relay let go"]]) {
     await attach(ann, picture("image/png", file));
     await say(ann, words);
-    await waitFor(dee, `${rowWith(words)}?.querySelector(".file-card")`, 20_000).catch(() => {});
+    await probe(dee, `${rowWith(words)}?.querySelector(".file-card")`, 20_000);
   }
   await press(dee, "for dee, elsewhere", "Load");
   check("and what comes loads on the other side", await waitFor(dee,
     `${rowWith("for dee, elsewhere")}?.querySelector(".file-card img")?.naturalWidth > 0`, 20_000).then(() => true, () => false),
     await dee.evaluate(`${rowWith("for dee, elsewhere")}?.querySelector(".file-card")?.textContent ?? "no card"`));
   await realClick(dee, ".settings-btn");
-  await waitFor(dee, `document.querySelector(".tab")`, 8_000).catch(() => {});
+  await probe(dee, `document.querySelector(".tab")`, 8_000);
   await dee.evaluate(`[...document.querySelectorAll(".tab")].find((b) => b.textContent.trim() === "Files")?.click()`);
-  await waitFor(dee, fmRow("dm-row.png"), 8_000).catch(() => {});
+  await probe(dee, fmRow("dm-row.png"), 8_000);
   await fmPress(dee, "dm-row.png", "Show");
-  await waitFor(dee, `${fmRow("dm-row.png")}?.querySelector(".file-card")`, 5_000).catch(() => {});
+  await probe(dee, `${fmRow("dm-row.png")}?.querySelector(".file-card")`, 5_000);
   await dee.evaluate(`[...(${fmRow("dm-row.png")})?.querySelectorAll(".file-card button") ?? []].find((b) => b.textContent.trim() === "Load")?.click()`);
   check("its row in Settings → Files loads it too", await waitFor(dee,
     `${fmRow("dm-row.png")}?.querySelector(".file-card img")?.naturalWidth > 0`, 20_000).then(() => true, () => false));
   await dee.send("Input.dispatchKeyEvent", { type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
   await dee.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
-  await waitFor(dee, `!document.querySelector(".fm-row")`, 5_000).catch(() => {});
+  await probe(dee, `!document.querySelector(".fm-row")`, 5_000);
   // A file from ann's room, forwarded into the conversation
   await ann.evaluate(`[...document.querySelectorAll(".channel")].find((e) => e.querySelector(".channel-name")?.textContent === ${JSON.stringify(ROOM)})
     ?.dispatchEvent(new MouseEvent("click", { bubbles: true }))`);
-  await waitFor(ann, rowWith("the original"), 5_000).catch(() => {});
+  await probe(ann, rowWith("the original"), 5_000);
   await ann.toFront();
   const origAt = await ann.evaluate(`(() => { const r = ${rowWith("the original")}; if (!r) return null; r.scrollIntoView({ block: "center" });
     const b = r.getBoundingClientRect(); return { x: Math.round(b.left + 40), y: Math.round(b.top + 10) }; })()`);
@@ -2482,9 +2482,9 @@ async function chatLane() {
   }
   await sleep(300);
   await ann.evaluate(`[...document.querySelectorAll(".msg-menu [role=menuitem]")].find((e) => e.textContent.trim() === "Forward")?.click()`);
-  await waitFor(ann, `document.querySelector(".forward-dialog .forward-dest")`, 3_000).catch(() => {});
+  await probe(ann, `document.querySelector(".forward-dialog .forward-dest")`, 3_000);
   await ann.evaluate(`[...document.querySelectorAll(".forward-dialog .forward-dest")].find((b) => b.textContent.includes("@ui-fd-${n}"))?.click()`);
-  await waitFor(dee, `${rowWith("the original")}?.querySelector(".file-card")`, 20_000).catch(() => {});
+  await probe(dee, `${rowWith("the original")}?.querySelector(".file-card")`, 20_000);
   await press(dee, "the original", "Load");
   check("a file forwarded into it arrives and loads", await waitFor(dee,
     `${rowWith("the original")}?.querySelector(".file-card img")?.naturalWidth > 0`, 20_000).then(() => true, () => false),
@@ -2493,7 +2493,7 @@ async function chatLane() {
   // ── The relay lets go; a member sends it again, or nobody can ──
   await attach(ben, picture("image/png", "gone.png"));
   await say(ben, "nobody else has this one");
-  await waitFor(ann, `${rowWith("nobody else has this one")}?.querySelector(".file-card")`, 20_000).catch(() => {});
+  await probe(ann, `${rowWith("nobody else has this one")}?.querySelector(".file-card")`, 20_000);
   // ben leaves, the only one holding gone.png; ann still holds her photo
   await ben.send("Page.navigate", { url: "about:blank" });
   // Over two minutes of nothing but waiting: 70 s here for the relay to let go
@@ -2562,7 +2562,7 @@ async function editsLane() {
     `(() => { const el = [...document.querySelectorAll(".channel")].find((e) => e.querySelector(".channel-name")?.textContent === ${JSON.stringify(name)});
        if (!el) return false; el.dispatchEvent(new MouseEvent(${JSON.stringify(how)}, { bubbles: true })); return true; })()`);
   await openChannel(ben, ROOM, "dblclick");
-  await waitFor(ben, `document.querySelector(".chat-main .input-bar .chat-input")`).catch(() => {});
+  await probe(ben, `document.querySelector(".chat-main .input-bar .chat-input")`, 20_000);
   await sleep(1500);
 
   const say = (tab, text) =>
@@ -2743,7 +2743,7 @@ async function editsLane() {
     const dt = new DataTransfer(); dt.items.add(window.__f); input.files = dt.files;
     input.dispatchEvent(new Event("change", { bubbles: true })); return true; })()`);
   await say(ann, "pass this on");
-  await waitFor(ben, `${rowWith("pass this on")}?.querySelector(".file-card")`, 20_000).catch(() => {});
+  await probe(ben, `${rowWith("pass this on")}?.querySelector(".file-card")`, 20_000);
   await useTool(ben, "pass this on", "More");
   await pressItem(ben, "Forward");
   const offered = await waitFor(ben, `[...document.querySelectorAll(".forward-dialog .forward-dest")].some((b) => b.textContent.includes("#lobby-chat"))`, 3_000)
@@ -2794,7 +2794,7 @@ async function emotesLane() {
   await sleep(2000);
   await ben.evaluate(`[...document.querySelectorAll(".channel")].find((e) => e.querySelector(".channel-name")?.textContent === ${JSON.stringify(ROOM)})
     ?.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }))`);
-  await waitFor(ben, `document.querySelector(".chat-main .input-bar .chat-input")`).catch(() => {});
+  await probe(ben, `document.querySelector(".chat-main .input-bar .chat-input")`, 20_000);
   const rowWith = (text) =>
     `[...document.querySelectorAll(".chat-main .msg")].find((e) => e.querySelector(".msg-content")?.textContent.includes(${JSON.stringify(text)}))`;
 
@@ -2805,9 +2805,9 @@ async function emotesLane() {
   // The server menu's shield item says "Admin login" until the token is taken
   const admin = await serverMenu(ann, /^Server admin/, { real: false, timeoutMs: 15_000 });
   check("the admin token makes this tab the server's admin", admin);
-  await waitFor(ann, `[...document.querySelectorAll(".admin-tabs button")].some((b) => b.textContent === "Emotes and stickers")`, 5_000).catch(() => {});
+  await probe(ann, `[...document.querySelectorAll(".admin-tabs button")].some((b) => b.textContent === "Emotes and stickers")`, 5_000);
   await ann.evaluate(`[...document.querySelectorAll(".admin-tabs button")].find((b) => b.textContent === "Emotes and stickers")?.click()`);
-  await waitFor(ann, `document.querySelector(".em-pick input[type=file][multiple]")`, 5_000).catch(() => {});
+  await probe(ann, `document.querySelector(".em-pick input[type=file][multiple]")`, 5_000);
   const name = `party_parrot_${n}`;
   await ann.evaluate(`(async () => {
     const c = document.createElement("canvas"); c.width = 64; c.height = 64;
@@ -3113,7 +3113,7 @@ async function accountsLane() {
       await sleep(300);
       await tab.evaluate(`(() => { const b = [...document.querySelectorAll(".ctx-item")].find((e) => e.textContent.includes("Verify identity"));
         if (!b) return false; b.click(); return true; })()`);
-      await waitFor(tab, `document.querySelector('.account-dialog[data-kind="safety"] .secret')`, 2_000).catch(() => {});
+      await probe(tab, `document.querySelector('.account-dialog[data-kind="safety"] .secret')`, 2_000);
     }
     const n = await tab.evaluate(`document.querySelector('.account-dialog[data-kind="safety"] .secret')?.textContent?.trim() ?? ""`);
     await tab.evaluate(click('.account-dialog[data-kind="safety"] .submit-btn'));
@@ -3225,7 +3225,7 @@ async function accountsLane() {
   check("and they can answer", await reads(back, answered), await texts(back));
   // What was cleared stays gone: the server's copies are all still there
   await back.evaluate(click('button.clear-chat-btn[title="Clear chat history"]'));
-  await waitFor(back, `document.querySelector(".clear-menu")`, 5_000).catch(() => {});
+  await probe(back, `document.querySelector(".clear-menu")`, 5_000);
   await back.evaluate(`[...document.querySelectorAll(".clear-menu .ttl-choice")].find((b) => b.textContent.trim() === "Clear here")?.click()`);
   await sleep(2500); // the save is debounced by two seconds
   await reload(back);
@@ -3314,7 +3314,7 @@ async function accountsLane() {
   // 1.0 (A6): the writer deletes what she kept in the channel, the server's
   // copy included (a tombstone follows for the readers' devices).
   await openKept(aliceAgain);
-  await waitFor(aliceAgain, `[...document.querySelectorAll(".msg-content")].some((e) => e.textContent.includes(${JSON.stringify(note)}))`, 15_000).catch(() => {});
+  await probe(aliceAgain, `[...document.querySelectorAll(".msg-content")].some((e) => e.textContent.includes(${JSON.stringify(note)}))`, 15_000);
   await aliceAgain.evaluate(click('button.clear-chat-btn[title="Clear chat history"]'));
   const menu = await waitFor(aliceAgain, `document.querySelector(".clear-menu")`, 5_000).then(() => true, () => false);
   if (menu) await aliceAgain.evaluate(`[...document.querySelectorAll(".clear-menu .ttl-choice")].find((b) => b.textContent.includes("server's copy"))?.click()`);
@@ -3336,7 +3336,7 @@ async function accountsLane() {
   await waitFor(guestTab, `document.querySelector('input[placeholder="Your name"]')`);
   await guestTab.evaluate(setInput('input[placeholder="Your name"]', `guest${process.pid % 10000}`));
   await realClick(guestTab, ".connect-btn");
-  await waitFor(guestTab, `document.querySelector(".channel-list") && !document.querySelector(".connect-btn")`, 20_000).catch(() => {});
+  await probe(guestTab, `document.querySelector(".channel-list") && !document.querySelector(".connect-btn")`, 20_000);
   await answerFirstRun(guestTab, "accounts guest", 10_000).catch(() => {});
   await guestTab.send("Page.reload");
   await sleep(1000);
@@ -3543,7 +3543,7 @@ async function accountsLane() {
   await serverMenu(keyNew, "Your account");
   await waitFor(keyNew, `document.querySelector('.account-dialog[data-kind="account"]')`);
   await keyNew.evaluate(`[...document.querySelectorAll('.account-dialog[data-kind="account"] .row')].find((r) => r.textContent.includes("Recovery key"))?.querySelector("button")?.click()`);
-  await waitFor(keyNew, `document.querySelector('.account-dialog[data-kind="recovery-new"] #acct-recovery-password')`, 10_000).catch(() => {});
+  await probe(keyNew, `document.querySelector('.account-dialog[data-kind="recovery-new"] #acct-recovery-password')`, 10_000);
   await keyNew.evaluate(setInput("#acct-recovery-password", "not the password at all"));
   await realClick(keyNew, '.account-dialog[data-kind="recovery-new"] .submit-btn');
   const wrongNew = await waitFor(keyNew, `document.querySelector('.account-dialog[data-kind="recovery-new"] .error')`, 30_000).then(() => true, () => false);
@@ -3554,7 +3554,7 @@ async function accountsLane() {
   );
   await keyNew.evaluate(setInput("#acct-recovery-password", pw));
   await realClick(keyNew, '.account-dialog[data-kind="recovery-new"] .submit-btn');
-  await waitFor(keyNew, `document.querySelector('.account-dialog[data-kind="recovery"] .secret')`, 30_000).catch(() => {});
+  await probe(keyNew, `document.querySelector('.account-dialog[data-kind="recovery"] .secret')`, 30_000);
   const keyB2 = await keyNew.evaluate(`document.querySelector('.account-dialog[data-kind="recovery"] .secret')?.textContent ?? ""`);
   const keyHead = await keyNew.evaluate(`document.querySelector('.account-dialog[data-kind="recovery"] h2')?.textContent ?? ""`);
   check(
