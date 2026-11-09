@@ -25,7 +25,7 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { loadPage, openTab, seen, sleep, startChromium, waitFor } from "./test-cdp.mjs";
+import { loadPage, openTab, probe, seen, sleep, startChromium, waitFor } from "./test-cdp.mjs";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.argv[2] ?? 49993);
@@ -459,7 +459,7 @@ async function giveCode(tab, secret, expect = "") {
 /** The same, when the last code may still hold (ten minutes): whether it was asked. */
 async function giveCodeIfAsked(tab, secret, expect = "") {
   const prompt = `${q(`.admin-dialog input[aria-label="Two-factor code"]`)} || ${q(".step-up-dialog input")}`;
-  if (!(await seen(tab, prompt, 2500))) return false;
+  if (!(await probe(tab, prompt, 2500))) return false;
   await giveCode(tab, secret, expect);
   return true;
 }

@@ -25,7 +25,7 @@ import { createHmac } from "node:crypto";
 import { mkdtempSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { openTab, sleep, waitFor as waitUntil } from "./test-cdp.mjs";
+import { openTab, probe, sleep, waitFor as waitUntil } from "./test-cdp.mjs";
 
 const PORT = process.argv[2] ?? "19987";
 const CDP = process.argv[3] ?? "9222";
@@ -84,8 +84,9 @@ async function newTab(cdp = CDP) {
   return tab;
 }
 
-/** test-cdp's waitFor, with this lane's 20 s: on running out it says what the page was doing. */
-const waitFor = (tab, expression, timeoutMs = 20_000) => waitUntil(tab, expression, timeoutMs);
+/** test-cdp's waitFor: a limit asked for here is a floor of test-cdp's HANG_MS, not a bet on
+ *  speed, and on running out it says what the page was doing. */
+const waitFor = (tab, expression, timeoutMs) => waitUntil(tab, expression, timeoutMs);
 
 const setInput = (selector, value) =>
   `(() => { const el = document.querySelector(${JSON.stringify(selector)}); if (!el) return false;
@@ -3036,7 +3037,7 @@ async function accountsLane() {
   const settle = async (tab, keep = true) => {
     await waitFor(tab, `document.querySelector(".channel-list")`, 30_000);
     const cloud = '.account-dialog[data-kind="cloud"]';
-    if (await waitFor(tab, `document.querySelector('${cloud}')`, 3_000).then(() => true, () => false)) {
+    if (await probe(tab, `document.querySelector('${cloud}')`, 3_000)) {
       await realClick(tab, `${cloud} ${keep ? ".submit-btn" : ".secondary"}`);
       await waitFor(tab, `!document.querySelector('${cloud}')`);
     }

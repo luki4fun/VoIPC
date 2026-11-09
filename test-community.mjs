@@ -20,7 +20,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { deflateSync } from "node:zlib";
-import { loadPage, openTab, seen, sleep, startChromium, waitFor } from "./test-cdp.mjs";
+import { loadPage, openTab, probe, seen, sleep, startChromium, waitFor } from "./test-cdp.mjs";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.argv[2] ?? 49991);
@@ -322,7 +322,7 @@ async function lane() {
   /** The panel's step-up: a code one step ahead each time, since a code is good once. */
   let codeStep = Math.floor(Date.now() / 30_000);
   const stepUp = async () => {
-    const asked = await seen(ann, `document.querySelector('.admin-dialog input[aria-label="Two-factor code"]')`, 3_000);
+    const asked = await probe(ann, `document.querySelector('.admin-dialog input[aria-label="Two-factor code"]')`, 3_000);
     if (!asked) return;
     codeStep += 1;
     await ann.evaluate(setInput('.admin-dialog input[aria-label="Two-factor code"]', totpAt(secret, codeStep)));

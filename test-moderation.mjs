@@ -23,7 +23,7 @@ import { mkdirSync, mkdtempSync, openSync, rmSync, writeFileSync } from "node:fs
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { loadPage, openTab, seen, sleep, startChromium, waitFor } from "./test-cdp.mjs";
+import { frameSummary, loadPage, openTab, probe, seen, sleep, startChromium, waitFor } from "./test-cdp.mjs";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.argv[2] ?? 49992);
@@ -115,7 +115,9 @@ const browser = async (cdpPort) => {
   });
   return cdpPort;
 };
-const newTab = (cdpPort) => openTab(cdpPort, { dom: true });
+// frames: what each page read off its control stream, for a check about a post that never
+// showed (CI run 42542682190: fay, back from three reloads, got neither of two live posts)
+const newTab = (cdpPort) => openTab(cdpPort, { dom: true, frames: true });
 
 const setInput = (selector, value) =>
   `(() => { const el = document.querySelector(${JSON.stringify(selector)}); if (!el) return false;
@@ -281,7 +283,7 @@ async function turnOnCodes(tab) {
 function stepUpWith(tab, secret) {
   let codeStep = Math.floor(Date.now() / 30_000);
   return async () => {
-    const asked = await seen(tab, `document.querySelector('.admin-dialog input[aria-label="Two-factor code"]')`, 3_000);
+    const asked = await probe(tab, `document.querySelector('.admin-dialog input[aria-label="Two-factor code"]')`, 3_000);
     if (!asked) return;
     codeStep += 1;
     await tab.evaluate(setInput('.admin-dialog input[aria-label="Two-factor code"]', totpAt(secret, codeStep)));
@@ -1063,9 +1065,10 @@ async function lane() {
   await messageMenu(ann, "bobby says hello");
   check("an admin is, on a moderator's", await ann.evaluate(`!!${offered("Hide")}`));
   await ann.evaluate(`${offered("Hide")}.click()`);
-  check("which counts for everyone", await seen(fay, removedBy("annika")), await pageText(fay));
+  // A miss says whether the posts reached fay's page at all (TextPost) and whether keys did
+  check("which counts for everyone", await seen(fay, removedBy("annika")), `${await pageText(fay)}\n${await frameSummary(fay)}`);
   await restoreLast(ann);
-  check("and an admin takes it back", await seen(fay, lastMessage("bobby says hello")), await pageText(fay));
+  check("and an admin takes it back", await seen(fay, lastMessage("bobby says hello")), `${await pageText(fay)}\n${await frameSummary(fay)}`);
 
   // What a member hands a newcomer leaves out what was hidden: hana has no stored log,
   // so all she gets is what ivy and bobby answer with
@@ -1317,7 +1320,7 @@ async function lane() {
   let handed = false;
   for (let i = 0; i < 6 && !handed; i++) {
     await han.evaluate(`document.querySelector(".resync-btn").click()`);
-    handed = await seen(han, rowWith("ivy answers ned"), 5_000);
+    handed = await probe(han, rowWith("ivy answers ned"), 5_000);
   }
   check("a guest is handed the rest", handed, await pageText(han));
   check("and not what was removed", !(await says(han, "ned sells pills here")), await pageText(han));
@@ -1441,7 +1444,7 @@ async function lane() {
     await messageMenu(tab, words);
     await tab.evaluate(`${offered("Report")}.click()`);
     // Four asks at once, then one per 30 s: a fast run can reach that, and it is no failure
-    if (await waitFor(tab, answered, 10_000).then(() => true, () => false)) return;
+    if (await probe(tab, answered, 10_000)) return;
     await cancelIt(tab);
     await sleep(31_000);
     await messageMenu(tab, words);

@@ -6,6 +6,12 @@ use voipc_protocol::codec::{decode_server_msg, encode_client_msg};
 use crate::config::ServerConfig;
 use crate::settings::ServerSettings;
 
+/// How long a test waits for something that has to happen before it calls it hung. A limit,
+/// not a speed check: on a CI runner's disk one 200-member import batch took past the 5 s
+/// these waits had, and failed CI run 42080222449 (`TMPDIR` on a disk reproduces it; in RAM
+/// it never happens). How fast an import is belongs to its own measurement.
+const HANG: Duration = Duration::from_secs(60);
+
 #[test]
 fn names_refuse_invisible_and_reordering_characters() {
     let bad = |name: &str| name.chars().any(bad_name_char);
@@ -75,9 +81,9 @@ async fn authenticates_over_duplex() {
             }
         }
     };
-    tokio::time::timeout(Duration::from_secs(5), read_replies)
+    tokio::time::timeout(HANG, read_replies)
         .await
-        .expect("replies within 5 s");
+        .expect("replies before the hang guard");
 
     let ServerMessage::Authenticated { session_id, .. } = replies[0] else {
         panic!("expected Authenticated, got {:?}", replies[0]);
@@ -94,7 +100,7 @@ async fn authenticates_over_duplex() {
     // Dropping our end is what the bridge does on teardown: the handler
     // must see EOF and clean the session up.
     drop(client);
-    tokio::time::timeout(Duration::from_secs(5), &mut handler)
+    tokio::time::timeout(HANG, &mut handler)
         .await
         .expect("handler exits after EOF")
         .unwrap();
@@ -123,11 +129,10 @@ impl Client {
             if let Some(payload) = try_decode_frame(&mut self.buf).unwrap() {
                 return Some(decode_server_msg(&payload).unwrap());
             }
-            let n =
-                tokio::time::timeout(Duration::from_secs(5), self.stream.read_buf(&mut self.buf))
-                    .await
-                    .expect("a server message within 5 s")
-                    .unwrap();
+            let n = tokio::time::timeout(HANG, self.stream.read_buf(&mut self.buf))
+                .await
+                .expect("a server message before the hang guard")
+                .unwrap();
             if n == 0 {
                 return None;
             }
@@ -150,7 +155,7 @@ impl Client {
             self.next().await.is_none(),
             "server should close the stream"
         );
-        tokio::time::timeout(Duration::from_secs(5), &mut self.handler)
+        tokio::time::timeout(HANG, &mut self.handler)
             .await
             .expect("handler exits")
             .unwrap();
@@ -403,7 +408,7 @@ async fn a_connection_task_that_dies_still_cleans_up() {
         user_id: 1,
         session_id: 1,
     });
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(HANG, async {
         while state.user_count() > 0 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -1646,7 +1651,7 @@ async fn a_direct_message_to_somebody_who_left_is_answered() {
     ));
 
     drop(bob);
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(HANG, async {
         while state.sessions.contains_key(&2) {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -6583,7 +6588,7 @@ async fn a_cancel_spends_the_ticket() {
         .await;
     let ticket = upload_ready(&mut alice).await;
     alice.send(&ClientMessage::FileCancel { hash }).await;
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(HANG, async {
         while put_blob(&state, &hash, &ticket, &bytes).await != 401 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -17644,7 +17649,7 @@ mod providers {
                 .is_empty());
             // Gone, or done with it, it is free
             drop(ann);
-            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::time::timeout(HANG, async {
                 while state.sessions.len() > 1 {
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
@@ -31843,7 +31848,8 @@ mod live_path {
         let (mut ann, ann_id) = connect_with_bundle(&state, "ann", test_bundle(1)).await;
         let tx = state.sessions.get(&ann_id).unwrap().control_tx.clone();
         let made_up: Vec<ChannelId> = (100_000..120_000).collect();
-        let soon = std::time::Duration::from_secs(5);
+        // A write lock asked for here would wait forever: any limit finds that
+        let soon = HANG;
         {
             // Open to readers, and shut to a writer until it goes
             let _read = state.channels.read().await;
