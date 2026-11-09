@@ -248,7 +248,8 @@ jobs:
 
   browser:
     # A copy's number only in a soak: the pull-request checks keep the names they have
-    name: Browser end-to-end (${{ matrix.part }}${{ inputs.browser-only && format(' #{0}', matrix.copy) || '' }})
+    # Quoted: in a plain YAML value a space and # start a comment, which cut this line once
+    name: "Browser end-to-end (${{ matrix.part }}${{ inputs.browser-only && format(', copy {0}', matrix.copy) || '' }})"
     runs-on: ubuntu-24.04
     # Four parts side by side: the two lanes that run test-ui.mjs, the quick lanes
     # (under a minute each) and the relay on Postgres. One job ran the first three
