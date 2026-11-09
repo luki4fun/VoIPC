@@ -270,7 +270,12 @@ async function until(tab, expression, timeoutMs) {
 
 /** Waits for `expression` to be truthy in `tab`; past HANG_MS throws with diagnose(). */
 export async function waitFor(tab, expression, timeoutMs = HANG_MS) {
-  const took = await until(tab, expression, Math.max(timeoutMs, HANG_MS));
+  // A wait that runs out in a run that passes was caught somewhere: a probe in disguise,
+  // costing HANG_MS each time. Said, so test-web.sh can count them (lane_verdict).
+  const took = await until(tab, expression, Math.max(timeoutMs, HANG_MS)).catch((e) => {
+    console.log(`TIMEOUT ${expression.replace(/\s+/g, " ").slice(0, 160)}`);
+    throw e;
+  });
   if (took > SLOW_MS) console.log(`SLOW ${(took / 1000).toFixed(1)}s waiting for ${expression.replace(/\s+/g, " ").slice(0, 160)}`);
   return true;
 }

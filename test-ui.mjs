@@ -2100,8 +2100,14 @@ async function chatLane() {
   // followed by the reader's own scrolling, not by measuring
   await ben.evaluate(`(() => { const el = document.querySelector(".chat-main .messages"); el.scrollTop = el.scrollHeight; })()`);
   await sleep(300);
-  for (let i = 0; i < 20; i++) await say(ann, `tall ${i}\n- one\n- two\n- three\n\n\`\`\`\ncode ${i}\nmore code\n\`\`\``);
-  await arrived(ben, "code 19");
+  // Paced to the relay's chat rate (state.rs `chat_rate`: 5 at once, then 5 a second). Sent
+  // at once, twenty meet that limit, and "code 19" never came in a passing run (2026-11-09):
+  // this checked fewer tall messages than it says
+  for (let i = 0; i < 20; i++) {
+    await say(ann, `tall ${i}\n- one\n- two\n- three\n\n\`\`\`\ncode ${i}\nmore code\n\`\`\``);
+    await sleep(250);
+  }
+  check("all twenty tall messages arrive", await arrived(ben, "code 19"));
   await sleep(800);
   const below = await ben.evaluate(`(() => { const el = document.querySelector(".chat-main .messages"); return Math.round(el.scrollHeight - el.scrollTop - el.clientHeight); })()`);
   check("a reader at the end stays at the end as tall messages arrive", below < 40, `${below} px above the end`);
@@ -3184,7 +3190,8 @@ async function accountsLane() {
   const inKept = `said in the kept channel ${process.pid}`;
   await openKept(back);
   await sayIn(back, inKept);
-  await reads(two, inKept, 3_000);
+  // A pause for it to spread, not a check: its yes or no is not used
+  await probe(two, `[...document.querySelectorAll(".msg-content")].some((e) => e.textContent.includes(${JSON.stringify(inKept)}))`, 3_000);
   const told = await waitFor(
     back,
     `[...document.querySelectorAll(".history-marker")].some((e) => e.textContent.includes("can be read by") && e.textContent.includes(${JSON.stringify(acctB)}))`,
