@@ -20,7 +20,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { deflateSync } from "node:zlib";
-import { loadPage, openTab, probe, seen, sleep, startChromium, waitFor } from "./test-cdp.mjs";
+import { diagnose, loadPage, openTab, probe, seen, sleep, startChromium, waitFor } from "./test-cdp.mjs";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.argv[2] ?? 49991);
@@ -1242,8 +1242,13 @@ async function lane() {
   await waitFor(fresh, `document.querySelector(".audio-setup select.device")`);
   for (const theme of ["dark", "light"]) {
     await fresh.evaluate(`document.documentElement.dataset.theme = ${JSON.stringify(theme)}; 0`);
-    const look = await fresh.evaluate(`(() => { const s = getComputedStyle(document.querySelector(".audio-setup select.device")); return [s.backgroundImage.includes("svg"), s.backgroundRepeat, s.backgroundPositionX]; })()`);
-    check(`the device list's chevron stands once in the ${theme} theme`, look[0] === true && look[1] === "no-repeat" && look[2] !== "0%", JSON.stringify(look));
+    // Each style sheet and its rule count, then the tab's failed loads: soak 42850702695
+    // read the browser's defaults here once ([false,"repeat","0%"]), which is the page with
+    // none of index.css (the chevron's only rule), and nothing said why. A sheet that did
+    // not load throws on cssRules, so its count is the error's name.
+    const look = await fresh.evaluate(`(() => { const s = getComputedStyle(document.querySelector(".audio-setup select.device")); const rules = (x) => { try { return x.cssRules.length; } catch (e) { return e.name; } }; return [s.backgroundImage.includes("svg"), s.backgroundRepeat, s.backgroundPositionX, [...document.styleSheets].map((x) => (x.href ?? "inline").split("/").pop() + ": " + rules(x)).join(", ")]; })()`);
+    const chevron = look[0] === true && look[1] === "no-repeat" && look[2] !== "0%";
+    check(`the device list's chevron stands once in the ${theme} theme`, chevron, chevron ? "" : `${JSON.stringify(look)}\n${await diagnose(fresh)}`);
   }
 
   for (const [who, tab] of [["annika", ann], ["bobby", bob], ["cathy", cat], ["deedee", dee], ["a new device", fresh]]) {

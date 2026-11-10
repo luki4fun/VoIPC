@@ -2,7 +2,7 @@
 
 All notable changes to VoIPC are documented here.
 
-## [1.11.0] - release candidate
+## [1.11.0] - 2026-11-10
 
 Protocol 21 (20 in rc.1, which nothing else speaks: update apps and relay together). This app still talks to relays back to 1.0 (protocol 12), and on an older relay holds back what its
 other apps could not read.
