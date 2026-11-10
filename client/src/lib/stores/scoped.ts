@@ -50,6 +50,12 @@ export interface Scoped<T> extends Readable<T> {
  * next store somebody adds.
  */
 const everyScoped = new Set<Scoped<unknown>>();
+/**
+ * What outlives a connection and goes only when the server is closed: a store
+ * made with `{ kept: true }`, whose state a network cut must not take. It holds
+ * no channel or user id, which a restarted relay would hand out again.
+ */
+const everyKept = new Set<Scoped<unknown>>();
 
 /** A store that re-subscribes to whichever store `pick` currently names. */
 function follow<T>(pick: Readable<Readable<T>>): Readable<T> {
@@ -69,7 +75,7 @@ function follow<T>(pick: Readable<Readable<T>>): Readable<T> {
   });
 }
 
-export function scoped<T>(init: () => T): Scoped<T> {
+export function scoped<T>(init: () => T, { kept = false }: { kept?: boolean } = {}): Scoped<T> {
   // The servers' stores. A plain Map, written the moment `of` needs a store:
   // `of` is also how a helper *reads* one server's value, and that read may
   // happen inside a component's `$derived` or markup, where writing a store
@@ -135,11 +141,16 @@ export function scoped<T>(init: () => T): Scoped<T> {
 
   const view = at(serverAddress);
   const store: Scoped<T> = { subscribe: view.subscribe, of, peek, at, all, drop };
-  everyScoped.add(store as Scoped<unknown>);
+  (kept ? everyKept : everyScoped).add(store as Scoped<unknown>);
   return store;
 }
 
 /** Forget one server in every scoped store. */
 export function dropServer(server: string): void {
   for (const store of everyScoped) store.drop(server);
+}
+
+/** A server closed: what outlived its connection goes too. */
+export function dropKept(server: string): void {
+  for (const store of everyKept) store.drop(server);
 }

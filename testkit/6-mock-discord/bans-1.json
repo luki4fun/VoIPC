@@ -1,0 +1,22 @@
+[
+  {
+    "reason": "Spam, over and over",
+    "user": {
+      "id": "1190000000000002001",
+      "username": "mallory",
+      "discriminator": "0",
+      "global_name": "Mallory",
+      "avatar": null
+    }
+  },
+  {
+    "reason": null,
+    "user": {
+      "id": "1190000000000002002",
+      "username": "spammer",
+      "discriminator": "0",
+      "global_name": null,
+      "avatar": null
+    }
+  }
+]

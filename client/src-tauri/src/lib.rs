@@ -12,6 +12,7 @@ mod emote_sources;
 mod emotes;
 mod files;
 mod global_keys;
+mod import;
 mod media;
 mod mumblelink;
 mod network;
@@ -109,6 +110,7 @@ pub fn run() {
 
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_opener::init())
         // A file dropped where the page does not take it would have the
         // WebView open it in place of the app, mid-call: since 1.3 drops go
         // to the page (`dragDropEnabled: false`). Nothing of ours is a file
@@ -352,6 +354,14 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::connect,
             account::account_totp,
+            account::account_open_page,
+            account::account_provider_ask,
+            account::account_provider_answer,
+            account::account_pair_look,
+            account::account_pair_answer,
+            account::account_pair_decline,
+            account::account_provider_start,
+            account::account_provider_unlink,
             account::account_password_change,
             account::account_recovery_key_new,
             account::account_leave,
@@ -361,7 +371,9 @@ pub fn run() {
             account::safety_number,
             account::forget_relay_id,
             account::account_set_prefs,
+            account::account_block,
             account::account_enter,
+            account::account_read_now,
             account::send_kept_dm,
             account::account_cancel,
             account::account_request,
@@ -371,10 +383,18 @@ pub fn run() {
             commands::disconnect_all,
             commands::join_channel,
             commands::leave_channel,
+            commands::join_text_channels,
+            commands::set_quiet,
+            commands::request_channel_page,
+            commands::set_metered,
+            commands::key_job_answer,
             commands::create_channel,
             commands::set_channel_password,
             commands::kick_user,
             commands::request_channel_users,
+            commands::profiles_get,
+            commands::report_takers_get,
+            commands::profile_picture_get,
             commands::send_invite,
             commands::send_poke,
             commands::accept_invite,
@@ -398,6 +418,12 @@ pub fn run() {
             emotes::emote_missing,
             emotes::emote_cache_clear,
             emote_sources::fetch_emote_source,
+            import::import_open,
+            import::import_plan,
+            import::import_run,
+            import::import_stop,
+            import::import_forget,
+            import::import_move_post,
             emotes::emote_stickers,
             files::cancel_file,
             files::file_stage,
@@ -488,9 +514,11 @@ pub fn run() {
             commands::admin_login,
             commands::admin_kick,
             commands::admin_ban,
+            commands::admin_restrict,
             commands::admin_unban,
             commands::admin_ban_account,
             commands::admin_list_bans,
+            commands::admin_bans_page,
             // Persistent config
             commands::load_config,
             commands::save_connection_info,

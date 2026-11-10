@@ -17,6 +17,12 @@ export function shortName(full: string): string {
   return splitName(full).name;
 }
 
+/** A last-used name with no tag was an account's: a guest always goes out with one
+ *  (`connectTo`), and the Guest tab could only be told the name is taken. */
+export function isAccountName(last: string): boolean {
+  return !!last && !splitName(last).tag;
+}
+
 export function randomTag(): string {
   return String(Math.floor(Math.random() * 10000)).padStart(4, "0");
 }

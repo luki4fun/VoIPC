@@ -18,8 +18,10 @@ const MAGIC: &[u8; 4] = b"VOIP";
 /// devices remembered by relays with accounts. v5 adds, per account, the
 /// newest generation of each vault item this device has seen (1.0). v6 adds
 /// `extra` to a message (1.2): one JSON string for every per-message field the
-/// chat has gained since, so a new one no longer needs a new version.
-const VERSION: u8 = 0x06;
+/// chat has gained since, so a new one no longer needs a new version. v7 adds, per account,
+/// the bucket lists this device has named to its user (protocol 21).
+const VERSION: u8 = 0x07;
+const VERSION_V6: u8 = 0x06;
 const VERSION_V5: u8 = 0x05;
 const VERSION_V4: u8 = 0x04;
 const SALT_LEN: usize = 32;
@@ -126,14 +128,43 @@ struct V4ChatArchive {
     cursors: HashMap<String, V4LogMemory>,
 }
 
-/// v5: today's archive with v4's messages.
+/// v5 and v6's log memory: everything but the lists named.
+#[derive(Deserialize)]
+struct V5LogMemory {
+    cursors: HashMap<String, i64>,
+    readers: HashMap<String, Vec<[u8; 16]>>,
+    vault_gens: HashMap<String, u64>,
+}
+
+impl V5LogMemory {
+    fn now(self) -> voipc_crypto::sync::LogMemory {
+        voipc_crypto::sync::LogMemory {
+            cursors: self.cursors,
+            readers: self.readers,
+            vault_gens: self.vault_gens,
+            named: HashMap::new(),
+        }
+    }
+}
+
+/// v6: today's archive with v5's log memory.
+#[derive(Deserialize)]
+struct V6ChatArchive {
+    channels: HashMap<String, Vec<ChatMessage>>,
+    dms: HashMap<String, Vec<ChatMessage>>,
+    cleared: HashMap<String, u64>,
+    devices: Vec<DeviceRecord>,
+    cursors: HashMap<String, V5LogMemory>,
+}
+
+/// v5: v6 with v4's messages.
 #[derive(Deserialize)]
 struct V5ChatArchive {
     channels: HashMap<String, Vec<V4ChatMessage>>,
     dms: HashMap<String, Vec<V4ChatMessage>>,
     cleared: HashMap<String, u64>,
     devices: Vec<DeviceRecord>,
-    cursors: HashMap<String, voipc_crypto::sync::LogMemory>,
+    cursors: HashMap<String, V5LogMemory>,
 }
 
 /// A v4 and v5 message: everything but `extra`.
@@ -278,7 +309,7 @@ pub fn decrypt_archive(
     }
     // v1 to v3 predate 0.12, and no 1.x promises to open them
     // (docs/COMPATIBILITY.md §4): such a file is refused and left alone
-    if ![VERSION, VERSION_V5, VERSION_V4].contains(&version) {
+    if ![VERSION, VERSION_V6, VERSION_V5, VERSION_V4].contains(&version) {
         anyhow::bail!("unsupported file version");
     }
 
@@ -317,7 +348,17 @@ pub fn decrypt_archive(
 
     // Deserialize. An older file is read through the shape it was written with
     // and written back as the current version on the next save.
-    let archive = if version == VERSION_V5 {
+    let archive = if version == VERSION_V6 {
+        let v6: V6ChatArchive = postcard::from_bytes(plaintext)
+            .map_err(|e| anyhow::anyhow!("deserialization failed: {e}"))?;
+        ChatArchive {
+            channels: v6.channels,
+            dms: v6.dms,
+            cleared: v6.cleared,
+            devices: v6.devices,
+            cursors: v6.cursors.into_iter().map(|(k, m)| (k, m.now())).collect(),
+        }
+    } else if version == VERSION_V5 {
         let v5: V5ChatArchive = postcard::from_bytes(plaintext)
             .map_err(|e| anyhow::anyhow!("deserialization failed: {e}"))?;
         ChatArchive {
@@ -325,7 +366,7 @@ pub fn decrypt_archive(
             dms: convert(v5.dms),
             cleared: v5.cleared,
             devices: v5.devices,
-            cursors: v5.cursors,
+            cursors: v5.cursors.into_iter().map(|(k, m)| (k, m.now())).collect(),
         }
     } else if version == VERSION_V4 {
         let v4: V4ChatArchive = postcard::from_bytes(plaintext)
@@ -345,6 +386,7 @@ pub fn decrypt_archive(
                             cursors: m.cursors,
                             readers: m.readers,
                             vault_gens: HashMap::new(),
+                            named: HashMap::new(),
                         },
                     )
                 })
@@ -384,7 +426,7 @@ fn kind_of(data: &[u8]) -> FileKind {
         FileKind::Unreadable
     } else if data[4] > VERSION {
         FileKind::Newer
-    } else if [VERSION, VERSION_V5, VERSION_V4].contains(&data[4]) {
+    } else if [VERSION, VERSION_V6, VERSION_V5, VERSION_V4].contains(&data[4]) {
         FileKind::Ours(data[4])
     } else {
         FileKind::Unreadable
@@ -530,13 +572,75 @@ mod tests {
             .channels
             .insert("k".into(), vec![msg("plain", None), reply]);
         let file = encrypt_archive(&archive, &key, &salt).unwrap();
-        assert_eq!(file[4], 0x06);
+        assert_eq!(file[4], VERSION);
         let (back, ..) = decrypt_archive(&file, "pw").unwrap();
         let extras: Vec<_> = back.channels["k"]
             .iter()
             .map(|m| m.extra.as_deref())
             .collect();
         assert_eq!(extras, [None, Some(r#"{"reply_to":"m1","thread":"m1"}"#)]);
+    }
+
+    /// What every version since 1.3.1 wrote (v6) opens, its messages and how far it read
+    /// whole, with no list named yet: the first seal from it reads the list and names them.
+    #[test]
+    fn a_v6_archive_opens_with_nothing_named() {
+        #[derive(Serialize)]
+        struct V6Memory {
+            cursors: HashMap<String, i64>,
+            readers: HashMap<String, Vec<[u8; 16]>>,
+            vault_gens: HashMap<String, u64>,
+        }
+        #[derive(Serialize)]
+        struct V6 {
+            channels: HashMap<String, Vec<ChatMessage>>,
+            dms: HashMap<String, Vec<ChatMessage>>,
+            cleared: HashMap<String, u64>,
+            devices: Vec<DeviceRecord>,
+            cursors: HashMap<String, V6Memory>,
+        }
+        let v6 = V6 {
+            channels: HashMap::new(),
+            dms: HashMap::new(),
+            cleared: [("k".to_string(), 3)].into(),
+            devices: Vec::new(),
+            cursors: [(
+                "r|luki".to_string(),
+                V6Memory {
+                    cursors: [("d:x".to_string(), 7)].into(),
+                    readers: [("c:y".to_string(), vec![[1; 16]])].into(),
+                    vault_gens: [("item.pins".to_string(), 2)].into(),
+                },
+            )]
+            .into(),
+        };
+        let salt = generate_salt();
+        let key = derive_key("pw", &salt);
+        let mut aad = [0u8; 5];
+        aad[..4].copy_from_slice(MAGIC);
+        aad[4] = VERSION_V6;
+        let mut sealed = postcard::to_allocvec(&v6).unwrap();
+        key.seal_in_place_append_tag(
+            Nonce::assume_unique_for_key([0u8; NONCE_LEN]),
+            Aad::from(&aad),
+            &mut sealed,
+        )
+        .unwrap();
+        let mut file = MAGIC.to_vec();
+        file.push(VERSION_V6);
+        file.extend_from_slice(&salt);
+        file.extend_from_slice(&[0u8; NONCE_LEN]);
+        file.extend_from_slice(&(sealed.len() as u32).to_be_bytes());
+        file.extend_from_slice(&sealed);
+        assert_eq!(kind_of(&file), FileKind::Ours(VERSION_V6));
+        let (archive, _, _, version) = decrypt_archive(&file, "pw").unwrap();
+        assert_eq!(version, VERSION_V6);
+        assert_eq!(archive.cleared["k"], 3);
+        let memory = &archive.cursors["r|luki"];
+        assert_eq!(memory.cursors["d:x"], 7);
+        assert_eq!(memory.readers["c:y"], vec![[1; 16]]);
+        assert_eq!(memory.vault_gens["item.pins"], 2);
+        assert!(memory.named.is_empty());
     }
 
     /// What 0.12 wrote (v4) opens, with no vault generations yet; a newer

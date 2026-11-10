@@ -2,6 +2,506 @@
 
 All notable changes to VoIPC are documented here.
 
+## [1.11.0] - 2026-11-10
+
+Protocol 21 (20 in rc.1, which nothing else speaks: update apps and relay together). This app still talks to relays back to 1.0 (protocol 12), and on an older relay holds back what its
+other apps could not read.
+
+### Changed
+- **Sharing with newcomers is opt-in now, and on a server with accounts it is a privilege.** *Share recent channel chat with
+  newcomers* answers requests with recent chat and gives people who join your older keys to what you kept. It used to start on,
+  and ticked in the copies question; it now starts off. **Everyone's saved setting goes off once, with one notice,** because a
+  saved "on" could not say whether anyone chose it: turn it back on under Settings → Privacy & data. On a server with accounts it
+  also takes a new privilege, *Share history* (`voipc:share_history`), which an admin gives to groups. No group holds it until
+  then, the moderator group included; `*` does. It needs no two-factor codes and spares nobody from a kick, and a guest there
+  cannot share. Without accounts, or on a relay too old to have it, the switch alone decides. It binds honest apps only: a
+  modified app can hand over what it holds, which is still shown as that member's word.
+- **Protocol 21.** An app at 21 still talks to relays back to protocol 12; a relay at 21 admits only 21, so 1.11.0-rc.1 apps
+  must update.
+- **A new way through text channels, in every app.** Protocol 21 adds the live path: following any number of channels is one
+  frame and tells nobody, a writer asks who it owes its key just before it posts, readers open the session, a post goes only to
+  people its writer has been told of, a quiet member holds a seat and gets a mark each minute, and leaving a gated or hand-joined
+  channel, or being put out of one, is pushed to its followers. Being in a text channel no longer shows on the roster, joining or
+  leaving one tells nobody else, and a browser writing during a call makes its keys eight at a time.
+- **A writer's message no longer waits for its keys.** The post goes first and the key after, so the people reading get it as
+  the key reaches them, with the first after about a third of a second. A reader holds a post it has no key for, asks after 10 s,
+  and shows a mark at 60 s if it never comes; a post that cannot open no longer shows as a failed line. A chain ends by age as
+  well as by someone leaving: at its next post after a minute on a small channel, up to an hour, by how many it named, which
+  no relay can stretch.
+- **Sessions outlive a reconnect, in memory, for accounts.** An app keeps them for a week at most and 5000 people, by account,
+  never on disk, wiped when you disconnect or forget the device; both apps up, a writer's return costs a reader 176 bytes and no
+  new session. A guest keeps nothing. Writers replace the keys a session starts from after each round of handing out keys, and
+  delete the old ones a minute later, so what is in memory opens no earlier session.
+- **Asking a text channel's history for someone is sealed.** The ask and the answer go as direct messages, with the channel inside
+  them, so the relay no longer sees which channel. It can no longer check them either: each
+  device now does, by one rule, and answers from a budget of its own. Someone under the new-member wait still asks the old way.
+  A poke to someone you have no session with waits for one, as a direct message does.
+- **An app follows the text channels a server marks, with no announcement.** All of them go in one frame at connect. An
+  ordinary post in one lights the row with a dot and no number, a mention a count and a sound; a channel the server asks
+  everyone to follow starts at "only what is for you", whatever its size. Text rows no longer show a count. A channel with no
+  list of its own (open to everyone on the server, followed by itself) lists who is online, and asking nothing about it means
+  opening it tells the relay nothing. Text channels with a gate, and those joined by hand, are listed from a sweep of all
+  of them at a moment nobody chose, up to ten minutes old, with Refresh.
+- **Chat history is asked for when a channel is first opened, not at a join.** Up to three people who share, one on mobile
+  data, and after that only a person's click: *Ask*, *Ask others*, and the button in the header. Nothing retries on a timer.
+  An empty channel says what is known: whom it asked, who else shares, and that people wrote there before, never that nobody
+  has a copy. Each device decides on an ask alone, and an asker it does not know brings the whole next sweep forward within
+  its budget, never that one list.
+- **A ring: someone wrote here while you were away.** A row shows it when the relay's last post is past where you read, or a
+  post never opened here. It clears when something is read; with nobody left to ask, on opening. Someone new to a channel, and
+  a relay that just restarted, show none.
+- **New readers are named, where it matters.** In a channel with a gate or joined by hand, a writer's app says "bob can now
+  read what you write here" when it first hands bob a key or recent chat, once per name on this device, merged per minute,
+  with the whole list a click away past five. An app that saw a gate says so when the gate goes away.
+- **Quiet mode.** Off, on mobile data, or always, per device and server, under Settings → Privacy & data: only the channels you
+  pick arrive, the others show a ring when someone wrote and ring for no mention until you open them, and direct messages
+  still arrive. The server sees which ones you picked and when you open another; opened, a channel goes quiet again ten
+  minutes after it leaves the screen, with nobody rotating. It lives on the device, so no server can turn it on.
+- **Being kicked from a text channel stays, and losing a gate does not.** A kick leaves the same mark as walking out, by the
+  channel's log as well as its name, so a rename while away does not bring you back. Lose a gate and regain it, and your app
+  follows the channel again.
+- **Kept channel messages move to chains and buckets.** What a writer keeps in a channel on a relay at protocol 21 goes under
+  a forward chain, with fresh randomness at each step, sealed once per bucket of about 62 seats, each seat a static wrap, a sealed
+  list of who is in it, and links between them, every one bound to its conversation, with known answers worked out apart from
+  the code. Someone new costs one row and one step at the writer's next post, however many are seated; someone leaving costs
+  about 9 KB rather than a key for everyone, and that writer's next post is under a chain with no path from what they hold. A
+  writer's device reads its buckets back from the relay, names anyone on a list it has not named before it seals to them, and a
+  list that does not check out is no list: those people go in a new bucket, named. Told someone left a gated channel, it ends its
+  chain whatever the relay says next. Who shares gets a link down to older chains, and only who is proven to have held the start
+  of a chain, by the writer's own rows, gets index 0 of the one linked to it. A reader is sent only what it can open, opens a row only when
+  a message needs it, and is told in one quiet line what it cannot. Following channels takes all their seats in one frame, and a
+  silent follow takes a log only up to half of `kept_seats`. Direct conversations, and any relay below 21, stay on epoch keys;
+  what a channel kept before goes on opening, and the relay takes no new epoch on a channel. The relay holds each writer to the
+  rules (a bucket never grows, a chain is not the newest until its last frame, a seal goes only to a bucket's newest version and
+  never to someone gone, at most three new buckets at once) and counts a seat's row at half against the quota. Apps no longer
+  take a log key of low order, or one with bytes after it, as endorsed. The desktop history moves to format 7, with a one-time
+  copy of the older file.
+- **Who you have met no longer has to fit one message.** A person's pins, the identity each other account had when first met,
+  go in pages outside the sign-in frame on a relay at protocol 21, up to about 32,000 people where one vault item held about 560.
+  Past that a key could be swapped at the next connect with nobody told, so no number of seats could safely go higher. Pages are
+  read right after sign-in, an app that stayed up reads only those whose generation moved, and nothing that checks a key, and no
+  key job, runs until they are in. A page gone, or older than this device saw or than the index says, is reported as any vault
+  item is and never saved over. Nothing is evicted: people met only in open channels stop at half the room, and those from direct
+  conversations and gated channels, and whoever you verified, keep the rest. A new pin goes out at most once in five minutes and
+  when you sign out, which also ends an upload that grew with the square of the people met; a changed key or a verified person
+  goes at once, and a crash costs only that those few are new again. The old item folds in at the first connect. An older build
+  leaves the new one alone. A relay at 20 or older keeps the single item and says nothing, unless pins really are in pages it
+  cannot hand back.
+- **A channel keeps messages for 5000 accounts by default, up from 256.** `kept_seats` still sets it, and silent follows stop at half.
+  A writer's first post reaches them all. More joiners than one `LogIndex` carries come after those are answered rather than at the next
+  connect, and in the browser who was named as a reader moved from localStorage to IndexedDB, where it cannot crowd out the vault's
+  generations. Measured figures are in [docs/OPERATING.md](docs/OPERATING.md).
+- **A kept post no longer adds up everything its writer stored.** Far from the quota it goes on the last count for up to an hour; within a
+  megabyte of it every post is counted, and a key write always counts again. A writer at the full quota went from about 21 ms a post to 2 ms.
+- **A channel keeps its newest messages, and only those.** New `kept_window` in `[accounts]`, 10,000 by default: the hourly
+  sweep deletes older messages there for good, once what pushed them out has stood three days and has three more left, so a flood
+  that is cleaned up or runs out takes nothing. Direct conversations are exempt.
+- **A relay refuses a log key its owner's identity did not endorse, or one of low order.** One member's bad key could stop
+  everyone's kept copies in every channel they sat in.
+- **Someone who leaves a channel's kept history holding a key there waits to take a seat again:** 10 minutes, doubling each time
+  they come back, across channels, up to a day. Each such leave makes every writer there start over at their next post.
+- **A person's direct messages come first when the relay lists what is new,** and past 512 conversations the rest come too: a
+  person in many channels had direct messages dropped from that list.
+
+### Fixed
+- **Someone who joins or comes back just after another person posted reads that person's next post.** A writer skipped
+  asking who was new for 2 s after each ask, and the relay sends a post only to the readers its writer was told of, so a
+  reader who came in that window missed that writer's posts for good: no later key opens them. A writer asks before every
+  post now, and a quick run of posts shares one ask (in rc.2).
+- **The relay's log says why a sign-in with Discord failed.** The account system's warnings and errors went to a log target
+  the default filter dropped, so a failed provider sign-in or a database error left no line. They are on by default now,
+  with hashed addresses and no names ([OPERATING.md](docs/OPERATING.md) §9). A `RUST_LOG` of your own needs `accounts=warn`
+  added.
+- **A post of yours is no longer lost on your own device by a crash just after it went.** The read cursor passed it and reached
+  disk while the post waited up to 2 s for its save: quit in between and it never came back there, though a browser read it from
+  the kept copy. A post moves no cursor now, and reads back once at the next read.
+- **A sharer with many newcomers no longer loses the connection at every connect.** An answer to about 840 people, or about 595
+  for the keys of a version before chains, was one frame past the limit, where the relay ends the connection, voice included. It
+  goes in several frames now. And neither app can send a frame the relay would end the connection at: that one message goes,
+  with a line in the log.
+- **A newcomer's wait on someone who shares ends when the whole answer is in.** The first of its frames ended it: they were told,
+  read past chains with no row yet, and were never told again, and an answer cut off was lost for good. Now the last frame ends
+  the wait, and an answer cut off goes round again, within seconds or at the next connect. Someone leaving while it goes out
+  costs the others nothing.
+- **One member with no log key no longer stops everyone's kept posts in a channel.** A member a writer's app cannot reach, with
+  no key or none it can trust, gets a row that opens nothing. They are not named, and that writer's posts reach them as messages
+  they cannot open, in the quiet line. A first key brings a real row at that writer's next post.
+- **A kept post lost because a seat was refused says so.** Written during the wait after leaving, or with a silent follow refused,
+  it went with no word. A silent follow stopped at half a log's seats now takes a seat for the post, as asking does.
+- **A kept post no longer goes round for ever behind a refusal.** Two out together when a new key was needed each went straight
+  out again behind the other, until the relay's budget ran out, and one answer lost on a full queue did the same. They now wait
+  for the refusal to settle; what has had no answer for about 30 s is given up on, with a word.
+- **Someone who left while a writer was away is named again when they come back.** Only a leave the app was told of at the time
+  cleared them from who it had named.
+- **A leave ends a writer's chain only if that writer could have reached them.** A guest or anyone else with no seat leaving a
+  gated or hand-joined channel spent every writer's budget of 60 new chains an hour, and then their kept posts.
+- **Nothing pairwise goes before your pins are read.** While the pages of the pins were out, a hand-off could answer a swapped key with up to 48 KiB of chat, a direct message could open a session on it, and the warning came late or never. Direct messages, pokes, session bundles, room keys and history asks now wait on that device until the pages are in, then each is opened and checked, with any warning first. If the server still has not handed the list over after about 30 seconds, the person is told once.
+- **A reconnect goes by the whole channel list.** Past one frame the list arrived as a first part and the rest, and a reconnect chose where to put you back from the first part alone, so a room or hand-joined channel further down was silently not rejoined. Long lists now come as parts told only at their end, on both apps.
+- **Opening a channel no longer tells the relay who wrote in it.** A channel holding messages from people not asked yet asked their names as the rows drew, within an eighth of a second. Everyone on the device is now asked at connect, in pages that name no channel, and a kept row's writer as the row comes.
+- **Quiet mode cannot put the channel on screen to sleep.** A mode that took effect with it open stopped its posts with nothing to say so, and its read mark then moved past what never came. It now stays whole while on screen and goes quiet ten minutes after it leaves.
+- **Nobody asks for chat in an anonymous channel.** Opening one asked up to three people, by name, for a channel whose pseudonym hides who is there, and offered Ask others for answers that could never come.
+- **Verify leaves no session behind.** A session it opened could not start a message once the other side's keys were renewed, which they are within the hour, so every direct message from then on arrived as "decryption failed". A bundle with nothing to send over it now opens nothing.
+- **A post waiting at a dropped connection says it was not delivered.** It showed as sent whether it waited behind its check, the mobile data question or the pins.
+- **A new member's key is not skipped after a lost answer.** The relay counted people as told once it answered, even when the answer came too late, was refused or got a no, and they could not read that writer for up to an hour. The next check now asks for everyone, and only those lacking the key get one. A reader named before the lists of public rooms arrive is picked up the same way, and only a second answer warns about them.
+- **A relay can no longer grow what an app holds without end**, through pages of a list or parts of the channel list.
+- **A line at the top of a full channel pushes out the oldest message, never the newest.**
+- **A ring stays until something is read, across a reconnect and a restart.** Where you read no longer moves to a post that could not open.
+- **After a dropped connection you are back on the text channel you had open.** The pane stayed empty after "Reconnected", though the rows were there. It sends nothing new, and asks nobody for chat until you open it yourself, unless the channel is gone or you lost access.
+- **Android notifies again.** A direct message, poke or mention never notified, because a WebView behind HOME goes on saying it has focus. It now counts as in view only when the page is also shown.
+- **A tap on a toast no longer stops its clock.** Only a mouse over it does, as a touch never says it has left.
+- **"On mobile data" works where the network can be read.** The Android app could not see the kind of network, so that mode and the mobile data question never acted; it now asks for the permission to. Where the type cannot be read at all, as on Windows, the mode is not offered.
+- **Settings no longer toasts about Discord** for an account with none linked, each time Privacy & data opens.
+- **Posts are kept after winning a gate back.** Lost and won back on one connection, the seat in its log stayed gone until the next connect, and every post said "not kept on the server". The relay now puts you out before it sends the new list, which also brings back the one toast that says you lost it.
+- **A poke's own row names who it was for**, not "Unknown". "Connection lost" is said once, and goes at the reconnect.
+- **A long list of channels no longer holds up voice.** Following or going quiet took the channel map's write lock for every
+  id a frame named, and one frame names about 60,000, repeats included. Each id now counts once, and only a text channel there
+  is reaches that lock. Asking who is in a channel has a budget of its own.
+- **Rows under an old log key do not stay live if the walk that ends them dies.** The relay stored a new key, then walked every
+  writer and marked rows under the old one, and a restart or a busy database halfway never walked again, so whoever held the
+  old key kept that bucket. A mark now goes in with the key and comes off at the end, and the walk resumes where it stopped, at
+  that account's next connect or the next sweep.
+- **A copy that needed a new key is no longer lost in slow mode.** A kept post answered with a rekey started the clock though
+  nothing was filed, so its retry was refused, and a busy slow channel lost a copy for every arrival or leave. The clock now
+  starts with what is filed.
+- **Connecting reads no channel's kept rows on SQLite to find direct conversations,** and the read of an account's own key
+  wraps at each key frame goes by an index on both databases.
+- **Keeping a gated channel to its gate no longer costs a query per seat, or the admin's frame.** A pass reads each account once
+  however many logs it sits in, runs hourly and beside whatever asked for it, one at a time, and a group change no longer waits
+  for it. Someone away who lost a group from the server's shell is out of that channel's kept messages as they sign in, if the
+  hour has not come yet. Winning a gate back no longer makes a seat wait, as if they had walked out, in every channel it gates.
+- **A key frame no longer reaches a quiet member.** Sender keys and asks for one now go only to who follows whole.
+- **A reader gets down a run of links past a chain never finished.** A chain whose last frame never came dead-ended the way
+  down for the hour it lasts, though a later chain linked to the same one.
+- **A relay's list of who stands in a channel no longer disappears past some 800 people,** nor its channel list past some 500
+  channels: a list too long for one frame now comes in several, and every app reads all of them. The limits that kept a list to
+  one frame are gone: a server no longer refuses to start, leaves a channel out or refuses a new one because of its list.
+- **A long direct message is no longer sent back to its sender,** who never read the copy.
+- **A moderator can clear the profile of someone who has gone,** from the Users tab, and everyone connected sees it at once, not
+  at their next connect. Clears now keep to the budget a person's own profile changes have.
+- **The Discord move's OK list shows a group's powers whole on a phone,** where the rest was cut off with nowhere to read it.
+- **A remembered account comes back on the Account tab,** with its name, not on Guest, where Connect could only say the name
+  belongs to an account.
+- **In a light theme the first-run device lists and two other lists draw one chevron,** not one repeated across the whole field.
+  A device list that names one device twice no longer stops the first-run steps.
+- **Only the browser that came back can tap the code on a provider's page.** Whoever started a sign-in held everything the
+  tap asked for, so they could send someone their link, wait for that person to approve at the provider, and tap for them:
+  claiming that person's waiting account, making an account on their provider id, or linking it to their own. The page now
+  carries a key that only the browser the provider sent back receives, for that code. *None of these* ends a sign-in whose
+  code is not on the page.
+- **One stranger can no longer keep people out of provider sign-in by starting many.** Starts now have a budget per IPv6
+  /48 (64 at once, then 6 a minute) and per /32 on top of the one per /64 or IPv4 address, which stays as it was. A full
+  table drops the oldest sign-in of whoever holds the most, with one warning a minute in the log, and refuses nobody. A
+  limiter no longer stays for good once its budget is whole again.
+- **Handing the key to a new device now takes you, on both sides, and the code is typed.** A hostile server could make both
+  devices show the same code by answering the new device twice, could try codes unseen because the old device answered before
+  anyone was asked, and could hand a new device a vault of its own. Now the old device first asks whether this is you and sends
+  nothing before your yes. The new device takes one answer and shows a code, which you type on the old device, which never shows
+  it and compares it with the one it worked out. A typo can be typed again three times; then it says no and warns. The new device
+  refuses a key from anywhere else, and opens nothing until you say you typed the code. A device that remembers the account
+  refuses another key for it, and says so when a server gives the account another name. Your device takes three asks and then one
+  per ten minutes, whatever the server does, for as long as the app or page runs. If the old device's field goes away with nothing handed over, it says so. A hostile
+  server can still show you a code of its own as text, and only you can catch that: the old device says where the code belongs, a
+  code anywhere else is not it, and during a pairing the new device shows no words of the server's. **Update the old device first:
+  a device from before this change and one after it cannot pair**, and a device that is not updated stays open to these until it is.
+- **A pairing no longer dies ten seconds in on the desktop and Android**, whose read gave up long before a person could reach the
+  other device. Over the TCP fallback the same sign-in gave up after 30 seconds of quiet at any step, and the relay after two and a
+  half minutes. In the browser it gave up after two and a half minutes in all, and after as much at any prompt, whatever the prompt
+  promised. It now waits as long as the server does, on either carrier, and has a Cancel. Asking again after a sign-in died failed
+  at once with "Your other device did not answer" or "said no", because the old device still held the last ask, which nothing ended.
+  Now the server ends it when the new device goes or asks again, and the old device lets go of an ask nobody ended. An ask
+  refused for any reason but the limit of asks no longer counts against what the sign-in may send, so a few refusals can't end a
+  sign-in that then gets a yes.
+- **A server can no longer take the old device's question off the screen, or raise a provider's dialog by itself.** It could
+  replace the field you were typing in with a dialog saying "Your code", close that with a notice saying "confirmed", and so make
+  the new device's question read as true with nothing handed over. Nothing replaces that question now but its own pairing's next
+  step, and a provider's page and its confirmation count only as the answer to a link or proof you started. In the browser, what
+  a server sends before you are signed in reaches the screen only if it belongs to the sign-in. On every client its words stay off
+  during a pairing up to your next act after a refusal, the version text of a refusal included.
+- **A plain Escape works on the new device's windows.** On *Check your other device* and the question after it Escape did nothing
+  until a click, since the focus had gone with the button that led there.
+- **A new device's code is not lost behind another server's prompt**, where its window stayed without one when it came up.
+- **Your first recovery key shows before the account opens.** If the server then refused the sign-in (a ban, a full server, a lost
+  connection) the account was stored, and the only key to it had never been on screen. Going back at the key leaves nothing behind,
+  and the next try has a key of its own. A second device racing to open the same account is told its key does not count.
+- **A failed sign-in's reason is on screen**, not below the fold of the connect dialog at the window's first size.
+- **A dialog with recovery codes comes only after you typed a code to turn them on**, not from whatever a server sends. A yes that
+  hands something over goes live a moment after its dialog shows, so a double click on the last dialog cannot land on it.
+- **A repeated id from a relay no longer stops the window.** A channel, member, group, invite, ban or sign-in provider listed
+  twice threw in the screen that draws the list, in a release build too, and took the whole window with it, other servers
+  included, and again at each start with that server on screen. Each of these lists now holds each id once before anything
+  draws it.
+- **A channel behind a gate now answers like one that is not there.** A kick, a gate change, a kept post and the time a join
+  with a password takes all told the two apart. A *Kick* holder outside the gate can put nobody out of the channel any more,
+  nor can its creator after losing the group. Refusing to delete a group names a channel only to someone who can see it: a
+  *Manage groups* holder outside the gate hears that a channel they cannot see uses the group, not which. Giving or taking a
+  group, resetting someone's codes, and saving or deleting a group now ask for the power first, so someone without it can no
+  longer test which accounts nobody has opened and which groups exist.
+- **A channel closed on Discord after a run and gated here stays narrow.** Nothing marked it private, so someone with
+  *Channels* inside the gate could open it again, for everyone. It now counts as private from then on: only an admin opens
+  that gate, and while it stands open no run files there. A gate holding `user` counts as open, since every account holds
+  that group, and no private rows land behind it.
+- **Who was banned on Discord is for admins alone.** Anyone who could read the account list could page through them, named
+  `dc-<their Discord id>`: on the *Banned* filter, in a search, among a group's members, or by an id seen earlier. Past `*`
+  they are on no list now, the filter is not offered, and such an id answers as one that does not exist.
+- **An account nobody has opened no longer hands its privileges to whoever opens it.** A group with privileges given from the
+  shell, a plain group that came to hold some while the account stood unopened, and one left on by `admin reclaim` all went to
+  whoever next signed in with that Discord login. They now wait for an admin's OK, as a role's power does, and the account's
+  history says so. `admin reclaim` refuses the last holder of `*`, and a claim that meets the last `*` on an unopened account is
+  refused too, with the log saying what to do: give that group to another account first.
+- **Deleting a channel that holds what came from Discord takes an admin.** With *Channels* and a code, someone could delete
+  a channel and its whole archive, which no later run brings back. The server says so before asking for a code. A channel that
+  holds none can still be deleted as before.
+- **A server can no longer tick a private channel's history for you.** On a later run a private channel started ticked if the
+  relay said it had read some of it, a channel closed since the dry-run stayed on the same way, and the relay's word set where
+  Anonymise started. A private channel now starts off and takes its tick on every run, one closed since the dry-run stays off
+  and says so, and Anonymise starts on every time. A private channel you forget to tick falls behind until the next run that
+  ticks it.
+- **The guides say what a relay's copies of its database do.** A copy a run from Discord makes stays until it is deleted, or
+  until a new run pushes it past the last two, and the wizard and *When you are done* now say so. Restoring a copy forgets what
+  members deleted since, so the next run files those posts again: use Undo to start over. The sample backup timer now removes
+  a relay's copies at 30 days.
+- **The promises about readable history name the Discord import,** in the README and on the website: old messages an operator
+  moved here are the one thing such a server can read.
+- **What a server holds is listed as it is.** The notice for members and the README now name join dates, roles, what each role
+  could do and the Discord ids of those banned; the README's short list gains display names, pictures, provider ids and badges;
+  neither list calls itself full. `admin reclaim` says that an account's kept messages stay and still count against its quota,
+  the threat model says everyone connected sees who may call on everybody, and MOVING and ACCOUNTS say that someone else's post
+  naming or forwarding a person stays when that person deletes theirs.
+
+### Fixed
+- **A slow or busy device no longer loses the relay's last word.** The relay closed a connection the moment the far end's
+  network layer had its last message, which threw it away if the app had not read it yet, and a sign-in answer, a refusal or
+  a kick reason became "Connection lost". It now waits for the app to hang up, for up to 5 seconds.
+- **A busy relay no longer drops packets for want of room.** Its UDP socket sat at the system's default of 212 KiB, and what
+  did not fit was lost without a word: 340,000 packets in one soak at 2000 clients, which slowed every join and could lose
+  a connection. It now asks for 8 MiB, and warns at start if the system gives less: see *How big one relay goes* in
+  OPERATING.md for the one setting.
+
+### Added
+- **What someone deleted, and what closed on Discord, stay that way through a move.** Every run and *Go on* read Discord's
+  channels and roles again first, and the relay refuses a channel closed there while its gate here is open. A hide or a
+  delete holds through a later run and an undo with a new run, for someone who has left Discord too, and a thread's title
+  goes with it.
+- **Move a Discord server here**, from *Server admin → Discord move* in the desktop app: channels and categories in
+  their order, roles and channel permissions, members, bans, emotes and stickers, and old messages with their threads,
+  pins and reactions. A dry-run says what it will do first and writes nothing. A later run takes what is new, Stop
+  loses nothing, and Undo takes back what a run made. A network cut keeps the wizard where it stood, with Go on. The
+  bot's token stays in memory, goes to discord.com only, and never
+  reaches the server. The browser and Android show a card saying why, and everything below it. Read
+  [docs/MOVING.md](docs/MOVING.md) first: it has what Discord's rules say and who answers for what.
+- **Old messages are not end to end encrypted, and say so.** They were never encrypted, so this server can read them.
+  They stay out of the conversation, in a pane labelled "Imported from Discord, unverified. This server can read it.",
+  with its own search, threads and pins, for whoever stands in the channel. Nothing of it stays on a device. A private
+  channel's history comes only if the owner ticks it, and then only someone with `*` can open its gate. One closed on
+  Discord after a run is refused until it has a gate here.
+- **People come in with Discord.** The move holds an account for each member. *Continue with Discord* opens it, with the
+  name they choose and their badges and gates, on `invite` and `closed` servers too. An account nobody opens goes after
+  `unclaimed_days` (`[accounts]`, 90 by default, 0 is never), and frees its name.
+- **Power waits for an OK.** Whatever a role could do on Discord goes into a group of its own that nobody holds until the
+  owner says OK for that person, with a code. The dashboard counts who has come and lists who waits. A delta never
+  widens anything, and an `admin reclaim` of such an account sends it back to waiting. An undo and a new run never link
+  Discord back to someone who took it off, nor disable them.
+- **Your posts are yours to take back.** Sign in with that Discord and hide or delete your own imported posts, one by
+  one or all at once under *Settings → Privacy & data*. What you delete stays gone through a later run, or an undo and a new
+  one, also if you have left Discord by then, and a thread you opened then keeps nothing of yours, only a way in to the
+  replies. An owner can delete by Discord id on request, or leave someone out before the first run. A ban with removal takes
+  imported posts in its span too, by when they were written, and the delete and ban dialogs say so.
+- **The Users tab filters** by who signed in, waits or was banned on Discord, with a chip on each row. *Lift ban* on a
+  banned row ends that ban here, and no later import brings it back.
+- **`archive_days`** in `[accounts]` (0 by default) says how long what came from Discord is kept, by when it was
+  written. 0 keeps it until someone removes it.
+
+### Changed
+- **Active bans come in pages,** with a search by name and *Show more*. Past some hundreds of rows the list used to be
+  too long for one message, and silently never arrived.
+- **Password reset** answers the same for an account nobody has opened as for one somebody has.
+
+### Fixed
+- A text channel called `general` can be made and edited in the app, as one from `channels.json` always could. A voice
+  channel still cannot take the lobby's name.
+- Saving a group is refused when the groups' list would no longer fit one message, and says so. It used to succeed,
+  and the panel then silently stopped getting the list.
+- A group a channel's gate names cannot be deleted by writing its name another way, such as ` CREW `, which only a
+  modified app could send.
+- Someone with no password, back on a remembered device, can turn two-factor codes on: the question now offers to
+  confirm with their provider. It used to tell them to sign in with a password they did not have.
+
+## [1.10.0] - release candidate
+
+Protocol 19. This app still talks to relays back to 1.0 (protocol 12), and on an older relay holds back what its
+other apps could not read.
+
+### Added
+- **Four new privileges** in the group editor, for the moderation tools: `voipc:restrict`, `voipc:hide`,
+  `voipc:reports` and `voipc:modlog`.
+- **A moderation log** for holders of `voipc:modlog`, under *Server admin*: who kicked, banned or lifted a ban, in the
+  app or from the shell, kicked someone from a channel, cleared a profile, deleted a channel or invited someone to a
+  room, when and why. Nobody can
+  change or delete a row from the app, and a step whose row cannot be kept does not happen. Rows go after `modlog_days`
+  (`[accounts]`, 180 by default), and until then keep the names of accounts since deleted. Someone behind a pseudonym
+  stays behind it, whoever acted, and a channel the reader cannot see is not named.
+- **Block someone**, from their menu. Their messages fold to one line you can open and light no dot on a stream's chat
+  button, their direct messages, pokes, invites and shared history stay quiet, and you do not hear them in a call.
+  Nothing is deleted, so unblocking brings it all back. *Settings → Privacy & data* lists who you blocked on that
+  server. They are not told, and the server is told nothing: an account keeps the list sealed in its vault, where the server sees only that it changed and about how
+  long it is; a guest keeps it on the device. A block does nothing where people go by pseudonyms, and it stops no
+  moderator's action.
+- **Mute and timeout**, for holders of `voipc:restrict`, from someone's menu, for ten minutes up to until someone lifts
+  it. A mute stops their voice and screen share, and a running share stops. A timeout stops those and their posts,
+  reactions, pins, edits and deletes included, as well as pokes, invites, new channels, and setting a display name or
+  picture. Direct messages stay open, so someone held can still appeal. While you cannot write in a conversation, the
+  bin there does not offer to delete what you wrote from the server's copy, and says why: other people's devices could
+  not be asked to drop theirs. The server enforces it from the first packet after a reconnect, and it outlasts a
+  restart on a relay with accounts. Everyone sees a mark with who and until when; only the person and holders of the
+  privilege see why. Setting and lifting one write a row in the moderation log, whose reason shows only to a reader who
+  holds that privilege too. You act on anyone holding no more than you do, and never on yourself; a guest goes by
+  address, for at most a day, and never binds an account there, nor an admin there by the server's token. A guest off
+  posts who connects again goes by `guest` and their tag, since a name is public text.
+- **Hide a message**, for holders of `voipc:hide`, from its menu. It collapses to "Removed by" whoever did it with
+  *Show anyway* for everyone reading the channel, and *Restore* takes it back. Nothing is deleted: anyone can still open
+  it, though it stays out of search, pins and Files, and an honest app hands it to nobody asking for the channel's past.
+  It still counts after a reload with the moderator offline, read from the channel's stored log; without a log, or with
+  the moderator's copies off, it reaches only those online, and the action says so. Only an admin hides what someone
+  holding a privilege wrote. There is no hide in a direct message or an anonymous channel. Slow mode does not hold a
+  holder back, since a hide is a post. Each hide and restore writes a row in the moderation log, marked as the
+  moderator's own word. For this, the server now tells everyone, guests too, every account holding a privilege, by id
+  without names: a server could use that to name a fake moderator, whose worst is a false line and one extra click.
+- **Ban and remove their posts**, with *Also remove their posts* in the ban dialog, under *Ban an account*, and as
+  *Remove posts* on each row of *Active bans*: the last hour, day or seven days, and for an admin everything kept. It
+  takes a fresh code, asked for right there even with the admin panel shut, and only works on someone banned now. What
+  the server keeps of their channel messages is deleted for good and stays deleted when the ban ends; their direct
+  messages are not touched, being the other party's too. Copies on devices cannot be deleted: everyone is told, also on
+  their next connect for as long as the moderation log keeps the row, and those copies collapse to "This server says"
+  whoever "removed this with a ban", with *Show anyway*. That line is the server's word, which no moderator signs, so a
+  hostile server could use it to hide a message behind one extra click, never to erase one. Only an admin removes the
+  posts of someone holding a privilege. Each removal writes a row in the moderation log saying how many went, or
+  neither happens. A guest has nothing kept: their removal only hides by name. So does a moderator's removal by a
+  pseudonym, where a real name tried against that ban answers as for someone not banned; an admin's deletes by the
+  account, and everyone is still told only the pseudonym. A ban's address row reaches the account's posts too when that
+  account is banned, and its hint says so. A limited window can bring back an older message they deleted or edited,
+  for devices reading the log anew. Files they attached leave the server when they age out.
+- **Invite someone to the room you stand in**, for holders of `voipc:channels`, from their menu, in any room, also one
+  from `channels.json`, which had no one who could. Accepting passes the room's password, which that privilege could
+  change anyway; a gate still holds, and someone outside it is neither asked nor told the room's name. It is an invite,
+  so nobody is moved without saying yes, and you hear the answer, not the room's creator. It cannot be sent from behind
+  a pseudonym. Each one writes a row in the moderation log.
+- **Report a message**, from its menu, to whoever holds `voipc:reports`, a moderator in a hidden channel too. The dialog
+  names who would get it and who of them is away, and you can untick anyone and say why. Each gets a direct message with
+  the message as you have it, under a line saying who it is from and that the rest is that person's word, and what their
+  own copy says: it matches, it says otherwise, it was edited since, or they have none. Someone away gets it when you
+  keep it on the server, sealed, until they are back, which you are asked for that one report, also with your copies off.
+  There is no queue: a moderator can forward a report into a staff channel, and it stays a report, though a member
+  handing over that channel's history passes it on as a plain forward. The dialog closes if you move to another server,
+  whose takers are not this report's. The writer is never told, never offered as someone to report to, and someone
+  muted, timed out or only reading can still report. The text stays out of system notifications. The server answers who takes reports and passes a direct message like any other: it
+  keeps no report, and sees neither the text, your reason, the writer nor the channel. The exception is a message with a
+  file: the file goes too by default, and since the server holds that same file in the conversation it came from, it can
+  then see which one that was. The dialog says so, and unticking the file sends the words only. Admins take reports, and
+  so does the moderator group.
+- **A wait for new members**, off by default: `new_member_wait_mins` in `server_settings.json` holds voice, posts and
+  direct messages for that long after an account is made or a guest first comes from an address, and a guest counts as
+  new again once the wait and one more day have gone by since their last visit. Admins, holders of a privilege and
+  anyone in a group other than `user` do not wait, so giving a group ends it at once.
+
+### Changed
+- **A pseudonym has eight digits now**, `Guest-48213907`, so that removing someone's posts by theirs does not also hide
+  what somebody else wrote under the same name.
+- **The moderator group** of a new server hands those four out too. On an existing server it gains them once, on the
+  first start of this version, and only if it still holds exactly the old default (`voipc:ban`, `voipc:channels`,
+  `voipc:kick`); the server's log says so, and relay self-update can make this happen unattended. A group someone
+  has edited is left as it is, and a privilege taken away afterwards is never given back. Giving the group out now
+  takes those four as well, as giving any group takes what it hands out.
+- **Holding only `voipc:reports` or `voipc:modlog` spares nobody** from a kick or an address ban, as with
+  `voipc:mention_all`: they act on nobody.
+
+### Fixed
+- **The group editor on an older relay** offers only the privileges that relay has heard of. Ticking `voipc:profiles`
+  or `voipc:mention_all` on a relay before 1.9 had the whole group refused.
+- **Someone's volume on the desktop** no longer outlasts the call. Leaving voice on a server, or moving it to another
+  server, now clears each person's volume and voice effect in the audio engine, as the browser always did. Someone you
+  had muted, or unblocked while out of the call, stayed silent when you rejoined while their slider said 100%.
+- **A ban from the server's shell** could leave the account in a channel's stored log if it came back before the running
+  server had read the ban, so writers went on wrapping new keys to it. It is taken out again when the server reads the
+  ban.
+
+## [1.9.0] - release candidate
+
+Protocol 18. A 1.9 app still talks to relays back to 1.0 (protocol 12), and on an older relay holds back what its
+other apps could not read. Needs l4f-accounts v0.13.0.
+
+### Added
+- **Channels made in the app** that stay until someone deletes them, with **categories** and an order, by anyone
+  holding `voipc:channels`, on a relay with accounts. Those from `channels.json` stay the file's, and can be placed
+  and ordered too. A **welcome channel** opens the first time someone comes to a server.
+- **A group's colour and place**: its badge in that colour, and the member list sections people by their top group.
+  Nobody climbs over a group they could not have made. A group's section can be turned off.
+- **Display names and profile pictures**, shown beside the `@name` and never instead of it. A name cannot pass for
+  another account's. Other people's pictures reach the screen only through the picture sanitizer, like any file.
+  `voipc:profiles` clears those of someone holding no more than its holder.
+- **What a server calls itself**: a name, description and icon, set by an admin (or `server_name` and
+  `server_description` in `server_settings.json`, without accounts). Always shown above the address, and never kept
+  in a bookmark.
+- **Invite links**: one link for many people, with a limit, an expiry and a starting group, on a relay of any sign-up
+  mode but `closed`. Each sign-up still solves the proof of work. It works with a password or through a provider, and
+  an admin's invite code now works through a provider too, also on an invite-only relay.
+- **`@everyone`, `@here` and `@&badge`**, from members holding `voipc:mention_all`. Every client decides for itself
+  and only for a message arriving live: nothing rings later for what happened while away, and a stored copy or
+  history handed over never has that power.
+- **Channel notifications**: all, mentions or nothing, per channel. Channels over 50 people start on mentions.
+
+### Fixed
+- `signups_per_hour` raised one of l4f's two sign-up limits, so a move could still be refused at the lower one.
+- A pin from a moderator outside your voice room was dropped: their rights were looked up among the people in that
+  room rather than in the channel.
+- Someone holding `voipc:channels` but outside a channel's gate could change that channel's password and options by
+  its id, though it was hidden from them.
+- A privilege given at the moment another check of that account was under way could be undone by the older answer,
+  until the next periodic check.
+- Two groups with the same badge stopped the member list for everyone showing someone in both.
+- A 1.8 app asked a 1.5 or 1.6 relay for a channel's gate, which it could not answer.
+- On Postgres, a channel with a very long uid could not have its gate kept.
+- In an anonymous channel, a stale roster could tag someone's message with their account, and your own header showed
+  your display name beside your pseudonym.
+- Whoever held the ban list without being an admin could ban an admin or a moderator by name.
+- A moderator's ban kept the real name of someone standing behind a pseudonym, for whoever read the ban list next.
+- A banned account stayed in the channels' stored logs, so the writers went on wrapping new keys to it.
+- Someone who lost the right to speak while sharing their screen was not told, and their app went on capturing.
+- After a relay restart, whoever got the old id of someone allowed to call on everybody could do so until they signed in again.
+- The group editor offered Profiles and Call on everybody on relays that refuse a group holding them.
+- Forwarding a message into a closed direct conversation marked it unread.
+- The nightly check of older relays named releases that do not exist yet.
+
+## [1.8.0] - release candidate
+
+Protocol 17. A 1.8 app still talks to relays back to 1.0 (protocol 12); there it offers no sign-in with a
+provider. Needs l4f-accounts v0.12.0.
+
+### Added
+- **Sign in with Discord, Google or Facebook**, on a relay with a web address and a public certificate
+  (`[accounts] public_url`, each provider's application in the environment). A provider says who you are and
+  cannot unlock your messages: a new device also needs the recovery key, another of your devices, or your
+  password, and without one of them it gets in nowhere ([docs/ACCOUNTS.md](docs/ACCOUNTS.md)).
+- **Accounts without a password**: the first sign-in through a provider opens the account and shows its recovery
+  key. `voipc-server admin reclaim <name>` is the way back for someone who lost everything.
+- **Linking** a provider to an account, and unlinking it, in the account panel.
+- **Approving a new device from another one**, comparing a six-digit code.
+- `[accounts] signups_per_hour`.
+- `community_load`, which measures how big a relay goes; the results are in docs/OPERATING.md §10a.
+
+### Changed
+- An app that pinned a relay's self-signed certificate accepts a new one the public CAs accept, so moving a
+  relay to a real certificate does not trip the pin at every renewal.
+
+### Fixed
+- **People missing from member lists after many joined at once.** A connection's queue held 256 messages and
+  dropped the rest without a word, and every join is told to everyone, so a burst (everybody reconnecting after a
+  relay restart) lost members from rosters, or a whole list. Someone missing a member never hands them their keys,
+  so that member cannot read them. At 1000 people on two cores, 3858 messages went; none go now. The queue is
+  bounded by bytes instead, as much memory as before, and a client that has really stopped reading is disconnected
+  rather than left behind.
+- An app speaking a newer protocol than a 1.7 relay could not read that relay's member lists. Nothing released
+  had hit it yet: it needed this protocol bump.
+
 ## [1.7.0] - release candidate
 
 Protocol 16. A 1.7 app still talks to relays back to 1.0 (protocol 12); there the admin

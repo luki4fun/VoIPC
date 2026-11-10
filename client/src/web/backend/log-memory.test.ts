@@ -1,19 +1,34 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { freshPage, keepMemory, markReplay } from "./log-memory.ts";
+import { freshPage, keepMemory, markReplay, wholeMemory } from "./log-memory.ts";
 
 const stored = JSON.stringify({ cursors: { "d:a": 5, "c:b": 9 }, readers: { "c:b": [[1]] }, vault_gens: { "item.pins": 3 } });
 
 test("a fresh page reads everything back, and keeps all the rest of the memory", () => {
   const { json, seen } = freshPage(stored);
-  assert.deepEqual(JSON.parse(json!), { cursors: {}, readers: { "c:b": [[1]] }, vault_gens: { "item.pins": 3 } });
+  assert.deepEqual(JSON.parse(json!), { cursors: {}, vault_gens: { "item.pins": 3 } });
   assert.deepEqual(seen, { "d:a": 5, "c:b": 9 });
 });
 
+test("who was named lives apart, and a memory from before that hands it over", () => {
+  const from = JSON.stringify({ readers: { "c:b": [[2]] }, named: {} });
+  assert.deepEqual(JSON.parse(freshPage(stored).named!), { readers: { "c:b": [[1]] }, named: {} });
+  assert.deepEqual(JSON.parse(freshPage(stored, from).named!), { readers: { "c:b": [[2]] }, named: {} });
+  assert.equal(freshPage(JSON.stringify({ cursors: {} })).named, null);
+  assert.deepEqual(JSON.parse(wholeMemory(freshPage(stored, from))!), {
+    cursors: {},
+    vault_gens: { "item.pins": 3 },
+    readers: { "c:b": [[2]] },
+    named: {},
+  });
+  assert.equal(wholeMemory(freshPage(null)), null);
+  assert.deepEqual(JSON.parse(wholeMemory(freshPage(null, from))!).readers, { "c:b": [[2]] });
+});
+
 test("a first visit, or a memory that does not parse, starts empty", () => {
-  assert.deepEqual(freshPage(null), { json: null, seen: {} });
-  assert.deepEqual(freshPage("{nope"), { json: null, seen: {} });
-  assert.deepEqual(freshPage("7"), { json: null, seen: {} });
+  assert.deepEqual(freshPage(null), { json: null, named: null, seen: {} });
+  assert.deepEqual(freshPage("{nope"), { json: null, named: null, seen: {} });
+  assert.deepEqual(freshPage("7"), { json: null, named: null, seen: {} });
 });
 
 test("a reload partway through a read loses nothing of what was read before", () => {

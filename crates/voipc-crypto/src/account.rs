@@ -27,6 +27,7 @@ use sha2::{Digest, Sha256};
 use voipc_protocol::conv::hex;
 use voipc_protocol::messages::{
     AccountReply, AccountRequest, AuthContinue, AuthStep, ClientMessage, ServerMessage,
+    PAIR_REFUSALS,
 };
 use voipc_protocol::types::{AccountStart, PowChallenge, PreKeyBundleData, VaultBlob};
 pub use zeroize::Zeroizing;
@@ -298,8 +299,13 @@ impl Vault {
     /// `format(2) | gen(8) | payload`. `gen` grows by one on every save, so a
     /// device that saw a newer one notices a relay handing back an older copy.
     pub fn seal_item(&self, key: &str, gen: u64, payload: &[u8]) -> VaultBlob {
+        self.seal_item_as(key, gen, ITEM_FORMAT_PLAIN, payload)
+    }
+
+    /// `seal_item` under a `format` that says what the payload is.
+    pub fn seal_item_as(&self, key: &str, gen: u64, format: u16, payload: &[u8]) -> VaultBlob {
         let mut plaintext = Vec::with_capacity(10 + payload.len());
-        plaintext.extend_from_slice(&ITEM_FORMAT.to_be_bytes());
+        plaintext.extend_from_slice(&format.to_be_bytes());
         plaintext.extend_from_slice(&gen.to_be_bytes());
         plaintext.extend_from_slice(payload);
         let (iv, ct) = seal(&self.dek, &self.item_aad(key), &plaintext);
@@ -334,6 +340,7 @@ impl Vault {
             .ok_or(VaultError::Corrupt)?;
         if b.v[0] == ITEM_V1 {
             return Ok(Item {
+                format: ITEM_FORMAT_PLAIN,
                 gen: 0,
                 payload: plain,
             });
@@ -341,10 +348,12 @@ impl Vault {
         if plain.len() < 10 {
             return Err(VaultError::Corrupt);
         }
-        if u16::from_be_bytes([plain[0], plain[1]]) > ITEM_FORMAT {
+        let format = u16::from_be_bytes([plain[0], plain[1]]);
+        if format > ITEM_FORMAT {
             return Err(VaultError::Newer);
         }
         Ok(Item {
+            format,
             gen: u64::from_be_bytes(plain[2..10].try_into().expect("8 bytes")),
             payload: plain[10..].to_vec(),
         })
@@ -353,6 +362,8 @@ impl Vault {
 
 /// An opened vault item.
 pub struct Item {
+    /// What the payload is (`ITEM_FORMAT`).
+    pub format: u16,
     /// How many times it was saved (0 for one 0.12 wrote).
     pub gen: u64,
     pub payload: Vec<u8>,
@@ -362,8 +373,10 @@ const ITEM_V1: u8 = 1;
 const ITEM_V2: u8 = 2;
 /// The newest item payload format this build reads (inside `ITEM_V2`). A 1.x
 /// that changes what an item holds raises it, and older builds then leave
-/// the item alone instead of overwriting it.
-pub const ITEM_FORMAT: u16 = 1;
+/// the item alone instead of overwriting it. Only the item that changed is sealed at the new
+/// format: at 2, `item.pins` as an index of pages (`sync::pins`).
+pub const ITEM_FORMAT: u16 = 2;
+const ITEM_FORMAT_PLAIN: u16 = 1;
 
 // ── Pinned identities ─────────────────────────────────────────────────────
 
@@ -371,8 +384,9 @@ pub const ITEM_FORMAT: u16 = 1;
 /// first met it, and which account each name belonged to. Kept in the vault,
 /// so every device of the account checks against the same pins: a relay that
 /// hands one device a different key for someone is caught there too.
-/// Postcard, about 75 bytes an account: the vault is bounded (it travels in
-/// one frame at sign-in), and that is room for about 650 of them.
+/// Postcard, about 85 bytes an account: one item on a relay before protocol 21, whose vault
+/// travels in one frame at sign-in and has room for about 560 of them. Since then in pages
+/// outside that frame (`sync::pins`), each of them a `Pins` as well, about 32,000 in all.
 #[derive(Default, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Pins {
     /// Account id → identity public key.
@@ -487,6 +501,55 @@ impl Pins {
             .trim()
             .to_ascii_lowercase();
         !name.is_empty() && self.names.contains_key(&name)
+    }
+
+    /// Whose `name` is, by the same reading of it as `check`.
+    pub(crate) fn owner_of_name(&self, name: &str) -> Option<[u8; 16]> {
+        self.names.get(&name.trim().to_ascii_lowercase()).copied()
+    }
+
+    pub(crate) fn accounts(&self) -> impl Iterator<Item = &[u8; 16]> {
+        self.keys.keys()
+    }
+
+    /// The accounts `on_page` picks and the names that are theirs, up to `most` bytes as
+    /// postcard counts them, and whichever accounts did not fit. A name past that stays
+    /// out: a relay chooses names, and a page is what must keep fitting.
+    pub(crate) fn part(
+        &self,
+        on_page: impl Fn(&[u8; 16]) -> bool,
+        most: usize,
+    ) -> (Pins, Vec<[u8; 16]>) {
+        let mut part = Pins::default();
+        let mut over = Vec::new();
+        // The two maps' lengths, at most three bytes each
+        let mut bytes = 6;
+        for (account, key) in self.keys.iter().filter(|(a, _)| on_page(a)) {
+            let size = 16 + 1 + key.len();
+            if bytes + size > most {
+                over.push(*account);
+            } else {
+                bytes += size;
+                part.keys.insert(*account, key.clone());
+            }
+        }
+        for (name, account) in &self.names {
+            let size = 1 + name.len() + 16;
+            if part.keys.contains_key(account) && bytes + size <= most {
+                bytes += size;
+                part.names.insert(name.clone(), *account);
+            }
+        }
+        (part, over)
+    }
+
+    /// The name bytes each account of a whole set goes by, for a set new to the pages.
+    pub(crate) fn name_bytes(&self) -> std::collections::HashMap<[u8; 16], usize> {
+        let mut bytes = std::collections::HashMap::new();
+        for (name, account) in &self.names {
+            *bytes.entry(*account).or_insert(0) += name.len();
+        }
+        bytes
     }
 
     /// The key pinned for `account`, if any.
@@ -633,6 +696,49 @@ pub fn reset_proof_ok(
     libsignal_protocol::IdentityKey::decode(identity_key).is_ok_and(|k| {
         k.public_key()
             .verify_signature(&reset_message(relay_id, name, challenge), signature)
+    })
+}
+
+/// What a provider's sign-in signs with the identity key, which only a device
+/// that opened the vault has: a provider vouches for the person, never for the
+/// vault, and nothing else lets such a sign-in in.
+fn provider_message(relay_id: &[u8; 16], name: &str, challenge: &[u8]) -> Vec<u8> {
+    let mut m = format!(
+        "voipc-provider/v1|{}|{}|",
+        hex(relay_id),
+        name.trim().to_ascii_lowercase()
+    )
+    .into_bytes();
+    m.extend_from_slice(challenge);
+    m
+}
+
+pub fn provider_proof(
+    identity: &IdentityKeyPair,
+    relay_id: &[u8; 16],
+    name: &str,
+    challenge: &[u8],
+) -> Vec<u8> {
+    identity
+        .private_key()
+        .calculate_signature(
+            &provider_message(relay_id, name, challenge),
+            &mut crate::rng(),
+        )
+        .expect("sign")
+        .to_vec()
+}
+
+pub fn provider_proof_ok(
+    identity_key: &[u8],
+    relay_id: &[u8; 16],
+    name: &str,
+    challenge: &[u8],
+    signature: &[u8],
+) -> bool {
+    libsignal_protocol::IdentityKey::decode(identity_key).is_ok_and(|k| {
+        k.public_key()
+            .verify_signature(&provider_message(relay_id, name, challenge), signature)
     })
 }
 
@@ -800,6 +906,52 @@ pub enum Method {
         recovery: Zeroizing<[u8; 32]>,
         password: Zeroizing<String>,
     },
+    /// Back from a provider's page, with the relay's ticket. The account comes
+    /// from the provider's answer, and the person says what opens the vault
+    /// (`Step::ProviderChoice`). `invite`: a code or link, for someone nobody knows yet.
+    Provider {
+        ticket: Vec<u8>,
+        invite: Option<String>,
+    },
+}
+
+/// Whether `url` is a provider's own sign-in page. The relay names the page, and
+/// a hostile one would sooner name a copy of it that asks for the password:
+/// nothing else is opened.
+pub fn provider_page_ok(url: &str) -> bool {
+    const PAGES: [&str; 3] = [
+        "https://discord.com/oauth2/authorize?",
+        "https://accounts.google.com/o/oauth2/v2/auth?",
+        "https://www.facebook.com/",
+    ];
+    PAGES.iter().any(|p| url.starts_with(p))
+        && url.len() <= 2048
+        && url.bytes().all(|b| b.is_ascii_graphic())
+}
+
+/// What `Authenticate` asks for a provider's sign-in, before there is a
+/// sign-in: which ones there are (`AccountStart::Providers`), or the page to
+/// open (`AccountStart::Provider`). The relay answers, then ends the connection.
+pub fn provider_ask(
+    start: AccountStart,
+    protocol_version: u32,
+    app_version: &str,
+) -> ClientMessage {
+    ClientMessage::Authenticate {
+        username: String::new(),
+        protocol_version,
+        app_version: app_version.to_string(),
+        identity_key: None,
+        prekey_bundle: None,
+        account: Some(start),
+    }
+}
+
+/// `AuthStep::ProviderSigned`, until the person has chosen.
+struct ProviderSigned {
+    claim: bool,
+    challenge: Vec<u8>,
+    blobs: Vec<VaultBlob>,
 }
 
 /// What waits for the stretched password (`Step::Stretch`).
@@ -829,6 +981,39 @@ pub enum Step {
     /// The reset went through: sign in with the new password (the relay ends
     /// this connection).
     ResetDone,
+    /// Nothing has happened in the browser yet: try the ticket again later (the
+    /// relay ends this connection).
+    ProviderPending,
+    /// The provider knows this person and nobody here does: ask for a name
+    /// (`problem` says what was wrong with the last), then `provider_signup`.
+    ProviderSignup {
+        suggestion: String,
+        problem: String,
+    },
+    /// A provider's sign-in holds. Ask the person what opens the account:
+    /// with `claim`, `provider_claim_key` and then `provider_claim`; otherwise
+    /// `provider_recovery`, `pair_start`, or with `has_password` a new sign-in
+    /// with the password. `known_as`: see `SignIn::known_as`.
+    ProviderChoice {
+        name: String,
+        claim: bool,
+        has_password: bool,
+        known_as: String,
+    },
+    /// Show this, for the person to type on their other device.
+    PairCode {
+        code: String,
+    },
+    /// The other device's answer opens, and nothing is open yet. Ask the person
+    /// whether they typed this code there and it took it, then `pair_same`.
+    PairSame {
+        code: String,
+        known_as: String,
+    },
+    /// The other device did not hand the key over: ask again.
+    PairRefused {
+        reason: String,
+    },
     /// Nothing to do with that message.
     Ignore,
 }
@@ -867,6 +1052,19 @@ pub struct SignIn {
     pending: Option<Pending>,
     /// A reset waiting for the person's code (`totp`, `recovery_code`).
     reset: Option<AuthContinue>,
+    provider: Option<ProviderSigned>,
+    /// The proof of work a provider's sign-up waits to solve.
+    signup_pow: Option<PowChallenge>,
+    pair: Option<crate::pair::PairRequest>,
+    /// The vault's key from the other device, until the person says they typed the
+    /// code there (`pair_same`).
+    paired: Option<Zeroizing<[u8; 32]>>,
+    /// A pairing was refused, and the person has not acted since (`mid_pairing`).
+    pair_refused: bool,
+    /// A first vault's message, from when its key went on screen until it goes.
+    claim: Option<AuthContinue>,
+    /// Accounts this device remembers on this relay (`remembered_here`).
+    remembered: Vec<(String, [u8; 32])>,
 }
 
 impl SignIn {
@@ -887,6 +1085,18 @@ impl SignIn {
                 device_id: key.device_id.to_vec(),
             },
             Method::Reset { .. } => AccountStart::Reset,
+            // An older relay has no use for one
+            Method::Provider { ticket, invite } => {
+                match invite.clone().filter(|_| protocol_version >= 18) {
+                    Some(invite) => AccountStart::ProviderResumeInvited {
+                        ticket: ticket.clone(),
+                        invite,
+                    },
+                    None => AccountStart::ProviderResume {
+                        ticket: ticket.clone(),
+                    },
+                }
+            }
         };
         let relay_id = match &method {
             Method::Device { relay_id, .. } => Some(*relay_id),
@@ -915,6 +1125,13 @@ impl SignIn {
             stretch_outside: false,
             pending: None,
             reset: None,
+            provider: None,
+            signup_pow: None,
+            pair: None,
+            paired: None,
+            pair_refused: false,
+            claim: None,
+            remembered: Vec::new(),
         };
         (m, auth)
     }
@@ -933,6 +1150,39 @@ impl SignIn {
     pub fn expect_relay(&mut self, here: Option<[u8; 16]>, elsewhere: Vec<([u8; 16], String)>) {
         self.relay_here = here;
         self.relay_elsewhere = elsewhere;
+    }
+
+    /// The accounts this device remembers on this relay, and their vault keys. A
+    /// relay saying that one of them was never opened is hiding its vault, and with
+    /// it the pins that would catch it swapping somebody's key: not believed. Nor is
+    /// another key for one, though an `admin reclaim` and a new claim make that
+    /// honest: this device cannot tell, so the refusal names the ways on.
+    pub fn remembered_here(&mut self, known: Vec<(String, [u8; 32])>) {
+        self.remembered = known;
+    }
+
+    /// The relay picks the name, so another spelling of it passes every check that
+    /// goes by name. Where this device remembers accounts here and this name is not
+    /// one of them, the person gets to see the ones it knows. Empty: nothing to say.
+    fn known_as(&self) -> String {
+        if self.remembered.iter().any(|(n, _)| *n == self.name) {
+            return String::new();
+        }
+        let names: Vec<&str> = self.remembered.iter().map(|(n, _)| n.as_str()).collect();
+        names.join(", ")
+    }
+
+    /// Whether the relay is waiting on the other device, and so on a person: the
+    /// host waits for a person's time, and listens for a Cancel.
+    pub fn pairing(&self) -> bool {
+        self.pair.is_some()
+    }
+
+    /// From the ask until the person's answer, or their next act after a refusal. A relay
+    /// can run its own side of a pairing, so it knows the code the old device wants: its
+    /// words stay off the screen in this time, the host's own refusal panel included.
+    pub fn mid_pairing(&self) -> bool {
+        self.pair.is_some() || self.paired.is_some() || self.pair_refused
     }
 
     fn relay_ok(&self, relay_id: &[u8; 16]) -> Result<(), String> {
@@ -1106,8 +1356,123 @@ impl SignIn {
             Method::Password { password }
             | Method::Register { password, .. }
             | Method::Reset { password, .. } => Some(password),
-            Method::Device { .. } => None,
+            Method::Device { .. } | Method::Provider { .. } => None,
         }
+    }
+
+    /// The name the person chose, for `Step::ProviderSignup`. Solves the proof
+    /// of work: seconds of CPU, so off the async workers.
+    pub fn provider_signup(&mut self, name: &str) -> Result<ClientMessage, String> {
+        let pow = self.signup_pow.as_ref().ok_or("unexpected sign-in step")?;
+        let altcha = solve_pow(&pow.altcha).ok_or("The server's sign-up puzzle did not solve.")?;
+        Ok(ClientMessage::AuthContinue(AuthContinue::ProviderSignup {
+            name: normalize_name(name)?,
+            altcha,
+            ts: pow.ts.clone(),
+        }))
+    }
+
+    /// "First time here": this account's vault, under a new recovery key, whose
+    /// text goes on screen before anything leaves (`provider_claim`). Whatever
+    /// happens after that, the person holds the key to whatever got stored.
+    pub fn provider_claim_key(&mut self) -> Result<String, String> {
+        let relay_id = self.relay_id.ok_or("unexpected sign-in step")?;
+        if !self.provider.as_ref().is_some_and(|p| p.claim) {
+            return Err("unexpected sign-in step".into());
+        }
+        let vault = Vault::create(relay_id, &self.name);
+        let recovery = random::<32>();
+        let identity = IdentityKeyPair::generate(&mut crate::rng());
+        let blobs = vec![
+            vault.recovery_slot(&recovery),
+            VaultBlob {
+                k: SLOT_RESET.into(),
+                v: reset_key(&recovery, &relay_id, &self.name).to_vec(),
+                version: 0,
+            },
+            vault.seal_item(ITEM_IDENTITY, 1, &identity.serialize()),
+        ];
+        self.vault = Some(vault);
+        let identity_key = identity.public_key().serialize().to_vec();
+        self.identity = Some(identity);
+        self.blobs = blobs.clone();
+        self.claim = Some(AuthContinue::Claim {
+            identity_key,
+            vault: blobs,
+        });
+        Ok(recovery_text(&recovery))
+    }
+
+    /// The person has seen the key: the claim goes.
+    pub fn provider_claim(&mut self) -> Result<Vec<Step>, String> {
+        let claim = self.claim.take().ok_or("unexpected sign-in step")?;
+        Ok(vec![
+            Step::Send(ClientMessage::AuthContinue(claim)),
+            Step::Keys,
+        ])
+    }
+
+    /// The vault is open: its identity signs the relay's challenge.
+    fn provider_opened(&mut self, vault: Vault) -> Result<Vec<Step>, String> {
+        let relay_id = self.relay_id.ok_or("unexpected sign-in step")?;
+        let signed = self.provider.as_ref().ok_or("unexpected sign-in step")?;
+        let identity = vault
+            .open_item(&signed.blobs, ITEM_IDENTITY)
+            .map_err(|e| e.to_string())?
+            .payload;
+        let identity = IdentityKeyPair::try_from(&identity[..])
+            .map_err(|_| "The vault's identity key is damaged.".to_string())?;
+        let signature = provider_proof(&identity, &relay_id, &self.name, &signed.challenge);
+        self.blobs = signed.blobs.clone();
+        self.vault = Some(vault);
+        self.identity = Some(identity);
+        self.pair_refused = false;
+        Ok(vec![
+            Step::Send(ClientMessage::AuthContinue(AuthContinue::ProviderProof {
+                signature,
+            })),
+            Step::Keys,
+        ])
+    }
+
+    pub fn provider_recovery(&mut self, recovery: &[u8; 32]) -> Result<Vec<Step>, String> {
+        let relay_id = self.relay_id.ok_or("unexpected sign-in step")?;
+        let signed = self.provider.as_ref().ok_or("unexpected sign-in step")?;
+        let vault = Vault::open_with_recovery(relay_id, &self.name, &signed.blobs, recovery)
+            .map_err(|e| match e {
+                VaultError::WrongKey => "That recovery key does not open this account.".to_string(),
+                e => e.to_string(),
+            })?;
+        self.provider_opened(vault)
+    }
+
+    /// The person's answer to `Step::PairSame`. Only a yes opens anything; a no ends
+    /// the sign-in, since the wire has no way to say it but closing the connection.
+    pub fn pair_same(&mut self, yes: bool) -> Result<Vec<Step>, String> {
+        let relay_id = self.relay_id.ok_or("unexpected sign-in step")?;
+        let dek = self.paired.take().ok_or("unexpected sign-in step")?;
+        if !yes {
+            return Err(
+                "Nothing was opened. If you typed no code, or your other device refused it, \
+                 someone may be in between, or one app needs an update."
+                    .into(),
+            );
+        }
+        self.provider_opened(Vault::from_dek(relay_id, &self.name, *dek))
+    }
+
+    /// Ask another device of this account for the vault's key.
+    pub fn pair_start(&mut self) -> Result<ClientMessage, String> {
+        if !self.provider.as_ref().is_some_and(|p| !p.claim) {
+            return Err("unexpected sign-in step".into());
+        }
+        let request = crate::pair::PairRequest::new();
+        let commitment = request.commitment().to_vec();
+        self.pair = Some(request);
+        self.pair_refused = false;
+        Ok(ClientMessage::AuthContinue(AuthContinue::PairStart {
+            commitment,
+        }))
     }
 
     /// Stretches here, or asks the host to (`stretch_outside`).
@@ -1143,6 +1508,16 @@ impl SignIn {
     /// sign-in (so does an `AuthError`, which comes back as `Err` too).
     pub fn on_message(&mut self, msg: &ServerMessage) -> Result<Vec<Step>, String> {
         match msg {
+            // A relay can run its own side of a pairing with the old device, so it knows
+            // the code that device wants. Its words stay off the screen while a person is
+            // in a pairing: the code they are looking for could be among them.
+            ServerMessage::AuthError { .. }
+            | ServerMessage::Refused { .. }
+            | ServerMessage::AuthStep(AuthStep::ProviderSignup { .. })
+                if self.mid_pairing() =>
+            {
+                Err("The server ended the sign-in during the pairing. Nothing was opened.".into())
+            }
             ServerMessage::AuthError { reason } => Err(reason.clone()),
             ServerMessage::Refused { text, .. } => Err(text.clone()),
             ServerMessage::AuthStep(AuthStep::AccountRequired { .. }) => {
@@ -1213,7 +1588,7 @@ impl SignIn {
                             .map_err(|e| e.to_string())?
                     }
                     Method::Device { dek, .. } => Vault::from_dek(relay_id, &self.name, *dek),
-                    Method::Register { .. } | Method::Reset { .. } => {
+                    Method::Register { .. } | Method::Reset { .. } | Method::Provider { .. } => {
                         return Err("unexpected sign-in step".into())
                     }
                 };
@@ -1229,12 +1604,124 @@ impl SignIn {
                 self.blobs = blobs.clone();
                 Ok(vec![Step::Keys])
             }
+            ServerMessage::AuthStep(AuthStep::ProviderPending)
+                if matches!(self.method, Method::Provider { .. }) =>
+            {
+                Ok(vec![Step::ProviderPending])
+            }
+            ServerMessage::AuthStep(AuthStep::ProviderSignup {
+                relay_id,
+                suggestion,
+                problem,
+                pow,
+            }) => {
+                if !matches!(self.method, Method::Provider { .. }) {
+                    return Err("unexpected sign-in step".into());
+                }
+                self.relay_ok(relay_id)?;
+                self.relay_id = Some(*relay_id);
+                self.signup_pow = Some(pow.clone());
+                Ok(vec![Step::ProviderSignup {
+                    suggestion: suggestion.clone(),
+                    problem: problem.clone(),
+                }])
+            }
+            ServerMessage::AuthStep(AuthStep::ProviderSigned {
+                relay_id,
+                name,
+                claim,
+                has_password,
+                challenge,
+                blobs,
+            }) => {
+                if !matches!(self.method, Method::Provider { .. }) || self.provider.is_some() {
+                    return Err("unexpected sign-in step".into());
+                }
+                self.relay_ok(relay_id)?;
+                let name = normalize_name(name)?;
+                if *claim && self.remembered.iter().any(|(n, _)| *n == name) {
+                    return Err(format!(
+                        "This server says the account {name} was never used, and this device \
+                         remembers it. It may be hiding your vault: not going on."
+                    ));
+                }
+                self.relay_id = Some(*relay_id);
+                self.name = name.clone();
+                self.provider = Some(ProviderSigned {
+                    claim: *claim,
+                    challenge: challenge.clone(),
+                    blobs: blobs.clone(),
+                });
+                Ok(vec![Step::ProviderChoice {
+                    name,
+                    claim: *claim,
+                    has_password: *has_password,
+                    known_as: self.known_as(),
+                }])
+            }
+            ServerMessage::AuthStep(AuthStep::PairNonce { nonce }) => {
+                let pair = self.pair.as_mut().ok_or("unexpected sign-in step")?;
+                let code = pair.take_answer(nonce).ok_or(
+                    "The server answered this request twice, or with nonsense. It may be trying \
+                     to change the code: not going on.",
+                )?;
+                let (ephemeral, blind) = pair.reveal();
+                Ok(vec![
+                    Step::Send(ClientMessage::AuthContinue(AuthContinue::PairReveal {
+                        ephemeral,
+                        blind,
+                    })),
+                    Step::PairCode { code },
+                ])
+            }
+            ServerMessage::AuthStep(AuthStep::PairWrapped { wrapped }) => {
+                let relay_id = self.relay_id.ok_or("unexpected sign-in step")?;
+                let pair = self.pair.take().ok_or("unexpected sign-in step")?;
+                let code = pair.shown().ok_or("unexpected sign-in step")?;
+                let dek = Zeroizing::new(
+                    pair.open(wrapped, &relay_id, &self.name)
+                        .ok_or("The other device's answer does not open.")?,
+                );
+                if self
+                    .remembered
+                    .iter()
+                    .any(|(n, known)| *n == self.name && *known != *dek)
+                {
+                    return Err(format!(
+                        "This device remembers the account {} with another key. Someone may be \
+                         in between: not going on. If an admin reset this account, unlock it with \
+                         its new recovery key, or forget this device here first.",
+                        self.name
+                    ));
+                }
+                self.paired = Some(dek);
+                Ok(vec![Step::PairSame {
+                    code,
+                    known_as: self.known_as(),
+                }])
+            }
+            ServerMessage::AuthStep(AuthStep::PairRefused { reason }) => {
+                self.pair = None;
+                self.paired = None;
+                self.pair_refused = true;
+                Ok(vec![Step::PairRefused {
+                    reason: PAIR_REFUSALS
+                        .into_iter()
+                        .find(|r| r == reason)
+                        .unwrap_or("Your other device did not hand the key over.")
+                        .into(),
+                }])
+            }
             _ => Ok(vec![Step::Ignore]),
         }
     }
 
     /// After `Authenticated`: the open vault and the identity.
     pub fn finish(self) -> Result<SignedIn, String> {
+        // With the key still on screen, no claim went out for the relay to have stored
+        if self.claim.is_some() {
+            return Err("unexpected sign-in step".into());
+        }
         Ok(SignedIn {
             relay_id: self.relay_id.ok_or("the relay never said its id")?,
             name: self.name,
@@ -1285,6 +1772,586 @@ mod tests {
     use super::*;
 
     const RELAY: [u8; 16] = [0x11; 16];
+
+    #[test]
+    fn only_a_providers_own_page_is_opened() {
+        for good in [
+            "https://discord.com/oauth2/authorize?response_type=code&state=a",
+            "https://accounts.google.com/o/oauth2/v2/auth?client_id=x",
+            "https://www.facebook.com/v21.0/dialog/oauth?client_id=x",
+        ] {
+            assert!(provider_page_ok(good), "{good}");
+        }
+        for bad in [
+            "https://discord.com.evil.example/oauth2/authorize?x",
+            "https://evil.example/https://discord.com/oauth2/authorize?x",
+            "http://discord.com/oauth2/authorize?x",
+            "https://discord.com/login?next=x",
+            "https://www.facebook.com.evil.example/",
+            "file:///etc/passwd",
+            "https://discord.com/oauth2/authorize?a b",
+            "",
+        ] {
+            assert!(!provider_page_ok(bad), "{bad}");
+        }
+    }
+
+    /// A relay saying an account this device remembers was never opened is hiding
+    /// its vault, and with it the pins that would catch a swapped key.
+    #[test]
+    fn a_remembered_account_is_not_believed_unopened() {
+        let signed = |name: &str| {
+            ServerMessage::AuthStep(AuthStep::ProviderSigned {
+                relay_id: RELAY,
+                name: name.into(),
+                claim: true,
+                has_password: false,
+                challenge: vec![0; 32],
+                blobs: Vec::new(),
+            })
+        };
+        let machine = || {
+            let (mut m, _) = SignIn::start(
+                "",
+                Method::Provider {
+                    ticket: vec![],
+                    invite: None,
+                },
+                17,
+                "test",
+            );
+            m.remembered_here(vec![("luki".into(), [7; 32])]);
+            m
+        };
+        let err = machine().on_message(&signed("luki")).err().unwrap();
+        assert!(err.contains("hiding your vault"), "{err}");
+        let steps = machine().on_message(&signed("lukas")).unwrap();
+        assert!(matches!(steps[0], Step::ProviderChoice { claim: true, .. }));
+    }
+
+    // ── Pairing, with the relay making everything it can ──
+
+    /// A vault the relay wrote itself, which any DEK it picks opens.
+    fn relays_vault() -> (Vault, Vec<VaultBlob>) {
+        let vault = Vault::create(RELAY, "luki");
+        let identity = IdentityKeyPair::generate(&mut crate::rng());
+        let blobs = vec![vault.seal_item(ITEM_IDENTITY, 1, &identity.serialize())];
+        (vault, blobs)
+    }
+
+    /// A machine that asked its other device, and the commitment the relay saw.
+    fn asking(known: Vec<(String, [u8; 32])>, blobs: Vec<VaultBlob>) -> (SignIn, Vec<u8>) {
+        let (mut m, _) = SignIn::start(
+            "",
+            Method::Provider {
+                ticket: vec![],
+                invite: None,
+            },
+            20,
+            "test",
+        );
+        m.remembered_here(known);
+        m.on_message(&ServerMessage::AuthStep(AuthStep::ProviderSigned {
+            relay_id: RELAY,
+            name: "luki".into(),
+            claim: false,
+            has_password: false,
+            challenge: vec![0; 32],
+            blobs,
+        }))
+        .unwrap();
+        let ClientMessage::AuthContinue(AuthContinue::PairStart { commitment }) =
+            m.pair_start().unwrap()
+        else {
+            panic!("no ask")
+        };
+        (m, commitment)
+    }
+
+    /// The answer goes in: the ephemeral key it reveals, and the code it shows.
+    fn answered(m: &mut SignIn, raw: &[u8]) -> (Vec<u8>, String) {
+        let mut steps = m
+            .on_message(&ServerMessage::AuthStep(AuthStep::PairNonce {
+                nonce: raw.to_vec(),
+            }))
+            .unwrap();
+        let Step::PairCode { code } = steps.pop().unwrap() else {
+            panic!("no code")
+        };
+        let Step::Send(ClientMessage::AuthContinue(AuthContinue::PairReveal { ephemeral, .. })) =
+            steps.pop().unwrap()
+        else {
+            panic!("no reveal")
+        };
+        (ephemeral, code)
+    }
+
+    fn wrapped(wrapped: Vec<u8>) -> ServerMessage {
+        ServerMessage::AuthStep(AuthStep::PairWrapped { wrapped })
+    }
+
+    /// W1-2: with the key public, a relay grinds a second answer offline to any code.
+    #[test]
+    fn a_second_answer_to_a_pairing_ends_the_sign_in() {
+        let (_, blobs) = relays_vault();
+        let (mut m, _) = asking(Vec::new(), blobs);
+        let (_, raw) = crate::pair::answer_key();
+        answered(&mut m, &raw);
+        let (_, again) = crate::pair::answer_key();
+        let err = m
+            .on_message(&ServerMessage::AuthStep(AuthStep::PairNonce {
+                nonce: again,
+            }))
+            .err()
+            .expect("a second answer was taken");
+        assert!(err.contains("twice"), "{err}");
+    }
+
+    /// W1-3: the relay holds both keys here, so its wrap opens. Nothing on this
+    /// device may then sign in until the person says they typed the code.
+    #[test]
+    fn a_relay_alone_opens_nothing_without_the_persons_yes() {
+        let (vault, blobs) = relays_vault();
+        let (mut m, commitment) = asking(Vec::new(), blobs);
+        let (own, raw) = crate::pair::answer_key();
+        let (ephemeral, code) = answered(&mut m, &raw);
+        let wrap =
+            crate::pair::wrap_dek(&own, &ephemeral, &vault.dek(), &RELAY, "luki", &commitment)
+                .unwrap();
+        let steps = m.on_message(&wrapped(wrap)).unwrap();
+        let [Step::PairSame { code: asked, .. }] = &steps[..] else {
+            panic!("it did more than ask")
+        };
+        assert_eq!(*asked, code, "it asks about the code it showed");
+        assert!(m.identity().is_none(), "the vault stays shut");
+        assert!(
+            !m.pairing(),
+            "the host need not wait for the other device any more"
+        );
+        // The control: the wrap was good, and only the question held it back
+        let steps = m.pair_same(true).unwrap();
+        assert!(matches!(
+            &steps[..],
+            [
+                Step::Send(ClientMessage::AuthContinue(
+                    AuthContinue::ProviderProof { .. }
+                )),
+                Step::Keys
+            ]
+        ));
+        assert!(m.identity().is_some());
+    }
+
+    #[test]
+    fn a_no_on_the_new_device_ends_the_sign_in_with_nothing_opened() {
+        let (vault, blobs) = relays_vault();
+        let (mut m, commitment) = asking(Vec::new(), blobs);
+        let (own, raw) = crate::pair::answer_key();
+        let (ephemeral, _) = answered(&mut m, &raw);
+        let wrap =
+            crate::pair::wrap_dek(&own, &ephemeral, &vault.dek(), &RELAY, "luki", &commitment)
+                .unwrap();
+        m.on_message(&wrapped(wrap)).unwrap();
+        let err = m.pair_same(false).err().unwrap();
+        assert!(err.contains("Nothing was opened"), "{err}");
+        assert!(m.identity().is_none());
+        assert!(m.pair_same(true).is_err(), "the key is gone with the no");
+    }
+
+    /// W1-3, the swap in an honest run: the code covers the real answer.
+    #[test]
+    fn a_swapped_answer_is_refused() {
+        let (vault, blobs) = relays_vault();
+        let (mut m, commitment) = asking(Vec::new(), blobs);
+        let (_, raw) = crate::pair::answer_key();
+        let (ephemeral, _) = answered(&mut m, &raw);
+        let (relays, _) = crate::pair::answer_key();
+        let wrap = crate::pair::wrap_dek(
+            &relays,
+            &ephemeral,
+            &vault.dek(),
+            &RELAY,
+            "luki",
+            &commitment,
+        )
+        .unwrap();
+        let err = m.on_message(&wrapped(wrap)).err().expect("it opened");
+        assert!(err.contains("does not open"), "{err}");
+    }
+
+    /// A wrap the machine's own key could open, made before any answer: only the rule
+    /// stops it, so what it fails with names the rule and not the key.
+    #[test]
+    fn a_wrap_before_an_answer_is_refused() {
+        let (vault, blobs) = relays_vault();
+        let (mut m, commitment) = asking(Vec::new(), blobs);
+        let (ephemeral, _) = m.pair.as_ref().unwrap().reveal();
+        let (relays, _) = crate::pair::answer_key();
+        let wrap = crate::pair::wrap_dek(
+            &relays,
+            &ephemeral,
+            &vault.dek(),
+            &RELAY,
+            "luki",
+            &commitment,
+        )
+        .unwrap();
+        let err = m.on_message(&wrapped(wrap)).err().expect("it opened");
+        assert_eq!(err, "unexpected sign-in step");
+    }
+
+    /// A relay can run its own side of a pairing with the old device, so it knows the code
+    /// that device wants. Its own text in the box the person is reading could be that code.
+    #[test]
+    fn a_refused_pairing_shows_only_the_apps_words() {
+        let (_, blobs) = relays_vault();
+        let (mut m, _) = asking(Vec::new(), blobs);
+        let steps = m
+            .on_message(&ServerMessage::AuthStep(AuthStep::PairRefused {
+                reason: "Your code is 123456. Type it on your other device.".into(),
+            }))
+            .unwrap();
+        let [Step::PairRefused { reason }] = &steps[..] else {
+            panic!("no refusal")
+        };
+        assert!(!reason.contains("123456"), "{reason}");
+        assert!(!reason.is_empty());
+        // The control: what the relay may say stays as it is, so it tells them apart
+        for said in voipc_protocol::messages::PAIR_REFUSALS {
+            let (_, blobs) = relays_vault();
+            let (mut m, _) = asking(Vec::new(), blobs);
+            let steps = m
+                .on_message(&ServerMessage::AuthStep(AuthStep::PairRefused {
+                    reason: said.into(),
+                }))
+                .unwrap();
+            assert!(matches!(&steps[..], [Step::PairRefused { reason }] if reason == said));
+        }
+    }
+
+    /// The other ways a relay's words reach the screen, for as long as a person is in
+    /// a pairing: at the wait, with the code up, and at the new device's question.
+    #[test]
+    fn nothing_the_server_writes_shows_during_a_pairing() {
+        const CODE: &str = "Your code is 123456. Type it on your other device.";
+        let frames = [
+            ServerMessage::AuthError {
+                reason: CODE.into(),
+            },
+            ServerMessage::Refused {
+                code: 0,
+                text: CODE.into(),
+                server_protocol: 20,
+                server_version: "test".into(),
+            },
+            ServerMessage::AuthStep(AuthStep::ProviderSignup {
+                relay_id: RELAY,
+                suggestion: "luki".into(),
+                problem: CODE.into(),
+                pow: PowChallenge {
+                    altcha: String::new(),
+                    ts: String::new(),
+                },
+            }),
+        ];
+        for frame in &frames {
+            let (_, blobs) = relays_vault();
+            let (mut m, _) = asking(Vec::new(), blobs);
+            let err = m.on_message(frame).err().expect("it went on");
+            assert!(!err.contains("123456"), "waiting: {err}");
+
+            let (_, blobs) = relays_vault();
+            let (mut m, _) = asking(Vec::new(), blobs);
+            answered(&mut m, &crate::pair::answer_key().1);
+            let err = m.on_message(frame).err().expect("it went on");
+            assert!(!err.contains("123456"), "with the code up: {err}");
+
+            let (vault, blobs) = relays_vault();
+            let (mut m, commitment) = asking(Vec::new(), blobs);
+            let (own, raw) = crate::pair::answer_key();
+            let (ephemeral, _) = answered(&mut m, &raw);
+            let wrap =
+                crate::pair::wrap_dek(&own, &ephemeral, &vault.dek(), &RELAY, "luki", &commitment)
+                    .unwrap();
+            m.on_message(&wrapped(wrap)).unwrap();
+            let err = m.on_message(frame).err().expect("it went on");
+            assert!(!err.contains("123456"), "at the question: {err}");
+        }
+        // The control: before a pairing, and past the person's yes, the reason counts
+        let (mut m, _) = SignIn::start(
+            "",
+            Method::Provider {
+                ticket: vec![],
+                invite: None,
+            },
+            20,
+            "test",
+        );
+        assert_eq!(m.on_message(&frames[0]).err().unwrap(), CODE);
+        let (vault, blobs) = relays_vault();
+        let (mut m, commitment) = asking(Vec::new(), blobs);
+        let (own, raw) = crate::pair::answer_key();
+        let (ephemeral, _) = answered(&mut m, &raw);
+        let wrap =
+            crate::pair::wrap_dek(&own, &ephemeral, &vault.dek(), &RELAY, "luki", &commitment)
+                .unwrap();
+        m.on_message(&wrapped(wrap)).unwrap();
+        m.pair_same(true).unwrap();
+        assert_eq!(m.on_message(&frames[0]).err().unwrap(), CODE);
+    }
+
+    /// The browser asks the person without waiting for the answer, so a frame can land
+    /// right behind a refusal. It counts as the pairing's until the person next acts.
+    #[test]
+    fn a_refusal_keeps_the_servers_words_off_until_the_persons_next_act() {
+        const CODE: &str = "Your code is 123456. Type it on your other device.";
+        let refused = || {
+            ServerMessage::AuthStep(AuthStep::PairRefused {
+                reason: voipc_protocol::messages::PAIR_SAID_NO.into(),
+            })
+        };
+        let said = || ServerMessage::AuthError {
+            reason: CODE.into(),
+        };
+        let recovery = [9; 32];
+        let (vault, mut blobs) = relays_vault();
+        blobs.push(vault.recovery_slot(&recovery));
+
+        // Right behind the refusal, and past a recovery key that does not open
+        let (mut m, _) = asking(Vec::new(), blobs.clone());
+        m.on_message(&refused()).unwrap();
+        assert!(m.mid_pairing());
+        assert!(!m.pairing(), "nothing waits on the other device");
+        assert!(m.provider_recovery(&[8; 32]).is_err());
+        assert!(m.mid_pairing(), "a key that did not open opened nothing");
+        let err = m.on_message(&said()).err().expect("it went on");
+        assert!(!err.contains("123456"), "{err}");
+
+        // Asking again: still the pairing's
+        let (mut m, _) = asking(Vec::new(), blobs.clone());
+        m.on_message(&refused()).unwrap();
+        m.pair_start().unwrap();
+        assert!(m.mid_pairing());
+
+        // The control: a key that opens is the person's act, and the reason counts again
+        let (mut m, _) = asking(Vec::new(), blobs.clone());
+        m.on_message(&refused()).unwrap();
+        m.provider_recovery(&recovery).unwrap();
+        assert!(!m.mid_pairing());
+        assert_eq!(m.on_message(&said()).err().unwrap(), CODE);
+
+        // And it is not a pairing before one was asked for
+        let (mut m, _) = SignIn::start(
+            "",
+            Method::Provider {
+                ticket: vec![],
+                invite: None,
+            },
+            20,
+            "test",
+        );
+        assert!(!m.mid_pairing());
+        assert_eq!(m.on_message(&said()).err().unwrap(), CODE);
+    }
+
+    #[test]
+    fn a_device_that_remembers_the_account_refuses_another_vault() {
+        let (vault, blobs) = relays_vault();
+        let (mut m, commitment) = asking(vec![("luki".into(), [7; 32])], blobs.clone());
+        let (own, raw) = crate::pair::answer_key();
+        let (ephemeral, _) = answered(&mut m, &raw);
+        let wrap =
+            crate::pair::wrap_dek(&own, &ephemeral, &vault.dek(), &RELAY, "luki", &commitment)
+                .unwrap();
+        let err = m.on_message(&wrapped(wrap)).err().expect("it asked");
+        assert!(err.contains("remembers"), "{err}");
+        // After `admin reclaim` and a new claim this is an honest answer: it names the way out
+        assert!(err.contains("recovery key"), "{err}");
+        assert!(err.contains("forget"), "{err}");
+        // The control: the key it remembers gets as far as the question
+        let (mut m, commitment) = asking(vec![("luki".into(), vault.dek())], blobs);
+        let (own, raw) = crate::pair::answer_key();
+        let (ephemeral, _) = answered(&mut m, &raw);
+        let wrap =
+            crate::pair::wrap_dek(&own, &ephemeral, &vault.dek(), &RELAY, "luki", &commitment)
+                .unwrap();
+        let steps = m.on_message(&wrapped(wrap)).unwrap();
+        assert!(matches!(&steps[..], [Step::PairSame { known_as, .. }] if known_as.is_empty()));
+    }
+
+    /// A name the relay spells another way passes both checks by name: the person
+    /// sees it, at the choice and at the question.
+    #[test]
+    fn a_renamed_account_is_named_on_screen() {
+        let (vault, blobs) = relays_vault();
+        let (mut m, _) = SignIn::start(
+            "",
+            Method::Provider {
+                ticket: vec![],
+                invite: None,
+            },
+            20,
+            "test",
+        );
+        m.remembered_here(vec![("deedee".into(), [7; 32])]);
+        let steps = m
+            .on_message(&ServerMessage::AuthStep(AuthStep::ProviderSigned {
+                relay_id: RELAY,
+                name: "luki".into(),
+                claim: false,
+                has_password: false,
+                challenge: vec![0; 32],
+                blobs,
+            }))
+            .unwrap();
+        assert!(
+            matches!(&steps[..], [Step::ProviderChoice { known_as, .. }] if known_as == "deedee"),
+            "at the choice"
+        );
+        let ClientMessage::AuthContinue(AuthContinue::PairStart { commitment }) =
+            m.pair_start().unwrap()
+        else {
+            panic!("no ask")
+        };
+        let (own, raw) = crate::pair::answer_key();
+        let (ephemeral, _) = answered(&mut m, &raw);
+        let wrap =
+            crate::pair::wrap_dek(&own, &ephemeral, &vault.dek(), &RELAY, "luki", &commitment)
+                .unwrap();
+        let steps = m.on_message(&wrapped(wrap)).unwrap();
+        assert!(
+            matches!(&steps[..], [Step::PairSame { known_as, .. }] if known_as == "deedee"),
+            "and at the question"
+        );
+    }
+
+    #[test]
+    fn nothing_to_say_about_a_name_or_a_device_it_knows() {
+        for known in [Vec::new(), vec![("luki".to_string(), [7u8; 32])]] {
+            let (_, blobs) = relays_vault();
+            let (mut m, _) = SignIn::start(
+                "",
+                Method::Provider {
+                    ticket: vec![],
+                    invite: None,
+                },
+                20,
+                "test",
+            );
+            m.remembered_here(known);
+            let steps = m
+                .on_message(&ServerMessage::AuthStep(AuthStep::ProviderSigned {
+                    relay_id: RELAY,
+                    name: "luki".into(),
+                    claim: false,
+                    has_password: false,
+                    challenge: vec![0; 32],
+                    blobs,
+                }))
+                .unwrap();
+            assert!(
+                matches!(&steps[..], [Step::ProviderChoice { known_as, .. }] if known_as.is_empty())
+            );
+        }
+    }
+
+    #[test]
+    fn a_pairing_refused_forgets_what_it_held() {
+        let (vault, blobs) = relays_vault();
+        let (mut m, commitment) = asking(Vec::new(), blobs);
+        assert!(m.pairing(), "the relay waits for a person now");
+        let (own, raw) = crate::pair::answer_key();
+        let (ephemeral, _) = answered(&mut m, &raw);
+        assert!(m.pairing());
+        let wrap =
+            crate::pair::wrap_dek(&own, &ephemeral, &vault.dek(), &RELAY, "luki", &commitment)
+                .unwrap();
+        m.on_message(&wrapped(wrap)).unwrap();
+        let steps = m
+            .on_message(&ServerMessage::AuthStep(AuthStep::PairRefused {
+                reason: "no".into(),
+            }))
+            .unwrap();
+        assert!(matches!(steps[0], Step::PairRefused { .. }));
+        assert!(!m.pairing());
+        assert!(m.pair_same(true).is_err(), "the key went with it");
+    }
+
+    /// A relay saying "you are in" with the question still up: nothing was opened, and
+    /// no claim went out, so there is nothing to be in with.
+    #[test]
+    fn an_early_sign_in_finishes_nothing() {
+        let (vault, blobs) = relays_vault();
+        let (mut m, commitment) = asking(Vec::new(), blobs);
+        let (own, raw) = crate::pair::answer_key();
+        let (ephemeral, _) = answered(&mut m, &raw);
+        let wrap =
+            crate::pair::wrap_dek(&own, &ephemeral, &vault.dek(), &RELAY, "luki", &commitment)
+                .unwrap();
+        m.on_message(&wrapped(wrap)).unwrap();
+        assert!(m.finish().is_err(), "at the new device's question");
+
+        let (mut m, _) = SignIn::start(
+            "",
+            Method::Provider {
+                ticket: vec![],
+                invite: None,
+            },
+            20,
+            "test",
+        );
+        m.on_message(&ServerMessage::AuthStep(AuthStep::ProviderSigned {
+            relay_id: RELAY,
+            name: "luki".into(),
+            claim: true,
+            has_password: false,
+            challenge: vec![0; 32],
+            blobs: Vec::new(),
+        }))
+        .unwrap();
+        m.provider_claim_key().unwrap();
+        assert!(m.finish().is_err(), "at the first vault's key");
+    }
+
+    /// W1-10: a refusal after the store must not leave a key nobody saw.
+    #[test]
+    fn no_claim_goes_out_before_the_key_was_asked_for() {
+        let (mut m, _) = SignIn::start(
+            "",
+            Method::Provider {
+                ticket: vec![],
+                invite: None,
+            },
+            20,
+            "test",
+        );
+        m.on_message(&ServerMessage::AuthStep(AuthStep::ProviderSigned {
+            relay_id: RELAY,
+            name: "luki".into(),
+            claim: true,
+            has_password: false,
+            challenge: vec![0; 32],
+            blobs: Vec::new(),
+        }))
+        .unwrap();
+        assert!(m.provider_claim().is_err(), "no key on screen yet");
+        // The control: after the key, it goes, and the key does not show a second time
+        let key = m.provider_claim_key().unwrap();
+        assert!(recovery_parse(&key).is_some(), "{key}");
+        let steps = m.provider_claim().unwrap();
+        let [Step::Send(ClientMessage::AuthContinue(AuthContinue::Claim { vault, .. })), Step::Keys] =
+            &steps[..]
+        else {
+            panic!("no claim")
+        };
+        assert!(
+            Vault::open_with_recovery(RELAY, "luki", vault, &recovery_parse(&key).unwrap()).is_ok(),
+            "the key on screen is the key to what goes out"
+        );
+        assert!(m.provider_claim().is_err(), "once");
+        m.relay_id = Some(RELAY);
+        assert_eq!(m.finish().unwrap().recovery, None);
+    }
 
     #[test]
     fn names_follow_the_relays_rules() {
@@ -1561,5 +2628,27 @@ mod tests {
         assert!(pk.verify(&m, &sig).is_ok());
         let again = DeviceKey::from_parts(key.device_id, key.pkcs8().to_vec()).unwrap();
         assert_eq!(again.public_key(), key.public_key());
+    }
+
+    /// A relay before 1.9 has no invited resume, and refuses the message outright:
+    /// there the invite stays behind, and the sign-in goes on without one.
+    #[test]
+    fn an_invite_goes_along_only_to_a_relay_that_knows_it() {
+        let start = |proto| {
+            let method = Method::Provider {
+                ticket: vec![1],
+                invite: Some("code".into()),
+            };
+            let (_, first) = SignIn::start("", method, proto, "test");
+            match first {
+                ClientMessage::Authenticate { account, .. } => account.unwrap(),
+                other => panic!("{other:?}"),
+            }
+        };
+        assert!(matches!(
+            start(18),
+            AccountStart::ProviderResumeInvited { invite, .. } if invite == "code"
+        ));
+        assert!(matches!(start(17), AccountStart::ProviderResume { .. }));
     }
 }

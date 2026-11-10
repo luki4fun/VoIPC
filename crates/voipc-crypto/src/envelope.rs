@@ -103,11 +103,15 @@ const MAX_SAFE_MS: u64 = (1 << 53) - 1;
 pub struct Forwarded {
     pub name: String,
     pub at: u64,
+    /// It is a report of that message to a moderator (protocol v19).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report: Option<ReportMark>,
 }
 
 impl Forwarded {
     /// A sender's claim, bounded: the name cleaned like a file's and cut to
-    /// `MAX_FWD_NAME`, the moment one a reader can hold; else no label.
+    /// `MAX_FWD_NAME`, the moment one a reader can hold; else no label. A
+    /// malformed report mark leaves a plain forward.
     pub fn checked(v: &serde_json::Value) -> Option<Forwarded> {
         let o = v.as_object()?;
         let at = o.get("at")?.as_u64().filter(|a| *a <= MAX_SAFE_MS)?;
@@ -119,19 +123,56 @@ impl Forwarded {
                 name
             },
             at,
+            report: o.get("report").and_then(ReportMark::checked),
+        })
+    }
+}
+
+/// Longest reason a report gives, in characters.
+pub const MAX_REPORT_WHY: usize = 300;
+
+/// What makes a forward a report: the reporter's word, like the rest of the label.
+/// Nothing proves it (a moderator checks it against their own copy, if they have
+/// one), and the relay never sees it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReportMark {
+    /// Where they say it was written; empty: a direct message.
+    pub channel: String,
+    /// Its id there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub why: String,
+    /// Who it came from, as told by whoever passes a report on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
+}
+
+impl ReportMark {
+    fn checked(v: &serde_json::Value) -> Option<ReportMark> {
+        let o = v.as_object()?;
+        Some(ReportMark {
+            channel: clean(o.get("channel")?.as_str()?, MAX_FWD_NAME),
+            id: bounded_id(o.get("id").and_then(|v| v.as_str())),
+            why: clean(o.get("why")?.as_str()?, MAX_REPORT_WHY),
+            by: o
+                .get("by")
+                .and_then(|v| v.as_str())
+                .map(|b| clean(b, MAX_FWD_NAME))
+                .filter(|b| !b.is_empty()),
         })
     }
 }
 
 /// The kinds an event envelope may have (`ChatEvent`).
-const EVENT_KINDS: [&str; 4] = ["edit", "delete", "react", "pin"];
+const EVENT_KINDS: [&str; 5] = ["edit", "delete", "react", "pin", "hide"];
 
 /// What an event does to an earlier message of the same conversation, which
 /// it names by id (`target`). Every reader on a protocol-13 relay knows these.
 ///
 /// Who may do what is the reader's to check (`chat-rules.ts`), against who
 /// sent the event: an edit or a delete only from the message's own writer, a
-/// pin only from one of the channel's managers. An event carries the
+/// pin only from one of the channel's managers, a hide only from a holder of
+/// `voipc:hide` (protocol 19). An event carries the
 /// conversation's destruction timer like a message does, so its copy in a
 /// stored log never outlives what it points at.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -149,6 +190,9 @@ pub enum ChatEvent {
     },
     /// The sender pinned it in the channel (`on`), or unpinned it.
     Pin { target: String, on: bool },
+    /// A holder of `voipc:hide` collapsed it for its readers (`on`), or took
+    /// that back. Never carries text, and destroys none.
+    Hide { target: String, on: bool },
 }
 
 impl ChatEvent {
@@ -158,6 +202,7 @@ impl ChatEvent {
             ChatEvent::Delete { .. } => "delete",
             ChatEvent::React { .. } => "react",
             ChatEvent::Pin { .. } => "pin",
+            ChatEvent::Hide { .. } => "hide",
         }
     }
 
@@ -166,7 +211,8 @@ impl ChatEvent {
             ChatEvent::Edit { target }
             | ChatEvent::Delete { target }
             | ChatEvent::React { target, .. }
-            | ChatEvent::Pin { target, .. } => target,
+            | ChatEvent::Pin { target, .. }
+            | ChatEvent::Hide { target, .. } => target,
         }
     }
 
@@ -187,6 +233,7 @@ impl ChatEvent {
                 on: on()?,
             },
             "pin" => ChatEvent::Pin { target, on: on()? },
+            "hide" => ChatEvent::Hide { target, on: on()? },
             _ => return None,
         })
     }
@@ -379,7 +426,7 @@ pub fn envelope_with(id: &str, text: &str, ttl_secs: Option<u32>, extras: &Extra
                 obj["emoji"] = serde_json::json!(emoji);
                 obj["on"] = serde_json::json!(on);
             }
-            ChatEvent::Pin { on, .. } => {
+            ChatEvent::Pin { on, .. } | ChatEvent::Hide { on, .. } => {
                 obj["text"] = serde_json::json!("");
                 obj["on"] = serde_json::json!(on);
             }
@@ -553,6 +600,66 @@ pub fn open_history_payload(
     }
 }
 
+/// The key that marks a direct message as a hand-off, inside its plaintext.
+const SEALED_MARK: &str = "handoff";
+
+/// A history hand-off carried as a direct message (protocol 21): the relay sees "R wrote
+/// to S", and not for which channel, nor that it is one until a large answer.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Sealed {
+    /// Send me this channel's recent chat.
+    Ask { channel_id: u32 },
+    /// What you asked for, bound to its channel as `history_payload` binds it.
+    Answer {
+        channel_id: u32,
+        messages: Vec<serde_json::Value>,
+    },
+    /// Marked, and not readable here: it shows nowhere either way.
+    Unreadable,
+}
+
+/// The ask's plaintext.
+pub fn sealed_ask(channel_id: u32) -> Vec<u8> {
+    serde_json::json!({ SEALED_MARK: "ask", "v": HISTORY_V, "channel": channel_id })
+        .to_string()
+        .into_bytes()
+}
+
+/// The answer's plaintext.
+pub fn sealed_answer(channel_id: u32, messages: &serde_json::Value) -> Vec<u8> {
+    serde_json::json!({ SEALED_MARK: "answer", "v": HISTORY_V, "channel": channel_id, "messages": messages })
+        .to_string()
+        .into_bytes()
+}
+
+/// A direct message's plaintext, if it is a hand-off. Asked before `open_envelope`, which
+/// would show one as text. `None`: an ordinary message.
+pub fn open_sealed(plaintext: &[u8]) -> Option<Sealed> {
+    let serde_json::Value::Object(map) = serde_json::from_slice(plaintext).ok()? else {
+        return None;
+    };
+    let kind = map.get(SEALED_MARK)?;
+    let channel_id = map
+        .get("channel")
+        .and_then(|v| v.as_u64())
+        .and_then(|c| u32::try_from(c).ok());
+    let newer = map
+        .get("v")
+        .and_then(|v| v.as_u64())
+        .is_none_or(|v| v > HISTORY_V);
+    Some(match (kind.as_str(), channel_id, newer) {
+        (Some("ask"), Some(channel_id), false) => Sealed::Ask { channel_id },
+        (Some("answer"), Some(channel_id), false) => match map.get("messages") {
+            Some(serde_json::Value::Array(messages)) => Sealed::Answer {
+                channel_id,
+                messages: messages.clone(),
+            },
+            _ => Sealed::Unreadable,
+        },
+        _ => Sealed::Unreadable,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -591,6 +698,45 @@ mod tests {
             "today's still read"
         );
         assert!(open_history_payload(1, br#"{"v":4,"channel":1,"messages":[]}"#).is_err());
+    }
+
+    /// A hand-off never reaches `open_envelope`, where it would be a line of JSON on
+    /// screen. The control: everything an ordinary message can be stays one.
+    #[test]
+    fn a_marked_direct_message_shows_no_line_and_keeps_no_copy() {
+        assert_eq!(
+            open_sealed(&sealed_ask(7)),
+            Some(Sealed::Ask { channel_id: 7 })
+        );
+        let messages = serde_json::json!([{ "id": "a", "text": "hi" }]);
+        match open_sealed(&sealed_answer(7, &messages)) {
+            Some(Sealed::Answer {
+                channel_id: 7,
+                messages,
+            }) => assert_eq!(messages.len(), 1),
+            other => panic!("{other:?}"),
+        }
+        for unreadable in [
+            br#"{"handoff":"ask"}"#.as_slice(),
+            br#"{"handoff":"ask","v":99,"channel":7}"#,
+            br#"{"handoff":"ask","v":3,"channel":-1}"#,
+            br#"{"handoff":"ask","v":3,"channel":99999999999}"#,
+            br#"{"handoff":"answer","v":3,"channel":7}"#,
+            br#"{"handoff":"answer","v":3,"channel":7,"messages":{}}"#,
+            br#"{"handoff":"what","v":3,"channel":7}"#,
+            br#"{"handoff":7,"v":3,"channel":7}"#,
+        ] {
+            assert_eq!(open_sealed(unreadable), Some(Sealed::Unreadable));
+        }
+        for ordinary in [
+            envelope("id", "hello", None),
+            envelope("id", r#"{"handoff":"ask","v":3,"channel":7}"#, None),
+            b"plain text".to_vec(),
+            b"{\"text\":\"not ours\"}".to_vec(),
+            b"[1,2]".to_vec(),
+        ] {
+            assert_eq!(open_sealed(&ordinary), None);
+        }
     }
 
     #[test]
@@ -764,6 +910,13 @@ mod tests {
                 },
                 "",
             ),
+            (
+                ChatEvent::Hide {
+                    target: "m1".into(),
+                    on: true,
+                },
+                "",
+            ),
         ] {
             let kind = event.kind();
             // A sender's extras beside the event never ride along
@@ -772,6 +925,7 @@ mod tests {
             extras.fwd = Some(Forwarded {
                 name: "ann".into(),
                 at: 5,
+                report: None,
             });
             let packed = envelope_with("e1", "fixed typo", Some(60), &extras);
             let map: serde_json::Map<String, serde_json::Value> =
@@ -814,6 +968,8 @@ mod tests {
             serde_json::json!({"v":2,"id":"e","kind":"react","target":"m","emoji":"\n","on":true,"text":""}),
             serde_json::json!({"v":2,"id":"e","kind":"pin","target":"m","on":"yes","text":""}),
             serde_json::json!({"v":2,"id":"e","kind":"pin","target":7,"on":true,"text":""}),
+            serde_json::json!({"v":2,"id":"e","kind":"hide","target":"m","text":""}),
+            serde_json::json!({"v":2,"id":"e","kind":"hide","target":"m","on":"yes","text":""}),
         ] {
             let m = open(bad.clone());
             assert_eq!(
@@ -831,6 +987,18 @@ mod tests {
             serde_json::json!({"v":2,"id":"e","kind":"react","target":"m","emoji":"🔥","on":false,"text":"spam"}),
         );
         assert_eq!(m.text, "");
+        // Nor a hide's: it carries no text, whatever a sender put there
+        let m = open(
+            serde_json::json!({"v":2,"id":"e","kind":"hide","target":"m","on":false,"text":"spam"}),
+        );
+        assert_eq!(m.text, "");
+        assert_eq!(
+            m.extras.event,
+            Some(ChatEvent::Hide {
+                target: "m".into(),
+                on: false
+            })
+        );
         // The front end's own shape is the same keys
         let mine = serde_json::json!({"kind":"pin","target":"m","on":true});
         assert_eq!(
@@ -852,6 +1020,7 @@ mod tests {
         let fwd = Forwarded {
             name: "ann#0001".into(),
             at: 1_700_000_000_000,
+            report: None,
         };
         let extras = Extras {
             fwd: Some(fwd.clone()),
@@ -886,6 +1055,103 @@ mod tests {
             open_envelope(br#"{"v":2,"id":"x","text":"t","fwd":7}"#).text,
             "t"
         );
+    }
+
+    #[test]
+    fn a_report_mark_round_trips_and_is_bounded() {
+        let report = ReportMark {
+            channel: "lobby-chat".into(),
+            id: Some("m1".into()),
+            why: "spam".into(),
+            by: None,
+        };
+        let fwd = Forwarded {
+            name: "dan".into(),
+            at: 7,
+            report: Some(report.clone()),
+        };
+        let extras = Extras {
+            fwd: Some(fwd.clone()),
+            ..Extras::default()
+        };
+        let m = open_envelope(&envelope_with("f1", "look", None, &extras));
+        assert_eq!(m.extras.fwd, Some(fwd));
+
+        let with = |r: serde_json::Value| {
+            let packed = serde_json::json!({
+                "v": 2, "id": "x", "text": "t", "fwd": { "name": "dan", "at": 1, "report": r },
+            });
+            open_envelope(packed.to_string().as_bytes())
+                .extras
+                .fwd
+                .and_then(|f| f.report)
+        };
+        let cut = with(serde_json::json!({
+            "channel": format!("\u{202e}{}", "c".repeat(100)),
+            "id": "i".repeat(100),
+            "why": format!("line\none {}", "w".repeat(400)),
+            "by": format!("\u{202e}{}", "b".repeat(100)),
+        }))
+        .unwrap();
+        assert_eq!(cut.channel, "c".repeat(MAX_FWD_NAME));
+        assert_eq!(cut.id.unwrap().chars().count(), MAX_MESSAGE_ID);
+        assert_eq!(cut.why.chars().count(), MAX_REPORT_WHY);
+        assert!(!cut.why.contains('\n'), "plain text on one line");
+        assert_eq!(cut.by.unwrap(), "b".repeat(MAX_FWD_NAME));
+        // A direct message has no channel, and nothing here has to be there
+        assert_eq!(
+            with(serde_json::json!({"channel": "", "why": "", "by": " "})),
+            Some(ReportMark {
+                channel: String::new(),
+                id: None,
+                why: String::new(),
+                by: None,
+            })
+        );
+    }
+
+    #[test]
+    fn a_forward_without_a_report_keeps_its_bytes() {
+        let extras = Extras {
+            fwd: Some(Forwarded {
+                name: "dan".into(),
+                at: 7,
+                report: None,
+            }),
+            ..Extras::default()
+        };
+        let packed = envelope_with("f1", "look", None, &extras);
+        let map: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&packed).unwrap();
+        assert_eq!(map["fwd"], serde_json::json!({"name": "dan", "at": 7}));
+    }
+
+    #[test]
+    fn a_malformed_report_mark_leaves_a_plain_forward() {
+        for bad in [
+            serde_json::json!("spam"),
+            serde_json::json!(7),
+            serde_json::json!(null),
+            serde_json::json!({"why": "no channel"}),
+            serde_json::json!({"channel": "no reason"}),
+            serde_json::json!({"channel": 1, "why": "x"}),
+            serde_json::json!({"channel": "c", "why": 1}),
+        ] {
+            let packed = serde_json::json!({
+                "v": 2, "id": "x", "text": "t", "fwd": { "name": "dan", "at": 1, "report": bad },
+            });
+            let m = open_envelope(packed.to_string().as_bytes());
+            assert_eq!(m.text, "t");
+            assert_eq!(
+                m.extras.fwd,
+                Some(Forwarded {
+                    name: "dan".into(),
+                    at: 1,
+                    report: None,
+                }),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

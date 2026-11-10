@@ -387,12 +387,13 @@ export function mentionNames(people: readonly string[]): string[] {
   return [...new Set(people.flatMap((p) => (uses.get(shortName(p)) === 1 ? [p, shortName(p)] : [p])))];
 }
 
-/** Whether `blocks` mention `name` anywhere outside code. */
-export function mentionsName(blocks: Block[], name: string): boolean {
+/** Whether `blocks` mention `name` anywhere outside code, and with `quotes` false,
+ *  outside what is quoted. */
+export function mentionsName(blocks: Block[], name: string, quotes = true): boolean {
   const want = name.toLowerCase();
   const inline = (nodes: Inline[]): boolean =>
     nodes.some((n) => (n.t === "mention" ? n.name.toLowerCase() === want : "c" in n && inline(n.c)));
   return blocks.some((b) =>
-    b.t === "p" || b.t === "h" ? inline(b.c) : b.t === "quote" ? mentionsName(b.c, name) : b.t === "list" && b.items.some((i) => mentionsName(i, name)),
+    b.t === "p" || b.t === "h" ? inline(b.c) : b.t === "quote" ? quotes && mentionsName(b.c, name, quotes) : b.t === "list" && b.items.some((i) => mentionsName(i, name, quotes)),
   );
 }

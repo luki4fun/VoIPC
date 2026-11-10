@@ -1,0 +1,545 @@
+[
+  {
+    "id": "1190000000000000001",
+    "name": "@everyone",
+    "color": 0,
+    "colors": {
+      "primary_color": 0,
+      "secondary_color": null,
+      "tertiary_color": null
+    },
+    "hoist": false,
+    "icon": null,
+    "unicode_emoji": null,
+    "position": 0,
+    "permissions": "3214848",
+    "managed": false,
+    "mentionable": false,
+    "flags": 0
+  },
+  {
+    "id": "1190000000000000106",
+    "name": "VoIPC Importer",
+    "color": 0,
+    "colors": {
+      "primary_color": 0,
+      "secondary_color": null,
+      "tertiary_color": null
+    },
+    "hoist": false,
+    "icon": null,
+    "unicode_emoji": null,
+    "position": 40,
+    "permissions": "8",
+    "managed": true,
+    "mentionable": false,
+    "flags": 0,
+    "tags": {
+      "bot_id": "1190000000000000002"
+    }
+  },
+  {
+    "id": "1190000000000000107",
+    "name": "Founder",
+    "color": 16766720,
+    "colors": {
+      "primary_color": 16766720,
+      "secondary_color": null,
+      "tertiary_color": null
+    },
+    "hoist": false,
+    "icon": null,
+    "unicode_emoji": null,
+    "position": 50,
+    "permissions": "8",
+    "managed": false,
+    "mentionable": false,
+    "flags": 0
+  },
+  {
+    "id": "1190000000000000101",
+    "name": "Admin",
+    "color": 15158332,
+    "colors": {
+      "primary_color": 15158332,
+      "secondary_color": null,
+      "tertiary_color": null
+    },
+    "hoist": true,
+    "icon": null,
+    "unicode_emoji": null,
+    "position": 30,
+    "permissions": "268435510",
+    "managed": false,
+    "mentionable": false,
+    "flags": 0
+  },
+  {
+    "id": "1190000000000000102",
+    "name": "Moderators",
+    "color": 3447003,
+    "colors": {
+      "primary_color": 3447003,
+      "secondary_color": null,
+      "tertiary_color": null
+    },
+    "hoist": true,
+    "icon": null,
+    "unicode_emoji": null,
+    "position": 29,
+    "permissions": "20979714",
+    "managed": false,
+    "mentionable": false,
+    "flags": 0
+  },
+  {
+    "id": "1190000000000000103",
+    "name": "-",
+    "color": 0,
+    "colors": {
+      "primary_color": 0,
+      "secondary_color": null,
+      "tertiary_color": null
+    },
+    "hoist": false,
+    "icon": null,
+    "unicode_emoji": null,
+    "position": 28,
+    "permissions": "0",
+    "managed": false,
+    "mentionable": false,
+    "flags": 0
+  },
+  {
+    "id": "1190000000000000104",
+    "name": "Muted",
+    "color": 0,
+    "colors": {
+      "primary_color": 0,
+      "secondary_color": null,
+      "tertiary_color": null
+    },
+    "hoist": false,
+    "icon": null,
+    "unicode_emoji": null,
+    "position": 27,
+    "permissions": "0",
+    "managed": false,
+    "mentionable": false,
+    "flags": 0
+  },
+  {
+    "id": "1190000000000000105",
+    "name": "Staff",
+    "color": 3066993,
+    "colors": {
+      "primary_color": 3066993,
+      "secondary_color": null,
+      "tertiary_color": null
+    },
+    "hoist": false,
+    "icon": null,
+    "unicode_emoji": null,
+    "position": 26,
+    "permissions": "0",
+    "managed": false,
+    "mentionable": false,
+    "flags": 0
+  },
+  {
+    "id": "1190000000000000108",
+    "name": "Regulars",
+    "color": 10181046,
+    "colors": {
+      "primary_color": 10181046,
+      "secondary_color": null,
+      "tertiary_color": null
+    },
+    "hoist": false,
+    "icon": null,
+    "unicode_emoji": null,
+    "position": 5,
+    "permissions": "0",
+    "managed": false,
+    "mentionable": false,
+    "flags": 0
+  },
+  {
+    "id": "1190000000000000110",
+    "name": "Team 01",
+    "color": 0,
+    "colors": {
+      "primary_color": 0,
+      "secondary_color": null,
+      "tertiary_color": null
+    },
+    "hoist": false,
+    "icon": null,
+    "unicode_emoji": null,
+    "position": 25,
+    "permissions": "0",
+    "managed": false,
+    "mentionable": false,
+    "flags": 0
+  },
+  {
+    "id": "1190000000000000111",
+    "name": "Team 02",
+    "color": 0,
+    "colors": {
+      "primary_color": 0,
+      "secondary_color": null,
+      "tertiary_color": null
+    },
+    "hoist": false,
+    "icon": null,
+    "unicode_emoji": null,
+    "position": 24,
+    "permissions": "0",
+    "managed": false,
+    "mentionable": false,
+    "flags": 0
+  },
+  {
+    "id": "1190000000000000112",
+    "name": "Team 03",
+    "color": 0,
+    "colors": {
+      "primary_color": 0,
+      "secondary_color": null,
+      "tertiary_color": null
+    },
+    "hoist": false,
+    "icon": null,
+    "unicode_emoji": null,
+    "position": 23,
+    "permissions": "0",
+    "managed": false,
+    "mentionable": false,
+    "flags": 0
+  },
+  {
+    "id": "1190000000000000113",
+    "name": "Team 04",
+    "color": 0,
+    "colors": {
+      "primary_color": 0,
+      "secondary_color": null,
+      "tertiary_color": null
+    },
+    "hoist": false,
+    "icon": null,
+    "unicode_emoji": null,
+    "position": 22,
+    "permissions": "0",
+    "managed": false,
+    "mentionable": false,
+    "flags": 0
+  },
+  {
+    "id": "1190000000000000114",
+    "name": "Team 05",
+    "color": 0,
+    "colors": {
+      "primary_color": 0,
+      "secondary_color": null,
+      "tertiary_color": null
+    },
+    "hoist": false,
+    "icon": null,
+    "unicode_emoji": null,
+    "position": 21,
+    "permissions": "0",
+    "managed": false,
+    "mentionable": false,
+    "flags": 0
+  },
+  {
+    "id": "1190000000000000115",
+    "name": "Team 06",
+    "color": 0,
+    "colors": {
+      "primary_color": 0,
+      "secondary_color": null,
+      "tertiary_color": null
+    },
+    "hoist": false,
+    "icon": null,
+    "unicode_emoji": null,
+    "position": 20,
+    "permissions": "0",
+    "managed": false,
+    "mentionable": false,
+    "flags": 0
+  },
+  {
+    "id": "1190000000000000116",
+    "name": "Team 07",
+    "color": 0,
+    "colors": {
+      "primary_color": 0,
+      "secondary_color": null,
+      "tertiary_color": null
+    },
+    "hoist": false,
+    "icon": null,
+    "unicode_emoji": null,
+    "position": 19,
+    "permissions": "0",
+    "managed": false,
+    "mentionable": false,
+    "flags": 0
+  },
+  {
+    "id": "1190000000000000117",
+    "name": "Team 08",
+    "color": 0,
+    "colors": {
+      "primary_color": 0,
+      "secondary_color": null,
+      "tertiary_color": null
+    },
+    "hoist": false,
+    "icon": null,
+    "unicode_emoji": null,
+    "position": 18,
+    "permissions": "0",
+    "managed": false,
+    "mentionable": false,
+    "flags": 0
+  },
+  {
+    "id": "1190000000000000118",
+    "name": "Team 09",
+    "color": 0,
+    "colors": {
+      "primary_color": 0,
+      "secondary_color": null,
+      "tertiary_color": null
+    },
+    "hoist": false,
+    "icon": null,
+    "unicode_emoji": null,
+    "position": 17,
+    "permissions": "0",
+    "managed": false,
+    "mentionable": false,
+    "flags": 0
+  },
+  {
+    "id": "1190000000000000119",
+    "name": "Team 10",
+    "color": 0,
+    "colors": {
+      "primary_color": 0,
+      "secondary_color": null,
+      "tertiary_color": null
+    },
+    "hoist": false,
+    "icon": null,
+    "unicode_emoji": null,
+    "position": 16,
+    "permissions": "0",
+    "managed": false,
+    "mentionable": false,
+    "flags": 0
+  },
+  {
+    "id": "1190000000000000120",
+    "name": "Team 11",
+    "color": 0,
+    "colors": {
+      "primary_color": 0,
+      "secondary_color": null,
+      "tertiary_color": null
+    },
+    "hoist": false,
+    "icon": null,
+    "unicode_emoji": null,
+    "position": 15,
+    "permissions": "0",
+    "managed": false,
+    "mentionable": false,
+    "flags": 0
+  },
+  {
+    "id": "1190000000000000121",
+    "name": "Team 12",
+    "color": 0,
+    "colors": {
+      "primary_color": 0,
+      "secondary_color": null,
+      "tertiary_color": null
+    },
+    "hoist": false,
+    "icon": null,
+    "unicode_emoji": null,
+    "position": 14,
+    "permissions": "0",
+    "managed": false,
+    "mentionable": false,
+    "flags": 0
+  },
+  {
+    "id": "1190000000000000122",
+    "name": "Team 13",
+    "color": 0,
+    "colors": {
+      "primary_color": 0,
+      "secondary_color": null,
+      "tertiary_color": null
+    },
+    "hoist": false,
+    "icon": null,
+    "unicode_emoji": null,
+    "position": 13,
+    "permissions": "0",
+    "managed": false,
+    "mentionable": false,
+    "flags": 0
+  },
+  {
+    "id": "1190000000000000123",
+    "name": "Team 14",
+    "color": 0,
+    "colors": {
+      "primary_color": 0,
+      "secondary_color": null,
+      "tertiary_color": null
+    },
+    "hoist": false,
+    "icon": null,
+    "unicode_emoji": null,
+    "position": 12,
+    "permissions": "0",
+    "managed": false,
+    "mentionable": false,
+    "flags": 0
+  },
+  {
+    "id": "1190000000000000124",
+    "name": "Team 15",
+    "color": 0,
+    "colors": {
+      "primary_color": 0,
+      "secondary_color": null,
+      "tertiary_color": null
+    },
+    "hoist": false,
+    "icon": null,
+    "unicode_emoji": null,
+    "position": 11,
+    "permissions": "0",
+    "managed": false,
+    "mentionable": false,
+    "flags": 0
+  },
+  {
+    "id": "1190000000000000125",
+    "name": "Team 16",
+    "color": 0,
+    "colors": {
+      "primary_color": 0,
+      "secondary_color": null,
+      "tertiary_color": null
+    },
+    "hoist": false,
+    "icon": null,
+    "unicode_emoji": null,
+    "position": 10,
+    "permissions": "0",
+    "managed": false,
+    "mentionable": false,
+    "flags": 0
+  },
+  {
+    "id": "1190000000000000126",
+    "name": "Team 17",
+    "color": 0,
+    "colors": {
+      "primary_color": 0,
+      "secondary_color": null,
+      "tertiary_color": null
+    },
+    "hoist": false,
+    "icon": null,
+    "unicode_emoji": null,
+    "position": 9,
+    "permissions": "0",
+    "managed": false,
+    "mentionable": false,
+    "flags": 0
+  },
+  {
+    "id": "1190000000000000127",
+    "name": "Team 18",
+    "color": 0,
+    "colors": {
+      "primary_color": 0,
+      "secondary_color": null,
+      "tertiary_color": null
+    },
+    "hoist": false,
+    "icon": null,
+    "unicode_emoji": null,
+    "position": 8,
+    "permissions": "0",
+    "managed": false,
+    "mentionable": false,
+    "flags": 0
+  },
+  {
+    "id": "1190000000000000128",
+    "name": "Team 19",
+    "color": 0,
+    "colors": {
+      "primary_color": 0,
+      "secondary_color": null,
+      "tertiary_color": null
+    },
+    "hoist": false,
+    "icon": null,
+    "unicode_emoji": null,
+    "position": 7,
+    "permissions": "0",
+    "managed": false,
+    "mentionable": false,
+    "flags": 0
+  },
+  {
+    "id": "1190000000000000129",
+    "name": "Team 20",
+    "color": 0,
+    "colors": {
+      "primary_color": 0,
+      "secondary_color": null,
+      "tertiary_color": null
+    },
+    "hoist": false,
+    "icon": null,
+    "unicode_emoji": null,
+    "position": 6,
+    "permissions": "0",
+    "managed": false,
+    "mentionable": false,
+    "flags": 0
+  },
+  {
+    "id": "3310000000000000101",
+    "name": "New Role",
+    "color": 1752220,
+    "colors": {
+      "primary_color": 1752220,
+      "secondary_color": null,
+      "tertiary_color": null
+    },
+    "hoist": false,
+    "icon": null,
+    "unicode_emoji": null,
+    "position": 4,
+    "permissions": "2",
+    "managed": false,
+    "mentionable": false,
+    "flags": 0
+  }
+]

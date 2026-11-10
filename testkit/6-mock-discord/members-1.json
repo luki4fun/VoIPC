@@ -1,0 +1,101 @@
+[
+  {
+    "user": {
+      "id": "1190000000000001001",
+      "username": "dan_d",
+      "discriminator": "0",
+      "global_name": "Dan D",
+      "avatar": null
+    },
+    "nick": null,
+    "avatar": null,
+    "roles": [
+      "1190000000000000102",
+      "1190000000000000105",
+      "1190000000000000108"
+    ],
+    "joined_at": "2024-01-02T03:04:05.000000+00:00",
+    "deaf": false,
+    "mute": false,
+    "flags": 0,
+    "pending": false
+  },
+  {
+    "user": {
+      "id": "1190000000000001002",
+      "username": "eva.e",
+      "discriminator": "0",
+      "global_name": null,
+      "avatar": null
+    },
+    "nick": "Eva",
+    "avatar": null,
+    "roles": [
+      "1190000000000000108",
+      "1190000000000000110"
+    ],
+    "joined_at": "2024-01-02T03:04:05.000000+00:00",
+    "deaf": false,
+    "mute": false,
+    "flags": 0,
+    "pending": false
+  },
+  {
+    "user": {
+      "id": "1190000000000001003",
+      "username": "bea_b",
+      "discriminator": "0",
+      "global_name": "Bea",
+      "avatar": null
+    },
+    "nick": null,
+    "avatar": null,
+    "roles": [
+      "1190000000000000108"
+    ],
+    "joined_at": "2024-01-02T03:04:05.000000+00:00",
+    "deaf": false,
+    "mute": false,
+    "flags": 0,
+    "pending": false
+  },
+  {
+    "user": {
+      "id": "1190000000000001004",
+      "username": "cal",
+      "discriminator": "0",
+      "global_name": "Cal",
+      "avatar": null
+    },
+    "nick": null,
+    "avatar": null,
+    "roles": [],
+    "joined_at": "2024-01-02T03:04:05.000000+00:00",
+    "deaf": false,
+    "mute": false,
+    "flags": 0,
+    "pending": false
+  },
+  {
+    "user": {
+      "id": "1190000000000001005",
+      "username": "admin",
+      "discriminator": "0",
+      "global_name": "Frank",
+      "avatar": null
+    },
+    "nick": null,
+    "avatar": null,
+    "roles": [
+      "1190000000000000101",
+      "1190000000000000102",
+      "1190000000000000105",
+      "1190000000000000103"
+    ],
+    "joined_at": "2024-01-02T03:04:05.000000+00:00",
+    "deaf": false,
+    "mute": false,
+    "flags": 0,
+    "pending": false
+  }
+]

@@ -8,7 +8,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { rosterForRow, rosterOf, trustRosterCount, worthAsking } from "./roster-rules.ts";
+import { rosterForRow, rosterOf, summonOffered, trustRosterCount, worthAsking } from "./roster-rules.ts";
 import type { ChannelInfo, UserInfo } from "./types.ts";
 
 function channel(over: Partial<ChannelInfo> = {}): ChannelInfo {
@@ -140,4 +140,16 @@ test("a channel we know nothing about draws nobody", () => {
   // Not an error and not a guess: a refused roster and an empty one look the
   // same here on purpose, because the difference is not ours to display.
   assert.deepEqual(rosterOf(42, new Map(), 7, [user(1, "me")]), []);
+});
+
+test("an invite on a privilege is offered in a room we stand in, to a holder, on a relay that has it", () => {
+  const room = channel();
+  assert.equal(summonOffered(room, true, null), true);
+  assert.equal(summonOffered(room, true, 19), true);
+  // Each of these alone takes it away
+  assert.equal(summonOffered(room, false, null), false, "no privilege");
+  assert.equal(summonOffered(room, true, 18), false, "a relay still asking for the creator");
+  assert.equal(summonOffered(undefined, true, null), false, "in no room");
+  assert.equal(summonOffered(channel({ channel_id: 0 }), true, null), false, "the lobby");
+  assert.equal(summonOffered(channel({ anonymous: true }), true, null), false, "behind a pseudonym");
 });

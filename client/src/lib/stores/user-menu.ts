@@ -7,6 +7,8 @@
 import { get, writable } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
 
+import { adminOp } from "./admin-ops.js";
+import { attachDm } from "./chat.js";
 import { currentChannelId, voice } from "./channels.js";
 import { serverAddress, userId } from "./connection.js";
 import { addNotification } from "./notifications.js";
@@ -82,6 +84,20 @@ export async function kickUser(targetUserId: number, name = "them"): Promise<voi
   }
 }
 
+/** Asked first. Cleared, the person may pick another: there is nothing to take back.
+ *  The server is the one on screen now: the view may move while the question is up.
+ *  Whether it was said yes to. */
+export async function clearProfile(id: number[], server = get(serverAddress)): Promise<boolean> {
+  const yes = await confirmAction({
+    title: "Clear this person's display name and picture?",
+    body: "They can pick others.",
+    confirm: "Clear them",
+    danger: true,
+  });
+  if (yes) await adminOp({ ProfileReset: { id, name: true, picture: true } }, null, server);
+  return yes;
+}
+
 export async function inviteUser(targetUserId: number): Promise<void> {
   try {
     await invoke("send_invite", {
@@ -137,6 +153,8 @@ export async function sendPoke(): Promise<void> {
   if (!target) return;
   const message = get(pokeMessage);
   cancelPoke();
+  // Our own copy files under whom it is for, with no conversation open to say it
+  attachDm(target.server, target.username, target.userId);
   try {
     await invoke("send_poke", { server: target.server, targetUserId: target.userId, message });
   } catch (e) {
@@ -144,16 +162,15 @@ export async function sendPoke(): Promise<void> {
   }
 }
 
-// ── Server kick and ban ────────────────────────────────────────────────────
+// ── Server kick, ban, mute and timeout ─────────────────────────────────────
 //
-// Both ask for a reason first: the person on the other end is told it, and
+// All ask for a reason first: the person on the other end is told it, and
 // "you were kicked" with no reason is how a moderator gets an angry DM.
 
 export interface AdminAction {
-  kind: "kick" | "ban";
+  kind: "kick" | "ban" | "mute" | "timeout";
   userId: number;
   username: string;
-  durationSecs: number;
   label: string;
   server: string;
   /** Signed in with an account, which a ban can cover too. */
@@ -162,12 +179,16 @@ export interface AdminAction {
 
 export const adminAction = writable<AdminAction | null>(null);
 export const adminReason = writable("");
+/** How long a ban or restriction goes for; 0: for good, or until lifted. */
+export const adminDuration = writable(0);
 /** "Ban the account too", for a user with one; on by default. */
 export const adminBanAccount = writable(true);
+/** How far back a ban also removes their posts, as `window_secs`; null: it does not. */
+export const adminRemovePosts = writable<number | null>(null);
 
 export function openAdminAction(
   user: UserInfo,
-  kind: "kick" | "ban",
+  kind: AdminAction["kind"],
   durationSecs: number,
   label: string,
 ): void {
@@ -175,13 +196,14 @@ export function openAdminAction(
     kind,
     userId: user.user_id,
     username: user.username,
-    durationSecs,
     label,
     server: get(serverAddress),
     hasAccount: !!user.account,
   });
   adminReason.set("");
+  adminDuration.set(durationSecs);
   adminBanAccount.set(true);
+  adminRemovePosts.set(null);
 }
 
 export function cancelAdminAction(): void {
@@ -193,19 +215,52 @@ export async function confirmAdminAction(): Promise<void> {
   const action = get(adminAction);
   if (!action) return;
   const reason = get(adminReason);
+  const durationSecs = get(adminDuration);
+  const removal = get(adminRemovePosts);
   cancelAdminAction();
   try {
     if (action.kind === "kick") {
       await invoke("admin_kick", { server: action.server, userId: action.userId, reason });
-    } else {
+    } else if (action.kind === "ban") {
       await invoke("admin_ban", {
         server: action.server,
         userId: action.userId,
         reason,
-        durationSecs: action.durationSecs,
-        account: action.hasAccount && get(adminBanAccount),
+        durationSecs,
+        // Nothing kept can go without the account's own ban
+        account: action.hasAccount && (get(adminBanAccount) || removal !== null),
+      });
+      // A step of its own: a ban's shape on the wire is released. Requests on a
+      // connection are handled in order, so the relay reads this with the ban made.
+      if (removal !== null) {
+        void adminOp({ RemovePosts: { name: action.username, window_secs: removal } }, null, action.server);
+      }
+    } else {
+      await invoke("admin_restrict", {
+        server: action.server,
+        userId: action.userId,
+        voice: true,
+        text: action.kind === "timeout",
+        durationSecs,
+        reason,
       });
     }
+  } catch (e) {
+    addNotification(`Admin action failed: ${e}`, "error");
+  }
+}
+
+/** Ends a moderator's mute or timeout. The wait for new members stays. */
+export async function liftRestriction(targetUserId: number): Promise<void> {
+  try {
+    await invoke("admin_restrict", {
+      server: get(serverAddress),
+      userId: targetUserId,
+      voice: false,
+      text: false,
+      durationSecs: 0,
+      reason: "",
+    });
   } catch (e) {
     addNotification(`Admin action failed: ${e}`, "error");
   }

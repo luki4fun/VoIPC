@@ -28,6 +28,9 @@ pub struct SignalStores {
     /// Our user id on this connection, once `Authenticated` named it: libsignal
     /// binds both parties' addresses into every message.
     pub own_user_id: u32,
+    /// Session keys renewed and not yet gone (`prekey::renew_session_keys`).
+    #[serde(default)]
+    pub retiring: Vec<crate::prekey::RetiringKeys>,
 }
 
 impl SignalStores {
@@ -45,15 +48,18 @@ impl SignalStores {
             },
             signed_prekey: VoipcSignedPreKeyStore {
                 signed_prekeys: HashMap::new(),
+                current: 0,
             },
             session: VoipcSessionStore {
                 sessions: HashMap::new(),
             },
             sender_key: VoipcSenderKeyStore {
                 keys: HashMap::new(),
+                used: HashMap::new(),
             },
             kyber: VoipcKyberPreKeyStore::default(),
             own_user_id: 0,
+            retiring: Vec::new(),
         }
     }
 }
@@ -155,13 +161,17 @@ impl IdentityKeyStore for VoipcIdentityStore {
 
 // ── Kyber Pre-Key Store ────────────────────────────────────────────────
 
-/// The post-quantum half of a session start (PQXDH). One last-resort key per
-/// connection: it is never deleted, so a PreKey message that uses it with a
-/// base key seen before is a replay and refused.
+/// The post-quantum half of a session start (PQXDH). One last-resort key at a
+/// time, kept until it is renewed and a minute after: a PreKey message that uses
+/// it with a base key seen before is a replay and refused, and once it has gone
+/// no message can use it at all.
 #[derive(Serialize, Deserialize, Default)]
 pub struct VoipcKyberPreKeyStore {
     /// kyber_pre_key_id -> serialized KyberPreKeyRecord
     pub keys: HashMap<u32, Vec<u8>>,
+    /// The one a bundle offers now.
+    #[serde(default)]
+    pub current: u32,
     /// (kyber id, signed pre-key id, base key) of every session started on it
     pub used: HashSet<(u32, u32, Vec<u8>)>,
 }
@@ -249,6 +259,9 @@ impl PreKeyStore for VoipcPreKeyStore {
 pub struct VoipcSignedPreKeyStore {
     /// signed_pre_key_id -> serialized SignedPreKeyRecord
     pub signed_prekeys: HashMap<u32, Vec<u8>>,
+    /// The one a bundle offers now.
+    #[serde(default)]
+    pub current: u32,
 }
 
 #[async_trait::async_trait(?Send)]
@@ -282,6 +295,35 @@ pub struct VoipcSessionStore {
     pub sessions: HashMap<String, Vec<u8>>,
 }
 
+impl VoipcSessionStore {
+    fn key_of(user_id: u32) -> String {
+        address_key(&crate::session::user_address(user_id))
+    }
+
+    pub fn has(&self, user_id: u32) -> bool {
+        self.sessions.contains_key(&Self::key_of(user_id))
+    }
+
+    /// A session record, out of the store.
+    pub fn take(&mut self, user_id: u32) -> Option<Vec<u8>> {
+        self.sessions.remove(&Self::key_of(user_id))
+    }
+
+    /// A record from another connection, under who the peer is on this one. libsignal
+    /// binds no address for a `user_N` name, only the two identity keys.
+    pub fn put(&mut self, user_id: u32, record: Vec<u8>) {
+        self.sessions.insert(Self::key_of(user_id), record);
+    }
+
+    /// Every session, by the user id it runs under.
+    pub fn by_user(&self) -> impl Iterator<Item = (u32, &[u8])> {
+        self.sessions.iter().filter_map(|(key, record)| {
+            let name = key.strip_suffix(".1")?;
+            Some((crate::session::user_of(name)?, record.as_slice()))
+        })
+    }
+}
+
 #[async_trait::async_trait(?Send)]
 impl SessionStore for VoipcSessionStore {
     async fn load_session(
@@ -312,7 +354,16 @@ impl SessionStore for VoipcSessionStore {
 pub struct VoipcSenderKeyStore {
     /// "sender_name.sender_device_id::distribution_id" -> serialized SenderKeyRecord
     pub keys: HashMap<String, Vec<u8>>,
+    /// When each last moved, for `evict`.
+    #[serde(skip, default)]
+    used: HashMap<String, u64>,
 }
+
+/// Sender keys a device holds at most: everyone in every channel adds up on a long
+/// connection, and one that went comes back by `KeyWanted`.
+const SENDER_KEYS_HELD: usize = 5000;
+/// One this young is not evicted, since a post on it would be lost: a chain's longest life.
+const SENDER_KEY_EVICT_AFTER_MS: u64 = 3_600_000;
 
 fn sender_key_key(sender: &ProtocolAddress, distribution_id: uuid::Uuid) -> String {
     format!(
@@ -327,7 +378,26 @@ impl VoipcSenderKeyStore {
     /// Drop one sender key. Used to rotate our own after a member leaves;
     /// libsignal has no API for it because it never expects a key to go away.
     pub fn forget(&mut self, sender: &ProtocolAddress, distribution_id: uuid::Uuid) {
-        self.keys.remove(&sender_key_key(sender, distribution_id));
+        let key = sender_key_key(sender, distribution_id);
+        self.keys.remove(&key);
+        self.used.remove(&key);
+    }
+
+    /// Past the limit, the one least recently used, if it is old enough to go.
+    fn evict(&mut self, now: u64) {
+        if self.keys.len() <= SENDER_KEYS_HELD {
+            return;
+        }
+        let oldest = self
+            .used
+            .iter()
+            .filter(|(_, at)| now.saturating_sub(**at) >= SENDER_KEY_EVICT_AFTER_MS)
+            .min_by_key(|(_, at)| **at)
+            .map(|(key, _)| key.clone());
+        if let Some(key) = oldest {
+            self.keys.remove(&key);
+            self.used.remove(&key);
+        }
     }
 }
 
@@ -340,7 +410,10 @@ impl SenderKeyStore for VoipcSenderKeyStore {
         record: &SenderKeyRecord,
     ) -> Result<(), SignalProtocolError> {
         let key = sender_key_key(sender, distribution_id);
+        let now = crate::time::now_millis();
+        self.used.insert(key.clone(), now);
         self.keys.insert(key, record.serialize()?);
+        self.evict(now);
         Ok(())
     }
 
@@ -354,5 +427,44 @@ impl SenderKeyStore for VoipcSenderKeyStore {
             None => Ok(None),
             Some(bytes) => Ok(Some(SenderKeyRecord::deserialize(bytes)?)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store(n: usize, at: u64) -> VoipcSenderKeyStore {
+        let mut s = VoipcSenderKeyStore {
+            keys: HashMap::new(),
+            used: HashMap::new(),
+        };
+        for i in 0..n {
+            s.keys.insert(format!("k{i}"), vec![0]);
+            s.used.insert(format!("k{i}"), at + i as u64);
+        }
+        s
+    }
+
+    #[test]
+    fn reader_sender_keys_go_least_used_first_past_the_limit() {
+        let mut s = store(SENDER_KEYS_HELD + 2, 0);
+        s.evict(SENDER_KEY_EVICT_AFTER_MS + SENDER_KEYS_HELD as u64 + 10);
+        assert_eq!(s.keys.len(), SENDER_KEYS_HELD + 1);
+        assert!(!s.keys.contains_key("k0"), "the oldest");
+        assert!(s.keys.contains_key("k1"));
+        // At the limit nothing goes, however old
+        let mut at = store(SENDER_KEYS_HELD, 0);
+        at.evict(u64::MAX);
+        assert_eq!(at.keys.len(), SENDER_KEYS_HELD);
+    }
+
+    /// A post on one this young would be lost, and a raid of fake writers could cost a real
+    /// writer's: the count may run over rather than that.
+    #[test]
+    fn a_sender_key_younger_than_a_chains_life_is_not_evicted() {
+        let mut s = store(SENDER_KEYS_HELD + 10, 1_000);
+        s.evict(1_000 + SENDER_KEY_EVICT_AFTER_MS - 1);
+        assert_eq!(s.keys.len(), SENDER_KEYS_HELD + 10);
     }
 }

@@ -42,6 +42,58 @@ const SHIPPED: &[(&str, &str)] = &[
         "postgres/0004_bans.sql",
         "60ddf372ad42d9f40c2f7ea58f1294ad147c77db1a500873f08ad01b3908e473",
     ),
+    // 1.7.0
+    (
+        "sqlite/0005_gates.sql",
+        "94b7d20cbed162ccb6c1de186ca4a4feecc54d4bbb03373653ef45ad23a5b757",
+    ),
+    (
+        "postgres/0005_gates.sql",
+        "94b7d20cbed162ccb6c1de186ca4a4feecc54d4bbb03373653ef45ad23a5b757",
+    ),
+    // 1.9.0
+    (
+        "sqlite/0006_community.sql",
+        "29e8ee4b9e7f029a632c08e93318854ffb78255807a01120257dd6d0b903ecd3",
+    ),
+    (
+        "sqlite/0007_group_sections.sql",
+        "7e5391a0b6929eb8f6251c4c0008702793d0e77dd18a8171dd80a7db2f58fdfc",
+    ),
+    (
+        "postgres/0006_community.sql",
+        "4e9424aaddbf094a19e6afdeb77d6d9566fcb1de525027e58a5df2a409feee28",
+    ),
+    (
+        "postgres/0007_group_sections.sql",
+        "bfd8bf320d9d9381bbb06ba0a794d683e6e4ebd0e618d56f200926c7f8584beb",
+    ),
+    // 1.10.0
+    (
+        "sqlite/0008_moderation.sql",
+        "b3dc46cf813b6c8bde418443b51952e331a6185431cb634a814c9fcbc67d7130",
+    ),
+    (
+        "postgres/0008_moderation.sql",
+        "9d315baf10d2bee5b7b32adff2f8325497747509b5cc660f8e165432235880ec",
+    ),
+    (
+        "sqlite/0009_move.sql",
+        "c5f52636c862bf33e3c0508c04b0314e4a01df45246d8f98a01ce35060defd1f",
+    ),
+    (
+        "postgres/0009_move.sql",
+        "94de0cecb0c6dd1f502209f7688a0c27a047e487eb03d7b996a7067904397e0b",
+    ),
+    // 1.11.0 (0010 shipped in rc.2; rc.1 had none of it)
+    (
+        "sqlite/0010_kept.sql",
+        "89377a0323a0bc2714aa683834f78bba29e053f09fac50731c8a56d7cccfb37e",
+    ),
+    (
+        "postgres/0010_kept.sql",
+        "d775561e5dea64d52ab7b4f4b2b19ff753c0da5e48c1b47d505ba01519630eb3",
+    ),
 ];
 
 #[test]

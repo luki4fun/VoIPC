@@ -85,11 +85,15 @@
   .create-input {
     padding: 6px 8px;
     font-size: var(--fs-body);
-    background: var(--bg-primary);
+    background-color: var(--bg-primary);
     color: var(--text-primary);
     border: 1px solid var(--border);
     border-radius: 4px;
     outline: none;
+  }
+
+  select.create-input {
+    padding-right: 28px;
   }
 
   .create-input:focus {

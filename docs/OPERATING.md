@@ -126,9 +126,46 @@ WantedBy=multi-user.target
 - **Commands:**
   - `admin grant|revoke <name> <group>` (`admin`, `moderator`, or one made in the app);
   - `admin reset-2fa <name>`;
+  - `admin reclaim <name>` (no password, every device and the recovery key lost);
   - `admin invite`;
   - `ban list|add|remove`.
   - [ACCOUNTS.md](ACCOUNTS.md) has the details.
+- **Sign-in with a provider** (`public_url`, `VOIPC_OAUTH_<PROVIDER>_ID` and `_SECRET`) needs a public
+  certificate on this port. Apps that pinned the old self-signed one accept it, since the public CAs do, and
+  go on doing so at each renewal. `signups_per_hour` (60) bounds new accounts: raise it for a move if you
+  expect newcomers. An account the move made is not one. Starting a sign-in is limited per address, per IPv6 /48 and
+  per /32. If the log says 4096 are open at once, someone is filling the table: the relay drops from whoever holds the
+  most and refuses nobody, and password sign-in is unaffected.
+- **Moving a Discord server here** ([MOVING.md](MOVING.md)) needs `*`, a code and `cloud = true`, and the desktop app
+  for the import itself. An account the move made and nobody opened goes after `unclaimed_days` (90; 0 is never), counted
+  from the first import, and frees its name. Importing writes in small transactions, so a long run holds up nobody; each
+  member who comes takes one short lock, which a move post can queue up for a moment.
+- **Mutes and timeouts** live in the database (`voipc_restrictions`), so they outlast a restart: an account's by its id, a guest's as a keyed hash of the address, never the address. A row goes when it is lifted or runs out, and with its account. On a relay without accounts they live in memory, so a reconnect keeps them and a restart does not. No shell command touches them.
+- **Hiding messages** keeps nothing new here of itself: a hide travels end to end like a message, and goes where the
+  channel's stored messages go. The moderator's app also adds a row to the moderation log, naming who hid or restored
+  whose message in which channel, with the message's id. Every client is told each account holding a privilege, from your groups, at connect and when it
+  changes. What your shell changes reaches them within five minutes.
+- **The moderation log** (*Server admin*, for holders of `voipc:modlog`) lives in the database. `modlog_days`
+  (180) is how long a row and the names in it stay, by time alone; 0 stops the start. Whoever holds the database can
+  change it, so back it up and guard it as the record it is.
+- **What came from Discord** stays until someone removes it. `archive_days` (0, never) takes rows older than that many
+  days by when they were written, which cannot be undone, so it is a choice to make and tell your members. A worker
+  deletes in batches of 5,000 with a pause between, so a large removal does not hold up sign-ins. Readers stop getting
+  what someone deleted at once; rows past `archive_days` go when the worker reaches them, within the hour on a small
+  archive.
+- **Removing a banned member's posts** deletes rows of `voipc_log` for good: back them up if you may want them. It
+  keeps the direct messages and every key, so someone back from a ban reads and writes as before. Everyone who connects
+  is told of each removal still in the moderation log, the newest 2,000, so `modlog_days` is also how long a device
+  coming back hears of one. Files stay until `max_age_hours` takes them. From the shell, ban first; the removal itself
+  is made in the app, from *Active bans*.
+- **Reports** keep no row of their own: a report is a direct message to each holder of `voipc:reports`, and the relay
+  only answers who they are. A report that carries the message's file, the default until it is unticked, lists that
+  file under the direct message too, as any forward does, so the relay can see which conversation it came from.
+  There is no setting beyond who holds it, and nothing to back up. Reports reach someone away
+  through the stored log, so with `cloud = false` they reach only those online. Admins hold it anyway, and on a relay
+  without accounts so does whoever logged in with the token, while connected. Give the privilege to someone who reads
+  their messages: where nobody who holds it can be reached, the dialog says nobody takes reports.
+- **In the app** (*Server admin*): channels and categories, the server's name and icon, invite links.
 
 ## 7. Backups
 
@@ -137,21 +174,59 @@ WantedBy=multi-user.target
 
       sudo -u voipc voipc-server --config /etc/voipc/server.toml db backup /var/backups/voipc/voipc-$(date +%F).db
 
-- **Postgres:** use `pg_dump`.
+- **Postgres:** `pg_dump -Fc`, as the unit below runs it. A dump holds no index and no dead rows.
 - **Also back up** `server.toml`, `channels.json`, `server_settings.json` and `bans.json`.
 - **How long to keep backups: 30 days at most.** A person who deletes their account or their
   kept messages expects them gone. A backup brings them back until it is itself deleted.
-- **Restore:** stop the service, copy the files back, start it again. Test a restore once,
-  before you need one.
+- **A run from Discord** copies a SQLite database first, beside it, as `<database>.before-import-<run>`,
+  readable by the owner only. A new run drops all but the last two, and nothing in the relay removes them otherwise: they
+  stay until you delete them. Postgres has nothing to make one from here: `pg_dump` first, and tick that you did. These
+  hold everything, so the 30 days apply to them too: delete them when you know the move went well. The daily timer below
+  does it at 30 days if you have not.
+- **A self-update's copy** of a SQLite database (§14) is one plain copy beside the binary. The newest two stay, and at each
+  update one past 30 days goes too, though never the newest: if no update comes, the timer below takes that one at 30 days.
+- **Kept channel messages and their keys are in every copy too,** and nothing compresses them much, since they are encrypted.
+  Measured per row at 2000 members, 300 channels and 1,500 writers-in-channels:
 
-A daily timer:
+  | Row | SQLite | Postgres |
+  |---|---|---|
+  | A kept message of about 100 characters | 409 B | 480 B |
+  | A member's key to a writer in a channel | 114 B | 216 B |
+  | A writer's new key, for about 60 members at once | 91 B | 161 B |
+
+  With the default `kept_window` of 10,000, on such a server, that comes to about 4 GB on SQLite and 7 GB on Postgres at 173,000 messages a
+  day, and about 6 GB and 11 GB at 46,800 a day, where quieter channels keep more keys for longer. With the 7 copies below, about 25 to 45 GB
+  in all. Those totals are sums from the rows above, not a year's run. A smaller `kept_window` is the way to spend less. Deduplicating backup
+  tools save next to nothing on these files: nearly every byte differs from one day's copy to the next.
+- **What came from Discord is in every copy,** and the daily timer below keeps 7 of them:
+
+  | Messages | SQLite | Postgres | One SQLite copy, plain / zstd | 7 plain copies, a sum |
+  |---|---|---|---|---|
+  | 1 M | 0.18 GB | 0.26 GB | 0.17 / 0.07 GB | 1.2 GB |
+  | 5 M | 0.85 GB | 1.24 GB | 0.84 / 0.32 GB | 5.9 GB |
+  | 20 M | 3.5 GB | 5 GB | 3.4 / 1.3 GB | 24 GB |
+  | 100 M | 18 GB | 26 GB | 17 / 6.5 GB | 119 GB |
+
+  The relay has no free-disk check, and when the disk is full sign-ins fail too.
+  A copy made before someone's deletion still holds their posts until it is deleted, which the timer below does within
+  30 days. Put the database and its copies on an encrypted disk ([MOVING.md](MOVING.md#data-protection)).
+- **Restore:** stop the service, `gunzip` the copy first and copy the files back (Postgres: `pg_restore --clean --if-exists
+  -d voipc` from the dump), start it again. Test a restore once, before you need one.
+- **A restore puts back whoever left or was removed since the copy.** Their seat returns with the rest, and writers' apps
+  hand them keys again at their next post, each named as it happens, until someone removes them again.
+- **A restore also takes back what members deleted since.** It is there again, and on a server that moved from Discord
+  their wishes are gone too, so the next run files those posts again. To start a move over, use Undo instead
+  ([MOVING.md](MOVING.md#undo-and-re-runs), which says what to do if you have to restore).
+
+A daily timer, which keeps 7: today, the two days before and the last four Sundays, the oldest 27 days old. `%u` names a
+Sunday 7, and `-f` lets a second run on one day replace the copy instead of stopping the job there:
 
 ```ini
 # /etc/systemd/system/voipc-backup.service
 [Service]
 Type=oneshot
 User=voipc
-ExecStart=/bin/sh -c 'voipc-server --config /etc/voipc/server.toml db backup /var/backups/voipc/voipc-$(date +%%F).db && find /var/backups/voipc -name "voipc-*.db" -mtime +30 -delete'
+ExecStart=/bin/sh -c 'f=/var/backups/voipc/voipc-$$(date +%%F-%%u).db && voipc-server --config /etc/voipc/server.toml db backup "$$f" && gzip -qf "$$f" && find /var/backups/voipc -name "voipc-*.db.gz" \\( -mtime +27 -o \\( -mtime +2 ! -name "*-7.db.gz" \\) \\) -delete && find /var/lib/voipc -maxdepth 2 -name "voipc*before-*" -mtime +30 -delete'
 
 # /etc/systemd/system/voipc-backup.timer
 [Timer]
@@ -162,7 +237,20 @@ Persistent=true
 WantedBy=timers.target
 ```
 
-Create `/var/backups/voipc`, owned by `voipc` with mode 0700, and copy the key file there once.
+On Postgres the same timer with this service. A custom-format dump is compressed already:
+
+```ini
+# /etc/systemd/system/voipc-backup.service
+[Service]
+Type=oneshot
+User=voipc
+UMask=0077
+ExecStart=/bin/sh -c 'pg_dump -Fc -d voipc -f /var/backups/voipc/voipc-$$(date +%%F-%%u).dump && find /var/backups/voipc -name "voipc-*.dump" \\( -mtime +27 -o \\( -mtime +2 ! -name "*-7.dump" \\) \\) -delete'
+```
+
+Create `/var/backups/voipc`, owned by `voipc` with mode 0700, and copy the key file there once. The SQLite unit's last
+`find` is for the copies a run from Discord and a self-update leave beside the database and the binary. Change its path
+and name if yours differ.
 
 ## 8. Upgrading
 
@@ -206,6 +294,25 @@ and the apps right after (the way back: [COMPATIBILITY.md](COMPATIBILITY.md) §4
 
 The apps go back by hand too ([COMPATIBILITY.md](COMPATIBILITY.md) §4).
 
+**From 1.9 to 1.10** (protocol 18 to 19):
+- **A migration:** `0008_moderation.sql` adds the moderation log and the restrictions, so going back takes the old binary
+  and the backup.
+- **The moderator group** gains the four new privileges once, on the first start, if it still holds exactly kick, ban and
+  channels, and the log says so. A group you edited is left alone: tick them yourself, or only `*` has the tools.
+- **New keys, with defaults that change nothing:** `modlog_days` in `[accounts]` and `new_member_wait_mins` in
+  `server_settings.json`.
+
+**From 1.10 to 1.11** (protocol 19 to 21):
+- **A migration:** `0009_move.sql` adds what a move from Discord holds, empty until you run one, so going back takes the
+  old binary and the backup.
+- **A migration:** `0010_kept.sql` adds the tables kept channel messages move to. What a channel kept before stays where it
+  is and goes on opening for whoever held its key; a writer who shares hands those keys on as well. Every post from here on is on a chain.
+- **New keys, with defaults that change nothing:** `archive_days` (0, kept until removed) and `unclaimed_days` (90) in
+  `[accounts]`.
+- **New keys that do:** `kept_window` (10,000). A channel with more than that deletes the rest at the next sweep once it has
+  stood three days, and `kept_seats` (5000) lifts what was fixed at 256.
+- A relay that never moves a server does no new work.
+
 **A later release that migrates the database** needs the old binary **and** the backup taken
 before the upgrade for a rollback: an older relay refuses a database that a newer one has
 migrated, by design. Release candidates (`-rc.N`) are for testing on a relay you can roll back.
@@ -216,6 +323,11 @@ migrated, by design. Release candidates (`-rc.N`) are for testing on a relay you
 
 - **What is logged:** at the default `info` level, the relay logs no client addresses and no
   account names; connection lines are at `debug`. Set `RUST_LOG=warn` to keep even less.
+- **The account system's own lines** (target `accounts`): its warnings and errors are on by
+  default, among them why a Discord sign-in failed (`outcome="oauth_failed"`) and database
+  errors, with a hashed address and account ids. A `RUST_LOG` of your own replaces the default,
+  so add `accounts=warn` to it. `accounts=info` adds each sign-in's outcome, and names the first
+  admin account when it is made.
 - **The journal:** it keeps what the service prints. Set its retention to match the backup
   policy, e.g. `MaxRetentionSec=30day` in `journald.conf`.
 
@@ -235,7 +347,7 @@ The simplest way is a host directory that user 65532 owns:
     install -d -o 65532 -g 65532 -m 0700 /srv/voipc
     install -o 65532 -g 65532 -m 0600 server.toml cert.pem key.pem /srv/voipc/
     docker run -d --name voipc -v /srv/voipc:/data \
-      -p 9987:9987/tcp -p 9987:9987/udp ghcr.io/luki4fun/voipc-server:1.7.0-rc.1
+      -p 9987:9987/tcp -p 9987:9987/udp ghcr.io/luki4fun/voipc-server:1.11.0
     docker exec voipc /voipc-server --config /data/server.toml admin grant <name> admin
 
 With a named volume instead, copy the files in with a throwaway container first, then run the
@@ -257,6 +369,121 @@ release speaks which protocol: [COMPATIBILITY.md](COMPATIBILITY.md) §1.
 `[update]` (§14) refuses to start in the container: its binary is part of the image. Pull a new
 tag instead, by hand or with `podman auto-update` and the `io.containers.autoupdate=registry`
 label.
+
+## 10a. How big one relay goes
+
+**Give the relay's UDP socket room, on any relay with more than a few dozen people.** Every client's voice, video and
+control packets wait in one socket's buffer while the relay is busy, and what does not fit is dropped without a word in any
+log. The relay asks for 8 MiB, and Linux gives at most twice `net.core.rmem_max`, which is usually only 212 KiB. It
+warns at start if it got less. On the host, a container's included:
+
+```sh
+sysctl -w net.core.rmem_max=4194304 net.core.wmem_max=4194304   # and the same in /etc/sysctl.d/ to keep it
+```
+
+At 2000 clients on this machine that took the packets dropped from 340,000 to under 11,000 a run, and all of them joining a
+channel from about 3 s to about 1 s. `nstat -az UdpRcvbufErrors` counts what the kernel has dropped this way.
+
+Measured with `community_load` (below) on one relay and one 32-thread machine with
+62 GiB, load clients on the same machine, 2026-11-04: guests, no voice, N clients arriving at
+50 a second, all joining one text channel at once, then one 200-byte chat message a second.
+
+| Clients | Relay's cores | Join all (s) | Join p95 (ms) | Rosters short | Chat p95 (ms) | Chat delivered | Relay RSS (MiB) |
+|---|---|---|---|---|---|---|---|
+| 500 | all | 0.2 | 77 | 0 | 3 | all | 107 |
+| 1000 | all | 1.0 | 239 | 0 | 5 | all | 229 |
+| 2000 | all | 3.8 | 1543 | 0 | 9 | all | 523 |
+| 500 | 2 | 0.2 | 145 | 0 | 3 | all | 97 |
+| 1000 | 2 | 0.8 | 426 | 0 | 8 | all | 198 |
+| 2000 | 2 | 3.4 | 1990 | 0 | 12 | all | 532 |
+
+On a relay with accounts (1.9), where each connection also reads the groups' colours, the server's name
+and who may call on everybody:
+
+| Clients | Cores | Join, s | Join p95, ms | Short rosters | Chat p95, ms | Delivered | Relay MiB |
+|---|---|---|---|---|---|---|---|
+| 500 | all | 0.2 | 84 | 0 | 3 | all | 114 |
+| 1000 | all | 0.6 | 269 | 0 | 5 | all | 246 |
+| 2000 | all | 3.2 | 1595 | 0 | 10 | all | 561 |
+| 2000 | 2 | 3.0 | 2022 | 0 | 24 | all | 739 |
+
+Moderation (protocol 19) adds who holds privileges, running restrictions and removal marks to each
+connection, with no measurable cost: 2000 clients joined in 2.4 s (2.6 s on 2 cores) with p95 1452 ms
+(2342 ms), no short rosters, every message delivered, at 569 MiB (668 MiB).
+
+So the relay itself carries 2000 connections. What a connection may have waiting is bounded at 16 MiB
+of messages. Past that its client has stopped reading, and the relay ends the connection (the log says so)
+rather than let it fall behind quietly: the app reconnects and gets the whole state again. The limits a
+real community meets first are these:
+
+- **One message holds one list.** `UserList` fits 2621 guests, 1598 accounts, or 789 accounts with three
+  badges each; `ChannelList` 1213 channels, 555 with a 64-byte description, 210 with 256 bytes. Past that
+  the relay sends the rest in further messages and every app reads them, so a long list only takes longer.
+- **Joining a voice room takes time at the client.** A member joining a room of N sends 3N control messages
+  at 50 a second: 120 s at 2000. The crypto itself is small: 0.4 ms and about 4 KiB a member.
+- **In text channels a writer pays, at its first post.** Following them is one message however many there
+  are, and costs nobody else anything. A first post to 2000 online who have no session with the writer comes
+  to about 3.6 MB down and 360 KB up for that writer, and its readers can read within seconds. These are
+  sums, not yet a measured run.
+- **Finding someone's direct conversations reads every kept direct message on the relay,** at each connect, though no channel's:
+  at a million of them, about 75 ms on SQLite and 155 ms on Postgres, measured with all of it in memory.
+- **Kept history is for 5000 members a channel** (`kept_seats`): the next joiner gets no offline catch-up there. Half of them
+  take a seat by following a channel, the rest by asking for one or writing there. It is a guard for a small disk, not a wall: set
+  it lower on one. Past about 32,000 a writer's app no longer keeps a copy there, since it can hold no more pins.
+- **What kept messages cost the relay,** measured at 2000 and at 5000 members on a desktop NVMe, through the relay's own code, with a
+  bare commit at about 3 ms. A post checks the channel's members against who holds its key, so it grows with members. A person does
+  not wait for it: the live post goes first.
+
+  | Each | 2000, Postgres | 5000, Postgres | 5000, SQLite |
+  |---|---|---|---|
+  | Kept post without the commit, p50 / p95 | 2.5 / 10 ms | 4.4 / 13 ms | 17 / 21 ms |
+  | Someone left: a writer's next key, p95 | 24 ms | 34 ms | 62 ms |
+  | A first post, its largest frame | 32 ms | 31 ms | 38 ms |
+  | Worst wait for anything else, 20 new keys a second | 124 ms | 28 ms | 478 ms |
+
+  A disk that stalls shows up in the last line: one run here saw 2.6 s when a bare commit went from 3 ms to over 20 ms. A newcomer's
+  first connect takes a seat in each channel: at 2000 members and 300 channels on Postgres about 100 ms, with one run in 40 at 400 ms,
+  once per person. On SQLite each writer waits its turn, so during those moments other posts wait too.
+- **A channel keeps its newest 10,000 messages** (`kept_window`). The sweep deletes older ones for good, once the posts that
+  pushed them out are three days old and have three days left: a raid cleaned up before then, or one on a short timer, takes
+  nothing. Lowering it later only takes more; raising it brings nothing back. A big server should set it lower: keys grow with it.
+- **What a writer's keys take is counted against `quota_mb`**, a seat's row at half. So seat rows on disk are bounded by
+  accounts times that figure, and nothing evicts them: a writer over it stops being kept.
+- **A person's pins fit about 32,000 accounts,** in 56 pages of 48 KiB outside the sign-in message, read after it: at 2000 pins
+  about 170 KB down at a sign-in, and nothing at a reconnect if the app stayed up and no page moved. People met only in open
+  channels stop at half of that. A relay below protocol 21 keeps one item, about 560.
+
+The importer's dry-run warns from these numbers, and stops at none of them: 789 accounts with three badges (a moved
+community's members come with badges, so this and not 1598 is its figure), 500 and 2000 online, `max_users`. Past what
+one group list holds it keeps the top roles and names the rest. A relay before protocol 21 sends its channel list in one
+message, so there the list is fitted by clipping topics, and only then by leaving a named channel out; from 21 on a list
+comes in as many frames as it takes. No person is ever a limit: nothing here caps the members of a move.
+
+An import's rows live in `voipc_archive`. 5,000,000 synthetic rows, mean body 70 characters with a long tail, on tmpfs:
+so no fsync cost and no cold reads, and these are floors.
+
+| | SQLite | Postgres |
+|---|---|---|
+| Size with all indexes | 852 MB, 178 B a row | 1,239 MB, 259 B a row |
+| Page of 201 rows, newest or deep | 0.15-0.18 ms | 0.2-0.3 ms plus planning |
+| Scan 200,000 rows with `LIKE` / `lower() LIKE` | 53 ms | 190-235 ms |
+| Batch of 5,000 rows deleted | 16-21 ms | 10-21 ms |
+| Whole backup | `VACUUM INTO` 0.9 s, 840 MB, 322 MB under `zstd -3` | `pg_dump -Fc` 13 s, 309 MB |
+| After deleting | the file keeps its size; free pages are reused | the same after `VACUUM`; autovacuum handles it |
+
+Discord's rate is what limits a run, never this. Search has no index of its own: it scans a channel, and at most two go
+at once.
+
+Not measured: voice in a big channel (`voice_load` is for that), accounts signing in at once, real
+networks.
+
+```sh
+cargo build -p voipc-server --release --bin voipc-server --example community_load
+target/release/voipc-server -c server.toml &   # max_users above N
+target/release/examples/community_load run 500 127.0.0.1:9987 "$!"
+target/release/examples/community_load frames
+target/release/examples/community_load crypto 2000
+```
 
 ## 11. The file cache
 
@@ -410,27 +637,34 @@ Runtime settings in `server_settings.json`:
   "max_channels": 50,
   "max_channel_name_len": 32,
   "proximity_enabled": true,
-  "game_token": null
+  "game_token": null,
+  "server_name": null,
+  "server_description": null,
+  "new_member_wait_mins": 0
 }
 ```
+
+`new_member_wait_mins` (0, off, by default; at most 10080, a week; read at start) holds new members back from speaking, posting and writing direct messages for that long, against raids. An account counts from when it was made; a guest from when that address first came, and a guest counts as new again once the wait and one more day have gone by since their last visit. Someone a move from Discord brought counts from their Discord join date if that covers the whole wait when the import ran, and otherwise from when they open the account. Admins, holders of a privilege and anyone in a group other than the built-in `user` do not wait, so someone you invite into a call cannot talk until the wait ends unless you give them a group, and an invite link that hands one out skips it. A plain group made by a move does not lift it. A guest's clock lives in memory: a restart, a self-update included, starts it again for every guest there. An account's does not. It keeps at most 100,000 addresses: when it is full, a guest from a new address waits from when they connect and again after a reload, and the next sweep, within five minutes, keeps only the clocks still inside the wait.
+
+`server_name` and `server_description` are what the server calls itself on a relay without accounts (on one with them, an admin sets these in the app, which goes first). Shown above the address, never instead of it. A name over 32 characters or shaped like an address reads as none.
 
 `proximity_enabled: false` switches proximity chat off for the whole server: every channel is served as non-positional, requests to enable it are refused, and position beacons are not relayed.
 
 `game_token` (unset by default) is a bearer token a **game server** may present to `POST /game/v1/routes`, which narrows who hears whom inside a channel whose `routed` flag is on. Unset, that endpoint answers 404 and this server has no idea games exist. It is not the admin token and is deliberately much weaker: no session list, no names, no kick, no bans — only "these players may hear each other, for the next few seconds", as opaque ids it forgets.
 
-**Persistent channels** (optional): drop a `channels.json` in the directory the server runs from (or pass `--channels <path>`) to pre-create long-lived rooms that survive restarts. See [channels.example.json](../channels.example.json) — plaintext `password` fields are hashed to SHA-256 on first load and the file is rewritten atomically. Per channel:
+**Persistent channels** (optional): drop a `channels.json` in the directory the server runs from (or pass `--channels <path>`) to pre-create long-lived rooms that survive restarts. See [channels.example.json](../channels.example.json) — plaintext `password` fields are hashed to SHA-256 on first load and the file is rewritten atomically. A holder of `voipc:channels` standing in such a room can change its password, and can invite someone past it. Per channel:
 
 | Option | Default | Effect |
 |---|---|---|
 | `proximity` | `"off"` | `"2d"` or `"3d"` makes it a proximity room |
 | `hidden` | `false` | Not listed in the sidebar for non-admins. It can still be joined — by an invite link, by the game SDK, or by anyone who knows it is there — so it is out of the way, not locked. Give a channel a `password` if you need it shut, and both if it is the one your game drives |
-| `anonymous` | `false` | Members see each other as `Guest-1234`, a fresh name per visit. The server substitutes it everywhere, so no client ever learns the real one; admins see the real names, and no chat history is handed over in such a channel. Voice channels only, and it hides a name rather than a person: user ids are the same everywhere, so somebody who is also in a channel where you can see them can be matched up by id — which is why a text channel, one you are in *besides* the voice channel you stand in, may not be anonymous at all |
+| `anonymous` | `false` | Members see each other as `Guest-48213907`, a fresh name per visit. The server substitutes it everywhere, so no client ever learns the real one; admins see the real names, and no chat history is handed over in such a channel. Voice channels only, and it hides a name rather than a person: user ids are the same everywhere, so somebody who is also in a channel where you can see them can be matched up by id — which is why a text channel, one you are in *besides* the voice channel you stand in, may not be anonymous at all |
 | `screen_share` | `true` | `false` refuses screen sharing there |
 | `hide_members` | `false` | Non-admins see no member list, only whoever is speaking (and can still adjust their volume). Nobody outside is told who joins or leaves either — only that the count changed — which is the same rule a password channel follows |
 | `routed` | `false` | The server forwards each voice only to whoever should hear it, instead of to every member. For a channel a game drives, where "every member" can be a whole map. **The one option that tells this server anything about who hears whom** — members in such a channel say which of the others they want to hear, and a game server with `game_token` may narrow that further. Positions, names and audio stay as unreadable to it as ever. Everyone joining is told, and the channel is marked **R** |
 | `text` | `false` | Makes it a **text channel**: no voice, no screen share, no proximity. Joining one is a subscription rather than a move, so any number can be open at once and none of them costs the voice channel you stand in |
 | `message_ttl_secs` | `0` | A **message destruction timer**: seconds a message written here lives before every client deletes it, `0` for none. Up to 30 days. Without accounts the server stores no chat and deletes nothing — this is what the channel tells its members, and each client stamps it on what it sends, inside the encryption where the relay cannot reach it. With accounts, the server also deletes the copies members keep there when their timer runs out. It applies to what is written from then on, not to what people already have |
-| `auto_join` | `false` | Only with `text`. Clients join this channel on connect. A user who leaves it is not brought back — the client remembers that, which is why the server joins nobody by itself. There is no limit on how many a client holds: the budgets that pay for joining them are sized from how many channels this server has |
+| `auto_join` | `false` | Only with `text`. Clients follow this channel from their first connect: one frame however many there are, with nobody told, and no keys until someone writes. A user who leaves it is not brought back, nor one who is kicked: the client remembers that, which is why the server joins nobody by itself. Moved channels are marked, and a `*` holder who passes a gate only as `*` enters such a channel by a click. Change it in Server admin → Channels |
 | `announce` | `false` | Only with `text`. An **announcement channel**: only its managers — admins and whoever holds the *Channels* privilege (moderators, by default), and for a channel somebody created, its creator — may post, and the server refuses everybody else's messages. It reads none of them; who posts where is all it checks. A member's shared history from such a channel is still shown as second-hand, as everywhere |
 | `slow_mode_secs` | `0` | **Slow mode**: each member may post once per this many seconds, up to 6 hours; `0` is off. The server holds them to it, the channel's managers are exempt, and the chat shows the countdown rather than letting a message be sent and refused |
 | `nsfw` | `false` | Marks the channel **18+**. Each app asks its user, once per server, to confirm being 18 or older before joining or showing such a channel, and never joins one by itself (`auto_join` waits for that answer). The server only carries the flag. It is a question, not an age check: give the channel a `password` too if it has to stay shut |
@@ -483,7 +717,8 @@ release_candidates = false # true: also take release candidates (rc.N), and thei
    updater trusts, for that version and that file. Anything else is refused.
 4. It runs the new binary once (`--version`), and copies a SQLite accounts database beside
    the binary as `voipc-server.accounts-before-<version>.db` (the newest two stay; Postgres
-   is yours to back up).
+   is yours to back up). After a move from Discord each of those holds the archive too, so the
+   disk needs room for one more, and an update stops if it cannot make the copy.
 5. It keeps the running binary as `voipc-server.previous`, puts the new one in its place,
    tells every client "updating to VoIPC X", and restarts into it in the same process. Calls
    drop; the apps reconnect within seconds.

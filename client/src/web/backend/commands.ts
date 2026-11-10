@@ -8,11 +8,12 @@
 import { audio } from "./audio";
 import { video } from "./video";
 import { share } from "./share";
-import { getConfig, resetConfig, updateConfig } from "./config";
+import { getConfig, onShareMoved, resetConfig, updateConfig } from "./config";
+import { emit as emitEvent } from "./events";
 import * as session from "./session";
 import { forgetDevice, listDevices } from "./devices";
 import { wasm } from "./wasm";
-import { forgetRelayId, type AccountArgs } from "./account";
+import { forgetRelayId, type AccountArgs, type ProviderAnswer } from "./account";
 import { playCue } from "./sounds";
 import type { SavedServer, SoundSettings } from "../../lib/stores/settings";
 import type { ProximityMode } from "../../lib/spatial";
@@ -41,6 +42,13 @@ function need(server: unknown): session.Session {
 function needAccount(server: unknown): { s: session.Session; account: NonNullable<session.Session["account"]> } {
   const s = session.sessionFor(str(server, "server")) ?? fail("Not connected to that server");
   return { s, account: s.account ?? fail("Not signed in to an account on that server") };
+}
+
+/** `fail` for a release: it knows no fixture, and says where the importer is. */
+function importer(cmd: string, args: Args): Promise<unknown> {
+  return __SELFTEST__
+    ? import("./import-selftest").then((m) => m.answer(cmd, args, need(args.server)))
+    : fail("Reading a Discord server runs in the desktop app.");
 }
 
 /** A voice-scoped command's connection: the one whose voice channel we are in. */
@@ -80,6 +88,10 @@ function num(v: unknown, name: string): number {
 
 function u32(v: unknown, name: string): number {
   return typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= 0xffff_ffff ? v : fail(`invalid ${name}`);
+}
+
+function ids(v: unknown, name: string): number[] {
+  return Array.isArray(v) ? v.map((id) => u32(id, name)) : fail(`invalid ${name}`);
 }
 
 function bool(v: unknown, name: string): boolean {
@@ -151,6 +163,8 @@ function accountArgs(raw: unknown): AccountArgs | undefined {
       return { kind: "device" };
     case "reset":
       return { kind: "reset", recovery: str(a.recovery, "recovery"), password: str(a.password, "password") };
+    case "provider":
+      return { kind: "provider", ticket: a.ticket as number[], invite: optStr(a.invite, "invite") };
     default:
       fail("unknown account sign-in");
   }
@@ -168,6 +182,22 @@ function laneEffect(effect: unknown): string {
   return name;
 }
 
+/** The switch moved: every open server. None is not a failure: the flag goes out again on
+ *  the next connect, from the config already written. */
+function moveShare(on: boolean): void {
+  for (const s of session.allSessions()) {
+    // A switch that does not count here is no news to this relay
+    if (!on || s.mayShare()) s.sendControl({ SetHistorySharing: { enabled: on } });
+    // The same consent hands our older keys to who joins a channel's log.
+    s.account?.setShare(on);
+  }
+}
+
+onShareMoved((on) => {
+  moveShare(on);
+  emitEvent("share-switch", on);
+});
+
 const handlers: Record<string, Handler> = {
   // ── connection ──
   connect: ({ address, username, account }) => {
@@ -175,8 +205,10 @@ const handlers: Record<string, Handler> = {
     const name = str(username, "username");
     if (addr.length === 0 || addr.length > 253) fail("address must be 1-253 characters");
     // 32 for the name and 5 for its "#0000" tag; the server checks each part
-    if (name.length === 0 || byteLength(name) > 37) fail("username must be 1-32 characters");
-    return session.connect(addr, name, accountArgs(account));
+    // A provider's sign-in has no name yet: its answer decides the account.
+    const args = accountArgs(account);
+    if ((name.length === 0 && args?.kind !== "provider") || byteLength(name) > 37) fail("username must be 1-32 characters");
+    return session.connect(addr, name, args);
   },
 
   // ── accounts (client/src-tauri/src/account.rs) ──
@@ -189,7 +221,56 @@ const handlers: Record<string, Handler> = {
   account_cancel: ({ server }) => {
     session.sessionOrSigningIn(str(server, "server"))?.account?.cancel();
   },
+  account_provider_ask: ({ address, ask }) => {
+    const a = ask as Record<string, unknown>;
+    const question =
+      a.kind === "providers" ? "providers"
+      : a.kind === "open" ? { open: a.provider }
+      : { status: a.ticket };
+    return session.askRelay(str(address, "address"), question);
+  },
+  account_open_page: ({ url }) => {
+    const page = str(url, "url");
+    if (!wasm().providerPageOk(page)) fail("This server named a page that is no provider's: not opening it.");
+    window.open(page, "_blank", "noopener");
+  },
+  account_provider_answer: ({ server, answer }) => {
+    const s = session.sessionOrSigningIn(str(server, "server"));
+    if (!s?.account) fail("No sign-in is waiting for that.");
+    s.account.answerProvider(answer as ProviderAnswer);
+  },
+  account_pair_look: ({ server, pair }) => {
+    const { s, account } = needAccount(server);
+    account.pairLook(s, pair as number);
+  },
+  account_pair_answer: ({ server, pair, code }) => {
+    const { s, account } = needAccount(server);
+    account.pairAnswer(s, pair as number, str(code, "code"));
+  },
+  account_pair_decline: ({ server, pair }) => {
+    const { s, account } = needAccount(server);
+    account.pairDecline(s, pair as number);
+  },
+  account_provider_start: ({ server, provider, link, password, totp, recovery }) => {
+    const { s, account } = needAccount(server);
+    const opt = (v: unknown, name: string) => (v == null ? null : str(v, name));
+    return account.providerStart(s, str(provider, "provider"), link === true, str(password, "password"), opt(totp, "totp"), opt(recovery, "recovery"));
+  },
+  account_provider_unlink: ({ server, provider, password, totp, recovery }) => {
+    const { s, account } = needAccount(server);
+    const opt = (v: unknown, name: string) => (v == null ? null : str(v, name));
+    return account.providerUnlink(s, str(provider, "provider"), str(password, "password"), opt(totp, "totp"), opt(recovery, "recovery"));
+  },
   account_request: ({ server, request }) => needAccount(server).s.sendControl({ Account: request }),
+  // Reading a Discord server is the desktop app's (import.rs): a page would hand the bot's
+  // token to whatever served it. A test build answers from a fixture, so that the wizard's
+  // own screens get clicked. In a release the import below is gone with its branch.
+  import_open: (a) => importer("import_open", a),
+  import_plan: (a) => importer("import_plan", a),
+  import_run: (a) => importer("import_run", a),
+  import_stop: (a) => importer("import_stop", a),
+  import_forget: (a) => importer("import_forget", a),
+  import_move_post: (a) => importer("import_move_post", a),
   account_password_change: ({ server, old, new: next, totp, recovery }) => {
     const { s, account } = needAccount(server);
     const opt = (v: unknown, name: string) => (v == null ? null : str(v, name));
@@ -219,7 +300,10 @@ const handlers: Record<string, Handler> = {
       name: d.name,
       relay_id: toHex(d.relay_id),
     })),
-  forget_device: ({ server, name }) => forgetDevice(str(server, "server"), str(name, "name")),
+  forget_device: ({ server, name }) => {
+    session.forgetKept(str(server, "server"));
+    return forgetDevice(str(server, "server"), str(name, "name"));
+  },
   send_kept_dm: ({ server, account, content, ttlSecs, replyTo, thread, file, fwd, event }) =>
     need(server).sendKeptDm(
       str(account, "account"),
@@ -230,6 +314,10 @@ const handlers: Record<string, Handler> = {
   account_enter: ({ server, conv }) => {
     const { s, account } = needAccount(server);
     account.enter(s, str(conv, "conv"));
+  },
+  account_read_now: ({ server, conv }) => {
+    const { s, account } = needAccount(server);
+    account.readNow(s, str(conv, "conv"));
   },
   account_purge: ({ server, conv }) => {
     const { s, account } = needAccount(server);
@@ -249,13 +337,18 @@ const handlers: Record<string, Handler> = {
     const p = prefs as Record<string, unknown>;
     account.setPrefs(s, bool(p?.cloud, "cloud"), bool(p?.asked, "asked"));
   },
+  account_block: ({ server, key, label, on }) => {
+    const { s, account } = needAccount(server);
+    account.setBlocked(s, str(key, "key"), str(label, "label"), bool(on, "on"));
+  },
   safety_number: ({ server, userId }) => need(server).safetyNumber(u32(userId, "userId")),
   qr_svg: ({ text }) => {
     const t = str(text, "text");
     if (!t.startsWith("otpauth://") || t.length > 512) fail("not an authenticator link");
     return wasm().qrSvg(t) ?? fail("could not draw the code");
   },
-  disconnect: ({ server }) => session.disconnect(str(server, "server")),
+  // A reconnect clearing the way, not a person leaving: what it kept is for what comes next.
+  disconnect: ({ server, keepSessions }) => session.disconnect(str(server, "server"), keepSessions === true),
   // A page load starts with no sessions anyway; this is here for the desktop
   // backend's sake, where a reloaded page can find connections still open.
   disconnect_all: async () => {
@@ -278,6 +371,13 @@ const handlers: Record<string, Handler> = {
   },
   leave_channel: ({ server, channelId }) =>
     need(server).sendControl({ LeaveChannel: { channel_id: u32(channelId, "channelId") } }),
+  join_text_channels: ({ server, channels, quiet }) =>
+    need(server).joinTextChannels(ids(channels, "channels"), ids(quiet, "quiet")),
+  set_quiet: ({ server, channels, quiet }) => need(server).setQuiet(ids(channels, "channels"), bool(quiet, "quiet")),
+  request_channel_page: ({ server, channelId, after }) =>
+    need(server).sendControl({ RequestChannelPage: { channel_id: u32(channelId, "channelId"), after: u32(after, "after") } }),
+  set_metered: ({ metered }) => session.setMetered(bool(metered, "metered")),
+  key_job_answer: ({ server, channelId, go }) => need(server).keyJobAnswer(u32(channelId, "channelId"), bool(go, "go")),
   create_channel: ({ server, name, password, proximity, anonymous, text }) => {
     const channelName = str(name, "name");
     if (channelName.length === 0 || byteLength(channelName) > 128) fail("channel name must be 1-128 characters");
@@ -333,6 +433,11 @@ const handlers: Record<string, Handler> = {
   },
   kick_user: ({ server, channelId, userId }) =>
     need(server).sendControl({ KickUser: { channel_id: u32(channelId, "channelId"), user_id: u32(userId, "userId") } }),
+  profiles_get: ({ server, accounts }) =>
+    need(server).sendControl({ ProfilesGet: { accounts } }),
+  report_takers_get: ({ server }) => need(server).sendControl("ReportTakersGet"),
+  profile_picture_get: ({ server, hash }) =>
+    need(server).sendControl({ ProfilePictureGet: { hash } }),
   request_channel_users: ({ server, channelId }) =>
     need(server).sendControl({ RequestChannelUsers: { channel_id: u32(channelId, "channelId") } }),
   send_invite: ({ server, channelId, targetUserId }) =>
@@ -482,26 +587,14 @@ const handlers: Record<string, Handler> = {
   },
   // The tab keeps files in its memory, at a size of its own (files.ts CACHE_CAP)
   set_file_cache_mb: () => fail("The browser's file cache has a fixed size"),
-  send_channel_history: ({ server, channelId, targetUserId, messages }) => {
+  send_channel_history: ({ server, channelId, targetUserId, messages, sealed }) => {
     if (!Array.isArray(messages)) fail("invalid messages");
-    need(server).sendChannelHistory(u32(channelId, "channelId"), u32(targetUserId, "targetUserId"), messages);
+    need(server).sendChannelHistory(u32(channelId, "channelId"), u32(targetUserId, "targetUserId"), messages, sealed === true);
   },
-  request_channel_history: ({ server, channelId, targetUserIds }) => {
-    if (!Array.isArray(targetUserIds)) fail("invalid targetUserIds");
-    need(server).requestChannelHistory(
-      u32(channelId, "channelId"),
-      targetUserIds.map((id) => u32(id, "targetUserIds")),
-    );
-  },
+  request_channel_history: ({ server, channelId, targetUserIds }) =>
+    need(server).requestChannelHistory(u32(channelId, "channelId"), ids(targetUserIds, "targetUserIds")),
   set_history_sharing: ({ enabled }) => {
-    // To every server, and none is not a failure: the flag goes out again on
-    // the next connect, from the config the settings toggle has already written.
-    const on = bool(enabled, "enabled");
-    for (const s of session.allSessions()) {
-      s.sendControl({ SetHistorySharing: { enabled: on } });
-      // The same consent hands our older keys to who joins a channel's log.
-      s.account?.setShare(on);
-    }
+    moveShare(bool(enabled, "enabled"));
   },
 
   // ── moderation (admin token session) ──
@@ -517,6 +610,16 @@ const handlers: Record<string, Handler> = {
         account: account === true,
       },
     }),
+  admin_restrict: ({ server, userId, voice, text, durationSecs, reason }) =>
+    need(server).sendControl({
+      AdminRestrict: {
+        user_id: u32(userId, "userId"),
+        voice: voice === true,
+        text: text === true,
+        duration_secs: u32(durationSecs, "durationSecs"),
+        reason: str(reason, "reason"),
+      },
+    }),
   admin_ban_account: ({ server, name, reason, durationSecs }) =>
     need(server).sendControl({
       AdminBanAccount: { name: str(name, "name"), reason: str(reason, "reason"), duration_secs: u32(durationSecs, "durationSecs") },
@@ -526,6 +629,8 @@ const handlers: Record<string, Handler> = {
     return need(server).sendControl({ AdminUnban: { id } });
   },
   admin_list_bans: ({ server }) => need(server).sendControl("AdminListBans"),
+  admin_bans_page: ({ server, search, offset }) =>
+    need(server).sendControl({ AdminBansPage: { search: str(search, "search"), offset: u32(offset, "offset") } }),
 
   // ── voice ──
   start_transmit: async () => {
@@ -886,6 +991,9 @@ const handlers: Record<string, Handler> = {
           break;
         case "share_channel_history":
           c.share_channel_history = enabled;
+          break;
+        case "share_off_notice":
+          c.share_off_notice = enabled;
           break;
         default:
           fail(`Unknown config key: ${key}`);

@@ -41,7 +41,9 @@ export function defaultConfig(): AppConfig {
     audio_setup_version: 0,
     sounds: defaultSoundSettings(),
     auto_connect: false,
-    share_channel_history: true,
+    share_channel_history: false,
+    share_off_once: true,
+    share_off_notice: false,
     max_conversations: 1000,
     // Null, not `{}`: the state the appearance blob starts in (see config.rs).
     // The first-run picker keys on `layout_asked_version`, 0 either way.
@@ -59,7 +61,20 @@ function load(): AppConfig {
     if (!raw) return defaults;
     const saved = JSON.parse(raw);
     if (!saved || typeof saved !== "object") throw new Error("not an object");
-    return { ...defaults, ...saved, sounds: { ...defaults.sounds, ...(saved.sounds ?? {}) } };
+    const loaded: AppConfig = { ...defaults, ...saved, sounds: { ...defaults.sounds, ...(saved.sounds ?? {}) } };
+    // As config.rs `share_off_once`: the switch used to start on, so a saved `true`
+    // cannot say whether anyone chose it. Once: off, with a notice if it was on.
+    if (saved.share_off_once !== true) {
+      loaded.share_off_notice = saved.share_channel_history === true;
+      loaded.share_channel_history = false;
+      loaded.share_off_once = true;
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(loaded));
+      } catch {
+        // It runs again next time, which only keeps the switch off
+      }
+    }
+    return loaded;
   } catch (e) {
     // Kept aside rather than overwritten by the next save, which would take
     // the remembered servers with it
@@ -91,9 +106,37 @@ export function getConfig(): AppConfig {
 
 /** Apply `change` to the config and persist it. */
 export function updateConfig(change: (c: AppConfig) => void): void {
+  const before = config.share_channel_history;
   change(config);
+  // Unless this is what moved it, the switch stays as stored: this tab may not have heard
+  // yet that another turned it off, and writing it back would turn it on for the next load.
+  if (config.share_channel_history === before) adoptStoredShare();
   save();
 }
+
+let shareMoved: (on: boolean) => void = () => {};
+
+/** What to do when another tab of this browser moves the switch. */
+export function onShareMoved(then: (on: boolean) => void): void {
+  shareMoved = then;
+}
+
+function adoptStoredShare(): void {
+  let stored: unknown;
+  try {
+    stored = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "null")?.share_channel_history;
+  } catch {
+    return;
+  }
+  if (typeof stored !== "boolean" || stored === config.share_channel_history) return;
+  config.share_channel_history = stored;
+  shareMoved(stored);
+}
+
+// Two tabs on one origin share this one setting
+globalThis.addEventListener?.("storage", (e) => {
+  if ((e as StorageEvent).key === STORAGE_KEY) adoptStoredShare();
+});
 
 /** Back to defaults; the stored copy is removed. */
 export function resetConfig(): void {

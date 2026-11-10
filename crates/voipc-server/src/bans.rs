@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use voipc_protocol::messages::ServerMessage;
 use voipc_protocol::types::BanInfo;
 
 use crate::state::ServerState;
@@ -49,11 +50,30 @@ pub struct Ban {
     /// A relay without accounts: the address itself, for `bans.json`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub addr: Option<IpAddr>,
+    /// The pseudonym they went by when an admin banned them, whose label is the
+    /// real name: what the moderation log, read by others, goes on calling them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
 }
 
 impl Ban {
     fn active(&self, now: i64) -> bool {
         self.expires_at.is_none_or(|t| t > now)
+    }
+
+    /// What a row in the moderation log calls whoever this ban covers.
+    pub fn log_name(&self) -> &str {
+        self.alias.as_deref().unwrap_or(&self.label)
+    }
+
+    /// The name a reader knows this ban by. Someone who is no admin has what the log
+    /// says: the real name beside a row's time would say who it was.
+    pub fn name_for(&self, admin: bool) -> &str {
+        if admin {
+            &self.label
+        } else {
+            self.log_name()
+        }
     }
 }
 
@@ -93,6 +113,25 @@ fn active(state: &ServerState, key: &Key) -> Option<Ban> {
         .get(key)
         .map(|b| b.clone())
         .filter(|b| b.active(now_secs()))
+}
+
+/// The ban `account` is under now, if any.
+pub fn account_ban(state: &ServerState, account: [u8; 16]) -> Option<Ban> {
+    active(state, &Key::Account(account))
+}
+
+/// The running ban of an address whoever went by `name` was banned from, if any, as
+/// this reader knows it (`Ban::name_for`).
+pub fn address_ban_as(state: &ServerState, name: &str, admin: bool) -> Option<Ban> {
+    let now = now_secs();
+    state
+        .bans
+        .iter()
+        .find(|e| {
+            let b = e.value();
+            matches!(e.key(), Key::Addr(_)) && b.name_for(admin) == name && b.active(now)
+        })
+        .map(|e| e.value().clone())
 }
 
 /// At accept: an address ban refuses at once on a relay without accounts.
@@ -148,6 +187,19 @@ pub async fn add(
     by: &str,
     duration: Option<Duration>,
 ) -> Result<Ban> {
+    add_as(state, target, label, None, reason, by, duration).await
+}
+
+/// `add`, with the pseudonym behind an admin's `label` (`Ban::alias`).
+pub async fn add_as(
+    state: &ServerState,
+    target: Target,
+    label: &str,
+    alias: Option<&str>,
+    reason: &str,
+    by: &str,
+    duration: Option<Duration>,
+) -> Result<Ban> {
     let now = now_secs();
     let key = key_of(state, &target);
     let mut ban = Ban {
@@ -158,6 +210,7 @@ pub async fn add(
         created_at: now,
         expires_at: duration.map(|d| now.saturating_add(d.as_secs().min(i64::MAX as u64) as i64)),
         addr: None,
+        alias: alias.map(|a| a.chars().take(64).collect()),
     };
     if let Some(relay) = &state.accounts {
         ban.id = relay.ban_put(&key, &ban).await?;
@@ -202,6 +255,12 @@ pub async fn remove(state: &ServerState, id: u64) -> Result<bool> {
 
 /// The active bans, accounts first, newest first within each.
 pub fn list(state: &ServerState) -> Vec<BanInfo> {
+    list_for(state, true)
+}
+
+/// The same for one reader (`Ban::name_for`). In a fixed order: a page is an offset into it,
+/// and many bans can share a second.
+pub fn list_for(state: &ServerState, admin: bool) -> Vec<BanInfo> {
     let now = now_secs();
     let mut bans: Vec<BanInfo> = state
         .bans
@@ -212,7 +271,7 @@ pub fn list(state: &ServerState) -> Vec<BanInfo> {
             BanInfo {
                 id: b.id,
                 account: matches!(e.key(), Key::Account(_)),
-                label: b.label.clone(),
+                label: b.name_for(admin).to_string(),
                 reason: b.reason.clone(),
                 by: b.by.clone(),
                 created_at: b.created_at.max(0) as u64,
@@ -224,8 +283,47 @@ pub fn list(state: &ServerState) -> Vec<BanInfo> {
         b.account
             .cmp(&a.account)
             .then(b.created_at.cmp(&a.created_at))
+            .then(b.id.cmp(&a.id))
     });
     bans
+}
+
+/// Rows a page of the list holds at most. `PAGE_BYTES` usually comes first only for long
+/// reasons.
+const PAGE_ROWS: usize = 100;
+/// Well under a frame, as the logs' pages are, with room for the rest of the message.
+const PAGE_BYTES: usize = 44 * 1024;
+/// A search no name is longer than. It comes back in the answer, which has to fit a frame.
+const SEARCH_CHARS: usize = 128;
+
+/// The answer to `AdminBansPage`: what this reader's list shows under `search`, by the name a
+/// row shows and never the one behind it, from `offset`. `search` is not kept or logged.
+pub fn page(state: &ServerState, admin: bool, search: &str, offset: u32) -> ServerMessage {
+    let search: String = search.chars().take(SEARCH_CHARS).collect();
+    let needle = search.to_lowercase();
+    let found: Vec<BanInfo> = list_for(state, admin)
+        .into_iter()
+        .filter(|b| b.label.to_lowercase().contains(&needle))
+        .collect();
+    let total = found.len() as u32;
+    let mut bytes = 0;
+    let bans = found
+        .into_iter()
+        .skip(offset as usize)
+        .take(PAGE_ROWS)
+        .enumerate()
+        .take_while(|(i, ban)| {
+            bytes += postcard::to_allocvec(ban).map_or(PAGE_BYTES, |row| row.len());
+            *i == 0 || bytes <= PAGE_BYTES
+        })
+        .map(|(_, ban)| ban)
+        .collect();
+    ServerMessage::AdminBansPaged {
+        search,
+        offset,
+        total,
+        bans,
+    }
 }
 
 /// Reads the list again (at start, and every `REVALIDATE_MINUTES`): what the
@@ -248,6 +346,15 @@ pub async fn load(state: &ServerState) -> Result<()> {
     } else {
         Vec::new()
     };
+    // A ban the shell made left the channels' logs in its own process, and this relay
+    // went on letting them join one again until it knew
+    if let Some(relay) = &state.accounts {
+        for (key, _) in fresh.iter().filter(|(k, _)| !state.bans.contains_key(k)) {
+            if let Key::Account(a) = key {
+                relay.ban_out_of_logs(a).await?;
+            }
+        }
+    }
     state.bans.retain(|k, _| fresh.iter().any(|(f, _)| f == k));
     for (k, b) in fresh {
         state.bans.insert(k, b);
@@ -270,12 +377,12 @@ pub async fn enforce(state: &Arc<ServerState>, skip: Option<u32>) {
             let account = s
                 .account
                 .as_ref()
-                .map(|a| (a.user.id.0, !a.scopes.is_empty()));
+                .map(|a| (a.user.id.0, crate::accounts::holds_power(&a.scopes)));
             refusal(state, s.peer_ip, account).map(|why| (*e.key(), why))
         })
         .collect();
     for (sid, why) in covered {
-        crate::session::force_disconnect(state, sid, &why).await;
+        crate::session::eject(state, sid, &why).await;
     }
 }
 

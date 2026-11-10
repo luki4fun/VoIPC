@@ -46,6 +46,8 @@ wtransport = { version = "0.7", features = ["quinn"] }
 # is reproducible (the server never reads last_modified).
 rust-embed = { version = "8", features = ["debug-embed", "mime-guess", "deterministic-timestamps"] }
 hex = "0.4"
+# The archive's search folds accents as the device's own search does. Already in the lock.
+unicode-normalization = "0.1"
 
 # Opt-in relay accounts (`[accounts]` in the config). SQLite for a small relay,
 # Postgres for a big one, chosen by the database URL; SQLite is bundled, so the
@@ -55,7 +57,7 @@ hex = "0.4"
 #   l4f-accounts = { path = "../l4f-accounts" }
 # to the workspace Cargo.toml while you need it; commit neither that nor the
 # Cargo.lock it changes.
-l4f-accounts = { git = "https://github.com/luki4fun/l4f-accounts.git", tag = "v0.11.0", features = ["postgres", "sqlite"] }
+l4f-accounts = { git = "https://github.com/luki4fun/l4f-accounts.git", tag = "v0.13.0", features = ["postgres", "sqlite", "oauth"] }
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "sqlite", "migrate", "macros"] }
 
 # The self-update (`[update]`, update.rs), all already in the lock through the
@@ -70,3 +72,8 @@ semver = "1"
 # The recovery-key reset's proof: an identity signature (libsignal)
 voipc-crypto = { workspace = true }
 unicode-security = "0.1.2"
+
+[dev-dependencies]
+# The importer's own driver and its stand-in Discord, against the real relay: no socket to
+# Discord, and nothing of it in the relay's binary.
+voipc-import = { path = "../voipc-import", features = ["mock"] }

@@ -2,6 +2,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { voice, voiceChannel } from "../stores/channels.js";
   import { voiceListenOnly } from "../stores/channel-ui.js";
+  import { voiceRestriction } from "../stores/restrictions.js";
   import {
     isSharingScreen,
     viewerCount,
@@ -22,10 +23,12 @@
 
   // A share goes to the voice channel we are in, on whichever server that is
   let inLobby = $derived($voice === null);
-  // A channel can switch sharing off, and its gate can leave us listening
-  // only (the server refuses both too)
+  // A channel can switch sharing off, its gate can leave us listening only, and
+  // a moderator or the wait can hold our voice (the server refuses them all too)
   let shareOff = $derived(
-    $voiceChannel?.screen_share === false || (!!$voiceChannel && $voiceListenOnly.has($voiceChannel.channel_id)),
+    $voiceChannel?.screen_share === false ||
+      (!!$voiceChannel && $voiceListenOnly.has($voiceChannel.channel_id)) ||
+      !!$voiceRestriction?.voice,
   );
 
   // The browser client shares through WebCodecs + getDisplayMedia; a browser

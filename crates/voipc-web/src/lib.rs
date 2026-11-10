@@ -14,9 +14,10 @@ pub mod signal;
 
 use serde::Serialize;
 use voipc_crypto::file::FileError;
+use voipc_crypto::time::now_millis;
 use voipc_protocol::codec::{APP_VERSION, PROTOCOL_VERSION};
 use voipc_protocol::messages::ClientMessage;
-use voipc_protocol::types::PreKeyBundleData;
+use voipc_protocol::types::{PreKeyBundleData, UserInfo};
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen(start)]
@@ -45,6 +46,17 @@ fn uint8array(data: &[u8]) -> JsValue {
 
 // ── Protocol codec ───────────────────────────────────────────────────────
 
+/// Whether a guest's switch counts on a relay (`Authenticated.accounts`): a browser
+/// speaks only its own protocol, so never a relay too old to have the privilege.
+#[wasm_bindgen(js_name = guestMayShare)]
+pub fn guest_may_share(has_accounts: bool) -> bool {
+    voipc_protocol::types::may_share_history(
+        voipc_protocol::codec::PROTOCOL_VERSION,
+        has_accounts,
+        None,
+    )
+}
+
 #[wasm_bindgen(js_name = protocolVersion)]
 pub fn protocol_version() -> u32 {
     PROTOCOL_VERSION
@@ -62,7 +74,7 @@ pub fn app_version() -> String {
 #[wasm_bindgen(js_name = encodeClientMsg)]
 pub fn encode_client_msg(msg: JsValue) -> Result<Vec<u8>, JsError> {
     let msg: ClientMessage = serde_wasm_bindgen::from_value(msg)?;
-    Ok(postcard::to_allocvec(&msg)?)
+    Ok(voipc_protocol::codec::client_payload(&msg)?)
 }
 
 /// Decodes postcard bytes (no length prefix) into a `ServerMessage` object:
@@ -105,14 +117,6 @@ impl SignalClient {
     #[wasm_bindgen(js_name = setOwnUserId)]
     pub fn set_own_user_id(&mut self, user_id: u32) {
         self.core.set_own_user_id(user_id);
-    }
-
-    /// `OneTimePreKey[]` for `UploadPreKeys`, answering `PreKeysLow`.
-    #[wasm_bindgen(js_name = morePrekeys)]
-    pub fn more_prekeys(&mut self) -> Result<JsValue, JsError> {
-        Ok(serde_wasm_bindgen::to_value(
-            &self.core.more_prekeys().map_err(js_err)?,
-        )?)
     }
 
     /// PQXDH with a peer's `PreKeyBundleData` (as decoded from `ServerMessage.PreKeyBundle`).
@@ -245,11 +249,6 @@ impl SignalClient {
         self.core.keying.is_text(channel_id)
     }
 
-    #[wasm_bindgen(js_name = textChannels)]
-    pub fn text_channels(&self) -> Vec<u32> {
-        self.core.keying.text_channels()
-    }
-
     #[wasm_bindgen(js_name = setMembers)]
     pub fn set_members(&mut self, channel_id: u32, user_ids: Vec<u32>) {
         self.core.keying.set_members(channel_id, user_ids);
@@ -269,12 +268,6 @@ impl SignalClient {
     #[wasm_bindgen(js_name = othersIn)]
     pub fn others_in(&self, channel_id: u32, own_user_id: u32) -> Vec<u32> {
         self.core.keying.others_in(channel_id, own_user_id)
-    }
-
-    /// Subscribe to a text channel; `true` if it is new to us.
-    #[wasm_bindgen(js_name = joinTextChannel)]
-    pub fn join_text_channel(&mut self, channel_id: u32) -> bool {
-        self.core.keying.join_text(channel_id)
     }
 
     /// Start a channel's group keying from nothing, our own chain included.
@@ -343,6 +336,292 @@ impl SignalClient {
     pub fn media_key_minter(&self, channel_id: u32) -> Option<u32> {
         self.core.keying.media_key_minter(channel_id)
     }
+
+    // ── The live path (`voipc_crypto::channel_state`) ────────────────────
+    //
+    // Text channels, written once for both backends: session.ts sends and emits what
+    // `LiveOut` says, as network.rs does.
+
+    /// This connection is on the live path, from now.
+    #[wasm_bindgen(js_name = liveStart)]
+    pub fn live_start(&mut self) {
+        self.core.keying.live_start(now_millis());
+    }
+
+    #[wasm_bindgen(js_name = liveSetMetered)]
+    pub fn live_set_metered(&mut self, metered: bool) {
+        self.core.keying.live_set_metered(metered);
+    }
+
+    #[wasm_bindgen(js_name = liveSetQuiet)]
+    pub fn live_set_quiet(&mut self, channels: Vec<u32>, quiet: bool) {
+        self.core.keying.live_set_quiet(&channels, quiet);
+    }
+
+    /// Takes over what an earlier connection of this account kept.
+    #[wasm_bindgen(js_name = liveAdoptKept)]
+    pub fn live_adopt_kept(&mut self, kept: KeptSessions) {
+        self.core.keying.live_adopt_kept(kept.inner);
+    }
+
+    /// The pages of pins are out: no key job until `livePinsIn`.
+    #[wasm_bindgen(js_name = liveWaitForPins)]
+    pub fn live_wait_for_pins(&mut self) {
+        self.core.keying.live_wait_for_pins();
+    }
+
+    /// They came in: what waited for them, as `LiveOut`.
+    #[wasm_bindgen(js_name = livePinsIn)]
+    pub fn live_pins_in(&mut self, own_channel: u32) -> Result<JsValue, JsError> {
+        live_out(self.core.live_pins_in(own_channel, now_millis()))
+    }
+
+    /// Whether the pages of pins are still out.
+    #[wasm_bindgen(js_name = livePinsOut)]
+    pub fn live_pins_out(&self) -> bool {
+        self.core.keying.live_pins_out()
+    }
+
+    /// Whether this frame, as its postcard bytes, is held until they are in.
+    #[wasm_bindgen(js_name = liveHoldsFrame)]
+    pub fn live_holds_frame(&self, payload: &[u8]) -> bool {
+        self.core.keying.live_pins_out()
+            && voipc_protocol::codec::decode_server_msg(payload)
+                .is_ok_and(|msg| self.core.keying.live_holds_frame(&msg))
+    }
+
+    /// A bundle came: whether the live path has something to send over a session with them.
+    #[wasm_bindgen(js_name = liveBundleWanted)]
+    pub fn live_bundle_wanted(&self, user_id: u32, own_room: u32) -> bool {
+        self.core
+            .keying
+            .live_bundle_wanted(user_id, own_room, now_millis())
+    }
+
+    /// The connection ends: `[{ channel_id, expired }]`, the posts that waited, per channel.
+    #[wasm_bindgen(js_name = liveEnd)]
+    pub fn live_end(&mut self) -> Result<JsValue, JsError> {
+        let lost: Vec<_> = self
+            .core
+            .keying
+            .live_end()
+            .into_iter()
+            .map(|(channel_id, expired)| {
+                serde_json::json!({ "channel_id": channel_id, "expired": expired })
+            })
+            .collect();
+        plain(&serde_json::Value::Array(lost))
+    }
+
+    /// What this connection hands to the next: before `free`, which takes the stores.
+    #[wasm_bindgen(js_name = liveKeepSessions)]
+    pub fn live_keep_sessions(&mut self) -> KeptSessions {
+        KeptSessions {
+            inner: self.core.live_keep_sessions(now_millis()),
+        }
+    }
+
+    /// The rows of a list: `[{ user_id, identity }]`, those it is news of, each with the
+    /// identity its session runs on, if there is a session yet.
+    #[wasm_bindgen(js_name = liveNoteRows)]
+    pub fn live_note_rows(&mut self, users: JsValue) -> Result<JsValue, JsError> {
+        let users: Vec<UserInfo> = serde_wasm_bindgen::from_value(users)?;
+        let seen: Vec<_> = self
+            .core
+            .live_note_rows(&users)
+            .iter()
+            .map(|s| serde_json::json!({ "user_id": s.user_id, "identity": s.identity }))
+            .collect();
+        plain(&serde_json::Value::Array(seen))
+    }
+
+    /// A frame of the live path, as its postcard bytes: `LiveOut`.
+    #[wasm_bindgen(js_name = liveFrame)]
+    pub fn live_frame(&mut self, own_channel: u32, payload: &[u8]) -> Result<JsValue, JsError> {
+        let msg = voipc_protocol::codec::decode_server_msg(payload)?;
+        live_out(self.core.live_frame(own_channel, &msg, now_millis()))
+    }
+
+    /// A post in a text channel, as `envelope` packed it: `LiveOut`.
+    #[wasm_bindgen(js_name = livePost)]
+    pub fn live_post(&mut self, channel_id: u32, payload: Vec<u8>) -> Result<JsValue, JsError> {
+        let out = self
+            .core
+            .live_post(channel_id, payload, now_millis())
+            .map_err(|e| JsError::new(&e))?;
+        live_out(out)
+    }
+
+    /// Each second: `LiveOut`.
+    #[wasm_bindgen(js_name = liveTick)]
+    pub fn live_tick(&mut self) -> Result<JsValue, JsError> {
+        live_out(self.core.live_tick(now_millis()))
+    }
+
+    /// The next key frame's postcard bytes, if one may go now.
+    #[wasm_bindgen(js_name = liveNextFrame)]
+    pub fn live_next_frame(&mut self, in_call: bool) -> Result<Option<Vec<u8>>, JsError> {
+        self.core
+            .live_next_frame(now_millis(), in_call)
+            .map(|frame| postcard::to_allocvec(&frame).map_err(JsError::from))
+            .transpose()
+    }
+
+    #[wasm_bindgen(js_name = liveHasWork)]
+    pub fn live_has_work(&self) -> bool {
+        self.core.keying.live_has_work()
+    }
+
+    /// A session with `user_id` that both ends hold came up.
+    #[wasm_bindgen(js_name = liveSessionUp)]
+    pub fn live_session_up(&mut self, user_id: u32) {
+        self.core.keying.live_session_up(user_id);
+    }
+
+    /// A kept session whose peer's key disagrees with their pin goes.
+    #[wasm_bindgen(js_name = liveDropKeptSession)]
+    pub fn live_drop_kept_session(&mut self, user_id: u32) -> bool {
+        self.core.live_drop_kept_session(user_id)
+    }
+
+    #[wasm_bindgen(js_name = liveNoBundle)]
+    pub fn live_no_bundle(&mut self, user_id: u32) {
+        self.core.keying.live_no_bundle(user_id);
+    }
+
+    /// Ask for a channel's recent chat, sealed. Of `targets`, who was picked.
+    #[wasm_bindgen(js_name = liveAskHistory)]
+    pub fn live_ask_history(&mut self, channel_id: u32, targets: Vec<u32>) -> Vec<u32> {
+        self.core
+            .keying
+            .live_ask_history(channel_id, &targets, now_millis())
+    }
+
+    /// An answer sealed in the session the ask came through, as postcard bytes. The
+    /// messages cross as JSON text, for `historyPayload`'s reason.
+    #[wasm_bindgen(js_name = liveSealAnswer)]
+    pub fn live_seal_answer(
+        &mut self,
+        channel_id: u32,
+        target: u32,
+        messages_json: &str,
+    ) -> Result<Vec<u8>, JsError> {
+        let messages: serde_json::Value = serde_json::from_str(messages_json)
+            .map_err(|e| JsError::new(&format!("history messages are not JSON: {e}")))?;
+        let frame = self
+            .core
+            .live_seal_answer(channel_id, target, &messages, now_millis())
+            .map_err(js_err)?;
+        Ok(postcard::to_allocvec(&frame)?)
+    }
+
+    /// Whether an answer from `from` is one we asked for, which it uses up.
+    #[wasm_bindgen(js_name = liveAnswerWanted)]
+    pub fn live_answer_wanted(&mut self, channel_id: u32, from: u32) -> bool {
+        self.core
+            .keying
+            .live_answer_wanted(channel_id, from, now_millis())
+    }
+
+    /// A plain ask went for this channel (the new-member wait refuses a sealed one).
+    #[wasm_bindgen(js_name = liveNoteAsked)]
+    pub fn live_note_asked(&mut self, channel_id: u32, from: u32) {
+        self.core
+            .keying
+            .live_note_asked(channel_id, from, now_millis());
+    }
+
+    /// Whether the relay's "not delivered" is about a hand-off, which nobody is to see.
+    #[wasm_bindgen(js_name = liveUndeliveredWasSealed)]
+    pub fn live_undelivered_was_sealed(&mut self, target: u32) -> bool {
+        self.core
+            .keying
+            .live_undelivered_was_sealed(target, now_millis())
+    }
+
+    /// A person's answer to `key-job-ask`: `LiveOut`.
+    #[wasm_bindgen(js_name = liveAnswerJob)]
+    pub fn live_answer_job(&mut self, channel_id: u32, go: bool) -> Result<JsValue, JsError> {
+        live_out(self.core.live_answer_job(channel_id, go, now_millis()))
+    }
+}
+
+/// Sessions with accounts, between one connection of an account to a server and its next.
+/// They stay in this page's memory (`voipc_crypto::KeptSessions`).
+#[wasm_bindgen]
+pub struct KeptSessions {
+    inner: voipc_crypto::KeptSessions,
+}
+
+/// A JSON value as plain JS objects: by default an object comes out as a `Map`.
+fn plain(v: &serde_json::Value) -> Result<JsValue, JsError> {
+    Ok(v.serialize(&serde_wasm_bindgen::Serializer::json_compatible())?)
+}
+
+/// `LiveOut` for the page: `{ send: Uint8Array[], emit: { name, payload }[], seen: { user_id,
+/// account, name, identity }[], check: { user_id, key }[], made: number[], gone: number[],
+/// entered: number[], gated: number[], gated_people: number[][], work: boolean }`.
+fn live_out(out: voipc_crypto::LiveOut) -> Result<JsValue, JsError> {
+    let send = js_sys::Array::new();
+    for frame in &out.send {
+        send.push(&uint8array(&postcard::to_allocvec(frame)?));
+    }
+    let emit: Vec<_> = out
+        .emit
+        .iter()
+        .map(|(name, payload)| serde_json::json!({ "name": name, "payload": payload }))
+        .collect();
+    let seen: Vec<_> = out
+        .seen
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "user_id": s.user_id,
+                "account": s.account,
+                "name": s.name,
+                "identity": s.identity,
+            })
+        })
+        .collect();
+    let check: Vec<_> = out
+        .check
+        .iter()
+        .map(|(user_id, key)| serde_json::json!({ "user_id": user_id, "key": key }))
+        .collect();
+    Ok(js_object(&[
+        ("send", send.into()),
+        ("emit", plain(&serde_json::Value::Array(emit))?),
+        ("seen", plain(&serde_json::Value::Array(seen))?),
+        ("check", plain(&serde_json::Value::Array(check))?),
+        ("made", js_sys::Uint32Array::from(&out.made[..]).into()),
+        ("gone", js_sys::Uint32Array::from(&out.gone[..]).into()),
+        (
+            "entered",
+            js_sys::Uint32Array::from(&out.entered[..]).into(),
+        ),
+        ("gated", js_sys::Uint32Array::from(&out.gated[..]).into()),
+        ("gated_people", plain(&serde_json::json!(out.gated_people))?),
+        ("work", JsValue::from_bool(out.work)),
+    ]))
+}
+
+/// A direct message's plaintext, if it is a history hand-off, before anything could show it:
+/// `{ ask: channelId }`, `{ answer: channelId, messages }` or `{ unreadable: true }`.
+#[wasm_bindgen(js_name = openSealed)]
+pub fn open_sealed(plaintext: &[u8]) -> JsValue {
+    use voipc_crypto::Sealed;
+    match voipc_crypto::open_sealed(plaintext) {
+        None => JsValue::UNDEFINED,
+        Some(Sealed::Ask { channel_id }) => js_object(&[("ask", JsValue::from(channel_id))]),
+        Some(Sealed::Answer {
+            channel_id,
+            messages,
+        }) => js_object(&[
+            ("answer", JsValue::from(channel_id)),
+            ("messages", as_js(Some(messages))),
+        ]),
+        Some(Sealed::Unreadable) => js_object(&[("unreadable", JsValue::TRUE)]),
+    }
 }
 
 // ── Message envelopes and history payloads ───────────────────────────────
@@ -352,6 +631,12 @@ impl SignalClient {
 #[wasm_bindgen(js_name = controlMsgsPerSec)]
 pub fn control_msgs_per_sec() -> u32 {
     voipc_protocol::codec::CONTROL_MSGS_PER_SEC
+}
+
+/// Frames a host holds for the pages of pins, the oldest going past this.
+#[wasm_bindgen(js_name = pinHeldMost)]
+pub fn pin_held_most() -> usize {
+    voipc_crypto::channel_state::PIN_HELD_MOST
 }
 
 /// Largest opaque blob the relay will re-wrap and forward.
@@ -437,7 +722,7 @@ fn as_js<T: serde::Serialize>(v: Option<T>) -> JsValue {
 
 /// `{ id: string | null, text: string, ttl_secs: number | null,
 /// reply_to: string | null, thread: string | null, file: FileRef | null,
-/// fwd: {name, at} | null, event: {kind, target, emoji?, on?} | null }` from a
+/// fwd: {name, at, report?} | null, event: {kind, target, emoji?, on?} | null }` from a
 /// received message.
 #[wasm_bindgen(js_name = openEnvelope)]
 pub fn open_envelope(plaintext: &[u8]) -> JsValue {

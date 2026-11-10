@@ -1,5 +1,7 @@
-use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{
+    AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+};
 use std::sync::{Arc, PoisonError};
 
 use bytes::BytesMut;
@@ -31,8 +33,8 @@ use voipc_protocol::video::{
 use voipc_protocol::voice::{PositionPayload, VoicePacket, VoicePacketType};
 
 use crate::app_state::{
-    encrypt_group, encrypt_pairwise, ActiveConnection, AppState, LossTally, PendingTarget,
-    SdkEvent, SignalState,
+    encrypt_group, encrypt_pairwise, with_keys, ActiveConnection, AppState, LossTally,
+    PendingTarget, SdkEvent, SignalState,
 };
 use crate::screenshare;
 use crate::transport::CONNECT_TIMEOUT;
@@ -149,7 +151,7 @@ pub async fn connect_to_server(
             )
             .await
             .map(|(user_id, session_id, link, files, emotes)| {
-                (user_id, session_id, Some(link), files, emotes)
+                (user_id, session_id, Some(link), files, emotes, false)
             }),
             None => guest_sign_in(
                 &app_handle,
@@ -162,7 +164,9 @@ pub async fn connect_to_server(
                 proto,
             )
             .await
-            .map(|(user_id, session_id, files, emotes)| (user_id, session_id, None, files, emotes)),
+            .map(|(user_id, session_id, files, emotes, may_share)| {
+                (user_id, session_id, None, files, emotes, may_share)
+            }),
         };
         match attempt {
             Ok(session) => break (conn, control_send, control_recv, buf, session),
@@ -174,7 +178,7 @@ pub async fn connect_to_server(
             Err(Refusal::Failed(e)) => return Err(e),
         }
     };
-    let (user_id, session_id, account, file_limits, emote_access) = session;
+    let (user_id, session_id, account, file_limits, emote_access, guest_may_share) = session;
 
     info!(user_id, session_id, "authenticated with server");
     // Whether this relay keeps files, and how large: the composer's to know
@@ -208,6 +212,36 @@ pub async fn connect_to_server(
         // libsignal binds both parties' ids into every pairwise message
         if let Some(stores) = sig.stores.as_mut() {
             stores.own_user_id = user_id;
+        }
+        if proto >= LIVE_PATH_SINCE {
+            sig.channels.live_start(voipc_crypto::time::now_millis());
+            sig.channels
+                .live_set_metered(state.metered.load(Ordering::Relaxed));
+            // What the last connection of this account here kept. A guest keeps nothing.
+            if let Some(link) = &account {
+                let key = (address.clone(), link.session().account_id());
+                let kept = state
+                    .kept_sessions
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&key);
+                if let Some(kept) = kept {
+                    sig.channels.live_adopt_kept(kept);
+                }
+                let kept = state
+                    .kept_pins
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&key);
+                let mut session = link.session();
+                if let Some(kept) = kept {
+                    session.adopt_pins(kept);
+                }
+                // No key job until what it checks against is here
+                if !session.pins_in() {
+                    sig.channels.live_wait_for_pins();
+                }
+            }
         }
     }
 
@@ -365,7 +399,11 @@ pub async fn connect_to_server(
         emote_access,
         tcp_tx.clone(),
     ));
-    let writer_handle = tokio::spawn(control_writer_task(control_send, tcp_rx));
+    let writer_handle = tokio::spawn(control_writer_task(
+        control_send,
+        tcp_rx,
+        tcp_tx.queued.clone(),
+    ));
     let reader_handle = tokio::spawn(control_reader_task(
         control_recv,
         buf,
@@ -390,6 +428,16 @@ pub async fn connect_to_server(
         account.clone(),
         files.clone(),
     ));
+    let live_handle = (proto >= LIVE_PATH_SINCE).then(|| {
+        tokio::spawn(live_task(
+            app_handle.clone(),
+            server.clone(),
+            signal.clone(),
+            tcp_tx.clone(),
+            is_voice.clone(),
+            account.clone(),
+        ))
+    });
     if let Some(link) = &account {
         crate::account::after_connect(&app_handle, &address, link, &tcp_tx).await;
         tokio::spawn(crate::account::tick_task(
@@ -501,8 +549,13 @@ pub async fn connect_to_server(
 
     // Store the active connection
     let tcp = tcp_tx.clone();
+    // A provider's sign-in only knows now who it is
+    let username = account
+        .as_ref()
+        .map_or(username, |link| link.session().name().to_string());
     let connection = ActiveConnection {
         account: account.clone(),
+        guest_may_share,
         files,
         user_id,
         username,
@@ -533,6 +586,7 @@ pub async fn connect_to_server(
         ]
         .into_iter()
         .chain(congestion_handle)
+        .chain(live_handle)
         .collect(),
         transmitting,
         capture_task: None,
@@ -574,6 +628,7 @@ pub async fn connect_to_server(
         spatial,
         channels: channels_snapshot,
     };
+    let may_share = connection.may_share();
 
     state
         .connections
@@ -589,8 +644,9 @@ pub async fn connect_to_server(
         let _ = send_tcp_message(&tcp, &ClientMessage::SetDeafened { deafened: true }).await;
     }
     // ...and whether we answer requests for recent chat, so the people here
-    // can see who asking would reach.
-    let enabled = state.config().share_channel_history;
+    // can see who asking would reach. A switch that does not count here reads as
+    // off: the relay is not told it is on.
+    let enabled = state.config().share_channel_history && may_share;
     let _ = send_tcp_message(&tcp, &ClientMessage::SetHistorySharing { enabled }).await;
 
     Ok(user_id)
@@ -612,6 +668,8 @@ pub async fn teardown(
     if clear_voice(state, server) {
         release_holds(app);
     }
+    tell_undelivered(app, server, &connection);
+    keep_sessions(state, server, &connection);
 
     // Stop any ongoing voice and screen capture. Bounded, as `stop_capture`
     // is: a wedged device must not hang the disconnect — and with it, through
@@ -664,6 +722,72 @@ pub async fn teardown(
     connection.conn.close().await;
 }
 
+/// Posts that waited for a check, a person's answer or the pins go with the connection, and
+/// they showed as sent. By name: the page has forgotten this connection's ids by now.
+fn tell_undelivered(app: &tauri::AppHandle, server: &str, connection: &ActiveConnection) {
+    let lost = connection
+        .signal
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .channels
+        .live_end();
+    if lost.is_empty() {
+        return;
+    }
+    let channels = connection
+        .channels
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    for (channel_id, expired) in lost {
+        let name = channels
+            .iter()
+            .find(|c| c.channel_id == channel_id)
+            .map(|c| c.name.as_str());
+        emit_server(
+            app,
+            server,
+            "channel-undelivered",
+            serde_json::json!({ "channel_id": channel_id, "expired": expired, "name": name }),
+        );
+    }
+}
+
+/// An account's sessions, for its next connection to this server. They stay in memory, a
+/// week at most: a disconnect the person chose wipes them (`commands::disconnect`).
+fn keep_sessions(state: &AppState, server: &str, connection: &ActiveConnection) {
+    let Some(link) = &connection.account else {
+        return;
+    };
+    if connection.tcp_tx.proto() < LIVE_PATH_SINCE {
+        return;
+    }
+    let now = voipc_crypto::time::now_millis();
+    let mut sig = connection
+        .signal
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let SignalState {
+        stores, channels, ..
+    } = &mut *sig;
+    let Some(stores) = stores.as_ref() else {
+        return;
+    };
+    let kept = channels.live_keep_sessions(stores, now);
+    let account = link.session().account_id();
+    state
+        .kept_sessions
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert((server.to_string(), account), kept);
+    if let Some(pins) = link.session().keep_pins() {
+        state
+            .kept_pins
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert((server.to_string(), account), pins);
+    }
+}
+
 /// Forget that `server` holds voice, if it does. Returns whether it did.
 fn clear_voice(state: &AppState, server: &str) -> bool {
     let mut voice = state
@@ -700,6 +824,21 @@ fn end_screen_share(c: &mut ActiveConnection) -> bool {
     c.capture_session = None;
     c.watching_user_id = None;
     std::mem::replace(&mut c.is_screen_sharing, false)
+}
+
+/// How we hear each person, on a connection leaving voice: a user id is somebody
+/// else next time. The mixer's stores forget them at this point too (`clearMixer`),
+/// so someone left silent here would stay so with the UI at 100%. Not on a move
+/// between this server's rooms. `audio.attach` does the same in the browser.
+fn forget_people(c: &ActiveConnection) {
+    c.user_volumes
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
+    c.user_fx
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
 }
 
 /// This connection's server confirmed a voice channel: voice is here now.
@@ -739,6 +878,7 @@ async fn claim_voice(app: &tauri::AppHandle, server: &str, is_voice: &Arc<Atomic
         if other.watching_user_id_shared.swap(0, Ordering::Relaxed) != 0 {
             let _ = send_tcp_message(&other.tcp_tx, &ClientMessage::StopWatchingScreenShare).await;
         }
+        forget_people(other);
         // A game driving the old room is detached now, before this claim
         // lets a `hello` waiting on this server return and subscribe afresh.
         // Left for the old server's leave to do, the Detached would land on
@@ -790,6 +930,7 @@ async fn leave_voice(
         .filter(|c| Arc::ptr_eq(&c.is_voice, is_voice))
     {
         end_screen_share(c);
+        forget_people(c);
     }
     if clear_voice(&state, server) {
         release_holds(app);
@@ -868,7 +1009,7 @@ async fn guest_sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
     control_recv: &mut R,
     buf: &mut BytesMut,
     proto: u32,
-) -> Result<(u32, u32, Option<FileLimits>, Option<EmoteAccess>), Refusal> {
+) -> Result<(u32, u32, Option<FileLimits>, Option<EmoteAccess>, bool), Refusal> {
     let (identity_key, prekey_bundle) = {
         let bundle = init_signal(signal, &voipc_crypto::generate_identity_key_pair())?;
         (Some(bundle.identity_key.clone()), Some(bundle))
@@ -915,11 +1056,20 @@ async fn guest_sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
                     emotes,
                     ..
                 } => {
+                    // A guest holds no privileges, so where there are accounts their
+                    // switch does not count.
+                    let may_share = may_share_history(proto, accounts.is_some(), None);
+                    emit_server(
+                        app_handle,
+                        address,
+                        "share-right",
+                        serde_json::json!({ "may": may_share }),
+                    );
                     // A guest on a relay with accounts: the UI can offer one.
                     if let Some(accounts) = accounts {
                         emit_server(app_handle, address, "relay-accounts", accounts);
                     }
-                    return Ok((user_id, session_id, files, emotes));
+                    return Ok((user_id, session_id, files, emotes, may_share));
                 }
                 ServerMessage::AuthError { reason } => {
                     return Err(format!("Authentication failed: {}", reason).into());
@@ -948,11 +1098,17 @@ async fn guest_sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
 pub struct ControlTx {
     tx: mpsc::UnboundedSender<Vec<u8>>,
     proto: u32,
+    /// Frames queued and not yet written: `drained`.
+    queued: Arc<AtomicUsize>,
 }
 
 impl ControlTx {
     pub fn new(tx: mpsc::UnboundedSender<Vec<u8>>, proto: u32) -> Self {
-        Self { tx, proto }
+        Self {
+            tx,
+            proto,
+            queued: Arc::default(),
+        }
     }
 
     pub fn proto(&self) -> u32 {
@@ -964,6 +1120,20 @@ impl ControlTx {
         self.tx.is_closed()
     }
 
+    /// Everything queued so far is on its way. A key job waits for this between frames, so
+    /// a seat or a post queued behind it waits for one key frame at most, with no lanes.
+    pub async fn drained(&self) {
+        while self.queued.load(Ordering::Relaxed) > 0 && !self.is_closed() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Done when the connection's writer has gone.
+    #[cfg(not(target_os = "android"))]
+    pub async fn closed(&self) {
+        self.tx.closed().await
+    }
+
     /// Queues `msg`, one entry per frame so the pacer counts what the relay
     /// does. A message the relay's protocol lacks is refused here.
     pub fn send(&self, msg: &ClientMessage) -> Result<(), String> {
@@ -972,6 +1142,7 @@ impl ControlTx {
             format!("Failed to encode message: {e}")
         })?;
         for frame in frames {
+            self.queued.fetch_add(1, Ordering::Relaxed);
             self.tx
                 .send(frame)
                 .map_err(|_| "TCP send channel closed".to_string())?;
@@ -993,7 +1164,7 @@ pub async fn send_tcp_message(tcp_tx: &ControlTx, msg: &ClientMessage) -> Result
     tcp_tx.send(msg)
 }
 
-fn parse_address(address: &str) -> Result<(String, u16), String> {
+pub(crate) fn parse_address(address: &str) -> Result<(String, u16), String> {
     let (host, port_str) = if address.starts_with('[') {
         // IPv6: [::1]:9987
         let bracket_end = address
@@ -1084,6 +1255,7 @@ impl ControlPacer {
 async fn control_writer_task<W: AsyncWrite + Unpin>(
     mut write_half: W,
     mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    queued: Arc<AtomicUsize>,
 ) {
     let mut pacer = ControlPacer::new(tokio::time::Instant::now());
     while let Some(data) = rx.recv().await {
@@ -1092,6 +1264,7 @@ async fn control_writer_task<W: AsyncWrite + Unpin>(
             error!("control write error: {}", e);
             break;
         }
+        queued.fetch_sub(1, Ordering::Relaxed);
     }
     info!("control writer task ended");
 }
@@ -1126,6 +1299,8 @@ async fn control_reader_task<R: AsyncRead + Unpin>(
     files: Arc<crate::files::Files>,
 ) {
     let mut inbound = Inbound::new(std::time::Instant::now());
+    // What waits for the pages of pins (`voipc_crypto::waits_for_pins`), in order
+    let mut pin_held = VecDeque::<ServerMessage>::new();
     'read: loop {
         match read_half.read_buf(&mut buf).await {
             Ok(0) => {
@@ -1145,7 +1320,7 @@ async fn control_reader_task<R: AsyncRead + Unpin>(
                     &app_handle,
                     &server,
                     "connection-lost",
-                    serde_json::json!({"reason": format!("Connection lost: {}", e)}),
+                    serde_json::json!({"reason": e.to_string()}),
                 );
                 break;
             }
@@ -1165,39 +1340,63 @@ async fn control_reader_task<R: AsyncRead + Unpin>(
                         break 'read;
                     }
                     Ok(msg) if crate::files::is_file_message(&msg) => files.on_message(msg),
+                    Ok(msg)
+                        if signal
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .channels
+                            .live_holds_frame(&msg) =>
+                    {
+                        if pin_held.len() >= voipc_crypto::channel_state::PIN_HELD_MOST {
+                            pin_held.pop_front();
+                        }
+                        pin_held.push_back(msg);
+                    }
                     Ok(msg) => {
-                        handle_server_message(
-                            msg,
-                            &app_handle,
-                            &media_key,
-                            &channel_id,
-                            &signal,
-                            &tcp_tx,
-                            own_user_id,
-                            &screen_share_active,
-                            &watching_user_id_shared,
-                            &watching_codec,
-                            &share_loss_ms,
-                            &share_loss_tally,
-                            &share_viewers,
-                            &spatial,
-                            &channels_snapshot,
-                            &server,
-                            &is_voice,
-                            &voice_asked_at,
-                            &transmitting,
-                            account.as_deref(),
-                        )
-                        .await;
-                        crate::account::check_seen(
-                            &app_handle,
-                            &server,
-                            account.as_deref(),
-                            &signal,
-                            &tcp_tx,
-                        )
-                        .await;
-                        drain_ready_dms(&signal, &tcp_tx, (&app_handle, &server)).await;
+                        let mut due = VecDeque::from([msg]);
+                        while let Some(msg) = due.pop_front() {
+                            handle_server_message(
+                                msg,
+                                &app_handle,
+                                &media_key,
+                                &channel_id,
+                                &signal,
+                                &tcp_tx,
+                                own_user_id,
+                                &screen_share_active,
+                                &watching_user_id_shared,
+                                &watching_codec,
+                                &share_loss_ms,
+                                &share_loss_tally,
+                                &share_viewers,
+                                &spatial,
+                                &channels_snapshot,
+                                &server,
+                                &is_voice,
+                                &voice_asked_at,
+                                &transmitting,
+                                account.as_deref(),
+                            )
+                            .await;
+                            crate::account::check_seen(
+                                &app_handle,
+                                &server,
+                                account.as_deref(),
+                                &signal,
+                                &tcp_tx,
+                            )
+                            .await;
+                            drain_ready_dms(&signal, &tcp_tx, (&app_handle, &server)).await;
+                            let sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
+                            // A session a queued ask waited for may have come up
+                            if sig.channels.live_has_work() {
+                                sig.live_wake.notify_one();
+                            }
+                            // The pages came in: what waited for them, after the key frames
+                            if !pin_held.is_empty() && !sig.channels.live_pins_out() {
+                                due.append(&mut pin_held);
+                            }
+                        }
                     }
                     Err(e) => warn!("failed to decode server message: {}", e),
                 },
@@ -1482,6 +1681,7 @@ async fn handle_server_message(
     // Everything a game hears about comes from the voice connection only: a
     // user id here means nothing on the server the game is playing on.
     let in_voice = || is_voice.load(Ordering::Relaxed);
+    let live = tcp_tx.proto() >= LIVE_PATH_SINCE;
     // Who is which account, for the pins and for keeping copies of direct
     // messages. The server never sends an account behind a pseudonym, so an
     // anonymous channel adds nothing here.
@@ -1495,6 +1695,18 @@ async fn handle_server_message(
     if let Some(link) = account {
         let a = link.session().note_roster(seen);
         crate::account::run(app_handle, server, tcp_tx, a).await;
+    }
+    // A bare id in `KeysOwed` goes by these, and a first sight is checked against the pins
+    if live && !seen.is_empty() {
+        let first = with_keys(signal, |stores, keying| keying.live_note_rows(stores, seen));
+        if let Some(link) = account {
+            for row in first.unwrap_or_default() {
+                if let Some(key) = row.identity {
+                    let a = link.session().check_identity(row.user_id, &key);
+                    crate::account::run(app_handle, server, tcp_tx, a).await;
+                }
+            }
+        }
     }
     match msg {
         ServerMessage::VideoLossReported {
@@ -1530,6 +1742,93 @@ async fn handle_server_message(
                 );
             }
         }
+        ServerMessage::ChannelLayout {
+            categories,
+            channels,
+        } => {
+            emit_server(
+                app_handle,
+                server,
+                "channel-layout",
+                serde_json::json!({ "categories": categories, "channels": channels }),
+            );
+        }
+        ServerMessage::Profiles { profiles } => {
+            emit_server(app_handle, server, "profiles", &profiles);
+        }
+        ServerMessage::ProfilePicture { hash, image } => {
+            emit_server(
+                app_handle,
+                server,
+                "profile-picture",
+                serde_json::json!({ "hash": hash, "image": image }),
+            );
+        }
+        ServerMessage::ServerProfile {
+            name,
+            description,
+            icon,
+        } => {
+            emit_server(
+                app_handle,
+                server,
+                "server-profile",
+                serde_json::json!({ "name": name, "description": description, "icon": icon }),
+            );
+        }
+        ServerMessage::MentionPower { user_ids, on } => {
+            emit_server(
+                app_handle,
+                server,
+                "mention-power",
+                serde_json::json!({ "user_ids": user_ids, "on": on }),
+            );
+        }
+        ServerMessage::Restrictions { list } => {
+            if let Some(own) = list.iter().find(|row| row.user_id == own_user_id) {
+                let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
+                sig.direct_held = own.direct;
+            }
+            emit_server(
+                app_handle,
+                server,
+                "restrictions",
+                serde_json::json!({ "list": list }),
+            );
+        }
+        ServerMessage::ChatMods { mods } => {
+            emit_server(
+                app_handle,
+                server,
+                "chat-mods",
+                serde_json::json!({ "mods": mods }),
+            );
+        }
+        ServerMessage::PostsHidden { marks } => {
+            emit_server(
+                app_handle,
+                server,
+                "posts-hidden",
+                serde_json::json!({ "marks": marks }),
+            );
+        }
+        ServerMessage::ReportTakers { takers } => {
+            if let Some(link) = account {
+                link.session().note_takers(&takers);
+            }
+            emit_server(
+                app_handle,
+                server,
+                "report-takers",
+                serde_json::json!({ "takers": takers }),
+            );
+        }
+        ServerMessage::MyBadges { badges } => {
+            emit_server(app_handle, server, "my-badges", &badges);
+        }
+        ServerMessage::GroupStyles { groups } => {
+            emit_server(app_handle, server, "group-styles", &groups);
+        }
         ServerMessage::ChannelList { channels } => {
             set_channels(channels_snapshot, channels.clone());
             apply_channel_proximity(
@@ -1541,6 +1840,27 @@ async fn handle_server_message(
                 is_voice,
             );
             emit_server(app_handle, server, "channel-list", &channels);
+        }
+        // A list too long for one frame. The front end hears it at its end, whole, so a reader
+        // of `channel-list` needs to know of no frames.
+        ServerMessage::ChannelListMore { channels, more } => {
+            let whole = signal
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .channel_parts
+                .take(channels, more);
+            if let Some(whole) = whole {
+                set_channels(channels_snapshot, whole.clone());
+                apply_channel_proximity(
+                    spatial,
+                    channels_snapshot,
+                    channel_id_store.load(Ordering::Relaxed),
+                    app_handle,
+                    server,
+                    is_voice,
+                );
+                emit_server(app_handle, server, "channel-list", &whole);
+            }
         }
         ServerMessage::UserList { channel_id, users } => {
             // In a channel with a log: keep it (with cloud copies on), and
@@ -1564,6 +1884,17 @@ async fn handle_server_message(
             // of the channel-change teardown below applies — no media key, no
             // room, no screen share, and the channel we stand in is untouched.
             if is_text_channel(channels_snapshot, channel_id) {
+                // On the live path no key work starts from a list: only who it names, and
+                // only so it can be drawn.
+                if live {
+                    emit_server(
+                        app_handle,
+                        server,
+                        "user-list",
+                        serde_json::json!({"channel_id": channel_id, "users": users}),
+                    );
+                    return;
+                }
                 let newly = {
                     let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
                     let newly = sig.channels.join_text(channel_id);
@@ -1691,7 +2022,15 @@ async fn handle_server_message(
                     } = &mut *sig;
                     channels.reset_channel(stores.as_mut(), own_user_id, channel_id);
                     // Ask the members who share, as each one's key arrives
-                    let sources = history_sources_of(&users, own_user_id);
+                    let anonymous = channels_snapshot.lock().is_ok_and(|list| {
+                        list.iter()
+                            .any(|c| c.channel_id == channel_id && c.anonymous)
+                    });
+                    let sources = if anonymous {
+                        HashSet::new()
+                    } else {
+                        history_sources_of(&users, own_user_id)
+                    };
                     sig.channels.want_history_from(channel_id, sources);
                 }
                 info!(old_ch, channel_id, "channel changed via UserList");
@@ -1749,7 +2088,9 @@ async fn handle_server_message(
             // Auto-request prekey bundles for users we don't have sessions with.
             // This must happen for ALL channels (including Channel 0) because
             // pairwise sessions are needed for DMs and pokes, not just channel chat.
-            request_prekey_bundles_for_users(&users, own_user_id, signal, tcp_tx).await;
+            if asks_bundles(live, channel_id, channel_id) {
+                request_prekey_bundles_for_users(&users, own_user_id, signal, tcp_tx).await;
+            }
 
             // Media keys never touch the server: one member of a channel
             // generates one; everyone else receives it from an existing member
@@ -1793,7 +2134,8 @@ async fn handle_server_message(
         }
         ServerMessage::UserJoined { ref user } => {
             // Auto-request prekey bundle for new user (all channels, needed for DMs/pokes)
-            if user.user_id != own_user_id {
+            let own_room = channel_id_store.load(Ordering::Relaxed);
+            if user.user_id != own_user_id && asks_bundles(live, user.channel_id, own_room) {
                 request_prekey_bundles_for_users(
                     std::slice::from_ref(user),
                     own_user_id,
@@ -1815,8 +2157,11 @@ async fn handle_server_message(
                 // this a channel we are in? (It used to be "do we hold a
                 // roster for it", which is the same answer by a different
                 // route — one question, one predicate.)
+                // Not a text channel on the live path: a key goes there only to who a
+                // check named, never because a relay said someone joined.
                 if user.user_id != own_user_id
                     && sig.channels.in_channel(own_channel, user.channel_id)
+                    && (!live || user.channel_id == own_channel)
                 {
                     sig.channels.add_member(user.channel_id, user.user_id);
                     sig.established_sessions.contains(&user.user_id)
@@ -2151,8 +2496,7 @@ async fn handle_server_message(
                         // If PreKeySignalMessage, mark session as established
                         if message_type == 1 {
                             let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
-                            sig.established_sessions.insert(from_user_id);
-                            sig.pending_sessions.remove(&from_user_id);
+                            sig.session_up(from_user_id);
                         }
                         String::from_utf8_lossy(&plaintext).to_string()
                     }
@@ -2280,6 +2624,27 @@ async fn handle_server_message(
                 let a = link.session().check_identity(user_id, &bundle.identity_key);
                 crate::account::run(app_handle, server, tcp_tx, a).await;
             }
+            // Verify's, or what it was for has run out. Nothing to send means no session
+            // (`live_bundle_wanted`)
+            let wanted = !live || {
+                let sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
+                let now = voipc_crypto::time::now_millis();
+                sig.pending_messages.iter().any(|m| m.fresh_for(user_id))
+                    || sig.channels.live_bundle_wanted(
+                        user_id,
+                        channel_id_store.load(Ordering::Relaxed),
+                        now,
+                    )
+            };
+            if !wanted {
+                signal
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .pending_sessions
+                    .remove(&user_id);
+                drain_pending_dms(user_id, signal, tcp_tx, (app_handle, server)).await;
+                return;
+            }
             handle_prekey_bundle(
                 user_id,
                 &bundle,
@@ -2300,11 +2665,16 @@ async fn handle_server_message(
             // Remove from pending so we don't loop
             let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
             sig.pending_sessions.remove(&user_id);
+            sig.channels.live_no_bundle(user_id);
             // What waited for that session is going nowhere, and looks sent.
             // It need not mean they left: the request may be what was refused.
             let before = sig.pending_messages.len();
             sig.pending_messages.retain(|m| {
-                !matches!(m.target, PendingTarget::Direct { target_user_id } if target_user_id == user_id)
+                !matches!(
+                    m.target,
+                    PendingTarget::Direct { target_user_id } | PendingTarget::Poke { target_user_id }
+                        if target_user_id == user_id
+                )
             });
             let expired = before - sig.pending_messages.len();
             drop(sig);
@@ -2317,6 +2687,21 @@ async fn handle_server_message(
                     serde_json::json!({"user_id": user_id, "expired": expired, "kept": kept}),
                 );
             }
+        }
+        // During a key job they wait for its end: a refill per 50 hellos is a fifth on top
+        // of the job's own upload
+        ServerMessage::PreKeysLow { .. } if live => {
+            run_live_frame(
+                &msg,
+                app_handle,
+                server,
+                tcp_tx,
+                signal,
+                account,
+                channel_id_store,
+                channels_snapshot,
+            )
+            .await;
         }
         ServerMessage::PreKeysLow { .. } => {
             // The relay has handed out most of our one-time pre-keys
@@ -2335,6 +2720,15 @@ async fn handle_server_message(
             }
         }
         ServerMessage::DirectMessageUndelivered { target_user_id } => {
+            // About a hand-off: nobody wrote anything to anyone
+            let sealed = signal
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .channels
+                .live_undelivered_was_sealed(target_user_id, voipc_crypto::time::now_millis());
+            if sealed {
+                return;
+            }
             // Between two accounts with cloud copies on, it went into the stored
             // log as well (send_direct_message): they read it when they are back.
             let kept = account.is_some_and(|l| l.session().kept_for(target_user_id));
@@ -2467,6 +2861,44 @@ async fn handle_server_message(
                 serde_json::json!({"bans": bans}),
             );
         }
+        // The live path's frames (protocol 21): `ChannelKeying` says what each comes to
+        ServerMessage::TextJoined { .. }
+        | ServerMessage::KeysOwed { .. }
+        | ServerMessage::SessionAsked { .. }
+        | ServerMessage::SessionHello { .. }
+        | ServerMessage::TextKeyReceived { .. }
+        | ServerMessage::KeyWanted { .. }
+        | ServerMessage::ChannelPage { .. }
+        | ServerMessage::ChannelMarks { .. }
+        | ServerMessage::Evicted { .. }
+        | ServerMessage::ChannelExits { .. }
+        | ServerMessage::TextPost { .. }
+        | ServerMessage::MemberGone { .. } => {
+            run_live_frame(
+                &msg,
+                app_handle,
+                server,
+                tcp_tx,
+                signal,
+                account,
+                channel_id_store,
+                channels_snapshot,
+            )
+            .await;
+        }
+        ServerMessage::AdminBansPaged {
+            search,
+            offset,
+            total,
+            bans,
+        } => {
+            emit_server(
+                app_handle,
+                server,
+                "admin-bans-page",
+                serde_json::json!({"search": search, "offset": offset, "total": total, "bans": bans}),
+            );
+        }
         ServerMessage::Disconnected { reason } => {
             // The server closes the socket next; the UI must not auto-reconnect
             info!("disconnected by server: {}", reason);
@@ -2510,7 +2942,20 @@ async fn handle_server_message(
             );
         }
         ServerMessage::Account(reply) => match account {
-            Some(link) => crate::account::on_reply(app_handle, server, link, tcp_tx, reply).await,
+            Some(link) => {
+                crate::account::on_reply(app_handle, server, link, tcp_tx, reply).await;
+                // The pages of pins came in: the key jobs that waited for them
+                if link.session().take_pins_in() {
+                    let own_channel = channel_id_store.load(Ordering::Relaxed);
+                    let now = voipc_crypto::time::now_millis();
+                    let out = with_keys(signal, |stores, keying| {
+                        keying.live_pins_in(stores, own_channel, now)
+                    });
+                    if let Some(out) = out {
+                        run_live(app_handle, server, tcp_tx, signal, account, out).await;
+                    }
+                }
+            }
             None => debug!("account reply on a guest connection, ignoring"),
         },
         ServerMessage::Authenticated { .. }
@@ -2528,6 +2973,174 @@ async fn handle_server_message(
         | ServerMessage::EmoteList { .. }
         | ServerMessage::EmoteTicket { .. }
         | ServerMessage::EmoteError { .. } => {}
+    }
+}
+
+/// What the live path asked for: the pins checked first, then its frames and events.
+pub(crate) async fn run_live(
+    app_handle: &tauri::AppHandle,
+    server: &str,
+    tcp_tx: &ControlTx,
+    signal: &std::sync::Mutex<SignalState>,
+    account: Option<&crate::account::AccountLink>,
+    out: voipc_crypto::LiveOut,
+) {
+    if let Some(link) = account {
+        link.session().note_gated_people(&out.gated_people);
+        for seen in out.seen {
+            let a = link
+                .session()
+                .note_person(seen.user_id, seen.account, &seen.name);
+            crate::account::run(app_handle, server, tcp_tx, a).await;
+            if let Some(key) = seen.identity {
+                let a = link.session().check_identity(seen.user_id, &key);
+                crate::account::run(app_handle, server, tcp_tx, a).await;
+            }
+        }
+        for (user_id, key) in out.check {
+            let a = link.session().check_identity(user_id, &key);
+            crate::account::run(app_handle, server, tcp_tx, a).await;
+        }
+    }
+    for m in &out.send {
+        let _ = tcp_tx.send(m);
+    }
+    for (name, payload) in out.emit {
+        emit_server(app_handle, server, name, payload);
+    }
+    let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
+    for user_id in out.made {
+        sig.session_up(user_id);
+    }
+    for user_id in out.gone {
+        sig.established_sessions.remove(&user_id);
+    }
+    if out.work {
+        sig.live_wake.notify_one();
+    }
+}
+
+/// One frame of the live path, through `ChannelKeying`, and whatever it says to do.
+#[allow(clippy::too_many_arguments)]
+async fn run_live_frame(
+    msg: &ServerMessage,
+    app_handle: &tauri::AppHandle,
+    server: &str,
+    tcp_tx: &ControlTx,
+    signal: &Arc<std::sync::Mutex<SignalState>>,
+    account: Option<&crate::account::AccountLink>,
+    channel_id_store: &AtomicU32,
+    channels_snapshot: &Arc<std::sync::Mutex<Vec<ChannelInfo>>>,
+) {
+    let own_channel = channel_id_store.load(Ordering::Relaxed);
+    let now = voipc_crypto::time::now_millis();
+    let Some(out) = with_keys(signal, |stores, keying| {
+        keying.live_frame(stores, own_channel, msg, now)
+    }) else {
+        return;
+    };
+    if let Some(link) = account {
+        let log_of = |channel_id: u32| {
+            channels_snapshot
+                .lock()
+                .ok()
+                .and_then(|c| {
+                    c.iter()
+                        .find(|ch| ch.channel_id == channel_id)
+                        .map(|ch| ch.log.clone())
+                })
+                .unwrap_or_default()
+        };
+        // Told someone is gone: our chain there ends at our next post, whatever the relay
+        // says after this
+        if let ServerMessage::MemberGone {
+            channel_id,
+            user_id,
+        } = msg
+        {
+            let log = log_of(*channel_id);
+            if !log.is_empty() {
+                link.session().member_gone(&log, *user_id);
+            }
+        }
+        for channel_id in &out.gated {
+            let log = log_of(*channel_id);
+            if !log.is_empty() {
+                link.session().note_gated_log(&log);
+            }
+        }
+        // Channels newly followed: keep their logs, all in one frame, and read what they kept
+        let logs: Vec<String> = out
+            .entered
+            .iter()
+            .map(|c| log_of(*c))
+            .filter(|l| !l.is_empty())
+            .collect();
+        if !logs.is_empty() {
+            let a = link.session().enter_many(&logs);
+            crate::account::run(app_handle, server, tcp_tx, a).await;
+        }
+    }
+    run_live(app_handle, server, tcp_tx, signal, account, out).await;
+}
+
+/// The live path's own clock and its key frames. One frame in the queue at a time, whatever
+/// the job's size, and in a call a pause as long as the frame took: `yield_to_voice`'s rule,
+/// since a burst of them queues ahead of voice on the way out.
+async fn live_task(
+    app_handle: tauri::AppHandle,
+    server: Arc<str>,
+    signal: Arc<std::sync::Mutex<SignalState>>,
+    tcp_tx: ControlTx,
+    is_voice: Arc<AtomicBool>,
+    account: Option<Arc<crate::account::AccountLink>>,
+) {
+    let wake = signal
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .live_wake
+        .clone();
+    let mut second = tokio::time::interval(std::time::Duration::from_secs(1));
+    second.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = second.tick() => {
+                let now = voipc_crypto::time::now_millis();
+                if let Some(out) = with_keys(&signal, |stores, keying| keying.live_tick(stores, now)) {
+                    run_live(&app_handle, &server, &tcp_tx, &signal, account.as_deref(), out).await;
+                }
+            }
+            _ = wake.notified() => {}
+        }
+        loop {
+            tcp_tx.drained().await;
+            let in_call = is_voice.load(Ordering::Relaxed);
+            let now = voipc_crypto::time::now_millis();
+            let frame = with_keys(&signal, |stores, keying| {
+                keying.live_next_frame(
+                    stores,
+                    now,
+                    in_call,
+                    voipc_crypto::channel_state::WRAPS_A_FRAME,
+                )
+            })
+            .flatten();
+            let Some(frame) = frame else {
+                break;
+            };
+            let started = std::time::Instant::now();
+            if tcp_tx.send(&frame).is_err() {
+                return;
+            }
+            tcp_tx.drained().await;
+            if in_call {
+                let pause = started.elapsed().min(std::time::Duration::from_secs(10));
+                tokio::time::sleep(pause).await;
+            }
+        }
+        // A wrap in a session kept from before names its peer's identity only now
+        crate::account::check_seen(&app_handle, &server, account.as_deref(), &signal, &tcp_tx)
+            .await;
     }
 }
 
@@ -2571,11 +3184,18 @@ fn handle_channel_history_received(
     // and hand it on to the next newcomer as `shared`. The two other pairwise
     // paths ask the same question.
     {
-        let sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
-        if !sig
-            .channels
-            .shares_channel_with(own_channel_id, channel_id, from_user_id)
-        {
+        let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
+        // On the live path no roster says who is in a text channel: there it has to be
+        // somebody we asked, lately.
+        let welcome = if seen.1.proto() >= LIVE_PATH_SINCE && sig.channels.is_text(channel_id) {
+            let now = voipc_crypto::time::now_millis();
+            sig.channels
+                .live_answer_wanted(channel_id, from_user_id, now)
+        } else {
+            sig.channels
+                .shares_channel_with(own_channel_id, channel_id, from_user_id)
+        };
+        if !welcome {
             debug!(
                 from_user_id,
                 channel_id, "history from a non-member, dropped"
@@ -2609,8 +3229,7 @@ fn handle_channel_history_received(
     };
     if message_type == 1 {
         let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
-        sig.established_sessions.insert(from_user_id);
-        sig.pending_sessions.remove(&from_user_id);
+        sig.session_up(from_user_id);
     }
     let messages = match voipc_crypto::open_history_payload(channel_id, &plaintext) {
         Ok(list) => list,
@@ -2633,6 +3252,13 @@ fn handle_channel_history_received(
 }
 
 // ── E2E Helper functions ─────────────────────────────────────────────────
+
+/// Whether someone listed in `channel` is asked for a bundle now. On the live path sessions
+/// open when there is something to say, and a list of General costs nothing: only a room
+/// we stand in has a key dance to do.
+fn asks_bundles(live: bool, channel: u32, own_room: u32) -> bool {
+    !live || (channel == own_room && own_room != 0)
+}
 
 /// Request prekey bundles for users we don't yet have sessions with.
 async fn request_prekey_bundles_for_users(
@@ -2714,8 +3340,7 @@ async fn handle_prekey_bundle(
             info!(remote_user_id, "E2E session established");
             {
                 let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
-                sig.pending_sessions.remove(&remote_user_id);
-                sig.established_sessions.insert(remote_user_id);
+                sig.session_up(remote_user_id);
             }
 
             // Drain any pending direct messages for this user
@@ -2724,11 +3349,15 @@ async fn handle_prekey_bundle(
             // Distribute our sender key (and the channel media key) for the
             // channel we stand in and for every text channel we are in — the
             // server drops a distribution for a channel either of us is not in.
-            let mut channels = vec![channel_id_store.load(Ordering::Relaxed)];
-            {
+            // On the live path, the room alone: a text channel's key goes to who a check
+            // named, and a session opening names nobody.
+            let channels = {
                 let sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
-                channels.extend(sig.channels.text_channels());
-            }
+                sig.channels.keyed_by_a_bundle(
+                    channel_id_store.load(Ordering::Relaxed),
+                    tcp_tx.proto() >= LIVE_PATH_SINCE,
+                )
+            };
             for channel in channels {
                 if channel == 0 {
                     continue;
@@ -3068,8 +3697,7 @@ async fn handle_media_key_received(
     // A PreKeySignalMessage establishes the session on our side as well
     if message_type == 1 {
         let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
-        sig.established_sessions.insert(from_user_id);
-        sig.pending_sessions.remove(&from_user_id);
+        sig.session_up(from_user_id);
     }
 
     if key.channel_id != channel_id || channel_id != current {
@@ -3161,8 +3789,7 @@ async fn handle_sender_key_received(
             // If PreKeySignalMessage, session was auto-established on our side
             if message_type == 1 {
                 let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
-                sig.established_sessions.insert(from_user_id);
-                sig.pending_sessions.remove(&from_user_id);
+                sig.session_up(from_user_id);
             }
 
             // Track the received sender key
@@ -3236,6 +3863,7 @@ async fn drain_ready_dms(
             .iter()
             .filter_map(|m| match m.target {
                 PendingTarget::Direct { target_user_id }
+                | PendingTarget::Poke { target_user_id }
                     if sig.established_sessions.contains(&target_user_id) =>
                 {
                     Some(target_user_id)
@@ -3260,6 +3888,7 @@ async fn drain_pending_dms(
 ) {
     // Extract pending DMs for this target, each with the id it was shown under
     // and the destruction timer it was written under
+    let mut pokes = Vec::new();
     let pending: Vec<(String, String, Option<u32>, crate::crypto::Extras)> = {
         let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
         let mut remaining = Vec::new();
@@ -3273,6 +3902,15 @@ async fn drain_pending_dms(
                     // Only send if queued less than 60 seconds ago
                     if msg.queued_at.elapsed().as_secs() < 60 {
                         to_send.push((msg.id, msg.content, msg.ttl_secs, msg.extras));
+                    } else {
+                        expired += 1;
+                    }
+                }
+                PendingTarget::Poke {
+                    target_user_id: tid,
+                } if *tid == target_user_id => {
+                    if msg.queued_at.elapsed().as_secs() < 60 {
+                        pokes.push(msg.content);
                     } else {
                         expired += 1;
                     }
@@ -3293,6 +3931,23 @@ async fn drain_pending_dms(
         sig.pending_messages = remaining;
         to_send
     };
+
+    for message in pokes {
+        match encrypt_pairwise(signal, target_user_id, message.as_bytes()) {
+            Ok((ciphertext, message_type)) => {
+                let _ = send_tcp_message(
+                    tcp_tx,
+                    &ClientMessage::SendPoke {
+                        target_user_id,
+                        ciphertext,
+                        message_type,
+                    },
+                )
+                .await;
+            }
+            Err(e) => warn!(target_user_id, "failed to encrypt a queued poke: {}", e),
+        }
+    }
 
     for (id, content, ttl_secs, extras) in pending {
         let payload = crate::crypto::envelope_with(&id, &content, ttl_secs, &extras);
@@ -3439,16 +4094,32 @@ fn handle_encrypted_direct_message(
 
     match result {
         Ok(plaintext) => {
-            // A DM carries the same envelope a channel message does since
-            // 0.9.0; anything else reads as the text itself.
-            let msg = crate::crypto::open_envelope(&plaintext);
-
             // If this was a PreKeySignalMessage, mark session as established
             if message_type == 1 {
                 let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
-                sig.established_sessions.insert(from_user_id);
-                sig.pending_sessions.remove(&from_user_id);
+                sig.session_up(from_user_id);
             }
+            // A history hand-off, before anything could show it: no line, no toast, no
+            // copy, and no window flashing at the person who was only asked.
+            if let Some(sealed) = voipc_crypto::open_sealed(&plaintext) {
+                route_sealed(
+                    sealed,
+                    from_user_id,
+                    from_username,
+                    signal,
+                    app_handle,
+                    server,
+                );
+                return;
+            }
+
+            if let Some(link) = seen.0 {
+                link.session().note_direct(from_user_id);
+            }
+
+            // A DM carries the same envelope a channel message does since
+            // 0.9.0; anything else reads as the text itself.
+            let msg = crate::crypto::open_envelope(&plaintext);
 
             // Emit as a regular plaintext DM event
             emit_server(
@@ -3495,6 +4166,56 @@ fn handle_encrypted_direct_message(
                     "decryption_failed": true,
                 }),
             );
+        }
+    }
+}
+
+/// A hand-off that came as a direct message, into what the relay-checked frames come to. An
+/// ask goes to the front end, whose one rule decides (`answersHandOff`); an answer is taken
+/// only from someone we asked.
+fn route_sealed(
+    sealed: voipc_crypto::Sealed,
+    from_user_id: u32,
+    from_username: &str,
+    signal: &std::sync::Mutex<SignalState>,
+    app_handle: &tauri::AppHandle,
+    server: &str,
+) {
+    match sealed {
+        voipc_crypto::Sealed::Ask { channel_id } => emit_server(
+            app_handle,
+            server,
+            "channel-history-requested",
+            serde_json::json!({"channel_id": channel_id, "from_user_id": from_user_id, "sealed": true}),
+        ),
+        voipc_crypto::Sealed::Answer {
+            channel_id,
+            messages,
+        } => {
+            let now = voipc_crypto::time::now_millis();
+            let welcome = signal
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .channels
+                .live_answer_wanted(channel_id, from_user_id, now);
+            if !welcome {
+                debug!(from_user_id, channel_id, "a sealed answer nobody asked for");
+                return;
+            }
+            emit_server(
+                app_handle,
+                server,
+                "channel-history-received",
+                serde_json::json!({
+                    "channel_id": channel_id,
+                    "from_user_id": from_user_id,
+                    "from_username": from_username,
+                    "messages": messages,
+                }),
+            );
+        }
+        voipc_crypto::Sealed::Unreadable => {
+            debug!(from_user_id, "a sealed message this build cannot read");
         }
     }
 }
@@ -3641,7 +4362,7 @@ struct LayerMix {
     chain: voipc_audio::mixer::SourceChain,
     /// Frames held back by `delay_frames`; empty while the layer is not
     /// delayed, which is the common case and costs nothing.
-    ring: std::collections::VecDeque<Vec<f32>>,
+    ring: VecDeque<Vec<f32>>,
 }
 
 impl LayerMix {
@@ -5648,6 +6369,79 @@ mod tests {
 
     /// S-045: a share's 60 fps (with its bursts) always passes; a flood of
     /// frames is held to `MAX_VIEW_FPS` a second.
+    #[test]
+    fn general_asks_no_bundles_and_a_room_asks_only_its_own() {
+        assert!(!asks_bundles(true, 0, 0), "General, standing in it");
+        assert!(!asks_bundles(true, 0, 5), "General, seen from a room");
+        assert!(!asks_bundles(true, 7, 5), "someone else's room");
+        assert!(asks_bundles(true, 5, 5), "the room we stand in");
+        // An older relay's apps expect the whole mesh
+        assert!(asks_bundles(false, 0, 0));
+        assert!(asks_bundles(false, 7, 5));
+    }
+
+    /// A key job's frames go one at a time, however long the job: a seat frame queued in
+    /// the middle waits for one key frame at most, with no lanes and no reorder.
+    #[tokio::test]
+    async fn a_seat_passes_a_big_key_job() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let tcp_tx = ControlTx::new(tx, PROTOCOL_VERSION);
+        let (mut read, write) = tokio::io::duplex(1 << 20);
+        let writer = tokio::spawn(control_writer_task(write, rx, tcp_tx.queued.clone()));
+        let key_frame = ClientMessage::DistributeSenderKeys {
+            channel_id: 1,
+            keys: vec![(2, 2, vec![0; 256])],
+        };
+        let seat = ClientMessage::JoinChannel {
+            channel_id: 9,
+            password: None,
+        };
+        // What `live_task` does: each frame out of the queue before the next goes in
+        let job = {
+            let tcp_tx = tcp_tx.clone();
+            tokio::spawn(async move {
+                for _ in 0..6 {
+                    tcp_tx.drained().await;
+                    tcp_tx.send(&key_frame).unwrap();
+                }
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let queued = tcp_tx.queued.load(Ordering::Relaxed);
+        assert!(queued <= 1, "{queued} frames waiting ahead of a seat");
+        tcp_tx.send(&seat).unwrap();
+        job.await.unwrap();
+        tcp_tx.drained().await;
+        assert_eq!(tcp_tx.queued.load(Ordering::Relaxed), 0);
+
+        let mut buf = BytesMut::new();
+        let mut frames = Vec::new();
+        while frames.len() < 7 {
+            read.read_buf(&mut buf).await.unwrap();
+            while let Some(frame) = try_decode_frame(&mut buf).unwrap() {
+                frames.push(voipc_protocol::codec::decode_client_msg(&frame).unwrap());
+            }
+        }
+        let at = frames
+            .iter()
+            .position(|m| matches!(m, ClientMessage::JoinChannel { .. }))
+            .unwrap();
+        assert!(at < 6, "the seat waited for the whole job: frame {at}");
+        drop(tcp_tx);
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn waiting_for_the_queue_ends_when_the_writer_has_gone() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let tcp_tx = ControlTx::new(tx, PROTOCOL_VERSION);
+        tcp_tx.send(&ClientMessage::Disconnect).unwrap();
+        drop(rx);
+        tokio::time::timeout(std::time::Duration::from_secs(1), tcp_tx.drained())
+            .await
+            .expect("no writer left to wait for");
+    }
+
     #[test]
     fn a_viewer_decodes_no_more_frames_than_any_share_sends() {
         let t0 = std::time::Instant::now();

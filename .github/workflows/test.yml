@@ -14,6 +14,17 @@ on:
   pull_request:
     paths-ignore: ['**/*.md', 'docs/**', 'website/**', '.impeccable/**', 'Dockerfile.relay']
   workflow_call:
+    # soak.yml: many copies of the browser jobs at once, and nothing else. Every other
+    # caller (the release gate) and every other event gets one copy of everything.
+    inputs:
+      copies:
+        description: The copies of each browser part, as a JSON list of numbers
+        type: string
+        default: '[1]'
+      browser-only:
+        description: Run the browser jobs alone
+        type: boolean
+        default: false
 
 # Nothing here writes. Without this a push event's token gets the repository's
 # default permissions, which may include write.
@@ -30,6 +41,7 @@ concurrency:
 jobs:
   rust:
     name: Rust
+    if: ${{ !inputs.browser-only }}
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
@@ -41,8 +53,7 @@ jobs:
       # and voipc-client links the desktop stack even for `cargo test`.
       - name: System dependencies
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
+          bash tools/ci-apt.sh \
             build-essential curl ca-certificates pkg-config nasm cmake protobuf-compiler \
             libavcodec-dev libavformat-dev libavfilter-dev libavdevice-dev \
             libavutil-dev libswscale-dev libx264-dev libx265-dev \
@@ -115,6 +126,7 @@ jobs:
   # deliberate toolchain bump, fixed in the same change.
   lint:
     name: Lint
+    if: ${{ !inputs.browser-only }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -124,8 +136,7 @@ jobs:
       # Clippy compiles the desktop client, so the same list as the Rust job
       - name: System dependencies
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
+          bash tools/ci-apt.sh \
             build-essential curl ca-certificates pkg-config nasm cmake protobuf-compiler \
             libavcodec-dev libavformat-dev libavfilter-dev libavdevice-dev \
             libavutil-dev libswscale-dev libx264-dev libx265-dev \
@@ -190,6 +201,7 @@ jobs:
   # a code change, and a pull request should not turn red for it.
   deny:
     name: cargo-deny
+    if: ${{ !inputs.browser-only }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
@@ -235,17 +247,20 @@ jobs:
           done
 
   browser:
-    name: Browser end-to-end (${{ matrix.part }})
+    # A copy's number only in a soak: the pull-request checks keep the names they have
+    # Quoted: in a plain YAML value a space and # start a comment, which cut this line once
+    name: "Browser end-to-end (${{ matrix.part }}${{ inputs.browser-only && format(', copy {0}', matrix.copy) || '' }})"
     runs-on: ubuntu-24.04
-    # Three parts side by side: the two lanes that run test-ui.mjs (about 15
-    # minutes each at 1.5) and the quick lanes (under a minute each). One job
-    # ran them in a row for 35 minutes. Each lane also has its own cap below,
-    # so a hang names its lane instead of using up the job.
+    # Four parts side by side: the two lanes that run test-ui.mjs, the quick lanes
+    # (under a minute each) and the relay on Postgres. One job ran the first three
+    # in a row for 35 minutes. Each lane also has its own cap below, so a hang names
+    # its lane instead of using up the job.
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        part: [quic, udp-blocked, lanes]
+        part: [quic, udp-blocked, lanes, postgres]
+        copy: ${{ fromJSON(inputs.copies || '[1]') }}
     # The image has both, and test-web.sh would pick `chromium` first — but that
     # one is an unbranded snapshot build (no proprietary codecs), so the browser
     # sharer quietly falls back to VP9 and no lane exercises the H.264 path that
@@ -253,6 +268,8 @@ jobs:
     # people running this client actually have.
     env:
       CHROME: /usr/bin/google-chrome
+      # test-web.sh copies every lane's output and relay log here; a red job uploads them
+      KEEP_LOGS: ${{ github.workspace }}/browser-logs
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         # No token left in .git/config for build scripts to find
@@ -260,8 +277,7 @@ jobs:
 
       - name: System dependencies
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
+          bash tools/ci-apt.sh \
             build-essential curl ca-certificates pkg-config nasm cmake protobuf-compiler \
             libavcodec-dev libavformat-dev libavfilter-dev libavdevice-dev \
             libavutil-dev libswscale-dev libx264-dev libx265-dev \
@@ -269,6 +285,11 @@ jobs:
             libssl-dev libclang-dev \
             libnss3-tools \
             pulseaudio pulseaudio-utils
+
+      # What the relay asks of its UDP socket (web.rs `UDP_BUFFER`), as OPERATING.md says to
+      # set it on a server. Past this limit Linux gives less, and says nothing.
+      - name: Room for the relay's UDP socket
+        run: sudo sysctl -w net.core.rmem_max=4194304 net.core.wmem_max=4194304
 
       # certutil (libnss3-tools) is how the Firefox lane trusts the test CA.
       #
@@ -309,6 +330,18 @@ jobs:
       - run: npm run web
         env: { VOIPC_SELFTEST: '1' }
 
+      # What test-move.mjs imports with: the importer's real driver against the
+      # stand-in Discord. An example, which `npm run web` does not build.
+      - run: cargo build --release --locked -p voipc-server --example import_replay
+        env: { VOIPC_SELFTEST: '1' }
+
+      # A fresh runner's first browser start is slow, and once stalled past Chromium's own
+      # 15 s watchdog, so the lane that started it lost its page. This pays for it here and
+      # prints the cost (first start against second).
+      - name: Warm the browsers
+        timeout-minutes: 8
+        run: bash tools/ci-warm-browsers.sh
+
       # Both engines, and both mixed pairings: a Chromium sharer feeds a Firefox
       # viewer H.264, a Firefox sharer feeds a Chromium viewer VP9.
       # `!cancelled()` so one red lane does not hide the others: knowing
@@ -320,7 +353,9 @@ jobs:
       # is the same test in every lane but where the network differs. It runs
       # in the `quic` part and with UDP blocked (the TCP fallback); UI_TEST:
       # '0' skips it in the others, and Firefox ↔ Firefox has no Chromium for
-      # it. Those two lanes get 25 minutes, the others 10.
+      # it. Those two lanes get 25 minutes, the others 10. test-web.sh runs its browser lanes
+      # one after another here: SIDE_BY_SIDE: '1' takes 4 minutes off, and its failures on 4
+      # cores were web.rs `LINGER`'s bug. Worth trying again once a few runs have been clean.
       - name: Chromium ↔ Chromium
         if: matrix.part == 'quic'
         timeout-minutes: 25
@@ -388,10 +423,66 @@ jobs:
           ./test-web.sh
         env: { BROWSER: chromium, UI_TEST: '0', FILE_KIB: '0' }
 
+      # The relay on Postgres, which nothing above reaches: the accounts tests that take a
+      # second database, and the lanes that read and write it most. The runner's own Postgres,
+      # so no image to pin. Each lane is its own step, so one red does not hide the others.
+      - name: Start Postgres
+        if: matrix.part == 'postgres'
+        run: |
+          sudo systemctl start postgresql.service
+          mkdir -p "$KEEP_LOGS"   # where the lanes below write their relay logs
+          sudo -u postgres psql -c "CREATE ROLE voipc SUPERUSER LOGIN PASSWORD 'voipc'"
+          for name in tests community moderation move; do
+            PGPASSWORD=voipc createdb -h 127.0.0.1 -U voipc "$name"
+          done
+      # --release: `npm run web` has built every dependency that way already. Only the tests
+      # that take a second database: all the others stay on SQLite whatever this says.
+      - name: Accounts tests on Postgres
+        if: matrix.part == 'postgres'
+        timeout-minutes: 15
+        run: bash tools/ci-run.sh "accounts tests on Postgres" cargo test --release --locked -p voipc-server --bin voipc-server -- moderator_group accounts::placeholder::tests
+        env: { VOIPC_SELFTEST: '1', VOIPC_TEST_POSTGRES: 'postgres://voipc:voipc@127.0.0.1:5432/tests' }
+      - name: Community lane on Postgres
+        if: ${{ !cancelled() && matrix.part == 'postgres' }}
+        timeout-minutes: 10
+        run: bash tools/ci-run.sh "community lane on Postgres" node test-community.mjs 29400
+        env:
+          COMMUNITY_DATABASE: 'postgres://voipc:voipc@127.0.0.1:5432/community'
+          RELAY_LOG: ${{ github.workspace }}/browser-logs/postgres-community-relay.log
+          RUST_LOG: voipc_server=debug,accounts=info
+      - name: Moderation lane on Postgres
+        if: ${{ !cancelled() && matrix.part == 'postgres' }}
+        timeout-minutes: 15
+        run: bash tools/ci-run.sh "moderation lane on Postgres" node test-moderation.mjs 29600
+        env:
+          MODERATION_DATABASE: 'postgres://voipc:voipc@127.0.0.1:5432/moderation'
+          RELAY_LOG: ${{ github.workspace }}/browser-logs/postgres-moderation-relay.log
+          RUST_LOG: voipc_server=debug,accounts=info
+      - name: Move lane on Postgres
+        if: ${{ !cancelled() && matrix.part == 'postgres' }}
+        timeout-minutes: 15
+        run: bash tools/ci-run.sh "move lane on Postgres" node test-move.mjs 29800
+        env:
+          MOVE_DATABASE: 'postgres://voipc:voipc@127.0.0.1:5432/move'
+          RELAY_LOG: ${{ github.workspace }}/browser-logs/postgres-move-relay.log
+          RUST_LOG: voipc_server=debug,accounts=info
+
+      # What the lanes said and their relays logged, for a red job: a timeout's diagnosis
+      # names the requests a page was waiting on, and the relay log what it refused then
+      - name: Lane logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: browser-logs-${{ matrix.part }}-${{ matrix.copy }}
+          path: ${{ github.workspace }}/browser-logs
+          if-no-files-found: ignore
+          retention-days: 7
+
   # The Windows and Android builds compile on every pull request, not first
   # in a release run. cargo check only, with the caches release.yml uses.
   cross:
     name: Windows and Android cargo check
+    if: ${{ !inputs.browser-only }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
@@ -402,8 +493,7 @@ jobs:
 
       - name: Cross toolchain
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
+          bash tools/ci-apt.sh \
             clang lld llvm ninja-build cmake nasm protobuf-compiler unzip curl pkg-config
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0

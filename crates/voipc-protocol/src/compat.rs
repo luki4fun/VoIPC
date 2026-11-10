@@ -15,9 +15,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::codec::{decode_server_msg, encode_client_msg, frame, PROTOCOL_VERSION};
+use crate::codec::{decode_server_msg, encode_client_msg, frame, MAX_MSG_SIZE, PROTOCOL_VERSION};
 use crate::error::ProtocolError;
-use crate::messages::{AccountRequest, AuthContinue, ClientMessage, ServerMessage};
+use crate::messages::{AccountRequest, AdminOp, AuthContinue, ClientMessage, ServerMessage};
 use crate::types::*;
 
 /// The oldest relay protocol an app still speaks: 1.0's. At least three
@@ -97,6 +97,156 @@ pub const RESHAPED: &[(u32, Side, u32, &str)] = &[
     (15, Side::Server, 5, "UserList without badges"),
     (15, Side::Server, 18, "ChannelUsers without badges"),
     (15, Side::Server, 46, "AccountReply::Admin never comes"),
+    (
+        17,
+        Side::Client,
+        0,
+        "Authenticate: a resume with an invite is refused",
+    ),
+    (
+        12,
+        Side::Client,
+        0,
+        "Authenticate: the provider starts are refused",
+    ),
+    (
+        12,
+        Side::Server,
+        45,
+        "AuthStep: the provider steps never come from it",
+    ),
+    (
+        13,
+        Side::Client,
+        0,
+        "Authenticate: the provider starts are refused",
+    ),
+    (
+        13,
+        Side::Client,
+        40,
+        "AuthContinue: the provider steps are refused",
+    ),
+    (
+        13,
+        Side::Server,
+        45,
+        "AuthStep: the provider steps never come from it",
+    ),
+    (
+        14,
+        Side::Client,
+        0,
+        "Authenticate: the provider starts are refused",
+    ),
+    (
+        14,
+        Side::Client,
+        40,
+        "AuthContinue: the provider steps are refused",
+    ),
+    (
+        14,
+        Side::Server,
+        45,
+        "AuthStep: the provider steps never come from it",
+    ),
+    (
+        15,
+        Side::Client,
+        0,
+        "Authenticate: the provider starts are refused",
+    ),
+    (
+        15,
+        Side::Client,
+        40,
+        "AuthContinue: the provider steps are refused",
+    ),
+    (
+        15,
+        Side::Server,
+        45,
+        "AuthStep: the provider steps never come from it",
+    ),
+    (
+        16,
+        Side::Client,
+        0,
+        "Authenticate: the provider starts are refused",
+    ),
+    (
+        16,
+        Side::Client,
+        40,
+        "AuthContinue: the provider steps are refused",
+    ),
+    (
+        16,
+        Side::Client,
+        41,
+        "AccountRequest: the provider requests are refused",
+    ),
+    (
+        16,
+        Side::Server,
+        45,
+        "AuthStep: the provider steps never come from it",
+    ),
+    (
+        16,
+        Side::Server,
+        46,
+        "AccountReply: the provider replies never come from it",
+    ),
+    (
+        17,
+        Side::Client,
+        41,
+        "AdminOp: the channel steps are refused",
+    ),
+    (
+        17,
+        Side::Server,
+        46,
+        "AccountReply: AdminReply::ChannelDone never comes from it",
+    ),
+    (
+        18,
+        Side::Client,
+        41,
+        "AdminOp: the moderation steps are refused",
+    ),
+    (
+        18,
+        Side::Server,
+        46,
+        "AccountReply: AdminReply::ModLog and PostsRemoved never come from it",
+    ),
+    (
+        19,
+        Side::Client,
+        41,
+        "AdminOp and AccountRequest: the import and archive steps are refused",
+    ),
+    (
+        19,
+        Side::Server,
+        46,
+        "AccountReply and AdminReply: the import and archive replies never come from it",
+    ),
+    (
+        20,
+        Side::Client,
+        41,
+        "AccountRequest::ArchiveChannels and the kept frames are refused",
+    ),
+    (
+        20,
+        Side::Server,
+        46,
+        "AccountReply: ArchiveChannels and the kept frames never come from it",
+    ),
 ];
 
 /// How many messages each side had at a protocol: an index at or past it is
@@ -106,7 +256,10 @@ fn client_messages(proto: u32) -> u32 {
         ..=12 => 42,
         13 => 45,
         14 => 49,
-        15 => 50,
+        15..=17 => 50,
+        18 => 52,
+        19 => 54,
+        20 => 55,
         _ => u32::MAX,
     }
 }
@@ -129,6 +282,15 @@ pub fn encode_client_msg_for(
     msg: &ClientMessage,
     proto: u32,
 ) -> Result<Vec<Vec<u8>>, ProtocolError> {
+    let frames = frames_for(msg, proto)?;
+    // An older shape takes another road here than `encode_client_msg`, past its check
+    match frames.iter().find(|f| f.len() > 4 + MAX_MSG_SIZE as usize) {
+        Some(f) => Err(ProtocolError::MessageTooLarge(f.len() - 4)),
+        None => Ok(frames),
+    }
+}
+
+fn frames_for(msg: &ClientMessage, proto: u32) -> Result<Vec<Vec<u8>>, ProtocolError> {
     if proto >= PROTOCOL_VERSION {
         return Ok(vec![encode_client_msg(msg)?]);
     }
@@ -160,6 +322,107 @@ pub fn encode_client_msg_for(
         ClientMessage::Account(AccountRequest::Admin { .. }) if proto < 16 => {
             Err(ProtocolError::NotOnThisRelay(proto))
         }
+        // New variants of enums nested in a message that is older: its index
+        // says nothing, so they are named.
+        ClientMessage::Authenticate {
+            account:
+                Some(
+                    AccountStart::Providers
+                    | AccountStart::Provider { .. }
+                    | AccountStart::ProviderResume { .. }
+                    | AccountStart::ProviderStatus { .. },
+                ),
+            ..
+        }
+        | ClientMessage::AuthContinue(
+            AuthContinue::ProviderSignup { .. }
+            | AuthContinue::Claim { .. }
+            | AuthContinue::ProviderProof { .. }
+            | AuthContinue::PairStart { .. }
+            | AuthContinue::PairReveal { .. },
+        )
+        | ClientMessage::Account(
+            AccountRequest::ProviderList
+            | AccountRequest::ProviderStart { .. }
+            | AccountRequest::ProviderUnlink { .. }
+            | AccountRequest::PairNonce { .. }
+            | AccountRequest::PairApprove { .. }
+            | AccountRequest::PairDecline { .. },
+        ) if proto < 17 => Err(ProtocolError::NotOnThisRelay(proto)),
+        ClientMessage::Account(AccountRequest::Admin {
+            op:
+                AdminOp::ChannelSave { .. }
+                | AdminOp::ChannelDelete { .. }
+                | AdminOp::CategorySave { .. }
+                | AdminOp::CategoryDelete { .. }
+                | AdminOp::LayoutSet { .. }
+                | AdminOp::WelcomeSet { .. }
+                | AdminOp::GroupStyle { .. }
+                | AdminOp::GroupOrder { .. }
+                | AdminOp::ProfileReset { .. }
+                | AdminOp::ServerProfileSet { .. }
+                | AdminOp::ServerIconSet { .. }
+                | AdminOp::InviteLinks
+                | AdminOp::InviteLinkNew { .. }
+                | AdminOp::InviteLinkRevoke { .. },
+            ..
+        })
+        | ClientMessage::Authenticate {
+            account: Some(AccountStart::ProviderResumeInvited { .. }),
+            ..
+        }
+        | ClientMessage::Account(
+            AccountRequest::ProfileSet { .. } | AccountRequest::ProfilePictureSet { .. },
+        ) if proto < 18 => Err(ProtocolError::NotOnThisRelay(proto)),
+        ClientMessage::Account(AccountRequest::Admin {
+            op: AdminOp::ModLog { .. } | AdminOp::ModNote { .. } | AdminOp::RemovePosts { .. },
+            ..
+        }) if proto < 19 => Err(ProtocolError::NotOnThisRelay(proto)),
+        ClientMessage::Account(AccountRequest::Admin {
+            op:
+                AdminOp::ImportFacts
+                | AdminOp::ImportBegin { .. }
+                | AdminOp::ImportCategories { .. }
+                | AdminOp::ImportChannels { .. }
+                | AdminOp::ImportEmote { .. }
+                | AdminOp::ImportThreads { .. }
+                | AdminOp::ImportMessages { .. }
+                | AdminOp::ImportCursors { .. }
+                | AdminOp::ImportEnd { .. }
+                | AdminOp::ImportReport { .. }
+                | AdminOp::ImportUndoPreview { .. }
+                | AdminOp::ImportRoles { .. }
+                | AdminOp::ImportMembers { .. }
+                | AdminOp::ImportBans { .. }
+                | AdminOp::MoveAccounts { .. }
+                | AdminOp::MoveStatus
+                | AdminOp::PowerWaiting { .. }
+                | AdminOp::PowerAnswer { .. }
+                | AdminOp::MoveExclude { .. }
+                | AdminOp::MoveExcluded { .. }
+                | AdminOp::ImportUndo { .. }
+                | AdminOp::ArchiveDelete { .. }
+                | AdminOp::ArchiveWishes { .. },
+            ..
+        })
+        | ClientMessage::Account(
+            AccountRequest::ArchiveFetch { .. }
+            | AccountRequest::ArchiveSearch { .. }
+            | AccountRequest::ArchiveMine { .. },
+        ) if proto < 20 => Err(ProtocolError::NotOnThisRelay(proto)),
+        ClientMessage::Account(
+            AccountRequest::ArchiveChannels
+            | AccountRequest::LogJoinMany { .. }
+            | AccountRequest::ChainPut { .. }
+            | AccountRequest::LogMemberIds { .. }
+            | AccountRequest::ChainFetch { .. }
+            | AccountRequest::WrapsPage { .. }
+            | AccountRequest::OwnChains { .. }
+            | AccountRequest::OwnBuckets { .. }
+            | AccountRequest::BucketLists { .. }
+            | AccountRequest::OwnChainRows { .. }
+            | AccountRequest::VaultPage { .. },
+        ) if proto < 21 => Err(ProtocolError::NotOnThisRelay(proto)),
         ClientMessage::EmoteAdd { emote } if proto == 14 => old(postcard::to_allocvec(&(
             EMOTE_ADD,
             EmoteAdd14 {
@@ -193,17 +456,17 @@ pub fn decode_server_msg_from(payload: &[u8], proto: u32) -> Result<ServerMessag
         (AUTHENTICATED, ..=12) => postcard::from_bytes::<Authenticated12>(rest)?.into(),
         (AUTHENTICATED, 13) => postcard::from_bytes::<Authenticated13>(rest)?.into(),
         (AUTHENTICATED, 14) => postcard::from_bytes::<Authenticated14>(rest)?.into(),
-        (USER_JOINED, _) => ServerMessage::UserJoined {
+        (USER_JOINED, ..=15) => ServerMessage::UserJoined {
             user: postcard::from_bytes::<UserJoined15>(rest)?.user.into(),
         },
-        (USER_LIST, _) => {
+        (USER_LIST, ..=15) => {
             let l: UserList15 = postcard::from_bytes(rest)?;
             ServerMessage::UserList {
                 channel_id: l.channel_id,
                 users: l.users.into_iter().map(UserInfo::from).collect(),
             }
         }
-        (CHANNEL_USERS, _) => {
+        (CHANNEL_USERS, ..=15) => {
             let l: ChannelUsers15 = postcard::from_bytes(rest)?;
             ServerMessage::ChannelUsers {
                 channel_id: l.channel_id,
@@ -669,6 +932,16 @@ mod tests {
         ));
     }
 
+    fn restrict() -> ClientMessage {
+        ClientMessage::AdminRestrict {
+            user_id: 1,
+            voice: true,
+            text: false,
+            duration_secs: 60,
+            reason: String::new(),
+        }
+    }
+
     #[test]
     fn what_an_older_relay_never_heard_of_is_refused() {
         let cases = [
@@ -700,6 +973,78 @@ mod tests {
                 }),
                 15,
             ),
+            (
+                ClientMessage::Authenticate {
+                    username: String::new(),
+                    protocol_version: 16,
+                    app_version: String::new(),
+                    identity_key: None,
+                    prekey_bundle: None,
+                    account: Some(AccountStart::Providers),
+                },
+                16,
+            ),
+            (
+                ClientMessage::Authenticate {
+                    username: String::new(),
+                    protocol_version: 17,
+                    app_version: String::new(),
+                    identity_key: None,
+                    prekey_bundle: None,
+                    account: Some(AccountStart::ProviderResumeInvited {
+                        ticket: vec![],
+                        invite: String::new(),
+                    }),
+                },
+                17,
+            ),
+            (
+                ClientMessage::AuthContinue(AuthContinue::ProviderProof { signature: vec![] }),
+                16,
+            ),
+            (ClientMessage::Account(AccountRequest::ProviderList), 16),
+            (
+                ClientMessage::Account(AccountRequest::PairDecline { pair: 1 }),
+                16,
+            ),
+            (
+                ClientMessage::Account(AccountRequest::Admin {
+                    op: AdminOp::ModLog { before: 0 },
+                    code: None,
+                }),
+                18,
+            ),
+            (
+                ClientMessage::Account(AccountRequest::Admin {
+                    op: AdminOp::ModNote {
+                        channel_id: 1,
+                        target: String::new(),
+                        message: String::new(),
+                        on: true,
+                    },
+                    code: None,
+                }),
+                18,
+            ),
+            (
+                ClientMessage::Account(AccountRequest::Admin {
+                    op: AdminOp::RemovePosts {
+                        name: "dan".into(),
+                        window_secs: 3600,
+                    },
+                    code: None,
+                }),
+                18,
+            ),
+            (restrict(), 18),
+            (ClientMessage::ReportTakersGet, 18),
+            (
+                ClientMessage::AdminBansPage {
+                    search: String::new(),
+                    offset: 0,
+                },
+                19,
+            ),
         ];
         for (msg, v) in cases {
             assert!(
@@ -710,6 +1055,344 @@ mod tests {
         // ... and the same messages are fine where they exist
         assert!(encode_client_msg_for(&ClientMessage::FileCancel { hash: [0; 32] }, 13).is_ok());
         assert!(encode_client_msg_for(&ClientMessage::EmoteStickers { on: true }, 14).is_ok());
+        assert!(encode_client_msg_for(
+            &ClientMessage::Account(AccountRequest::Admin {
+                op: AdminOp::ModLog { before: 0 },
+                code: None,
+            }),
+            PROTOCOL_VERSION,
+        )
+        .is_ok());
+        assert!(encode_client_msg_for(
+            &ClientMessage::Account(AccountRequest::Admin {
+                op: AdminOp::RemovePosts {
+                    name: "dan".into(),
+                    window_secs: 0,
+                },
+                code: None,
+            }),
+            PROTOCOL_VERSION,
+        )
+        .is_ok());
+        assert_eq!(
+            encode_client_msg_for(&restrict(), PROTOCOL_VERSION).unwrap(),
+            vec![encode_client_msg(&restrict()).unwrap()]
+        );
+    }
+
+    /// One of everything the move added, in the order of the enums.
+    fn the_moves_requests() -> Vec<AccountRequest> {
+        let ops = [
+            AdminOp::ImportFacts,
+            AdminOp::ImportBegin {
+                guild_id: "1".into(),
+                options: ImportOptions {
+                    channels: true,
+                    roles: true,
+                    permissions: true,
+                    members: true,
+                    bans: true,
+                    emotes: true,
+                    messages: true,
+                    threads: true,
+                    pins: true,
+                    reactions: true,
+                    anonymise: true,
+                    acknowledged: true,
+                },
+                backup_taken: false,
+            },
+            AdminOp::ImportCategories {
+                run: 1,
+                rows: vec![],
+            },
+            AdminOp::ImportChannels {
+                run: 1,
+                rows: vec![],
+            },
+            AdminOp::ImportEmote {
+                run: 1,
+                dc_id: 1,
+                name: "ab".into(),
+            },
+            AdminOp::ImportThreads {
+                run: 1,
+                rows: vec![],
+            },
+            AdminOp::ImportMessages {
+                run: 1,
+                channel: 1,
+                thread: None,
+                high: 1,
+                rows: vec![],
+            },
+            AdminOp::ImportCursors { after: 0 },
+            AdminOp::ImportEnd {
+                run: 1,
+                report: String::new(),
+            },
+            AdminOp::ImportReport { run: 1 },
+            AdminOp::ImportUndoPreview { run: 1 },
+            AdminOp::ImportRoles {
+                run: 1,
+                roles: vec![],
+            },
+            AdminOp::ImportMembers {
+                run: 1,
+                members: vec![],
+            },
+            AdminOp::ImportBans {
+                run: 1,
+                bans: vec![],
+            },
+            AdminOp::MoveAccounts {
+                search: String::new(),
+                offset: 0,
+                filter: MoveFilter::All,
+            },
+            AdminOp::MoveStatus,
+            AdminOp::PowerWaiting { offset: 0 },
+            AdminOp::PowerAnswer {
+                id: [0; 16],
+                group: String::new(),
+                grant: false,
+            },
+            AdminOp::MoveExclude {
+                dc_id: "1".into(),
+                on: true,
+                erase: false,
+            },
+            AdminOp::MoveExcluded {
+                after: String::new(),
+            },
+            AdminOp::ImportUndo { run: 1 },
+            AdminOp::ArchiveDelete {
+                target: ArchiveTarget::Author { id: "1".into() },
+            },
+            AdminOp::ArchiveWishes { after: None },
+        ];
+        ops.into_iter()
+            .map(|op| AccountRequest::Admin { op, code: None })
+            .chain([
+                AccountRequest::ArchiveFetch {
+                    channel_id: 1,
+                    thread: String::new(),
+                    before: String::new(),
+                    pinned: false,
+                },
+                AccountRequest::ArchiveSearch {
+                    channel_id: 1,
+                    query: "a".into(),
+                    from: String::new(),
+                },
+                AccountRequest::ArchiveMine {
+                    action: ArchiveAction::Count,
+                    scope: ArchiveScope::Everything,
+                },
+            ])
+            .collect()
+    }
+
+    /// The arm that names them is the only thing between them and a relay that reads
+    /// another step at that index, or none: `Account` is a message every relay knows.
+    #[test]
+    fn the_move_is_refused_below_20_and_goes_at_20() {
+        for req in the_moves_requests() {
+            let msg = ClientMessage::Account(req);
+            for v in OLDEST_RELAY_PROTOCOL..20 {
+                assert!(
+                    matches!(encode_client_msg_for(&msg, v), Err(ProtocolError::NotOnThisRelay(p)) if p == v),
+                    "{msg:?} at {v}"
+                );
+            }
+            assert_eq!(
+                encode_client_msg_for(&msg, 20).unwrap(),
+                vec![encode_client_msg(&msg).unwrap()]
+            );
+        }
+        // Moderation's are not touched by the arm: fine at 19
+        assert!(encode_client_msg_for(
+            &ClientMessage::Account(AccountRequest::Admin {
+                op: AdminOp::ModLog { before: 0 },
+                code: None,
+            }),
+            19,
+        )
+        .is_ok());
+    }
+
+    /// The live path's frames, and what an older relay does with them: it never hears of
+    /// them, and an app knows at the frame it would have sent. `Account` is a message every
+    /// relay knows, so its one request needs an arm of its own.
+    #[test]
+    fn an_older_relay_never_hears_of_the_live_path() {
+        let frames = [
+            ClientMessage::JoinTextChannels {
+                channels: vec![1],
+                quiet: vec![],
+            },
+            ClientMessage::KeyCheck {
+                channel_id: 1,
+                restart: true,
+            },
+            ClientMessage::OpenSessions {
+                channel_id: 1,
+                targets: vec![2],
+            },
+            ClientMessage::SessionHello {
+                to: 2,
+                message_type: 3,
+                ciphertext: vec![0],
+            },
+            ClientMessage::DistributeSenderKeys {
+                channel_id: 1,
+                keys: vec![(2, 2, vec![0])],
+            },
+            ClientMessage::KeyWanted {
+                channel_id: 1,
+                from: 2,
+                reset: false,
+            },
+            ClientMessage::RequestChannelPage {
+                channel_id: 1,
+                after: 0,
+            },
+            ClientMessage::SetQuiet {
+                channels: vec![1],
+                quiet: true,
+            },
+            ClientMessage::RenewSessionKeys {
+                signed_prekey_id: 2,
+                signed_prekey: vec![0],
+                signed_prekey_signature: vec![0],
+                kyber_prekey_id: 2,
+                kyber_prekey: vec![0],
+                kyber_prekey_signature: vec![0],
+            },
+            ClientMessage::Account(AccountRequest::ArchiveChannels),
+        ];
+        for msg in frames {
+            for v in OLDEST_RELAY_PROTOCOL..21 {
+                assert!(
+                    matches!(encode_client_msg_for(&msg, v), Err(ProtocolError::NotOnThisRelay(p)) if p == v),
+                    "{msg:?} at {v}"
+                );
+            }
+            assert_eq!(
+                encode_client_msg_for(&msg, 21).unwrap(),
+                vec![encode_client_msg(&msg).unwrap()]
+            );
+        }
+        // Today's frames for the same acts still go there
+        assert!(encode_client_msg_for(
+            &ClientMessage::JoinChannel {
+                channel_id: 1,
+                password: None,
+            },
+            20,
+        )
+        .is_ok());
+    }
+
+    /// The kept path's frames: a channel writer on an older relay stays on `EpochPut`.
+    #[test]
+    fn an_older_relay_never_hears_of_the_kept_path() {
+        let conv = || "c:0".to_string();
+        let frames = [
+            AccountRequest::LogJoinMany {
+                convs: vec![conv()],
+            },
+            AccountRequest::ChainPut {
+                conv: conv(),
+                epoch: 1 << 12,
+                self_wrap: Some(vec![0; 60]),
+                step: None,
+                link: None,
+                wraps: vec![],
+                buckets: vec![],
+                seals: vec![],
+                last: true,
+            },
+            AccountRequest::LogMemberIds {
+                conv: conv(),
+                after: None,
+            },
+            AccountRequest::ChainFetch {
+                conv: conv(),
+                after: -500,
+            },
+            AccountRequest::WrapsPage {
+                conv: conv(),
+                asks: vec![],
+            },
+            AccountRequest::OwnChains {
+                conv: conv(),
+                before: None,
+            },
+            AccountRequest::OwnBuckets {
+                conv: conv(),
+                after: None,
+            },
+            AccountRequest::BucketLists {
+                conv: conv(),
+                wanted: vec![],
+            },
+            AccountRequest::OwnChainRows {
+                conv: conv(),
+                chain: 1,
+                after: None,
+            },
+            AccountRequest::VaultPage {
+                k: "pins.0".to_string(),
+            },
+        ];
+        for req in frames {
+            let msg = ClientMessage::Account(req);
+            for v in OLDEST_RELAY_PROTOCOL..21 {
+                assert!(
+                    matches!(encode_client_msg_for(&msg, v), Err(ProtocolError::NotOnThisRelay(p)) if p == v),
+                    "{msg:?} at {v}"
+                );
+            }
+            assert_eq!(
+                encode_client_msg_for(&msg, 21).unwrap(),
+                vec![encode_client_msg(&msg).unwrap()]
+            );
+        }
+        // What stays for them: the epoch path, and direct conversations everywhere
+        assert!(encode_client_msg_for(
+            &ClientMessage::Account(AccountRequest::EpochPut {
+                conv: conv(),
+                epoch: 1,
+                wraps: vec![],
+            }),
+            20,
+        )
+        .is_ok());
+    }
+
+    /// A step added later and left out of that list fails here, not on someone's relay.
+    #[test]
+    fn the_list_of_the_moves_requests_is_whole() {
+        // The index of what a request carries: the outer one, or the op's inside `Admin`
+        let (mut ops, mut requests) = (BTreeSet::new(), BTreeSet::new());
+        for req in the_moves_requests() {
+            let bytes = postcard::to_allocvec(&req).unwrap();
+            let (outer, rest) = postcard::take_from_bytes::<u32>(&bytes).unwrap();
+            if matches!(req, AccountRequest::Admin { .. }) {
+                ops.insert(postcard::take_from_bytes::<u32>(rest).unwrap().0);
+            } else {
+                requests.insert(outer);
+            }
+        }
+        let added = |name: &str| -> BTreeSet<u32> {
+            let was = golden(19)[name]["ENUM"].as_object().unwrap().len() as u32;
+            let now = golden(20)[name]["ENUM"].as_object().unwrap().len() as u32;
+            (was..now).collect()
+        };
+        assert_eq!(ops, added("AdminOp"));
+        assert_eq!(requests, added("AccountRequest"));
+        assert_eq!((ops.len(), requests.len()), (23, 3));
     }
 
     #[test]
@@ -754,6 +1437,50 @@ mod tests {
             decode_server_msg_from(&list, 15).unwrap(),
             ServerMessage::UserList { channel_id: 2, .. }
         ));
+    }
+
+    /// The arms above are for the protocols before badges, and only those. As
+    /// `_` they turned on the first relay of the protocol before today's: all of
+    /// a 1.7 relay's rosters failed to decode once this app spoke 17.
+    #[test]
+    fn rosters_with_badges_decode_at_every_protocol_that_has_them() {
+        let user = UserInfo {
+            user_id: 7,
+            username: "ann".into(),
+            channel_id: 2,
+            is_muted: false,
+            is_deafened: false,
+            is_screen_sharing: false,
+            is_admin: false,
+            shares_history: false,
+            account: Some([5; 16]),
+            is_moderator: false,
+            badges: vec!["crew".into()],
+        };
+        let messages = [
+            ServerMessage::UserJoined { user: user.clone() },
+            ServerMessage::UserList {
+                channel_id: 2,
+                users: vec![user.clone()],
+            },
+            ServerMessage::ChannelUsers {
+                channel_id: 2,
+                users: vec![user],
+            },
+        ];
+        for v in 16..=PROTOCOL_VERSION {
+            for msg in &messages {
+                let bytes = postcard::to_allocvec(msg).unwrap();
+                let back = decode_server_msg_from(&bytes, v).unwrap();
+                let users = match back {
+                    ServerMessage::UserJoined { user } => vec![user],
+                    ServerMessage::UserList { users, .. }
+                    | ServerMessage::ChannelUsers { users, .. } => users,
+                    other => panic!("{other:?} at {v}"),
+                };
+                assert_eq!(users[0].badges, ["crew"], "at {v}");
+            }
+        }
     }
 
     #[test]

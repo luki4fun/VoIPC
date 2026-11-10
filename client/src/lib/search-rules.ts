@@ -8,6 +8,7 @@
 //
 // Pure, so search-rules.test.ts runs it under Node's own test runner.
 
+import { isHidden } from "./chat-rules.ts";
 import { plainText } from "./markdown.ts";
 import type { ChatMessage } from "./types.ts";
 
@@ -35,9 +36,10 @@ function haystack(m: ChatMessage): string {
   return h;
 }
 
-/** A message with something worth finding in it: not one of our dividers, not a placeholder. */
+/** A message with something worth finding in it: not one of our dividers, not a
+ *  placeholder, not one a moderator hid (shown anyway or not). */
 function searchable(m: ChatMessage): boolean {
-  return m.kind !== "history-marker" && m.kind !== "notice" && m.kind !== "undecryptable" && m.kind !== "deleted";
+  return m.kind !== "history-marker" && m.kind !== "notice" && m.kind !== "undecryptable" && m.kind !== "deleted" && !isHidden(m);
 }
 
 export interface Hit<C> {

@@ -12,7 +12,15 @@ all-features = false
 # Only our direct dependencies: an unmaintained crate deep in Tauri's GTK
 # stack is not ours to replace.
 unmaintained = "workspace"
-ignore = []
+ignore = [
+    # SQLite reading a crafted database with a crafted -wal file. The relay opens
+    # only its own accounts database, named in its config and readable by its user
+    # only; whoever can write that file and its -wal has the relay's secrets anyway.
+    # sqlx 0.9.0 caps libsqlite3-sys below the fixed 0.39; sqlx main allows it
+    # (launchbadge/sqlx#4502), unreleased: drop this entry with the first sqlx
+    # release that has it (launchbadge/sqlx#4516).
+    { id = "RUSTSEC-2026-0459", reason = "relay opens only its own owner-only database; no sqlx release takes libsqlite3-sys 0.39 yet" },
+]
 
 [licenses]
 confidence-threshold = 0.9

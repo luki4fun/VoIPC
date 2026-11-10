@@ -86,6 +86,14 @@ export interface PendingInvite {
 }
 export const pendingInvite = writable<PendingInvite | null>(null);
 
+/** A link to sign up with: the connect dialog opens "Create account" with its code. */
+export interface PendingJoin {
+  code: string;
+  host?: string;
+  port?: number;
+}
+export const pendingJoin = writable<PendingJoin | null>(null);
+
 /** Channel passwords this session used (create / join / invite), so invite
  *  links can carry them and a reconnect can get back in. Memory only, and
  *  keyed per server like everything else that is named rather than numbered —

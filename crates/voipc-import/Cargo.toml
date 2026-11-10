@@ -1,0 +1,22 @@
+[package]
+name = "voipc-import"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+# A stand-in Discord, for tests and `import_replay`: no socket and no real host.
+mock = []
+
+[dependencies]
+voipc-protocol = { workspace = true }
+serde = { workspace = true }
+postcard = { workspace = true }
+serde_json = "1.0"
+tokio = { version = "1", default-features = false, features = ["macros", "rt", "sync", "time"] }
+
+[dev-dependencies]
+# Waits run on tokio's paused clock, so a test of an hour's wait takes no time.
+tokio = { version = "1", features = ["macros", "rt", "test-util"] }

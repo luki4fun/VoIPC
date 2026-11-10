@@ -1,13 +1,18 @@
 import { derived, writable, get } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
 import {
+  addMarks,
   applyEvent,
+  applyMarks,
   dropExpired,
   fromArchived,
+  isHidden,
   isLegacyDmKey,
+  marked,
   MAX_MESSAGES,
   mergeHistory,
   newestTimestamp,
+  placedByTime,
   pruneConversations,
   receivedText,
   rowKey,
@@ -15,8 +20,13 @@ import {
   messageRefs,
   toArchived,
   type EventIn,
+  type MarkIndex,
+  type PostsMark,
 } from "../chat-rules.js";
-import { archivedPeers, browserMarksKey, closeMarkKey, listRows } from "../dm-rules.js";
+import { isBlocked } from "../block-rules.js";
+import { archivedPeers, browserMarksKey, closeMarkKey, dmCountsUnread, listRows } from "../dm-rules.js";
+import { accountHex } from "./account.js";
+import { blocked } from "./blocks.js";
 import { previewChannelId, previewUsers } from "./channels.js";
 import { serverAddress, serverKey, userId } from "./connection.js";
 import { scoped } from "./scoped.js";
@@ -91,11 +101,12 @@ export const joinedTextChannelIds = scoped<Set<number>>(() => new Set());
 export const dmConversations = scoped<DmConversation[]>(() => []);
 
 /** The direct conversations both sidebars list on the server on screen:
- *  newest first, closed ones left out (dm-rules.ts `listRows`). */
+ *  newest first, closed ones and those with someone blocked left out (dm-rules.ts
+ *  `listRows`). */
 export const dmList = derived(
-  [dmConversations, dmMessages, clearedBefore, activeDmUserId, activeDmUsername, serverAddress],
-  ([$rows, $dms, $marks, $id, $name, $server]) =>
-    listRows($rows, $dms, serverKey($server), $marks, $id === null ? null : $name),
+  [dmConversations, dmMessages, clearedBefore, activeDmUserId, activeDmUsername, serverAddress, blocked],
+  ([$rows, $dms, $marks, $id, $name, $server, $blocked]) =>
+    listRows($rows, $dms, serverKey($server), $marks, $id === null ? null : $name, (row) => isBlocked($blocked, row, false)),
 );
 
 /**
@@ -110,6 +121,12 @@ export const dmList = derived(
  * Read it through [`channelUnread`] rather than by hand.
  */
 export const unreadPerChannel = writable<Map<string, number>>(new Map());
+
+/**
+ * Chat keys with something new and no count: a dot on the row. It costs one write per channel
+ * however many posts arrive, in a server where every channel is followed.
+ */
+export const unseenChannels = writable<ReadonlySet<string>>(new Set());
 
 /** One channel row's unread count, in whichever sidebar is drawing the row. */
 export function channelUnread(
@@ -300,6 +317,24 @@ export function detachDm(server: string, id: number): void {
   if (get(activeDmUserId.peek(server)) === id) activeDmUserId.of(server).set(away);
 }
 
+/**
+ * The row of a conversation with someone away, made if it is not there: what is
+ * written to them is filed by the row's id (`dmKeyOf`), and with no row that would be
+ * the open conversation's name, or "Unknown". Returns the id to write under.
+ */
+export function ensureAwayDm(server: string, name: string, account: string): number {
+  const row = get(dmConversations.peek(server)).find((c) => c.username === name);
+  const id = row?.user_id ?? archivedId--;
+  if (row?.account !== account) {
+    dmConversations.of(server).update((convos) => {
+      const c = convos.find((x) => x.username === name);
+      if (c) c.account = account;
+      return c ? [...convos] : [...convos, { user_id: id, username: name, unread: 0, account }];
+    });
+  }
+  return id;
+}
+
 // ---------------------------------------------------------------------------
 // Debounced save to Tauri backend
 // ---------------------------------------------------------------------------
@@ -312,16 +347,24 @@ let saveAskedAt = 0;
  * restarted the wait with each one and was never saved until it went quiet.
  */
 const SAVE_MAX_WAIT_MS = 10_000;
+/** Past this much, the whole archive through IPC, sealed and on flash each few seconds would
+ *  be the app's largest cost: it goes this often, and at quit. A crash loses what a log or a
+ *  hand-off can bring back. */
+const LARGE_ARCHIVE_BYTES = 5_000_000;
+const LARGE_SAVE_EVERY_MS = 5 * 60_000;
+let lastSaveBytes = 0;
+let lastSaveAt = 0;
 
 function scheduleSave() {
   if (saveTimeout) {
     // Long enough waiting: let the one already set go off
-    if (Date.now() - saveAskedAt >= SAVE_MAX_WAIT_MS) return;
+    if (Date.now() - saveAskedAt >= SAVE_MAX_WAIT_MS || lastSaveBytes > LARGE_ARCHIVE_BYTES) return;
     clearTimeout(saveTimeout);
   } else {
     saveAskedAt = Date.now();
   }
-  saveTimeout = setTimeout(() => void saveNow(), 2000);
+  const wait = lastSaveBytes > LARGE_ARCHIVE_BYTES ? Math.max(2000, lastSaveAt + LARGE_SAVE_EVERY_MS - Date.now()) : 2000;
+  saveTimeout = setTimeout(() => void saveNow(), wait);
 }
 
 /**
@@ -370,6 +413,11 @@ async function saveNow() {
   get(clearedBefore).forEach((at, key) => {
     clearedObj[key] = at;
   });
+
+  // Each row's text, near enough: this runs no serializer of its own
+  lastSaveBytes = 0;
+  for (const msgs of chMap.values()) for (const m of msgs) lastSaveBytes += m.content.length + 100;
+  lastSaveAt = Date.now();
 
   try {
     await invoke("save_chat_messages", {
@@ -457,6 +505,10 @@ export function populateFromArchive(archive: {
     if (live.length > 0) chMap.set(key, live);
   }
   channelMessages.set(chMap);
+  // Connected before the archive was unlocked: what it holds has not seen these
+  for (const [key, seen] of hidesSeen) {
+    for (const id of new Set(seen.map((h) => h.ev.event.target))) rehide(key, id);
+  }
 
   const dmMap = new Map<string, ChatMessage[]>();
   let droppedLegacyDms = 0;
@@ -479,6 +531,8 @@ export function populateFromArchive(archive: {
 
   // Unlocking while already connected is the other moment a bare key appears
   adoptLegacyKeys();
+  // It replaced the store: what is in it now has not seen what was said of it
+  for (const [server, marks] of postsMarks) markChannels(server, marks);
   for (const server of get(openServers)) seedArchivedDms(server);
 }
 
@@ -575,34 +629,150 @@ function held(existing: ChatMessage[] | undefined, m: ChatMessage): boolean {
   );
 }
 
-/** Returns whether it was new. */
-export function addChannelMessage(server: string, channelName: string, msg: ChatMessage): boolean {
+/** Hides remembered, per chat key. */
+const MAX_HIDES_SEEN = 256;
+
+/**
+ * The hides that counted on this connection, by chat key. A copy of their target
+ * can still arrive: from a writer first met in the stored log, which holds their
+ * entries back until it has their key, or under an id a second account repeats.
+ */
+const hidesSeen = new Map<string, { ev: EventIn; may: (m: ChatMessage) => boolean }[]>();
+
+/** What `hidesSeen` holds for `id` done to the channel chat `key`. Returns whether
+ *  that left it hidden: what just arrived then counts as news for nobody. */
+function rehide(key: string, id: string | undefined): boolean {
+  const seen = id ? hidesSeen.get(key)?.filter((h) => h.ev.event.target === id) : undefined;
+  if (!seen?.length) return false;
+  let changed = false;
+  channelMessages.update((map) => {
+    const list = map.get(key);
+    if (!list) return map;
+    const next = seen.reduce((l, h) => applyEvent(l, h.ev, { mayPin: false, mayHide: h.may }), list);
+    if (next === list) return map;
+    changed = true;
+    return new Map(map).set(key, next);
+  });
+  if (changed) scheduleSave();
+  return !!get(channelMessages).get(key)?.some((m) => m.id === id && isHidden(m));
+}
+
+/** What each server said it removed, remembered on this connection: the relay says
+ *  it all again at the next. */
+const postsMarks = new Map<string, MarkIndex>();
+/** Marks remembered per server, past what an honest relay says on one connection. */
+const MAX_POSTS_MARKS = 4096;
+const postsMarkCount = new Map<string, number>();
+
+/** `marks` taken to every channel chat on `server`, never to a direct conversation:
+ *  one is the other party's too. Never `clearedBefore` either: that erases for good,
+ *  and would let a relay do so with a push. */
+function markChannels(server: string, marks: MarkIndex): void {
+  const prefix = `${serverKey(server)}/`;
+  const map = get(channelMessages);
+  let next = map;
+  for (const [key, list] of map) {
+    if (!key.startsWith(prefix)) continue;
+    const hidden = applyMarks(list, marks);
+    if (hidden === list) continue;
+    if (next === map) next = new Map(map);
+    next.set(key, hidden);
+  }
+  // Asked first: an update that changes nothing still wakes every list
+  if (next === map) return;
+  channelMessages.set(next);
+  scheduleSave();
+}
+
+/** The server says these posts were removed (`PostsHidden`): now, or at connect.
+ *  Copies still to arrive are held against them where they do. */
+export function onPostsHidden(server: string, wire: readonly (Omit<PostsMark, "account"> & { account: number[] | null })[]): void {
+  const marks = wire.map((m) => ({ ...m, account: m.account ? accountHex(m.account) : null }));
+  let index = postsMarks.get(server);
+  if (!index) postsMarks.set(server, (index = new Map()));
+  const count = postsMarkCount.get(server) ?? 0;
+  if (count < MAX_POSTS_MARKS) {
+    addMarks(index, marks);
+    postsMarkCount.set(server, count + marks.length);
+  }
+  markChannels(server, addMarks(new Map(), marks));
+}
+
+/** Returns whether it was new, and is there to be told of. `held`: it waited for its key,
+ *  so it goes in at its own time, no further back than the wait, and not at the end. */
+export function addChannelMessage(server: string, channelName: string, msg: ChatMessage, held_ = false): boolean {
   const key = chatKey(server, channelName);
   if (held(get(channelMessages).get(key), msg)) return false;
-  msg = bounded(msg);
+  msg = marked(bounded(msg), postsMarks.get(server));
   noteReceived(server, msg);
   channelMessages.update((map) => {
     const existing = map.get(key) ?? [];
-    const msgs = [...existing, msg];
-    if (msgs.length > MAX_MESSAGES) {
-      msgs.splice(0, msgs.length - MAX_MESSAGES);
+    const msgs = held_ ? placedByTime(existing, msg, Date.now() - HOLD_MS) : [...existing, msg];
+    const most = keptIn(key, existing.length);
+    if (msgs.length > most) {
+      msgs.splice(0, msgs.length - most);
     }
     map.set(key, msgs);
     return new Map(map);
   });
   scheduleSave();
-  return true;
+  return !rehide(key, msg.id) && !msg.hide?.ban;
+}
+
+/** Followed and never opened on this device: what such a channel keeps here, when the server
+ *  has hundreds of them. It keeps the usual number from the first opening on. */
+const NEVER_OPENED_KEEPS = 100;
+/** How long a reader holds a post with no key (`channel_state.rs`, HOLD_MS). */
+const HOLD_MS = 60_000;
+const neverOpened = new Set<string>();
+
+/** What a conversation keeps. Nothing already here goes for this: an archive from before it
+ *  was asked, say, is someone's own. */
+function keptIn(key: string, holds: number): number {
+  return neverOpened.has(key) && holds <= NEVER_OPENED_KEEPS ? NEVER_OPENED_KEEPS : MAX_MESSAGES;
+}
+
+/** A followed channel not yet opened on this device, or one opened at last. */
+export function noteNeverOpened(server: string, channelName: string, never: boolean): void {
+  const key = chatKey(server, channelName);
+  if (never) neverOpened.add(key);
+  else neverOpened.delete(key);
+}
+
+/**
+ * A quiet line above everything in a channel, once: what a read could not bring. Not a
+ * message, and nothing to be told of.
+ */
+export function addChannelLineAtTop(server: string, channelName: string, content: string): void {
+  const key = chatKey(server, channelName);
+  channelMessages.update((map) => {
+    const existing = map.get(key) ?? [];
+    if (existing.some((m) => m.kind === "notice" && m.content === content)) return map;
+    const line: ChatMessage = {
+      user_id: 0,
+      username: "",
+      content,
+      // Above the oldest, where a merge by time leaves it
+      timestamp: (existing[0]?.timestamp ?? Date.now()) - 1,
+      kind: "notice",
+    };
+    // The oldest makes way: `existing` runs oldest to newest, and the newest is what they read
+    map.set(key, [line, ...existing.slice(Math.max(0, existing.length - (MAX_MESSAGES - 1)))]);
+    return new Map(map);
+  });
+  scheduleSave();
 }
 
 /**
  * A message from a channel's stored log (`ChannelInfo.log`), merged the way
  * a member's history is — a copy of one already here is the same message, by
  * its writer's account and id — but not hearsay: its writer signed it. What
- * the user cleared stays cleared. Returns whether it was new.
+ * the user cleared stays cleared. Returns whether it was new, and is there to be
+ * told of.
  */
 export function fileStoredChannelMessage(server: string, channelName: string, msg: ChatMessage): boolean {
   if (msg.expires_at !== undefined && msg.expires_at <= Date.now()) return false;
-  msg = bounded(msg);
+  msg = marked(bounded(msg), postsMarks.get(server));
   const key = chatKey(server, channelName);
   if (purged(key, msg)) return false;
   const watermark = get(clearedBefore).get(key) ?? 0;
@@ -615,11 +785,11 @@ export function fileStoredChannelMessage(server: string, channelName: string, ms
     if (messages === existing) return map;
     changed = true;
     added = n > 0;
-    map.set(key, messages.filter((x) => x.kind !== "history-marker").slice(-MAX_MESSAGES));
+    map.set(key, messages.filter((x) => x.kind !== "history-marker").slice(-keptIn(key, existing.length)));
     return new Map(map);
   });
   if (changed) scheduleSave();
-  return added;
+  return !rehide(key, msg.id) && added && !msg.hide?.ban;
 }
 
 /**
@@ -641,7 +811,10 @@ export function mergeChannelHistory(
   policyTtlSecs?: number | null,
 ) {
   const key = chatKey(server, channelName);
-  const valid = sanitizeHistory(incoming, policyTtlSecs).filter((m) => !purged(key, m));
+  const marks = postsMarks.get(server);
+  const valid = sanitizeHistory(incoming, policyTtlSecs)
+    .filter((m) => !purged(key, m))
+    .map((m) => marked(m, marks));
   if (valid.length === 0) return;
 
   const watermark = get(clearedBefore).get(key) ?? 0;
@@ -654,16 +827,30 @@ export function mergeChannelHistory(
     return new Map(map);
   });
   if (added > 0) scheduleSave();
+  for (const m of valid) rehide(key, m.id);
 }
 
 /**
- * An edit, delete, reaction or pin, done to a message of a channel's chat
+ * An edit, delete, reaction, pin or hide, done to a message of a channel's chat
  * (`applyEvent` in chat-rules.ts has the rules). `mayPin`: its sender is one
- * of the channel's managers, by the roster's roles. Returns whether it
- * changed anything.
+ * of the channel's managers, by the roster's roles. `mayHide`: on which messages a
+ * hide of theirs counts (`hideCheck`). Returns whether it changed anything.
  */
-export function applyChannelEvent(server: string, channelName: string, ev: EventIn, mayPin: boolean): boolean {
-  return applyTo(server, channelMessages, chatKey(server, channelName), ev, mayPin);
+export function applyChannelEvent(
+  server: string,
+  channelName: string,
+  ev: EventIn,
+  mayPin: boolean,
+  mayHide?: (m: ChatMessage) => boolean,
+): boolean {
+  const key = chatKey(server, channelName);
+  if (ev.event.kind === "hide" && mayHide) {
+    const seen = hidesSeen.get(key) ?? [];
+    seen.push({ ev, may: mayHide });
+    if (seen.length > MAX_HIDES_SEEN) seen.shift();
+    hidesSeen.set(key, seen);
+  }
+  return applyTo(server, channelMessages, key, ev, mayPin, mayHide);
 }
 
 /** `applyChannelEvent` for a direct conversation, filed as `addDmMessage`
@@ -678,7 +865,14 @@ export function applyStoredDmEvent(server: string, peerName: string, ev: EventIn
   return applyTo(server, dmMessages, dmKey(server, peerName), ev, false);
 }
 
-function applyTo(server: string, store: typeof channelMessages, key: string, ev: EventIn, mayPin: boolean): boolean {
+function applyTo(
+  server: string,
+  store: typeof channelMessages,
+  key: string,
+  ev: EventIn,
+  mayPin: boolean,
+  mayHide?: (m: ChatMessage) => boolean,
+): boolean {
   let changed = false;
   // An edit's new text is a message's text: cut where it arrives too
   const content = receivedText(ev.content);
@@ -686,7 +880,7 @@ function applyTo(server: string, store: typeof channelMessages, key: string, ev:
   store.update((map) => {
     const list = map.get(key);
     if (!list) return map;
-    const next = applyEvent(list, content === ev.content ? ev : { ...ev, content }, { mayPin, current });
+    const next = applyEvent(list, content === ev.content ? ev : { ...ev, content }, { mayPin, current, mayHide });
     if (next === list) return map;
     changed = true;
     return new Map(map).set(key, next);
@@ -757,6 +951,8 @@ export function addDmMessage(
     // Not for our notice: it is about an id that is gone, and the row may have
     // moved on to the one they have now.
     const notice = msg.kind === "notice";
+    const fromBlocked = isBlocked(get(blocked.peek(server)), { account: msg.account, username: fromName }, false);
+    const counts = dmCountsUnread({ echo: isEcho, onScreen, notice, blocked: fromBlocked });
     if (existing && existing.user_id !== peerId && !notice) {
       moved = existing.user_id;
       existing.user_id = peerId;
@@ -766,19 +962,19 @@ export function addDmMessage(
       if (!isEcho) {
         existing.username = fromName;
       }
-      if (!onScreen && !notice) {
+      if (counts) {
         existing.unread++;
         noteUnread(dmKey(server, existing.username), msg.timestamp);
       }
       return [...convos];
     } else {
-      if (!onScreen && !notice) noteUnread(dmKey(server, name), msg.timestamp);
+      if (counts) noteUnread(dmKey(server, name), msg.timestamp);
       return [
         ...convos,
         {
           user_id: peerId,
           username: name,
-          unread: onScreen || notice ? 0 : 1,
+          unread: counts ? 1 : 0,
         },
       ];
     }
@@ -852,7 +1048,8 @@ export function fileStoredDm(
   if (changed) scheduleSave();
   const onScreen =
     server === get(serverAddress) && get(activeDmUserId.peek(server)) !== null && get(activeDmUsername.peek(server)) === peerName;
-  const news = added && !m.from_me && !m.replay && !onScreen;
+  const fromBlocked = isBlocked(get(blocked.peek(server)), { account: m.peer_account, username: peerName }, false);
+  const news = added && !m.from_me && !m.replay && !onScreen && !fromBlocked;
   dmConversations.of(server).update((convos) => {
     const existing = convos.find((c) => c.username === peerName);
     if (existing) {
@@ -871,6 +1068,19 @@ export function fileStoredDm(
     if (news) noteUnread(key, m.timestamp);
     return [...convos, { user_id: id, username: peerName, unread: news ? 1 : 0, account: m.peer_account }];
   });
+}
+
+/** The accounts whose names rows on this device for this server show (`headerAccount`). */
+export function authorsHere(server: string): Set<string> {
+  const prefix = `${serverKey(server)}/`;
+  const authors = new Set<string>();
+  for (const map of [get(channelMessages), get(dmMessages)]) {
+    for (const [key, messages] of map) {
+      if (!key.startsWith(prefix)) continue;
+      for (const m of messages) if (m.account && m.kind !== "shared") authors.add(m.account);
+    }
+  }
+  return authors;
 }
 
 /** Show a text channel's chat, or (null) the chat of the channel we stand in. */
@@ -911,6 +1121,25 @@ export function openDm(server: string, userId: number, username: string) {
 export function closeDm(server: string) {
   activeDmUserId.of(server).set(null);
   activeDmUsername.of(server).set("");
+}
+
+/**
+ * What somebody just blocked had waiting is not unread any more: their row is off
+ * the list, and the server's badge would go on counting it.
+ */
+export function quietBlockedDms(server: string): void {
+  const list = get(blocked.peek(server));
+  const quiet = (c: DmConversation) => c.unread > 0 && isBlocked(list, c, false);
+  // Asked first: an update that changes nothing still wakes every list
+  if (!get(dmConversations.peek(server)).some(quiet)) return;
+  dmConversations.of(server).update((convos) => {
+    for (const c of convos) {
+      if (!quiet(c)) continue;
+      c.unread = 0;
+      unreadSince.delete(dmKey(server, c.username));
+    }
+    return [...convos];
+  });
 }
 
 /**
@@ -988,10 +1217,70 @@ export function incrementChannelUnread(server: string, channelName: string, at =
   });
 }
 
+/** A channel has a new name: what is filed under the old one moves. */
+export function renameChannelChat(server: string, from: string, to: string) {
+  const [old, next] = [chatKey(server, from), chatKey(server, to)];
+  const move = <T>(map: Map<string, T>) => {
+    if (!map.has(old)) return map;
+    const out = new Map(map);
+    out.set(next, out.get(old) as T);
+    out.delete(old);
+    return out;
+  };
+  channelMessages.update(move);
+  unreadPerChannel.update(move);
+  unseenChannels.update((set) => {
+    if (!set.has(old)) return set;
+    const moved = new Set(set);
+    moved.delete(old);
+    return moved.add(next);
+  });
+  const hides = hidesSeen.get(old);
+  if (hides) {
+    hidesSeen.set(next, hides);
+    hidesSeen.delete(old);
+  }
+  // With what its writers deleted, kept beside it: without those their messages
+  // would be taken back from a member's copy
+  clearedBefore.update((map) => {
+    const out = move(map);
+    const marks = `${old}\u0001`;
+    const moved = new Map(out);
+    for (const [k, v] of out) {
+      if (k.startsWith(marks)) {
+        moved.delete(k);
+        moved.set(`${next}\u0001${k.slice(marks.length)}`, v);
+      }
+    }
+    return moved;
+  });
+  newMessagesAt.update(move);
+  scheduleSave();
+  const since = unreadSince.get(old);
+  if (since !== undefined) {
+    unreadSince.set(next, since);
+    unreadSince.delete(old);
+  }
+}
+
+/** Not counted (`notify-rules.ts`), though "New" still begins here. */
+export function noteChannelUnseen(server: string, channelName: string, at = Date.now()) {
+  const key = chatKey(server, channelName);
+  noteUnread(key, at);
+  if (!get(unseenChannels).has(key)) unseenChannels.update((set) => new Set(set).add(key));
+}
+
 export function clearChannelUnread(server: string, channelName: string) {
   const key = chatKey(server, channelName);
-  if (!get(unreadPerChannel).has(key)) return;
   markRead(key);
+  if (get(unseenChannels).has(key)) {
+    unseenChannels.update((set) => {
+      const next = new Set(set);
+      next.delete(key);
+      return next;
+    });
+  }
+  if (!get(unreadPerChannel).has(key)) return;
   unreadPerChannel.update((map) => {
     map.delete(key);
     return new Map(map);
@@ -1156,8 +1445,16 @@ export function clearServerUnread(server: string) {
   // its ids were (`peerName`)
   thisConnection.delete(server);
   openedIds.delete(server);
+  postsMarks.delete(server);
+  postsMarkCount.delete(server);
   const prefix = `${serverKey(server)}/`;
+  unseenChannels.update((set) => {
+    const next = new Set([...set].filter((key) => !key.startsWith(prefix)));
+    return next.size === set.size ? set : next;
+  });
+  for (const key of [...neverOpened]) if (key.startsWith(prefix)) neverOpened.delete(key);
   for (const key of [...unreadSince.keys()]) if (key.startsWith(prefix)) unreadSince.delete(key);
+  for (const key of [...hidesSeen.keys()]) if (key.startsWith(prefix)) hidesSeen.delete(key);
   unreadPerChannel.update((map) => {
     const next = new Map([...map].filter(([key]) => !key.startsWith(prefix)));
     return next.size === map.size ? map : next;

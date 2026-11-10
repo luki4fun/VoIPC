@@ -6,6 +6,7 @@ members = [
     "crates/voipc-video",
     "crates/voipc-crypto",
     "crates/voipc-media",
+    "crates/voipc-import",
     "crates/voipc-server",
     "client/src-tauri",
 ]
@@ -14,7 +15,7 @@ members = [
 exclude = ["crates/voipc-web", "crates/voipc-opus-wasm", "crates/voipc-media-wasm", "fuzz"]
 
 [workspace.package]
-version = "1.7.0-rc.1"
+version = "1.11.0"
 edition = "2021"
 license = "MIT"
 # The toolchain CI tests with (rust-toolchain.toml)
@@ -42,3 +43,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1.0"
 thiserror = "2.0"
 bytes = "1"
+
+# Debug builds without full debug info: half the disk, and a test binary a quarter
+# of the size. Backtraces keep their file and line in our crates. To inspect
+# variables in a debugger: CARGO_PROFILE_DEV_DEBUG=true.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false

@@ -16,12 +16,16 @@ mod accounts;
 mod bans;
 mod channels;
 mod config;
+mod control;
 mod emotes;
 mod files;
 mod fsutil;
 mod gates;
+mod layout;
 mod media;
 mod presets;
+mod report;
+mod restrict;
 mod routing;
 mod session;
 mod settings;
@@ -143,6 +147,8 @@ enum BanCommand {
 
 /// Where a relay without accounts keeps its bans (next to channels.json).
 const BANS_FILE: &str = "bans.json";
+/// Who a ban and a moderation log row say acted, from the command line.
+const SHELL: &str = "server shell";
 
 async fn run_ban(config: &ServerConfig, command: BanCommand) -> Result<()> {
     let mut state = ServerState::new(
@@ -189,7 +195,8 @@ async fn run_ban(config: &ServerConfig, command: BanCommand) -> Result<()> {
             reason,
             days,
         } => {
-            let duration = (days > 0).then(|| Duration::from_secs(u64::from(days) * 86_400));
+            let secs = u64::from(days) * 86_400;
+            let duration = (days > 0).then(|| Duration::from_secs(secs));
             let reason = if reason.trim().is_empty() {
                 "no reason given".to_string()
             } else {
@@ -207,23 +214,49 @@ async fn run_ban(config: &ServerConfig, command: BanCommand) -> Result<()> {
                         .user_by_username(&name)
                         .await?
                         .with_context(|| format!("no account named {name:?}"))?;
+                    relay
+                        .modlog_put(&accounts::modlog::Entry {
+                            action: "ban",
+                            actor_name: SHELL,
+                            target: Some(user.id.0),
+                            target_name: &user.username,
+                            reason: &reason,
+                            detail: &accounts::modlog::ban_detail("account", secs),
+                            ..Default::default()
+                        })
+                        .await
+                        .context("writing the moderation log")?;
                     bans::add(
                         &state,
                         bans::Target::Account(user.id.0),
                         &user.username,
                         &reason,
-                        "server shell",
+                        SHELL,
                         duration,
                     )
                     .await?
                 }
                 (None, Some(ip)) => {
+                    let label = "(from the server shell)";
+                    if let Some(relay) = &state.accounts {
+                        relay
+                            .modlog_put(&accounts::modlog::Entry {
+                                action: "ban",
+                                actor_name: SHELL,
+                                target_name: label,
+                                reason: &reason,
+                                detail: &accounts::modlog::ban_detail("address", secs),
+                                ..Default::default()
+                            })
+                            .await
+                            .context("writing the moderation log")?;
+                    }
                     bans::add(
                         &state,
                         bans::Target::Addr(ip),
-                        "(from the server shell)",
+                        label,
                         &reason,
-                        "server shell",
+                        SHELL,
                         duration,
                     )
                     .await?
@@ -237,6 +270,25 @@ async fn run_ban(config: &ServerConfig, command: BanCommand) -> Result<()> {
             );
         }
         BanCommand::Remove { id } => {
+            let ban = state.bans.iter().find(|e| e.value().id == id).map(|e| {
+                let covers = match e.key() {
+                    bans::Key::Account(_) => "account",
+                    bans::Key::Addr(_) => "address",
+                };
+                (e.value().log_name().to_string(), covers)
+            });
+            if let (Some(relay), Some((name, covers))) = (&state.accounts, ban) {
+                relay
+                    .modlog_put(&accounts::modlog::Entry {
+                        action: "unban",
+                        actor_name: SHELL,
+                        target_name: &name,
+                        detail: covers,
+                        ..Default::default()
+                    })
+                    .await
+                    .context("writing the moderation log")?;
+            }
             if bans::remove(&state, id).await? {
                 println!(
                     "ban {id} lifted; a running server lets them in again within {} minutes",
@@ -271,6 +323,10 @@ enum AdminCommand {
     /// their phone.
     #[command(name = "reset-2fa")]
     Reset2fa { name: String },
+    /// For someone without a password who lost every device and their recovery
+    /// key: wipe the account's vault and identity, so its provider sign-in opens
+    /// it anew. What it kept is gone, and everyone who knew it is warned.
+    Reclaim { name: String },
     /// Print a single-use sign-up code (registration = "invite" or "closed").
     Invite {
         /// Only this account name can use it.
@@ -620,9 +676,18 @@ fn decrement(map: &DashMap<IpAddr, u32>, key: IpAddr) {
 
 /// An IPv6 address's /48, the usual size of one site's allocation; `None` for
 /// IPv4, where a shared prefix is as often a carrier's NAT as one site.
-fn site_key(ip: IpAddr) -> Option<IpAddr> {
+pub(crate) fn site_key(ip: IpAddr) -> Option<IpAddr> {
     match ip.to_canonical() {
         IpAddr::V6(v6) => Some(IpAddr::V6((u128::from(v6) & !((1u128 << 80) - 1)).into())),
+        IpAddr::V4(_) => None,
+    }
+}
+
+/// An IPv6 address's /32, the usual size of what one network holds and leases out;
+/// `None` for IPv4, as `site_key`.
+pub(crate) fn block_key(ip: IpAddr) -> Option<IpAddr> {
+    match ip.to_canonical() {
+        IpAddr::V6(v6) => Some(IpAddr::V6((u128::from(v6) & !((1u128 << 96) - 1)).into())),
         IpAddr::V4(_) => None,
     }
 }
@@ -677,6 +742,15 @@ async fn run_command(config: &ServerConfig, command: Command) -> Result<()> {
                     "{} now holds {role}; its rights apply once the account has two-factor codes.",
                     user.username
                 );
+                let name = role.trim().to_ascii_lowercase();
+                if relay.power_would_wait(user.id).await?
+                    && store
+                        .role_by_name(&name)
+                        .await?
+                        .is_some_and(|r| !r.scopes.is_empty())
+                {
+                    println!("It waits for an admin's OK once the account is opened.");
+                }
             } else {
                 println!("{} already holds {role}.", user.username);
             }
@@ -712,6 +786,20 @@ async fn run_command(config: &ServerConfig, command: Command) -> Result<()> {
                     "{} has no second factor, remembered device or session; nothing changed.",
                     user.username
                 );
+            }
+        }
+        Command::Admin(AdminCommand::Reclaim { name }) => {
+            let user = user_named(name).await?;
+            relay
+                .reclaim(&ctx, &user)
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+            println!(
+                "{}: vault and identity wiped, signed out everywhere. The next sign-in through a provider opens it anew, and whoever knew this account is warned.",
+                user.username
+            );
+            if relay.power_would_wait(user.id).await? {
+                println!("Groups with privileges wait for an admin's OK.");
             }
         }
         Command::Admin(AdminCommand::Invite { name, days }) => {
@@ -757,11 +845,13 @@ async fn main() -> Result<()> {
         .install_default()
         .expect("failed to install rustls crypto provider");
 
-    // Initialize tracing
+    // Initialize tracing. `accounts` is l4f-accounts' own target: its warnings and errors
+    // (a provider sign-in that failed, a database error) carry hashed addresses and account
+    // ids, never a name; its info lines can name the first admin, so they stay off.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "voipc_server=info".into()),
+                .unwrap_or_else(|_| "voipc_server=info,accounts=warn".into()),
         )
         .init();
 
@@ -966,6 +1056,16 @@ async fn main() -> Result<()> {
                     Ok(_) => {}
                     Err(e) => warn!("stored-message sweep: {e}"),
                 }
+                match accounts::modlog::sweep(&sweeper).await {
+                    Ok(n) if n > 0 => info!(dropped = n, "moderation log rows past their time"),
+                    Ok(_) => {}
+                    Err(e) => warn!("moderation log sweep: {e}"),
+                }
+                match accounts::placeholder::sweep(&sweeper).await {
+                    Ok(n) if n > 0 => info!(dropped = n, "accounts nobody opened in time"),
+                    Ok(_) => {}
+                    Err(e) => warn!("unopened accounts sweep: {e}"),
+                }
             }
         });
         Some(relay)
@@ -987,9 +1087,18 @@ async fn main() -> Result<()> {
         }
     }
 
+    // The channels made in the app join the file's before the state is built
+    let kept = match &relay {
+        Some(relay) => relay.layout_rows().await.context("reading the channels")?,
+        None => Default::default(),
+    };
+    let mut persistent_channels = persistent_channels;
+    let apps = layout::merge_kept(&kept, &mut persistent_channels);
+
     // Create shared state
     let mut state = ServerState::new(&config, server_settings, persistent_channels, admin_token);
     state.accounts = relay;
+    layout::load(&state, kept, &apps).await;
     if state.accounts.is_none() {
         state.bans_file = Some(std::path::PathBuf::from(BANS_FILE));
     }
@@ -1045,17 +1154,35 @@ async fn main() -> Result<()> {
         });
     }
     bans::load(&state).await.context("reading the bans")?;
-    // Every client gets the channel list in one frame. Too many channels with
-    // long descriptions and it cannot be sent, and clients see no channels at
-    // all: say so now instead (1.0 audit H1-06)
-    let list = voipc_protocol::codec::encode_server_msg(
-        &voipc_protocol::messages::ServerMessage::ChannelList {
-            channels: state.channel_list().await,
-        },
-    );
-    if list.as_ref().map_or(true, |b| b.len() > 60 * 1024) {
-        anyhow::bail!("channels.json describes more channels than fit in one channel list (60 KiB): shorten descriptions or remove channels");
-    }
+    restrict::load(&state)
+        .await
+        .context("reading the restrictions")?;
+    // What ran out is told to everyone. Asks for nothing while nobody is held
+    // and no wait is set.
+    let ticking = state.clone();
+    tokio::spawn(async move {
+        let mut every = tokio::time::interval(Duration::from_secs(restrict::TICK_SECS));
+        loop {
+            every.tick().await;
+            restrict::tick(&ticking, bans::now_secs()).await;
+        }
+    });
+    // Exits each second, so a ban across many channels is one frame per writer; quiet
+    // channels' news each minute. Neither asks for anything while there is none.
+    let ticking = state.clone();
+    tokio::spawn(async move {
+        let mut every = tokio::time::interval(Duration::from_secs(session::EXITS_EVERY_SECS));
+        let mut marks_since = 0;
+        let mut ticks = 0;
+        loop {
+            every.tick().await;
+            session::send_exits(&ticking);
+            ticks += 1;
+            if ticks % (session::MARKS_EVERY_SECS / session::EXITS_EVERY_SECS) == 0 {
+                marks_since = session::send_marks(&ticking, marks_since).await;
+            }
+        }
+    });
     if state.accounts.is_some() {
         accounts::locked_logs_at_boot(&state)
             .await
@@ -1064,6 +1191,12 @@ async fn main() -> Result<()> {
             .await
             .context("reading the channel gates")?;
         gates::prune_logs(&state).await;
+        accounts::refresh_chat_mods(&state).await;
+    }
+    // What came from Discord that is to go: deleting a channel, or what someone said
+    // about their posts, needs no more than to wake this.
+    if state.accounts.is_some() {
+        tokio::spawn(accounts::archive::worker(state.clone()));
     }
     // What the server's shell changes (roles, codes, bans) reaches
     // connections already open.
@@ -1075,13 +1208,26 @@ async fn main() -> Result<()> {
         loop {
             every.tick().await;
             accounts::revalidate(&watched).await;
-            gates::prune_logs(&watched).await;
+            restrict::prune_clocks(&watched, bans::now_secs());
             match bans::load(&watched).await {
                 Ok(()) => bans::enforce(&watched, None).await,
                 Err(e) => warn!("reading the bans: {e:#}"),
             }
         }
     });
+
+    // What the shell changed for someone away, who no session's scopes tell of
+    if state.accounts.is_some() {
+        let pruned = state.clone();
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(Duration::from_secs(3600));
+            every.tick().await;
+            loop {
+                every.tick().await;
+                gates::prune_soon(&pruned);
+            }
+        });
+    }
 
     // Bind TCP listener
     let tcp_addr = config.bind_addr(config.tcp_port)?;
@@ -1395,6 +1541,22 @@ mod tests {
             limit_key(v6("2001:db8:1:2::1")),
             limit_key(v6("2001:db8:1:3::1"))
         );
+    }
+
+    #[test]
+    fn a_site_is_a_48_and_a_block_a_32_and_ipv4_has_neither() {
+        let v6 = |s: &str| IpAddr::V6(s.parse().unwrap());
+        assert_eq!(site_key(v6("2001:db8:1:ffff::9")), Some(v6("2001:db8:1::")));
+        assert_ne!(site_key(v6("2001:db8:1::1")), site_key(v6("2001:db8:2::1")));
+        assert_eq!(block_key(v6("2001:db8:ffff:1::9")), Some(v6("2001:db8::")));
+        assert_ne!(block_key(v6("2001:db8::1")), block_key(v6("2001:db9::1")));
+        for ipv4 in [
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7)),
+            v6("::ffff:192.0.2.7"),
+        ] {
+            assert_eq!(site_key(ipv4), None);
+            assert_eq!(block_key(ipv4), None);
+        }
     }
 
     /// S-028: connects racing for one site's last pre slots (different /64s

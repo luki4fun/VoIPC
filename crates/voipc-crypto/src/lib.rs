@@ -24,6 +24,7 @@ pub mod group;
 pub mod identity;
 pub mod log;
 pub mod media_keys;
+pub mod pair;
 pub mod prekey;
 pub mod session;
 pub mod stores;
@@ -31,10 +32,14 @@ pub mod sync;
 pub mod time;
 
 // Re-export key types for convenience
-pub use channel_state::{history_sources, pick_history_sources, ChannelKeying, HISTORY_SOURCES};
+pub use channel_state::{
+    history_sources, pick_history_sources, ChannelKeying, KeptSessions, LiveOut, Seen,
+    HISTORY_SOURCES,
+};
 pub use envelope::{
     envelope, envelope_with, history_payload, new_message_id, open_envelope, open_history_payload,
-    ChatEvent, Extras, FileRef, Forwarded, Message, MAX_MESSAGE_TTL_SECS,
+    open_sealed, sealed_answer, sealed_ask, ChatEvent, Extras, FileRef, Forwarded, Message,
+    ReportMark, Sealed, MAX_MESSAGE_TTL_SECS,
 };
 pub use identity::{generate_identity_key_pair, SerializableIdentityKeyPair};
 pub use media_keys::{

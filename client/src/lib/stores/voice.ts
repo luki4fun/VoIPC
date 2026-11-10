@@ -7,6 +7,7 @@ import { clearMixer } from "./mixer.js";
 import { addNotification } from "./notifications.js";
 import { resetRoom } from "./room.js";
 import { resetScreenShareState } from "./screenshare.js";
+import { voiceRestriction } from "./restrictions.js";
 import { noiseSuppression } from "./settings.js";
 import { speakingUsers } from "./users.js";
 import { transmitOrder } from "../transmit-order.js";
@@ -106,8 +107,10 @@ const transmit = transmitOrder(
 export async function startTransmit(): Promise<void> {
   // Muted, both backends treat a start as done without opening anything, and
   // `isTransmitting` would then claim a microphone nobody opened — so voice
-  // activation, which waits for it to go false, never opened it after unmute
-  if (voiceDisabled() || get(isMuted)) return;
+  // activation, which waits for it to go false, never opened it after unmute.
+  // A restriction is not a mute (that one goes across servers, is kept and is
+  // announced), and the relay would drop what we sent.
+  if (voiceDisabled() || get(isMuted) || get(voiceRestriction)?.voice) return;
   return transmit.start();
 }
 

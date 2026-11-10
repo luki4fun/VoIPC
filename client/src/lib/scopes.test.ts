@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { allowed, canWith, grants } from "./scopes.ts";
+import { allowed, canWith, grants, noPowerOverAnyone, PRIVILEGES, privilegesOn, SHARE_HISTORY } from "./scopes.ts";
 
 test("a grant covers what l4f says it covers, and nothing more", () => {
   assert.equal(grants("*", "voipc:kick"), true);
@@ -25,4 +25,40 @@ test("a moderator on a relay before 1.7 still kicks, bans and changes channels",
   for (const s of ["voipc:kick", "voipc:ban", "voipc:channels"]) assert.equal(allowed(["voipc:moderate"], s), true, s);
   assert.equal(allowed(["voipc:moderate"], "voipc:bans"), false, "the ban list stayed an admin's");
   assert.equal(allowed(["voipc:moderate"], "voipc:emotes"), false);
+});
+
+test("a relay is offered only the privileges it has heard of", () => {
+  const offered = (p: number | null) => privilegesOn(p).map((x) => x.scope);
+  const newest = ["voipc:restrict", "voipc:hide", "voipc:reports", "voipc:modlog"];
+  const community = ["voipc:profiles", "voipc:mention_all"];
+  assert.deepEqual(offered(null), PRIVILEGES.map((x) => x.scope), "our own protocol has them all");
+  assert.deepEqual(offered(21), offered(null));
+  assert.equal(offered(20).includes(SHARE_HISTORY), false, "a relay at 20 would refuse the whole group");
+  assert.deepEqual(offered(19), offered(20));
+  for (const s of newest) {
+    assert.equal(offered(18).includes(s), false, `${s} at 18`);
+    assert.equal(offered(19).includes(s), true, `${s} at 19`);
+  }
+  for (const s of community) {
+    assert.equal(offered(17).includes(s), false, `${s} at 17`);
+    assert.equal(offered(18).includes(s), true, `${s} at 18`);
+  }
+  // Every relay with a group editor keeps what it has always had
+  const always = PRIVILEGES.filter((x) => !x.since).map((x) => x.scope);
+  assert.deepEqual(offered(16), always);
+  for (const s of ["*", "voipc:kick", "voipc:ban", "voipc:channels", "roles:admin"]) assert.equal(always.includes(s), true, s);
+});
+
+test("the privileges have one row each, so the group editor's keyed list holds", () => {
+  const scopes = PRIVILEGES.map((x) => x.scope);
+  assert.equal(new Set(scopes).size, scopes.length);
+});
+
+test("a group holding nothing, or only Share history, has no power over anyone", () => {
+  assert.equal(noPowerOverAnyone([]), true);
+  assert.equal(noPowerOverAnyone([SHARE_HISTORY]), true);
+  assert.equal(noPowerOverAnyone([SHARE_HISTORY, "voipc:kick"]), false);
+  assert.equal(noPowerOverAnyone(["voipc:mention_all"]), false, "what spares nobody can still be power to hand out");
+  assert.equal(noPowerOverAnyone(["voipc:*"]), false);
+  assert.equal(noPowerOverAnyone(["*"]), false);
 });

@@ -403,11 +403,15 @@
   .control {
     font-size: var(--fs-sm);
     padding: 4px 8px;
-    background: var(--bg-secondary);
+    background-color: var(--bg-secondary);
     color: var(--text-primary);
     border: 1px solid var(--border);
     border-radius: 4px;
     cursor: pointer;
+  }
+
+  select.control {
+    padding-right: 28px;
   }
 
   .control:disabled {

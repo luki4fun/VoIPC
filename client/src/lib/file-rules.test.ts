@@ -146,3 +146,12 @@ test("a file a system can run is known by its extension, whatever its case", () 
     assert.equal(runsCode(name), false, name);
   }
 });
+
+test("a message a moderator hid is no reason to hand its file to whoever asks", () => {
+  const hidden = m({ file: { hash: A, key: B, size: 1, z: false, name: "f" }, hide: { on: true, at: T, by: "bobby" } });
+  assert.equal(refersTo([hidden], A, T), false);
+  assert.equal(refersTo([{ ...hidden, hide: { on: false, at: T + 1, by: "bobby" } }], A, T), true);
+  // This device keeps it, for whoever shows it anyway here
+  assert.deepEqual(referencedHashes([new Map([["k", [hidden]]])], T), [A]);
+  assert.equal(refersTo([{ ...hidden, hide: { on: true, at: T, by: "bobby", ban: true } }], A, T), false, "nor one a ban removed");
+});

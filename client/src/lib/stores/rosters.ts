@@ -19,27 +19,43 @@ import { invoke } from "@tauri-apps/api/core";
 
 import { channels, currentChannelId } from "./channels.js";
 import { joinedTextChannelIds } from "./chat.js";
-import { isAdmin } from "./connection.js";
+import { isAdmin, serverAddress } from "./connection.js";
 import { scoped } from "./scoped.js";
 import { users } from "./users.js";
-import { rosterOf, trustRosterCount, worthAsking } from "../roster-rules.js";
+import { applyRosterChanges, onlineIn, rosterOf, trustRosterCount, worthAsking, type RosterChange } from "../roster-rules.js";
+import { livePath } from "../relay-rules.js";
+import { olderRelay } from "./relay.js";
 import type { UserInfo } from "../types.js";
 
 /** channel_id → who is in it, as far as this client is allowed to know; per server. */
 export const channelRosters = scoped<Map<number, UserInfo[]>>(() => new Map());
+
+/** A text channel this connection follows on the live path (`TextJoined`). */
+export interface TextSeat {
+  /** A gate keeps people out: who is there goes by a list, and a guest gets nothing. */
+  gated: boolean;
+  /** When the relay last saw a post there, by its clock; 0 for none since it started. */
+  lastPost: number;
+}
+
+export const textSeats = scoped<ReadonlyMap<number, TextSeat>>(() => new Map());
+
+/** Who `MemberGone` said left a gated or hand-joined channel since the last list of it: a
+ *  hand-off asks the device to answer them, and their name may still be on that list. */
+export const goneFrom = scoped<ReadonlyMap<number, ReadonlySet<number>>>(() => new Map());
 
 /**
  * Asking is a round trip, and a busy server moves people constantly — one
  * request per join would put a burst on the wire every time a channel fills.
  * Ids collect here and go out together, per server: the ids are that server's.
  */
-const pending = new Map<string, { ids: Set<number>; timer: ReturnType<typeof setTimeout> | null }>();
+const pending = new Map<string, { ids: Set<number>; changes: RosterChange[]; timer: ReturnType<typeof setTimeout> | null }>();
 const FLUSH_MS = 250;
 
 function pendingFor(server: string) {
   let entry = pending.get(server);
   if (!entry) {
-    entry = { ids: new Set(), timer: null };
+    entry = { ids: new Set(), changes: [], timer: null };
     pending.set(server, entry);
   }
   return entry;
@@ -49,6 +65,13 @@ function flush(server: string): void {
   const entry = pending.get(server);
   if (!entry) return;
   pending.delete(server);
+  if (entry.changes.length > 0) {
+    const { rosters, moved } = applyRosterChanges(get(channelRosters.peek(server)), entry.changes);
+    channelRosters.of(server).set(rosters);
+    channels.of(server).update((chs) =>
+      chs.map((c) => (moved.get(c.channel_id) ? { ...c, user_count: Math.max(0, c.user_count + moved.get(c.channel_id)!) } : c)),
+    );
+  }
   for (const channelId of entry.ids) {
     invoke("request_channel_users", { server, channelId }).catch(() => {
       // A channel that vanished between the ask and the answer is not an error
@@ -58,9 +81,45 @@ function flush(server: string): void {
 
 function schedule(server: string): void {
   const entry = pendingFor(server);
-  if (entry.ids.size > 0 && entry.timer === null) {
+  if ((entry.ids.size > 0 || entry.changes.length > 0) && entry.timer === null) {
     entry.timer = setTimeout(() => flush(server), FLUSH_MS);
   }
+}
+
+const liveHere = (server: string) => livePath(get(olderRelay.peek(server))?.protocol ?? null);
+
+/** When each room's list was last asked for only to bring its flags up to date. */
+const healed = new Map<string, Map<number, number>>();
+
+/**
+ * A room's mute and live flags reach only the room, and a join or a leave with a name needs
+ * no ask any more, which was what brought them here. So a change there asks now and then:
+ * only for the server on screen, and less often the more people are online.
+ */
+function healFlags(server: string, channelId: number): void {
+  if (server !== get(serverAddress) || channelId === 0) return;
+  const here = healed.get(server) ?? new Map<number, number>();
+  healed.set(server, here);
+  const now = Date.now();
+  if (now - (here.get(channelId) ?? 0) < Math.max(5000, onlineById(server).size * 5)) return;
+  here.set(channelId, now);
+  requestRoster(server, channelId);
+}
+
+/** A join's broadcast, with the next ones. With a name, the list needs no ask. */
+export function noteJoin(server: string, u: UserInfo): void {
+  pendingFor(server).changes.push({ join: u });
+  schedule(server);
+  if (!liveHere(server) || !u.username) requestRoster(server, u.channel_id);
+  else healFlags(server, u.channel_id);
+}
+
+/** A leave's broadcast, with the next ones. An id of 0 is someone a list here hides. */
+export function noteLeft(server: string, channelId: number, id: number): void {
+  pendingFor(server).changes.push({ left: id, channel: channelId });
+  schedule(server);
+  if (!liveHere(server) || !id) requestRoster(server, channelId);
+  else healFlags(server, channelId);
 }
 
 /** Ask for one channel's roster on a server, soon. */
@@ -73,6 +132,7 @@ export function requestRoster(server: string, channelId: number): void {
       get(currentChannelId.peek(server)),
       get(isAdmin.peek(server)),
       get(joinedTextChannelIds.peek(server)),
+      liveHere(server),
     )
   )
     return;
@@ -86,8 +146,9 @@ export function requestAllRosters(server: string): void {
   const admin = get(isAdmin.peek(server));
   const joinedText = get(joinedTextChannelIds.peek(server));
   const ids = pendingFor(server).ids;
+  const live = liveHere(server);
   for (const channel of get(channels.peek(server))) {
-    if (worthAsking(channel, currentId, admin, joinedText)) ids.add(channel.channel_id);
+    if (worthAsking(channel, currentId, admin, joinedText, live)) ids.add(channel.channel_id);
   }
   schedule(server);
 }
@@ -119,6 +180,36 @@ export function forgetUser(server: string, id: number): void {
     return next;
   });
   users.of(server).update((list) => list.filter((u) => u.user_id !== id));
+}
+
+/** Rows of a roster too long for one frame (`channel-page`): they add to it. */
+export function addToRoster(server: string, channelId: number, rows: UserInfo[]): void {
+  if (!rows.length) return;
+  channelRosters.of(server).update((m) => {
+    const fresh = new Set(rows.map((u) => u.user_id));
+    const kept = (m.get(channelId) ?? []).filter((u) => !fresh.has(u.user_id));
+    return new Map(m).set(channelId, [...kept, ...rows]);
+  });
+  if (channelId === get(currentChannelId.peek(server))) {
+    users.of(server).update((list) => {
+      const fresh = new Set(rows.map((u) => u.user_id));
+      return [...list.filter((u) => !fresh.has(u.user_id)), ...rows];
+    });
+  }
+}
+
+/** This app exchanged a key with them here, so a list of this channel shows them from now on,
+ *  unless `MemberGone` said they left it. They may be on a public list with more to say. */
+export function exchangedKey(server: string, channelId: number, row: UserInfo): void {
+  if (!row.username || get(goneFrom.peek(server)).get(channelId)?.has(row.user_id)) return;
+  if (get(channelRosters.peek(server)).get(channelId)?.some((u) => u.user_id === row.user_id)) return;
+  addToRoster(server, channelId, [onlineById(server).get(row.user_id) ?? row]);
+}
+
+/** Everyone a list of General or of a room names, by id: who is online, as far as anyone
+ *  may know. In an open text channel that is who may be reading. */
+export function onlineById(server: string): Map<number, UserInfo> {
+  return onlineIn(get(channelRosters.peek(server)), get(channels.peek(server)), get(users.peek(server)));
 }
 
 /** `id`'s account, on the roster of any channel. */
@@ -182,6 +273,7 @@ export function clearRosters(server: string): void {
   const entry = pending.get(server);
   if (entry?.timer != null) clearTimeout(entry.timer);
   pending.delete(server);
+  healed.delete(server);
 }
 
 export { rosterOf };

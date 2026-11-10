@@ -410,6 +410,10 @@ const TUNNEL_CONTROL_BUFFER: usize = 1024 * 1024;
 /// Nothing at all from the server for this long ends the tunnel. Its pongs
 /// answer our keepalive ping every 10 s (network.rs `latency_task`).
 const TUNNEL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// The same before the first pong. No ping runs during a sign-in, and the relay says
+/// nothing while a person decides (five minutes at most): the sign-in's reads have
+/// their own bound.
+const TUNNEL_SIGN_IN_IDLE: Duration = Duration::from_secs(310);
 
 /// The client end of the TCP fallback: one TLS stream carrying the
 /// WebSocket, read and written by two tasks of its own, so the control
@@ -674,6 +678,7 @@ async fn tunnel_reader<R: AsyncRead + Unpin>(
     let mut decoder = Decoder::new(false, TUNNEL_MAX_MESSAGE);
     decoder.feed(&leftover);
     let mut chunk = vec![0u8; 16 * 1024];
+    let mut idle = TUNNEL_SIGN_IN_IDLE;
     loop {
         loop {
             match decoder.next() {
@@ -684,9 +689,11 @@ async fn tunnel_reader<R: AsyncRead + Unpin>(
                         }
                     }
                     Some(0x13 | 0x14) => {
+                        idle = TUNNEL_IDLE_TIMEOUT;
                         let _ = video.try_send(data);
                     }
                     Some(_) => {
+                        idle = TUNNEL_IDLE_TIMEOUT;
                         let _ = datagrams.try_send(Bytes::from(data));
                     }
                     None => {}
@@ -704,7 +711,7 @@ async fn tunnel_reader<R: AsyncRead + Unpin>(
                 }
             }
         }
-        match tokio::time::timeout(TUNNEL_IDLE_TIMEOUT, tls.read(&mut chunk)).await {
+        match tokio::time::timeout(idle, tls.read(&mut chunk)).await {
             Ok(Ok(n)) if n > 0 => decoder.feed(&chunk[..n]),
             Ok(Ok(_)) => {
                 info!("the server closed the TCP connection");
@@ -715,7 +722,7 @@ async fn tunnel_reader<R: AsyncRead + Unpin>(
                 return;
             }
             Err(_) => {
-                info!("nothing from the server for {TUNNEL_IDLE_TIMEOUT:?}, giving the tunnel up");
+                info!("nothing from the server for {idle:?}, giving the tunnel up");
                 return;
             }
         }
@@ -805,6 +812,22 @@ fn server_name(host: &str) -> Result<ServerName<'static>, String> {
     }
 }
 
+/// Checks a certificate against the public CAs, for `host`.
+fn public_verifier(
+    host: &str,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+) -> Result<VerifyAs, String> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let inner = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider)
+        .build()
+        .map_err(|e| format!("TLS configuration error: {e}"))?;
+    Ok(VerifyAs {
+        inner,
+        name: server_name(host)?,
+    })
+}
+
 fn tls_config(
     host: &str,
     port: u16,
@@ -824,18 +847,13 @@ fn tls_config(
             .with_custom_certificate_verifier(Arc::new(TofuCertVerifier {
                 key: tofu_key(host, port),
                 seen: sight.clone(),
+                public: public_verifier(host, provider)?,
             }))
             .with_no_client_auth()
     } else {
-        let mut roots = rustls::RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let inner = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider)
-            .build()
-            .map_err(|e| format!("TLS configuration error: {e}"))?;
-        let name = server_name(host)?;
         builder
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(VerifyAs { inner, name }))
+            .with_custom_certificate_verifier(Arc::new(public_verifier(host, provider)?))
             .with_no_client_auth()
     };
     config.alpn_protocols = vec![alpn.to_vec()];
@@ -1038,16 +1056,17 @@ pub fn tofu_forget(host: &str, port: u16) -> bool {
 struct TofuCertVerifier {
     key: String,
     seen: FirstSight,
+    public: VerifyAs,
 }
 
 impl ServerCertVerifier for TofuCertVerifier {
     fn verify_server_cert(
         &self,
         end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
         // Compute SHA-256 fingerprint of the server's certificate
         use ring::digest;
@@ -1070,6 +1089,18 @@ impl ServerCertVerifier for TofuCertVerifier {
         if let Some(pinned) = store.get(host_key) {
             // We've connected to this host before — verify the fingerprint matches
             if *pinned != fp_bytes {
+                // A relay that moved to a public certificate, which is what a
+                // provider's sign-in needs, and which changes at each renewal.
+                // The pin stays: it is dropped by nothing short of a person,
+                // since a certificate is public and this handshake not done yet.
+                if self
+                    .public
+                    .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+                    .is_ok()
+                {
+                    info!("TOFU: {} now has a public certificate", host_key);
+                    return Ok(ServerCertVerified::assertion());
+                }
                 warn!(
                     "TOFU: certificate fingerprint changed for {}! Possible MITM attack.",
                     host_key
@@ -1145,6 +1176,73 @@ impl ServerCertVerifier for TofuCertVerifier {
 mod tests {
     use super::*;
 
+    fn ring() -> Arc<rustls::crypto::CryptoProvider> {
+        Arc::new(rustls::crypto::ring::default_provider())
+    }
+
+    /// The real roots: nothing a test makes passes them.
+    fn no_public_ca() -> VerifyAs {
+        public_verifier("tofu-test.invalid", ring()).unwrap()
+    }
+
+    /// A relay that moved to a public certificate renews it every few months,
+    /// so a pin must not stop it. Anything the public CAs do not accept still
+    /// meets the pin, and the pin itself is never touched here: this runs before
+    /// the handshake has proved the key, and a certificate is public.
+    #[test]
+    fn a_changed_certificate_passes_only_if_the_public_cas_accept_it() {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
+        let host = "moved.invalid";
+        let name = ServerName::try_from(host).unwrap();
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca = ca_params.clone().self_signed(&ca_key).unwrap();
+        let issuer = Issuer::new(ca_params, ca_key);
+        let leaf_key = KeyPair::generate().unwrap();
+        let leaf = CertificateParams::new(vec![host.to_string()])
+            .unwrap()
+            .signed_by(&leaf_key, &issuer)
+            .unwrap();
+        let stranger_key = KeyPair::generate().unwrap();
+        let stranger = CertificateParams::new(vec![host.to_string()])
+            .unwrap()
+            .self_signed(&stranger_key)
+            .unwrap();
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca.der().clone()).unwrap();
+        let inner = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), ring())
+            .build()
+            .unwrap();
+        let key = tofu_key(host, 3);
+        TOFU_STORE.lock().unwrap().insert(key.clone(), vec![9; 32]);
+        let verifier = TofuCertVerifier {
+            key: key.clone(),
+            seen: FirstSight::default(),
+            public: VerifyAs {
+                inner,
+                name: name.clone(),
+            },
+        };
+
+        verifier
+            .verify_server_cert(leaf.der(), &[], &name, &[], UnixTime::now())
+            .expect("what the CAs accept passes the old pin");
+        let refused = verifier
+            .verify_server_cert(stranger.der(), &[], &name, &[], UnixTime::now())
+            .unwrap_err();
+        assert!(
+            refused.to_string().contains("fingerprint changed"),
+            "{refused}"
+        );
+        assert_eq!(
+            TOFU_STORE.lock().unwrap().get(&key),
+            Some(&vec![9; 32]),
+            "the pin is left alone"
+        );
+    }
+
     /// The verifier sees the certificate before the handshake proves the
     /// server holds its key, so it must not pin by itself: only a connect
     /// that went through does (`tofu_settle`).
@@ -1154,6 +1252,7 @@ mod tests {
         let verifier = TofuCertVerifier {
             key: key.clone(),
             seen: FirstSight::default(),
+            public: no_public_ca(),
         };
         let cert = CertificateDer::from(vec![1u8, 2, 3]);
         let name = ServerName::try_from("tofu-test.invalid").unwrap();
@@ -1179,10 +1278,12 @@ mod tests {
         let winner = TofuCertVerifier {
             key: key.clone(),
             seen: FirstSight::default(),
+            public: no_public_ca(),
         };
         let loser = TofuCertVerifier {
             key: key.clone(),
             seen: FirstSight::default(),
+            public: no_public_ca(),
         };
         winner
             .verify_server_cert(
@@ -1293,5 +1394,54 @@ mod tests {
         let mut rest = Vec::new();
         control_recv.read_to_end(&mut rest).await.unwrap();
         assert!(rest.is_empty());
+    }
+
+    /// One server message on the tunnel, as a server writes it.
+    async fn server_says<W: AsyncWrite + Unpin>(server: &mut W, parts: &[&[u8]]) {
+        let mut wire = Vec::new();
+        ws::encode_frame(&mut wire, ws::OP_BINARY, parts, None);
+        server.write_all(&wire).await.unwrap();
+    }
+
+    /// The relay says nothing while a person walks to their other device or holds a
+    /// prompt, and nothing keeps a tunnel talking before the sign-in is through. It
+    /// gave up after 30 s of that, and the sign-in read a closed connection.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_tunnel_lives_through_a_persons_wait() {
+        let (ours, mut server) = tokio::io::duplex(1 << 20);
+        let mut link = start_tunnel(ours, Vec::new());
+        // The relay's longest wait (`CHOICE_WAIT`), after a first word from it
+        server_says(&mut server, &[&[0x00], b"first"]).await;
+        let mut word = [0u8; 5];
+        link.control_recv.read_exact(&mut word).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(299)).await;
+        server_says(&mut server, &[&[0x00], b"later"]).await;
+        link.control_recv
+            .read_exact(&mut word)
+            .await
+            .expect("the tunnel gave up on a person");
+        assert_eq!(&word, b"later");
+    }
+
+    /// The control: past the sign-in the pongs flow, and a silent server is a dead one.
+    #[tokio::test(start_paused = true)]
+    async fn once_the_pongs_flow_a_silent_server_ends_the_tunnel() {
+        let (ours, mut server) = tokio::io::duplex(1 << 20);
+        let Link {
+            conn,
+            control_send: _control_send,
+            mut control_recv,
+        } = start_tunnel(ours, Vec::new());
+        let Conn::Tunnel(mut tunnel) = conn else {
+            unreachable!("start_tunnel builds a tunnel")
+        };
+        let mut datagrams_in = tunnel.datagrams_in.take().unwrap();
+        server_says(&mut server, &[&[0x05, 1]]).await;
+        datagrams_in.recv().await.unwrap();
+        let started = tokio::time::Instant::now();
+        let mut rest = Vec::new();
+        control_recv.read_to_end(&mut rest).await.unwrap();
+        assert!(rest.is_empty());
+        assert!(started.elapsed() <= TUNNEL_IDLE_TIMEOUT + Duration::from_secs(1));
     }
 }

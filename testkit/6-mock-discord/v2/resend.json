@@ -1,0 +1,26 @@
+{
+  "_about": "Never reached by a walk, whose cursor is past it: the row someone deleted, for import_replay to send again straight. The relay must count it as skipped.",
+  "channel": "1190000000000000211",
+  "message": {
+    "id": "1200000000000005001",
+    "type": 0,
+    "channel_id": "1190000000000000211",
+    "author": {
+      "id": "1190000000000001001",
+      "username": "dan_d",
+      "discriminator": "0",
+      "global_name": "Dan D",
+      "avatar": null
+    },
+    "content": "Welcome to the lounge.",
+    "timestamp": "2024-02-01T10:00:00.000000+00:00",
+    "edited_timestamp": null,
+    "tts": false,
+    "mention_everyone": false,
+    "mentions": [],
+    "mention_roles": [],
+    "attachments": [],
+    "embeds": [],
+    "pinned": false
+  }
+}

@@ -11,7 +11,7 @@
 // mirrors it; closing the server that carries voice only lets go of the mirror.
 
 import { hasNsfwConsent } from "./stores/channel-ui.js";
-import { dropPrompts } from "./stores/account.js";
+import { account as signedInAccount, dropPrompts, takeLook } from "./stores/account.js";
 import { isWeb } from "./stores/platform.js";
 import { derived, get, writable, type Readable } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
@@ -33,14 +33,22 @@ import {
   unreadPerChannel,
   releaseBrowserMarks,
 } from "./stores/chat.js";
+import { loadGuestBlocks } from "./stores/blocks.js";
 import { pendingInvites } from "./stores/invites.js";
 import { parseHostPort } from "./invite.js";
-import { addNotification } from "./stores/notifications.js";
+import { addNotification, removeNotification } from "./stores/notifications.js";
 import { pendingPokes } from "./stores/pokes.js";
 import { splitName, withTag } from "./username.js";
 import { clearRosters } from "./stores/rosters.js";
+import { clearSweeps } from "./stores/sweep.js";
+import { clearNoticing } from "./stores/noticing.js";
+import { clearQuiet } from "./stores/quiet.js";
+import { clearProfiles } from "./stores/profiles.js";
+import { forgetRings } from "./stores/marks.js";
+import { reopenAfterDrop } from "./stores/handoff.js";
 import { dropEmotes } from "./stores/emotes.js";
-import { dropServer, scoped } from "./stores/scoped.js";
+import { dropKept, dropServer, scoped } from "./stores/scoped.js";
+import { lastOp, removalWithCode } from "./stores/admin-ops.js";
 import {
   buildEntries,
   openServers,
@@ -58,7 +66,7 @@ import {
   savedServers,
   type SavedServer,
 } from "./stores/settings.js";
-import { reconnectDelay, resolveRejoin } from "./rejoin-rules.js";
+import { connectionLostLine, reconnectDelay, resolveRejoin } from "./rejoin-rules.js";
 import type { ChannelInfo } from "./types.js";
 
 export { serverId };
@@ -209,14 +217,20 @@ export function withReloadServers(list: SavedServer[]): SavedServer[] {
 /** How a connect signs in to a relay account (account.rs `AccountArgs`). */
 export interface AccountSignIn {
   /** "device": with the key this device got at an earlier sign-in. "reset":
-   *  a new password with the recovery key, which ends in `RESET_DONE`. */
-  mode: "login" | "register" | "device" | "reset";
+   *  a new password with the recovery key, which ends in `RESET_DONE`.
+   *  "provider": back from a provider's page, with the relay's ticket. */
+  mode: "login" | "register" | "device" | "reset" | "provider";
+  ticket?: number[];
   password?: string;
   /** A sign-up invite code, where the relay wants one. */
   invite?: string | null;
   /** The recovery key as it was shown, for "reset". */
   recovery?: string;
 }
+
+/** What a provider's sign-in ends with when the person chose their password
+ *  (account.rs `USE_PASSWORD`); the name follows. */
+export const USE_PASSWORD = "Sign in with your password: ";
 
 /** What a reset ends with (account.rs `RESET_DONE`): sign in with the new password. */
 export const RESET_DONE = "Your password was reset. Sign in with the new one.";
@@ -267,7 +281,8 @@ export async function connectTo(
   // takes the tag last used, or a new one, and keeps it. An account's name
   // has no tag: the account is what tells it apart.
   const { name, tag } = account ? { name: request.username.trim(), tag: "" } : splitName(request.username.trim());
-  if (!host.trim() || !name.trim()) return { ok: false, error: "Please fill in all fields" };
+  // A provider's sign-in has no name yet: its answer decides the account.
+  if (!host.trim() || (!name.trim() && account?.mode !== "provider")) return { ok: false, error: "Please fill in all fields" };
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     return { ok: false, error: "Port must be between 1 and 65535" };
   }
@@ -279,7 +294,7 @@ export async function connectTo(
     return { ok: true, server, userId: get(userId.peek(server)) };
   }
 
-  const asked = account ? name : withTag(name, tag || splitName(get(lastUsername)).tag);
+  let asked = account ? name : withTag(name, tag || splitName(get(lastUsername)).tag);
   let actual = asked;
   details.set(server, { host, port, username: actual, asked, acceptSelfSigned: selfSigned, account: !!account });
   // Open before the invoke, not after: the channel list arrives from the
@@ -287,6 +302,7 @@ export async function connectTo(
   // returns, and `listenServer` drops events for servers that are not open.
   openServers.update((list) => [...list, server]);
   connectionState.of(server).set("connecting");
+  loadGuestBlocks(server);
 
   let id: number;
   for (let tries = 0; ; tries++) {
@@ -296,7 +312,9 @@ export async function connectTo(
         username: actual,
         acceptInvalidCerts: selfSigned,
         account: account
-          ? { kind: account.mode, password: account.password ?? "", invite: account.invite ?? null, recovery: account.recovery ?? null }
+          ? account.mode === "provider"
+            ? { kind: "provider", ticket: account.ticket ?? [], invite: account.invite ?? null }
+            : { kind: account.mode, password: account.password ?? "", invite: account.invite ?? null, recovery: account.recovery ?? null }
           : null,
       });
       break;
@@ -327,6 +345,11 @@ export async function connectTo(
     return { ok: false, error: "Disconnected" };
   }
 
+  // A provider's sign-in only knows now who it is, and a reconnect goes by the name
+  if (account?.mode === "provider") {
+    asked = actual = get(signedInAccount.peek(server))?.name ?? actual;
+    details.set(server, { host, port, username: actual, asked, acceptSelfSigned: selfSigned, account: true });
+  }
   userId.of(server).set(id);
   username.of(server).set(actual);
   acceptSelfSigned.of(server).set(selfSigned);
@@ -433,7 +456,8 @@ export async function saveOpenServers(): Promise<void> {
 
 /**
  * Forget what a connection held, keeping the server open: everything in a
- * scoped store, its unread counts, and the call if it was this server's.
+ * scoped store but one made `kept`, its unread counts, and the call if it was
+ * this server's.
  *
  * A channel id or a user id is a slot in one server's run — a reconnect may
  * land on a restarted server where the numbers have been handed out again — so
@@ -441,9 +465,24 @@ export async function saveOpenServers(): Promise<void> {
  */
 export function resetServer(server: string): void {
   clearRosters(server);
+  clearSweeps(server);
+  clearNoticing(server);
+  clearQuiet(server);
+  clearProfiles(server);
   dropEmotes(server);
   dropServer(server);
+  // Not scoped, and as much the connection's: what they name gets no answer now, and a later
+  // refusal must not bring it back
+  lastOp.delete(server);
+  removalWithCode.delete(server);
   dropPrompts(server);
+  if (takeLook(server)) {
+    addNotification(
+      `${fromServer(server)}the connection ended during a request for your key, so nothing was handed over. If that was not you, someone may be trying codes. If a new device now asks whether you typed the code, say no.`,
+      "warning",
+      0,
+    );
+  }
   clearServerUnread(server);
   if (get(voice)?.server === server) voice.set(null);
 }
@@ -455,6 +494,11 @@ function removeServer(server: string): void {
   reconnectRuns.delete(server);
   releaseBrowserMarks(server);
   resetServer(server);
+  dropKept(server);
+  forgetRings(server);
+  openAtDrop.delete(server);
+  // The bot's token goes with the wizard that holds it. A cut keeps both, for a run to go on
+  invoke("import_forget", { server }).catch(() => {});
   details.delete(server);
   // What it sent can no longer be answered: its connection is gone
   pendingInvites.update((list) => list.filter((i) => i.server !== server));
@@ -514,14 +558,32 @@ const reconnectRuns = new Map<string, { cancelled: boolean; voiceTaken: boolean 
  */
 const channelListWaiters = new Map<string, Array<(list: ChannelInfo[]) => void>>();
 
+/** The text channel on screen when a connection dropped, by name, for the next list. */
+const openAtDrop = new Map<string, string>();
+/** The toast each drop put up, which has said its piece once the server is back. */
+const lostToasts = new Map<string, number>();
+
+/** A connection dropped: said once, and taken down at the reconnect. */
+export function sayConnectionLost(server: string, reason: string): void {
+  lostToasts.set(server, addNotification(`${fromServer(server)}${connectionLostLine(reason)}`, "error"));
+}
+
 /** App.svelte's `channel-list` handler reports every list here. */
 export function channelListArrived(server: string, list: ChannelInfo[]): void {
+  const open = openAtDrop.get(server);
+  if (open !== undefined) {
+    openAtDrop.delete(server);
+    const [channel] = resolveRejoin([open], list, "text");
+    // What a reconnect will not bring back it does not put on screen either
+    const hasWayIn = !!channel && (!channel.nsfw || hasNsfwConsent(server)) && (!channel.has_password || channelPassword(server, channel.name) !== null);
+    if (hasWayIn) reopenAfterDrop(server, channel);
+  }
   const waiting = channelListWaiters.get(server) ?? [];
   channelListWaiters.delete(server);
   for (const waiter of waiting) waiter(list);
 }
 
-function nextChannelList(server: string, timeoutMs = 5000): Promise<ChannelInfo[]> {
+function nextChannelList(server: string, timeoutMs = 15_000): Promise<ChannelInfo[]> {
   return new Promise((resolve) => {
     const waiter = (list: ChannelInfo[]) => {
       clearTimeout(timer);
@@ -545,15 +607,16 @@ function nextChannelList(server: string, timeoutMs = 5000): Promise<ChannelInfo[
  * The server stays in the list the whole time, and its pane says so.
  *
  * `previous` is where the user was, by name: the voice channel (only if the
- * call was on this server) and the text channels they had open.
+ * call was on this server), the text channels they had open, and the one on screen.
  */
 export async function startReconnect(
   server: string,
-  previous: { voice: string; text: string[] },
+  previous: { voice: string; text: string[]; open?: string },
   initialError = "",
 ): Promise<void> {
   const d = details.get(server);
   if (!d || reconnectRuns.has(server)) return;
+  if (previous.open) openAtDrop.set(server, previous.open);
   reconnectInfo.of(server).set({ attempt: 0, error: initialError });
   const run = { cancelled: false, voiceTaken: false };
   reconnectRuns.set(server, run);
@@ -602,9 +665,10 @@ async function reconnectLoop(
       return;
     }
 
-    // Clean up stale connection state
+    // Clean up stale connection state. Not a person leaving: what its sessions
+    // were goes on to the connection this makes.
     try {
-      await invoke("disconnect", { server });
+      await invoke("disconnect", { server, keepSessions: true });
     } catch {
       // Ignore — may already be cleaned up
     }
@@ -616,6 +680,7 @@ async function reconnectLoop(
       // Registered before connecting: the server sends the channel list while
       // logging us in, so it can be here before `connect` has resolved.
       const listArrived = nextChannelList(server);
+      loadGuestBlocks(server);
       const id = await invoke<number>("connect", {
         address: server,
         username: d.username,
@@ -636,6 +701,9 @@ async function reconnectLoop(
       connectionState.of(server).set("connected");
       info.set({ attempt: 0, error: "" });
       claimLegacyKeys(server);
+      const lost = lostToasts.get(server);
+      if (lost !== undefined) removeNotification(lost);
+      lostToasts.delete(server);
       addNotification(`${fromServer(server)}Reconnected to server`, "info");
 
       // Where to go back to is decided against the list *this* connection

@@ -65,7 +65,9 @@ const CONTROL_CHUNK: usize = 16 * 1024;
 /// No message at all for this long ends the session. Only a backstop: the
 /// server's control Ping every 60 s draws a reply from every client, and a
 /// dead peer is found by keepalive and TCP_USER_TIMEOUT long before this.
-const IDLE_TIMEOUT: Duration = Duration::from_secs(150);
+/// Before sign-in there is no Ping, and a person may hold a prompt this long.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(310);
+const _: () = assert!(IDLE_TIMEOUT.as_secs() > crate::accounts::provider::CHOICE_WAIT.as_secs());
 /// Datagram lane, in packets: voice from every speaker, pongs, screen audio.
 /// A full lane drops the new packet, as UDP would.
 const DATAGRAM_LANE: usize = 64;

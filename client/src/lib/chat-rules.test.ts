@@ -6,6 +6,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  addMarks,
+  applyMarks,
+  markHits,
+  marked,
+  type PostsMark,
   isLegacyDmKey,
   mergeHistory,
   newestTimestamp,
@@ -25,6 +30,10 @@ import {
   applyEvent,
   chatEvent,
   forHandOff,
+  foldedByHide,
+  handOffOf,
+  hiddenLine,
+  isHidden,
   cutText,
   forwarded,
   isOneEmoji,
@@ -38,6 +47,7 @@ import {
   notificationBody,
   receivedText,
   type EventIn,
+  placedByTime,
 } from "./chat-rules.ts";
 import type { ChatMessage } from "./types.ts";
 import { EMOJI_CATEGORIES, QUICK_REACTIONS } from "./emoji.ts";
@@ -702,6 +712,7 @@ test("a notification never carries the text of a message with a timer (R2-14)", 
   assert.equal(notificationBody({ content: "", file }), "Sent a file: cat.png", "a file without a caption");
   assert.equal(notificationBody({ content: "", file, expires_at: T }), "");
   assert.equal(notificationBody({ content: "x".repeat(500) }).length, 140);
+  assert.equal(notificationBody({ content: "hi", fwd: { name: "dan", at: 1, report: { channel: "c", why: "" } } }), "Reported a message");
 });
 
 test("a field a later version kept in the archive survives this one's save (R2-03)", () => {
@@ -791,4 +802,330 @@ test("history cuts a long text, never inside an emote's token", () => {
   // A stray "<:(" far from the end is text: the cut keeps the whole length
   const stray = `see <:( ${"x".repeat(3000)}`;
   assert.equal(cutText(stray), stray.slice(0, 2000), "not cut back to the stray <:");
+});
+
+// ── Hiding (1.10) ───────────────────────────────────────────────────────────
+
+const mod = { user_id: 3, username: "bobby#1234", account: "b0" };
+const member = (over: Partial<ChatMessage> = {}) =>
+  msg({ timestamp: T, id: "m1", username: "dan", account: "d0", content: "spam spam", ...over });
+const hideEv = (on: boolean, at: number, target = "m1"): EventIn => ({ event: { kind: "hide", target, on }, by: mod, at, content: "" });
+const anyone = () => true;
+
+test("a holder's hide collapses a message and keeps all of it", () => {
+  const list = [member({ file: { hash: "a".repeat(64), key: "b".repeat(64), size: 1, z: false, name: "f" } })];
+  const hidden = applyEvent(list, hideEv(true, T + 10), { mayPin: false, mayHide: anyone });
+  const m = hidden[0];
+  assert.deepEqual(m.hide, { on: true, at: T + 10, by: "bobby#1234" });
+  assert.equal(isHidden(m), true);
+  assert.equal(hiddenLine(m), "Removed by bobby", "the name, as shown");
+  assert.equal(m.content, "spam spam", "nothing of it goes");
+  assert.equal(m.file?.name, "f");
+  assert.equal(m.kind, undefined);
+  assert.equal(m.id, "m1");
+  assert.equal(rowKey(m), rowKey(list[0]), "the same row on screen");
+  // The control: the same event from someone who may not
+  assert.equal(applyEvent(list, hideEv(true, T + 10), { mayPin: false }), list);
+});
+
+test("a false holder gets a named line and a click, and no text is destroyed", () => {
+  // A relay that lists anyone it likes: the reader's check says yes
+  const list = [member()];
+  const liar = { user_id: 66, username: "Totally The Admin#6666", account: "66" };
+  const hidden = applyEvent(list, { ...hideEv(true, T + 10), by: liar }, { mayPin: false, mayHide: anyone });
+  assert.equal(hiddenLine(hidden[0]), "Removed by Totally The Admin");
+  assert.equal(hidden[0].content, list[0].content);
+  // Show anyway is all it takes, and it is this reader's: the store still has the text
+  assert.equal(foldedByHide(hidden[0], new Set()), true);
+  assert.equal(foldedByHide(hidden[0], new Set([rowKey(hidden[0])])), false);
+  // A long name is cut where it is kept
+  const long = applyEvent(list, { ...hideEv(true, T + 10), by: { ...liar, username: "x".repeat(500) } }, { mayPin: false, mayHide: anyone });
+  assert.equal(long[0].hide?.by.length, 64);
+  // Its line reads, whatever it was given
+  assert.equal(hiddenLine({ hide: { on: true, at: T, by: "" } }), "Removed by a moderator");
+});
+
+test("the right to pin never grants a hide", () => {
+  const list = [member()];
+  assert.equal(applyEvent(list, hideEv(true, T + 10), { mayPin: true }), list);
+  // The control: the same right does apply a pin
+  const pinned = applyEvent(list, { ...hideEv(true, T + 10), event: { kind: "pin", target: "m1", on: true } }, { mayPin: true });
+  assert.equal(pinned[0].pin?.on, true);
+});
+
+test("a second account repeating the id shields nothing", () => {
+  const list = [member(), member({ account: "e0", username: "evil", content: "the same id" })];
+  const hidden = applyEvent(list, hideEv(true, T + 10), { mayPin: false, mayHide: anyone });
+  assert.deepEqual(hidden.map(isHidden), [true, true]);
+  // The control: a quote's lookup finds no one writer here, so a pin goes nowhere
+  const pin = { ...hideEv(true, T + 10), event: { kind: "pin" as const, target: "m1", on: true } };
+  assert.equal(applyEvent(list, pin, { mayPin: true }), list);
+});
+
+test("it asks about each copy: a holder's own message is spared, a member's copy of one is not", () => {
+  const first = member({ account: "b1", username: "kim" });
+  const copy = member({ kind: "shared", username: "kim" });
+  const list = [first, copy];
+  const unlessListed = (m: ChatMessage) => m.kind === "shared" || !m.account;
+  const hidden = applyEvent(list, hideEv(true, T + 10), { mayPin: false, mayHide: unlessListed });
+  assert.deepEqual(hidden.map(isHidden), [false, true]);
+});
+
+test("only a message there to be read can be hidden", () => {
+  for (const kind of ["notice", "deleted", "undecryptable", "history-marker"] as const) {
+    const list = [member({ kind })];
+    assert.equal(applyEvent(list, hideEv(true, T + 10), { mayPin: false, mayHide: anyone }), list, kind);
+  }
+  assert.equal(applyEvent([member()], hideEv(true, T + 10, "nope"), { mayPin: false, mayHide: anyone }).some(isHidden), false);
+});
+
+test("a restore takes a hide back, the latest wins, and an edit or a delete does what it did", () => {
+  const list = [member()];
+  const apply = (l: ChatMessage[], on: boolean, at: number) => applyEvent(l, hideEv(on, at), { mayPin: false, mayHide: anyone });
+  const hidden = apply(list, true, T + 10);
+  const restored = apply(hidden, false, T + 20);
+  assert.equal(isHidden(restored[0]), false);
+  assert.equal(restored[0].content, "spam spam");
+  assert.equal(apply(restored, true, T + 15), restored, "an older hide after a newer restore");
+  assert.equal(apply(hidden, true, T + 10), hidden, "the same event again changes nothing");
+
+  const writer = { user_id: 1, username: "dan", account: "d0" };
+  const edited = applyEvent(hidden, ev({ kind: "edit", target: "m1" }, writer, T + 30, "sorry"), { mayPin: false });
+  assert.equal(edited[0].content, "sorry");
+  assert.equal(isHidden(edited[0]), true, "an edit does not get out of it");
+  const gone = applyEvent(hidden, ev({ kind: "delete", target: "m1" }, writer, T + 30), { mayPin: false });
+  assert.equal(gone[0].kind, "deleted");
+  assert.equal(gone[0].hide, undefined, "a tombstone holds nothing");
+});
+
+test("a peer's copy brings no hide, and an honest sharer hands none on", () => {
+  const hidden = applyEvent([member({ timestamp: Date.now() - 1000 })], hideEv(true, Date.now()), { mayPin: false, mayHide: anyone })[0];
+  assert.equal(sanitizeHistory([hidden])[0].hide, undefined, "not what a peer says of it");
+  assert.equal(forHandOff(hidden).hide, undefined);
+  const plain = member();
+  assert.equal(forHandOff(plain), plain, "a plain message stays the object it was");
+});
+
+test("the hand-off leaves out what a moderator hid", () => {
+  const now = Date.now();
+  const list = [
+    member({ id: "a", timestamp: now - 3, content: "seen" }),
+    { ...member({ id: "b", timestamp: now - 2, content: "taken down" }), hide: { on: true, at: now, by: "bobby" } },
+    { ...member({ id: "c", timestamp: now - 1, content: "brought back" }), hide: { on: false, at: now, by: "bobby" } },
+    member({ id: "d", timestamp: now - 1, expires_at: now - 1 }),
+    member({ id: "e", timestamp: now - 1, kind: "notice" }),
+  ];
+  const offered = handOffOf(list, now);
+  assert.deepEqual(offered.map((m) => m.id), ["a", "c"]);
+  assert.equal(offered[1].hide, undefined, "what a restore left is this reader's record too");
+});
+
+test("a stored copy taking over from a member's keeps what this reader saw done to it", () => {
+  const shared = member({ kind: "shared", account: undefined });
+  const hidden = applyEvent([shared], hideEv(true, T + 10), { mayPin: false, mayHide: anyone });
+  const signed = member();
+  const { messages } = mergeHistory(hidden, [signed], "");
+  assert.equal(messages[0].kind, undefined, "the signed copy took over");
+  assert.deepEqual(messages[0].hide, hidden[0].hide);
+  assert.equal(rowKey(messages[0]), rowKey(hidden[0]));
+});
+
+test("a hide outlives the archive, and a damaged one costs only the hide", () => {
+  const hidden = applyEvent([member()], hideEv(true, T + 10), { mayPin: false, mayHide: anyone })[0];
+  const back = fromArchived(toArchived(hidden));
+  assert.deepEqual(back.hide, hidden.hide);
+  assert.equal(back.extra_kept, undefined, "read, not kept unread");
+  assert.equal(isHidden(back), true);
+  // The field the next step adds comes through; anything else about it does not
+  const banned = { ...member(), hide: { on: true, at: T, by: "this server", ban: true, more: 1 } } as ChatMessage;
+  assert.deepEqual(fromArchived(toArchived(banned)).hide, { on: true, at: T, by: "this server", ban: true });
+
+  for (const hide of [{ on: "yes", at: T, by: "x" }, { on: true, at: -1, by: "x" }, { on: true, at: T, by: 7 }, { on: true, at: T }, "yes", 7]) {
+    const damaged = { ...member(), hide } as unknown as ChatMessage;
+    const m = fromArchived(toArchived(damaged));
+    assert.equal(m.hide, undefined, JSON.stringify(hide));
+    assert.equal(m.content, "spam spam");
+    assert.equal(m.extra_kept, undefined, "nor is it put back as a later version's");
+  }
+});
+
+test("a hidden message is out of the pins, and back with them once restored", () => {
+  const pinned = { ...member(), pin: { on: true, at: T, by: "olga" } };
+  const hidden = applyEvent([pinned], hideEv(true, T + 10), { mayPin: false, mayHide: anyone });
+  assert.deepEqual(pinnedOf(hidden), []);
+  const restored = applyEvent(hidden, hideEv(false, T + 20), { mayPin: false, mayHide: anyone });
+  assert.deepEqual(pinnedOf(restored).map((m) => m.id), ["m1"]);
+});
+
+test("an event's word for a hide needs its on", () => {
+  assert.deepEqual(chatEvent({ kind: "hide", target: "m", on: false }), { kind: "hide", target: "m", on: false });
+  for (const bad of [{ kind: "hide", target: "m" }, { kind: "hide", target: "m", on: 1 }, { kind: "hide", on: true }, { kind: "hide", target: "", on: true }]) {
+    assert.equal(chatEvent(bad), undefined, JSON.stringify(bad));
+  }
+});
+
+// ── What a ban removed (1.10) ───────────────────────────────────────────────
+
+const DAN = "d0";
+const banMark = (over: Partial<PostsMark> = {}): PostsMark => ({
+  account: DAN,
+  name: "dan",
+  since_ms: T - 1000,
+  before_ms: T + 1000,
+  by: "bobby#1234",
+  ...over,
+});
+const banIndex = (...marks: PostsMark[]) => addMarks(new Map(), marks);
+
+test("a mark is about their messages: by account, else by the name a copy gives", () => {
+  assert.equal(markHits(member(), banMark()), true, "by account");
+  assert.equal(markHits(member({ username: "dan the other" }), banMark()), true, "whatever they go by");
+  assert.equal(markHits(member({ account: undefined }), banMark()), true, "a live copy that knows no account");
+  assert.equal(markHits(member({ account: undefined, kind: "shared" }), banMark()), true, "a member's copy");
+  assert.equal(markHits(member({ account: undefined, username: "gus#1234" }), banMark({ account: null, name: "gus#1234" })), true, "a guest");
+});
+
+test("and only theirs, in its window", () => {
+  assert.equal(markHits(member({ account: "c0", username: "cat" }), banMark()), false);
+  assert.equal(markHits(member({ account: "c0", username: "dan" }), banMark()), false, "an account is not its name");
+  assert.equal(markHits(member({ account: undefined, username: "cat" }), banMark()), false);
+  assert.equal(markHits(member({ timestamp: T - 1000 }), banMark()), true, "the edges count");
+  assert.equal(markHits(member({ timestamp: T + 1000 }), banMark()), true);
+  assert.equal(markHits(member({ timestamp: T - 1001 }), banMark()), false);
+  assert.equal(markHits(member({ timestamp: T + 1001 }), banMark()), false);
+});
+
+test("the control: a guest's mark takes nothing of an account going by that name", () => {
+  assert.equal(markHits(member({ username: "gus" }), banMark({ account: null, name: "gus" })), false);
+  assert.equal(marked(member({ username: "gus" }), banIndex(banMark({ account: null, name: "gus" }))).hide, undefined);
+  assert.equal(markHits(member({ account: undefined, username: "gus" }), banMark({ account: null, name: "gus" })), true);
+});
+
+test("a mark hides in the field a hide uses, keeps it all, and keeps the row", () => {
+  const m = member({ file: { hash: "a".repeat(64), key: "b".repeat(64), size: 1, z: false, name: "f" } });
+  const hidden = marked(m, banIndex(banMark()));
+  assert.deepEqual(hidden.hide, { on: true, at: T + 1000, by: "bobby#1234", ban: true });
+  assert.equal(isHidden(hidden), true);
+  assert.equal(hidden.content, m.content);
+  assert.deepEqual(hidden.file, m.file);
+  assert.equal(rowKey(hidden), rowKey(m), "the row on screen stays");
+  assert.equal(foldedByHide(hidden, new Set()), true);
+  assert.equal(foldedByHide(hidden, new Set([rowKey(m)])), false, "anyone can still show it");
+});
+
+test("the same object where a mark changes nothing, so nothing is saved or drawn again", () => {
+  const list = [member(), member({ id: "m2", account: "c0" })];
+  const index = banIndex(banMark());
+  const once = applyMarks(list, index);
+  assert.notEqual(once, list);
+  assert.equal(once[1], list[1], "the other writer's message");
+  assert.equal(applyMarks(once, index), once, "a second go at it");
+  assert.equal(applyMarks(list, banIndex(banMark({ account: "e0", name: "eve" }))), list);
+  assert.equal(applyMarks(list, new Map()), list);
+  assert.equal(applyMarks(list, undefined), list);
+});
+
+test("a mark takes what someone wrote, not our lines or what is left of a message", () => {
+  for (const kind of ["notice", "history-marker", "deleted", "undecryptable"] as const) {
+    const m = member({ kind });
+    assert.equal(marked(m, banIndex(banMark())), m, kind);
+  }
+  assert.ok(marked(member({ id: undefined }), banIndex(banMark())).hide?.ban, "from before messages had ids");
+});
+
+test("the line says whose word it is", () => {
+  const hidden = marked(member(), banIndex(banMark()));
+  assert.equal(hiddenLine(hidden), "This server says bobby removed this with a ban");
+  assert.equal(hiddenLine({ hide: { on: true, at: T, by: "", ban: true } }), "This server says a moderator removed this with a ban");
+  assert.equal(hiddenLine({ hide: { on: true, at: T, by: "bobby" } }), "Removed by bobby", "the control: a moderator's own");
+});
+
+test("a moderator's restore does not lift it, and a mark replaces a moderator's hide", () => {
+  const hidden = applyMarks([member()], banIndex(banMark()));
+  const apply = (on: boolean, at: number) => applyEvent(hidden, hideEv(on, at), { mayPin: false, mayHide: anyone });
+  assert.equal(apply(false, T + 5000), hidden, "the next connect would only hide it again");
+  assert.equal(apply(true, T + 5000), hidden);
+  const byHand = applyEvent([member()], hideEv(true, T + 10), { mayPin: false, mayHide: anyone });
+  assert.equal(applyMarks(byHand, banIndex(banMark()))[0].hide?.ban, true);
+  const restored = applyEvent(byHand, hideEv(false, T + 20), { mayPin: false, mayHide: anyone });
+  assert.equal(applyMarks(restored, banIndex(banMark()))[0].hide?.on, true, "restored by hand is no answer to the server");
+});
+
+test("the writer's copy replacing a live one keeps it", () => {
+  const now = Date.now();
+  const mark = banMark({ since_ms: now - 5000, before_ms: now + 5000 });
+  const live = member({ account: undefined, timestamp: now });
+  const [hidden] = applyMarks([live], banIndex(mark));
+  assert.ok(hidden.hide?.ban);
+  const stored = member({ timestamp: now });
+  const { messages } = mergeHistory([hidden], [stored], "");
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].account, DAN, "the signed copy replaced it");
+  assert.deepEqual(messages[0].hide, hidden.hide);
+  assert.equal(rowKey(messages[0]), rowKey(live));
+  // And a copy already marked as it arrives keeps its own
+  const { messages: fresh } = mergeHistory([live], [marked(stored, banIndex(mark))], "");
+  assert.ok(fresh[0].hide?.ban);
+});
+
+test("it survives the archive, and a damaged one is dropped", () => {
+  const hidden = marked(member(), banIndex(banMark()));
+  const back = fromArchived(toArchived(hidden));
+  assert.deepEqual(back.hide, hidden.hide);
+  assert.equal(back.extra_kept, undefined, "read as a hide, not kept as a later version's");
+  const extra = (hide: unknown) => fromArchived({ ...toArchived(member()), extra: JSON.stringify({ hide }) });
+  assert.equal(extra({ on: true, at: "soon", by: "x", ban: true }).hide, undefined);
+  assert.equal(extra({ on: true, at: T, by: "x", ban: "yes" }).hide?.ban, undefined, "only a real true");
+});
+
+test("a peer's word is no ban's, and an honest sharer hands on neither", () => {
+  const at = Date.now();
+  const hidden = marked(member({ timestamp: at }), banIndex(banMark({ before_ms: at + 1, since_ms: 0 })));
+  assert.ok(hidden.hide?.ban);
+  assert.equal(sanitizeHistory([hidden])[0].hide, undefined);
+  assert.equal(forHandOff(hidden).hide, undefined);
+  assert.deepEqual(handOffOf([hidden]), [], "not to a newcomer");
+  assert.deepEqual(handOffOf([member({ timestamp: at })]).length, 1, "the control");
+});
+
+test("forwarded keeps a report mark bounded and cleans its junk", () => {
+  const f = forwarded({
+    name: "dan",
+    at: 7,
+    report: { channel: `\u202e${"c".repeat(100)}`, id: "i".repeat(100), why: `\u202eline\n${"w".repeat(400)}`, by: `\u202e${"b".repeat(100)}`, more: "x" },
+  })!;
+  assert.equal(f.report!.channel, "c".repeat(64));
+  assert.ok(f.report!.id!.length <= 64, "bounded like any id");
+  assert.equal(Array.from(f.report!.why).length, 300);
+  assert.ok(!/[\u202e\n]/.test(f.report!.why));
+  assert.equal(f.report!.by, "b".repeat(64));
+  assert.ok(!("more" in f.report!));
+  // What the crate gives: nothing that is not there
+  assert.deepEqual(forwarded({ name: "dan", at: 7, report: { channel: "", why: "", id: undefined, by: " " } }), {
+    name: "dan",
+    at: 7,
+    report: { channel: "", why: "" },
+  });
+  // A malformed mark leaves a plain forward, whose bytes are what they were
+  for (const bad of ["spam", 7, null, { why: "no channel" }, { channel: "no reason" }, { channel: 1, why: "" }]) {
+    assert.deepEqual(forwarded({ name: "dan", at: 7, report: bad }), { name: "dan", at: 7 }, JSON.stringify(bad));
+  }
+  assert.deepEqual(forwarded({ name: "dan", at: 7 }), { name: "dan", at: 7 });
+});
+
+test("a report mark survives toArchived and fromArchived", () => {
+  const report = { channel: "lobby-chat", id: "m1", why: "spam", by: "carla" };
+  const m: ChatMessage = { user_id: 5, username: "carla", content: "look", timestamp: 1, id: "r1", fwd: { name: "dan", at: 7, report } };
+  const back = fromArchived(JSON.parse(JSON.stringify(toArchived(m))));
+  assert.deepEqual(back.fwd, m.fwd);
+});
+
+test("a post held for its key goes in at its own time, and no further back than the hold", () => {
+  const row = (timestamp: number, content = "") => ({ user_id: 1, username: "a", content, timestamp }) as ChatMessage;
+  const list = [row(1000, "old"), row(50_000, "b"), row(60_000, "c")];
+  const at = (msg: ChatMessage, floor: number) => placedByTime(list, msg, floor).map((m) => m.timestamp);
+  assert.deepEqual(at(row(70_000), 10_000), [1000, 50_000, 60_000, 70_000], "newest goes last");
+  assert.deepEqual(at(row(55_000), 10_000), [1000, 50_000, 55_000, 60_000]);
+  assert.deepEqual(at(row(500), 10_000), [1000, 500, 50_000, 60_000], "the floor stops it");
+  assert.deepEqual(at(row(500), 100_000), [1000, 50_000, 60_000, 500], "nothing here within the hold: at the end, as it came");
 });

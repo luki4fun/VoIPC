@@ -31,6 +31,7 @@
     /** Mentions: who an `@` may name, our own names, and who the box offers. */
     names?: readonly string[];
     me?: readonly string[];
+    anonymous?: boolean;
     mentionables?: readonly string[];
     /** Opened to answer in it: the box gets the cursor. Not when opened to read,
      *  where on a phone it would bring the keyboard up over the thread. */
@@ -53,6 +54,7 @@
     held = null,
     names = [],
     me = [],
+    anonymous = false,
     mentionables = [],
     focusComposer = false,
     server = "",
@@ -134,7 +136,7 @@
     </button>
   </header>
   <div class="thread-messages" bind:this={scroller} onscroll={onScroll}>
-    <MessageList messages={rows} {all} {onlink} under={root} onreply={onsend ? reply : undefined} {onjumpelsewhere} {names} {me} {server} {fileConv} {actions} />
+    <MessageList messages={rows} {all} {onlink} under={root} onreply={onsend ? reply : undefined} {onjumpelsewhere} {names} {me} {anonymous} {server} {fileConv} {actions} />
   </div>
   {#if onsend}
     <Composer

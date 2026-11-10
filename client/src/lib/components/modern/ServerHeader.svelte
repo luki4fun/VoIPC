@@ -8,6 +8,8 @@
   import { disconnectServer, serverEntries } from "../../connect.js";
   import { playDisconnectedSound } from "../../sounds.js";
   import { account, showPrompt } from "../../stores/account.js";
+  import { serverProfile } from "../../stores/profiles.js";
+  import { cleanServerName } from "../../profile-rules.js";
   import Icon from "../Icons.svelte";
   import { menu } from "../../actions/menu.js";
 
@@ -21,7 +23,15 @@
 
   let open = $state(false);
 
-  const name = $derived($serverEntries.find((e) => e.active)?.name ?? $serverAddress);
+  const entry = $derived($serverEntries.find((e) => e.active));
+  const name = $derived(entry?.name ?? $serverAddress);
+  /** What the server calls itself, always above its address: it is only a name. */
+  const relayName = $derived(
+    cleanServerName(
+      $serverProfile?.name,
+      $serverEntries.filter((e) => !e.active).flatMap((e) => [e.name, e.host]),
+    ),
+  );
 
   // This server only: the others, and the call if it is on one of them, stay
   async function disconnect() {
@@ -46,7 +56,14 @@
     aria-haspopup="menu"
     aria-expanded={open}
   >
-    <span class="server-name">{name}</span>
+    {#if relayName}
+      <span class="server-names">
+        <span class="server-name">{relayName}</span>
+        <span class="server-host">{entry ? `${entry.host}:${entry.port}` : $serverAddress}</span>
+      </span>
+    {:else}
+      <span class="server-name">{name}</span>
+    {/if}
     <Icon name="chevron-down" size={16} />
   </button>
 
@@ -60,6 +77,9 @@
       onclick={(e) => e.stopPropagation()}
       use:menu={{ onclose: () => (open = false), label: name }}
     >
+      {#if $serverProfile?.description}
+        <p class="server-description">{$serverProfile.description}</p>
+      {/if}
       {#if $currentChannelId !== 0}
         <button
           class="menu-item"
@@ -146,6 +166,31 @@
 
   .header-btn:hover {
     background: var(--bg-hover);
+  }
+
+  .server-names {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    line-height: 1.2;
+    text-align: left;
+  }
+
+  .server-host {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: var(--fs-micro);
+    font-weight: normal;
+    color: var(--text-secondary);
+  }
+
+  .server-description {
+    margin: 0;
+    padding: 8px 12px;
+    font-size: var(--fs-micro);
+    color: var(--text-secondary);
+    white-space: pre-line;
   }
 
   .server-name {

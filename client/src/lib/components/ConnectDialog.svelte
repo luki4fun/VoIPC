@@ -19,13 +19,14 @@
     type SavedServer,
   } from "../stores/settings.js";
   import { isWeb } from "../stores/platform.js";
-  import { pendingInvite, serverAddress } from "../stores/connection.js";
-  import { parseInviteLink } from "../invite.js";
-  import { DOWNLOAD_PAGE, RESET_DONE, connectTo, serverId, showConnectDialog, signInAgain, updateNeeded, type AccountSignIn } from "../connect.js";
-  import { randomTag, splitName, withTag } from "../username.js";
+  import { pendingInvite, pendingJoin, serverAddress } from "../stores/connection.js";
+  import { parseInviteLink, parseJoinLink } from "../invite.js";
+  import { DOWNLOAD_PAGE, RESET_DONE, USE_PASSWORD, connectTo, serverId, showConnectDialog, signInAgain, updateNeeded, type AccountSignIn } from "../connect.js";
+  import { isAccountName, randomTag, splitName, withTag } from "../username.js";
   import { availableUpdate, checkForUpdate, checkUpdates, installUpdate, updateBusy, updatesSupported } from "../stores/updates.js";
   import { updateFits } from "../update-rules.js";
   import { voice } from "../stores/channels.js";
+  import { chatUnlocked } from "../stores/chat.js";
   import { forgetEmotes } from "../stores/emotes.js";
 
   // Invite link pasted here: takes host/port from it and joins the channel
@@ -33,6 +34,16 @@
   let inviteLink = $state("");
 
   function applyInviteLink() {
+    const join = parseJoinLink(inviteLink);
+    if (join) {
+      pendingJoin.set({ code: join.code, host: join.host, port: join.port });
+      if (join.channel) {
+        pendingInvite.set({ channel: join.channel, password: null, server: serverId(join.host, join.port) });
+      }
+      inviteLink = "";
+      error = "";
+      return;
+    }
     const parsed = parseInviteLink(inviteLink);
     if (!parsed) {
       if (inviteLink.trim()) error = "Not a VoIPC invite link (expected https://host:port/#channel=…)";
@@ -55,6 +66,12 @@
   /** The four digits after the name. Random unless the user picks them. */
   let tag = $state(splitName($lastUsername).tag || randomTag());
   let error = $state("");
+  let errorEl = $state<HTMLElement | undefined>();
+  // At the window's first size an error can sit below the fold of this dialog, and
+  // a person just sees the form come back.
+  $effect(() => {
+    if (error) errorEl?.scrollIntoView({ block: "nearest" });
+  });
   let connecting = $state(false);
   let selfSigned = $state($lastAcceptSelfSigned);
   let remember = $state($rememberConnection);
@@ -83,8 +100,36 @@
     signInAgain.set(null);
   });
 
+  // A link to sign up with: "Create account" with its code in place
+  $effect(() => {
+    const join = $pendingJoin;
+    if (!join) return;
+    if (join.host && join.port) {
+      host = join.host;
+      port = join.port;
+      touched = true;
+    }
+    mode = "account";
+    accountAction = "create";
+    signupInvite = join.code;
+    codeIsFor = { host: join.host ?? host, port: join.port ?? port };
+    pendingJoin.set(null);
+  });
+
+  // A link's code is for its own server: pointed at another, the form forgets it
+  // rather than hand it over
+  let codeIsFor = $state<{ host: string; port: number } | null>(null);
+  $effect(() => {
+    if (codeIsFor && (host !== codeIsFor.host || port !== codeIsFor.port)) {
+      codeIsFor = null;
+      signupInvite = "";
+    }
+  });
+
   $effect(() => {
     const [h, p, n, m] = [host, port, name, mode];
+    // The list lives in the vault, so a form drawn behind its gate asks too early
+    void $chatUnlocked;
     if (m !== "account" || !h || !n) {
       remembered = false;
       return;
@@ -94,6 +139,89 @@
     invoke<{ server: string; name: string }[]>("account_devices")
       .then((list) => (remembered = list.some((d) => d.server === server && d.name === want)))
       .catch(() => (remembered = false));
+  });
+
+  // ── Sign-in with a provider ──
+  /** What this server offers. Only where it has a public certificate: the
+   *  provider sends the browser back there, so a pin would not do. */
+  let providers = $state<string[]>([]);
+  /** Out at the provider's page: the code to tap there, and the ticket to come
+   *  back with. */
+  let providerWait = $state<{ provider: string; url: string; code: string; ticket: number[]; server: { host: string; port: number } } | null>(null);
+
+  $effect(() => {
+    const [h, p, m] = [host, port, mode];
+    providers = [];
+    if (m !== "account" || !h.trim() || !p) return;
+    const t = setTimeout(() => {
+      invoke<{ providers: string[] }>("account_provider_ask", { address: serverId(h, p), ask: { kind: "providers" } })
+        .then((r) => (providers = [...new Set(r.providers)]))
+        .catch(() => {});
+    }, 500);
+    return () => clearTimeout(t);
+  });
+
+  async function startProvider(provider: string) {
+    error = "";
+    try {
+      const r = await invoke<{ url: string; code: string; ticket: number[] }>("account_provider_ask", {
+        address: serverId(host, port),
+        ask: { kind: "open", provider },
+      });
+      providerWait = { provider, ...r, server: { host, port } };
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  /** Whether the browser is through; then the sign-in goes on. */
+  async function checkProvider() {
+    const wait = providerWait;
+    if (!wait || connecting) return;
+    let ready = false;
+    try {
+      const r = await invoke<{ ready: boolean }>("account_provider_ask", {
+        address: serverId(wait.server.host, wait.server.port),
+        ask: { kind: "status", ticket: wait.ticket },
+      });
+      ready = r.ready;
+    } catch (e) {
+      providerWait = null;
+      error = String(e);
+      return;
+    }
+    if (!ready || providerWait !== wait) return;
+    providerWait = null;
+    connecting = true;
+    const result = await connectTo({
+      ...wait.server,
+      username: "",
+      acceptSelfSigned: selfSigned,
+      remember,
+      account: { mode: "provider", ticket: wait.ticket, invite: signupInvite.trim() || null },
+    });
+    connecting = false;
+    if (result.ok) {
+      showConnectDialog.set(false);
+    } else if (result.error.includes(USE_PASSWORD)) {
+      name = result.error.slice(result.error.indexOf(USE_PASSWORD) + USE_PASSWORD.length).trim();
+      accountAction = "signin";
+      error = "Enter your password to unlock this account.";
+    } else {
+      error = result.error;
+    }
+  }
+
+  // Coming back from the browser, or side by side with it
+  $effect(() => {
+    if (!providerWait) return;
+    const check = () => void checkProvider();
+    const timer = setInterval(check, 3000);
+    window.addEventListener("focus", check);
+    return () => {
+      clearInterval(timer);
+      window.removeEventListener("focus", check);
+    };
   });
 
   /** What the connect signs in with, or a reason it cannot yet. */
@@ -126,6 +254,7 @@
     const parts = splitName(u);
     name = parts.name;
     tag = parts.tag || tag;
+    if (isAccountName(u)) mode = "account";
     selfSigned = ss;
     remember = r;
   });
@@ -442,6 +571,21 @@
         <button type="button" class:active={accountAction === "signin"} onclick={() => (accountAction = "signin")} disabled={connecting}>Sign in</button>
         <button type="button" class:active={accountAction === "create"} onclick={() => (accountAction = "create")} disabled={connecting}>Create account</button>
       </div>
+      {#if providerWait}
+        <div class="provider-wait">
+          <p class="account-note">Your code is</p>
+          <code class="provider-code">{providerWait.code}</code>
+          <p class="account-note">Open {providerWait.provider} and sign in there. When it comes back, tap this code on the page, then return here.</p>
+          <button type="button" class="connect-provider" onclick={() => providerWait && invoke("account_open_page", { url: providerWait.url }).catch((e) => (error = String(e)))}>Open {providerWait.provider}</button>
+          <button type="button" class="link-btn" onclick={() => (providerWait = null)}>Cancel</button>
+        </div>
+      {:else if providers.length && (accountAction === "signin" || signupInvite.trim())}
+        <div class="providers">
+          {#each providers as provider (provider)}
+            <button type="button" class="connect-provider" onclick={() => startProvider(provider)} disabled={connecting}>Continue with {provider}</button>
+          {/each}
+        </div>
+      {/if}
       <div class="field">
         <label for="account-name">Account name</label>
         <input
@@ -476,7 +620,7 @@
         </div>
       {/if}
       <div class="field">
-        <label for="account-password">{accountAction === "reset" ? "New password" : "Password"}{#if accountAction === "signin" && remembered} (not needed on this device){/if}</label>
+        <label for="account-password">{accountAction === "reset" ? "New password" : "Password"}{#if accountAction === "signin" && remembered}{" (not needed on this device)"}{/if}</label>
         <input
           id="account-password"
           type="password"
@@ -520,7 +664,7 @@
           />
         </div>
         <div class="field">
-          <label for="signup-invite">Invite code (if the server asks for one)</label>
+          <label for="signup-invite">Invite code or link's code (if the server asks for one)</label>
           <input id="signup-invite" type="text" bind:value={signupInvite} disabled={connecting} />
         </div>
         <p class="account-note">
@@ -596,7 +740,7 @@
         {/if}
       </div>
     {:else if error}
-      <div class="error" role="alert">{error}</div>
+      <div class="error" role="alert" bind:this={errorEl}>{error}</div>
       {#if pinRejected && !isWeb}
         <button
           type="button"
@@ -661,6 +805,30 @@
     font-size: var(--fs-sm);
   }
 
+  .providers,
+  .provider-wait {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+    margin-bottom: 12px;
+  }
+  .provider-code {
+    font-size: 2rem;
+    letter-spacing: 0.2em;
+    text-align: center;
+  }
+  .connect-provider {
+    padding: 10px 12px;
+    border-radius: 8px;
+    border: 1px solid var(--border-color);
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    cursor: pointer;
+  }
+  .connect-provider:hover:not(:disabled) {
+    background: var(--bg-hover);
+  }
   .account-note {
     font-size: var(--fs-sm);
     color: var(--text-secondary);

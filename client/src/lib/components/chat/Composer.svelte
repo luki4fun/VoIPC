@@ -264,7 +264,7 @@
   const suggestions = $derived.by(() => {
     if (!query || query.start === dismissedAt) return [];
     return mentionables
-      .filter((n) => shortName(n).toLowerCase().startsWith(query.q) || n.toLowerCase().startsWith(query.q))
+      .filter((n) => shortName(n).replace(/^&/, "").toLowerCase().startsWith(query.q) || n.toLowerCase().startsWith(query.q))
       .slice(0, 6);
   });
   /** This device's recently used emotes here, newest first (stores/emotes.ts). */

@@ -68,6 +68,8 @@ export interface Transport {
   readonly tcp: boolean;
   /** Frame and queue one control payload (postcard ClientMessage). */
   sendControl(payload: Uint8Array): void;
+  /** Control frames not written out yet (only ever compared to 0). */
+  controlBacklog(): number;
   sendDatagram(bytes: Uint8Array): void;
   /**
    * Write one encoded video frame on a unidirectional stream of its own, the
@@ -82,6 +84,11 @@ export interface Transport {
   sendVideoFrame(body: Uint8Array, key: boolean): boolean;
   /** Frames whose stream has not finished writing (only ever compared to 0). */
   videoBacklog(): number;
+  /**
+   * The server may say nothing for this long from now on, as a sign-in waiting on a person:
+   * none of its pings run yet. Never under the usual bound, so 0 puts that back.
+   */
+  allowQuiet(ms: number): void;
   /** Flush queued control frames and close the session. onClosed is not called. */
   close(): Promise<void>;
 }
@@ -208,8 +215,11 @@ async function wrapSession(wt: WebTransport, handlers: TransportHandlers): Promi
 
   let closed = false;
   let watchdog: ReturnType<typeof setTimeout> | undefined;
+  let idleMs = IDLE_TIMEOUT_MS;
   /** Frames whose stream has not finished writing (send-side backpressure). */
   let framesInFlight = 0;
+  /** Control frames handed to the stream and not taken yet. */
+  let controlInFlight = 0;
 
   const finish = (reason: string) => {
     if (closed) return;
@@ -224,7 +234,7 @@ async function wrapSession(wt: WebTransport, handlers: TransportHandlers): Promi
   };
   const armWatchdog = () => {
     clearTimeout(watchdog);
-    watchdog = setTimeout(() => finish("Connection timed out (no data from server)"), IDLE_TIMEOUT_MS);
+    watchdog = setTimeout(() => finish("Connection timed out (no data from server)"), idleMs);
   };
 
   wt.closed.then(
@@ -243,8 +253,13 @@ async function wrapSession(wt: WebTransport, handlers: TransportHandlers): Promi
       const frame = new Uint8Array(4 + payload.length);
       new DataView(frame.buffer).setUint32(0, payload.length);
       frame.set(payload, 4);
-      controlWriter.write(frame).catch((e) => finish(`Write error: ${message(e)}`));
+      controlInFlight++;
+      controlWriter
+        .write(frame)
+        .catch((e) => finish(`Write error: ${message(e)}`))
+        .finally(() => controlInFlight--);
     },
+    controlBacklog: () => controlInFlight,
     sendDatagram(bytes) {
       if (closed) return;
       datagramWriter.write(bytes).catch(() => {
@@ -273,6 +288,11 @@ async function wrapSession(wt: WebTransport, handlers: TransportHandlers): Promi
       return true;
     },
     videoBacklog: () => framesInFlight,
+    allowQuiet(ms) {
+      if (closed) return;
+      idleMs = Math.max(ms, IDLE_TIMEOUT_MS);
+      armWatchdog();
+    },
     async close() {
       if (closed) return;
       closed = true;
@@ -325,6 +345,7 @@ function openSocket(urlHost: string, port: number): Promise<WebSocket> {
 function wrapSocket(ws: WebSocket, handlers: TransportHandlers): Transport {
   let closed = false;
   let watchdog: ReturnType<typeof setTimeout> | undefined;
+  let idleMs = IDLE_TIMEOUT_MS;
 
   const finish = (reason: string) => {
     if (closed) return;
@@ -339,7 +360,7 @@ function wrapSocket(ws: WebSocket, handlers: TransportHandlers): Transport {
   };
   const armWatchdog = () => {
     clearTimeout(watchdog);
-    watchdog = setTimeout(() => finish("Connection timed out (no data from server)"), IDLE_TIMEOUT_MS);
+    watchdog = setTimeout(() => finish("Connection timed out (no data from server)"), idleMs);
   };
   const pushControl = controlFramer(handlers, finish);
 
@@ -364,6 +385,9 @@ function wrapSocket(ws: WebSocket, handlers: TransportHandlers): Transport {
 
   return {
     tcp: true,
+    // Past what voice still goes behind: video and voice share this queue, so it may
+    // never be quite empty during a share
+    controlBacklog: () => (ws.bufferedAmount > TUNNEL_MAX_DELTA_BACKLOG ? 1 : 0),
     sendControl(payload) {
       if (closed) return;
       const framed = new Uint8Array(4 + payload.length);
@@ -398,6 +422,11 @@ function wrapSocket(ws: WebSocket, handlers: TransportHandlers): Transport {
       return true;
     },
     videoBacklog: () => (ws.bufferedAmount > 0 ? 1 : 0),
+    allowQuiet(ms) {
+      if (closed) return;
+      idleMs = Math.max(ms, IDLE_TIMEOUT_MS);
+      armWatchdog();
+    },
     async close() {
       if (closed) return;
       closed = true;

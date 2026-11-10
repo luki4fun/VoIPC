@@ -1,0 +1,35 @@
+name: Soak
+
+# The browser jobs, five copies of each part at once (20 jobs), and nothing else. A flake
+# that fails one run in ten shows up here in one round of about 25 minutes, where pull-
+# request runs find one per run. "Fixed" for a flaky lane means a soak with every job green.
+#
+# Two ways to start one:
+# - the label `soak` on a pull request: `gh pr edit <n> --add-label soak` (remove it and add
+#   it again for the next round). A pull-request run takes this file from the branch, so it
+#   works before the file is on main.
+# - by hand, once this file is on the default branch (workflow_dispatch needs that):
+#   `gh workflow run soak.yml --ref <branch>`
+#
+# A red job uploads its lanes' output and relay logs (test.yml, "Lane logs").
+
+on:
+  pull_request:
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      copies:
+        description: Copies of each browser part, as a JSON list of numbers
+        type: string
+        default: '[1,2,3,4,5]'
+
+permissions:
+  contents: read
+
+jobs:
+  soak:
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'soak'
+    uses: ./.github/workflows/test.yml
+    with:
+      copies: ${{ inputs.copies || '[1,2,3,4,5]' }}
+      browser-only: true

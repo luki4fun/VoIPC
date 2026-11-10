@@ -73,9 +73,24 @@ pub struct AppState {
     /// another's. ponytail: entries are never removed; one per server id this
     /// session ever connected to.
     pub connect_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Sessions with accounts between one connection and the next, by server and by the
+    /// account signed in there (`voipc_crypto::KeptSessions`). Memory only.
+    pub kept_sessions: std::sync::Mutex<HashMap<(String, [u8; 16]), voipc_crypto::KeptSessions>>,
+    /// The same for their pins (`voipc_crypto::sync::KeptPins`): a reconnect reads again only
+    /// the pages whose generation moved. Memory only.
+    pub kept_pins: std::sync::Mutex<HashMap<(String, [u8; 16]), voipc_crypto::sync::KeptPins>>,
+    /// On mobile data, as the front end last said (`commands::set_metered`).
+    pub metered: AtomicBool,
+    /// A move from Discord: a bot's token in RAM and the run it drives, by server id.
+    #[cfg(not(target_os = "android"))]
+    pub import: Arc<crate::import::ImportHub>,
     /// Sign-ins waiting for the person to type a code, by server id.
     pub totp_answers:
         std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<crate::account::TotpAnswer>>>,
+    /// Sign-ins through a provider waiting for the person to choose, by server id.
+    pub provider_answers: std::sync::Mutex<
+        HashMap<String, tokio::sync::oneshot::Sender<crate::account::ProviderAnswer>>,
+    >,
     pub chat: RwLock<ChatState>,
     // ── Settings every connection shares ──
     // One user, one microphone, one pair of ears: each connection holds a
@@ -191,6 +206,18 @@ pub enum SdkEvent {
 }
 
 impl AppState {
+    /// What accounts kept here goes: a person's leave, or a device forgotten.
+    pub fn forget_kept(&self, server: &str) {
+        self.kept_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|(kept_on, _), _| kept_on != server);
+        self.kept_pins
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|(kept_on, _), _| kept_on != server);
+    }
+
     pub fn new() -> Self {
         let state = Self {
             connections: RwLock::new(HashMap::new()),
@@ -200,7 +227,13 @@ impl AppState {
             echo_reference: Arc::default(),
             voice_server: std::sync::Mutex::new(None),
             connect_locks: std::sync::Mutex::new(HashMap::new()),
+            kept_sessions: std::sync::Mutex::new(HashMap::new()),
+            kept_pins: std::sync::Mutex::new(HashMap::new()),
+            metered: AtomicBool::new(false),
+            #[cfg(not(target_os = "android"))]
+            import: Arc::default(),
             totp_answers: std::sync::Mutex::new(HashMap::new()),
+            provider_answers: std::sync::Mutex::new(HashMap::new()),
             chat: RwLock::new(ChatState::default()),
             is_muted: Arc::new(AtomicBool::new(false)),
             is_deafened: Arc::new(AtomicBool::new(false)),
@@ -328,12 +361,27 @@ pub struct PendingMessage {
     pub queued_at: std::time::Instant,
 }
 
+impl PendingMessage {
+    /// A direct message or a poke for `user_id` that can still go.
+    pub fn fresh_for(&self, user_id: u32) -> bool {
+        let theirs = matches!(
+            self.target,
+            PendingTarget::Direct { target_user_id } | PendingTarget::Poke { target_user_id }
+                if target_user_id == user_id
+        );
+        theirs && self.queued_at.elapsed().as_secs() < 60
+    }
+}
+
 /// Target of a pending (queued) message.
 pub enum PendingTarget {
     /// Channel message — waiting for sender key distribution.
     Channel { channel_id: u32 },
     /// Direct message — waiting for pairwise Signal session.
     Direct { target_user_id: u32 },
+    /// A poke, the same: on the live path nothing opens a session with someone before
+    /// there is something to say to them.
+    Poke { target_user_id: u32 },
 }
 
 /// E2E encryption state using Signal Protocol.
@@ -356,6 +404,69 @@ pub struct SignalState {
     /// Shared with the browser build rather than written twice: see
     /// `voipc_crypto::ChannelKeying`.
     pub channels: ChannelKeying,
+    /// Wakes the live path's task: it has key frames to send (`network::live_task`).
+    pub live_wake: Arc<tokio::sync::Notify>,
+    /// The new-member wait holds our direct messages, so a sealed ask would be refused:
+    /// history is asked by the plain frames meanwhile.
+    pub direct_held: bool,
+    /// A channel list too long for one frame, until its last.
+    pub channel_parts: ChannelListParts<voipc_protocol::types::ChannelInfo>,
+}
+
+/// The frames a list too long for one comes in, and at the last of them the list. A relay can
+/// say "more" for ever: past this many frames, about 19,000 channels, the rest is not kept.
+const CHANNEL_LIST_FRAMES_MOST: usize = 64;
+
+pub struct ChannelListParts<T> {
+    channels: Vec<T>,
+    frames: usize,
+}
+
+impl<T> Default for ChannelListParts<T> {
+    fn default() -> Self {
+        ChannelListParts {
+            channels: Vec::new(),
+            frames: 0,
+        }
+    }
+}
+
+impl<T> ChannelListParts<T> {
+    pub fn take(&mut self, channels: Vec<T>, more: bool) -> Option<Vec<T>> {
+        if self.frames < CHANNEL_LIST_FRAMES_MOST {
+            self.frames += 1;
+            self.channels.extend(channels);
+        }
+        if more {
+            return None;
+        }
+        self.frames = 0;
+        Some(std::mem::take(&mut self.channels))
+    }
+}
+
+impl SignalState {
+    /// A session with `user_id` that both ends hold came up: direct messages may use it.
+    pub fn session_up(&mut self, user_id: u32) {
+        self.established_sessions.insert(user_id);
+        self.pending_sessions.remove(&user_id);
+        self.channels.live_session_up(user_id);
+    }
+}
+
+/// The stores and the keying, under one lock, on a thread that may block: libsignal's work
+/// takes a moment, and a key job's frame some milliseconds. None: not initialized.
+pub fn with_keys<T>(
+    signal: &std::sync::Mutex<SignalState>,
+    f: impl FnOnce(&mut SignalStores, &mut ChannelKeying) -> T,
+) -> Option<T> {
+    tokio::task::block_in_place(|| {
+        let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
+        let SignalState {
+            stores, channels, ..
+        } = &mut *sig;
+        stores.as_mut().map(|stores| f(stores, channels))
+    })
 }
 
 /// `plaintext` for `to` over our pairwise session, under one lock: the
@@ -456,6 +567,8 @@ pub struct ActiveConnection {
     pub tcp_tx: crate::network::ControlTx,
     /// The relay account this connection signed in with; `None` for a guest.
     pub account: Option<Arc<crate::account::AccountLink>>,
+    /// Whether a guest's switch counts here. An account's session keeps its own.
+    pub guest_may_share: bool,
     /// This connection's file transfers (`files.rs`).
     pub files: Arc<crate::files::Files>,
     /// Sender for voice packets (QUIC datagrams, or the TCP fallback's datagram lane).
@@ -576,6 +689,15 @@ pub struct ActiveConnection {
     /// channel's proximity mode (and, for the game SDK, a channel by name)
     /// without asking the UI.
     pub channels: Arc<std::sync::Mutex<Vec<ChannelInfo>>>,
+}
+
+impl ActiveConnection {
+    /// Whether the switch to share history counts on this connection.
+    pub fn may_share(&self) -> bool {
+        self.account
+            .as_ref()
+            .map_or(self.guest_may_share, |link| link.session().may_share())
+    }
 }
 
 pub use voipc_audio::game::{Motion, MAX_GLIDE, MIN_GLIDE};
@@ -958,6 +1080,35 @@ pub fn merge_source(
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_channel_list_past_one_frame_is_told_whole_at_its_last_frame() {
+        let mut parts = ChannelListParts::default();
+        assert_eq!(
+            parts.take(vec![1, 2], true),
+            None,
+            "the first frame says nothing yet"
+        );
+        assert_eq!(parts.take(vec![3], true), None);
+        assert_eq!(parts.take(vec![4], false), Some(vec![1, 2, 3, 4]));
+        assert_eq!(
+            parts.take(vec![5], false),
+            Some(vec![5]),
+            "the next list starts over"
+        );
+    }
+
+    #[test]
+    fn a_relay_that_says_more_for_ever_stops_being_kept() {
+        let mut parts = ChannelListParts::default();
+        for i in 0..1000 {
+            assert_eq!(parts.take(vec![i], true), None);
+        }
+        let whole = parts.take(vec![1000], false).unwrap();
+        assert_eq!(whole.len(), CHANNEL_LIST_FRAMES_MOST);
+        assert_eq!(whole[..2], [0, 1]);
+    }
+
     use voipc_audio::game::TELEPORT_M;
     use voipc_audio::spatial::{Source, FLAT, MAX_MUFFLE};
 

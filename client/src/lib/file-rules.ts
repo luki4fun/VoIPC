@@ -6,6 +6,7 @@
 //
 // Pure, so file-rules.test.ts runs it under Node's own test runner.
 
+import { isHidden } from "./chat-rules.ts";
 import type { ChatMessage, FileBlob } from "./types.ts";
 
 /** A message that is still here at `now`: its timer, if any, has not run out. */
@@ -13,9 +14,10 @@ function live(m: ChatMessage, now: number): boolean {
   return m.expires_at === undefined || m.expires_at > now;
 }
 
-/** Whether a message in `messages` names the blob `hash`. */
+/** Whether a message in `messages` names the blob `hash`, as a reason to hand it
+ *  to a member who asks: a message a moderator hid is none, as with its text. */
 export function refersTo(messages: readonly ChatMessage[] | undefined, hash: string, now = Date.now()): boolean {
-  return !!messages?.some((m) => m.file?.hash === hash && live(m, now));
+  return !!messages?.some((m) => m.file?.hash === hash && live(m, now) && !isHidden(m));
 }
 
 /** Every blob some message in these conversations names. */

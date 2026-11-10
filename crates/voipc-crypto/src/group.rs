@@ -105,6 +105,15 @@ pub fn forget_own_sender_key(stores: &mut SignalStores, my_user_id: u32, channel
         .forget(&address, channel_distribution_id(channel_id));
 }
 
+/// Whether a decrypt failed for want of this writer's key, which may still come, and not
+/// because the post can never open: a key from after it, a bad signature.
+pub fn lacks_key(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<libsignal_protocol::SignalProtocolError>(),
+        Some(libsignal_protocol::SignalProtocolError::NoSenderKeyState { .. })
+    )
+}
+
 /// Decrypt a channel message from a specific sender.
 ///
 /// `channel_id` is the channel the *server* said the message arrived in, and

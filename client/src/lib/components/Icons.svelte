@@ -37,6 +37,16 @@
     <path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3v5Z"/>
     <path d="M3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3v5Z"/>
 
+  {:else if name === "bell"}
+    <path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/>
+    <path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/>
+
+  {:else if name === "bell-off"}
+    <path d="M8.7 3A6 6 0 0 1 18 8c0 2.3.3 4.1.8 5.5"/>
+    <path d="M17 17H3s3-2 3-9c0-.7.1-1.3.3-1.9"/>
+    <path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/>
+    <path d="M3 3l18 18"/>
+
   {:else if name === "headphones-off"}
     <path d="M21 18v-6a9 9 0 0 0-9-9"/>
     <path d="M3 3l18 18"/>
@@ -205,6 +215,11 @@
     <path d="M5 2h14"/>
     <path d="M17 22v-4.17a2 2 0 0 0-.59-1.42L12 12l-4.41 4.41A2 2 0 0 0 7 17.83V22"/>
     <path d="M7 2v4.17a2 2 0 0 0 .59 1.42L12 12l4.41-4.41A2 2 0 0 0 17 6.17V2"/>
+
+  {:else if name === "archive"}
+    <rect x="2" y="3" width="20" height="5" rx="1"/>
+    <path d="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8"/>
+    <line x1="10" y1="12" x2="14" y2="12"/>
 
   {:else if name === "history"}
     <path d="M3 12a9 9 0 1 0 3-6.7L3 8"/>

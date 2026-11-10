@@ -36,9 +36,14 @@
     transmitHeldByGame,
     isAdmin,
     pendingInvite,
+    pendingJoin,
     rememberChannelPassword,
+    serverKey,
   } from "./lib/stores/connection.js";
   import {
+    channelLayout,
+    groupStyles,
+    layoutArrived,
     channels,
     currentChannelId,
     previewChannelId,
@@ -46,9 +51,12 @@
     voice,
     voiceChannel,
     voiceServer,
+    voiceUsers,
   } from "./lib/stores/channels.js";
   import { patchUser, users, speakingUsers } from "./lib/stores/users.js";
-  import { account, accountHex } from "./lib/stores/account.js";
+  import { account, accountHex, shareRight } from "./lib/stores/account.js";
+  import { blocked } from "./lib/stores/blocks.js";
+  import { isBlocked, silenceChanges } from "./lib/block-rules.js";
   import { addNotification, removeNotification } from "./lib/stores/notifications.js";
   import { availableUpdate, initUpdates } from "./lib/stores/updates.js";
   import { updateToast, type UpdateInfo } from "./lib/update-rules.js";
@@ -56,6 +64,8 @@
   import { pendingPokes, createPoke, addPoke } from "./lib/stores/pokes.js";
   import {
     addChannelMessage,
+    noteNeverOpened,
+    addChannelLineAtTop,
     addDmMessage,
     detachDm,
     peerName,
@@ -68,22 +78,26 @@
     activeTextChannelId,
     dmConversations,
     incrementChannelUnread,
+    noteChannelUnseen,
     clearChannelUnread,
     markRead,
     dmKey,
     chatKey,
     chatUnlocked,
+    authorsHere,
     channelMessages,
     joinedTextChannelIds,
     mergeChannelHistory,
+    onPostsHidden,
     openTextChannel,
     flushChatSave,
+    quietBlockedDms,
     receivedNow,
   } from "./lib/stores/chat.js";
   import ChatHistorySetup from "./lib/components/ChatHistorySetup.svelte";
   import AudioSetup from "./lib/components/AudioSetup.svelte";
   import type { ChannelInfo, ChatMessage, UserInfo } from "./lib/types.js";
-  import { parseInviteFragment } from "./lib/invite.js";
+  import { parseInviteFragment, parseJoinFragment } from "./lib/invite.js";
   import {
     channelListArrived,
     disconnectServer,
@@ -93,6 +107,7 @@
     withReloadServers,
     serverId,
     resetServer,
+    sayConnectionLost,
     showConnectDialog,
     startReconnect,
     updateNeeded,
@@ -137,17 +152,33 @@
     uiPrefsReady,
   } from "./lib/stores/ui-prefs.js";
   import {
+    addToRoster,
     channelRosters,
+    exchangedKey,
+    goneFrom,
+    noteJoin,
+    noteLeft,
     currentRosterOf,
+    onlineById,
     patchRosters,
     requestAllRosters,
     requestRoster,
     forgetUser,
     rosterAccount,
     setRoster,
+    textSeats,
   } from "./lib/stores/rosters.js";
-  import { emoteLimits, setEmotes, type EmoteLimits, type EmoteSet } from "./lib/stores/emotes.js";
+  import { emoteLimits, metered, setEmotes, type EmoteLimits, type EmoteSet } from "./lib/stores/emotes.js";
+  import { UNOPENED_LINE, answersHandOff, clampedLine, spendServe, type ServeBudget } from "./lib/history-rules.js";
   import { olderRelay } from "./lib/stores/relay.js";
+  import { community, livePath } from "./lib/relay-rules.js";
+  import { askArchiveChannels } from "./lib/stores/imported.js";
+  import { noteMemberGone, onSweepPage, startSweeps, sweepForAsker } from "./lib/stores/sweep.js";
+  import { goesByList, marksChannel } from "./lib/follow-rules.js";
+  import { gateNoted, noteReaders, relayWentBack, type NamedReader } from "./lib/stores/noticing.js";
+  import { forgetHandOff, handOffAnswered } from "./lib/stores/handoff.js";
+  import { clearRing, flushMarks, moveRead, noteLastPost, ringBack, ringForPost } from "./lib/stores/marks.js";
+  import { networkChanged } from "./lib/stores/quiet.js";
   import { confirmAction } from "./lib/stores/confirm.js";
   import {
     askNsfwConsent,
@@ -157,23 +188,41 @@
     forgetLeft,
     isTextChannel,
     listenOnly,
+    hideCheck,
     managesChannel,
     openJoinedTextChannel,
     previewChannel,
     settingsAsk,
+    channelNotify,
+    channelRenamed,
+    firstVisit,
+    forgetAutoJoinAsk,
+    markKicked,
+    type PostFlags,
+    selectChannel,
   } from "./lib/stores/channel-ui.js";
+  import { arrival, pageInView } from "./lib/notify-rules.js";
+  import { cleanLayout, type ChannelLayout } from "./lib/channel-groups.js";
+  import type { GroupStyle } from "./lib/member-sections.js";
+  import type { WireProfile } from "./lib/profile-rules.js";
+  import { callsOn, hasPower, ownMentionNames, powerTokens, tokensForMe } from "./lib/mention-rules.js";
+  import { chatMods, mentionPower, myBadges, onChatMods, onMentionPower, onReportTakers, reportTakers } from "./lib/stores/powers.js";
+  import { onRestrictions, restrictions, voiceRestriction } from "./lib/stores/restrictions.js";
+  import { heldNotice, type RestrictionRow } from "./lib/restrict-rules.js";
+  import { writerTag } from "./lib/profile-rules.js";
+  import { askProfile, askProfiles, onPicture, onProfiles, onServerProfile } from "./lib/stores/profiles.js";
+  type ServerProfileEvent = Parameters<typeof onServerProfile>[1];
   import {
     chatEvent,
     expiryFor,
-    forHandOff,
-    HISTORY_MAX_MESSAGES,
+    handOffOf,
     MAX_CONVERSATIONS,
     messageRefs,
     notificationBody,
     receivedText,
   } from "./lib/chat-rules.js";
   import { LAYOUT_PICKER_VERSION } from "./lib/ui-prefs.js";
-  import { voiceMode, vadThreshold } from "./lib/stores/voice.js";
+  import { stopTransmit, voiceMode, vadThreshold } from "./lib/stores/voice.js";
   import {
     playChannelSwitchSound,
     playUserJoinedSound,
@@ -194,11 +243,11 @@
     selectedUserId,
     syncing,
   } from "./lib/stores/room.js";
-  import { upsertById } from "./lib/stores/upsert.js";
+  import { eachOnce, upsertById } from "./lib/stores/upsert.js";
   import { shortName } from "./lib/username.js";
-  import { mentionNames, mentionsName, parse } from "./lib/markdown.js";
+  import { mentionsName, parse } from "./lib/markdown.js";
   import { findTarget, isOwn } from "./lib/thread-rules.js";
-  import { cleanLane, micLane } from "./lib/stores/mixer.js";
+  import { cleanLane, micLane, silenceUser, silencedIds } from "./lib/stores/mixer.js";
   import {
     addScreenShare,
     removeScreenShare,
@@ -284,6 +333,11 @@
   /** Channels we have already explained the `routed` flag for this session,
    *  as `server/channel id`. */
   const routedNoticeShown = new Set<string>();
+  type HandOffAskEvent = { channel_id: number; from_user_id: number; sealed?: boolean };
+  /** What this device has left for answering hand-offs, per server. */
+  const serveBudgets = new Map<string, ServeBudget>();
+  /** Channels already told nobody else is there, this run. */
+  const nobodyHereSaid = new Set<string>();
 
   // Every server's state and list at once, for what runs per server
   const connectionStates = connectionState.all();
@@ -342,6 +396,24 @@
       .catch(() => {});
   }
 
+  // A block silences someone in the call, whichever server is on screen: only the
+  // voice server's roster may drive this, since `set_user_volume` has no server and
+  // an id on another one is a stranger. By volume alone, which the relay never sees.
+  const voiceBlocked = blocked.at(voiceServer);
+  $effect(() => {
+    const changes = silenceChanges($voiceUsers, $voiceBlocked, !!$voiceChannel?.anonymous, silencedIds());
+    untrack(() => {
+      for (const { id, on } of changes) void silenceUser(id, on);
+    });
+  });
+
+  // What someone newly blocked had waiting stops counting, on every open server
+  const everyBlocked = blocked.all();
+  $effect(() => {
+    const servers = [...$everyBlocked.keys()];
+    untrack(() => servers.forEach(quietBlockedDms));
+  });
+
   // A server can ask every client into a text channel; the ones this user
   // walked out of are skipped. Every open server, not just the one on screen.
   //
@@ -355,6 +427,36 @@
       if (state === "connected") autoJoinTextChannels(server, $channelLists.get(server) ?? []);
     }
   });
+
+  // The names of everyone on this device for that server, once a connection and in pages of
+  // their own: drawn later they cost nothing, where asking then would say which channel is
+  // on screen. An archive unlocked after connecting brings more of them.
+  $effect(() => {
+    void $chatUnlocked;
+    for (const [server, state] of $connectionStates) {
+      if (state === "connected") untrack(() => {
+        if (community(get(olderRelay.peek(server))?.protocol ?? null)) askProfiles(server, authorsHere(server));
+      });
+    }
+  });
+
+  // Only once the layout that names it has come, which is a frame of its own behind
+  // the sign-in: deciding earlier would use up this device's one welcome on nothing.
+  // And only for the server on screen: one coming up in the background must not
+  // pull the view to it.
+  $effect(() => {
+    const server = $serverAddress;
+    if (!server || !$layoutArrived || $connectionStates.get(server) !== "connected") return;
+    if (($channelLists.get(server) ?? []).length > 0) untrack(() => welcomeOnce(server));
+  });
+
+  /** The first time on this server on this device, with nothing else open: its
+   *  welcome channel, if it has one. */
+  function welcomeOnce(server: string) {
+    if (server !== get(serverAddress) || get(activeTextChannelId) !== null || get(activeDmUserId) !== null) return;
+    const channel = firstVisit(server);
+    if (channel) selectChannel(channel);
+  }
 
   // A saved device that is no longer plugged in: the name is all we store
   // (cpal has no stable id, and a browser's deviceId is wiped with site data),
@@ -452,17 +554,109 @@
    *  by our short name only where nobody else in the channel goes by it (R2-11). */
   function mentionsUs(server: string, channelId: number, content: string): boolean {
     if (!content.includes("@")) return false;
-    if (get(channels.peek(server)).find((c) => c.channel_id === channelId)?.anonymous) return false;
+    const channel = get(channels.peek(server)).find((c) => c.channel_id === channelId);
+    if (channel?.anonymous) return false;
     const own = get(username.peek(server));
     if (!own) return false;
-    const people = currentRosterOf(server, channelId).map((u) => u.username);
-    const names = mentionNames([...people, own]).filter((n) => n === own || n === shortName(own));
+    const names = ownMentionNames(
+      own,
+      currentRosterOf(server, channelId).map((u) => u.username),
+      !!channel?.text && livePath(get(olderRelay.peek(server))?.protocol ?? null),
+    );
     const tree = parse(content, { names });
     return names.some((n) => mentionsName(tree, n));
   }
 
+  /** Whether someone here is blocked: by their account where a list we see has
+   *  it, else by the name. */
+  function blockedSender(server: string, uid: number, name: string): boolean {
+    const known = get(users.peek(server)).find((u) => u.user_id === uid)?.account ?? rosterAccount(server, uid);
+    return isBlocked(get(blocked.peek(server)), { account: known, username: name }, false);
+  }
+
+  /** Whether this message came with its sender's power to call on everybody. A post on the
+   *  live path says itself whether its writer is an admin; no list may hold them. */
+  function arrivedWithPower(server: string, channelId: number, uid: number, content: string, post?: PostFlags): boolean {
+    if (!community(get(olderRelay.peek(server))?.protocol ?? null)) return false;
+    const channel = get(channels.peek(server)).find((c) => c.channel_id === channelId);
+    const row = post ?? currentRosterOf(server, channelId).find((u) => u.user_id === uid);
+    return hasPower(
+      content,
+      { holder: get(mentionPower.peek(server)).has(uid), isAdmin: !!row?.is_admin },
+      { anonymous: !!channel?.anonymous },
+      powerTokens(get(groupStyles.peek(server))),
+    );
+  }
+
+  /**
+   * Someone asks for a channel's recent chat. The request reaches us through the server, and the
+   * server is the adversary this whole layer is built against: it can invent one, for any
+   * channel and from any name, and forty-eight kilobytes of our plaintext would go straight back
+   * out. A sealed one the relay could not even look at. So one rule for both, here on the device.
+   *
+   * A relay can still put a stranger *in* a list, as it is the one who sends it. In a gated
+   * channel that is a name on screen, and answering names them to us too; in an open one it
+   * reads no more than anyone on the server may. Off the live path every channel goes by its
+   * list. `mayWait`: a stranger to the last list moves the next sweep up, and is looked at once
+   * more when it is in.
+   */
+  function answerHandOff(server: string, data: HandOffAskEvent, mayWait: boolean): void {
+    const channelId = data.channel_id;
+    const chName = channelNameById(server, channelId);
+    if (!chName) return;
+    let msgs: ChatMessage[] = handOffOf($channelMessages.get(chatKey(server, chName)) ?? []);
+    if (msgs.length === 0) return;
+    const channel = get(channels.peek(server)).find((c) => c.channel_id === channelId);
+    const seat = get(textSeats.peek(server)).get(channelId);
+    const asker = currentRosterOf(server, channelId).find((u) => u.user_id === data.from_user_id);
+    const hold = get(restrictions.peek(server)).get(get(userId.peek(server)));
+    const live = livePath(get(olderRelay.peek(server))?.protocol ?? null);
+    const swept = !live || goesByList(channel, seat?.gated);
+    const right = $shareChannelHistory && get(shareRight.peek(server));
+    const gone = !!get(goneFrom.peek(server)).get(channelId)?.has(data.from_user_id);
+    if (mayWait && live && swept && right && !asker && !gone && seat) {
+      sweepForAsker(server, () => answerHandOff(server, data, false));
+      return;
+    }
+    const answer = answersHandOff({
+      switchOn: $shareChannelHistory,
+      right: get(shareRight.peek(server)),
+      anonymous: !!channel?.anonymous,
+      listenOnly: get(listenOnly.peek(server)).has(channelId),
+      held: !!hold?.text || !!hold?.direct,
+      ours:
+        channelId === get(currentChannelId.peek(server)) ||
+        get(joinedTextChannelIds.peek(server)).has(channelId),
+      swept,
+      askerOnline: onlineById(server).has(data.from_user_id),
+      askerOnSweep: !!asker,
+      askerGone: gone,
+      askerGuest: !!seat?.gated && !asker?.account,
+      metered: metered(),
+      spend: () => {
+        let budget = serveBudgets.get(server);
+        if (!budget) serveBudgets.set(server, (budget = { spent: 0, at: Date.now() }));
+        return spendServe(budget, Date.now());
+      },
+    });
+    if (!answer) return;
+    // Stay well under the 64 KiB control-message cap (Signal envelope + framing)
+    const bytes = (list: ChatMessage[]) => new TextEncoder().encode(JSON.stringify(list)).length;
+    while (msgs.length > 0 && bytes(msgs) > 48 * 1024) msgs = msgs.slice(1);
+    if (msgs.length === 0) return;
+    // They can read this now: on the same line as a key, where who reads is what matters
+    if (live && asker) noteReaders(server, channelId, [{ account: asker.account, name: asker.username }]);
+    invoke("send_channel_history", {
+      server,
+      channelId,
+      targetUserId: data.from_user_id,
+      messages: msgs,
+      sealed: data.sealed ?? false,
+    }).catch((e: unknown) => console.warn("channel history hand-off failed:", e));
+  }
+
   async function notifyUnfocused(title: string, body: string) {
-    if (document.hasFocus()) return;
+    if (pageInView(document)) return;
     const now = performance.now();
     if (now - lastNotifyAt < 2000) return;
     lastNotifyAt = now;
@@ -595,6 +789,36 @@
     return () => { if (timer) clearTimeout(timer); };
   });
 
+  /** A live post is here. It moves where they read to it, ends a ring if they are looking,
+   *  and in a channel that goes by a list its writer is on the list from now on: this app has
+   *  a key from them. */
+  function noteArrival(server: string, channelId: number, uid: number, name: string, at: number, post: PostFlags | undefined, writer: number[] | null | undefined): void {
+    const channel = get(channels.peek(server)).find((c) => c.channel_id === channelId);
+    if (!channel?.text) return;
+    moveRead(server, channel, at);
+    if (uid === get(userId.peek(server))) return;
+    if (viewingChannel(server, channelId)) clearRing(server, channelId);
+    if (!post) return;
+    if (!goesByList(channel, get(textSeats.peek(server)).get(channelId)?.gated)) return;
+    exchangedKey(server, channelId, bareRow(channelId, uid, name, writer, post));
+  }
+
+  /** A person a frame named, as a row of a list. */
+  function bareRow(channelId: number, uid: number, name: string, account: number[] | null | undefined, post?: PostFlags): UserInfo {
+    return {
+      user_id: uid,
+      username: name,
+      channel_id: channelId,
+      is_muted: false,
+      is_deafened: false,
+      is_screen_sharing: false,
+      is_admin: !!post?.is_admin,
+      is_moderator: post?.is_moderator,
+      shares_history: false,
+      account,
+    };
+  }
+
   /** That channel's chat is on screen: this server, no DM over the pane,
    *  and this channel in it. */
   function viewingChannel(server: string, channelId: number): boolean {
@@ -614,7 +838,17 @@
     // ...and the file cache follows what the chat still refers to
     const stopFileRetain = startFileRetain();
     // A reload, or a window closed under us: the debounced chat save goes now
-    window.addEventListener("beforeunload", () => void flushChatSave());
+    window.addEventListener("beforeunload", () => {
+      void flushChatSave();
+      flushMarks();
+    });
+    // What a key job may cost, and what asking and answering may: the backend asks only on this
+    const sayMetered = () => {
+      void invoke("set_metered", { metered: metered() }).catch(() => {});
+      networkChanged(() => [...get(connectionStates).keys()]);
+    };
+    sayMetered();
+    (navigator as { connection?: EventTarget }).connection?.addEventListener?.("change", sayMetered);
     // A file dropped where nothing takes it (the member list, a chat that
     // cannot send files) must not open in the window in place of the app:
     // the desktop page sees drops itself since 1.3 (R3-07). A chat that takes
@@ -634,6 +868,14 @@
       // For the server that served this page, which is the one the link names:
       // with several open, "whichever is on screen" could be another one.
       const inv = parseInviteFragment(window.location.hash);
+      const join = parseJoinFragment(window.location.hash);
+      if (join) {
+        pendingJoin.set({
+          code: join.code,
+          host: window.location.hostname.replace(/^\[|\]$/g, ""),
+          port: Number(window.location.port) || 443,
+        });
+      }
       if (inv) {
         pendingInvite.set({
           ...inv,
@@ -666,7 +908,11 @@
       muteKey.set(config.mute_key ?? "");
       deafenKey.set(config.deafen_key ?? "");
       chatHistoryDisabled.set(config.chat_history_disabled ?? false);
-      shareChannelHistory.set(config.share_channel_history ?? true);
+      shareChannelHistory.set(config.share_channel_history ?? false);
+      if (config.share_off_notice) {
+        addNotification("Sharing with newcomers is off now, until you turn it on: it used to start on. Settings → Privacy & data.", "info", 15000);
+        invoke("set_config_bool", { key: "share_off_notice", value: false }).catch(() => {});
+      }
       maxConversations.set(config.max_conversations ?? MAX_CONVERSATIONS);
       screenShareCodec.set(config.screen_share_codec ?? "h264");
       spatialAudio.set(config.spatial_audio ?? true);
@@ -745,9 +991,16 @@
       listenServer<EmoteSet>("emote-list", (server, d) => setEmotes(server, d)),
       listenServer<EmoteLimits | null>("emote-limits", (server, d) => emoteLimits.of(server).set(d)),
       // An older relay's protocol and version: the banner, and what the app holds back there
-      listenServer<{ protocol: number; version: string | null }>("relay-version", (server, d) =>
-        olderRelay.of(server).set(d.version === null ? null : { protocol: d.protocol, version: d.version }),
-      ),
+      listenServer<{ protocol: number; version: string | null }>("relay-version", (server, d) => {
+        olderRelay.of(server).set(d.version === null ? null : { protocol: d.protocol, version: d.version });
+        if (relayWentBack(server, d.protocol)) {
+          addNotification(
+            `${fromServer(server)}this server spoke a newer protocol before. On the older one your app does not check its gates and hand-offs as it did. If nobody said it would go back, someone may be between you and it.`,
+            "warning",
+            0,
+          );
+        }
+      }),
       listenServer<{ name: string; reason: string }>("emote-error", (server, d) =>
         addNotification(`${fromServer(server)}${d.name ? `:${d.name}: — ` : ""}${d.reason}`, "error"),
       ),
@@ -762,7 +1015,8 @@
           0,
         ),
       ),
-      listenServer<ChannelInfo[]>("channel-list", (server, list) => {
+      listenServer<ChannelInfo[]>("channel-list", (server, raw) => {
+        const list = eachOnce(raw, (c) => c.channel_id);
         channels.of(server).set(list);
         // A reconnect waits for this before deciding where to put the user back
         channelListArrived(server, list);
@@ -772,7 +1026,8 @@
         requestAllRosters(server);
       }),
 
-      listenServer<{ channel_id: number; users: UserInfo[] }>("user-list", (server, data) => {
+      listenServer<{ channel_id: number; users: UserInfo[] }>("user-list", (server, raw) => {
+        const data = { ...raw, users: eachOnce(raw.users, (u) => u.user_id) };
         const oldChannelId = get(currentChannelId.peek(server));
         const newChannelId = data.channel_id;
         // A join: whether we may only listen there comes right after
@@ -813,6 +1068,8 @@
         currentChannelId.of(server).set(newChannelId);
         users.of(server).set(data.users);
         setRoster(server, newChannelId, data.users);
+        // A room can hold an archive too, and the relay is what moved us
+        if (newChannelId !== 0 && livePath(get(olderRelay.peek(server))?.protocol ?? null)) askArchiveChannels(server);
         // We just left one, and the channel we joined may have been listed with
         // a roster we fetched before joining.
         if (oldChannelId !== newChannelId) {
@@ -888,10 +1145,24 @@
           return next;
         });
         const name = channelNameById(server, d.channel_id);
+        // A gate letting us speak again means nothing while we are held on the whole server
+        if (!d.on && get(restrictions.peek(server)).get(get(userId.peek(server)))?.voice) return;
         addNotification(
           `${fromServer(server)}${d.on ? `You can only listen and read in ${name}` : `You may speak in ${name} again`}`,
           "info",
         );
+      }),
+
+      listenServer<{ list: RestrictionRow[] }>("restrictions", (server, d) => {
+        const me = get(userId.peek(server));
+        const before = get(restrictions.peek(server)).get(me) ?? null;
+        onRestrictions(server, d.list);
+        const after = get(restrictions.peek(server)).get(me) ?? null;
+        const notice = heldNotice(before, after, Date.now());
+        if (notice) addNotification(`${fromServer(server)}${notice}`, after ? "warning" : "info");
+        // Not through the mute, which goes across every server, is kept and is
+        // announced: this is one server's. A lift re-arms voice activation (VoiceKeys)
+        if (after?.voice && !before?.voice && inVoice(server)) void stopTransmit();
       }),
 
       listenServer<UserInfo>("user-joined", (server, joiner) => {
@@ -899,9 +1170,9 @@
         // the server, so a user we already have can arrive again (two joins
         // at once). Replacing is idempotent; appending twice would throw
         // each_key_duplicate and wedge the UI.
-        let isNew = true;
         const current = get(currentChannelId.peek(server));
         if (joiner.channel_id === current) {
+          let isNew = true;
           users.of(server).update((u) => {
             const next = upsertById(u, joiner, (x) => x.user_id);
             isNew = next.added;
@@ -918,17 +1189,9 @@
             playUserJoinedSound();
           }
         }
-        // Always update channel user count (broadcast to all)
-        if (isNew) {
-          channels.of(server).update((chs) =>
-            chs.map((ch) =>
-              ch.channel_id === joiner.channel_id ? { ...ch, user_count: ch.user_count + 1 } : ch,
-            ),
-          );
-        }
-        // The broadcast told us somebody joined but not who, if it is not our
-        // channel. Coalesced, so a filling channel is one question, not ten.
-        requestRoster(server, joiner.channel_id);
+        // The row's count and its list, with the next ones. The broadcast told us somebody
+        // joined but maybe not who, and then it is asked, as one question, not ten.
+        noteJoin(server, joiner);
       }),
 
       listenServer<{ user_id: number; channel_id: number }>("user-left", (server, data) => {
@@ -942,6 +1205,7 @@
             return next;
           });
           if (get(activeTextChannelId.peek(server)) === data.channel_id) openTextChannel(server, null);
+          forgetHandOff(server, data.channel_id);
         }
 
         // Only remove from local user list if they left our channel
@@ -965,15 +1229,7 @@
             selectedUserId.update((id) => (id === data.user_id ? null : id));
           }
         }
-        // Always update channel count
-        channels.of(server).update((chs) =>
-          chs.map((ch) =>
-            ch.channel_id === data.channel_id
-              ? { ...ch, user_count: Math.max(0, ch.user_count - 1) }
-              : ch,
-          ),
-        );
-        requestRoster(server, data.channel_id);
+        noteLeft(server, data.channel_id, data.user_id);
       }),
 
       listenServer<{ user_id: number; muted: boolean }>("user-muted", (server, data) => {
@@ -1105,13 +1361,21 @@
       listenServer<{ reason: string }>("connection-lost", (server, data) => {
         const reason = data.reason;
         console.error(`Connection to ${server} lost:`, reason);
-        addNotification(`${fromServer(server)}Connection lost: ${reason}`, "error");
+        sayConnectionLost(server, reason);
 
         // Session-scoped warnings die with the session
         if (mediaKeyToast?.server === server) {
           removeNotification(mediaKeyToast.id);
           mediaKeyToast = null;
         }
+
+        // Its ids go with the connection: a restarted relay numbers from 1 again,
+        // and whoever gets a holder's old id must not call on everybody. The relay
+        // says who holds it again at sign-in.
+        mentionPower.of(server).set(new Set());
+        chatMods.of(server).set(new Map());
+        restrictions.of(server).set(new Map());
+        reportTakers.of(server).set(null);
 
         // A second connection-lost during a reconnect (ServerShutdown is
         // followed by the socket closing) is the loop's business, not a
@@ -1130,11 +1394,13 @@
         const prevText = [...get(joinedTextChannelIds.peek(server))]
           .map((id) => channelNameById(server, id))
           .filter((n) => n !== "");
+        const shownText = get(activeDmUserId.peek(server)) === null ? get(activeTextChannelId.peek(server)) : null;
+        const prevOpen = shownText === null ? "" : channelNameById(server, shownText);
         // What the connection held goes now, the call with it if it was this
         // server's: a channel id is a slot in one server's run, and the
         // reconnect may land on a restarted server that hands them out again.
         resetServer(server);
-        void startReconnect(server, { voice: prevVoice, text: prevText }, reason);
+        void startReconnect(server, { voice: prevVoice, text: prevText, open: prevOpen }, reason);
       }),
 
       listen<{ error: string; retrying?: boolean }>("audio-device-error", (event) => {
@@ -1162,6 +1428,7 @@
       // the archive. It does not wait for us for long.
       listen("quit-requested", async () => {
         await flushChatSave();
+        flushMarks();
         await invoke("quit_app");
       }),
 
@@ -1257,60 +1524,11 @@
         void disconnectServer(server, { save: false });
       }),
 
+      // Another tab of this browser moved the switch
+      listen<boolean>("share-switch", (event) => shareChannelHistory.set(event.payload)),
+
       // ── Channel history hand-off (E2E, member → newcomer) ──
-      listenServer<{ channel_id: number; from_user_id: number }>(
-        "channel-history-requested",
-        (server, data) => {
-          if (!$shareChannelHistory) return;
-          const channelId = data.channel_id;
-          const chName = channelNameById(server, channelId);
-          if (!chName) return;
-          // The request reaches us through the server, and the server is the
-          // adversary this whole layer is built against: it can invent one, for
-          // any channel and from any name, and forty-eight kilobytes of our
-          // plaintext would go straight back out. So: a channel we are actually
-          // in, and somebody the roster of that channel holds.
-          //
-          // A relay can still put a stranger *in* that roster — it is the one who
-          // sends the member list. But then the stranger is on screen in the
-          // channel, which is the difference between a silent harvest and a
-          // visible one.
-          if (
-            channelId !== get(currentChannelId.peek(server)) &&
-            !get(joinedTextChannelIds.peek(server)).has(channelId)
-          )
-            return;
-          if (!currentRosterOf(server, channelId).some((u) => u.user_id === data.from_user_id)) {
-            return;
-          }
-          // Second-hand messages go on: a conversation should outlive the last
-          // person who was there for it, and it stays marked as hearsay all the
-          // way down the chain — sanitizeHistory re-stamps whatever it is handed.
-          const now = Date.now();
-          const text = ($channelMessages.get(chatKey(server, chName)) ?? []).filter(
-            (m) =>
-              (!m.kind || m.kind === "text" || m.kind === "shared") &&
-              // A message whose destruction timer has run out is not history. The
-              // sweep takes it off our own screen within seconds; handing it over
-              // in the meantime would put it back into somebody else's archive
-              // with a fresh copy of the same deadline.
-              !(m.expires_at !== undefined && m.expires_at <= now),
-          );
-          // Without what events did here (reactions, a pin): the reader's own record
-          let msgs: ChatMessage[] = text.slice(-HISTORY_MAX_MESSAGES).map(forHandOff);
-          // Stay well under the 64 KiB control-message cap (Signal envelope + framing)
-          const bytes = (list: ChatMessage[]) =>
-            new TextEncoder().encode(JSON.stringify(list)).length;
-          while (msgs.length > 0 && bytes(msgs) > 48 * 1024) msgs = msgs.slice(1);
-          if (msgs.length === 0) return;
-          invoke("send_channel_history", {
-            server,
-            channelId,
-            targetUserId: data.from_user_id,
-            messages: msgs,
-          }).catch((e: unknown) => console.warn("channel history hand-off failed:", e));
-        },
-      ),
+      listenServer<HandOffAskEvent>("channel-history-requested", (server, data) => answerHandOff(server, data, true)),
 
       listenServer<{
         channel_id: number;
@@ -1319,6 +1537,12 @@
         messages: unknown[];
       }>("channel-history-received", (server, data) => {
         const chName = channelNameById(server, data.channel_id);
+        handOffAnswered(server, data.channel_id);
+        // Not from someone blocked. Read and dropped here: the sharer never knows
+        const anonymous = !!get(channels.peek(server)).find((c) => c.channel_id === data.channel_id)?.anonymous;
+        if (!anonymous && blockedSender(server, data.from_user_id, data.from_username)) return;
+        // Something was read: the ring's work is done
+        if (data.messages.length > 0) clearRing(server, data.channel_id);
         if (chName) {
           mergeChannelHistory(
             server,
@@ -1344,6 +1568,7 @@
         // Read before the list loses it: the name is the key to everything the
         // channel owns here, and the list is the only place it exists.
         const goneName = channelNameById(server, goneId);
+        forgetAutoJoinAsk(server, goneId);
         // The badge goes with the channel. What the user *deleted* there does
         // not: `clearedBefore` outlives the channel on purpose, so a channel
         // recreated under the same name cannot be used to hand the messages
@@ -1378,7 +1603,42 @@
         addNotification(`${fromServer(server)}${data.reason}`, "error");
       }),
 
+      listenServer<ChannelLayout>("channel-layout", (server, layout) => {
+        channelLayout.of(server).set(cleanLayout(layout));
+        layoutArrived.of(server).set(true);
+        // An import's end comes as this, to everybody at once, so asking names no channel
+        if (livePath(get(olderRelay.peek(server))?.protocol ?? null)) askArchiveChannels(server);
+      }),
+
+      listenServer<WireProfile[]>("profiles", (server, list) => onProfiles(server, list)),
+
+      listenServer<{ hash: number[]; image: number[] }>("profile-picture", (server, p) => {
+        void onPicture(server, p.hash, p.image);
+      }),
+
+      listenServer<ServerProfileEvent>("server-profile", (server, p) => onServerProfile(server, p)),
+
+      listenServer<{ user_ids: number[]; on: boolean }>("mention-power", (server, p) =>
+        onMentionPower(server, p.user_ids, p.on),
+      ),
+
+      listenServer<{ mods: { account: number[]; hide: boolean; admin: boolean }[] }>("chat-mods", (server, d) =>
+        onChatMods(server, d.mods),
+      ),
+
+      listenServer<{ marks: Parameters<typeof onPostsHidden>[1] }>("posts-hidden", (server, d) => onPostsHidden(server, d.marks)),
+      listenServer<{ takers: Parameters<typeof onReportTakers>[1] }>("report-takers", (server, d) => onReportTakers(server, d.takers)),
+      listenServer<string[]>("my-badges", (server, badges) => {
+        myBadges.of(server).set(badges);
+      }),
+
+      listenServer<GroupStyle[]>("group-styles", (server, styles) => {
+        groupStyles.of(server).set(styles);
+      }),
+
       listenServer<ChannelInfo>("channel-updated", (server, updated) => {
+        const before = get(channels.peek(server)).find((c) => c.channel_id === updated.channel_id);
+        if (before && before.name !== updated.name) channelRenamed(server, before.name, updated.name);
         channels.of(server).update((chs) =>
           chs.map((ch) => (ch.channel_id === updated.channel_id ? updated : ch)),
         );
@@ -1395,10 +1655,148 @@
           `${fromServer(server)}You were removed from ${from}: ${data.reason}`,
           "warning",
         );
+        markKicked(server, data.channel_id);
+      }),
+
+      // Out of a channel we may not enter any more: no mark, we follow it again if we may
+      listenServer<{ channel_id: number; reason: string }>("evicted", (server, data) => {
+        const name = channelNameById(server, data.channel_id);
+        if (name) addNotification(`${fromServer(server)}You were removed from #${name}: ${data.reason}`, "warning");
+      }),
+
+      // On the live path a text channel is followed with no roster: this is the join, and a
+      // gate that came or went on one we hold.
+      listenServer<{
+        joined: { channel_id: number; listen_only: boolean; gated: boolean; last_post_ms: number }[];
+        refused: number[];
+      }>("text-joined", (server, data) => {
+        const ids = data.joined.map((row) => row.channel_id);
+        joinedTextChannelIds.of(server).update((had) => new Set([...had, ...ids]));
+        textSeats.of(server).update((had) => {
+          const next = new Map(had);
+          for (const row of data.joined) next.set(row.channel_id, { gated: row.gated, lastPost: row.last_post_ms });
+          return next;
+        });
+        const list = get(channels.peek(server));
+        const seen = get(uiPrefs).opened_channels[serverKey(server)] ?? [];
+        for (const row of data.joined) {
+          const channel = list.find((c) => c.channel_id === row.channel_id);
+          if (!channel) continue;
+          if (gateNoted(server, channel, row.gated)) {
+            addNotification(`${fromServer(server)}#${channel.name} no longer has a gate.`, "warning");
+          }
+          noteLastPost(server, row.channel_id, row.last_post_ms);
+          ringBack(server, channel);
+          if (!marksChannel(seen, channel)) noteNeverOpened(server, channel.name, true);
+        }
+        listenOnly.of(server).update((had) => {
+          const next = new Set(had);
+          for (const row of data.joined) {
+            if (row.listen_only) next.add(row.channel_id);
+            else next.delete(row.channel_id);
+          }
+          return next;
+        });
+        // What they are reading stays on screen: a preview ends as its channel is followed,
+        // and the pane would go back to the text channel open before it
+        const previewed = get(previewChannelId.peek(server));
+        if (previewed !== null && ids.includes(previewed)) {
+          activeTextChannelId.of(server).set(previewed);
+          previewChannelId.of(server).set(null);
+          previewUsers.of(server).set([]);
+        }
+        const active = get(activeTextChannelId.peek(server));
+        if (active !== null && ids.includes(active)) {
+          const name = channelNameById(server, active);
+          if (name) clearChannelUnread(server, name);
+        }
+        askArchiveChannels(server);
+        startSweeps(server);
+      }),
+
+      listenServer<{ channel_id: number; user_id: number }>("member-gone", (server, data) => {
+        noteMemberGone(server, data.channel_id, data.user_id);
+      }),
+
+      // This device just handed these its key: said where who reads is what matters
+      listenServer<{ channel_id: number; readers: NamedReader[] }>("key-readers", (server, data) => {
+        noteReaders(server, data.channel_id, data.readers);
+        const channel = get(channels.peek(server)).find((c) => c.channel_id === data.channel_id);
+        if (!goesByList(channel, get(textSeats.peek(server)).get(data.channel_id)?.gated)) return;
+        for (const r of data.readers) {
+          if (r.user_id) exchangedKey(server, data.channel_id, bareRow(data.channel_id, r.user_id, r.name, r.account));
+        }
+      }),
+
+      // Marks for channels followed quietly
+      listenServer<{ marks: { channel_id: number; last_post_ms: number }[] }>("channel-marks", (server, data) => {
+        textSeats.of(server).update((had) => {
+          const next = new Map(had);
+          for (const m of data.marks) {
+            const seat = next.get(m.channel_id);
+            if (seat) next.set(m.channel_id, { ...seat, lastPost: m.last_post_ms });
+          }
+          return next;
+        });
+        for (const m of data.marks) if (!viewingChannel(server, m.channel_id)) noteLastPost(server, m.channel_id, m.last_post_ms);
+      }),
+
+      // A post that will never open here: all a row can honestly say is that someone wrote
+      listenServer<{ channel_id: number; timestamp: number }>("channel-ring", (server, data) => {
+        ringForPost(server, data.channel_id, data.timestamp);
+      }),
+
+      // On mobile data past what is fair to spend unasked: a person says whether it goes
+      listenServer<{ channel_id: number; people: number; bytes: number }>("key-job-ask", async (server, data) => {
+        const where = channelNameById(server, data.channel_id);
+        const megabytes = (data.bytes / 1_000_000).toFixed(1);
+        const go = await confirmAction({
+          title: "Use mobile data?",
+          body: `${data.people} people are online in #${where}, so sending this uses about ${megabytes} MB of mobile data.`,
+          confirm: "Send",
+        });
+        invoke("key_job_answer", { server, channelId: data.channel_id, go }).catch((e: unknown) =>
+          console.warn("could not answer about the key job:", e),
+        );
+      }),
+
+      // A first post with nobody to hand a key to: once a connection, and only if it is true
+      listenServer<{ channel_id: number }>("nobody-here", (server, data) => {
+        const channel = get(channels.peek(server)).find((c) => c.channel_id === data.channel_id);
+        if (!channel || (channel.log && get(account.peek(server))?.cloud)) return;
+        const said = `${server}/${data.channel_id}`;
+        if (nobodyHereSaid.has(said)) return;
+        nobodyHereSaid.add(said);
+        addChannelMessage(server, channel.name, {
+          user_id: 0,
+          username: "",
+          content: "Nobody else is here now, and no copy is kept: only you hold this.",
+          timestamp: Date.now(),
+          kind: "notice",
+        });
+      }),
+
+      // A page of a sweep, or the rest of a roster too long for one frame
+      listenServer<{ channel_id: number; ids?: number[]; rows: UserInfo[]; next: number }>("channel-page", (server, data) => {
+        if (!onSweepPage(server, data)) addToRoster(server, data.channel_id, eachOnce(data.rows, (u) => u.user_id));
+      }),
+
+      // What a writer's device would not do, or could not: said once each. A gate gone is said
+      // by `gateNoted`, which remembers it across connections.
+      listenServer<{ kind: "gate-gone" | "guest-in-gate" | "unlisted"; channel_id: number }>("key-warning", (server, data) => {
+        const where = channelNameById(server, data.channel_id);
+        const channel = where ? `#${where}` : "this channel";
+        const said = {
+          "gate-gone": null,
+          "guest-in-gate": `The server named a guest as a reader of ${channel}, which has a gate. They got no key.`,
+          unlisted: `The server named someone as a reader of ${channel} whom it has never listed. They got no key.`,
+        }[data.kind];
+        if (said) addNotification(`${fromServer(server)}${said}`, "warning");
       }),
 
       // Channel preview response
-      listenServer<{ channel_id: number; users: UserInfo[] }>("channel-users", (server, data) => {
+      listenServer<{ channel_id: number; users: UserInfo[] }>("channel-users", (server, raw) => {
+        const data = { ...raw, users: eachOnce(raw.users, (u) => u.user_id) };
         setRoster(server, data.channel_id, data.users);
         if (data.channel_id === get(previewChannelId.peek(server))) {
           previewUsers.of(server).set(data.users);
@@ -1409,6 +1807,9 @@
       listenServer<{ channel_id: number; channel_name: string; invited_by: string }>(
         "invite-received",
         (server, data) => {
+          // Dropped, never declined: a decline would tell them. An invite has
+          // only the name to go by.
+          if (isBlocked(get(blocked.peek(server)), { username: data.invited_by }, false)) return;
           pendingInvites.update((inv) => [
             ...inv.filter((i) => !(i.server === server && i.channel_id === data.channel_id)),
             {
@@ -1435,6 +1836,7 @@
       listenServer<{ from_user_id: number; from_username: string; message: string }>(
         "poke-received",
         (server, data) => {
+          if (blockedSender(server, data.from_user_id, data.from_username)) return;
           const poke = createPoke(server, data.from_user_id, data.from_username, data.message);
           let fresh = false;
           pendingPokes.update((p) => {
@@ -1462,6 +1864,12 @@
         thread?: string | null;
         event?: unknown;
         decryption_failed?: boolean;
+        /** Past here only on the live path: the post's own word, for want of a list. */
+        account?: number[] | null;
+        is_admin?: boolean;
+        is_moderator?: boolean;
+        /** It waited for its key. */
+        held?: boolean;
       }>("channel-chat-message", (server, data) => {
         const { channel_id, user_id: uid, username, timestamp, message_id } = data;
         // Cut where it arrives (D-7): what follows parses it, for a mention
@@ -1480,50 +1888,82 @@
           const uname = uid === self ? ownDisplayName(server, username, channel_id) : username;
           // Tagged with the writer's account, so the same message read from
           // the channel's stored log is recognised (sameMessage).
-          const writer = uid === self
-            ? get(account.peek(server))?.info.id
-            : get(users.peek(server)).find((u) => u.user_id === uid)?.account;
-          // An edit, delete, reaction or pin: done to an earlier message here,
-          // never a message itself. A pin counts only from one of the
-          // channel's managers, as the roster has the sender now.
+          const post: PostFlags | undefined =
+            data.is_admin === undefined ? undefined : { user_id: uid, is_admin: data.is_admin, is_moderator: data.is_moderator };
+          const writer = writerTag(
+            uid === self,
+            !!get(channels.peek(server)).find((c) => c.channel_id === channel_id)?.anonymous,
+            get(account.peek(server))?.info.id,
+            () =>
+              post
+                ? (data.account ?? undefined)
+                : (currentRosterOf(server, channel_id).find((u) => u.user_id === uid)?.account ??
+                  get(users.peek(server)).find((u) => u.user_id === uid)?.account),
+          );
+          // Their chosen name, on arrival: so drawing the row later says nothing of what is
+          // on screen, which asking then would
+          if (post && writer && uid !== self) askProfile(server, accountHex(writer));
+          // An edit, delete, reaction, pin or hide: done to an earlier message
+          // here, never a message itself. A pin counts only from one of the
+          // channel's managers, as the roster has the sender now; a hide only from
+          // a holder of its privilege.
           if (data.event != null) {
             const event = chatEvent(data.event);
             const by = { user_id: uid, username: uname, account: writer ? accountHex(writer) : undefined };
-            const mayPin = event?.kind === "pin" && managesChannel(server, channel_id, uid);
-            if (event) applyChannelEvent(server, chName, { event, by, at: timestamp, content }, mayPin);
+            const mayPin = event?.kind === "pin" && managesChannel(server, channel_id, uid, post);
+            const mayHide = event?.kind === "hide" ? hideCheck(server, channel_id, by, post) : undefined;
+            if (event) applyChannelEvent(server, chName, { event, by, at: timestamp, content }, mayPin, mayHide);
             return;
           }
-          const added = addChannelMessage(server, chName, {
-            user_id: uid,
-            username: uname,
-            content,
-            timestamp,
-            id: message_id ?? undefined,
-            expires_at,
-            // Marked, so it is never handed on as history: a placeholder is
-            // not what the sender wrote, and passing it to the next person to
-            // join spreads one member's missing key to everybody after them.
-            kind: data.decryption_failed ? "undecryptable" : undefined,
-            account: writer ? accountHex(writer) : undefined,
-            ...messageRefs(data),
-          });
-          if (added && !viewingChannel(server, channel_id)) {
-            incrementChannelUnread(server, chName, timestamp);
-            if (uid !== self) playChannelMessageSound();
-          }
-          // An answer to something we wrote, or our name after an @, reaches
-          // us like a direct message does
-          if (added && uid !== self) {
-            const target = data.reply_to
-              ? findTarget(get(channelMessages).get(chatKey(server, chName)) ?? [], data.reply_to, timestamp)
-              : undefined;
+          // A forward only repeats what somebody else said, as a quote does
+          const power = !messageRefs(data).fwd && arrivedWithPower(server, channel_id, uid, content, post);
+          const added = addChannelMessage(
+            server,
+            chName,
+            {
+              user_id: uid,
+              username: uname,
+              content,
+              timestamp,
+              ...(power ? { power: true } : {}),
+              id: message_id ?? undefined,
+              expires_at,
+              // Marked, so it is never handed on as history: a placeholder is
+              // not what the sender wrote, and passing it to the next person to
+              // join spreads one member's missing key to everybody after them.
+              kind: data.decryption_failed ? "undecryptable" : undefined,
+              account: writer ? accountHex(writer) : undefined,
+              ...messageRefs(data),
+            },
+            !!data.held,
+          );
+          noteArrival(server, channel_id, uid, uname, timestamp, post, writer);
+          // Kept, and nothing more: no count, no sound, no notification, whoever
+          // they call on. The channel's own anonymity decides, not the tag.
+          const anonymous = !!get(channels.peek(server)).find((c) => c.channel_id === channel_id)?.anonymous;
+          const quiet = uid !== self && isBlocked(get(blocked.peek(server)), { account: writer, username: uname }, anonymous);
+          if (added && !quiet) {
+            // An answer to something we wrote, or our name after an @, reaches
+            // us like a direct message does
+            const mine = uid === self;
+            const target =
+              !mine && data.reply_to
+                ? findTarget(get(channelMessages).get(chatKey(server, chName)) ?? [], data.reply_to, timestamp)
+                : undefined;
             const me = { account: ownAccount(server), user_id: self };
             const answered = !!target && isOwn(target, me, (m) => receivedNow(server, m));
-            const named = !answered && mentionsUs(server, channel_id, content);
-            if (answered || named) {
+            const called = power && callsOn(content, tokensForMe(get(myBadges.peek(server))), powerTokens(get(groupStyles.peek(server))));
+            const named = !mine && !answered && (called || mentionsUs(server, channel_id, content));
+            const onScreen = viewingChannel(server, channel_id);
+            const here = get(channels.peek(server)).find((c) => c.channel_id === channel_id);
+            const does = arrival(here ? channelNotify(server, here) : "mentions", { mine, onScreen, forMe: answered || named });
+            if (does.count) incrementChannelUnread(server, chName, timestamp);
+            else if (!onScreen) noteChannelUnseen(server, chName, timestamp);
+            if (does.sound) playChannelMessageSound();
+            if (does.os) {
               notifyUnfocused(
                 `${fromServer(server)}${shortName(uname)} ${answered ? "replied to you" : "mentioned you"}`,
-                notificationBody({ content, file: messageRefs(data).file, expires_at }),
+                notificationBody({ ...messageRefs(data), content, expires_at }),
               );
             }
           }
@@ -1547,6 +1987,8 @@
       }>("stored-channel-message", (server, m) => {
         const ch = get(channels.peek(server)).find((c) => c.log === m.conv);
         if (!ch) return;
+        // As with a post: the read named this log already, and a draw later says nothing
+        if (!m.from_me) askProfile(server, m.sender_account);
         const self = get(userId.peek(server));
         const online = m.from_me ? undefined : get(users.peek(server)).find((u) => u.username === m.sender_name);
         const added = fileStoredChannelMessage(server, ch.name, {
@@ -1559,7 +2001,19 @@
           expires_at: expiryFor(m.timestamp, m.ttl_secs, channelMessageTtl(server, ch.channel_id)),
           ...messageRefs(m),
         });
-        if (added && !m.from_me && !m.replay && !viewingChannel(server, ch.channel_id)) incrementChannelUnread(server, ch.name, m.timestamp);
+        const quiet = isBlocked(get(blocked.peek(server)), { account: m.sender_account, username: m.sender_name }, !!ch.anonymous);
+        // The words a ring only hinted at are here, or some of them are. One's own too: after an
+        // exit with no save it reads back, and may be all the ring was about.
+        if (added && !m.replay) {
+          moveRead(server, ch, m.timestamp);
+          clearRing(server, ch.channel_id);
+        }
+        if (added && !quiet && !m.from_me && !m.replay && !viewingChannel(server, ch.channel_id)) {
+          const forMe = mentionsUs(server, ch.channel_id, m.content);
+          const does = arrival(channelNotify(server, ch), { mine: false, onScreen: false, forMe });
+          if (does.count) incrementChannelUnread(server, ch.name, m.timestamp);
+          else noteChannelUnseen(server, ch.name, m.timestamp);
+        }
       }),
 
       // Who can read what we write in a channel's stored log, said where it
@@ -1577,6 +2031,16 @@
           timestamp: Date.now(),
           kind: "notice",
         });
+      }),
+
+      // What a read could not bring, in a quiet line above what it did: no toast, no mark
+      listenServer<{ conv: string }>("stored-unopened", (server, d) => {
+        const ch = get(channels.peek(server)).find((c) => c.log === d.conv);
+        if (ch) addChannelLineAtTop(server, ch.name, UNOPENED_LINE);
+      }),
+      listenServer<{ conv: string; window: number }>("stored-clamped", (server, d) => {
+        const ch = get(channels.peek(server)).find((c) => c.log === d.conv);
+        if (ch) addChannelLineAtTop(server, ch.name, clampedLine(d.window));
       }),
 
       listenServer<{
@@ -1623,10 +2087,10 @@
           account: sender ? accountHex(sender) : undefined,
           ...messageRefs(data),
         });
-        if (from_user_id !== myId) {
+        if (from_user_id !== myId && !isBlocked(get(blocked.peek(server)), { account: sender, username: from_username }, false)) {
           playDirectMessageSound();
-          // Never the text of a message with a timer (R2-14)
-          const body = notificationBody({ content, file: messageRefs(data).file, expires_at });
+          // Never the text of a message with a timer (R2-14), nor of a report
+          const body = notificationBody({ ...messageRefs(data), content, expires_at });
           notifyUnfocused(`${fromServer(server)}${shortName(from_username)}`, body || "New message");
         }
       }),
@@ -1662,15 +2126,17 @@
         },
       ),
 
-      // The channel's keys did not arrive within a minute of writing, so what
-      // was written then was never sent, though it showed as sent.
-      listenServer<{ channel_id: number; expired: number }>("channel-undelivered", (server, d) => {
-        const ch = get(channels.peek(server)).find((c) => c.channel_id === d.channel_id);
-        if (!ch) return;
-        addChannelMessage(server, ch.name, {
+      // The channel's keys did not get out, so what was written then was never
+      // sent, though it showed as sent.
+      // A connection's end says which channel by name: its ids have gone from the stores by then,
+      // and if the person is the one who closed it, the server has too. It goes in that chat.
+      listen<{ server: string; data: { channel_id: number; expired: number; name?: string | null } }>("channel-undelivered", ({ payload: { server, data: d } }) => {
+        const name = d.name ?? get(channels.peek(server)).find((c) => c.channel_id === d.channel_id)?.name;
+        if (!name) return;
+        addChannelMessage(server, name, {
           user_id: 0,
           username: "",
-          content: `Not delivered — the channel's keys did not arrive within a minute (${d.expired} ${d.expired === 1 ? "message" : "messages"})`,
+          content: `Not delivered — the channel's keys could not be sent (${d.expired} ${d.expired === 1 ? "message" : "messages"})`,
           timestamp: Date.now(),
           kind: "notice",
         });
@@ -1772,6 +2238,8 @@
       // Global PTT shortcut events from Rust backend
       listen("ptt-global-pressed", () => {
         isTransmitting.set(true);
+        // The hotkey opens the capture in Rust and only then says so
+        if (get(voiceRestriction)?.voice) void stopTransmit();
       }),
       listen("ptt-global-released", () => {
         isTransmitting.set(false);

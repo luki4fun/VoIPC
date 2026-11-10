@@ -5,7 +5,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { reconnectDelay, resolveRejoin } from "./rejoin-rules.ts";
+import { connectionLostLine, reconnectDelay, resolveRejoin } from "./rejoin-rules.ts";
 import type { ChannelInfo } from "./types.ts";
 
 function channel(over: Partial<ChannelInfo> & { channel_id: number; name: string }): ChannelInfo {
@@ -73,4 +73,12 @@ test("reconnects spread out, within half to one and a half times the backoff", (
   assert.equal(reconnectDelay(40, () => 0.5), 10000, "capped");
   const seen = new Set(Array.from({ length: 20 }, () => Math.round(reconnectDelay(2))));
   assert.ok(seen.size > 1, "not all in step");
+});
+
+test("a dropped connection is said once, however the transport words it", () => {
+  assert.equal(connectionLostLine("Connection lost: connection lost"), "Connection lost");
+  assert.equal(connectionLostLine("connection lost"), "Connection lost");
+  assert.equal(connectionLostLine("connection lost: timed out"), "Connection lost: timed out");
+  assert.equal(connectionLostLine("Server closed connection"), "Connection lost: Server closed connection");
+  assert.equal(connectionLostLine("Connection lost (code 1006)"), "Connection lost (code 1006)");
 });

@@ -193,9 +193,16 @@ const askedMobile = new Set<string>();
 /** Mobile data, as the browser or the Android WebView tells it. shortcut:
  *  where `navigator.connection` is missing (desktop WebViews, Firefox,
  *  Safari) every network counts as unmetered. */
-function metered(): boolean {
+export function metered(): boolean {
   const c = (globalThis.navigator as { connection?: { type?: string; saveData?: boolean } } | undefined)?.connection;
   return c?.type === "cellular" || c?.saveData === true;
+}
+
+/** Whether this WebView can say what kind of network it is on. WebView2 has
+ *  `navigator.connection` with no `type`, so mobile data never shows there. */
+export function networkKnown(): boolean {
+  const c = (globalThis.navigator as { connection?: object } | undefined)?.connection;
+  return !!c && "type" in c;
 }
 
 function hold(server: string, wait: { bytes: number; missing: Set<string> | null } | null) {

@@ -112,3 +112,11 @@ test("headings follow the sort; kinds keep their own order", () => {
   );
   assert.deepEqual(sections("kind"), [["image", ["new"]], ["audio", ["mid"]], ["other", ["dm", "old"]]]);
 });
+
+test("a file whose message a moderator hid is not listed, and is once restored", () => {
+  const key = "a.example:9987/general";
+  const hidden = m({ file: file("a"), hide: { on: true, at: T, by: "bobby" } });
+  assert.equal(fileRows(new Map([[key, [hidden]]]), new Map(), [], T).length, 0);
+  const restored = { ...hidden, hide: { on: false, at: T + 1, by: "bobby" } };
+  assert.equal(fileRows(new Map([[key, [restored]]]), new Map(), [], T).length, 1);
+});

@@ -36,7 +36,9 @@
     setSelfMuted,
   } from "../stores/connection.js";
   import { testLabel, testSource } from "../spatial.js";
-  import { clearAllHistory } from "../stores/chat.js";
+  import { clearAllHistory, joinedTextChannelIds } from "../stores/chat.js";
+  import { setQuietMode, setWholeHere } from "../stores/quiet.js";
+  import { marksChannel, type QuietMode } from "../follow-rules.js";
   import { confirmAction } from "../stores/confirm.js";
   import { addNotification } from "../stores/notifications.js";
   import { isMobile, isWeb, volumeKeyPtt } from "../stores/platform.js";
@@ -60,9 +62,17 @@
   import { availableUpdate, checkForUpdate, checkUpdates, installUpdate, setCheckUpdates, updateBusy, updatesSupported } from "../stores/updates.js";
   import { protocolWarning, updateOffer } from "../update-rules.js";
   import { olderRelay } from "../stores/relay.js";
+  import { livePath, moves } from "../relay-rules.js";
+  import { mineLine } from "../archive-rules.js";
+  import { importedCount, importedMine, importedMineAsk } from "../stores/imported.js";
   import { serverName } from "../stores/servers.js";
   import { saveOpenServers } from "../connect.js";
-  import { voice } from "../stores/channels.js";
+  import { channels, voice } from "../stores/channels.js";
+  import { account, shareRight } from "../stores/account.js";
+  import { shareReachLine } from "../history-rules.js";
+  import { blocked, unblock } from "../stores/blocks.js";
+  import { serverAddress, serverKey } from "../stores/connection.js";
+  import { shortName } from "../username.js";
   import Icon from "./Icons.svelte";
   import PaletteEditor from "./PaletteEditor.svelte";
   import FileManager from "./FileManager.svelte";
@@ -71,7 +81,7 @@
   import { get } from "svelte/store";
   import LayoutPreview from "./LayoutPreview.svelte";
   import { uiPrefs, updateUiPrefs } from "../stores/ui-prefs.js";
-  import { reducedMotion } from "../stores/emotes.js";
+  import { networkKnown, reducedMotion } from "../stores/emotes.js";
   import { buildHash, buildLine, buildTime } from "../build-info.js";
   import {
     CHAT_FONT_MAX,
@@ -100,6 +110,26 @@
   $effect(() => {
     if (activeTab === "privacy") void loadRemembered();
   });
+
+  // Quiet mode on the server on screen, and what it can pick from
+  const quietNow = $derived($uiPrefs.quiet_mode[serverKey($serverAddress)] ?? { mode: "off" as QuietMode, whole: [] });
+  const followedHere = $derived($channels.filter((c) => c.text && $joinedTextChannelIds.has(c.channel_id)));
+
+  // What came from Discord that this account wrote, for the server on screen
+  const askMine = $derived(activeTab === "privacy" && !!$account && moves($olderRelay?.protocol ?? null) && $connectionState === "connected");
+  $effect(() => {
+    if (askMine) importedCount($serverAddress);
+  });
+  async function deleteAllMine() {
+    const server = $serverAddress;
+    const yes = await confirmAction({
+      title: "Delete all your posts imported from Discord?",
+      body: "They go from this server for good, and a later import does not bring them back. Discord still has its own copies.",
+      confirm: "Delete them",
+      danger: true,
+    });
+    if (yes) importedMineAsk(server, "Delete", "Everything");
+  }
   async function forgetRemembered(list: { server: string; name: string }[]) {
     for (const d of list) await invoke("forget_device", { server: d.server, name: d.name }).catch(() => {});
     await loadRemembered();
@@ -640,6 +670,18 @@
     ...(!isWeb && sdkAvailable ? [{ id: "games" as Tab, label: "Games" }] : []),
     { id: "about", label: "About" },
   ]);
+  // Where the switch does nothing, among the servers that have said
+  const shareRights = shareRight.all();
+  const accounts = account.all();
+  const shareReach = $derived(
+    shareReachLine(
+      [...$shareRights].map(([id, may]) => ({
+        name: serverName(id, $savedServers),
+        may,
+        guest: !$accounts.get(id),
+      })),
+    ),
+  );
 </script>
 
 <div class="overlay" role="presentation" onclick={backdrop(onclose)}>
@@ -1134,6 +1176,49 @@
 
     {#if activeTab === "privacy"}
       <div class="section">
+        <h4>Blocked people</h4>
+        {#if $blocked.size === 0}
+          <span class="toggle-hint">Nobody on this server. A person's menu blocks them.</span>
+        {:else}
+          {#each [...$blocked] as [key, label] (key)}
+            <div class="device-row blocked-row">
+              <span title={label}>{shortName(label)}</span>
+              <button class="danger-btn btn btn-danger-outline" onclick={() => void unblock($serverAddress, key, label)}>Unblock</button>
+            </div>
+          {/each}
+        {/if}
+        <span class="toggle-hint">
+          For the server on screen. Their messages fold away, their direct messages, pokes and invites stay quiet, and you
+          do not hear them in a call. Nothing changes in a channel where people go by pseudonyms. They are not told.
+          {#if $account}
+            Kept sealed in your account: the server can see that the list changed and about how long it is, never who is on it.
+          {:else}
+            Kept on this {isWeb ? "browser" : "device"} and never sent. A guest is only a name: a block falls on whoever
+            uses that name next, and a guest can get past it with another.
+          {/if}
+        </span>
+      </div>
+
+      {#if askMine && ($importedMine.rows !== null || $importedMine.refused)}
+        <div class="section imported-mine">
+          <h4>Imported from Discord</h4>
+          {#if $importedMine.rows !== null}
+            <span class="toggle-hint">{mineLine($importedMine.rows)}</span>
+            {#if $importedMine.rows > 0}
+              <div class="device-row imported-actions">
+                <button class="btn btn-secondary imported-hide" onclick={() => importedMineAsk($serverAddress, "Hide", "Everything")}>Hide all</button>
+                <button class="btn btn-secondary imported-show" onclick={() => importedMineAsk($serverAddress, "Show", "Everything")}>Show all</button>
+                <button class="danger-btn btn btn-danger-outline imported-delete" onclick={deleteAllMine}>Delete all</button>
+              </div>
+              <span class="toggle-hint">Hidden, only you see them, and whoever runs this server still has them. Deleted, they are gone from it.</span>
+            {/if}
+          {:else}
+            <span class="toggle-hint imported-refused">{$importedMine.refused}</span>
+          {/if}
+        </div>
+      {/if}
+
+      <div class="section">
         <h4>Remembered accounts</h4>
         {#if remembered.length === 0}
           <span class="toggle-hint">No account signs in here without its password.</span>
@@ -1193,9 +1278,35 @@
           />
           <span class="toggle-label">Share recent channel chat with newcomers</span>
           <span class="toggle-hint">
-            When someone joins a channel you are in, your client may hand them the last 50 messages it has there — end-to-end encrypted to that person only, never through the server in the clear. While this is on, the other people there can see that you are one of the members worth asking.
+            Off until you turn it on, on this device. Someone joining a channel you are in can ask your app for its recent messages there, which they see as your word, and can read what you kept there before they joined. End-to-end encrypted to that person. The others there can see you are worth asking. What you already gave stays given.
           </span>
+          {#if shareReach}
+            <span class="toggle-hint share-reach">{shareReach}</span>
+          {/if}
         </label>
+        {#if $connectionState === "connected" && livePath($olderRelay?.protocol ?? null)}
+          <div class="ptt-config">
+            <span class="hotkey-label">Quiet mode on this server</span>
+            <select aria-label="Quiet mode on this server" value={quietNow.mode} onchange={(e) => setQuietMode($serverAddress, (e.target as HTMLSelectElement).value as QuietMode)}>
+              <option value="off">Off</option>
+              {#if networkKnown() || quietNow.mode === "mobile"}<option value="mobile">On mobile data</option>{/if}
+              <option value="always">Always</option>
+            </select>
+          </div>
+          <span class="toggle-hint">
+            Only the channels you pick arrive here. The others show a ring when someone wrote, and you hear no mention from them until you open them. The server can see which ones you picked and when you open another. Direct messages still arrive.
+          </span>
+          {#if quietNow.mode !== "off"}
+            <div class="quiet-picks" role="group" aria-label="Channels that arrive here">
+              {#each followedHere as channel (channel.channel_id)}
+                <label class="toggle-row">
+                  <input type="checkbox" checked={marksChannel(quietNow.whole, channel)} onchange={(e) => setWholeHere($serverAddress, channel, (e.target as HTMLInputElement).checked)} />
+                  <span class="toggle-label">#{channel.name}</span>
+                </label>
+              {/each}
+            </div>
+          {/if}
+        {/if}
         <div class="ptt-config">
           <span class="hotkey-label">Conversations kept</span>
           <input
@@ -1582,6 +1693,11 @@
   .tab.active {
     color: var(--text-primary);
     border-bottom-color: var(--text-primary);
+  }
+
+  .device-row.imported-actions {
+    justify-content: flex-start;
+    gap: var(--sp-2);
   }
 
   .section {

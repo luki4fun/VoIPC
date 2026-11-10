@@ -7,12 +7,12 @@ use tauri::{Emitter, State};
 
 use voipc_audio::spatial::Listener;
 use voipc_protocol::messages::ClientMessage;
-use voipc_protocol::types::ProximityMode;
+use voipc_protocol::types::{ProximityMode, LIVE_PATH_SINCE};
 use voipc_protocol::voice::VoicePacket;
 
 use crate::app_state::{
-    conn, conn_mut, encrypt_group, encrypt_pairwise, voice, voice_mut, AppState, PendingMessage,
-    PendingTarget,
+    conn, conn_mut, encrypt_group, encrypt_pairwise, voice, voice_mut, with_keys, AppState,
+    PendingMessage, PendingTarget,
 };
 use crate::crypto::{self, ChatArchive, ChatMessage};
 use crate::network;
@@ -46,8 +46,10 @@ pub async fn connect(
     if address.is_empty() || address.len() > 253 {
         return Err("address must be 1-253 characters".into());
     }
-    // 32 for the name and 5 for its "#0000" tag; the server checks each part
-    if username.is_empty() || username.len() > 37 {
+    // 32 for the name and 5 for its "#0000" tag; the server checks each part. A
+    // provider's sign-in has no name yet: its answer decides the account.
+    let named = !matches!(account, Some(crate::account::AccountArgs::Provider { .. }));
+    if (named && username.is_empty()) || username.len() > 37 {
         return Err("username must be 1-32 characters".into());
     }
 
@@ -71,16 +73,29 @@ pub async fn disconnect(
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
     server: String,
+    // A reconnect clearing the way, not a person leaving: what it kept is for what comes next.
+    keep_sessions: Option<bool>,
 ) -> Result<(), String> {
     // The user's own leave: a game may not bring them back with a hello after
     // a reconnect (S-030)
     state.user_moved.fetch_add(1, Ordering::Relaxed);
+    // A cut comes this way too, on every reconnect try, and a run goes on after one with the
+    // token it has. Only what is going stops: the page forgets when the person disconnects
+    #[cfg(not(target_os = "android"))]
+    state.import.stop(&server);
     // Out of the map under the lock, torn down outside it (see `teardown`).
     // Its Signal state goes with it: it lived on the connection.
     let connection = state.connections.write().await.remove(&server);
     if let Some(connection) = connection {
+        // A person leaving: new pins go now, or they would be new again next time
+        if !keep_sessions.unwrap_or(false) {
+            crate::account::save_pins(&app_handle, &server, &connection).await;
+        }
         network::teardown(&state, &app_handle, &server, connection).await;
         tracing::info!(server, "disconnected gracefully");
+    }
+    if !keep_sessions.unwrap_or(false) {
+        state.forget_kept(&server);
     }
     Ok(())
 }
@@ -97,6 +112,10 @@ pub async fn disconnect_all(
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
+    // Of every server, connected or not: a cut has taken its own out of the map, and the page
+    // that could go on with its token is gone
+    #[cfg(not(target_os = "android"))]
+    state.import.forget_all();
     let all: Vec<_> = state.connections.write().await.drain().collect();
     for (server, connection) in all {
         network::teardown(&state, &app_handle, &server, connection).await;
@@ -223,6 +242,126 @@ pub async fn create_channel(
     .await
 }
 
+/// Follow these text channels, whole or quiet, in one frame. It tells nobody, and a gate or
+/// a channel that is not there comes back in `TextJoined`'s `refused`, in the same words.
+#[tauri::command]
+pub async fn join_text_channels(
+    state: State<'_, AppState>,
+    server: String,
+    mut channels: Vec<u32>,
+    mut quiet: Vec<u32>,
+) -> Result<(), String> {
+    channels.sort_unstable();
+    channels.dedup();
+    quiet.sort_unstable();
+    quiet.dedup();
+    let conns = state.connections.read().await;
+    let connection = conn(&conns, &server)?;
+    connection
+        .signal
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .channels
+        .live_set_quiet(&quiet, true);
+    network::send_tcp_message(
+        &connection.tcp_tx,
+        &ClientMessage::JoinTextChannels { channels, quiet },
+    )
+    .await
+}
+
+/// Take followed channels whole or quiet: going quiet is no exit, and whole again is
+/// answered like a join.
+#[tauri::command]
+pub async fn set_quiet(
+    state: State<'_, AppState>,
+    server: String,
+    channels: Vec<u32>,
+    quiet: bool,
+) -> Result<(), String> {
+    let conns = state.connections.read().await;
+    let connection = conn(&conns, &server)?;
+    connection
+        .signal
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .channels
+        .live_set_quiet(&channels, quiet);
+    network::send_tcp_message(
+        &connection.tcp_tx,
+        &ClientMessage::SetQuiet { channels, quiet },
+    )
+    .await
+}
+
+/// A page of who is in a channel, from past `after`: `channel-page` answers.
+#[tauri::command]
+pub async fn request_channel_page(
+    state: State<'_, AppState>,
+    server: String,
+    channel_id: u32,
+    after: u32,
+) -> Result<(), String> {
+    let conns = state.connections.read().await;
+    let connection = conn(&conns, &server)?;
+    network::send_tcp_message(
+        &connection.tcp_tx,
+        &ClientMessage::RequestChannelPage { channel_id, after },
+    )
+    .await
+}
+
+/// On mobile data or not, as the front end sees it: a large key job asks first, and fewer
+/// sessions open at once.
+#[tauri::command]
+pub async fn set_metered(state: State<'_, AppState>, metered: bool) -> Result<(), String> {
+    state.metered.store(metered, Ordering::Relaxed);
+    for connection in state.connections.read().await.values() {
+        connection
+            .signal
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .channels
+            .live_set_metered(metered);
+    }
+    Ok(())
+}
+
+/// A person's answer to `key-job-ask`: go on with it, or drop what waits behind it.
+#[tauri::command]
+pub async fn key_job_answer(
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+    server: String,
+    channel_id: u32,
+    go: bool,
+) -> Result<(), String> {
+    let (tcp_tx, signal, account) = {
+        let conns = state.connections.read().await;
+        let connection = conn(&conns, &server)?;
+        (
+            connection.tcp_tx.clone(),
+            connection.signal.clone(),
+            connection.account.clone(),
+        )
+    };
+    let now = crypto::now_ms();
+    if let Some(out) = with_keys(&signal, |stores, keying| {
+        keying.live_answer_job(stores, channel_id, go, now)
+    }) {
+        network::run_live(
+            &app_handle,
+            &server,
+            &tcp_tx,
+            &signal,
+            account.as_deref(),
+            out,
+        )
+        .await;
+    }
+    Ok(())
+}
+
 /// Unsubscribe from a text channel. Leaving a voice channel is still
 /// `join_channel(0)` — the lobby is where you stand when you are nowhere.
 #[tauri::command]
@@ -249,11 +388,14 @@ pub async fn set_history_sharing(state: State<'_, AppState>, enabled: bool) -> R
     // is sent again on the next connect, from the config the settings toggle
     // has already written.
     for connection in state.connections.read().await.values() {
-        let _ = network::send_tcp_message(
-            &connection.tcp_tx,
-            &ClientMessage::SetHistorySharing { enabled },
-        )
-        .await;
+        // A switch that does not count here is no news to this relay
+        if !enabled || connection.may_share() {
+            let _ = network::send_tcp_message(
+                &connection.tcp_tx,
+                &ClientMessage::SetHistorySharing { enabled },
+            )
+            .await;
+        }
         // The same consent hands our older keys to who joins a channel's log.
         if let Some(link) = &connection.account {
             link.session().set_share(enabled);
@@ -274,12 +416,46 @@ pub async fn request_channel_history(
     server: String,
     channel_id: u32,
     target_user_ids: Vec<u32>,
-) -> Result<(), String> {
-    let (tcp_tx, signal) = {
+) -> Result<Vec<u32>, String> {
+    let (tcp_tx, signal, text, anonymous) = {
         let conns = state.connections.read().await;
         let connection = conn(&conns, &server)?;
-        (connection.tcp_tx.clone(), connection.signal.clone())
+        let (text, anonymous) = connection
+            .channels
+            .lock()
+            .ok()
+            .and_then(|list| {
+                list.iter()
+                    .find(|c| c.channel_id == channel_id)
+                    .map(|c| (c.text, c.anonymous))
+            })
+            .unwrap_or((false, false));
+        (
+            connection.tcp_tx.clone(),
+            connection.signal.clone(),
+            text,
+            anonymous,
+        )
     };
+    if anonymous {
+        return Err("an anonymous channel shares no history".into());
+    }
+    let live = text && tcp_tx.proto() >= LIVE_PATH_SINCE;
+    let now = crypto::now_ms();
+    // Sealed: the relay sees "R wrote to S", not for which channel. It goes when a session
+    // both ends hold is up, opened for it if need be. Under the new-member wait a direct
+    // message is refused, so there the plain frames below ask whoever already has a session.
+    if live && !signal.lock().map_err(|e| e.to_string())?.direct_held {
+        let mut sig = signal.lock().map_err(|e| e.to_string())?;
+        let asked = sig
+            .channels
+            .live_ask_history(channel_id, &target_user_ids, now);
+        if asked.is_empty() {
+            return Err("nobody here can share that history yet".into());
+        }
+        sig.live_wake.notify_one();
+        return Ok(asked);
+    }
     let targets: Vec<u32> = {
         let sig = signal.lock().map_err(|e| e.to_string())?;
         // A pairwise session is all an answer needs — history travels over that,
@@ -296,17 +472,22 @@ pub async fn request_channel_history(
     if targets.is_empty() {
         return Err("nobody here can share that history yet".into());
     }
-    for target_user_id in targets {
+    for target_user_id in &targets {
+        if live {
+            let mut sig = signal.lock().map_err(|e| e.to_string())?;
+            sig.channels
+                .live_note_asked(channel_id, *target_user_id, now);
+        }
         network::send_tcp_message(
             &tcp_tx,
             &ClientMessage::RequestChannelHistory {
                 channel_id,
-                target_user_id,
+                target_user_id: *target_user_id,
             },
         )
         .await?;
     }
-    Ok(())
+    Ok(targets)
 }
 
 /// Change a channel's other options (creator, or an admin for a channel from
@@ -418,7 +599,35 @@ pub async fn request_channel_users(
     .await
 }
 
-/// Invite a user to your channel (creator only).
+/// Display names and pictures of these accounts (`ServerMessage::Profiles`).
+#[tauri::command]
+pub async fn profiles_get(
+    state: State<'_, AppState>,
+    server: String,
+    accounts: Vec<[u8; 16]>,
+) -> Result<(), String> {
+    let conns = state.connections.read().await;
+    let connection = conn(&conns, &server)?;
+    network::send_tcp_message(&connection.tcp_tx, &ClientMessage::ProfilesGet { accounts }).await
+}
+
+/// A profile picture's file (`ServerMessage::ProfilePicture`), for the sanitizer.
+#[tauri::command]
+pub async fn profile_picture_get(
+    state: State<'_, AppState>,
+    server: String,
+    hash: [u8; 32],
+) -> Result<(), String> {
+    let conns = state.connections.read().await;
+    let connection = conn(&conns, &server)?;
+    network::send_tcp_message(
+        &connection.tcp_tx,
+        &ClientMessage::ProfilePictureGet { hash },
+    )
+    .await
+}
+
+/// Invite a user to your channel, as its creator or on `voipc:channels` (the relay decides).
 #[tauri::command]
 pub async fn send_invite(
     state: State<'_, AppState>,
@@ -459,19 +668,50 @@ pub async fn send_poke(
         )
     };
 
-    // Encrypt the poke message with Signal Protocol pairwise session
-    let (ciphertext, message_type) = encrypt_pairwise(&signal, target_user_id, message.as_bytes())
-        .map_err(|e| format!("poke encryption failed: {e}"))?;
+    // On the live path nothing opened a session with them yet, and one kept from before is
+    // a key's alone: it waits, as a direct message does, for one both ends hold.
+    let waits = tcp_tx.proto() >= LIVE_PATH_SINCE
+        && !signal
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .established_sessions
+            .contains(&target_user_id);
+    if waits {
+        let ask_session = {
+            let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
+            sig.pending_messages.push(PendingMessage {
+                target: PendingTarget::Poke { target_user_id },
+                id: String::new(),
+                content: message.clone(),
+                ttl_secs: None,
+                extras: crypto::Extras::default(),
+                queued_at: std::time::Instant::now(),
+            });
+            sig.pending_sessions.insert(target_user_id)
+        };
+        if ask_session {
+            network::send_tcp_message(
+                &tcp_tx,
+                &ClientMessage::RequestPreKeyBundle { target_user_id },
+            )
+            .await?;
+        }
+    } else {
+        // Encrypt the poke message with Signal Protocol pairwise session
+        let (ciphertext, message_type) =
+            encrypt_pairwise(&signal, target_user_id, message.as_bytes())
+                .map_err(|e| format!("poke encryption failed: {e}"))?;
 
-    network::send_tcp_message(
-        &tcp_tx,
-        &ClientMessage::SendPoke {
-            target_user_id,
-            ciphertext,
-            message_type,
-        },
-    )
-    .await?;
+        network::send_tcp_message(
+            &tcp_tx,
+            &ClientMessage::SendPoke {
+                target_user_id,
+                ciphertext,
+                message_type,
+            },
+        )
+        .await?;
+    }
 
     // Emit the poke as a local DM for the sender's chat history
     if !message.is_empty() {
@@ -590,10 +830,19 @@ pub async fn send_channel_message(
         return Err("Chat is not available in the lobby".into());
     }
 
+    // On the live path a text channel's keys follow the post (`ChannelKeying::live_post`).
+    let live = tcp_tx.proto() >= LIVE_PATH_SINCE
+        && channels
+            .lock()
+            .ok()
+            .is_some_and(|c| c.iter().any(|ch| ch.channel_id == channel_id && ch.text));
+
     // Somebody left this channel since we last wrote in it: mint a new sender
     // key and hand it to the members still here, so the leaver's copy of the
     // chain cannot read what follows.
-    network::rotate_sender_key_if_stale(channel_id, user_id, &signal, &tcp_tx).await;
+    if !live {
+        network::rotate_sender_key_if_stale(channel_id, user_id, &signal, &tcp_tx).await;
+    }
 
     // The id travels inside the ciphertext, so our own echo below and every
     // receiver's copy file the message under the same one.
@@ -617,6 +866,46 @@ pub async fn send_channel_message(
             .session()
             .outgoing_channel(&log, payload.clone(), crypto::now_ms(), ttl_secs);
         crate::account::run(&app_handle, &server, &tcp_tx, a).await;
+    }
+
+    if live {
+        let now = crypto::now_ms();
+        let out = with_keys(&signal, |stores, keying| {
+            keying.live_post(stores, channel_id, payload, now)
+        })
+        .ok_or("E2E encryption not initialized")??;
+        network::run_live(
+            &app_handle,
+            &server,
+            &tcp_tx,
+            &signal,
+            account.as_deref(),
+            out,
+        )
+        .await;
+        // Their own row shows it as sent: the check and the keys are the app's to do, and
+        // `channel-undelivered` says so if they cannot be.
+        network::emit_server(
+            &app_handle,
+            &server,
+            "channel-chat-message",
+            serde_json::json!({
+                "channel_id": channel_id,
+                "user_id": user_id,
+                "username": username,
+                "content": content,
+                "timestamp": now,
+                "message_id": message_id,
+                "ttl_secs": ttl_secs,
+                "reply_to": extras.reply,
+                "thread": extras.thread,
+                "file": extras.file,
+                "fwd": extras.fwd,
+                "event": extras.event,
+                "encrypted": true,
+            }),
+        );
+        return Ok(());
     }
 
     // Try encrypted channel message via Sender Keys
@@ -3353,6 +3642,8 @@ pub async fn send_channel_history(
     channel_id: u32,
     target_user_id: u32,
     messages: serde_json::Value,
+    // The ask came sealed, so the answer goes the same way: as a direct message.
+    sealed: Option<bool>,
 ) -> Result<(), String> {
     // The channel travels inside the ciphertext, not only on the envelope the
     // server writes — see voipc_crypto::envelope::history_payload.
@@ -3365,6 +3656,23 @@ pub async fn send_channel_history(
         let connection = conn(&conns, &server)?;
         (connection.tcp_tx.clone(), connection.signal.clone())
     };
+    if signal
+        .lock()
+        .map_err(|e| e.to_string())?
+        .channels
+        .live_pins_out()
+    {
+        return Err("the pins are not in yet".into());
+    }
+    if sealed.unwrap_or(false) {
+        let now = crypto::now_ms();
+        let frame = with_keys(&signal, |stores, keying| {
+            keying.live_seal_answer(stores, channel_id, target_user_id, &messages, now)
+        })
+        .ok_or("E2E encryption not initialized")?
+        .map_err(|e| format!("encryption failed: {e}"))?;
+        return network::send_tcp_message(&tcp_tx, &frame).await;
+    }
     let (ciphertext, message_type) = encrypt_pairwise(&signal, target_user_id, &payload)
         .map_err(|e| format!("encryption failed: {e}"))?;
 
@@ -3444,6 +3752,32 @@ pub async fn admin_ban(
     .await
 }
 
+/// Restrict a member (`voipc:restrict`): both false lifts, `duration_secs` 0 is
+/// until lifted.
+#[tauri::command]
+pub async fn admin_restrict(
+    state: State<'_, AppState>,
+    server: String,
+    user_id: u32,
+    voice: bool,
+    text: bool,
+    duration_secs: u32,
+    reason: String,
+) -> Result<(), String> {
+    send_admin_message(
+        &state,
+        &server,
+        ClientMessage::AdminRestrict {
+            user_id,
+            voice,
+            text,
+            duration_secs,
+            reason,
+        },
+    )
+    .await
+}
+
 /// Ban an account by name, online or not (admin only).
 #[tauri::command]
 pub async fn admin_ban_account(
@@ -3465,7 +3799,8 @@ pub async fn admin_ban_account(
     .await
 }
 
-/// Lift a ban by its id (admin only). The updated list arrives as `admin-bans`.
+/// Lift a ban by its id (admin only). The updated list arrives as `admin-bans-page`, or
+/// `admin-bans` from a relay before protocol 20.
 #[tauri::command]
 pub async fn admin_unban(
     state: State<'_, AppState>,
@@ -3475,10 +3810,33 @@ pub async fn admin_unban(
     send_admin_message(&state, &server, ClientMessage::AdminUnban { id }).await
 }
 
-/// Request the ban list (admin only); delivered as the `admin-bans` event.
+/// Who takes a report of a message now; delivered as the `report-takers` event.
+#[tauri::command]
+pub async fn report_takers_get(state: State<'_, AppState>, server: String) -> Result<(), String> {
+    send_admin_message(&state, &server, ClientMessage::ReportTakersGet).await
+}
+
+/// Request the ban list (admin only) of a relay before protocol 20; delivered as the
+/// `admin-bans` event.
 #[tauri::command]
 pub async fn admin_list_bans(state: State<'_, AppState>, server: String) -> Result<(), String> {
     send_admin_message(&state, &server, ClientMessage::AdminListBans).await
+}
+
+/// A page of the ban list (admin only), protocol 20; delivered as the `admin-bans-page` event.
+#[tauri::command]
+pub async fn admin_bans_page(
+    state: State<'_, AppState>,
+    server: String,
+    search: String,
+    offset: u32,
+) -> Result<(), String> {
+    send_admin_message(
+        &state,
+        &server,
+        ClientMessage::AdminBansPage { search, offset },
+    )
+    .await
 }
 
 /// Forget the TOFU-pinned certificate of a server (after a legitimate
@@ -3884,6 +4242,7 @@ pub fn set_config_bool(state: State<'_, AppState>, key: String, value: bool) -> 
         "auto_connect" => config.auto_connect = value,
         "remember_connection" => config.remember_connection = value,
         "share_channel_history" => config.share_channel_history = value,
+        "share_off_notice" => config.share_off_notice = value,
         _ => return Err(format!("Unknown config key: {key}")),
     }
     crate::config::save_config(&config)
@@ -3915,10 +4274,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("chat_history.bin");
         let named = |suffix: &str| dir.join(format!("chat_history.bin{suffix}"));
-        let copies = [".v1", ".v4", ".v5"].map(named);
+        let copies = [".v1", ".v4", ".v5", ".v6"].map(named);
         // Not ours to remove: a file moved aside for a newer VoIPC, a
         // version that is no older one's, and another name
-        let others = [".old-1700000000", ".v6", ".v0", ".v5.tmp"].map(named);
+        let others = [".old-1700000000", ".v7", ".v0", ".v5.tmp"].map(named);
         let write_all = || {
             for f in copies.iter().chain(&others).chain([&path]) {
                 std::fs::write(f, b"x").unwrap();
