@@ -335,6 +335,13 @@ jobs:
       - run: cargo build --release --locked -p voipc-server --example import_replay
         env: { VOIPC_SELFTEST: '1' }
 
+      # A fresh runner's first browser start is slow, and once stalled past Chromium's own
+      # 15 s watchdog, so the lane that started it lost its page. This pays for it here and
+      # prints the cost (first start against second).
+      - name: Warm the browsers
+        timeout-minutes: 8
+        run: bash tools/ci-warm-browsers.sh
+
       # Both engines, and both mixed pairings: a Chromium sharer feeds a Firefox
       # viewer H.264, a Firefox sharer feeds a Chromium viewer VP9.
       # `!cancelled()` so one red lane does not hide the others: knowing
