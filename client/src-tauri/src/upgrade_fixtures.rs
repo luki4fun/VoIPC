@@ -1,7 +1,8 @@
-//! What 0.12.0 left on a desktop still reads in this version, nothing lost:
-//! the chat history (archive v4), settings.json and tofu_pins.json. The files
-//! in tests/fixtures/0.12.0/ were written once by 0.12.0's own code (see the
-//! README there) and are never regenerated.
+//! What earlier versions left on a desktop still reads in this version, nothing
+//! lost: 0.12.0's chat history (archive v4), settings.json and tofu_pins.json;
+//! 1.1.0's history (v5), 1.6.0's (v6) and 1.11.0's (v7) with its settings.json.
+//! Each tests/fixtures/<version>/ was written once by that version's own code
+//! (see the README there) and is never regenerated.
 
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -124,4 +125,82 @@ fn a_0_12_pin_file_keeps_every_pin() {
             .unwrap();
     assert_eq!(pins.get("voice.example.org:9987"), Some(&vec![0xab; 32]));
     assert_eq!(pins.get("192.168.1.20:9987"), Some(&vec![0x01; 32]));
+}
+
+/// A history `version` left in tests/fixtures/`dir`: it opens with everything
+/// in its expected.json, and a save in this version's format keeps all of it.
+fn history_keeps(dir: &str, version: u8) {
+    use crate::crypto::{decrypt_archive, encrypt_archive, file_kind, FileKind, ARCHIVE_VERSION};
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(dir);
+    assert_eq!(
+        file_kind(&path.join("chat_history.bin")),
+        FileKind::Ours(version)
+    );
+    let want: Value =
+        serde_json::from_str(&std::fs::read_to_string(path.join("expected.json")).unwrap())
+            .unwrap();
+    let (archive, salt, key, read) = decrypt_archive(
+        &std::fs::read(path.join("chat_history.bin")).unwrap(),
+        PASSWORD,
+    )
+    .unwrap();
+    assert_eq!(read, version);
+    assert!(
+        keeps(&json(&archive), &want),
+        "the {dir} history lost something on opening"
+    );
+    let saved = encrypt_archive(&archive, &key, &salt).unwrap();
+    assert_eq!(saved[4], ARCHIVE_VERSION);
+    let (again, ..) = decrypt_archive(&saved, PASSWORD).unwrap();
+    assert!(
+        keeps(&json(&again), &want),
+        "the {dir} history lost something on saving"
+    );
+}
+
+/// 1.3.1 to 1.10 wrote archive v6 (`extra` on a message); 1.6.0 is the last
+/// final release among them, so most desktops upgrade from this file.
+#[test]
+fn a_1_6_chat_history_opens_and_keeps_everything_through_a_save() {
+    history_keeps("1.6.0", 6);
+}
+
+/// 1.11 writes v7 (the bucket lists a device has named, protocol 21), with
+/// every `extra` field the 1.11 front end keeps and one it does not know.
+#[test]
+fn a_1_11_chat_history_opens_and_keeps_everything_through_a_save() {
+    history_keeps("1.11.0", 7);
+}
+
+/// Every key 1.11 writes, none at its default: read, and loaded through a
+/// start (which changes nothing here), all of them stay, and a save (the same
+/// serde_json of the config) is allowed and writes them back.
+#[test]
+fn a_1_11_settings_file_loads_and_saves_every_key_back() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/1.11.0/settings.json");
+    let text = std::fs::read_to_string(&fixture).unwrap();
+    let want: Value = serde_json::from_str(&text).unwrap();
+    let config: crate::config::AppConfig = serde_json::from_str(&text).unwrap();
+    assert!(
+        keeps(&json(&config), &want),
+        "a 1.11 setting is dropped or changed on reading"
+    );
+    let dir = std::env::temp_dir().join(format!("voipc-fixture-1-11-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("settings.json");
+    std::fs::write(&path, &text).unwrap();
+    let loaded = crate::config::load_config_at(&path);
+    let after = std::fs::read_to_string(&path).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(after, text, "a start rewrote the 1.11 settings");
+    assert!(
+        loaded.format <= crate::config::SETTINGS_FORMAT,
+        "saving is allowed"
+    );
+    assert!(
+        keeps(&json(&loaded), &want),
+        "a 1.11 setting is changed by a start, or dropped on saving"
+    );
 }

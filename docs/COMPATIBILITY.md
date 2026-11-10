@@ -62,8 +62,9 @@ out of servers that have not upgraded yet.
 - Any change with the same `PROTOCOL_VERSION` fails it.
 - `compat.rs`'s tests fail when a message's layout at an older protocol differs from today's
   and `RESHAPED` does not name it, and when an old shape there differs from its golden file.
-- The nightly `old-relays` job runs the released 1.0, 1.3, 1.4, 1.6 and 1.7 relays and speaks to each
-  in its own protocol (`voice_load`). A release joins the list once it is tagged.
+- The nightly `old-relays` job runs the released 1.0, 1.3, 1.4, 1.6, 1.7.0-rc.1 and 1.11.0-rc.1
+  (protocol 20) relays and speaks to each in its own protocol (`voice_load`). A release joins the
+  list once it is tagged. 1.8 to 1.10 were never tagged, so protocols 17 to 19 have no relay there.
 
 ## 2. Game SDK (`docs/SDK.md`)
 
@@ -203,15 +204,24 @@ means uninstalling, which deletes the app's history on the phone. The browser ne
 loads the page its relay serves. The relay's side is in [OPERATING.md](OPERATING.md) §8.
 
 **Break detection:**
-- the fixtures written by 0.12.0's own code, one directory per released version, never
-  regenerated:
+- the fixtures each version's own code wrote, one directory per released version, never
+  regenerated (each README says how):
   - `crates/voipc-crypto/tests/fixtures/0.12.0/`: vault, log key, kept entry, safety number, log
     memory;
+  - `crates/voipc-crypto/tests/fixtures/1.11.0/`: a vault at the `0x02` item layout, its pins as
+    an index of pages, prefs and blocks, read back by a new sign-in; log memory with `named`;
   - `client/src-tauri/tests/fixtures/0.12.0/`: chat history, settings, pins;
   - `client/src-tauri/tests/fixtures/1.1.0/`: chat history (archive v5, the format 1.0 and 1.1
     write);
+  - `client/src-tauri/tests/fixtures/1.6.0/`: chat history (archive v6, the format 1.3.1 to 1.10
+    write), written by 1.6.0's archive code;
+  - `client/src-tauri/tests/fixtures/1.11.0/`: chat history (archive v7, every `extra` field,
+    also read by the front end's `archive-fixtures.test.ts`) and settings with every key;
   - `crates/voipc-server/tests/fixtures/0.12.0/`: the accounts database, which is opened,
     migrated and signed into, and the kept DM read;
+  - `crates/voipc-server/tests/fixtures/1.11.0/`: the accounts database at migration 0010, rows
+    in every table 0006 to 0010 made (an import, placeholders, the archive, moderation, a kept
+    channel post on a chain), opened, counted, signed into, the kept DM and post read;
   - `client/src/lib/__fixtures__/0.12.0/`: browser settings, checked by `test-ui.mjs`
     section 18;
 - `crates/voipc-server/tests/migrations.rs`: a shipped migration's hash may not change;

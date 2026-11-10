@@ -10,6 +10,7 @@
 // checks are "no page error on X's side", and what that means must not change under it.
 
 import { spawn } from "node:child_process";
+import { closeSync, mkdirSync, openSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -111,18 +112,36 @@ export async function frameSummary(tab, ms = null) {
  * lane's stop() to end.
  */
 export async function startChromium({ chrome, work, cdpPort, children, args = [] }) {
+  // Chromium's own output goes to a file (in KEEP_LOGS when set, which CI uploads), and a start
+  // that fails says whether it exited and what it last said. Soak run 42831799186 had only
+  // "did not come up": the output was thrown away, so nothing told a crash from a slow start.
+  const logDir = process.env.KEEP_LOGS || work;
+  mkdirSync(logDir, { recursive: true });
+  const logPath = join(logDir, `chromium-${cdpPort}.log`);
+  const fd = openSync(logPath, "w");
+  const started = Date.now();
   const c = spawn(
     chrome,
     ["--headless=new", "--no-sandbox", "--ignore-certificate-errors", `--remote-debugging-port=${cdpPort}`,
      ...args, `--user-data-dir=${join(work, `profile-${cdpPort}`)}`, "about:blank"],
-    { stdio: "ignore" },
+    { stdio: ["ignore", fd, fd] },
   );
+  closeSync(fd);
   children.push(c);
-  for (let i = 0; i < 60; i++) {
-    if (await fetch(`http://127.0.0.1:${cdpPort}/json/version`).then((r) => r.ok, () => false)) return c;
+  let exited = null;
+  c.on("exit", (code, signal) => { exited = `it exited (code ${code}, signal ${signal})`; });
+  c.on("error", (e) => { exited = `it did not start (${e.message})`; });
+  for (let i = 0; i < 60 && !exited; i++) {
+    if (await fetch(`http://127.0.0.1:${cdpPort}/json/version`).then((r) => r.ok, () => false)) {
+      const took = Date.now() - started;
+      if (took > 5000) console.log(`note: chromium on ${cdpPort} took ${(took / 1000).toFixed(1)} s to come up`);
+      return c;
+    }
     await sleep(250);
   }
-  throw new Error(`chromium on ${cdpPort} did not come up`);
+  const state = exited ?? `it was still running after ${((Date.now() - started) / 1000).toFixed(1)} s`;
+  const tail = readFileSync(logPath, "utf8").trim().split("\n").slice(-15).join("\n");
+  throw new Error(`chromium on ${cdpPort} did not come up: ${state}. Its last lines (${logPath}):\n${tail || "(nothing)"}`);
 }
 
 /**

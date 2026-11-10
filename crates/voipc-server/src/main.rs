@@ -845,11 +845,13 @@ async fn main() -> Result<()> {
         .install_default()
         .expect("failed to install rustls crypto provider");
 
-    // Initialize tracing
+    // Initialize tracing. `accounts` is l4f-accounts' own target: its warnings and errors
+    // (a provider sign-in that failed, a database error) carry hashed addresses and account
+    // ids, never a name; its info lines can name the first admin, so they stay off.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "voipc_server=info".into()),
+                .unwrap_or_else(|_| "voipc_server=info,accounts=warn".into()),
         )
         .init();
 

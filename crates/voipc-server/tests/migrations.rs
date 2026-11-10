@@ -85,6 +85,15 @@ const SHIPPED: &[(&str, &str)] = &[
         "postgres/0009_move.sql",
         "94de0cecb0c6dd1f502209f7688a0c27a047e487eb03d7b996a7067904397e0b",
     ),
+    // 1.11.0 (0010 shipped in rc.2; rc.1 had none of it)
+    (
+        "sqlite/0010_kept.sql",
+        "89377a0323a0bc2714aa683834f78bba29e053f09fac50731c8a56d7cccfb37e",
+    ),
+    (
+        "postgres/0010_kept.sql",
+        "d775561e5dea64d52ab7b4f4b2b19ff753c0da5e48c1b47d505ba01519630eb3",
+    ),
 ];
 
 #[test]

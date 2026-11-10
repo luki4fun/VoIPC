@@ -323,6 +323,11 @@ migrated, by design. Release candidates (`-rc.N`) are for testing on a relay you
 
 - **What is logged:** at the default `info` level, the relay logs no client addresses and no
   account names; connection lines are at `debug`. Set `RUST_LOG=warn` to keep even less.
+- **The account system's own lines** (target `accounts`): its warnings and errors are on by
+  default, among them why a Discord sign-in failed (`outcome="oauth_failed"`) and database
+  errors, with a hashed address and account ids. A `RUST_LOG` of your own replaces the default,
+  so add `accounts=warn` to it. `accounts=info` adds each sign-in's outcome, and names the first
+  admin account when it is made.
 - **The journal:** it keeps what the service prints. Set its retention to match the backup
   policy, e.g. `MaxRetentionSec=30day` in `journald.conf`.
 

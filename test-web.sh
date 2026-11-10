@@ -428,7 +428,7 @@ elif [ "$BROWSER_ALICE" = chromium ] || [ "$BROWSER_BOB" = chromium ]; then
   # RELAY_LOG: a lane that starts its own relay logs it there, at debug, so a failure can say
   # what the relay refused or ended at that moment (lane_verdict)
   # shellcheck disable=SC2086
-  run_lane() { RELAY_LOG="$WORK/$1-relay.log" RUST_LOG="${RUST_LOG:-voipc_server=debug}" CHROME="$CHROME" TMPDIR="$WORK" exec node "$SCRIPT_DIR/"${lane_args[$1]}; }
+  run_lane() { RELAY_LOG="$WORK/$1-relay.log" RUST_LOG="${RUST_LOG:-voipc_server=debug,accounts=info}" CHROME="$CHROME" TMPDIR="$WORK" exec node "$SCRIPT_DIR/"${lane_args[$1]}; }
   # A lane has ended: its verdict, and on a failure what it said goes to fails.txt
   lane_verdict() { # name exit-status
     # On every run, green too: connections and QUIC sessions (web.rs logs those as sessions)

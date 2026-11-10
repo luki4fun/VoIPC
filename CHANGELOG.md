@@ -104,6 +104,14 @@ other apps could not read.
   person in many channels had direct messages dropped from that list.
 
 ### Fixed
+- **Someone who joins or comes back just after another person posted reads that person's next post.** A writer skipped
+  asking who was new for 2 s after each ask, and the relay sends a post only to the readers its writer was told of, so a
+  reader who came in that window missed that writer's posts for good: no later key opens them. A writer asks before every
+  post now, and a quick run of posts shares one ask (in rc.2).
+- **The relay's log says why a sign-in with Discord failed.** The account system's warnings and errors went to a log target
+  the default filter dropped, so a failed provider sign-in or a database error left no line. They are on by default now,
+  with hashed addresses and no names ([OPERATING.md](docs/OPERATING.md) §9). A `RUST_LOG` of your own needs `accounts=warn`
+  added.
 - **A post of yours is no longer lost on your own device by a crash just after it went.** The read cursor passed it and reached
   disk while the post waited up to 2 s for its save: quit in between and it never came back there, though a browser read it from
   the kept copy. A post moves no cursor now, and reads back once at the next read.

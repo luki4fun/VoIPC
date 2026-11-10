@@ -1,0 +1,116 @@
+{
+  "input_device": "USB Mic",
+  "output_device": "Headset",
+  "volume": 0.8,
+  "input_gain": 1.25,
+  "noise_suppression": false,
+  "voice_mode": "vad",
+  "vad_threshold_db": -42.5,
+  "ptt_key": "KeyV",
+  "ptt_hold_mode": false,
+  "mute_key": "KeyM",
+  "deafen_key": "KeyN",
+  "muted": true,
+  "deafened": true,
+  "remember_connection": true,
+  "last_host": "voice.example.org",
+  "last_port": 9987,
+  "last_username": "luki#4821",
+  "last_accept_self_signed": true,
+  "saved_servers": [
+    {
+      "name": "Home",
+      "host": "voice.example.org",
+      "port": 9987,
+      "username": "luki",
+      "accept_self_signed": false,
+      "account": true
+    },
+    {
+      "name": "LAN",
+      "host": "192.168.1.20",
+      "port": 9987,
+      "username": "luki",
+      "accept_self_signed": true,
+      "account": false
+    }
+  ],
+  "open_servers": [
+    {
+      "name": "Home",
+      "host": "voice.example.org",
+      "port": 9987,
+      "username": "luki",
+      "accept_self_signed": false,
+      "account": true
+    }
+  ],
+  "screen_share_codec": "av1",
+  "spatial_audio": true,
+  "screen_audio_spatial": true,
+  "mic_effect": "radio",
+  "mic_muffle": 30,
+  "mic_reverb": 40,
+  "mic_water": 50,
+  "audio_setup_version": 3,
+  "sdk_enabled": true,
+  "sdk_port": 39988,
+  "sdk_allowed_origins": [
+    "null",
+    "https://game.example.org"
+  ],
+  "mumblelink_enabled": true,
+  "sdk_beacon_allowed": true,
+  "sdk_transmit_allowed": true,
+  "sounds": {
+    "channel_switch": {
+      "enabled": true,
+      "path": null
+    },
+    "user_joined": {
+      "enabled": true,
+      "path": null
+    },
+    "user_left": {
+      "enabled": true,
+      "path": null
+    },
+    "disconnected": {
+      "enabled": true,
+      "path": null
+    },
+    "direct_message": {
+      "enabled": true,
+      "path": "/home/luki/sounds/dm.ogg"
+    },
+    "channel_message": {
+      "enabled": true,
+      "path": null
+    },
+    "poke": {
+      "enabled": false,
+      "path": null
+    }
+  },
+  "auto_connect": true,
+  "share_channel_history": true,
+  "share_off_once": true,
+  "share_off_notice": false,
+  "ui_prefs": {
+    "layout": "modern",
+    "panel": {
+      "left": 240
+    },
+    "theme": "day",
+    "zoom": 1.1
+  },
+  "chat_history_path": "/home/luki/voipc/chat_history.bin",
+  "chat_history_disabled": true,
+  "max_conversations": 75,
+  "file_cache_mb": 2048,
+  "relay_ids": {
+    "voice.example.org:9987": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
+  },
+  "check_updates": false,
+  "format": 1
+}

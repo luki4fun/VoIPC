@@ -1134,8 +1134,9 @@ async function lane() {
   check("and it reads back after a reload", await seen(held, lastMessage("won it back"), 60_000), await messagesOf(held));
   await openChat(held, "lobby-chat");
 
-  // Someone new, with nobody sharing: they read from now on, and are told so without a fuss
-  const gina = await openDialog(await browser(PORT + 108));
+  // Someone new, with nobody sharing: they read from now on, and are told so without a fuss.
+  // A browser of her own: +108 is nils's, still running, so she was a tab of his.
+  const gina = await openDialog(await browser(PORT + 111));
   await createAccount(gina, "gina");
   await settle(gina);
   await openChat(gina, "lobby-chat");

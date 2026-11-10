@@ -10087,6 +10087,33 @@ mod providers {
             }
         }
 
+        /// Each table migrations 0006 to 0010 made, with rows in the 1.11.0 fixture.
+        const FIXTURE_1_11_TABLES: &[&str] = &[
+            "voipc_channels",
+            "voipc_categories",
+            "voipc_group_style",
+            "voipc_profiles",
+            "voipc_invite_links",
+            "voipc_modlog",
+            "voipc_restrictions",
+            "voipc_imports",
+            "voipc_import_items",
+            "voipc_import_cursors",
+            "voipc_placeholders",
+            "voipc_import_groups",
+            "voipc_power_waiting",
+            "voipc_import_excluded",
+            "voipc_archive",
+            "voipc_archive_wishes",
+            "voipc_writers",
+            "voipc_chains",
+            "voipc_seats",
+            "voipc_seals",
+            "voipc_bucket_lists",
+            "voipc_log",
+            "voipc_wraps",
+        ];
+
         async fn count(state: &ServerState, sql: &str) -> i64 {
             crate::accounts::raw(state.accounts.as_ref().unwrap(), sql)
                 .await
@@ -21403,6 +21430,138 @@ mod providers {
                     .collect();
                 assert_eq!(names, ["Voice rooms", "Help"]);
             }
+        }
+
+        /// An accounts database as 1.11.0 left it (tests/fixtures/1.11.0, written once by
+        /// 1.11's own code, see its README): a start on it opens and migrates it, every
+        /// table migrations 0006 to 0010 made keeps its rows, bob signs in with his
+        /// password and still reads the DM alice kept for him, and the lounge still
+        /// serves him alice's kept post with his seat and the chain's seal.
+        #[tokio::test]
+        async fn a_1_11_accounts_database_opens_signs_in_and_keeps_everything() {
+            use voipc_crypto::log::{open_entry, unwrap, LogKey, ROW_BYTES};
+            use voipc_protocol::messages::ChainAsk;
+            async fn next(c: &mut Client, r: AccountRequest) -> AccountReply {
+                c.send(&ClientMessage::Account(r)).await;
+                let m = c
+                    .expect("an answer", |m| {
+                        matches!(m, ServerMessage::Account(r) if !matches!(
+                            r,
+                            AccountReply::LogNews { .. } | AccountReply::LogPending { .. } | AccountReply::Info(_)
+                        ))
+                    })
+                    .await;
+                let ServerMessage::Account(r) = m else {
+                    unreachable!()
+                };
+                r
+            }
+            let dir =
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/1.11.0");
+            let meta: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(dir.join("accounts.json")).unwrap())
+                    .unwrap();
+            let db = TempDb(std::env::temp_dir().join(format!(
+                "voipc-upgrade-{}.db",
+                hex::encode(rand::random::<[u8; 8]>())
+            )));
+            std::fs::copy(dir.join("voipc.db"), &db.0).unwrap();
+            let state = super::super::layouts::restart(&db, Vec::new()).await;
+            assert_eq!(hex::encode(relay_of(&state).relay_id), meta["relay_id"]);
+            for t in FIXTURE_1_11_TABLES {
+                let n = count(&state, &format!("SELECT CAST(COUNT(*) AS BIGINT) FROM {t}")).await;
+                assert_eq!(Some(n), meta["tables"][t].as_i64(), "{t}");
+            }
+
+            // The DM, as in the 0.12 fixture
+            let (mut bob, b, _) = sign_in_password(&state, "bob").await;
+            assert_eq!(hex::encode(b.id), meta["bob"]);
+            let conv = meta["conv"].as_str().unwrap().to_string();
+            let AccountReply::Wraps { wraps, .. } =
+                next(&mut bob, AccountRequest::WrapsFetch { conv: conv.clone() }).await
+            else {
+                panic!("no wraps")
+            };
+            let bob_lk =
+                LogKey::from_bytes(&hex::decode(meta["bob_logkey"].as_str().unwrap()).unwrap())
+                    .unwrap();
+            let key = unwrap(
+                &bob_lk,
+                &wraps[0].wrapped,
+                &conv,
+                &wraps[0].owner,
+                wraps[0].epoch,
+                &b.id,
+            )
+            .unwrap();
+            let AccountReply::LogPage { entries, .. } = next(
+                &mut bob,
+                AccountRequest::LogFetch {
+                    conv: conv.clone(),
+                    after: 0,
+                },
+            )
+            .await
+            else {
+                panic!("no page")
+            };
+            let alice_lk = hex::decode(meta["alice_logkey_public"].as_str().unwrap()).unwrap();
+            let (envelope, _) = open_entry(
+                &key,
+                &conv,
+                &entries[0].sender,
+                entries[0].epoch,
+                &alice_lk,
+                &entries[0].ct,
+            )
+            .unwrap();
+            assert_eq!(
+                voipc_crypto::envelope::open_envelope(&envelope).text,
+                meta["text"]
+            );
+
+            // The lounge, imported, with its log; alice's post and what opens it for bob
+            let log = meta["log"].as_str().unwrap().to_string();
+            let id = lounge(&state).await;
+            assert_eq!(state.channels.read().await[&id].info.log, log);
+            enter(&mut bob, id).await;
+            let AccountReply::ChainPage { entries, .. } = next(
+                &mut bob,
+                AccountRequest::ChainFetch {
+                    conv: log.clone(),
+                    after: 0,
+                },
+            )
+            .await
+            else {
+                panic!("no chain page")
+            };
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].ct, vec![0x55; 64]);
+            let alice: [u8; 16] = hex::decode(meta["alice"].as_str().unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap();
+            let ask = ChainAsk {
+                owner: alice,
+                chain: 1,
+                from: None,
+            };
+            let AccountReply::WrapsPage { keys, .. } = next(
+                &mut bob,
+                AccountRequest::WrapsPage {
+                    conv: log.clone(),
+                    asks: vec![ask],
+                },
+            )
+            .await
+            else {
+                panic!("no keys")
+            };
+            let seal = keys[0].seal.as_ref().expect("the chain's seal");
+            assert_eq!((seal.bucket, seal.version, seal.index), (7, 0, 0));
+            assert_eq!(seal.sealed, vec![0xC3; ROW_BYTES]);
+            assert_eq!(keys[0].seat, Some((0, vec![0xB2; ROW_BYTES])));
         }
     }
 }

@@ -442,7 +442,7 @@ jobs:
         env:
           COMMUNITY_DATABASE: 'postgres://voipc:voipc@127.0.0.1:5432/community'
           RELAY_LOG: ${{ github.workspace }}/browser-logs/postgres-community-relay.log
-          RUST_LOG: voipc_server=debug
+          RUST_LOG: voipc_server=debug,accounts=info
       - name: Moderation lane on Postgres
         if: ${{ !cancelled() && matrix.part == 'postgres' }}
         timeout-minutes: 15
@@ -450,7 +450,7 @@ jobs:
         env:
           MODERATION_DATABASE: 'postgres://voipc:voipc@127.0.0.1:5432/moderation'
           RELAY_LOG: ${{ github.workspace }}/browser-logs/postgres-moderation-relay.log
-          RUST_LOG: voipc_server=debug
+          RUST_LOG: voipc_server=debug,accounts=info
       - name: Move lane on Postgres
         if: ${{ !cancelled() && matrix.part == 'postgres' }}
         timeout-minutes: 15
@@ -458,7 +458,7 @@ jobs:
         env:
           MOVE_DATABASE: 'postgres://voipc:voipc@127.0.0.1:5432/move'
           RELAY_LOG: ${{ github.workspace }}/browser-logs/postgres-move-relay.log
-          RUST_LOG: voipc_server=debug
+          RUST_LOG: voipc_server=debug,accounts=info
 
       # What the lanes said and their relays logged, for a red job: a timeout's diagnosis
       # names the requests a page was waiting on, and the relay log what it refused then
