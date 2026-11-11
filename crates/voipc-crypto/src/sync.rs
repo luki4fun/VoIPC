@@ -375,7 +375,7 @@ impl Event {
                 let (id, text, ttl, at, extras) = opened(envelope, *sent_at, *server_at);
                 let payload = serde_json::json!({
                     "conv": conv, "seq": seq, "peer_account": hex(peer), "peer_name": peer_name, "from_me": from_me,
-                    "message_id": id, "content": text, "ttl_secs": ttl, "timestamp": at,
+                    "message_id": id, "content": text, "ttl_secs": ttl, "timestamp": at, "server_at": server_at,
                     "reply_to": extras.reply, "thread": extras.thread, "file": extras.file, "fwd": extras.fwd,
                 });
                 ("stored-dm", payload)
@@ -393,7 +393,7 @@ impl Event {
                 let (id, text, ttl, at, extras) = opened(envelope, *sent_at, *server_at);
                 let payload = serde_json::json!({
                     "conv": conv, "seq": seq, "sender_account": hex(sender), "sender_name": sender_name, "from_me": from_me,
-                    "message_id": id, "content": text, "ttl_secs": ttl, "timestamp": at,
+                    "message_id": id, "content": text, "ttl_secs": ttl, "timestamp": at, "server_at": server_at,
                     "reply_to": extras.reply, "thread": extras.thread, "file": extras.file, "fwd": extras.fwd,
                 });
                 ("stored-channel-message", payload)
@@ -785,6 +785,11 @@ impl AccountSync {
         }
         out.push(ask(AccountRequest::LogIndex));
         (s, out)
+    }
+
+    /// The account's identity, for what only it signs (`AccountSession`'s login key).
+    pub(crate) fn identity(&self) -> &IdentityKeyPair {
+        &self.identity
     }
 
     /// Our log key, for the relay to hand to the others, with our identity's
@@ -2479,6 +2484,11 @@ mod tests {
             (Some("r1"), Some("t1"))
         );
         assert_eq!(payload["file"]["name"], "a.txt");
+        // Where it stands when read back (1.12): the relay's filing time, beside the shown one
+        assert_eq!(
+            (payload["timestamp"].as_u64(), payload["server_at"].as_u64()),
+            (Some(10), Some(20))
+        );
         let plain = Event::Message {
             conv: "d:1".into(),
             peer: [1; 16],
@@ -2491,6 +2501,7 @@ mod tests {
         };
         let (_, plain) = plain.to_wire().unwrap();
         assert!(plain["reply_to"].is_null() && plain["file"].is_null() && plain["fwd"].is_null());
+        assert_eq!(plain["server_at"].as_u64(), Some(20));
     }
 
     /// An edit, delete, reaction or pin from the stored log reaches the front
@@ -2665,6 +2676,9 @@ mod tests {
             vault,
             identity: me.identity,
             recovery: None,
+            binding: None,
+            keyed: false,
+            login_key: None,
             blobs,
         };
         let (mut s, _) = AccountSync::start(&signed, me.id, LogMemory::default(), false);
@@ -2973,6 +2987,9 @@ mod tests {
             vault: Vault::create(RELAY, "me"),
             identity: me.identity,
             recovery: None,
+            binding: None,
+            keyed: false,
+            login_key: None,
             blobs: Vec::new(),
         };
         let (mut s, first) = AccountSync::start(&signed, me.id, LogMemory::default(), false);
@@ -3508,6 +3525,9 @@ mod tests {
             vault,
             identity: me.identity,
             recovery: None,
+            binding: None,
+            keyed: false,
+            login_key: None,
             blobs,
         };
         let (s, _) = AccountSync::start(&signed, me.id, memory, false);
@@ -3660,6 +3680,9 @@ mod tests {
             vault,
             identity: me.identity,
             recovery: None,
+            binding: None,
+            keyed: false,
+            login_key: None,
             blobs,
         };
         let (s, _) = AccountSync::start(&signed, me.id, memory, false);

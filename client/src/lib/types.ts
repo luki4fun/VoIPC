@@ -117,6 +117,12 @@ export interface ChatMessage {
   content: string;
   timestamp: number;
   /**
+   * When the relay filed a row of its stored log (Unix ms, 1.12): what a read-back sorts by,
+   * one clock for every writer, so a reply never stands above what it answers because two
+   * people's clocks differ. Only from the relay's own read, never from a member's hand-off.
+   */
+  relay_at?: number;
+  /**
    * Minted by the sender inside the end-to-end envelope, so every copy of a
    * message carries the same one — which is what lets history offered by
    * several members be merged without duplicates. Absent for anything stored

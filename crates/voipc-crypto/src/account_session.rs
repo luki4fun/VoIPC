@@ -16,7 +16,8 @@ use voipc_protocol::types::{may_share_history, AccountInfo, ProviderKind, Report
 use zeroize::Zeroizing;
 
 use crate::account::{
-    derive_from_master, kdf_salt, recovery_text, reset_key, DeviceEnrol, PinCheck, SignedIn, Vault,
+    derive_from_master, kdf_salt, login_key_proof, recovery_text, reset_key, DeviceEnrol, LoginKey,
+    PinCheck, SignedIn, Vault,
 };
 use crate::sync::{AccountSync, Event, KeptPins, LogMemory, Prefs};
 
@@ -102,6 +103,26 @@ pub struct AccountSession {
     /// What waits for the pages of pins, and whether they were out when the host looked.
     pin_wait: Vec<PinWait>,
     pins_out: bool,
+    /// What this connection's proofs are bound to (`crate::bind`).
+    binding: Option<crate::bind::Binding>,
+    /// The password is the account's login key here (protocol v22): a request that wants
+    /// it again goes after a `KeyStepUp` (`confirmed`).
+    keyed: bool,
+    /// A request waiting for its `KeyStepUp`.
+    stepping: Option<Stepping>,
+    /// A `LoginKeySet` out: `Some("PasswordChange")` for a new password (its refusal is
+    /// that request's), `Some("")` for the move after a sign-in with the secret.
+    key_set: Option<&'static str>,
+}
+
+/// A request that wants the password again, on a keyed account: the key that signs the
+/// challenge, the codes, what goes once the step-up held, and the request's name.
+struct Stepping {
+    key: LoginKey,
+    totp: Option<String>,
+    recovery_code: Option<String>,
+    then: ClientMessage,
+    request: &'static str,
 }
 
 /// A pairing this device was asked for (`crate::pair`).
@@ -203,7 +224,30 @@ impl AccountSession {
         proto: u32,
     ) -> (AccountSession, Actions) {
         let right = may_share_history(proto, true, Some(&info.scopes));
-        let (mut sync, first) = AccountSync::start(&signed, info.id, memory, switch && right);
+        // Signed in with the password's secret at 22: the password moves to its login key
+        // now, signed by the identity over this connection
+        let upgrade = match (signed.login_key, signed.binding) {
+            (Some(key), Some(b)) if proto >= 22 => {
+                Some(ClientMessage::Account(AccountRequest::LoginKeySet {
+                    login_key: key.to_vec(),
+                    identity_sig: login_key_proof(
+                        &signed.identity,
+                        &signed.relay_id,
+                        &signed.name,
+                        &key,
+                        None,
+                        &b,
+                    ),
+                    pass_slot: None,
+                    web: b.web(),
+                }))
+            }
+            _ => None,
+        };
+        let keyed = signed.keyed || upgrade.is_some();
+        let (mut sync, mut first) = AccountSync::start(&signed, info.id, memory, switch && right);
+        let key_set = upgrade.as_ref().map(|_| "");
+        first.extend(upgrade);
         sync.set_protocol(proto);
         let signed_in = json!({
             "name": signed.name,
@@ -232,6 +276,10 @@ impl AccountSession {
             pairing: None,
             pin_wait: Vec::new(),
             pins_out: false,
+            binding: signed.binding,
+            keyed,
+            stepping: None,
+            key_set,
         };
         (
             s,
@@ -450,40 +498,148 @@ impl AccountSession {
     /// link needs a recent sign-in: `master` is the stretched password, where
     /// the account has one. `ProviderBrowser` answers as `account-reply`.
     pub fn provider_start(
-        &self,
+        &mut self,
         kind: ProviderKind,
         link: bool,
         master: Option<&[u8; 32]>,
         totp: Option<String>,
         recovery_code: Option<String>,
     ) -> Actions {
-        Actions::sending(vec![ClientMessage::Account(
-            AccountRequest::ProviderStart {
+        self.confirmed(
+            master,
+            (totp, recovery_code),
+            "ProviderStart",
+            |secret, totp, recovery_code| AccountRequest::ProviderStart {
                 kind,
                 link,
-                secret: secret_of(master),
+                secret,
                 totp,
                 recovery_code,
             },
-        )])
+        )
     }
 
     /// As for a link. `ProviderUnlinked` answers as `account-reply`.
     pub fn provider_unlink(
-        &self,
+        &mut self,
         kind: ProviderKind,
         master: Option<&[u8; 32]>,
         totp: Option<String>,
         recovery_code: Option<String>,
     ) -> Actions {
-        Actions::sending(vec![ClientMessage::Account(
-            AccountRequest::ProviderUnlink {
+        self.confirmed(
+            master,
+            (totp, recovery_code),
+            "ProviderUnlink",
+            |secret, totp, recovery_code| AccountRequest::ProviderUnlink {
                 kind,
-                secret: secret_of(master),
+                secret,
                 totp,
                 recovery_code,
             },
-        )])
+        )
+    }
+
+    /// A request that wants the password again (`master`, stretched) and the second
+    /// factor where there is one. On a keyed account at 22 the password never goes: a
+    /// challenge, `KeyStepUp` with the login key and the codes, then the request without
+    /// them (`on_key_reply`). Otherwise the request with the password's secret, as before.
+    fn confirmed(
+        &mut self,
+        master: Option<&[u8; 32]>,
+        (totp, recovery_code): (Option<String>, Option<String>),
+        request: &'static str,
+        then: impl FnOnce(Option<Vec<u8>>, Option<String>, Option<String>) -> AccountRequest,
+    ) -> Actions {
+        let totp = totp
+            .map(|c| c.trim().replace(' ', ""))
+            .filter(|c| !c.is_empty());
+        let recovery_code = recovery_code
+            .map(|c| c.trim().to_string())
+            .filter(|c| !c.is_empty());
+        match master {
+            Some(m) if self.keyed && self.proto >= 22 => {
+                if self.binding.is_none() {
+                    return self.refusal(request, NO_BINDING);
+                }
+                self.stepping = Some(Stepping {
+                    key: LoginKey::from_master(m),
+                    totp,
+                    recovery_code,
+                    then: ClientMessage::Account(then(None, None, None)),
+                    request,
+                });
+                Actions::sending(vec![ClientMessage::Account(AccountRequest::KeyChallenge)])
+            }
+            _ => Actions::sending(vec![ClientMessage::Account(then(
+                secret_of(master),
+                totp,
+                recovery_code,
+            ))]),
+        }
+    }
+
+    /// The page hears `reason` as the answer to `request`.
+    fn refusal(&self, request: &str, reason: &str) -> Actions {
+        Actions {
+            emit: vec![(
+                "account-reply",
+                json!({ "Error": { "request": request, "reason": reason } }),
+            )],
+            ..Default::default()
+        }
+    }
+
+    /// The login key's replies (protocol v22): the challenge signed, the step-up's request
+    /// sent, a refusal on the page as the request's own, the move to the key done.
+    fn on_key_reply(&mut self, reply: &AccountReply) -> Option<Actions> {
+        match reply {
+            AccountReply::KeyChallenge { challenge } => {
+                let st = self.stepping.as_ref()?;
+                let Some(b) = self.binding else {
+                    let request = self.stepping.take()?.request;
+                    return Some(self.refusal(request, NO_BINDING));
+                };
+                Some(Actions::sending(vec![ClientMessage::Account(
+                    AccountRequest::KeyStepUp {
+                        challenge: challenge.clone(),
+                        signature: st.key.sign(&self.relay_id, &self.name, challenge, &b),
+                        totp: st.totp.clone(),
+                        recovery_code: st.recovery_code.clone(),
+                        web: b.web(),
+                    },
+                )]))
+            }
+            AccountReply::SteppedUp => {
+                let st = self.stepping.take()?;
+                Some(Actions::sending(vec![st.then]))
+            }
+            AccountReply::Error { request, reason }
+                if request == "KeyChallenge" || request == "KeyStepUp" =>
+            {
+                let st = self.stepping.take()?;
+                if st.request == "PasswordChange" {
+                    self.key_set = None;
+                }
+                Some(self.refusal(st.request, reason))
+            }
+            AccountReply::LoginKeySaved => {
+                self.key_set = None;
+                self.keyed = true;
+                Some(Actions::default())
+            }
+            AccountReply::Error { request, reason } if request == "LoginKeySet" => {
+                match self.key_set.take()? {
+                    // The move after a sign-in: the account stays as it was
+                    "" => {
+                        self.keyed = false;
+                        Some(Actions::default())
+                    }
+                    r => Some(self.refusal(r, reason)),
+                }
+            }
+            _ => None,
+        }
     }
 
     /// The account's name here.
@@ -494,7 +650,24 @@ impl AccountSession {
     /// One `AccountReply`. What none of this answers goes to the front end
     /// as `account-reply`.
     pub fn on_reply(&mut self, reply: &AccountReply) -> Actions {
+        // A numbered answer (`AdminAsk`, protocol v22): what it holds, as any other, and its
+        // number goes to the page with it. One that does not decode is nobody's
+        if let AccountReply::Asked { ask, reply } = reply {
+            let Ok(inner) = voipc_protocol::codec::decode_asked(reply) else {
+                return Actions::default();
+            };
+            let mut a = self.on_reply(&inner);
+            for (name, value) in a.emit.iter_mut() {
+                if let (&mut "account-reply", Value::Object(fields)) = (name, value) {
+                    fields.insert("ask".into(), (*ask).into());
+                }
+            }
+            return a;
+        }
         if let Some(actions) = self.on_pair_reply(reply) {
+            return actions;
+        }
+        if let Some(actions) = self.on_key_reply(reply) {
             return actions;
         }
         if let Some(next) = self.enrol.as_ref().and_then(|e| e.on_reply(reply)) {
@@ -571,6 +744,31 @@ impl AccountSession {
                     )),
                     None => a.send.extend(self.sync.send_channel(conv, tomb, now, None)),
                 }
+            }
+            // From 22 the code the app shows is its own, from its end of the connection;
+            // a browser shows the relay's, having nothing else (W1-24)
+            AccountReply::ProviderBrowser { url, code } if self.proto >= 22 => {
+                let code = match self.binding {
+                    Some(crate::bind::Binding::Tls(x)) => {
+                        crate::bind::provider_code(&x, url.as_bytes())
+                    }
+                    Some(crate::bind::Binding::Web) => code.clone(),
+                    None => {
+                        a.emit.push((
+                            "account-reply",
+                            json!({ "Error": {
+                                "request": "ProviderStart",
+                                "reason": "This connection cannot be checked. Nothing was opened.",
+                            }}),
+                        ));
+                        return a;
+                    }
+                };
+                a.emit.push((
+                    "account-reply",
+                    json!({ "ProviderBrowser": { "url": url, "code": code } }),
+                ));
+                return a;
             }
             _ => {}
         }
@@ -908,22 +1106,21 @@ impl AccountSession {
     /// factor where it has one. `AccountDeleted` answers; the relay then
     /// closes the connection.
     pub fn delete_account(
-        &self,
+        &mut self,
         master: Option<&[u8; 32]>,
         totp: Option<String>,
         recovery_code: Option<String>,
     ) -> Actions {
-        Actions::sending(vec![ClientMessage::Account(
-            AccountRequest::DeleteAccount {
-                secret: secret_of(master).unwrap_or_default(),
-                totp: totp
-                    .map(|c| c.trim().replace(' ', ""))
-                    .filter(|c| !c.is_empty()),
-                recovery_code: recovery_code
-                    .map(|c| c.trim().to_string())
-                    .filter(|c| !c.is_empty()),
+        self.confirmed(
+            master,
+            (totp, recovery_code),
+            "DeleteAccount",
+            |secret, totp, recovery_code| AccountRequest::DeleteAccount {
+                secret: secret.unwrap_or_default(),
+                totp,
+                recovery_code,
             },
-        )])
+        )
     }
 
     /// The PBKDF2 salt for this account's passwords (`account::stretch`).
@@ -936,7 +1133,7 @@ impl AccountSession {
     /// slot is wrapped again for the new one; the DEK and the recovery slot
     /// stay. `PasswordChanged` answers it; every other device is signed out.
     pub fn password_change(
-        &self,
+        &mut self,
         old_master: &[u8; 32],
         new_master: &[u8; 32],
         totp: Option<String>,
@@ -947,6 +1144,35 @@ impl AccountSession {
             derive_from_master(new_master),
         );
         let vault = Vault::from_dek(self.relay_id, &self.name, *self.dek);
+        // A keyed account (22): the old key steps up, then the new key goes in, signed by
+        // the identity with the new slot over this connection. Neither secret goes.
+        if self.keyed && self.proto >= 22 {
+            let Some(b) = self.binding else {
+                return self.refusal("PasswordChange", NO_BINDING);
+            };
+            let key = LoginKey::from_master(new_master).public_key();
+            let slot = vault.pass_slot(&new.vault_key).v;
+            let identity_sig = login_key_proof(
+                self.sync.identity(),
+                &self.relay_id,
+                &self.name,
+                &key,
+                Some(&slot),
+                &b,
+            );
+            self.key_set = Some("PasswordChange");
+            return self.confirmed(
+                Some(old_master),
+                (totp, recovery_code),
+                "PasswordChange",
+                |_, _, _| AccountRequest::LoginKeySet {
+                    login_key: key.to_vec(),
+                    identity_sig,
+                    pass_slot: Some(slot),
+                    web: b.web(),
+                },
+            );
+        }
         Actions::sending(vec![ClientMessage::Account(
             AccountRequest::PasswordChange {
                 old_secret: old.auth_secret.to_vec(),
@@ -967,28 +1193,28 @@ impl AccountSession {
     /// an account made before 1.3 its reset key (`slot.reset`), so only the
     /// recovery key resets its password from then on (S-006).
     pub fn recovery_key_new(
-        &self,
+        &mut self,
         master: Option<&[u8; 32]>,
         totp: Option<String>,
         recovery_code: Option<String>,
     ) -> (Actions, String) {
         let recovery = Zeroizing::new(crate::aead::random::<32>());
         let vault = Vault::from_dek(self.relay_id, &self.name, *self.dek);
-        let msg = AccountRequest::RecoveryKeyNew {
-            secret: secret_of(master).unwrap_or_default(),
-            recovery_slot: vault.recovery_slot(&recovery).v,
-            reset_key: reset_key(&recovery, &self.relay_id, &self.name).to_vec(),
-            totp: totp
-                .map(|c| c.trim().replace(' ', ""))
-                .filter(|c| !c.is_empty()),
-            recovery_code: recovery_code
-                .map(|c| c.trim().to_string())
-                .filter(|c| !c.is_empty()),
-        };
-        (
-            Actions::sending(vec![ClientMessage::Account(msg)]),
-            recovery_text(&recovery),
-        )
+        let recovery_slot = vault.recovery_slot(&recovery).v;
+        let reset = reset_key(&recovery, &self.relay_id, &self.name).to_vec();
+        let a = self.confirmed(
+            master,
+            (totp, recovery_code),
+            "RecoveryKeyNew",
+            |secret, totp, recovery_code| AccountRequest::RecoveryKeyNew {
+                secret: secret.unwrap_or_default(),
+                recovery_slot,
+                reset_key: reset,
+                totp,
+                recovery_code,
+            },
+        );
+        (a, recovery_text(&recovery))
     }
 
     pub fn cloud(&self) -> bool {
@@ -1030,6 +1256,9 @@ impl AccountSession {
     }
 }
 
+/// Said instead of a proof when the host gave the session no binding.
+const NO_BINDING: &str = "This connection cannot be checked. Nothing was sent.";
+
 /// What a stretched password proves itself with. An account without a password
 /// sends none (a recent sign-in through a provider, or a code, stands in for it).
 fn secret_of(master: Option<&[u8; 32]>) -> Option<Vec<u8>> {
@@ -1067,6 +1296,9 @@ mod tests {
             vault: Vault::create(RELAY, "me"),
             identity: IdentityKeyPair::generate(&mut crate::rng()),
             recovery: None,
+            binding: None,
+            keyed: false,
+            login_key: None,
             blobs: Vec::new(),
         };
         AccountSession::start(
@@ -1088,6 +1320,9 @@ mod tests {
             vault: Vault::create(relay, "me"),
             identity: IdentityKeyPair::generate(&mut crate::rng()),
             recovery: None,
+            binding: None,
+            keyed: false,
+            login_key: None,
             blobs: Vec::new(),
         };
         AccountSession::start(
@@ -1600,6 +1835,9 @@ mod tests {
             vault,
             identity: IdentityKeyPair::generate(&mut crate::rng()),
             recovery: None,
+            binding: None,
+            keyed: false,
+            login_key: None,
             blobs,
         };
         let (mut s, started) = AccountSession::start(
@@ -1781,6 +2019,198 @@ mod tests {
         let (mut s, _) = writer(true, &[SHARE], NOW);
         s.set_share(false);
         assert!(!gives_older_keys(&mut s));
+    }
+
+    /// W2-31: the page goes by the number to tell whose an answer is, a refusal most of all.
+    /// W3: on a keyed account the password goes as a step-up with its login key, and the
+    /// request after it without any secret; a refusal of the step-up is the request's own.
+    #[test]
+    fn a_keyed_account_steps_up_with_its_key_and_sends_no_secret() {
+        use crate::bind::{login_ok, Binding};
+        let session_at = |keyed: bool, login_key: Option<[u8; 32]>, proto: u32| {
+            let signed = SignedIn {
+                relay_id: RELAY,
+                name: "me".into(),
+                vault: Vault::create(RELAY, "me"),
+                identity: IdentityKeyPair::generate(&mut crate::rng()),
+                recovery: None,
+                binding: Some(Binding::Tls([5; 32])),
+                keyed,
+                login_key,
+                blobs: Vec::new(),
+            };
+            AccountSession::start(
+                signed,
+                &info(false),
+                LogMemory::default(),
+                false,
+                true,
+                proto,
+            )
+            .0
+        };
+        let master = [3u8; 32];
+        let key = LoginKey::from_master(&master).public_key();
+
+        let mut s = session_at(true, None, 22);
+        let a = s.delete_account(Some(&master), Some("123 456".into()), None);
+        assert!(matches!(
+            &a.send[..],
+            [ClientMessage::Account(AccountRequest::KeyChallenge)]
+        ));
+        let a = s.on_reply(&AccountReply::KeyChallenge {
+            challenge: "tok".into(),
+        });
+        let [ClientMessage::Account(AccountRequest::KeyStepUp {
+            signature,
+            totp,
+            web: false,
+            ..
+        })] = &a.send[..]
+        else {
+            panic!("{:?}", a.send)
+        };
+        assert!(login_ok(
+            &key,
+            &RELAY,
+            "me",
+            "tok",
+            &Binding::Tls([5; 32]),
+            signature
+        ));
+        assert_eq!(totp.as_deref(), Some("123456"));
+        let a = s.on_reply(&AccountReply::SteppedUp);
+        assert!(matches!(
+            &a.send[..],
+            [ClientMessage::Account(AccountRequest::DeleteAccount { secret, totp: None, .. })] if secret.is_empty()
+        ));
+        // A refused step-up reaches the page as the request's
+        s.provider_unlink(ProviderKind::Discord, Some(&master), None, None);
+        s.on_reply(&AccountReply::KeyChallenge {
+            challenge: "tok".into(),
+        });
+        let a = s.on_reply(&AccountReply::Error {
+            request: "KeyStepUp".into(),
+            reason: "Wrong password.".into(),
+        });
+        let (_, page) = a.emit.iter().find(|(n, _)| *n == "account-reply").unwrap();
+        assert_eq!(page["Error"]["request"], "ProviderUnlink");
+        assert!(a.send.is_empty());
+        // A relay before 22 gets the secret, as before
+        let mut s = session_at(true, None, 21);
+        let a = s.delete_account(Some(&master), None, None);
+        assert!(matches!(
+            &a.send[..],
+            [ClientMessage::Account(AccountRequest::DeleteAccount { secret, .. })] if secret.len() == 32
+        ));
+
+        // A sign-in with the secret at 22: the move to the key goes first thing
+        let mut s = session_at(false, Some(key), 22);
+        let a = s.after_connect();
+        let Some(ClientMessage::Account(AccountRequest::LoginKeySet {
+            login_key,
+            pass_slot: None,
+            ..
+        })) = a.send.iter().find(|m| {
+            matches!(
+                m,
+                ClientMessage::Account(AccountRequest::LoginKeySet { .. })
+            )
+        })
+        else {
+            panic!("no move to the key")
+        };
+        assert_eq!(login_key[..], key[..]);
+        // Refused: the account stays as it was, and the page hears nothing of it
+        let a = s.on_reply(&AccountReply::Error {
+            request: "LoginKeySet".into(),
+            reason: "no".into(),
+        });
+        assert!(a.emit.is_empty() && a.send.is_empty());
+        let a = s.delete_account(Some(&master), None, None);
+        assert!(matches!(
+            &a.send[..],
+            [ClientMessage::Account(AccountRequest::DeleteAccount { secret, .. })] if secret.len() == 32
+        ));
+    }
+
+    /// W1-24: from 22 the app shows the code it derives from its own end of the connection,
+    /// never the one the relay sends (a server passing the flow on would send the relay's).
+    #[test]
+    fn a_link_shows_the_code_of_this_end_of_the_connection() {
+        use crate::bind::{provider_code, Binding};
+        let shown = |b: Option<Binding>, proto: u32| {
+            let signed = SignedIn {
+                relay_id: RELAY,
+                name: "me".into(),
+                vault: Vault::create(RELAY, "me"),
+                identity: IdentityKeyPair::generate(&mut crate::rng()),
+                recovery: None,
+                binding: b,
+                keyed: false,
+                login_key: None,
+                blobs: Vec::new(),
+            };
+            let (mut s, _) = AccountSession::start(
+                signed,
+                &info(false),
+                LogMemory::default(),
+                false,
+                true,
+                proto,
+            );
+            let a = s.on_reply(&AccountReply::ProviderBrowser {
+                url: "https://discord.com/x?state=s".into(),
+                code: "111111".into(),
+            });
+            let (_, v) = a.emit.iter().find(|(n, _)| *n == "account-reply").unwrap();
+            v.clone()
+        };
+        let ours = provider_code(&[3; 32], b"https://discord.com/x?state=s");
+        assert_ne!(ours, "111111");
+        assert_eq!(
+            shown(Some(Binding::Tls([3; 32])), 22)["ProviderBrowser"]["code"],
+            ours.as_str()
+        );
+        assert_eq!(
+            shown(Some(Binding::Web), 22)["ProviderBrowser"]["code"],
+            "111111"
+        );
+        assert_eq!(
+            shown(Some(Binding::Tls([3; 32])), 21)["ProviderBrowser"]["code"],
+            "111111",
+            "an older relay's code is the only one there is"
+        );
+        let none = shown(None, 22);
+        assert!(none.get("ProviderBrowser").is_none(), "{none}");
+        assert_eq!(none["Error"]["request"], "ProviderStart");
+    }
+
+    #[test]
+    fn a_numbered_answer_reaches_the_page_as_itself_with_its_number() {
+        let (mut s, _) = session(true, false);
+        let inner = AccountReply::Error {
+            request: "Admin".into(),
+            reason: "No such run.".into(),
+        };
+        let numbered = voipc_protocol::codec::encode_asked(9, &inner).unwrap();
+        let a = s.on_reply(&numbered);
+        let (_, value) = a.emit.iter().find(|(n, _)| *n == "account-reply").unwrap();
+        assert_eq!(value["ask"], 9);
+        assert_eq!(value["Error"]["reason"], "No such run.");
+        // The control, and what is not a reply at all
+        let plain = s.on_reply(&inner);
+        let (_, value) = plain
+            .emit
+            .iter()
+            .find(|(n, _)| *n == "account-reply")
+            .unwrap();
+        assert!(value.get("ask").is_none());
+        let junk = AccountReply::Asked {
+            ask: 1,
+            reply: vec![0xff; 8],
+        };
+        assert!(s.on_reply(&junk).emit.is_empty());
     }
 
     /// A conversation's tombstone goes only after the relay purged it: sent
@@ -2081,6 +2511,9 @@ mod tests {
             vault,
             identity: IdentityKeyPair::generate(&mut crate::rng()),
             recovery: None,
+            binding: None,
+            keyed: false,
+            login_key: None,
             blobs,
         };
         let (mut s, _) = AccountSession::start(

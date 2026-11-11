@@ -2,6 +2,39 @@
 
 All notable changes to VoIPC are documented here.
 
+## [1.12.0] - release candidate
+
+Protocol 22. A 1.12 app talks to relays back to 1.0 (protocol 12); update the apps first, then the relay
+([OPERATING.md](docs/OPERATING.md) §8). One database migration (`0011_promises.sql`) and l4f-accounts 0.14.
+
+### Security
+- **A sign-in is bound to the connection it was made on.** A server you are lured to, which passes your sign-in on to
+  the real relay, gets nothing it can use there: a remembered device's answer, a reset, a provider's proof and the
+  password's proof each end in the app's own TLS session, and the relay checks them against its end. The provider's code
+  is the one your app works out from its own connection, six digits now, so through a server in between the app and the
+  page show different codes. A browser cannot read its TLS session; its sign-ins say so and an app's never do
+  ([THREAT-MODEL.md](docs/THREAT-MODEL.md)).
+- **The password never leaves the app.** It signs in with a key derived from the password, and the server keeps only the
+  key's public half. A new password, deleting the account, a new recovery key and linking a provider prove the password
+  the same way. An account from before 1.12 moves at its first sign-in with a 1.12 app; from then on its old secret opens
+  nothing.
+- **The relay must end TLS itself**: a proxy that ends it in front of the TCP fallback breaks app sign-ins there.
+
+### Changed
+- **Your history is your account's.** Signed in, a server shows only what belongs to that account; as a guest, one history
+  per server, whatever name you join with. History from before 1.12 goes to the account this device remembers for that
+  server, if that is the first to sign in there with 1.12, and stays the guests' otherwise. The history file moves to
+  format 8 (`chat_history.bin.v7` keeps the old one for 1.11).
+- **Messages read back from the server stand in the order it kept them**, not by each writer's clock: a reply no longer
+  sorts above what it answers when two clocks differ.
+- **An admin step's refusal ends only that step** (protocol 22): the move's wizard and an undo no longer stop for another
+  step's refusal.
+
+### Fixed
+- **Lift ban holds for someone who deleted their account themselves**: the next import made their banned row again.
+- **Deleting an account takes its imported posts also after it unlinked Discord**: unlinking forgot the Discord id.
+- `voipc-import`'s check that it touches no disk failed on the fuzz replay added in 1.11.1.
+
 ## [1.11.1] - release candidate
 
 Protocol 21, as 1.11.0: apps and relays of both versions talk to each other.

@@ -5,6 +5,11 @@ use voipc_protocol::codec::{decode_server_msg, encode_client_msg};
 
 use crate::config::ServerConfig;
 use crate::settings::ServerSettings;
+use voipc_crypto::bind::Binding;
+
+/// Every test connection's TLS exporter (`voipc_crypto::bind`): what a client in a test
+/// binds its proofs to, as an app does to its own end of the TLS session.
+pub(crate) const TEST_BIND: [u8; 32] = [0x5a; 32];
 
 /// How long a test waits for something that has to happen before it calls it hung. A limit,
 /// not a speed check: on a CI runner's disk one 200-member import batch took past the 5 s
@@ -55,6 +60,7 @@ async fn authenticates_over_duplex() {
         media_tx,
         sid_tx,
         state.clone(),
+        Some(TEST_BIND),
     ));
 
     let auth = ClientMessage::Authenticate {
@@ -236,6 +242,7 @@ async fn open(state: &Arc<ServerState>, username: &str, ip: IpAddr) -> Client {
         media_tx,
         sid_tx,
         state.clone(),
+        Some(TEST_BIND),
     ));
     let mut client = Client {
         stream,
@@ -337,6 +344,7 @@ async fn an_oversized_prekey_bundle_is_refused_at_the_door() {
         media_tx,
         sid_tx,
         state.clone(),
+        Some(TEST_BIND),
     ));
     let mut client = Client {
         stream,
@@ -454,6 +462,7 @@ async fn connect_with_bundle(
         media_tx,
         sid_tx,
         state.clone(),
+        Some(TEST_BIND),
     ));
     let mut client = Client {
         stream,
@@ -2362,6 +2371,7 @@ async fn open_account(state: &Arc<ServerState>, name: &str, start: AccountStart)
         media_tx,
         sid_tx,
         state.clone(),
+        Some(TEST_BIND),
     ));
     let mut client = Client {
         stream,
@@ -2433,8 +2443,8 @@ async fn register(state: &Arc<ServerState>, name: &str) -> (Client, AccountInfo)
         reset_slot(),
     ];
     let altcha = solve(&pow.altcha);
-    c.send(&ClientMessage::AuthContinue(AuthContinue::Register {
-        auth_secret: SECRET.to_vec(),
+    c.send(&ClientMessage::AuthContinue(AuthContinue::RegisterKey {
+        login_key: test_key().public_key().to_vec(),
         altcha,
         ts: pow.ts,
         vault,
@@ -2457,19 +2467,433 @@ async fn register(state: &Arc<ServerState>, name: &str) -> (Client, AccountInfo)
     (c, info)
 }
 
-/// Signs `name` in with the password secret; answers a code with `code`.
+/// The test accounts' password, as its login key (protocol v22). An account `register`
+/// made signs in with it; one made by hand with `SECRET` signs in with that.
+fn test_key() -> voipc_crypto::account::LoginKey {
+    voipc_crypto::account::LoginKey::from_master(&[0x4b; 32])
+}
+
+/// The login key's answer to `challenge`, for `name`, on a test connection.
+fn key_sig(state: &Arc<ServerState>, name: &str, challenge: &str) -> ClientMessage {
+    let relay_id = state.accounts.as_ref().unwrap().relay_id;
+    ClientMessage::AuthContinue(AuthContinue::KeySig {
+        signature: test_key().sign(&relay_id, name, challenge, &Binding::Tls(TEST_BIND)),
+        web: false,
+    })
+}
+
+/// Signs `name` in with the password: its login key where the relay asks for that, else
+/// its secret.
 async fn login(state: &Arc<ServerState>, name: &str, identity: &[u8], reset: bool) -> Client {
     let mut c = open_account(state, name, AccountStart::Login).await;
-    assert!(matches!(
-        c.next().await,
-        Some(ServerMessage::AuthStep(AuthStep::Salt { pow: None, .. }))
+    match c.next().await {
+        Some(ServerMessage::AuthStep(AuthStep::KeyChallenge { challenge, .. })) => {
+            c.send(&key_sig(state, name, &challenge)).await
+        }
+        Some(ServerMessage::AuthStep(AuthStep::Salt { pow: None, .. })) => {
+            c.send(&ClientMessage::AuthContinue(AuthContinue::Secret {
+                auth_secret: SECRET.to_vec(),
+            }))
+            .await
+        }
+        other => panic!("{other:?}"),
+    }
+    c.send(&keys(identity, reset)).await;
+    c
+}
+
+/// The password again on a signed-in connection of a keyed account (protocol v22): a
+/// challenge, the login key's answer, and the second factor where there is one. The next
+/// request that wants the password takes it.
+async fn step_up(c: &mut Client, state: &Arc<ServerState>, name: &str, totp: Option<String>) {
+    let r = step_up_with(c, state, name, &test_key(), totp).await;
+    assert!(
+        matches!(r, ServerMessage::Account(AccountReply::SteppedUp)),
+        "{r:?}"
+    );
+}
+
+/// `step_up` for an account `register_with` made: its password's login key.
+async fn password_again(c: &mut Client, state: &Arc<ServerState>, name: &str) {
+    let relay_id = state.accounts.as_ref().unwrap().relay_id;
+    let key = voipc_crypto::account::LoginKey::from_master(&voipc_crypto::account::stretch(
+        "correct horse battery",
+        &relay_id,
+        name,
     ));
+    let r = step_up_with(c, state, name, &key, None).await;
+    assert!(
+        matches!(r, ServerMessage::Account(AccountReply::SteppedUp)),
+        "{r:?}"
+    );
+}
+
+/// `step_up` with `key`; the relay's answer.
+async fn step_up_with(
+    c: &mut Client,
+    state: &Arc<ServerState>,
+    name: &str,
+    key: &voipc_crypto::account::LoginKey,
+    totp: Option<String>,
+) -> ServerMessage {
+    c.send(&ClientMessage::Account(AccountRequest::KeyChallenge))
+        .await;
+    let ServerMessage::Account(AccountReply::KeyChallenge { challenge }) =
+        c.expect("a challenge", |m| reply(m).is_some()).await
+    else {
+        panic!("no challenge")
+    };
+    let relay_id = state.accounts.as_ref().unwrap().relay_id;
+    c.send(&ClientMessage::Account(AccountRequest::KeyStepUp {
+        signature: key.sign(&relay_id, name, &challenge, &Binding::Tls(TEST_BIND)),
+        challenge,
+        totp,
+        recovery_code: None,
+        web: false,
+    }))
+    .await;
+    c.expect("stepped up", |m| reply(m).is_some()).await
+}
+
+/// Sends what an app's session asks, and feeds it the relay's answers, until one reaches
+/// the page: that answer, what the page hears of it, and what the session did with it.
+async fn through(
+    c: &mut Client,
+    session: &mut voipc_crypto::account_session::AccountSession,
+    mut a: voipc_crypto::account_session::Actions,
+) -> (
+    AccountReply,
+    serde_json::Value,
+    voipc_crypto::account_session::Actions,
+) {
+    loop {
+        for m in std::mem::take(&mut a.send) {
+            c.send(&m).await;
+        }
+        let ServerMessage::Account(r) = c.expect("an answer", |m| reply(m).is_some()).await else {
+            unreachable!()
+        };
+        a = session.on_reply(&r);
+        if let Some((_, page)) = a.emit.iter().find(|(n, _)| *n == "account-reply") {
+            let page = page.clone();
+            return (r, page, a);
+        }
+    }
+}
+
+/// After `AccountStart::Login`: the password, as the relay asks for it.
+async fn password_answer(c: &mut Client, state: &Arc<ServerState>, name: &str) {
+    match c.next().await {
+        Some(ServerMessage::AuthStep(AuthStep::KeyChallenge { challenge, .. })) => {
+            c.send(&key_sig(state, name, &challenge)).await
+        }
+        Some(ServerMessage::AuthStep(AuthStep::Salt { pow: None, .. })) => {
+            c.send(&ClientMessage::AuthContinue(AuthContinue::Secret {
+                auth_secret: SECRET.to_vec(),
+            }))
+            .await
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// An account made before 1.12, whose password l4f holds as Argon2 of its secret, with a
+/// real identity (the move to the login key is signed by it).
+async fn legacy_account(state: &Arc<ServerState>, name: &str) -> voipc_crypto::IdentityKeyPair {
+    let relay = state.accounts.as_ref().unwrap();
+    let ctx = relay.ctx(IpAddr::V4(Ipv4Addr::LOCALHOST), "test");
+    let code = relay
+        .accounts
+        .invite_create_as_host(&ctx, Some(name), 1)
+        .await
+        .unwrap();
+    let form = l4f_accounts::service::InviteForm {
+        code: &code,
+        username: name,
+        password: &l4f_accounts::util::b64u(&SECRET),
+        email: None,
+        display_name: None,
+    };
+    relay.accounts.register_invite(&ctx, form).await.unwrap();
+    assert!(relay
+        .accounts
+        .hostkey(
+            relay
+                .store()
+                .user_by_username(name)
+                .await
+                .unwrap()
+                .unwrap()
+                .id
+        )
+        .await
+        .unwrap()
+        .is_none());
+    voipc_crypto::generate_identity_key_pair()
+}
+
+/// W3: the password never leaves the device. An account made before 1.12 signs in with
+/// its secret once more, and its app moves it to the login key at once, signed by the
+/// identity over this connection; from then on the key is the only password there is.
+#[tokio::test]
+async fn an_account_moves_to_its_login_key_once_after_a_sign_in_with_its_secret() {
+    let (state, _db_state) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+    let relay_id = state.accounts.as_ref().unwrap().relay_id;
+    let id = legacy_account(&state, "lex").await;
+    let public = id.identity_key().serialize().to_vec();
+    let key = test_key().public_key();
+    let set = |id: &voipc_crypto::IdentityKeyPair, b: Binding, slot: Option<Vec<u8>>| {
+        ClientMessage::Account(AccountRequest::LoginKeySet {
+            login_key: key.to_vec(),
+            identity_sig: voipc_crypto::account::login_key_proof(
+                id,
+                &relay_id,
+                "lex",
+                &key,
+                slot.as_deref(),
+                &b,
+            ),
+            pass_slot: slot,
+            web: b.web(),
+        })
+    };
+    let refused = |m: ServerMessage| match m {
+        ServerMessage::Account(AccountReply::Error { request, reason }) => {
+            assert_eq!(request, "LoginKeySet");
+            reason
+        }
+        other => panic!("{other:?}"),
+    };
+
+    // The secret, one more time (the relay asks for nothing else of this account)
+    let mut c = login(&state, "lex", &public, false).await;
+    c.expect("signed in", |m| {
+        matches!(
+            m,
+            ServerMessage::Authenticated {
+                account: Some(_),
+                ..
+            }
+        )
+    })
+    .await;
+    let mut other = login(&state, "lex", &public, false).await;
+    other
+        .expect("signed in", |m| {
+            matches!(
+                m,
+                ServerMessage::Authenticated {
+                    account: Some(_),
+                    ..
+                }
+            )
+        })
+        .await;
+    c = login(&state, "lex", &public, false).await;
+    c.expect("signed in", |m| {
+        matches!(
+            m,
+            ServerMessage::Authenticated {
+                account: Some(_),
+                ..
+            }
+        )
+    })
+    .await;
+    // A server between holds no identity, and its own connection
+    c.send(&set(
+        &voipc_crypto::generate_identity_key_pair(),
+        Binding::Tls(TEST_BIND),
+        None,
+    ))
+    .await;
+    assert!(refused(c.expect("refused", |m| reply(m).is_some()).await).contains("not signed"));
+    c.send(&set(&id, Binding::Tls([0x77; 32]), None)).await;
+    assert!(refused(c.expect("refused", |m| reply(m).is_some()).await).contains("not signed"));
+    // The account's own, over this connection
+    c.send(&set(&id, Binding::Tls(TEST_BIND), None)).await;
+    let r = c.expect("saved", |m| reply(m).is_some()).await;
+    assert!(
+        matches!(r, ServerMessage::Account(AccountReply::LoginKeySaved)),
+        "{r:?}"
+    );
+    // Once per sign-in with the secret
+    c.send(&set(&id, Binding::Tls(TEST_BIND), None)).await;
+    assert!(refused(c.expect("refused", |m| reply(m).is_some()).await).contains("password first"));
+
+    // The secret opens nothing now, and the key does
+    let mut old = open_account(&state, "lex", AccountStart::Login).await;
+    let Some(ServerMessage::AuthStep(AuthStep::KeyChallenge { .. })) = old.next().await else {
+        panic!("the relay still asks for the secret")
+    };
+    old.send(&ClientMessage::AuthContinue(AuthContinue::Secret {
+        auth_secret: SECRET.to_vec(),
+    }))
+    .await;
+    assert!(matches!(
+        old.next().await,
+        Some(ServerMessage::AuthError { .. })
+    ));
+    let mut keyed = login(&state, "lex", &public, false).await;
+    keyed
+        .expect("signed in with the key", |m| {
+            matches!(
+                m,
+                ServerMessage::Authenticated {
+                    account: Some(_),
+                    ..
+                }
+            )
+        })
+        .await;
+    // A key sign-in moves nothing: it never held the secret
+    keyed.send(&set(&id, Binding::Tls(TEST_BIND), None)).await;
+    assert!(
+        refused(keyed.expect("refused", |m| reply(m).is_some()).await).contains("password first")
+    );
+    drop(other);
+}
+
+/// W3, end to end with the app's own code: an account whose password l4f holds as Argon2
+/// signs in with its secret, its session moves it to the login key at once, and the next
+/// sign-in is by the key.
+#[tokio::test]
+async fn an_apps_first_sign_in_at_22_moves_its_account_to_the_login_key() {
+    use voipc_crypto::account::{derive, stretch, LoginKey, Method, SignIn};
+    use voipc_crypto::account_session::AccountSession;
+    let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+    let (_c, _, signed) = register_with(&state, "moe").await;
+    let relay = state.accounts.as_ref().unwrap();
+    let id = relay
+        .store()
+        .user_by_username("moe")
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    // As before 1.12: the password's secret, under Argon2
+    let ctx = relay.ctx(IpAddr::V4(Ipv4Addr::LOCALHOST), "test");
+    let secret = derive("correct horse battery", &signed.relay_id, "moe").auth_secret;
+    relay
+        .accounts
+        .password_set_as_host(&ctx, id, &l4f_accounts::util::b64u(&secret))
+        .await
+        .unwrap();
+    assert!(relay.accounts.hostkey(id).await.unwrap().is_none());
+
+    let (mut m, first) = SignIn::start(
+        "moe",
+        Method::Password {
+            password: zeroize::Zeroizing::new("correct horse battery".into()),
+        },
+        PROTOCOL_VERSION,
+        APP_VERSION,
+    );
+    m.bind(Binding::Tls(TEST_BIND));
+    let mut c = open_raw(&state, &first).await;
+    let info = drive(&mut c, &mut m).await.unwrap();
+    let signed = m.finish().unwrap();
+    assert!(signed.login_key.is_some() && !signed.keyed);
+    let (mut session, _) = AccountSession::start(
+        signed,
+        &info,
+        Default::default(),
+        false,
+        true,
+        PROTOCOL_VERSION,
+    );
+    let a = session.after_connect();
+    assert!(a.send.iter().any(|m| matches!(
+        m,
+        ClientMessage::Account(AccountRequest::LoginKeySet {
+            pass_slot: None,
+            ..
+        })
+    )));
+    for m in a.send {
+        c.send(&m).await;
+    }
+    c.expect("saved", |m| {
+        matches!(m, ServerMessage::Account(AccountReply::LoginKeySaved))
+    })
+    .await;
+    let key = LoginKey::from_master(&stretch("correct horse battery", &relay.relay_id, "moe"));
+    assert_eq!(
+        relay.accounts.hostkey(id).await.unwrap(),
+        Some(key.public_key())
+    );
+    // The next sign-in is by the key, and opens the same vault
+    let again = password_sign_in(&state, "moe", "correct horse battery")
+        .await
+        .unwrap();
+    assert!(again.keyed && again.login_key.is_none());
+}
+
+/// W3 and W1-24: the login key's answer is bound to the connection. A browser's says it
+/// is one, and an app never makes that shape.
+#[tokio::test]
+async fn a_login_key_answer_holds_only_on_its_own_connection() {
+    let (state, _db_state) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+    let relay_id = state.accounts.as_ref().unwrap().relay_id;
+    let (_c, _) = register(&state, "kay").await;
+    for (b, holds) in [
+        (Binding::Tls([0x77; 32]), false),
+        (Binding::Tls(TEST_BIND), true),
+        (Binding::Web, true),
+    ] {
+        let mut c = open_account(&state, "kay", AccountStart::Login).await;
+        let Some(ServerMessage::AuthStep(AuthStep::KeyChallenge { challenge, .. })) =
+            c.next().await
+        else {
+            panic!("no key challenge")
+        };
+        c.send(&ClientMessage::AuthContinue(AuthContinue::KeySig {
+            signature: test_key().sign(&relay_id, "kay", &challenge, &b),
+            web: b.web(),
+        }))
+        .await;
+        c.send(&keys(&IDENTITY, false)).await;
+        let m = c
+            .expect("an end", |m| {
+                matches!(
+                    m,
+                    ServerMessage::Authenticated { .. } | ServerMessage::AuthError { .. }
+                )
+            })
+            .await;
+        assert_eq!(
+            matches!(m, ServerMessage::Authenticated { .. }),
+            holds,
+            "{b:?}: {m:?}"
+        );
+    }
+    // The 21 shapes are refused at 22: no secret, no unbound sign-up
+    let mut c = open_account(&state, "kay", AccountStart::Login).await;
+    c.next().await;
     c.send(&ClientMessage::AuthContinue(AuthContinue::Secret {
         auth_secret: SECRET.to_vec(),
     }))
     .await;
-    c.send(&keys(identity, reset)).await;
-    c
+    assert!(matches!(
+        c.next().await,
+        Some(ServerMessage::AuthError { .. })
+    ));
+    let mut c = open_account(&state, "kim", AccountStart::Register { invite: None }).await;
+    let Some(ServerMessage::AuthStep(AuthStep::Salt { pow: Some(pow), .. })) = c.next().await
+    else {
+        panic!("a puzzle")
+    };
+    c.send(&ClientMessage::AuthContinue(AuthContinue::Register {
+        auth_secret: SECRET.to_vec(),
+        altcha: solve(&pow.altcha),
+        ts: pow.ts,
+        vault: vec![reset_slot()],
+    }))
+    .await;
+    let Some(ServerMessage::AuthError { reason }) = c.next().await else {
+        panic!("signed up with a secret")
+    };
+    assert!(reason.contains("unexpected"), "{reason}");
 }
 
 #[tokio::test]
@@ -2538,11 +2962,24 @@ async fn an_account_signs_up_and_signs_in_with_its_vault_and_identity() {
         Some(vec![6; 33])
     );
 
+    // Another password is another key
     let mut wrong = open_account(&state, "alice", AccountStart::Login).await;
-    wrong.next().await;
+    let Some(ServerMessage::AuthStep(AuthStep::KeyChallenge {
+        challenge,
+        relay_id,
+    })) = wrong.next().await
+    else {
+        panic!("a keyed account is asked for its key")
+    };
     wrong
-        .send(&ClientMessage::AuthContinue(AuthContinue::Secret {
-            auth_secret: vec![8; 32],
+        .send(&ClientMessage::AuthContinue(AuthContinue::KeySig {
+            signature: voipc_crypto::account::LoginKey::from_master(&[8; 32]).sign(
+                &relay_id,
+                "alice",
+                &challenge,
+                &Binding::Tls(TEST_BIND),
+            ),
+            web: false,
         }))
         .await;
     assert!(
@@ -2679,8 +3116,8 @@ async fn invites_are_the_way_in_when_sign_up_is_not_open() {
         ),
         "no proof of work with an invite"
     );
-    c.send(&ClientMessage::AuthContinue(AuthContinue::Register {
-        auth_secret: SECRET.to_vec(),
+    c.send(&ClientMessage::AuthContinue(AuthContinue::RegisterKey {
+        login_key: test_key().public_key().to_vec(),
         altcha: String::new(),
         ts: String::new(),
         vault: vec![reset_slot()],
@@ -2780,11 +3217,7 @@ async fn the_admin_token_makes_the_first_admin_whose_rights_wait_for_codes() {
 
     // A new device: password, then a code; a wrong code asks again.
     let mut c = open_account(&state, "gina", AccountStart::Login).await;
-    c.next().await;
-    c.send(&ClientMessage::AuthContinue(AuthContinue::Secret {
-        auth_secret: SECRET.to_vec(),
-    }))
-    .await;
+    password_answer(&mut c, &state, "gina").await;
     assert!(matches!(
         c.next().await,
         Some(ServerMessage::AuthStep(AuthStep::NeedTotp))
@@ -2854,6 +3287,19 @@ async fn a_remembered_device_signs_in_alone_and_its_signature_does_not_replay() 
         );
         key.sign(&msg).as_ref().to_vec()
     };
+    let device = voipc_crypto::account::DeviceKey::from_parts(
+        device_id.clone().try_into().unwrap(),
+        pkcs8.as_ref().to_vec(),
+    )
+    .unwrap();
+    // l4f's signature, and the device key over this connection (22)
+    let answer = |challenge: &str, b: Binding| {
+        ClientMessage::AuthContinue(AuthContinue::DeviceSigBound {
+            signature: sign(challenge),
+            bind: device.sign_bound(&relay_id, challenge, &b),
+            web: b.web(),
+        })
+    };
     ivy.send(&ClientMessage::Account(AccountRequest::DeviceChallenge))
         .await;
     let ServerMessage::Account(AccountReply::DeviceChallenge { challenge }) =
@@ -2889,11 +3335,8 @@ async fn a_remembered_device_signs_in_alone_and_its_signature_does_not_replay() 
         panic!("a device challenge")
     };
     assert_eq!(rid, relay_id);
-    let first_sig = sign(&challenge);
-    d.send(&ClientMessage::AuthContinue(AuthContinue::DeviceSig {
-        signature: first_sig.clone(),
-    }))
-    .await;
+    let first = answer(&challenge, Binding::Tls(TEST_BIND));
+    d.send(&first).await;
     d.expect("Vault", |m| {
         matches!(m, ServerMessage::AuthStep(AuthStep::Vault { .. }))
     })
@@ -2920,15 +3363,52 @@ async fn a_remembered_device_signs_in_alone_and_its_signature_does_not_replay() 
     )
     .await;
     replay.next().await;
-    replay
-        .send(&ClientMessage::AuthContinue(AuthContinue::DeviceSig {
-            signature: first_sig,
-        }))
-        .await;
+    replay.send(&first).await;
     assert!(
         matches!(replay.next().await, Some(ServerMessage::AuthError { .. })),
         "a replayed signature is refused"
     );
+
+    // W1-24: what a server between the app and this relay holds. Each with l4f's signature
+    // right for this challenge, so only the binding stops it.
+    let forwarded = [
+        // The app's end of a forwarder's connection has another exporter
+        answer("", Binding::Tls([0x77; 32])),
+        // The unbound shape, as a 21 relay takes it
+        ClientMessage::AuthContinue(AuthContinue::DeviceSig {
+            signature: Vec::new(),
+        }),
+    ];
+    for (i, msg) in forwarded.into_iter().enumerate() {
+        let mut c = open_account(
+            &state,
+            "ivy",
+            AccountStart::DeviceKey {
+                device_id: device_id.clone(),
+            },
+        )
+        .await;
+        let Some(ServerMessage::AuthStep(AuthStep::DeviceChallenge { challenge, .. })) =
+            c.next().await
+        else {
+            panic!("a device challenge")
+        };
+        let msg = match msg {
+            ClientMessage::AuthContinue(AuthContinue::DeviceSigBound { .. }) => {
+                answer(&challenge, Binding::Tls([0x77; 32]))
+            }
+            _ => ClientMessage::AuthContinue(AuthContinue::DeviceSig {
+                signature: sign(&challenge),
+            }),
+        };
+        c.send(&msg).await;
+        let Some(ServerMessage::AuthError { reason }) = c.next().await else {
+            panic!("case {i}: a forwarded answer signed in")
+        };
+        if i == 0 {
+            assert_eq!(reason, crate::accounts::NOT_THIS_CONNECTION);
+        }
+    }
 
     // H1-14: a remembered device alone cannot replace the identity every
     // contact pinned; that takes the password
@@ -2946,9 +3426,7 @@ async fn a_remembered_device_signs_in_alone_and_its_signature_does_not_replay() 
         panic!("a device challenge")
     };
     reset
-        .send(&ClientMessage::AuthContinue(AuthContinue::DeviceSig {
-            signature: sign(&challenge),
-        }))
+        .send(&answer(&challenge, Binding::Tls(TEST_BIND)))
         .await;
     reset
         .expect("Vault", |m| {
@@ -2987,6 +3465,7 @@ async fn a_pre_1_0_client_is_told_to_update() {
         media_tx,
         sid_tx,
         state.clone(),
+        Some(TEST_BIND),
     ));
     let payload = postcard::to_allocvec(&Old::Authenticate {
         username: "old".into(),
@@ -3111,6 +3590,7 @@ async fn slow_reader(state: &Arc<ServerState>, name: &str) -> Client {
         media_tx,
         sid_tx,
         state.clone(),
+        Some(TEST_BIND),
     ));
     let mut c = Client {
         stream,
@@ -3242,6 +3722,7 @@ async fn reset_with(
         password: zeroize::Zeroizing::new(password.into()),
     };
     let (mut m, first) = SignIn::start(name, method, PROTOCOL_VERSION, APP_VERSION);
+    m.bind(Binding::Tls(TEST_BIND));
     let mut c = open_raw(state, &first).await;
     loop {
         let msg = c.next().await.ok_or("closed")?;
@@ -3270,6 +3751,7 @@ async fn password_sign_in(
         PROTOCOL_VERSION,
         APP_VERSION,
     );
+    m.bind(Binding::Tls(TEST_BIND));
     drive(&mut open_raw(state, &first).await, &mut m).await?;
     m.finish()
 }
@@ -3318,19 +3800,22 @@ async fn the_recovery_key_sets_a_new_password_and_signs_every_device_out() {
             && blobs.len() == 2,
         "{blobs:?}"
     );
-    let forged = voipc_crypto::account::reset_proof(
+    let forged = voipc_crypto::account::reset_proof_bound(
         &voipc_crypto::generate_identity_key_pair(),
         &signed.relay_id,
         "kim",
         b"x",
+        &[3; 32],
+        &Binding::Tls(TEST_BIND),
     );
-    raw.send(&ClientMessage::AuthContinue(AuthContinue::Reset {
+    raw.send(&ClientMessage::AuthContinue(AuthContinue::ResetBound {
         signature: forged,
         key_signature: vec![0; 64],
-        auth_secret: SECRET.to_vec(),
+        login_key: vec![3; 32],
         pass_slot: vec![1; 101],
         totp: None,
         recovery_code: None,
+        web: false,
     }))
     .await;
     let ServerMessage::AuthError { reason } = raw
@@ -3364,6 +3849,7 @@ async fn the_recovery_key_sets_a_new_password_and_signs_every_device_out() {
         PROTOCOL_VERSION,
         APP_VERSION,
     );
+    m.bind(Binding::Tls(TEST_BIND));
     assert!(
         drive(&mut open_raw(&state, &first).await, &mut m)
             .await
@@ -3377,12 +3863,95 @@ async fn the_recovery_key_sets_a_new_password_and_signs_every_device_out() {
     assert_eq!(again.identity.public_key().serialize().to_vec(), identity);
 }
 
+/// W1-24 and W3: a reset is bound to its connection and carries the new password's login
+/// key, never its secret. What a server between holds opens nothing here.
+#[tokio::test]
+async fn a_reset_holds_only_on_its_own_connection_and_names_its_key() {
+    use voipc_crypto::account::{recovery_parse, reset_key_proof, reset_key_proof_bound};
+    let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+    let (_c, _, signed) = register_with(&state, "ria").await;
+    let recovery = recovery_parse(signed.recovery.as_deref().unwrap()).unwrap();
+    let key = [4u8; 32];
+    let bound = |challenge: &[u8], b: Binding, signed_key: [u8; 32]| {
+        ClientMessage::AuthContinue(AuthContinue::ResetBound {
+            signature: Vec::new(),
+            key_signature: reset_key_proof_bound(
+                &recovery,
+                &signed.relay_id,
+                "ria",
+                challenge,
+                &signed_key,
+                &b,
+            ),
+            login_key: key.to_vec(),
+            pass_slot: vec![1; 101],
+            totp: None,
+            recovery_code: None,
+            web: b.web(),
+        })
+    };
+    let challenge = |m: Option<ServerMessage>| match m {
+        Some(ServerMessage::AuthStep(AuthStep::ResetChallenge { challenge, .. })) => challenge,
+        other => panic!("{other:?}"),
+    };
+    // Another connection's
+    let mut raw = open_account(&state, "ria", AccountStart::Reset).await;
+    let ch = challenge(raw.next().await);
+    raw.send(&bound(&ch, Binding::Tls([0x77; 32]), key)).await;
+    let Some(ServerMessage::AuthError { reason }) = raw.next().await else {
+        panic!("a forwarded reset went through")
+    };
+    assert!(reason.contains("not this account's"), "{reason}");
+    // Another key in place of the one signed
+    let mut raw = open_account(&state, "ria", AccountStart::Reset).await;
+    let ch = challenge(raw.next().await);
+    raw.send(&bound(&ch, Binding::Tls(TEST_BIND), [5; 32]))
+        .await;
+    assert!(matches!(
+        raw.next().await,
+        Some(ServerMessage::AuthError { .. })
+    ));
+    // The unbound shape, with a right signature
+    let mut raw = open_account(&state, "ria", AccountStart::Reset).await;
+    let ch = challenge(raw.next().await);
+    raw.send(&ClientMessage::AuthContinue(AuthContinue::Reset {
+        signature: Vec::new(),
+        key_signature: reset_key_proof(&recovery, &signed.relay_id, "ria", &ch),
+        auth_secret: SECRET.to_vec(),
+        pass_slot: vec![1; 101],
+        totp: None,
+        recovery_code: None,
+    }))
+    .await;
+    let Some(ServerMessage::AuthError { reason }) = raw.next().await else {
+        panic!("an unbound reset went through")
+    };
+    assert!(reason.contains("unexpected"), "{reason}");
+    // The control: bound to this connection, with the key it names
+    let mut raw = open_account(&state, "ria", AccountStart::Reset).await;
+    let ch = challenge(raw.next().await);
+    raw.send(&bound(&ch, Binding::Tls(TEST_BIND), key)).await;
+    assert!(matches!(
+        raw.next().await,
+        Some(ServerMessage::AuthStep(AuthStep::ResetDone))
+    ));
+    let relay = state.accounts.as_ref().unwrap();
+    let id = relay
+        .store()
+        .user_by_username("ria")
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    assert_eq!(relay.accounts.hostkey(id).await.unwrap(), Some(key));
+}
+
 /// S-006: the vault's DEK, which a remembered device keeps, opens the
 /// identity, so it can make the old reset proof. An account with a reset
 /// key refuses that proof: only the recovery key resets its password.
 #[tokio::test]
 async fn a_device_that_holds_the_vault_key_cannot_reset_the_password() {
-    use voipc_crypto::account::{reset_proof, Vault};
+    use voipc_crypto::account::{reset_proof_bound, Vault};
     let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
     let (_c, _, signed) = register_with(&state, "ida").await;
     let mut raw = open_account(&state, "ida", AccountStart::Reset).await;
@@ -3400,13 +3969,21 @@ async fn a_device_that_holds_the_vault_key_cannot_reset_the_password() {
         .unwrap()
         .payload;
     assert_eq!(opened, signed.identity.serialize().to_vec());
-    raw.send(&ClientMessage::AuthContinue(AuthContinue::Reset {
-        signature: reset_proof(&signed.identity, &relay_id, "ida", &challenge),
+    raw.send(&ClientMessage::AuthContinue(AuthContinue::ResetBound {
+        signature: reset_proof_bound(
+            &signed.identity,
+            &relay_id,
+            "ida",
+            &challenge,
+            &[3; 32],
+            &Binding::Tls(TEST_BIND),
+        ),
         key_signature: vec![0; 64],
-        auth_secret: SECRET.to_vec(),
+        login_key: vec![3; 32],
         pass_slot: vec![1; 101],
         totp: None,
         recovery_code: None,
+        web: false,
     }))
     .await;
     let ServerMessage::AuthError { reason } = raw
@@ -3427,32 +4004,46 @@ async fn a_device_that_holds_the_vault_key_cannot_reset_the_password() {
 /// before 1.3 gets its reset key.
 #[tokio::test]
 async fn a_new_recovery_key_replaces_the_old_one() {
-    use voipc_crypto::account::{derive_from_master, recovery_text, reset_key, stretch, Vault};
+    use voipc_crypto::account::{recovery_text, reset_key, stretch, LoginKey, Vault};
     let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
     let (mut c, _, signed) = register_with(&state, "joe").await;
     let old = signed.recovery.clone().unwrap();
     let fresh = [9u8; 32];
-    let ask = |password: &str| {
-        let master = stretch(password, &signed.relay_id, "joe");
-        let vault = Vault::from_dek(signed.relay_id, "joe", signed.vault.dek());
-        ClientMessage::Account(AccountRequest::RecoveryKeyNew {
-            secret: derive_from_master(&master).auth_secret.to_vec(),
-            recovery_slot: vault.recovery_slot(&fresh).v,
-            reset_key: reset_key(&fresh, &signed.relay_id, "joe").to_vec(),
-            totp: None,
-            recovery_code: None,
-        })
-    };
-    c.send(&ask("not the password")).await;
-    assert!(matches!(
-        c.expect("refused", |m| reply(m).is_some()).await,
-        ServerMessage::Account(AccountReply::Error { .. })
+    let vault = Vault::from_dek(signed.relay_id, "joe", signed.vault.dek());
+    // The password goes as its login key's step-up (22), never in the request
+    let ask = ClientMessage::Account(AccountRequest::RecoveryKeyNew {
+        secret: Vec::new(),
+        recovery_slot: vault.recovery_slot(&fresh).v,
+        reset_key: reset_key(&fresh, &signed.relay_id, "joe").to_vec(),
+        totp: None,
+        recovery_code: None,
+    });
+    let key = |password: &str| LoginKey::from_master(&stretch(password, &signed.relay_id, "joe"));
+    let refused =
+        |m: ServerMessage| matches!(m, ServerMessage::Account(AccountReply::Error { .. }));
+    c.send(&ask).await;
+    assert!(
+        refused(c.expect("refused", |m| reply(m).is_some()).await),
+        "not without the password again, though the sign-in is recent"
+    );
+    assert!(refused(
+        step_up_with(&mut c, &state, "joe", &key("not the password"), None).await
     ));
-    c.send(&ask("correct horse battery")).await;
+    c.send(&ask).await;
+    assert!(refused(c.expect("refused", |m| reply(m).is_some()).await));
+    let r = step_up_with(&mut c, &state, "joe", &key("correct horse battery"), None).await;
+    assert!(
+        matches!(r, ServerMessage::Account(AccountReply::SteppedUp)),
+        "{r:?}"
+    );
+    c.send(&ask).await;
     assert!(matches!(
         c.expect("changed", |m| reply(m).is_some()).await,
         ServerMessage::Account(AccountReply::RecoveryKeyChanged)
     ));
+    // One step-up is one request
+    c.send(&ask).await;
+    assert!(refused(c.expect("refused", |m| reply(m).is_some()).await));
     assert!(
         reset_with(&state, "joe", &old, "a brand new password", None)
             .await
@@ -3546,27 +4137,29 @@ async fn a_password_change_keeps_this_connection_and_forgets_the_device_keys() {
     );
     let old = stretch("correct horse battery", &relay_id, "max");
     let new = stretch("another good password", &relay_id, "max");
-    for m in session.password_change(&new, &new, None, None).send {
-        c.send(&m).await;
-    }
-    let msg = c.expect("refused", |m| reply(m).is_some()).await;
+    // Neither password's secret goes (22): the old key steps up, the new key goes in
+    let wrong = session.password_change(&new, &new, None, None);
     assert!(
-        matches!(msg, ServerMessage::Account(AccountReply::Error { ref request, .. }) if request == "PasswordChange"),
-        "the old password must be right: {msg:?}"
+        matches!(
+            &wrong.send[..],
+            [ClientMessage::Account(AccountRequest::KeyChallenge)]
+        ),
+        "{:?}",
+        wrong.send
     );
-    for m in session.password_change(&old, &new, None, None).send {
-        c.send(&m).await;
-    }
-    let ServerMessage::Account(changed) = c.expect("changed", |m| reply(m).is_some()).await else {
-        unreachable!()
-    };
+    let (_, page, _) = through(&mut c, &mut session, wrong).await;
+    assert_eq!(
+        page["Error"]["request"], "PasswordChange",
+        "the old password must be right, and the page hears it as its own: {page}"
+    );
+    let right = session.password_change(&old, &new, None, None);
+    let (changed, _, again) = through(&mut c, &mut session, right).await;
     assert!(
         matches!(changed, AccountReply::PasswordChanged),
         "{changed:?}"
     );
     // Every device key went with the old password, this one's too: the
     // session asks to remember this device again.
-    let again = session.on_reply(&changed);
     assert!(again
         .send
         .iter()
@@ -3590,6 +4183,7 @@ async fn a_password_change_keeps_this_connection_and_forgets_the_device_keys() {
         PROTOCOL_VERSION,
         APP_VERSION,
     );
+    m.bind(Binding::Tls(TEST_BIND));
     assert!(
         drive(&mut open_raw(&state, &first).await, &mut m)
             .await
@@ -3643,6 +4237,7 @@ async fn open_raw_from(state: &Arc<ServerState>, first: &ClientMessage, ip: IpAd
         media_tx,
         sid_tx,
         state.clone(),
+        Some(TEST_BIND),
     ));
     let mut c = Client {
         stream,
@@ -3776,6 +4371,7 @@ async fn stalled_sign_ins_hold_no_permit() {
         PROTOCOL_VERSION,
         APP_VERSION,
     );
+    m.bind(Binding::Tls(TEST_BIND));
     drive(&mut open_raw(&state, &first).await, &mut m)
         .await
         .unwrap();
@@ -3786,7 +4382,7 @@ async fn stalled_sign_ins_hold_no_permit() {
         let mut c = open_account(&state, "kim", AccountStart::Login).await;
         assert!(matches!(
             c.next().await,
-            Some(ServerMessage::AuthStep(AuthStep::Salt { .. }))
+            Some(ServerMessage::AuthStep(AuthStep::KeyChallenge { .. }))
         ));
         stalled.push(c);
     }
@@ -3796,6 +4392,7 @@ async fn stalled_sign_ins_hold_no_permit() {
         PROTOCOL_VERSION,
         APP_VERSION,
     );
+    m.bind(Binding::Tls(TEST_BIND));
     drive(&mut open_raw(&state, &first).await, &mut m)
         .await
         .expect("signs in beside the stalled ones");
@@ -3817,6 +4414,7 @@ async fn the_clients_sign_in_machine_signs_up_remembers_the_device_and_signs_in_
         PROTOCOL_VERSION,
         APP_VERSION,
     );
+    m.bind(Binding::Tls(TEST_BIND));
     let mut c = open_raw(&state, &first).await;
     drive(&mut c, &mut m).await.unwrap();
     let signed = m.finish().unwrap();
@@ -3847,6 +4445,7 @@ async fn the_clients_sign_in_machine_signs_up_remembers_the_device_and_signs_in_
         PROTOCOL_VERSION,
         APP_VERSION,
     );
+    m.bind(Binding::Tls(TEST_BIND));
     let mut c2 = open_raw(&state, &first).await;
     drive(&mut c2, &mut m).await.unwrap();
     assert_eq!(
@@ -3875,6 +4474,7 @@ async fn the_clients_sign_in_machine_signs_up_remembers_the_device_and_signs_in_
         PROTOCOL_VERSION,
         APP_VERSION,
     );
+    m.bind(Binding::Tls(TEST_BIND));
     let mut c3 = open_raw(&state, &first).await;
     drive(&mut c3, &mut m).await.unwrap();
     assert_eq!(
@@ -3896,6 +4496,7 @@ async fn the_clients_sign_in_machine_signs_up_remembers_the_device_and_signs_in_
         PROTOCOL_VERSION,
         APP_VERSION,
     );
+    m.bind(Binding::Tls(TEST_BIND));
     let mut c4 = open_raw(&state, &first).await;
     assert!(drive(&mut c4, &mut m).await.unwrap_err().contains("Wrong"));
 }
@@ -4104,6 +4705,7 @@ async fn register_with(
         PROTOCOL_VERSION,
         APP_VERSION,
     );
+    m.bind(Binding::Tls(TEST_BIND));
     let mut c = open_raw(state, &first).await;
     let info = drive(&mut c, &mut m).await.unwrap();
     (c, info, m.finish().unwrap())
@@ -4388,6 +4990,7 @@ async fn sign_in_password(
         PROTOCOL_VERSION,
         APP_VERSION,
     );
+    m.bind(Binding::Tls(TEST_BIND));
     let mut c = open_raw(state, &first).await;
     let info = drive(&mut c, &mut m).await.unwrap();
     (c, info, m.finish().unwrap())
@@ -5022,8 +5625,8 @@ async fn an_open_sign_up_needs_its_puzzle_solved() {
     else {
         panic!("an open relay hands out a proof of work");
     };
-    let register = AuthContinue::Register {
-        auth_secret: SECRET.to_vec(),
+    let register = AuthContinue::RegisterKey {
+        login_key: test_key().public_key().to_vec(),
         altcha: String::new(),
         ts: pow.ts,
         vault: vec![reset_slot()],
@@ -5118,11 +5721,7 @@ async fn account_bans_follow_the_account_and_roles_pass_address_bans() {
 
     // The admin signs in again from the banned address: password, code, in.
     let mut c = open_account(&state, "gina", AccountStart::Login).await;
-    c.next().await;
-    c.send(&ClientMessage::AuthContinue(AuthContinue::Secret {
-        auth_secret: SECRET.to_vec(),
-    }))
-    .await;
+    password_answer(&mut c, &state, "gina").await;
     assert!(matches!(
         c.next().await,
         Some(ServerMessage::AuthStep(AuthStep::NeedTotp))
@@ -5981,19 +6580,24 @@ async fn an_account_deletes_itself_and_its_name_is_free() {
     let out = sd.send_channel(&log, say("d1", "bye"), 1, None);
     pump(&mut dora, &mut sd, out).await;
     let relay = state.accounts.clone().unwrap();
-    let secret = |pw: &str| {
-        voipc_crypto::account::derive(pw, &relay.relay_id, "dora")
-            .auth_secret
-            .to_vec()
+    let key = |pw: &str| {
+        voipc_crypto::account::LoginKey::from_master(&voipc_crypto::account::stretch(
+            pw,
+            &relay.relay_id,
+            "dora",
+        ))
     };
-    let delete = |secret: Vec<u8>| {
-        ClientMessage::Account(AccountRequest::DeleteAccount {
-            secret,
-            totp: None,
-            recovery_code: None,
-        })
-    };
-    dora.send(&delete(secret("not her password"))).await;
+    let delete = ClientMessage::Account(AccountRequest::DeleteAccount {
+        secret: Vec::new(),
+        totp: None,
+        recovery_code: None,
+    });
+    let msg = step_up_with(&mut dora, &state, "dora", &key("not her password"), None).await;
+    assert!(
+        matches!(&msg, ServerMessage::Account(AccountReply::Error { request, .. }) if request == "KeyStepUp"),
+        "{msg:?}"
+    );
+    dora.send(&delete).await;
     let msg = dora.expect("refused", |m| reply(m).is_some()).await;
     assert!(
         matches!(&msg, ServerMessage::Account(AccountReply::Error { request, .. }) if request == "DeleteAccount"),
@@ -6006,7 +6610,19 @@ async fn an_account_deletes_itself_and_its_name_is_free() {
     }))
     .await;
     dora.expect("stored", |m| reply(m).is_some()).await;
-    dora.send(&delete(secret("correct horse battery"))).await;
+    let msg = step_up_with(
+        &mut dora,
+        &state,
+        "dora",
+        &key("correct horse battery"),
+        None,
+    )
+    .await;
+    assert!(
+        matches!(msg, ServerMessage::Account(AccountReply::SteppedUp)),
+        "{msg:?}"
+    );
+    dora.send(&delete).await;
     assert!(matches!(
         dora.expect("deleted", |m| reply(m).is_some()).await,
         ServerMessage::Account(AccountReply::AccountDeleted)
@@ -6051,9 +6667,10 @@ async fn an_account_deletes_itself_and_its_name_is_free() {
         "{:06}",
         l4f_accounts::totp::code_at(&secret, l4f_accounts::util::now() / 30 + 1)
     );
+    step_up(&mut gina, &state, "gina", Some(code)).await;
     gina.send(&ClientMessage::Account(AccountRequest::DeleteAccount {
-        secret: SECRET.to_vec(),
-        totp: Some(code),
+        secret: Vec::new(),
+        totp: None,
         recovery_code: None,
     }))
     .await;
@@ -7795,6 +8412,11 @@ mod providers {
         let mut c = open_raw_from(state, &first, ip).await;
         match c.next().await {
             Some(ServerMessage::AuthStep(AuthStep::OpenBrowser { url, code, ticket })) => {
+                // W1-24: what an app derives from its own end of this connection
+                assert_eq!(
+                    code,
+                    voipc_crypto::bind::provider_code(&TEST_BIND, url.as_bytes())
+                );
                 Ok((url, code, ticket))
             }
             Some(ServerMessage::AuthError { reason }) => Err(reason),
@@ -7891,6 +8513,7 @@ mod providers {
             PROTOCOL_VERSION,
             APP_VERSION,
         );
+        m.bind(Binding::Tls(TEST_BIND));
         let mut c = open_raw(state, &first).await;
         let mut shown = None;
         loop {
@@ -8061,15 +8684,12 @@ mod providers {
     async fn a_link_is_not_tied_by_someone_else_tapping() {
         let (state, _db, subject) = relay(RegistrationMode::Open).await;
         *subject.lock().unwrap() = "3003".into();
-        let (mut c, _, signed) = register_with(&state, "wendy").await;
-        let secret =
-            voipc_crypto::account::derive("correct horse battery", &signed.relay_id, "wendy")
-                .auth_secret
-                .to_vec();
+        let (mut c, _, _) = register_with(&state, "wendy").await;
+        password_again(&mut c, &state, "wendy").await;
         c.send(&ClientMessage::Account(AccountRequest::ProviderStart {
             kind: ProviderKind::Discord,
             link: true,
-            secret: Some(secret),
+            secret: None,
             totp: None,
             recovery_code: None,
         }))
@@ -8079,6 +8699,11 @@ mod providers {
         else {
             panic!("no page")
         };
+        // The signed-in connection's exporter, as for a sign-in's page
+        assert_eq!(
+            code,
+            voipc_crypto::bind::provider_code(&TEST_BIND, url.as_bytes())
+        );
         let s = state_in(&url).to_string();
         let page = back(&state, &s, "abc");
         assert_eq!(page.status(), StatusCode::OK);
@@ -8173,27 +8798,23 @@ mod providers {
     #[tokio::test]
     async fn a_link_that_did_not_happen_does_not_say_done() {
         let (state, _db, subject) = relay(RegistrationMode::Open).await;
-        async fn start_link(c: &mut Client, secret: Vec<u8>) {
+        async fn start_link(c: &mut Client, state: &Arc<ServerState>, name: &str) {
+            password_again(c, state, name).await;
             c.send(&ClientMessage::Account(AccountRequest::ProviderStart {
                 kind: ProviderKind::Discord,
                 link: true,
-                secret: Some(secret),
+                secret: None,
                 totp: None,
                 recovery_code: None,
             }))
             .await;
         }
-        let secret_of = |signed: &voipc_crypto::account::SignedIn, name: &str| {
-            voipc_crypto::account::derive("correct horse battery", &signed.relay_id, name)
-                .auth_secret
-                .to_vec()
-        };
         // The Discord account is someone else's already
         let (_xan, xi) = register(&state, "xan").await;
         link_directly(&state, AccountId(xi.id), "3003").await;
         *subject.lock().unwrap() = "3003".into();
-        let (mut c, _, signed) = register_with(&state, "wendy").await;
-        start_link(&mut c, secret_of(&signed, "wendy")).await;
+        let (mut c, _, _) = register_with(&state, "wendy").await;
+        start_link(&mut c, &state, "wendy").await;
         let ServerMessage::Account(AccountReply::ProviderBrowser { url, code }) =
             c.expect("page", |m| reply(m).is_some()).await
         else {
@@ -8209,7 +8830,7 @@ mod providers {
 
         // The app went away while the browser was up
         *subject.lock().unwrap() = "3004".into();
-        start_link(&mut c, secret_of(&signed, "wendy")).await;
+        start_link(&mut c, &state, "wendy").await;
         let ServerMessage::Account(AccountReply::ProviderBrowser { url, code }) =
             c.expect("page", |m| reply(m).is_some()).await
         else {
@@ -8228,8 +8849,8 @@ mod providers {
         assert!(page.contains(provider::APP_GONE), "{page}");
 
         // The control: one that happens says so
-        let (mut c, _, signed) = register_with(&state, "yuri").await;
-        start_link(&mut c, secret_of(&signed, "yuri")).await;
+        let (mut c, _, _) = register_with(&state, "yuri").await;
+        start_link(&mut c, &state, "yuri").await;
         let ServerMessage::Account(AccountReply::ProviderBrowser { url, code }) =
             c.expect("page", |m| reply(m).is_some()).await
         else {
@@ -8502,9 +9123,12 @@ mod providers {
         );
 
         let (mut c, _, _, _) = at_the_choice(&state).await;
-        c.send(&ClientMessage::AuthContinue(AuthContinue::ProviderProof {
-            signature: vec![0; 64],
-        }))
+        c.send(&ClientMessage::AuthContinue(
+            AuthContinue::ProviderProofBound {
+                signature: vec![0; 64],
+                web: false,
+            },
+        ))
         .await;
         let Some(ServerMessage::AuthError { reason }) = c.next().await else {
             panic!("a made-up signature is no way in")
@@ -8515,20 +9139,68 @@ mod providers {
         let (mut c, challenge, _, _) = at_the_choice(&state).await;
         let stranger = voipc_crypto::generate_identity_key_pair();
         let relay_id = relay_of(&state).relay_id;
-        c.send(&ClientMessage::AuthContinue(AuthContinue::ProviderProof {
-            signature: voipc_crypto::account::provider_proof(
-                &stranger, &relay_id, "deedee", &challenge,
-            ),
-        }))
-        .await;
+        let sign = |id, challenge: &[u8], b: Binding| {
+            ClientMessage::AuthContinue(AuthContinue::ProviderProofBound {
+                signature: voipc_crypto::account::provider_proof_bound(
+                    id, &relay_id, "deedee", challenge, &b,
+                ),
+                web: b.web(),
+            })
+        };
+        c.send(&sign(&stranger, &challenge, Binding::Tls(TEST_BIND)))
+            .await;
         assert!(matches!(
             c.next().await,
             Some(ServerMessage::AuthError { .. })
         ));
 
+        // W1-24: the person's own proof, as a server between their app and this relay
+        // holds it: bound to that server's connection, or in the unbound shape
+        let (mut c, challenge, _, _) = at_the_choice(&state).await;
+        c.send(&sign(
+            &signed.identity,
+            &challenge,
+            Binding::Tls([0x77; 32]),
+        ))
+        .await;
+        let Some(ServerMessage::AuthError { reason }) = c.next().await else {
+            panic!("a proof for another connection opened it")
+        };
+        assert!(reason.contains("not made on this connection"), "{reason}");
+        let (mut c, challenge, _, _) = at_the_choice(&state).await;
+        c.send(&ClientMessage::AuthContinue(AuthContinue::ProviderProof {
+            signature: voipc_crypto::account::provider_proof(
+                &signed.identity,
+                &relay_id,
+                "deedee",
+                &challenge,
+            ),
+        }))
+        .await;
+        assert!(
+            matches!(c.next().await, Some(ServerMessage::AuthError { .. })),
+            "the unbound shape opened it"
+        );
+
         real.send(&ClientMessage::Ping { timestamp: 7 }).await;
         real.expect("the real connection lives on", |m| {
             matches!(m, ServerMessage::Pong { timestamp: 7 })
+        })
+        .await;
+
+        // The control: the same proof, bound to this connection, opens it
+        let (mut c, challenge, _, _) = at_the_choice(&state).await;
+        c.send(&sign(&signed.identity, &challenge, Binding::Tls(TEST_BIND)))
+            .await;
+        c.send(&keys(&public, false)).await;
+        c.expect("signed in", |m| {
+            matches!(
+                m,
+                ServerMessage::Authenticated {
+                    account: Some(_),
+                    ..
+                }
+            )
         })
         .await;
     }
@@ -8639,6 +9311,7 @@ mod providers {
             PROTOCOL_VERSION,
             APP_VERSION,
         );
+        m.bind(Binding::Tls(TEST_BIND));
         m.on_message(&msg).unwrap();
         // The vault opened and proved, as the real person's device would
         let Step::Send(proof) = m.provider_recovery(&key).unwrap().remove(0) else {
@@ -8897,6 +9570,7 @@ mod providers {
             PROTOCOL_VERSION,
             APP_VERSION,
         );
+        m.bind(Binding::Tls(TEST_BIND));
         let mut c = open_raw(&state, &first).await;
         drive(&mut c, &mut m).await.unwrap();
         assert_eq!(
@@ -8925,6 +9599,7 @@ mod providers {
             PROTOCOL_VERSION,
             APP_VERSION,
         );
+        m.bind(Binding::Tls(TEST_BIND));
         let mut c = open_raw(&state, &first).await;
         let msg = c.next().await.unwrap();
         for s in m.on_message(&msg).unwrap() {
@@ -9174,6 +9849,7 @@ mod providers {
             PROTOCOL_VERSION,
             APP_VERSION,
         );
+        m.bind(Binding::Tls(TEST_BIND));
         let mut c = open_raw(&state, &first).await;
         drive(&mut c, &mut m).await.unwrap();
         c.send(&ClientMessage::Account(AccountRequest::DeviceChallenge))
@@ -9314,6 +9990,7 @@ mod providers {
             PROTOCOL_VERSION,
             APP_VERSION,
         );
+        m.bind(Binding::Tls(TEST_BIND));
         let mut c = open_raw(state, &first).await;
         let msg = c.next().await.unwrap();
         let steps = m.on_message(&msg).unwrap();
@@ -9741,6 +10418,7 @@ mod providers {
             PROTOCOL_VERSION,
             APP_VERSION,
         );
+        m.bind(Binding::Tls(TEST_BIND));
         let mut c = open_raw(state, &first).await;
         let msg = c.next().await.unwrap();
         let steps = m.on_message(&msg).unwrap();
@@ -9764,6 +10442,7 @@ mod providers {
             PROTOCOL_VERSION,
             APP_VERSION,
         );
+        m.bind(Binding::Tls(TEST_BIND));
         let mut c = open_raw(state, &first).await;
         let msg = c.next().await.unwrap();
         let mut steps = m.on_message(&msg).unwrap();
@@ -9904,11 +10583,7 @@ mod providers {
     async fn a_password_account_links_with_its_password_and_unlinks_again() {
         let (state, _db, subject) = relay(RegistrationMode::Open).await;
         *subject.lock().unwrap() = "3003".into();
-        let (mut c, _, signed) = register_with(&state, "wendy").await;
-        let secret =
-            voipc_crypto::account::derive("correct horse battery", &signed.relay_id, "wendy")
-                .auth_secret
-                .to_vec();
+        let (mut c, _, _) = register_with(&state, "wendy").await;
         c.send(&ClientMessage::Account(AccountRequest::ProviderList))
             .await;
         let ServerMessage::Account(AccountReply::Providers {
@@ -9936,10 +10611,11 @@ mod providers {
             ServerMessage::Account(AccountReply::Error { .. })
         ));
 
+        password_again(&mut c, &state, "wendy").await;
         c.send(&ClientMessage::Account(AccountRequest::ProviderStart {
             kind: ProviderKind::Discord,
             link: true,
-            secret: Some(secret.clone()),
+            secret: None,
             totp: None,
             recovery_code: None,
         }))
@@ -9964,9 +10640,10 @@ mod providers {
         assert_eq!(linked.len(), 1);
         assert_eq!(linked[0].kind, ProviderKind::Discord);
 
+        password_again(&mut c, &state, "wendy").await;
         c.send(&ClientMessage::Account(AccountRequest::ProviderUnlink {
             kind: ProviderKind::Discord,
-            secret: Some(secret),
+            secret: None,
             totp: None,
             recovery_code: None,
         }))
@@ -10394,6 +11071,7 @@ mod providers {
                 PROTOCOL_VERSION,
                 APP_VERSION,
             );
+            m.bind(Binding::Tls(TEST_BIND));
             let mut c = open_raw(state, &first).await;
             let msg = c.next().await.unwrap();
             let mut steps = m.on_message(&msg).unwrap();
@@ -10428,8 +11106,8 @@ mod providers {
                 c.next().await,
                 Some(ServerMessage::AuthStep(AuthStep::Salt { .. }))
             ));
-            c.send(&ClientMessage::AuthContinue(AuthContinue::Register {
-                auth_secret: SECRET.to_vec(),
+            c.send(&ClientMessage::AuthContinue(AuthContinue::RegisterKey {
+                login_key: test_key().public_key().to_vec(),
                 altcha: String::new(),
                 ts: String::new(),
                 vault: vec![reset_slot()],
@@ -10476,14 +11154,6 @@ mod providers {
             let secret = totp_on(&mut c).await;
             settled(&mut c).await;
             (c, info, secret)
-        }
-
-        /// What `register_with`'s password comes to.
-        fn the_secret(state: &ServerState, name: &str) -> Vec<u8> {
-            let relay_id = relay_of(state).relay_id;
-            voipc_crypto::account::derive("correct horse battery", &relay_id, name)
-                .auth_secret
-                .to_vec()
         }
 
         // ── A run ──
@@ -10686,6 +11356,64 @@ mod providers {
             // The frames take none, however long a run takes
             let done = roles(&mut ann, run, vec![]).await;
             assert_eq!(done.made, 0);
+        }
+
+        /// W2-31: a refusal named no step, and an app asking from two places could not tell
+        /// whose it was. `AdminAsk` numbers every answer, the late `ImportBegun` too.
+        #[tokio::test]
+        async fn every_answer_to_a_numbered_ask_carries_its_number() {
+            let (state, _db, _) = relay(RegistrationMode::Open).await;
+            let (mut ann, _, secret) = admin_account(&state, "ann").await;
+            let numbered = |ask: u32, op: AdminOp, code: Option<String>| {
+                ClientMessage::Account(AccountRequest::AdminAsk { ask, op, code })
+            };
+            async fn next(c: &mut Client) -> (u32, AccountReply) {
+                let ServerMessage::Account(AccountReply::Asked { ask, reply }) = c
+                    .expect("a numbered answer", |m| {
+                        matches!(m, ServerMessage::Account(AccountReply::Asked { .. }))
+                    })
+                    .await
+                else {
+                    unreachable!()
+                };
+                (ask, voipc_protocol::codec::decode_asked(&reply).unwrap())
+            }
+            ann.send(&numbered(5, AdminOp::ImportFacts, None)).await;
+            let (ask, r) = next(&mut ann).await;
+            assert_eq!(ask, 5);
+            assert!(
+                matches!(r, AccountReply::Admin(AdminReply::ImportFacts { .. })),
+                "{r:?}"
+            );
+            ann.send(&numbered(6, AdminOp::ImportUndo { run: 999 }, None))
+                .await;
+            let (ask, r) = next(&mut ann).await;
+            assert_eq!(ask, 6);
+            assert!(
+                refusal_of(&r).contains("No such run"),
+                "a refusal too: {r:?}"
+            );
+            // The copy's answer comes later, on its own
+            ann.send(&numbered(7, begin_op(GUILD), Some(code(&secret))))
+                .await;
+            let (ask, r) = next(&mut ann).await;
+            assert_eq!(ask, 7);
+            assert!(
+                matches!(r, AccountReply::Admin(AdminReply::ImportBackingUp { .. })),
+                "{r:?}"
+            );
+            let (ask, r) = next(&mut ann).await;
+            assert_eq!(ask, 7);
+            assert!(
+                matches!(r, AccountReply::Admin(AdminReply::ImportBegun { .. })),
+                "{r:?}"
+            );
+            // The control: unnumbered, as before 22
+            let r = op(&mut ann, AdminOp::ImportFacts, None).await;
+            assert!(matches!(
+                r,
+                AccountReply::Admin(AdminReply::ImportFacts { .. })
+            ));
         }
 
         #[tokio::test]
@@ -12977,11 +13705,11 @@ mod providers {
 
             // Linking it to an account they make otherwise: refused
             let (mut c, _, _) = register_with(&state, "evader").await;
-            let secret = the_secret(&state, "evader");
+            password_again(&mut c, &state, "evader").await;
             c.send(&ClientMessage::Account(AccountRequest::ProviderStart {
                 kind: ProviderKind::Discord,
                 link: true,
-                secret: Some(secret),
+                secret: None,
                 totp: None,
                 recovery_code: None,
             }))
@@ -13460,13 +14188,14 @@ mod providers {
         }
 
         fn a_reset_answer() -> ClientMessage {
-            ClientMessage::AuthContinue(AuthContinue::Reset {
+            ClientMessage::AuthContinue(AuthContinue::ResetBound {
                 signature: vec![0; 64],
                 key_signature: vec![0; 64],
-                auth_secret: SECRET.to_vec(),
+                login_key: vec![0; 32],
                 pass_slot: vec![0; 101],
                 totp: None,
                 recovery_code: None,
+                web: false,
             })
         }
 
@@ -13806,9 +14535,14 @@ mod providers {
             );
         }
 
-        async fn delete_own(c: &mut Client, secret: Option<Vec<u8>>) {
+        /// `password`: the account `register_with` made under that name, which proves
+        /// its password again first.
+        async fn delete_own(c: &mut Client, password: Option<(&Arc<ServerState>, &str)>) {
+            if let Some((state, name)) = password {
+                password_again(c, state, name).await;
+            }
             c.send(&ClientMessage::Account(AccountRequest::DeleteAccount {
-                secret: secret.unwrap_or_default(),
+                secret: Vec::new(),
                 totp: None,
                 recovery_code: None,
             }))
@@ -13863,19 +14597,132 @@ mod providers {
             let (mut w, _, _) = register_with(&state, "wendy").await;
             let wid = account(&state, "wendy").await.id;
             link_directly(&state, wid, "2002").await;
-            let secret = the_secret(&state, "wendy");
-            delete_own(&mut w, Some(secret)).await;
+            delete_own(&mut w, Some((&state, "wendy"))).await;
             assert_eq!(excluded_rows(&state).await, 2);
             let done = members(&mut ann, run, vec![member(2002, "wendy", &[])]).await;
             assert_eq!((done.left_out, done.made), (1, 0), "{done:?}");
+        }
+
+        /// W1-34: linked here, then unlinked, then deleted: the account's Discord id was
+        /// forgotten at the unlink, and the delete took none of their imported posts.
+        #[tokio::test]
+        async fn linking_unlinking_then_deleting_still_takes_their_posts() {
+            let (state, _db, _) = relay(RegistrationMode::Open).await;
+            let (mut w, _, _) = register_with(&state, "wendy").await;
+            let wid = account(&state, "wendy").await.id;
+            link_directly(&state, wid, "2002").await;
+            password_again(&mut w, &state, "wendy").await;
+            w.send(&ClientMessage::Account(AccountRequest::ProviderUnlink {
+                kind: ProviderKind::Discord,
+                secret: None,
+                totp: None,
+                recovery_code: None,
+            }))
+            .await;
+            let r = w.expect("unlinked", |m| reply(m).is_some()).await;
+            assert!(
+                matches!(
+                    r,
+                    ServerMessage::Account(AccountReply::ProviderUnlinked { .. })
+                ),
+                "{r:?}"
+            );
+            assert_eq!(excluded_rows(&state).await, 0, "nothing yet: they are here");
+            // Kept in the open: their export names it
+            let exported = state
+                .accounts
+                .as_ref()
+                .unwrap()
+                .accounts
+                .export(wid)
+                .await
+                .unwrap()
+                .to_string();
+            assert!(
+                exported.contains(r#""discord_unlinked":["2002"]"#),
+                "{exported}"
+            );
+            delete_own(&mut w, Some((&state, "wendy"))).await;
+            assert_eq!(excluded_rows(&state).await, 1);
+            assert_eq!(
+                count(
+                    &state,
+                    "SELECT CAST(COUNT(*) AS BIGINT) FROM voipc_import_excluded \
+                     WHERE dc_id = 2002 AND own = TRUE AND erase = TRUE"
+                )
+                .await,
+                1
+            );
+            assert_eq!(
+                count(
+                    &state,
+                    "SELECT CAST(COUNT(*) AS BIGINT) FROM voipc_dc_unlinked"
+                )
+                .await,
+                0,
+                "it went with the account"
+            );
+        }
+
+        /// W1-31: a ban lifted for someone who deleted their own account stays lifted: the
+        /// next run made their banned row anew.
+        #[tokio::test]
+        async fn a_ban_lifted_on_someone_who_left_by_themselves_stays_lifted() {
+            let (state, _db, subject) = relay(RegistrationMode::Open).await;
+            let (mut ann, _, run) = running(&state).await;
+            members(&mut ann, run, vec![member(1001, "dee", &[])]).await;
+            let (mut c, _) = come(&state, &subject, 1001, &["dee"]).await.unwrap();
+            prove_with_discord(&state, &mut c).await;
+            delete_own(&mut c, None).await;
+            // Banned on Discord too: a run makes their banned row
+            let (made, _, _) = bans(&mut ann, run, &[1001]).await;
+            assert_eq!(made, 1);
+            let relay = state.accounts.as_ref().unwrap();
+            assert!(relay
+                .store()
+                .user_by_username("dc-1001")
+                .await
+                .unwrap()
+                .is_some());
+            // The owner lifts it: the row goes, and no later run makes it
+            let r = left_out(&mut ann, "1001", true, false).await;
+            assert_eq!(
+                excluded_ids(&r),
+                [("1001".to_string(), true, true)],
+                "still their own exit, and their posts stay gone"
+            );
+            assert!(relay
+                .store()
+                .user_by_username("dc-1001")
+                .await
+                .unwrap()
+                .is_none());
+            let (made, _, _) = bans(&mut ann, run, &[1001]).await;
+            assert_eq!(made, 0, "lifted for good");
+            assert!(relay
+                .store()
+                .user_by_username("dc-1001")
+                .await
+                .unwrap()
+                .is_none());
+            // Leaving them out again changes nothing of that
+            left_out(&mut ann, "1001", true, true).await;
+            assert_eq!(bans(&mut ann, run, &[1001]).await.0, 0);
+            // The control: someone else's own exit, not lifted, is banned again
+            let (mut e, _) = {
+                members(&mut ann, run, vec![member(1002, "eve", &[])]).await;
+                come(&state, &subject, 1002, &["eve"]).await.unwrap()
+            };
+            prove_with_discord(&state, &mut e).await;
+            delete_own(&mut e, None).await;
+            assert_eq!(bans(&mut ann, run, &[1002]).await.0, 1);
         }
 
         #[tokio::test]
         async fn someone_else_deleted_says_nothing_of_a_discord_id() {
             let (state, _db, _) = relay(RegistrationMode::Open).await;
             let (mut w, _, _) = register_with(&state, "wendy").await;
-            let secret = the_secret(&state, "wendy");
-            delete_own(&mut w, Some(secret)).await;
+            delete_own(&mut w, Some((&state, "wendy"))).await;
             assert_eq!(
                 excluded_rows(&state).await,
                 0,
@@ -17091,8 +17938,7 @@ mod providers {
             let (mut w, _, _) = register_with(&state, "wendy").await;
             let wid = account(&state, "wendy").await.id;
             link_directly(&state, wid, "2002").await;
-            let secret = the_secret(&state, "wendy");
-            delete_own(&mut w, Some(secret)).await;
+            delete_own(&mut w, Some((&state, "wendy"))).await;
             assert_eq!(reads(&mut cal, id).await, ["another's"]);
 
             assert_eq!(tidied(&state).await, 2);
@@ -20078,6 +20924,7 @@ mod providers {
                 PROTOCOL_VERSION,
                 APP_VERSION,
             );
+            m.bind(Binding::Tls(TEST_BIND));
             let mut c = open_raw(state, &first).await;
             drive(&mut c, &mut m).await.unwrap();
             c
@@ -28561,8 +29408,8 @@ mod invite_links {
             reset_slot(),
         ];
         let altcha = solve(&pow.altcha);
-        c.send(&ClientMessage::AuthContinue(AuthContinue::Register {
-            auth_secret: SECRET.to_vec(),
+        c.send(&ClientMessage::AuthContinue(AuthContinue::RegisterKey {
+            login_key: test_key().public_key().to_vec(),
             altcha,
             ts: pow.ts,
             vault,
@@ -28713,8 +29560,8 @@ mod invite_links {
         else {
             panic!("a link is asked for the work too");
         };
-        c.send(&ClientMessage::AuthContinue(AuthContinue::Register {
-            auth_secret: SECRET.to_vec(),
+        c.send(&ClientMessage::AuthContinue(AuthContinue::RegisterKey {
+            login_key: test_key().public_key().to_vec(),
             altcha: String::new(),
             ts: pow.ts,
             vault: vec![
@@ -28915,8 +29762,8 @@ mod invite_links {
         let Some(ServerMessage::AuthStep(AuthStep::Salt { .. })) = c.next().await else {
             panic!("a code opens the door");
         };
-        c.send(&ClientMessage::AuthContinue(AuthContinue::Register {
-            auth_secret: SECRET.to_vec(),
+        c.send(&ClientMessage::AuthContinue(AuthContinue::RegisterKey {
+            login_key: test_key().public_key().to_vec(),
             altcha: String::new(),
             ts: String::new(),
             vault: vec![
@@ -29852,6 +30699,7 @@ mod restriction {
             media_tx,
             sid_tx,
             state.clone(),
+            Some(TEST_BIND),
         ));
         let mut c = Client {
             stream,
@@ -29867,14 +30715,7 @@ mod restriction {
             account: Some(AccountStart::Login),
         })
         .await;
-        assert!(matches!(
-            c.next().await,
-            Some(ServerMessage::AuthStep(AuthStep::Salt { pow: None, .. }))
-        ));
-        c.send(&ClientMessage::AuthContinue(AuthContinue::Secret {
-            auth_secret: SECRET.to_vec(),
-        }))
-        .await;
+        password_answer(&mut c, state, name).await;
         c.send(&keys(&IDENTITY, false)).await;
         (c, sid_rx)
     }
@@ -35534,13 +36375,9 @@ mod kept_chains {
         ask(&mut d, AccountRequest::LogJoin { conv: log.clone() }).await;
         sealed_chain(&mut a, &log, aid, &[info.id]).await;
         assert!(filed(&post(&mut a, &log, 1, 0).await));
-        let relay = state.accounts.clone().unwrap();
-        let secret =
-            voipc_crypto::account::derive("correct horse battery", &relay.relay_id, "dora")
-                .auth_secret
-                .to_vec();
+        password_again(&mut d, &state, "dora").await;
         d.send(&ClientMessage::Account(AccountRequest::DeleteAccount {
-            secret,
+            secret: Vec::new(),
             totp: None,
             recovery_code: None,
         }))

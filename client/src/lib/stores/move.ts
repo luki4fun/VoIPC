@@ -35,7 +35,7 @@ import {
   type Plan,
   type UndoTotal,
 } from "../move-rules.js";
-import { adminOp, adminRead, codeAskedAgain } from "./admin-ops.js";
+import { adminOp, adminRead, askedName, codeAskedAgain } from "./admin-ops.js";
 import { confirmAction } from "./confirm.js";
 import { connectionState } from "./connection.js";
 import { importedChanged } from "./imported.js";
@@ -471,8 +471,36 @@ function onUndone(server: string, r: Extract<AdminReply, { ImportUndone: unknown
 
 // ── What the relay and the importer say ────────────────────────────────────
 
+/** A refusal whose step is known by its number (protocol v22): only what waited on that step
+ *  ends. Before 22 any refusal ended all of it (W2-31), and so it still does there. */
+function refusedStep(server: string, step: string, reason: string): void {
+  const code = codeAskedAgain(server);
+  if (step === "MoveExcluded") {
+    const reads = get(excludedReads.of(server));
+    if (reads > 0) excludedReads.of(server).set(reads - 1);
+  } else if (step === "MoveExclude") {
+    if (!code) {
+      idsBack(server, { refused: reason });
+      excludeOut.of(server).set(false);
+    }
+  } else if (step === "ImportBegin") {
+    if (!code && get(moveWizard.peek(server)).step === "beginning") wizardSay(server, { step: "choose", backingUp: false });
+  } else if (step === "ImportUndo" || step === "ImportUndoPreview") {
+    undoAsked.of(server).set(null);
+    if (!code) undoStopped(server);
+  } else if (step === "PowerAnswer") {
+    powerOut.of(server).set(false);
+  }
+}
+
 export function onMoveReply(server: string, raw: unknown): void {
-  const r = raw as { Admin?: AdminReply; Error?: { request: string; reason: string } };
+  const r = raw as { Admin?: AdminReply; Error?: { request: string; reason: string }; ask?: unknown };
+  // Whose it is, by its number on a 22 relay; undefined before 22, which guesses below
+  const step = askedName(server, r.ask);
+  if (r.Error?.request === "Admin" && step !== undefined) {
+    refusedStep(server, step, r.Error.reason);
+    return;
+  }
   if (r.Error?.request === "Admin") {
     // A read of the left-out list refused stayed counted, and the next exclusion's answer
     // passed for it: the list sat at "Sending…" (W2-30). With no exclusion out, who asked
@@ -503,8 +531,11 @@ export function onMoveReply(server: string, raw: unknown): void {
       more: a.MoveExcluded.more,
     }));
     const reads = get(excludedReads.of(server));
-    if (reads > 0) excludedReads.of(server).set(reads - 1);
-    else if (get(excludeOut.of(server))) {
+    // A read's answer or an exclusion's: by its number, or the reads out go first
+    const read = step === undefined ? reads > 0 : step === "MoveExcluded";
+    if (read) {
+      if (reads > 0) excludedReads.of(server).set(reads - 1);
+    } else if (get(excludeOut.of(server))) {
       excludeOut.of(server).set(false);
       excludeAnswered(server);
     }

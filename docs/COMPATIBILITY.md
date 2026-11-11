@@ -12,15 +12,17 @@ nobody checks, so a new one comes with its test.
 
 **1.x keeps:**
 - A relay admits a client exactly when their `PROTOCOL_VERSION` is equal (12 in 1.0, 13 in
-  1.3, 14 in 1.4, 15 in 1.5, 16 in 1.7, 17 in 1.8, 18 in 1.9, 19 in 1.10, 21 in 1.11, 20 in its rc.1 only). The app version is informational only.
+  1.3, 14 in 1.4, 15 in 1.5, 16 in 1.7, 17 in 1.8, 18 in 1.9, 19 in 1.10, 21 in 1.11, 20 in its rc.1 only,
+  22 in 1.12). The app version is informational only.
 - **Since 1.6, an app talks to relays from its own protocol down to `OLDEST_RELAY_PROTOCOL`**
   (`crates/voipc-protocol/src/compat.rs`; 12 in 1.6 to 1.11), never fewer than three protocols back.
   It asks with its own; a relay of an older protocol refuses with its own (below), and the app
   connects again speaking that one. It shows a banner there, and holds back what that relay's
   other apps could not read:
 
-  | Relay | What a 1.11 app does not offer there |
+  | Relay | What a 1.12 app does not offer there |
   |---|---|
+  | 1.11 (21) | a sign-in bound to its connection (device key, provider, reset) and a password that never leaves the device: there they go as in 1.11; an admin step's refusal ends every step waiting, not only its own |
   | 1.11.0-rc.1 (20) | the *Share history* privilege: there the switch alone decides |
   | 1.10 (19) | the move from Discord and its archive |
   | 1.9 (18) | mute and timeouts, a wait for new members, hiding messages, removing a banned member's posts, summons, the moderation log, reports |
@@ -62,9 +64,13 @@ out of servers that have not upgraded yet.
 - Any change with the same `PROTOCOL_VERSION` fails it.
 - `compat.rs`'s tests fail when a message's layout at an older protocol differs from today's
   and `RESHAPED` does not name it, and when an old shape there differs from its golden file.
-- The nightly `old-relays` job runs the released 1.0, 1.3, 1.4, 1.6, 1.7.0-rc.1 and 1.11.0-rc.1
-  (protocol 20) relays and speaks to each in its own protocol (`voice_load`). A release joins the
-  list once it is tagged. 1.8 to 1.10 were never tagged, so protocols 17 to 19 have no relay there.
+- The nightly `old-relays` job runs the released 1.0, 1.3, 1.4, 1.6, 1.7.0-rc.1, 1.11.0-rc.1
+  (protocol 20) and 1.11.0 relays and speaks to each in its own protocol (`voice_load`). A release
+  joins the list once it is tagged. 1.8 to 1.10 were never tagged, so protocols 17 to 19 have no
+  relay there.
+- **Since 1.12 an app's sign-in is bound to its TLS session** (`voipc_crypto::bind`): the relay must
+  end TLS itself. A proxy that passes TLS through is fine; one that ends it in front of the TCP
+  fallback makes every app sign-in over that fallback fail (a guest connects as before).
 
 ## 2. Game SDK (`docs/SDK.md`)
 
@@ -159,7 +165,9 @@ storage, the accounts database, the kept-message log and its crypto labels.
   copy of the older file, named after its format, the first time a newer version opens it:
   `chat_history.bin.v4` when 1.0 opens a 0.12 file, `chat_history.bin.v5` when 1.3.1 opens a
   1.0 one (1.1 and 1.2 wrote the same format as 1.0, and were never released on their own),
-  `chat_history.bin.v6` when 1.11 opens one from before it.
+  `chat_history.bin.v6` when 1.11 opens one from before it, `chat_history.bin.v7` when 1.12 does
+  (format 8 files an account's own history under keys of its own, which an older build would
+  take for keys from before 0.9).
   Clearing or deleting the history in the app removes these copies too.
 - Shipped database migrations are append-only and never edited.
 - The crypto labels are frozen: `voipc-vault-item/v1|`, `voipc-log/v1|`, `voipc-wrap/v1|`,

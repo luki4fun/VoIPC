@@ -391,9 +391,12 @@ What is done in the app counts at once.
 
 ## For members
 
-- **One password, one recovery key.** The app derives everything from your password:
-  the secret the server checks, and the key to your vault. The password itself never
-  leaves your device. A new account is shown a recovery key once; write it down.
+- **One password, one recovery key.** The app derives everything from your password: a key
+  it signs your sign-ins with, and the key to your vault. Neither the password nor anything
+  that stands in for it leaves your device: since 1.12 the server keeps only that signing key's
+  public half, and each signature names the connection it was made on, so a server you were
+  lured to cannot pass your sign-in on. An account from before 1.12 moves to this at its first
+  sign-in with a 1.12 app. A new account is shown a recovery key once; write it down.
 - **Reporting a message** (from its menu, not on your own). The dialog names who takes
   reports here and who of them is away, and you can untick anyone you would rather not
   tell, and say why. They see your name and the message as you have it; the server sees
@@ -422,9 +425,8 @@ What is done in the app counts at once.
   can bring more of them, and you would have to delete them again. Someone else's post that names you or
   forwards yours stays: it is theirs. A post of yours that
   opened a thread stays for the replies in it, for others with no author and no words, and named
-  "Thread". Deleting your account takes them too, unless you unlinked Discord first and the move never knew
-  you as a member (you had left Discord by then, or linked after its last run): then the server cannot tell
-  which are yours. Delete them before you unlink, or ask an admin to remove them by your Discord id. A moderator's
+  "Thread". Deleting your account takes them too, also after you unlinked Discord: since 1.12 the server
+  keeps which Discord id you unlinked, for that alone, and your data export lists it. A moderator's
   *Hide*, your block list and *Report* do not reach these rows; removing a banned member's posts
   does, by when they were written. Only an admin deletes someone else's, and it takes a code.
 - **A new password.** *Your account → Password: Change* asks for the current one,
@@ -652,7 +654,9 @@ From accounts:
   asks, guests too. It also sees whose picture each person fetches
 - for a linked provider, the provider's id for you and the name it gives. Never your email, and no provider
   token is kept
-- an Argon2id hash of a secret derived from each password
+- for each password, the public half of the key derived from it (since 1.12; an account
+  nobody signed in to with a 1.12 app keeps an Argon2id hash of a secret derived from it)
+- the Discord ids an account unlinked, kept only so that deleting it takes their posts too
 - identity public keys
 - the public keys of remembered devices
 - two-factor secrets, sealed by the key file

@@ -87,6 +87,7 @@ pub async fn handle_connection<S>(
     media_tx: mpsc::Sender<Bytes>,
     sid_tx: oneshot::Sender<SessionId>,
     state: Arc<ServerState>,
+    binding: Option<[u8; voipc_crypto::bind::BIND_LEN]>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -104,6 +105,7 @@ pub async fn handle_connection<S>(
         peer_ip,
         media_tx,
         sid_tx,
+        binding,
     )
     .await;
     let Admitted {
@@ -482,6 +484,7 @@ async fn refuse_version<S: AsyncWrite + Unpin>(stream: &mut S, client_protocol: 
 
 /// Perform the authentication handshake: one `Authenticate` for a guest, and
 /// for an account the steps in `accounts::sign_in` after it.
+#[allow(clippy::too_many_arguments)]
 async fn authenticate<S>(
     stream: &mut S,
     buf: &mut BytesMut,
@@ -490,6 +493,7 @@ async fn authenticate<S>(
     peer_ip: IpAddr,
     media_tx: mpsc::Sender<Bytes>,
     sid_tx: oneshot::Sender<SessionId>,
+    binding: Option<[u8; voipc_crypto::bind::BIND_LEN]>,
 ) -> Result<Admitted>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -556,6 +560,7 @@ where
                 start,
                 peer_ip,
                 &app_version,
+                binding,
             )
             .await
             {
@@ -746,6 +751,10 @@ where
             standing: s.standing,
             step_up_at: None,
             vault_proven: s.vault_proven,
+            binding,
+            key_challenge: None,
+            key_stepped: None,
+            by_secret: s.by_secret,
         });
         session.set_scopes(s.user, s.scopes);
         s.account

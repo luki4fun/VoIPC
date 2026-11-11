@@ -8,12 +8,14 @@ import {
   fromArchived,
   isHidden,
   isLegacyDmKey,
+  joinHistories,
   marked,
   MAX_MESSAGES,
   mergeHistory,
   newestTimestamp,
   placedByTime,
   pruneConversations,
+  readingAt,
   receivedText,
   rowKey,
   sanitizeHistory,
@@ -25,14 +27,16 @@ import {
 } from "../chat-rules.js";
 import { isBlocked } from "../block-rules.js";
 import { archivedPeers, browserMarksKey, closeMarkKey, dmCountsUnread, listRows } from "../dm-rules.js";
-import { accountHex } from "./account.js";
+import { account, accountHex } from "./account.js";
 import { blocked } from "./blocks.js";
 import { previewChannelId, previewUsers } from "./channels.js";
 import { serverAddress, serverKey, userId } from "./connection.js";
 import { scoped } from "./scoped.js";
+import { historyKey, historyPrefix, historyScopes, onServer } from "./history-scope.js";
 import { isWeb } from "./platform.js";
 import { openServers } from "./servers.js";
 import { chatHistoryDisabled, maxConversations } from "./settings.js";
+import { uiPrefs, updateUiPrefs } from "./ui-prefs.js";
 import type { ChatMessage } from "../types.js";
 
 export interface DmConversation {
@@ -45,7 +49,8 @@ export interface DmConversation {
 }
 
 /**
- * Channel chat: chat key -> messages, where the key is `"host:port/name"`.
+ * Channel chat: chat key -> messages, where the key is `"host:port/name"`, or
+ * `"host:port~<account>/name"` for an account's own history (`historyKey`).
  *
  * Scoped to the server, because two servers' `#general` are two rooms. Without
  * that, a server that puts everybody in a text channel called `general` on
@@ -74,7 +79,7 @@ export const clearedBefore = writable<Map<string, number>>(new Map());
  * those are carried over.
  */
 export function chatKey(server: string, channelName: string): string {
-  const key = serverKey(server);
+  const key = historyKey(server);
   return key ? `${key}/${channelName}` : channelName;
 }
 
@@ -104,9 +109,9 @@ export const dmConversations = scoped<DmConversation[]>(() => []);
  *  newest first, closed ones and those with someone blocked left out (dm-rules.ts
  *  `listRows`). */
 export const dmList = derived(
-  [dmConversations, dmMessages, clearedBefore, activeDmUserId, activeDmUsername, serverAddress, blocked],
+  [dmConversations, dmMessages, clearedBefore, activeDmUserId, activeDmUsername, serverAddress, blocked, historyScopes],
   ([$rows, $dms, $marks, $id, $name, $server, $blocked]) =>
-    listRows($rows, $dms, serverKey($server), $marks, $id === null ? null : $name, (row) => isBlocked($blocked, row, false)),
+    listRows($rows, $dms, historyKey($server), $marks, $id === null ? null : $name, (row) => isBlocked($blocked, row, false)),
 );
 
 /**
@@ -193,8 +198,9 @@ export function peerName(server: string, peerId: number, fallback: string): stri
   );
 }
 
-/** The shape of a scoped key. A channel name may itself contain a slash. */
-const SCOPED_KEY = /^[^/]+:\d+\//;
+/** The shape of a scoped key, a guest's or an account's. A channel name may itself contain a
+ *  slash. */
+const SCOPED_KEY = /^[^/]+:\d+(?:~[0-9a-f]{32})?\//;
 
 /**
  * The server legacy history is filed under: the first one this run connected
@@ -241,6 +247,106 @@ export function claimLegacyKeys(server: string): void {
   if (legacyOwner === null) legacyOwner = server;
   adoptLegacyKeys();
   seedArchivedDms(server);
+  void decideLegacyHistory(server, signedInAs(server));
+}
+
+// ---------------------------------------------------------------------------
+// Whose history from before 1.12 is (history-scope.ts)
+// ---------------------------------------------------------------------------
+
+/**
+ * History from before 1.12 says nobody's: it was a server's, filed as a guest's is now. On
+ * this device's first 1.12 connection to a server with the archive open, it goes to the account
+ * the device remembers there, if that is the one that signed in, and stays a guest's
+ * otherwise; either way once (`history_split`). Each later guest's history is a guest's.
+ */
+export async function decideLegacyHistory(server: string, who: { name: string; hex: string } | null): Promise<void> {
+  const key = serverKey(server);
+  if (!key || get(uiPrefs).history_split.includes(key)) return;
+  const split = () =>
+    updateUiPrefs((p) => {
+      if (!p.history_split.includes(key)) p.history_split.push(key);
+    });
+  // The browser keeps no history, and its marks are each account's already
+  if (isWeb) return split();
+  // The archive is shut: nothing to give yet, decided when it opens (`populateFromArchive`)
+  if (!get(chatUnlocked)) return;
+  let remembered: string[] = [];
+  if (who) {
+    try {
+      const devices = await invoke<{ server: string; name: string }[]>("account_devices");
+      remembered = devices.filter((d) => d.server === server).map((d) => d.name);
+    } catch {
+      return;
+    }
+  }
+  if (get(uiPrefs).history_split.includes(key)) return;
+  split();
+  if (who && remembered.length === 1 && remembered[0] === who.name) adoptGuestHistory(server, who.hex);
+}
+
+/** The account signed in on `server` now, for `decideLegacyHistory`. */
+function signedInAs(server: string): { name: string; hex: string } | null {
+  const a = get(account.peek(server));
+  return a ? { name: a.name, hex: accountHex(a.info.id) } : null;
+}
+
+/**
+ * A server's guest history becomes `account`'s: messages, deletion marks and a log's names
+ * (`clearedBefore`), where they read and whom they named. Joined with what the account has
+ * there already, which a sign-in may have filed before this ran.
+ */
+export function adoptGuestHistory(server: string, account: string): void {
+  const sk = serverKey(server);
+  if (!sk || !/^[0-9a-f]{32}$/.test(account)) return;
+  const [from, to] = [`${sk}/`, `${sk}~${account}/`];
+  let moved = 0;
+  const move = (map: Map<string, ChatMessage[]>) => {
+    let next = map;
+    for (const [key, list] of map) {
+      if (!key.startsWith(from)) continue;
+      if (next === map) next = new Map(map);
+      const target = to + key.slice(from.length);
+      const there = next.get(target);
+      next.set(target, there ? joinHistories(there, list) : list);
+      next.delete(key);
+      moved++;
+    }
+    return next;
+  };
+  channelMessages.update(move);
+  dmMessages.update(move);
+  clearedBefore.update((marks) => {
+    let next = marks;
+    for (const [key, at] of marks) {
+      if (!key.startsWith(from)) continue;
+      if (next === marks) next = new Map(marks);
+      const target = to + key.slice(from.length);
+      next.set(target, Math.max(at, next.get(target) ?? 0));
+      next.delete(key);
+      moved++;
+    }
+    return next;
+  });
+  updateUiPrefs((p) => {
+    const ak = `${sk}~${account}`;
+    if (p.read_marks[sk]) {
+      const mine = { ...p.read_marks[ak] };
+      for (const [name, at] of Object.entries(p.read_marks[sk])) mine[name] = Math.max(at, mine[name] ?? 0);
+      p.read_marks[ak] = mine;
+      delete p.read_marks[sk];
+    }
+    if (p.readers_named[sk]) {
+      const mine = { ...p.readers_named[ak] };
+      for (const [name, ids] of Object.entries(p.readers_named[sk])) mine[name] = [...new Set([...(mine[name] ?? []), ...ids])];
+      p.readers_named[ak] = mine;
+      delete p.readers_named[sk];
+    }
+  });
+  if (moved > 0) {
+    seedArchivedDms(server);
+    scheduleSave();
+  }
 }
 
 /** The next id an archived conversation stands under: below the ones a
@@ -257,7 +363,7 @@ let archivedId = -(2 ** 30);
  * the archive is (unlocking, `populateFromArchive`).
  */
 export function seedArchivedDms(server: string): void {
-  const key = serverKey(server);
+  const key = historyKey(server);
   if (!key) return;
   const peers = archivedPeers(get(dmMessages), key);
   if (peers.length === 0) return;
@@ -305,7 +411,7 @@ export function detachDm(server: string, id: number): void {
   noteOpened(server, id, name);
   const away = archivedId--;
   // Where writing to them goes now: the row may have seen only live messages
-  const account = row.account ?? archivedPeers(get(dmMessages), serverKey(server)).find((p) => p.name === name)?.account;
+  const account = row.account ?? archivedPeers(get(dmMessages), historyKey(server)).find((p) => p.name === name)?.account;
   dmConversations.of(server).update((convos) => {
     const c = convos.find((x) => x.username === name);
     if (c) {
@@ -454,9 +560,12 @@ export function loadBrowserMarks(server: string, accountName: string): void {
     return;
   }
   if (!stored || typeof stored !== "object") return;
+  // Kept per account already; saved before 1.12 under the server's bare key
+  const [bare, mine] = [`${serverKey(server)}/`, historyPrefix(server)];
   clearedBefore.update((marks) => {
     const next = new Map(marks);
-    for (const [mark, at] of Object.entries(stored)) {
+    for (const [saved, at] of Object.entries(stored)) {
+      const mark = saved.startsWith(bare) && mine !== bare ? mine + saved.slice(bare.length) : saved;
       if (typeof at === "number" && at > (next.get(mark) ?? 0)) next.set(mark, at);
     }
     return next;
@@ -476,7 +585,7 @@ export function releaseBrowserMarks(server: string, keep = true): void {
 
 function saveBrowserMarks(): void {
   for (const [server, key] of markOwners) {
-    const prefix = `${serverKey(server)}/`;
+    const prefix = historyPrefix(server);
     const own = [...get(clearedBefore)].filter(([mark]) => mark.startsWith(prefix));
     try {
       localStorage.setItem(key, JSON.stringify(Object.fromEntries(own)));
@@ -536,6 +645,7 @@ export function populateFromArchive(archive: {
   for (const server of get(openServers)) {
     seedArchivedDms(server);
     afterArchive?.(server);
+    void decideLegacyHistory(server, signedInAs(server));
   }
 }
 
@@ -671,7 +781,7 @@ const postsMarkCount = new Map<string, number>();
  *  one is the other party's too. Never `clearedBefore` either: that erases for good,
  *  and would let a relay do so with a push. */
 function markChannels(server: string, marks: MarkIndex): void {
-  const prefix = `${serverKey(server)}/`;
+  const prefix = historyPrefix(server);
   const map = get(channelMessages);
   let next = map;
   for (const [key, list] of map) {
@@ -1001,6 +1111,8 @@ export function fileStoredDm(
     message_id: string | null;
     content: string;
     timestamp: number;
+    /** When the relay filed it: where it stands when read back (`relay_at`). */
+    server_at?: number;
     reply_to?: string | null;
     thread?: string | null;
     file?: unknown;
@@ -1024,6 +1136,7 @@ export function fileStoredDm(
     id: m.message_id ?? undefined,
     account: m.from_me ? own.account : m.peer_account,
     expires_at,
+    ...(typeof m.server_at === "number" ? { relay_at: m.server_at } : {}),
     ...messageRefs(m),
   };
   if (expires_at !== undefined && expires_at <= Date.now()) return;
@@ -1075,7 +1188,7 @@ export function fileStoredDm(
 
 /** The accounts whose names rows on this device for this server show (`headerAccount`). */
 export function authorsHere(server: string): Set<string> {
-  const prefix = `${serverKey(server)}/`;
+  const prefix = historyPrefix(server);
   const authors = new Set<string>();
   for (const map of [get(channelMessages), get(dmMessages)]) {
     for (const [key, messages] of map) {
@@ -1275,7 +1388,7 @@ export function renameChannelChat(server: string, from: string, to: string) {
 function mergedChat(kept: ChatMessage[], moved: ChatMessage[]): ChatMessage[] {
   const out = [...kept];
   for (const m of moved) if (!held(kept, m)) out.push(m);
-  out.sort((a, b) => a.timestamp - b.timestamp);
+  out.sort((a, b) => readingAt(a) - readingAt(b));
   return out.slice(-MAX_MESSAGES);
 }
 
@@ -1287,9 +1400,8 @@ const LOG_MARK = "\u0003";
 /** The name each logged channel on `server` last had here, by its log. */
 export function channelLogNames(server: string): Map<string, string> {
   const out = new Map<string, string>();
-  const key = serverKey(server);
-  if (!key) return out;
-  const prefix = `${key}/`;
+  const prefix = historyPrefix(server);
+  if (!prefix) return out;
   for (const mark of get(clearedBefore).keys()) {
     const at = mark.indexOf(LOG_MARK);
     if (at > prefix.length && mark.startsWith(prefix)) out.set(mark.slice(at + 1), mark.slice(prefix.length, at));
@@ -1506,16 +1618,17 @@ export function clearServerUnread(server: string) {
   openedIds.delete(server);
   postsMarks.delete(server);
   postsMarkCount.delete(server);
-  const prefix = `${serverKey(server)}/`;
+  // Whoever's history it was: what this connection counted goes with it
+  const here = (key: string) => onServer(key, server);
   unseenChannels.update((set) => {
-    const next = new Set([...set].filter((key) => !key.startsWith(prefix)));
+    const next = new Set([...set].filter((key) => !here(key)));
     return next.size === set.size ? set : next;
   });
-  for (const key of [...neverOpened]) if (key.startsWith(prefix)) neverOpened.delete(key);
-  for (const key of [...unreadSince.keys()]) if (key.startsWith(prefix)) unreadSince.delete(key);
-  for (const key of [...hidesSeen.keys()]) if (key.startsWith(prefix)) hidesSeen.delete(key);
+  for (const key of [...neverOpened]) if (here(key)) neverOpened.delete(key);
+  for (const key of [...unreadSince.keys()]) if (here(key)) unreadSince.delete(key);
+  for (const key of [...hidesSeen.keys()]) if (here(key)) hidesSeen.delete(key);
   unreadPerChannel.update((map) => {
-    const next = new Map([...map].filter(([key]) => !key.startsWith(prefix)));
+    const next = new Map([...map].filter(([key]) => !here(key)));
     return next.size === map.size ? map : next;
   });
 }

@@ -57,7 +57,7 @@ unicode-normalization = "0.1"
 #   l4f-accounts = { path = "../l4f-accounts" }
 # to the workspace Cargo.toml while you need it; commit neither that nor the
 # Cargo.lock it changes.
-l4f-accounts = { git = "https://github.com/luki4fun/l4f-accounts.git", tag = "v0.13.1", features = ["postgres", "sqlite", "oauth"] }
+l4f-accounts = { git = "https://github.com/luki4fun/l4f-accounts.git", tag = "v0.14.0", features = ["postgres", "sqlite", "oauth"] }
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "sqlite", "migrate", "macros"] }
 
 # The self-update (`[update]`, update.rs), all already in the lock through the

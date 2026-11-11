@@ -460,6 +460,18 @@ impl Relay {
         }))
     }
 
+    /// Whether a ban on this id stays lifted: a lifted ban (`own` off), or one lifted for
+    /// someone who deleted their own account (`lifted`, W1-31).
+    async fn ban_lifted(&self, dc_id: i64) -> Result<bool> {
+        let row: Option<(bool, bool)> = db!(self.store(), pool => {
+            sqlx::query_as("SELECT own, lifted FROM voipc_import_excluded WHERE dc_id = $1")
+                .bind(dc_id)
+                .fetch_optional(pool)
+                .await?
+        });
+        Ok(row.is_some_and(|(own, lifted)| !own || lifted))
+    }
+
     /// `Some(own)` for an id no import touches.
     async fn excluded_own(&self, dc_id: i64) -> Result<Option<bool>> {
         Ok(db!(self.store(), pool => {
@@ -1352,7 +1364,8 @@ async fn groups_of(
 /// `AdminOp::ImportBans`, past `import::frame`. An import never acts on someone who has
 /// opened an account: those are named, and the owner bans by name if they mean it. A
 /// lifted ban stays lifted, since a lift leaves the id on the excluded list; someone's own
-/// exclusion (they deleted their account) does not stop a ban.
+/// exclusion (they deleted their account) does not stop a ban, until one was lifted for them
+/// (`lifted`, W1-31).
 pub(super) async fn bans(
     relay: &Relay,
     ctx: &Ctx,
@@ -1364,7 +1377,7 @@ pub(super) async fn bans(
     let (mut claimed, mut names_kept) = (Vec::new(), Vec::new());
     for b in rows {
         let dc = b.dc_id as i64;
-        if relay.excluded_own(dc).await? == Some(false) {
+        if relay.ban_lifted(dc).await? {
             continue;
         }
         let ext_id = b.dc_id.to_string();
@@ -1537,8 +1550,12 @@ pub(super) async fn exclude(
         let mut tx = pool.begin().await?;
         if on {
             sqlx::query(
+                // On someone who deleted their own account, holding is all a lift can be: it
+                // stays lifted (W1-31)
                 "INSERT INTO voipc_import_excluded (dc_id, own, erase, at) VALUES ($1, $2, $3, $4)
-                 ON CONFLICT (dc_id) DO UPDATE SET erase = voipc_import_excluded.erase OR excluded.erase",
+                 ON CONFLICT (dc_id) DO UPDATE SET erase = voipc_import_excluded.erase OR excluded.erase,
+                   lifted = voipc_import_excluded.lifted
+                     OR (voipc_import_excluded.own AND NOT excluded.erase)",
             )
             .bind(dc_id)
             .bind(false)

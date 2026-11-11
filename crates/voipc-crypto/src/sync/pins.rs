@@ -802,6 +802,9 @@ mod tests {
             vault,
             identity: IdentityKeyPair::generate(&mut crate::rng()),
             recovery: None,
+            binding: None,
+            keyed: false,
+            login_key: None,
             blobs,
         }
     }
@@ -1346,6 +1349,9 @@ mod tests {
             name: "me".into(),
             identity: signed.identity,
             recovery: None,
+            binding: None,
+            keyed: false,
+            login_key: None,
         };
         let (mut s2, events) = sync_on(&again, s.memory(), 21);
         assert!(events.is_empty());

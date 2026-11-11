@@ -1993,6 +1993,8 @@
         content: string;
         ttl_secs: number | null;
         timestamp: number;
+        /** When the relay filed it: where it stands when read back. */
+        server_at?: number;
         reply_to?: string | null;
         thread?: string | null;
         replay?: boolean;
@@ -2011,6 +2013,7 @@
           id: m.message_id ?? undefined,
           account: m.sender_account,
           expires_at: expiryFor(m.timestamp, m.ttl_secs, channelMessageTtl(server, ch.channel_id)),
+          ...(typeof m.server_at === "number" ? { relay_at: m.server_at } : {}),
           ...messageRefs(m),
         });
         const quiet = isBlocked(get(blocked.peek(server)), { account: m.sender_account, username: m.sender_name }, !!ch.anonymous);

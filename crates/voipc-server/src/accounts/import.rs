@@ -77,6 +77,8 @@ pub struct ActiveRun {
     pub ready: bool,
     /// Its last frame, or when it became ready.
     pub last: Instant,
+    /// The number its `ImportBegin` was asked with: `ImportBegun` after the copy carries it.
+    pub ask: Option<u32>,
 }
 
 /// How long a ready run may send nothing before another session may take its place. Stop on
@@ -675,6 +677,7 @@ pub(super) async fn before_the_code(
 /// `AdminOp::ImportBegin`, past its code: the row in the log first, the run's row, then
 /// its copy of the database, in a task: it can take minutes, and this session's read
 /// loop waits on what runs here.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn begin(
     state: &Arc<ServerState>,
     relay: &Relay,
@@ -683,6 +686,7 @@ pub(super) async fn begin(
     mut active: MutexGuard<'_, Option<ActiveRun>>,
     begin: Begin,
     options: &ImportOptions,
+    ask: Option<u32>,
 ) -> Result<AccountReply> {
     let Begin { guild, resumes } = begin;
     let detail = match &resumes {
@@ -717,6 +721,7 @@ pub(super) async fn begin(
         session_id,
         ready: !copying && needs_copy.is_none(),
         last: Instant::now(),
+        ask,
     });
     drop(active);
     let Some(db) = needs_copy else {
@@ -747,6 +752,7 @@ fn copy_then_tell(state: Arc<ServerState>, db: PathBuf, run: i64, resumed: bool,
             .sessions
             .get(&a.session_id)
             .map(|s| s.control_tx.clone());
+        let ask = a.ask;
         let answer = match made {
             Ok(path) => {
                 a.ready = true;
@@ -767,6 +773,7 @@ fn copy_then_tell(state: Arc<ServerState>, db: PathBuf, run: i64, resumed: bool,
             }
         };
         if let Some(tx) = tx {
+            let answer = super::asked(ask, answer);
             let _ = crate::session::send_msg(&tx, &ServerMessage::Account(answer));
         }
     });

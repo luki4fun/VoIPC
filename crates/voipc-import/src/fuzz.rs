@@ -72,10 +72,6 @@ mod tests {
         ] {
             fuzz_import(input);
         }
-        let dir =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/regressions/import");
-        for file in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-            fuzz_import(&std::fs::read(file.path()).unwrap());
-        }
+        // The saved regressions replay in `fixture`, the one module that reads the disk
     }
 }

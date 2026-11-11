@@ -202,8 +202,21 @@ pub const RESHAPED: &[(u32, Side, u32, &str)] = &[
     (
         17,
         Side::Client,
+        40,
+        "AuthContinue::DeviceSigBound goes as DeviceSig; the other bound proofs and the login \
+         key are refused",
+    ),
+    (
+        17,
+        Side::Client,
         41,
         "AdminOp: the channel steps are refused",
+    ),
+    (
+        17,
+        Side::Server,
+        45,
+        "AuthStep::KeyChallenge never comes from it",
     ),
     (
         17,
@@ -214,8 +227,21 @@ pub const RESHAPED: &[(u32, Side, u32, &str)] = &[
     (
         18,
         Side::Client,
+        40,
+        "AuthContinue::DeviceSigBound goes as DeviceSig; the other bound proofs and the login \
+         key are refused",
+    ),
+    (
+        18,
+        Side::Client,
         41,
         "AdminOp: the moderation steps are refused",
+    ),
+    (
+        18,
+        Side::Server,
+        45,
+        "AuthStep::KeyChallenge never comes from it",
     ),
     (
         18,
@@ -226,8 +252,21 @@ pub const RESHAPED: &[(u32, Side, u32, &str)] = &[
     (
         19,
         Side::Client,
+        40,
+        "AuthContinue::DeviceSigBound goes as DeviceSig; the other bound proofs and the login \
+         key are refused",
+    ),
+    (
+        19,
+        Side::Client,
         41,
         "AdminOp and AccountRequest: the import and archive steps are refused",
+    ),
+    (
+        19,
+        Side::Server,
+        45,
+        "AuthStep::KeyChallenge never comes from it",
     ),
     (
         19,
@@ -238,14 +277,53 @@ pub const RESHAPED: &[(u32, Side, u32, &str)] = &[
     (
         20,
         Side::Client,
+        40,
+        "AuthContinue::DeviceSigBound goes as DeviceSig; the other bound proofs and the login \
+         key are refused",
+    ),
+    (
+        20,
+        Side::Client,
         41,
         "AccountRequest::ArchiveChannels and the kept frames are refused",
     ),
     (
         20,
         Side::Server,
+        45,
+        "AuthStep::KeyChallenge never comes from it",
+    ),
+    (
+        20,
+        Side::Server,
         46,
         "AccountReply: ArchiveChannels and the kept frames never come from it",
+    ),
+    (
+        21,
+        Side::Client,
+        40,
+        "AuthContinue::DeviceSigBound goes as DeviceSig; the other bound proofs and the login \
+         key are refused",
+    ),
+    (
+        21,
+        Side::Client,
+        41,
+        "AccountRequest::AdminAsk goes as Admin, without its number; the login key's requests \
+         are refused",
+    ),
+    (
+        21,
+        Side::Server,
+        45,
+        "AuthStep::KeyChallenge never comes from it",
+    ),
+    (
+        21,
+        Side::Server,
+        46,
+        "AccountReply: Asked and the login key's replies never come from it",
     ),
 ];
 
@@ -260,6 +338,7 @@ fn client_messages(proto: u32) -> u32 {
         18 => 52,
         19 => 54,
         20 => 55,
+        21 => 64,
         _ => u32::MAX,
     }
 }
@@ -423,6 +502,41 @@ fn frames_for(msg: &ClientMessage, proto: u32) -> Result<Vec<Vec<u8>>, ProtocolE
             | AccountRequest::OwnChainRows { .. }
             | AccountRequest::VaultPage { .. },
         ) if proto < 21 => Err(ProtocolError::NotOnThisRelay(proto)),
+        // The number stays here: an older relay's answers come unnumbered, and the app goes
+        // by what it guessed before 22
+        ClientMessage::Account(AccountRequest::AdminAsk { op, code, .. }) if proto < 22 => {
+            frames_for(
+                &ClientMessage::Account(AccountRequest::Admin {
+                    op: op.clone(),
+                    code: code.clone(),
+                }),
+                proto,
+            )
+        }
+        // l4f's signature is the same; the binding is for a relay that checks it
+        ClientMessage::AuthContinue(AuthContinue::DeviceSigBound { signature, .. })
+            if proto < 22 =>
+        {
+            frames_for(
+                &ClientMessage::AuthContinue(AuthContinue::DeviceSig {
+                    signature: signature.clone(),
+                }),
+                proto,
+            )
+        }
+        // Each signs another message than the old shape's, and the key replaces a secret:
+        // the app makes the old shape itself for an older relay
+        ClientMessage::AuthContinue(
+            AuthContinue::ResetBound { .. }
+            | AuthContinue::ProviderProofBound { .. }
+            | AuthContinue::KeySig { .. }
+            | AuthContinue::RegisterKey { .. },
+        )
+        | ClientMessage::Account(
+            AccountRequest::KeyChallenge
+            | AccountRequest::KeyStepUp { .. }
+            | AccountRequest::LoginKeySet { .. },
+        ) if proto < 22 => Err(ProtocolError::NotOnThisRelay(proto)),
         ClientMessage::EmoteAdd { emote } if proto == 14 => old(postcard::to_allocvec(&(
             EMOTE_ADD,
             EmoteAdd14 {
@@ -1581,6 +1695,81 @@ mod tests {
                 assert_eq!((hash, name.as_str(), ticket.as_str()), ([5; 32], "", "t"))
             }
             other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_bound_proof_reaches_an_older_relay_only_where_it_means_the_same() {
+        use crate::types::VaultBlob;
+        let bound = ClientMessage::AuthContinue(AuthContinue::DeviceSigBound {
+            signature: vec![1, 2, 3],
+            bind: vec![9; 64],
+            web: false,
+        });
+        let plain = ClientMessage::AuthContinue(AuthContinue::DeviceSig {
+            signature: vec![1, 2, 3],
+        });
+        for v in OLDEST_RELAY_PROTOCOL..PROTOCOL_VERSION {
+            assert_eq!(
+                frames(encode_client_msg_for(&bound, v).unwrap()),
+                frames(encode_client_msg_for(&plain, v).unwrap()),
+                "protocol {v}"
+            );
+        }
+        assert_ne!(
+            frames(encode_client_msg_for(&bound, PROTOCOL_VERSION).unwrap()),
+            frames(encode_client_msg_for(&plain, PROTOCOL_VERSION).unwrap()),
+        );
+        let refused = [
+            ClientMessage::AuthContinue(AuthContinue::ResetBound {
+                signature: vec![],
+                key_signature: vec![],
+                login_key: vec![],
+                pass_slot: vec![],
+                totp: None,
+                recovery_code: None,
+                web: false,
+            }),
+            ClientMessage::AuthContinue(AuthContinue::ProviderProofBound {
+                signature: vec![],
+                web: false,
+            }),
+            ClientMessage::AuthContinue(AuthContinue::KeySig {
+                signature: vec![],
+                web: true,
+            }),
+            ClientMessage::AuthContinue(AuthContinue::RegisterKey {
+                login_key: vec![],
+                altcha: String::new(),
+                ts: String::new(),
+                vault: Vec::<VaultBlob>::new(),
+            }),
+            ClientMessage::Account(AccountRequest::KeyChallenge),
+            ClientMessage::Account(AccountRequest::KeyStepUp {
+                challenge: String::new(),
+                signature: vec![],
+                totp: None,
+                recovery_code: None,
+                web: false,
+            }),
+            ClientMessage::Account(AccountRequest::LoginKeySet {
+                login_key: vec![],
+                identity_sig: vec![],
+                pass_slot: None,
+                web: false,
+            }),
+        ];
+        for msg in &refused {
+            for v in OLDEST_RELAY_PROTOCOL..PROTOCOL_VERSION {
+                assert!(
+                    matches!(
+                        encode_client_msg_for(msg, v),
+                        Err(ProtocolError::NotOnThisRelay(p)) if p == v
+                    ),
+                    "{msg:?} at {v}"
+                );
+            }
+            assert!(encode_client_msg_for(msg, PROTOCOL_VERSION).is_ok());
         }
     }
 

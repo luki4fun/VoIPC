@@ -4278,10 +4278,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("chat_history.bin");
         let named = |suffix: &str| dir.join(format!("chat_history.bin{suffix}"));
-        let copies = [".v1", ".v4", ".v5", ".v6"].map(named);
+        let copies = [".v1", ".v4", ".v5", ".v6", ".v7"].map(named);
         // Not ours to remove: a file moved aside for a newer VoIPC, a
         // version that is no older one's, and another name
-        let others = [".old-1700000000", ".v7", ".v0", ".v5.tmp"].map(named);
+        let others = [".old-1700000000", ".v8", ".v0", ".v5.tmp"].map(named);
         let write_all = || {
             for f in copies.iter().chain(&others).chain([&path]) {
                 std::fs::write(f, b"x").unwrap();

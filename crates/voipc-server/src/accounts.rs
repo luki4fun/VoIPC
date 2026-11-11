@@ -30,6 +30,7 @@ use l4f_accounts::{pow, scope, util, IpMode};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
+use voipc_crypto::bind::Binding;
 use voipc_protocol::codec::{decode_client_msg, encode_server_msg};
 use voipc_protocol::conv::dm_parties;
 use voipc_protocol::messages::{
@@ -282,6 +283,29 @@ impl Host for RelayHost {
                 ));
             }
         }
+        // Discord ids unlinked from it, kept so that deleting it takes their posts (W1-34)
+        let unlinked: sqlx::Result<Vec<i64>> = db!(&self.store, pool => {
+            sqlx::query_scalar(
+                "SELECT CAST(dc_id AS BIGINT) FROM voipc_dc_unlinked WHERE account = $1 ORDER BY dc_id",
+            )
+            .bind(&user.0[..])
+            .fetch_all(pool)
+            .await
+        });
+        match unlinked {
+            Ok(ids) if ids.is_empty() => {}
+            Ok(ids) => entries.push((
+                "discord_unlinked".into(),
+                serde_json::json!(ids.iter().map(i64::to_string).collect::<Vec<_>>()),
+            )),
+            Err(e) => {
+                tracing::warn!("reading unlinked Discord ids for an export: {e:#}");
+                entries.push((
+                    "discord_unlinked".into(),
+                    serde_json::json!("could not be read"),
+                ));
+            }
+        }
         entries
     }
 
@@ -314,6 +338,14 @@ impl Host for RelayHost {
                 ids.extend(linked.iter().filter_map(|s| {
                     std::str::from_utf8(s).ok()?.parse::<i64>().ok()
                 }));
+                // And the ones it unlinked before (W1-34)
+                let unlinked: Vec<i64> = sqlx::query_scalar(
+                    "SELECT CAST(dc_id AS BIGINT) FROM voipc_dc_unlinked WHERE account = $1",
+                )
+                .bind(&user.0[..])
+                .fetch_all(&mut *c)
+                .await?;
+                ids.extend(unlinked);
                 for id in ids {
                     sqlx::query(
                         "INSERT INTO voipc_import_excluded (dc_id, own, erase, at) VALUES ($1, $2, $3, $4)
@@ -1027,6 +1059,14 @@ fn vault_item_ok(k: &str, v: &[u8]) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// `reply`, with the number it was asked with, if any (`AccountRequest::AdminAsk`).
+pub(crate) fn asked(ask: Option<u32>, reply: AccountReply) -> AccountReply {
+    match ask {
+        Some(ask) => voipc_protocol::codec::encode_asked(ask, &reply).unwrap_or(reply),
+        None => reply,
+    }
+}
+
 fn refused(request: &str, reason: &str) -> AccountReply {
     AccountReply::Error {
         request: request.into(),
@@ -1067,6 +1107,9 @@ pub struct SignedIn {
     pub prekey_bundle: PreKeyBundleData,
     /// This connection's device opened the vault (`AccountSession::vault_proven`).
     pub vault_proven: bool,
+    /// This connection signed in with the password's secret: it may move the password to
+    /// its login key (`AccountRequest::LoginKeySet` without a slot), once.
+    pub by_secret: bool,
 }
 
 async fn send<S: AsyncWrite + Unpin>(stream: &mut S, msg: &ServerMessage) -> Result<(), String> {
@@ -1107,6 +1150,15 @@ fn unexpected() -> String {
     "unexpected sign-in step".into()
 }
 
+/// l4f's credential kind for a device key (`devkey_add`).
+const DEVKEY_KIND: &str = "devkey";
+
+/// A proof bound to another connection than this one: a server between the app and this
+/// relay passed it on (W1-24), or the device's key is gone.
+pub(crate) const NOT_THIS_CONNECTION: &str =
+    "This sign-in was not made on this connection. If you used a link, open the server's \
+     own address in VoIPC instead.";
+
 /// Runs an account sign-in on a connection whose `Authenticate` named one, up
 /// to the keys. `Err` is the reason for the client (`AuthError`). A session
 /// made on the way is ended again when a later step fails.
@@ -1120,29 +1172,78 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
     start: AccountStart,
     ip: IpAddr,
     app_version: &str,
+    binding: Option<[u8; voipc_crypto::bind::BIND_LEN]>,
 ) -> Result<SignedIn, String> {
     let ctx = relay.ctx(ip, app_version);
     let mut answers = 0u32;
     let mut registered = false;
+    let mut by_secret = false;
     let work = || relay.pending_slot(ip).ok_or_else(|| BUSY.to_string());
     let session: NewSession = match start {
         AccountStart::Login => {
-            step(
-                stream,
-                AuthStep::Salt {
-                    relay_id: relay.relay_id,
-                    pow: None,
-                },
-            )
-            .await?;
-            let AuthContinue::Secret { auth_secret } =
-                next(stream, buf, STEP_WAIT, &mut answers).await?
-            else {
-                return Err(unexpected());
-            };
-            let pw = secret_text(&auth_secret)?;
-            let login = {
+            // An account whose password is its login key (22) proves it over this
+            // connection; any other name, and an account that has not moved yet, as before
+            let keyed = {
                 let _work = work()?;
+                match scope::normalize_username(name, &[]) {
+                    Ok(clean) => match relay.store().user_by_username(&clean).await {
+                        Ok(Some(u)) => relay.accounts.hostkey(u.id).await.ok().flatten().is_some(),
+                        _ => false,
+                    },
+                    Err(_) => false,
+                }
+            };
+            let login = if keyed {
+                // Kept here and never sent, as for a device key
+                let nonce: [u8; 16] = rand::random();
+                let challenge = relay.accounts.hostkey_challenge(None, &nonce);
+                step(
+                    stream,
+                    AuthStep::KeyChallenge {
+                        relay_id: relay.relay_id,
+                        challenge: challenge.clone(),
+                    },
+                )
+                .await?;
+                let AuthContinue::KeySig { signature, web } =
+                    next(stream, buf, STEP_WAIT, &mut answers).await?
+                else {
+                    return Err(unexpected());
+                };
+                let Some(b) = Binding::claimed(web, binding) else {
+                    return Err(NOT_THIS_CONNECTION.into());
+                };
+                let _work = work()?;
+                relay
+                    .accounts
+                    .login_hostkey(&ctx, name, &challenge, &nonce, None, |key| {
+                        voipc_crypto::bind::login_ok(
+                            key,
+                            &relay.relay_id,
+                            name,
+                            &challenge,
+                            &b,
+                            &signature,
+                        )
+                    })
+                    .await
+            } else {
+                step(
+                    stream,
+                    AuthStep::Salt {
+                        relay_id: relay.relay_id,
+                        pow: None,
+                    },
+                )
+                .await?;
+                let AuthContinue::Secret { auth_secret } =
+                    next(stream, buf, STEP_WAIT, &mut answers).await?
+                else {
+                    return Err(unexpected());
+                };
+                let pw = secret_text(&auth_secret)?;
+                let _work = work()?;
+                by_secret = true;
                 relay.accounts.login_password(&ctx, name, &pw, None).await
             };
             match login {
@@ -1166,12 +1267,39 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
                 },
             )
             .await?;
-            let AuthContinue::DeviceSig { signature } =
-                next(stream, buf, STEP_WAIT, &mut answers).await?
+            // Only the bound answer (22): an unbound one is what a server passing the
+            // sign-in on would hold (W1-24)
+            let AuthContinue::DeviceSigBound {
+                signature,
+                bind,
+                web,
+            } = next(stream, buf, STEP_WAIT, &mut answers).await?
             else {
                 return Err(unexpected());
             };
             let _work = work()?;
+            // Before l4f makes a session: the device's own key over this connection
+            let key = relay
+                .store()
+                .credential(DEVKEY_KIND, &device_id)
+                .await
+                .map_err(|e| e.to_string())?
+                .and_then(|c| c.public_key);
+            let bound = Binding::claimed(web, binding).is_some_and(|b| {
+                key.as_deref().is_some_and(|k| {
+                    voipc_crypto::bind::devkey_ok(
+                        k,
+                        &relay.relay_id,
+                        &device_id,
+                        &challenge,
+                        &b,
+                        &bind,
+                    )
+                })
+            });
+            if !bound {
+                return Err(NOT_THIS_CONNECTION.into());
+            }
             relay
                 .accounts
                 .devkey_login(&ctx, &challenge, &nonce, &device_id, &signature)
@@ -1179,7 +1307,18 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
                 .map_err(|e| e.message().to_string())?
         }
         AccountStart::Reset => {
-            return reset(state, relay, stream, buf, name, &ctx, ip, &mut answers).await
+            return reset(
+                state,
+                relay,
+                stream,
+                buf,
+                name,
+                &ctx,
+                ip,
+                &mut answers,
+                binding,
+            )
+            .await
         }
         AccountStart::Providers => {
             let kinds = relay.provider_kinds();
@@ -1187,7 +1326,7 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
             return Err(ANSWERED.into());
         }
         AccountStart::Provider { kind } => {
-            relay.provider_open(stream, kind, ip).await?;
+            relay.provider_open(stream, kind, ip, binding).await?;
             return Err(ANSWERED.into());
         }
         AccountStart::ProviderResume { ticket } => {
@@ -1201,6 +1340,7 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
                 &ctx,
                 ip,
                 &mut answers,
+                binding,
             )
             .await;
         }
@@ -1215,6 +1355,7 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
                 &ctx,
                 ip,
                 &mut answers,
+                binding,
             )
             .await;
         }
@@ -1266,8 +1407,9 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
                 },
             )
             .await?;
-            let AuthContinue::Register {
-                auth_secret,
+            // The password's login key, never its secret (22)
+            let AuthContinue::RegisterKey {
+                login_key,
                 altcha,
                 ts,
                 vault,
@@ -1275,6 +1417,7 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
             else {
                 return Err(unexpected());
             };
+            let login_key: [u8; 32] = login_key.try_into().map_err(|_| unexpected())?;
             if vault.len() as i64 > VAULT_MAX_ITEMS
                 || vault.iter().map(|b| b.v.len()).sum::<usize>() > VAULT_TOTAL_BYTES
             {
@@ -1291,7 +1434,6 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
             {
                 return Err(unexpected());
             }
-            let pw = secret_text(&auth_secret)?;
             let _work = work()?;
             let s = if let Some(code) = invite.as_deref().filter(|c| links::is_link_code(c)) {
                 links::register(
@@ -1299,7 +1441,7 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
                     &ctx,
                     code,
                     name,
-                    links::How::Password(&pw),
+                    links::How::HostKey(&login_key),
                     &altcha,
                     &ts,
                 )
@@ -1311,11 +1453,14 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
                         let form = InviteForm {
                             code,
                             username: name,
-                            password: &pw,
+                            password: "",
                             email: None,
                             display_name: None,
                         };
-                        relay.accounts.register_invite(&ctx, form).await
+                        relay
+                            .accounts
+                            .register_invite_hostkey(&ctx, form, &login_key)
+                            .await
                     }
                     None => {
                         // l4f takes an empty one as a browser without JavaScript;
@@ -1330,12 +1475,15 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
                         };
                         let form = RegisterForm {
                             username: name,
-                            password: &pw,
+                            password: "",
                             email: None,
                             display_name: None,
                             proof,
                         };
-                        relay.accounts.register(&ctx, form).await
+                        relay
+                            .accounts
+                            .register_hostkey(&ctx, form, &login_key)
+                            .await
                     }
                 }
                 .map_err(|e| e.message().to_string())?
@@ -1373,7 +1521,8 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
         &mut answers,
         ip,
     )
-    .await;
+    .await
+    .map(|s| SignedIn { by_secret, ..s });
     if r.is_err() {
         let _ = relay.accounts.logout(&token).await;
     }
@@ -1395,6 +1544,7 @@ async fn reset<S: AsyncRead + AsyncWrite + Unpin>(
     ctx: &Ctx,
     ip: IpAddr,
     answers: &mut u32,
+    binding: Option<[u8; voipc_crypto::bind::BIND_LEN]>,
 ) -> Result<SignedIn, String> {
     let gone = || "Something went wrong. Please try again.".to_string();
     let allowed = relay
@@ -1447,32 +1597,43 @@ async fn reset<S: AsyncRead + AsyncWrite + Unpin>(
         },
     )
     .await?;
-    let AuthContinue::Reset {
+    // Only the bound shape (22): over this connection and the new password's login key,
+    // which goes in place of a secret (W1-24)
+    let AuthContinue::ResetBound {
         signature,
         key_signature,
-        auth_secret,
+        login_key,
         pass_slot,
         totp,
         recovery_code,
+        web,
     } = next(stream, buf, TOTP_WAIT, answers).await?
     else {
         return Err(unexpected());
     };
+    let Some(b) = Binding::claimed(web, binding) else {
+        return Err(NOT_THIS_CONNECTION.into());
+    };
+    let login_key: [u8; 32] = login_key.try_into().map_err(|_| unexpected())?;
     // An account with a reset key proves the recovery key itself; one made
     // before 1.3 has only its identity, which the vault's DEK opens too
     let proved = match vault.iter().find(|b| b.k == SLOT_RESET) {
-        Some(reset_key) => voipc_crypto::account::reset_key_proof_ok(
+        Some(reset_key) => voipc_crypto::account::reset_key_proof_bound_ok(
             &reset_key.v,
             &relay.relay_id,
             &user.username,
             &challenge,
+            &login_key,
+            &b,
             &key_signature,
         ),
-        None => voipc_crypto::account::reset_proof_ok(
+        None => voipc_crypto::account::reset_proof_bound_ok(
             &identity,
             &relay.relay_id,
             &user.username,
             &challenge,
+            &login_key,
+            &b,
             &signature,
         ),
     };
@@ -1482,7 +1643,6 @@ async fn reset<S: AsyncRead + AsyncWrite + Unpin>(
     if pass_slot.len() != SLOT_LEN {
         return Err(unexpected());
     }
-    let pw = secret_text(&auth_secret)?;
     let _work = relay.pending_slot(ip).ok_or_else(|| BUSY.to_string())?;
     if second_factor {
         let factor = match (&totp, &recovery_code) {
@@ -1502,7 +1662,7 @@ async fn reset<S: AsyncRead + AsyncWrite + Unpin>(
             .map_err(|e| e.message().to_string())?;
     }
     replace_pass_slot(relay, user.id, &vault, &pass_slot, || {
-        relay.accounts.password_set_as_host(ctx, user.id, &pw)
+        relay.accounts.hostkey_set_as_host(ctx, user.id, &login_key)
     })
     .await?;
     info!(user = %user.id.hex(), "account password reset with the recovery key");
@@ -1532,7 +1692,7 @@ async fn decoy_reset<S: AsyncRead + AsyncWrite + Unpin>(
     )
     .await?;
     match next(stream, buf, TOTP_WAIT, answers).await? {
-        AuthContinue::Reset { .. } => Err(NOT_THIS_KEY.into()),
+        AuthContinue::ResetBound { .. } => Err(NOT_THIS_KEY.into()),
         _ => Err(unexpected()),
     }
 }
@@ -1704,6 +1864,7 @@ async fn finish<S: AsyncRead + AsyncWrite + Unpin>(
         identity_key,
         prekey_bundle,
         vault_proven: false,
+        by_secret: false,
     })
 }
 
@@ -1872,6 +2033,178 @@ async fn confirm_again(
     Ok((user, fresh))
 }
 
+/// A login-key answer to a challenge this session asked for (`KeyStepUp`).
+struct KeyProof<'a> {
+    challenge: &'a str,
+    nonce: &'a [u8; 16],
+    binding: &'a Binding,
+    signature: &'a [u8],
+}
+
+/// How long a `KeyStepUp` stands in for the password in the next request that wants it.
+const KEY_STEPPED: Duration = Duration::from_secs(120);
+
+/// `confirm_again` with the login key (protocol v22): the key over the challenge and this
+/// connection, then the second factor where there is one. This session is a recent
+/// sign-in after it, with a new token.
+#[allow(clippy::too_many_arguments)]
+async fn confirm_again_key(
+    state: &ServerState,
+    relay: &Relay,
+    session_id: u32,
+    ctx: &Ctx,
+    user: &User,
+    info: &SessionInfo,
+    proof: KeyProof<'_>,
+    (totp, recovery_code): (Option<String>, Option<String>),
+) -> Result<User, String> {
+    let msg = |e: l4f_accounts::service::Error| e.message().to_string();
+    let user = relay
+        .store()
+        .user_by_id(user.id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or("This account is gone.")?;
+    let verify = |key: &[u8; 32]| {
+        voipc_crypto::bind::login_ok(
+            key,
+            &relay.relay_id,
+            &user.username,
+            proof.challenge,
+            proof.binding,
+            proof.signature,
+        )
+    };
+    let fresh = if l4f_accounts::service::has_second_factor(&user) {
+        relay
+            .accounts
+            .confirm_hostkey(ctx, &user, proof.challenge, proof.nonce, verify)
+            .await
+            .map_err(msg)?;
+        match (&totp, &recovery_code) {
+            (Some(code), _) => relay.accounts.step_up_totp(ctx, &user, info, code).await,
+            (None, Some(code)) => {
+                relay
+                    .accounts
+                    .step_up_recovery(ctx, &user, info, code)
+                    .await
+            }
+            (None, None) => {
+                return Err(
+                    "This account needs a code from the authenticator app, or a recovery code."
+                        .into(),
+                )
+            }
+        }
+    } else {
+        relay
+            .accounts
+            .step_up_hostkey(ctx, &user, info, proof.challenge, proof.nonce, verify)
+            .await
+    }
+    .map_err(msg)?;
+    if let Some(a) = state
+        .sessions
+        .get_mut(&session_id)
+        .as_mut()
+        .and_then(|s| s.account.as_mut())
+    {
+        a.token = fresh.token.clone();
+        a.info = fresh.info.clone();
+    }
+    Ok(user)
+}
+
+/// Takes this session's `KeyStepUp`, if it is recent: the password, proved again.
+fn take_key_stepped(state: &ServerState, session_id: u32) -> bool {
+    state
+        .sessions
+        .get_mut(&session_id)
+        .and_then(|mut s| s.account.as_mut().and_then(|a| a.key_stepped.take()))
+        .is_some_and(|at| at.elapsed() <= KEY_STEPPED)
+}
+
+/// `LoginKeySet`: the identity's signature over the key (and the slot), bound to this
+/// connection. Without a slot, the password moves to its key: only on a connection that
+/// just signed in with the password's secret, so that nobody who got in another way (a
+/// provider and the vault) picks the password. With one, a new password: after a
+/// `KeyStepUp` with the old one, as `PasswordChange` takes the old secret. True for a new
+/// password.
+#[allow(clippy::too_many_arguments)]
+async fn login_key_set(
+    state: &ServerState,
+    relay: &Relay,
+    session_id: u32,
+    ctx: &Ctx,
+    user: &User,
+    info: &SessionInfo,
+    (key, identity_sig, pass_slot): (&[u8], &[u8], Option<&[u8]>),
+    binding: Option<Binding>,
+) -> Result<bool, String> {
+    let msg = |e: l4f_accounts::service::Error| e.message().to_string();
+    let gone = || "Something went wrong. Please try again.".to_string();
+    let b = binding.ok_or(NOT_THIS_CONNECTION)?;
+    let key: [u8; 32] = key
+        .try_into()
+        .map_err(|_| "malformed login key".to_string())?;
+    let identity = relay
+        .identity(user.id)
+        .await
+        .map_err(|_| gone())?
+        .ok_or_else(gone)?;
+    if !voipc_crypto::account::login_key_proof_ok(
+        &identity,
+        &relay.relay_id,
+        &user.username,
+        &key,
+        pass_slot,
+        &b,
+        identity_sig,
+    ) {
+        return Err("That key was not signed by this account.".into());
+    }
+    let user = relay
+        .store()
+        .user_by_id(user.id)
+        .await
+        .map_err(|_| gone())?
+        .ok_or("This account is gone.")?;
+    match pass_slot {
+        None => {
+            let by_secret = state
+                .sessions
+                .get_mut(&session_id)
+                .and_then(|mut s| s.account.as_mut().map(|a| std::mem::take(&mut a.by_secret)))
+                .unwrap_or(false);
+            if !by_secret {
+                return Err("Sign in with your password first.".into());
+            }
+            relay
+                .accounts
+                .hostkey_upgrade(ctx, &user, info, &key)
+                .await
+                .map_err(msg)?;
+            info!(user = %user.id.hex(), "account password moved to its login key");
+            Ok(false)
+        }
+        Some(slot) => {
+            if slot.len() != SLOT_LEN {
+                return Err("malformed password slot".into());
+            }
+            if !take_key_stepped(state, session_id) {
+                return Err("Enter your password.".into());
+            }
+            let vault = relay.vault(user.id).await.map_err(|e| e.to_string())?;
+            replace_pass_slot(relay, user.id, &vault, slot, || {
+                relay.accounts.hostkey_change(ctx, &user, info, &key)
+            })
+            .await?;
+            info!(user = %user.id.hex(), "account password changed");
+            Ok(true)
+        }
+    }
+}
+
 /// Deletes the account at this connection, once it proved itself again. Its
 /// vault, identity, log key, what it wrote to the stored logs, the keys to
 /// and from it, its memberships, sessions and device keys go (the database's
@@ -1945,6 +2278,19 @@ async fn prove_recent(
         .await
         .map_err(|e| e.to_string())?
         .ok_or("This account is gone.")?;
+    // A login key is the password: `KeyStepUp` proved it (and the second factor) just now
+    if relay
+        .accounts
+        .hostkey(now_user.id)
+        .await
+        .map_err(|e| e.to_string())?
+        .is_some()
+    {
+        if !take_key_stepped(state, session_id) {
+            return Err("Enter your password.".into());
+        }
+        return Ok(now_user);
+    }
     if now_user.has_password {
         let secret = secret.ok_or("Enter your password.")?;
         let password = secret_text(secret)?;
@@ -2032,18 +2378,34 @@ pub async fn handle_request(
     req: AccountRequest,
     tx: &ControlTx,
 ) -> Result<()> {
-    let reply = |r: AccountReply| ServerMessage::Account(r);
+    // `AdminAsk` is `Admin` with a number of the client's that every answer carries back,
+    // a refusal too (protocol v22, W2-31)
+    let (req, ask) = match req {
+        AccountRequest::AdminAsk { ask, op, code } => {
+            (AccountRequest::Admin { op, code }, Some(ask))
+        }
+        req => (req, None),
+    };
+    let reply = |r: AccountReply| ServerMessage::Account(asked(ask, r));
     let Some(relay) = state.accounts.clone() else {
         return crate::session::send_msg(
             tx,
             &reply(refused("Account", "This relay has no accounts.")),
         );
     };
-    let Some((user, info, peer_ip, vault_proven)) = state.sessions.get(&session_id).and_then(|s| {
-        s.account
-            .as_ref()
-            .map(|a| (a.user.clone(), a.info.clone(), s.peer_ip, a.vault_proven))
-    }) else {
+    let Some((user, info, peer_ip, vault_proven, binding)) =
+        state.sessions.get(&session_id).and_then(|s| {
+            s.account.as_ref().map(|a| {
+                (
+                    a.user.clone(),
+                    a.info.clone(),
+                    s.peer_ip,
+                    a.vault_proven,
+                    a.binding,
+                )
+            })
+        })
+    else {
         return crate::session::send_msg(
             tx,
             &reply(refused("Account", "Sign in with an account first.")),
@@ -2218,9 +2580,9 @@ pub async fn handle_request(
                 Ok(())
             };
             match proved {
-                Ok(()) => {
-                    provider::start_for_account(&relay, session_id, &user, kind, link, peer_ip)
-                }
+                Ok(()) => provider::start_for_account(
+                    &relay, session_id, &user, kind, link, peer_ip, binding,
+                ),
                 Err(reason) => refused("ProviderStart", &reason),
             }
         }
@@ -2539,8 +2901,91 @@ pub async fn handle_request(
             .await
             .unwrap_or_else(|e| read_failed("LogMembers", e)),
         AccountRequest::Admin { op, code } => {
-            admin::handle(state, &relay, session_id, &user, &ctx, op, code).await?
+            admin::handle(state, &relay, session_id, &user, &ctx, op, code, ask).await?
         }
+        // Made `Admin` above
+        AccountRequest::AdminAsk { .. } => refused("Admin", "Something went wrong."),
+        AccountRequest::KeyChallenge => {
+            let nonce: [u8; 16] = rand::random();
+            let challenge = relay.accounts.hostkey_challenge(Some(&user), &nonce);
+            if let Some(mut s) = state.sessions.get_mut(&session_id) {
+                if let Some(a) = s.account.as_mut() {
+                    a.key_challenge = Some((challenge.clone(), nonce));
+                }
+            }
+            AccountReply::KeyChallenge { challenge }
+        }
+        AccountRequest::KeyStepUp {
+            challenge,
+            signature,
+            totp,
+            recovery_code,
+            web,
+        } => {
+            let pending = state
+                .sessions
+                .get_mut(&session_id)
+                .and_then(|mut s| s.account.as_mut().and_then(|a| a.key_challenge.take()));
+            let proof = match (pending, Binding::claimed(web, binding)) {
+                (Some((issued, nonce)), Some(b)) if issued == challenge => Ok((nonce, b)),
+                (_, None) => Err(NOT_THIS_CONNECTION.to_string()),
+                _ => Err("That took too long. Try again.".to_string()),
+            };
+            let stepped = match proof {
+                Ok((nonce, b)) => {
+                    let check = KeyProof {
+                        challenge: &challenge,
+                        nonce: &nonce,
+                        binding: &b,
+                        signature: &signature,
+                    };
+                    confirm_again_key(
+                        state,
+                        &relay,
+                        session_id,
+                        &ctx,
+                        &user,
+                        &info,
+                        check,
+                        (totp, recovery_code),
+                    )
+                    .await
+                }
+                Err(reason) => Err(reason),
+            };
+            match stepped {
+                Ok(_) => {
+                    if let Some(mut s) = state.sessions.get_mut(&session_id) {
+                        if let Some(a) = s.account.as_mut() {
+                            a.key_stepped = Some(std::time::Instant::now());
+                        }
+                    }
+                    AccountReply::SteppedUp
+                }
+                Err(reason) => refused("KeyStepUp", &reason),
+            }
+        }
+        AccountRequest::LoginKeySet {
+            login_key,
+            identity_sig,
+            pass_slot,
+            web,
+        } => match login_key_set(
+            state,
+            &relay,
+            session_id,
+            &ctx,
+            &user,
+            &info,
+            (&login_key, &identity_sig, pass_slot.as_deref()),
+            Binding::claimed(web, binding),
+        )
+        .await
+        {
+            Ok(true) => AccountReply::PasswordChanged,
+            Ok(false) => AccountReply::LoginKeySaved,
+            Err(reason) => refused("LoginKeySet", &reason),
+        },
         AccountRequest::ProfileSet { name } => {
             profile::set_name(state, &relay, session_id, &user, name).await?
         }

@@ -33,6 +33,7 @@ import {
   dmMessages,
   joinedTextChannelIds,
 } from "./chat.js";
+import { historyScopes } from "./history-scope.js";
 import { isAdmin, serverAddress, userId, voiceIsAdmin } from "./connection.js";
 import { can } from "./powers.js";
 import { olderRelay } from "./relay.js";
@@ -82,7 +83,8 @@ export const displayChannelName: Readable<string> = derived(
  * array each time, so a message pushed into the same one still reads as new.
  */
 export const shownMessages: Readable<ChatMessage[]> = derived(
-  [activeDmUserId, activeDmUsername, serverAddress, displayChannelName, channelMessages, dmMessages],
+  // `historyScopes`: a sign-in changes whose history the same names stand for
+  [activeDmUserId, activeDmUsername, serverAddress, displayChannelName, channelMessages, dmMessages, historyScopes],
   // What a writer deleted stays only as a tombstone, which is never drawn
   ([$dm, $dmName, $server, $name, $channels, $dms]) =>
     (($dm !== null ? $dms.get(dmKey($server, $dmName)) : $channels.get(chatKey($server, $name))) ?? []).filter(

@@ -9,6 +9,7 @@ import { addChannelMessage } from "./chat.js";
 import { accountHex } from "./account.js";
 import { channels } from "./channels.js";
 import { serverKey } from "./connection.js";
+import { historyKey } from "./history-scope.js";
 import { textSeats } from "./rosters.js";
 import { uiPrefs, updateUiPrefs } from "./ui-prefs.js";
 import { goesByList, readersLine, stableName } from "../follow-rules.js";
@@ -50,7 +51,7 @@ function say(server: string, channel: ChannelInfo, w: Waiting): void {
     ...(all.length > 0 ? { names: all } : {}),
   });
   // Marked when said, not when seen: someone who quits inside the minute has named nobody
-  const key = serverKey(server);
+  const key = historyKey(server);
   const stable = stableName(channel);
   updateUiPrefs((p) => {
     const here = p.readers_named[key] ?? (p.readers_named[key] = {});
@@ -63,7 +64,7 @@ export function noteReaders(server: string, channelId: number, readers: readonly
   const channel = get(channels.peek(server)).find((c) => c.channel_id === channelId);
   if (!channel || readers.length === 0) return;
   if (!goesByList(channel, get(textSeats.peek(server)).get(channelId)?.gated ?? false)) return;
-  const told = new Set(get(uiPrefs).readers_named[serverKey(server)]?.[stableName(channel)] ?? []);
+  const told = new Set(get(uiPrefs).readers_named[historyKey(server)]?.[stableName(channel)] ?? []);
   const id = `${server}/${channelId}`;
   let w = waiting.get(id);
   if (!w) waiting.set(id, (w = { names: new Map(), timer: null, lastAt: 0 }));

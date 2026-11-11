@@ -103,8 +103,12 @@ pub fn tune(tcp: &TcpStream, peer: SocketAddr) {
 /// Serve one connection that negotiated `http/1.1`: files on `/f/`
 /// (`files::serve_http1`, always), the tunnel on `GET /voipc` (with
 /// `tcp_fallback` on), a short refusal for anything else.
-pub async fn serve<S>(mut stream: S, state: Arc<ServerState>, peer: SocketAddr)
-where
+pub async fn serve<S>(
+    mut stream: S,
+    state: Arc<ServerState>,
+    peer: SocketAddr,
+    binding: Option<[u8; voipc_crypto::bind::BIND_LEN]>,
+) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let mut buf = Vec::new();
@@ -130,7 +134,7 @@ where
         debug!(%peer, "tunnel refused: {e}");
         return;
     }
-    run(stream, buf, state, peer).await;
+    run(stream, buf, state, peer, binding).await;
 }
 
 /// What `read_head` found.
@@ -226,8 +230,13 @@ fn accept_key(key: &str) -> String {
 
 /// Bridge one tunnelled session onto the control handler and the media relay
 /// until either side goes away (the twin of `web::run_session`).
-async fn run<S>(stream: S, leftover: Vec<u8>, state: Arc<ServerState>, peer: SocketAddr)
-where
+async fn run<S>(
+    stream: S,
+    leftover: Vec<u8>,
+    state: Arc<ServerState>,
+    peer: SocketAddr,
+    binding: Option<[u8; voipc_crypto::bind::BIND_LEN]>,
+) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let label = format!("tcp:{}", peer.ip());
@@ -240,7 +249,7 @@ where
         bridge,
         media_rx,
         sid_rx,
-    } = web::start_session(&label, peer.ip(), &state);
+    } = web::start_session(&label, peer.ip(), &state, binding);
     let (bridge_read, bridge_write) = tokio::io::split(bridge);
     let (stream_read, stream_write) = tokio::io::split(stream);
     let (datagram_tx, datagram_rx) = mpsc::channel(DATAGRAM_LANE);
@@ -458,7 +467,12 @@ mod tests {
     /// Serve one in-memory connection; returns the client's end.
     fn open(state: &Arc<ServerState>) -> DuplexStream {
         let (client, server) = tokio::io::duplex(1 << 20);
-        tokio::spawn(serve(server, state.clone(), "127.0.0.1:1".parse().unwrap()));
+        tokio::spawn(serve(
+            server,
+            state.clone(),
+            "127.0.0.1:1".parse().unwrap(),
+            None,
+        ));
         client
     }
 

@@ -19,8 +19,12 @@ const MAGIC: &[u8; 4] = b"VOIP";
 /// newest generation of each vault item this device has seen (1.0). v6 adds
 /// `extra` to a message (1.2): one JSON string for every per-message field the
 /// chat has gained since, so a new one no longer needs a new version. v7 adds, per account,
-/// the bucket lists this device has named to its user (protocol 21).
-const VERSION: u8 = 0x07;
+/// the bucket lists this device has named to its user (protocol 21). v8 is v7's layout with an
+/// account's history under keys of its own (`host:port~<account>/…`, 1.12): a build from
+/// before would take those for keys from before 0.9 and file them as a guest's channels, so
+/// it must refuse the file, as it refuses any newer one, and leave it alone.
+const VERSION: u8 = 0x08;
+const VERSION_V7: u8 = 0x07;
 const VERSION_V6: u8 = 0x06;
 const VERSION_V5: u8 = 0x05;
 const VERSION_V4: u8 = 0x04;
@@ -309,7 +313,7 @@ pub fn decrypt_archive(
     }
     // v1 to v3 predate 0.12, and no 1.x promises to open them
     // (docs/COMPATIBILITY.md §4): such a file is refused and left alone
-    if ![VERSION, VERSION_V6, VERSION_V5, VERSION_V4].contains(&version) {
+    if ![VERSION, VERSION_V7, VERSION_V6, VERSION_V5, VERSION_V4].contains(&version) {
         anyhow::bail!("unsupported file version");
     }
 
@@ -426,7 +430,7 @@ fn kind_of(data: &[u8]) -> FileKind {
         FileKind::Unreadable
     } else if data[4] > VERSION {
         FileKind::Newer
-    } else if [VERSION, VERSION_V6, VERSION_V5, VERSION_V4].contains(&data[4]) {
+    } else if [VERSION, VERSION_V7, VERSION_V6, VERSION_V5, VERSION_V4].contains(&data[4]) {
         FileKind::Ours(data[4])
     } else {
         FileKind::Unreadable
@@ -721,6 +725,16 @@ mod tests {
         assert_eq!(archive.dms["k"][0].content, "from 0.12");
         assert_eq!(archive.cursors["r|luki"].cursors["d:x"], 7);
         assert!(archive.cursors["r|luki"].vault_gens.is_empty());
+
+        // 1.11's v7 is today's layout: it opens as it is, and is told older (a copy is kept)
+        let mut today = ChatArchive::default();
+        today.channels.insert("h:1/general".into(), vec![]);
+        let v7 = seal(VERSION_V7, postcard::to_allocvec(&today).unwrap());
+        assert_eq!(kind_of(&v7), FileKind::Ours(VERSION_V7));
+        let (archive, _, _, version) = decrypt_archive(&v7, "pw").unwrap();
+        assert_eq!(version, VERSION_V7);
+        assert!(version < ARCHIVE_VERSION);
+        assert!(archive.channels.contains_key("h:1/general"));
 
         let newer = seal(VERSION + 1, vec![1, 2, 3]);
         assert_eq!(kind_of(&newer), FileKind::Newer);

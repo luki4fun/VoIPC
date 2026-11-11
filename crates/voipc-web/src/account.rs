@@ -159,6 +159,8 @@ impl AccountSignIn {
         };
         let (mut machine, first) = SignIn::start(&name, method, PROTOCOL_VERSION, APP_VERSION);
         machine.stretch_outside();
+        // A browser cannot read its TLS session: its proofs say so, and an app's never do
+        machine.bind(voipc_crypto::bind::Binding::Web);
         Ok(AccountSignIn {
             machine: Some(machine),
             first: bytes(&first),
@@ -767,7 +769,7 @@ impl AccountSession {
     /// Delete this account, from its stretched password (`kdfSalt`).
     #[wasm_bindgen(js_name = deleteAccount)]
     pub fn delete_account(
-        &self,
+        &mut self,
         master: Option<Vec<u8>>,
         totp: Option<String>,
         recovery_code: Option<String>,
@@ -782,7 +784,7 @@ impl AccountSession {
     /// `AccountSession::provider_start`. `kind`: "Discord", "Google", "Facebook".
     #[wasm_bindgen(js_name = providerStart)]
     pub fn provider_start(
-        &self,
+        &mut self,
         kind: JsValue,
         link: bool,
         master: Option<Vec<u8>>,
@@ -799,7 +801,7 @@ impl AccountSession {
 
     #[wasm_bindgen(js_name = providerUnlink)]
     pub fn provider_unlink(
-        &self,
+        &mut self,
         kind: JsValue,
         master: Option<Vec<u8>>,
         totp: Option<String>,
@@ -886,7 +888,7 @@ impl AccountSession {
     /// a code where the account has codes on.
     #[wasm_bindgen(js_name = passwordChange)]
     pub fn password_change(
-        &self,
+        &mut self,
         old_master: &[u8],
         new_master: &[u8],
         totp: Option<String>,
@@ -909,7 +911,7 @@ impl AccountSession {
     /// text to show once `RecoveryKeyChanged` answers (S-006).
     #[wasm_bindgen(js_name = recoveryKeyNew)]
     pub fn recovery_key_new(
-        &self,
+        &mut self,
         master: Option<Vec<u8>>,
         totp: Option<String>,
         recovery_code: Option<String>,

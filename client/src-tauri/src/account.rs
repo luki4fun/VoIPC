@@ -152,8 +152,14 @@ pub async fn account_provider_ask(
             ServerMessage::AuthStep(AuthStep::Providers { kinds }) => {
                 return Ok(serde_json::json!({ "providers": kinds }))
             }
-            ServerMessage::AuthStep(AuthStep::OpenBrowser { url, code, ticket }) => {
-                return Ok(serde_json::json!({ "url": url, "code": code, "ticket": ticket }))
+            // The code this app shows is its own, from its end of this connection: through
+            // a server that passes the flow on, the relay's page shows another (W1-24)
+            ServerMessage::AuthStep(AuthStep::OpenBrowser { url, ticket, .. }) => {
+                let x = link
+                    .binding
+                    .ok_or("This connection cannot be checked. Nothing was opened.")?;
+                let code = voipc_crypto::bind::provider_code(&x, url.as_bytes());
+                return Ok(serde_json::json!({ "url": url, "code": code, "ticket": ticket }));
             }
             ServerMessage::AuthStep(AuthStep::ProviderReady) => {
                 return Ok(serde_json::json!({ "ready": true }))
@@ -414,6 +420,7 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
     recv: &mut R,
     buf: &mut BytesMut,
     proto: u32,
+    binding: Option<[u8; voipc_crypto::bind::BIND_LEN]>,
 ) -> Result<
     (
         u32,
@@ -472,6 +479,10 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
     };
     let password_based = !matches!(method, Method::Device { .. });
     let (mut machine, first) = SignIn::start(&name, method, proto, APP_VERSION);
+    // Without one, a relay at 22 or later gets no proof (W1-24)
+    if let Some(x) = binding {
+        machine.bind(voipc_crypto::bind::Binding::Tls(x));
+    }
     let known_here = {
         let cfg = state.config();
         let here = cfg.relay_ids.get(server).and_then(|h| unhex16(h));

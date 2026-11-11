@@ -42,10 +42,12 @@
     applyStoredDmEvent,
     fileStoredDm,
     joinedTextChannelIds,
+    decideLegacyHistory,
     loadBrowserMarks,
     purgeWritten,
     releaseBrowserMarks,
   } from "../stores/chat.js";
+  import { setHistoryScope } from "../stores/history-scope.js";
   import { onAccountBlocks } from "../stores/blocks.js";
   import { channels, currentChannelId } from "../stores/channels.js";
   import { shareChannelHistory } from "../stores/settings.js";
@@ -231,11 +233,14 @@
         "account-signed-in",
         (server, d) => {
           account.of(server).set({ name: d.name, relayId: d.relay_id, info: d.info, cloud: d.prefs.cloud });
+          // Its own history from here on, before anything of it is filed (1.12)
+          setHistoryScope(server, accountHex(d.info.id));
           onAccountBlocks(server, d.blocks);
           const waiting = get(accountPrompt);
           if (waiting?.kind === "pair-wait" && waiting.server === server) closePrompt(waiting);
           // Before the log is read: what was cleared must not come back with it
           loadBrowserMarks(server, d.name);
+          void decideLegacyHistory(server, { name: d.name, hex: accountHex(d.info.id) });
           // The second factor a role needs is asked for by the backend once the
           // connection is listed (account.rs after_connect); its setup waits
           // behind the recovery key, which nothing replaces.
@@ -312,6 +317,7 @@
         content: string;
         ttl_secs: number | null;
         timestamp: number;
+        server_at?: number;
         reply_to?: string | null;
         thread?: string | null;
         file?: unknown;

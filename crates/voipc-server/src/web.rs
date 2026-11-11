@@ -41,6 +41,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_rustls::server::TlsStream;
 use tracing::{debug, info, warn};
+use voipc_crypto::bind::{BIND_LEN, EXPORTER_LABEL};
 use voipc_protocol::types::UserId;
 use wtransport::config::QuicTransportConfig;
 use wtransport::endpoint::endpoint_side::Server;
@@ -903,7 +904,12 @@ pub(crate) struct SessionStart {
 /// Start the control handler for a new session. It starts now, so its 5 s
 /// authentication deadline covers the client opening its control channel as
 /// well.
-pub(crate) fn start_session(label: &str, peer: IpAddr, state: &Arc<ServerState>) -> SessionStart {
+pub(crate) fn start_session(
+    label: &str,
+    peer: IpAddr,
+    state: &Arc<ServerState>,
+    binding: Option<[u8; BIND_LEN]>,
+) -> SessionStart {
     let (handler_end, bridge) = tokio::io::duplex(65536);
     let (media_tx, media_rx) = mpsc::channel::<Bytes>(512);
     let (sid_tx, sid_rx) = oneshot::channel::<SessionId>();
@@ -914,6 +920,7 @@ pub(crate) fn start_session(label: &str, peer: IpAddr, state: &Arc<ServerState>)
         media_tx,
         sid_tx,
         state.clone(),
+        binding,
     ));
     SessionStart {
         handler,
@@ -936,7 +943,7 @@ async fn run_session(connection: Connection, state: Arc<ServerState>, peer: Sock
         bridge: bridge_end,
         media_rx,
         sid_rx,
-    } = start_session(&label, peer.ip(), &state);
+    } = start_session(&label, peer.ip(), &state, quic_binding(&connection));
 
     let (video_tx, video_rx) = mpsc::channel::<Bytes>(512);
     // The control leg is kept apart from the media pumps: it is the one that
@@ -998,6 +1005,23 @@ async fn run_session(connection: Connection, state: Arc<ServerState>, peer: Sock
 
 /// How long a finished session's connection waits for its peer to close it.
 const LINGER: Duration = Duration::from_secs(5);
+
+/// This QUIC connection's exporter (`voipc_crypto::bind`), which the client reads from its
+/// end of the same TLS session. None only if TLS failed to give one: every proof that
+/// needs it is then refused.
+fn quic_binding(connection: &Connection) -> Option<[u8; BIND_LEN]> {
+    let mut out = [0u8; BIND_LEN];
+    connection
+        .export_keying_material(&mut out, EXPORTER_LABEL, &[])
+        .ok()
+        .map(|()| out)
+}
+
+/// The same, for the TCP fallback's TLS session.
+pub(crate) fn tls_binding(conn: &rustls::ServerConnection) -> Option<[u8; BIND_LEN]> {
+    conn.export_keying_material([0u8; BIND_LEN], EXPORTER_LABEL, Some(&[]))
+        .ok()
+}
 
 /// Control leg: the client's single bidirectional stream carries the native
 /// control framing byte for byte.

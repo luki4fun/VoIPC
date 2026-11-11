@@ -134,6 +134,8 @@ struct Link {
     send: SendStream,
     recv: RecvStream,
     buf: bytes::BytesMut,
+    /// This end's TLS exporter, which the sign-in's proofs are bound to (protocol v22).
+    binding: [u8; voipc_crypto::bind::BIND_LEN],
 }
 
 impl Link {
@@ -200,6 +202,7 @@ async fn sign_in(
         password: Zeroizing::new(options.password.clone()),
     };
     let (mut machine, first) = SignIn::start(&options.name, method, PROTOCOL_VERSION, APP_VERSION);
+    machine.bind(voipc_crypto::bind::Binding::Tls(link.binding));
     link.write(&first).await?;
     let mut channels = Vec::new();
     let mut emotes = Vec::new();
@@ -340,10 +343,15 @@ async fn main() -> Result<(), Error> {
     let endpoint = client_endpoint(addr, IpAddr::V4(Ipv4Addr::LOCALHOST))?;
     let connection = endpoint.connect(native_url(addr)).await?;
     let (send, recv) = connection.open_bi().await?.await?;
+    let mut binding = [0u8; voipc_crypto::bind::BIND_LEN];
+    connection
+        .export_keying_material(&mut binding, voipc_crypto::bind::EXPORTER_LABEL, &[])
+        .map_err(|_| "this connection gives no exporter")?;
     let mut link = Link {
         send,
         recv,
         buf: bytes::BytesMut::with_capacity(8192),
+        binding,
     };
     let mut codes = Codes {
         secret: options.secret.clone(),

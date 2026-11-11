@@ -98,6 +98,10 @@ WantedBy=multi-user.target
 
 ## 4. TLS
 
+- **The relay ends TLS itself, for QUIC and for the TCP fallback.** Since 1.12 an app binds its
+  sign-in to its own TLS session, and the relay checks that against its end. Port forwarding and
+  proxies that pass TLS through are fine; one that ends TLS in front of the TCP port breaks app
+  sign-ins over the fallback (guests and browsers are unaffected).
 - The certificate and key are read once, at start; there is no reload. A certbot deploy hook
   therefore restarts the service (`systemctl restart voipc`). That drops calls in progress, so
   schedule the renewal for a quiet hour.
@@ -330,6 +334,19 @@ of them:
   stood three days, and `kept_seats` (5000) lifts what was fixed at 256.
 - A relay that never moves a server does no new work.
 
+**From 1.11 to 1.12** (protocol 21 to 22):
+- **Apps first**, as for any protocol: a 1.12 app talks to the 1.11 relay meanwhile.
+- **A migration:** `0011_promises.sql` remembers a ban lifted for someone who deleted their own
+  account, and the Discord ids an account unlinked, so that deleting it later still takes what the
+  move filed under them. Going back takes the old binary and the backup.
+- **The password never leaves an app again.** At each account's first sign-in with a 1.12 app,
+  the app moves its password to a key derived from it (l4f-accounts 0.14 keeps that key in the
+  password's place); from then on that account's password is checked as a signature and its
+  secret opens nothing. An account nobody signs in to stays as it was.
+- **The relay must end TLS itself** (§4): an app's sign-in is bound to its own TLS session. A
+  proxy that passes TLS through is fine; one that ends it in front of the TCP fallback makes
+  app sign-ins over that fallback fail.
+
 **A later release that migrates the database** needs the old binary **and** the backup taken
 before the upgrade for a rollback: an older relay refuses a database that a newer one has
 migrated, by design. Release candidates (`-rc.N`) are for testing on a relay you can roll back.
@@ -364,7 +381,7 @@ The simplest way is a host directory that user 65532 owns:
     install -d -o 65532 -g 65532 -m 0700 /srv/voipc
     install -o 65532 -g 65532 -m 0600 server.toml cert.pem key.pem /srv/voipc/
     docker run -d --name voipc -v /srv/voipc:/data \
-      -p 9987:9987/tcp -p 9987:9987/udp ghcr.io/luki4fun/voipc-server:1.11.1-rc.1
+      -p 9987:9987/tcp -p 9987:9987/udp ghcr.io/luki4fun/voipc-server:1.12.0-rc.1
     docker exec voipc /voipc-server --config /data/server.toml admin grant <name> admin
 
 With a named volume instead, copy the files in with a throwaway container first, then run the

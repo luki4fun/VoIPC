@@ -10,6 +10,7 @@
 // Nothing here decides where voice is. The backend does, and channels.ts
 // mirrors it; closing the server that carries voice only lets go of the mirror.
 
+import { setHistoryScope } from "./stores/history-scope.js";
 import { dropJoinWaits } from "./stores/join-wait.js";
 import { hasNsfwConsent } from "./stores/channel-ui.js";
 import { account as signedInAccount, dropPrompts, takeLook } from "./stores/account.js";
@@ -49,7 +50,7 @@ import { forgetRings } from "./stores/marks.js";
 import { reopenAfterDrop } from "./stores/handoff.js";
 import { dropEmotes } from "./stores/emotes.js";
 import { dropKept, dropServer, scoped } from "./stores/scoped.js";
-import { lastOp, removalWithCode } from "./stores/admin-ops.js";
+import { lastOp, forgetAsks, removalWithCode } from "./stores/admin-ops.js";
 import {
   buildEntries,
   openServers,
@@ -304,6 +305,9 @@ export async function connectTo(
   openServers.update((list) => [...list, server]);
   connectionState.of(server).set("connecting");
   loadGuestBlocks(server);
+  // A guest's history is the server's guest history, whatever name and tag (1.12); an
+  // account's is set at its sign-in (`account-signed-in`)
+  if (!account) setHistoryScope(server, null);
 
   let id: number;
   for (let tries = 0; ; tries++) {
@@ -476,6 +480,7 @@ export function resetServer(server: string): void {
   // Not scoped, and as much the connection's: what they name gets no answer now, and a later
   // refusal must not bring it back
   lastOp.delete(server);
+  forgetAsks(server);
   removalWithCode.delete(server);
   dropPrompts(server);
   if (takeLook(server)) {

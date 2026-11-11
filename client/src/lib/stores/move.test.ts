@@ -34,7 +34,7 @@ const {
   wizardStart,
 } = await import("./move.ts");
 const { pendingConfirm } = await import("./confirm.ts");
-const { adminError, codeAskedAgain, isRemoval, lastOp, removalWithCode, stepUp, stepUpCancelled, stepUpSays } = await import("./admin-ops.ts");
+const { adminError, adminRead, codeAskedAgain, isRemoval, lastOp, removalWithCode, stepUp, stepUpCancelled, stepUpSays } = await import("./admin-ops.ts");
 const { connectionState } = await import("./connection.ts");
 const { dropKept, dropServer } = await import("./scoped.ts");
 const { NO_TOKEN } = await import("../move-rules.ts");
@@ -42,10 +42,11 @@ const { NO_TOKEN } = await import("../move-rules.ts");
 const S = "h.example:9987";
 const plan = JSON.parse(readFileSync(join(import.meta.dirname, "../../../../testkit/6-mock-discord/plan.json"), "utf8"));
 
+/** The steps sent, numbered (`AdminAsk`, protocol v22) or not. */
 const asks = () =>
   invoked()
     .filter(([c]: [string]) => c === "account_request")
-    .map(([, a]: [string, { request: { Admin: { op: unknown } } }]) => a.request.Admin.op);
+    .map(([, a]: [string, { request: { Admin?: { op: unknown }; AdminAsk?: { op: unknown } } }]) => (a.request.AdminAsk ?? a.request.Admin)!.op);
 const sent = (cmd: string) => invoked().filter(([c]: [string]) => c === cmd).map(([, a]: [string, unknown]) => a);
 const wizard = () => get(moveWizard.peek(S));
 const facts = { backup_here: true, cloud: true, public_url: "https://x", discord_sign_in: true };
@@ -495,6 +496,46 @@ test("so does one that was out before the step went", () => {
   assert.deepEqual(wizard().leaving, ["11", "12"]);
   onMoveReply(S, excluded);
   assert.deepEqual(wizard().leaving, ["12"]);
+});
+
+/** The number the last `AdminAsk` went with. */
+const lastAsk = (): number =>
+  (invoked()
+    .filter(([c]: [string]) => c === "account_request")
+    .at(-1)![1] as { request: { AdminAsk: { ask: number } } }).request.AdminAsk.ask;
+
+// W2-31: a refusal names no step, and before 22 any refusal ended the wizard's begin
+test("by its number, another step's refusal leaves the begin waiting, and its own ends it", async () => {
+  fresh();
+  atChoose();
+  wizardBegin(S);
+  assert.equal(wizard().step, "beginning");
+  const begin = lastAsk();
+  adminRead({ Users: { search: "", offset: 0 } }, S);
+  const users = lastAsk();
+  onMoveReply(S, { Error: { request: "Admin", reason: "Too many requests at once; slow down." }, ask: users });
+  assert.equal(wizard().step, "beginning", "the Users tab's, not the begin's");
+  onMoveReply(S, { Error: { request: "Admin", reason: "That is not a Discord server's id." }, ask: begin });
+  assert.equal(wizard().step, "choose");
+  // The control: unnumbered, a relay before 22, any refusal ends it as before
+  wizardBegin(S);
+  onMoveReply(S, { Error: { request: "Admin", reason: "Too many requests at once; slow down." } });
+  assert.equal(wizard().step, "choose");
+});
+
+test("by its number, a list read's answer never passes for an exclusion's", () => {
+  fresh();
+  excludeIds(S, ["11", "12"]);
+  const exclude = lastAsk();
+  excludedNextPage(S);
+  adminRead({ MoveExcluded: { after: "50" } }, S);
+  const read = lastAsk();
+  invoked().length = 0;
+  // The read's answer comes first, numbered: the box still waits for 11's
+  onMoveReply(S, { Admin: { MoveExcluded: { ids: [["51", false, true, 1]], more: false } }, ask: read });
+  assert.deepEqual(wizard().leaving, ["11", "12"]);
+  onMoveReply(S, { Admin: { MoveExcluded: { ids: [["11", false, true, 1]], more: false } }, ask: exclude });
+  assert.deepEqual(asks()[0], { MoveExclude: { dc_id: "12", on: true, erase: true } }, "then the next one goes");
 });
 
 test("another person's step ends the list: the prompt is about theirs now", () => {

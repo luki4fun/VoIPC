@@ -499,6 +499,50 @@ pub enum AuthContinue {
         ephemeral: Vec<u8>,
         blind: Vec<u8>,
     },
+
+    // ── Bound to the connection (protocol v22) ──
+    // A signature here ends in this connection's TLS exporter (`|tls|<32 bytes>`,
+    // `voipc_crypto::bind`), or in `|web` from a browser, which cannot read it (`web`).
+    // A relay takes a `tls` one only with its own exporter, so a server that passes a
+    // sign-in on to another gets nothing it can use there. A 22 relay refuses the
+    // unbound shapes (`DeviceSig`, `Reset`, `ProviderProof`, `Register`) from anyone.
+    /// `DeviceSig`, and the device key's signature over `voipc-devkey/v1|…` (`bind`).
+    /// To an older relay it goes as `DeviceSig`.
+    DeviceSigBound {
+        signature: Vec<u8>,
+        bind: Vec<u8>,
+        web: bool,
+    },
+    /// `Reset`, bound, with the new password's login key in place of its secret: the
+    /// identity signs `voipc-reset/v3|…` and the reset key `voipc-reset/v4|…`, both over
+    /// the challenge, `login_key` and the binding.
+    ResetBound {
+        signature: Vec<u8>,
+        key_signature: Vec<u8>,
+        login_key: Vec<u8>,
+        pass_slot: Vec<u8>,
+        totp: Option<String>,
+        recovery_code: Option<String>,
+        web: bool,
+    },
+    /// `ProviderProof`, bound: the identity over `voipc-provider/v2|…`.
+    ProviderProofBound {
+        signature: Vec<u8>,
+        web: bool,
+    },
+    /// The answer to `AuthStep::KeyChallenge`: the login key (derived from the password
+    /// beside the vault key, never sent) over `voipc-login/v1|…`.
+    KeySig {
+        signature: Vec<u8>,
+        web: bool,
+    },
+    /// `Register` with the password's login key (32 bytes, Ed25519) in place of its secret.
+    RegisterKey {
+        login_key: Vec<u8>,
+        altcha: String,
+        ts: String,
+        vault: Vec<VaultBlob>,
+    },
 }
 
 /// Account management after sign-in.
@@ -769,6 +813,39 @@ pub enum AccountRequest {
     /// `AccountReply::VaultPageFound` answers; `VaultPut` writes it.
     VaultPage {
         k: String,
+    },
+    /// `Admin`, with a number of the client's own that every answer to it carries back in
+    /// `AccountReply::Asked`, a refusal included (protocol v22). A refusal names no step,
+    /// and an app with a panel and a wizard asking side by side could not tell whose it was.
+    /// To an older relay it goes as `Admin`.
+    AdminAsk {
+        ask: u32,
+        op: AdminOp,
+        code: Option<String>,
+    },
+    /// A challenge for the login key (protocol v22): `AccountReply::KeyChallenge`.
+    KeyChallenge,
+    /// Proves the password again with the login key (`voipc-login/v1|…` over the challenge
+    /// and the binding), and the second factor where there is one: the session is a recent
+    /// sign-in after it (`SteppedUp`). `DeleteAccount`, `RecoveryKeyNew`, `ProviderStart`
+    /// and `ProviderUnlink` then go with an empty `secret`.
+    KeyStepUp {
+        challenge: String,
+        signature: Vec<u8>,
+        totp: Option<String>,
+        recovery_code: Option<String>,
+        web: bool,
+    },
+    /// The account's login key, on a recent sign-in, signed by its identity over
+    /// `voipc-login-key/v1|…` (the key, the slot and the binding). Without `pass_slot`: an
+    /// account that signed in with its password's secret moves to the key, and its other
+    /// sessions stay. With it: a new password, and every other session ends.
+    /// `LoginKeySaved` answers.
+    LoginKeySet {
+        login_key: Vec<u8>,
+        identity_sig: Vec<u8>,
+        pass_slot: Option<Vec<u8>>,
+        web: bool,
     },
 }
 
@@ -1116,6 +1193,12 @@ pub enum AuthStep {
     /// No device could, or would. `reason` says which, in the words of
     /// `PAIR_REFUSALS`: a client shows no others.
     PairRefused { reason: String },
+    /// In place of `Salt`, for an account that signs in with its login key (protocol
+    /// v22): derive it with this relay id and answer `AuthContinue::KeySig`.
+    KeyChallenge {
+        relay_id: [u8; 16],
+        challenge: String,
+    },
 }
 
 /// Answers to `AccountRequest`.
@@ -1381,6 +1464,22 @@ pub enum AccountReply {
     /// After a `LogIndex`: more joiners wait for our answer than one index carries. Asked
     /// again once these are answered.
     LogPendingMore,
+    /// An answer to `AccountRequest::AdminAsk`, whatever it is, with the number it was asked
+    /// with (protocol v22). Also one that comes later: a run's `ImportBegun` after its copy.
+    /// `reply` is that `AccountReply` encoded (`codec::encode_asked`, `decode_asked`): held
+    /// as bytes, so that no type holds itself.
+    Asked {
+        ask: u32,
+        reply: Vec<u8>,
+    },
+    /// For `AccountRequest::KeyChallenge` (protocol v22).
+    KeyChallenge {
+        challenge: String,
+    },
+    /// `KeyStepUp` held: this session is a recent sign-in.
+    SteppedUp,
+    /// `LoginKeySet` held.
+    LoginKeySaved,
 }
 
 /// Answers to `AdminOp`.

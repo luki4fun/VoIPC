@@ -68,6 +68,7 @@ fn admin_user(u: &User) -> AdminUser {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn handle(
     state: &Arc<ServerState>,
     relay: &Relay,
@@ -76,6 +77,7 @@ pub(super) async fn handle(
     ctx: &Ctx,
     op: AdminOp,
     code: Option<String>,
+    ask: Option<u32>,
 ) -> Result<AccountReply> {
     let scopes = state
         .sessions
@@ -748,6 +750,7 @@ pub(super) async fn handle(
                 active,
                 begin,
                 &options,
+                ask,
             )
             .await
         }

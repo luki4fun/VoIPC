@@ -264,6 +264,16 @@ pub struct AccountSession {
     /// turning codes on, and for nothing else. A provider alone never sets this,
     /// nor does a remembered device, so one stolen device stays what it was.
     pub vault_proven: bool,
+    /// This connection's TLS exporter (`voipc_crypto::bind`): what its proofs are bound to.
+    pub binding: Option<[u8; voipc_crypto::bind::BIND_LEN]>,
+    /// A login-key challenge waiting for `KeyStepUp`, and its nonce (kept here, never sent).
+    pub key_challenge: Option<(String, [u8; 16])>,
+    /// When `KeyStepUp` last held: the password again, for the next request that wants it
+    /// (`accounts::prove_recent` takes it, as it took a secret in the request).
+    pub key_stepped: Option<std::time::Instant>,
+    /// Signed in with the password's secret on this connection, and not moved to the login
+    /// key yet (`accounts::login_key_set`).
+    pub by_secret: bool,
 }
 
 impl UserSession {

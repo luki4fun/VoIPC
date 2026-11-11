@@ -30,6 +30,7 @@ use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use voipc_crypto::bind::BIND_LEN;
 
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
@@ -319,15 +320,23 @@ impl Flows {
     }
 }
 
-fn three_digits() -> String {
-    rand::thread_rng().gen_range(100..1000).to_string()
+fn six_digits() -> String {
+    format!("{:06}", rand::thread_rng().gen_range(0..1_000_000))
 }
 
-fn code_and_choices() -> (String, [String; 3]) {
-    let code = three_digits();
+/// The code and the page's three buttons. With the connection's exporter the code is
+/// `voipc_crypto::bind::provider_code` over the provider's address, which an app at 22
+/// derives from its own end and shows: through a server that passes the sign-in on, the
+/// two differ (W1-24). Six digits: such a server knows both exporters and could start
+/// flows here until two codes agree. Without one (it never lacks one), a random code.
+fn code_and_choices(binding: Option<[u8; BIND_LEN]>, url: &str) -> (String, [String; 3]) {
+    let code = match binding {
+        Some(x) => voipc_crypto::bind::provider_code(&x, url.as_bytes()),
+        None => six_digits(),
+    };
     let mut others = Vec::with_capacity(2);
     while others.len() < 2 {
-        let other = three_digits();
+        let other = six_digits();
         if other != code && !others.contains(&other) {
             others.push(other);
         }
@@ -355,6 +364,7 @@ impl Relay {
         intent: Intent,
         user: Option<&User>,
         ip: IpAddr,
+        binding: Option<[u8; BIND_LEN]>,
     ) -> Result<(String, String, [u8; 32]), String> {
         if !self.providers.admit(ip) {
             return Err("Too many sign-ins from your address. Try again later.".into());
@@ -370,7 +380,7 @@ impl Relay {
             .find_map(|p| p.strip_prefix("state="))
             .ok_or("unexpected sign-in step")?
             .to_string();
-        let (code, choices) = code_and_choices();
+        let (code, choices) = code_and_choices(binding, &url);
         let ticket: [u8; 32] = rand::random();
         self.providers.by_state.insert(state.clone(), ticket);
         self.providers.by_ticket.insert(
@@ -396,9 +406,10 @@ impl Relay {
         stream: &mut S,
         kind: ProviderKind,
         ip: IpAddr,
+        binding: Option<[u8; BIND_LEN]>,
     ) -> Result<(), String> {
         let (url, code, ticket) =
-            self.flow_begin(kind, Purpose::SignIn, Intent::Login, None, ip)?;
+            self.flow_begin(kind, Purpose::SignIn, Intent::Login, None, ip, binding)?;
         step(
             stream,
             AuthStep::OpenBrowser {
@@ -828,6 +839,7 @@ pub(super) async fn resume<S: AsyncRead + AsyncWrite + Unpin>(
     ctx: &l4f_accounts::service::Ctx,
     ip: IpAddr,
     answers: &mut u32,
+    binding: Option<[u8; voipc_crypto::bind::BIND_LEN]>,
 ) -> Result<SignedIn, String> {
     let ticket: [u8; 32] = ticket.try_into().map_err(|_| ENDED.to_string())?;
     let not_yet = relay
@@ -871,7 +883,10 @@ pub(super) async fn resume<S: AsyncRead + AsyncWrite + Unpin>(
         _ => return Err(ENDED.into()),
     };
     let token = session.token.clone();
-    let r = finish(state, relay, stream, buf, ctx, session, answers, ip).await;
+    let r = finish(
+        state, relay, stream, buf, ctx, session, answers, ip, binding,
+    )
+    .await;
     if r.is_err() {
         let _ = relay.accounts.logout(&token).await;
     }
@@ -1118,6 +1133,7 @@ async fn finish<S: AsyncRead + AsyncWrite + Unpin>(
     session: NewSession,
     answers: &mut u32,
     ip: IpAddr,
+    binding: Option<[u8; voipc_crypto::bind::BIND_LEN]>,
 ) -> Result<SignedIn, String> {
     let gone = || "Something went wrong. Please try again.".to_string();
     let work = || relay.pending_slot(ip).ok_or_else(|| BUSY.to_string());
@@ -1163,16 +1179,26 @@ async fn finish<S: AsyncRead + AsyncWrite + Unpin>(
                 info!(user = %user.id.hex(), "account claimed through a provider");
                 break identity_key;
             }
-            AuthContinue::ProviderProof { signature } if !claim_it => {
+            // Only the bound proof (22): an unbound one is what a server passing the
+            // sign-in on would hold (W1-24)
+            AuthContinue::ProviderProofBound { signature, web } if !claim_it => {
                 let key = known.as_deref().ok_or_else(unexpected)?;
-                if !voipc_crypto::account::provider_proof_ok(
+                let Some(b) = voipc_crypto::bind::Binding::claimed(web, binding) else {
+                    return Err(super::NOT_THIS_CONNECTION.into());
+                };
+                if !voipc_crypto::account::provider_proof_bound_ok(
                     key,
                     &relay.relay_id,
                     &user.username,
                     &challenge,
+                    &b,
                     &signature,
                 ) {
-                    return Err("That does not open this account.".into());
+                    return Err(
+                        "That does not open this account, or the sign-in was not made \
+                                on this connection."
+                            .into(),
+                    );
                 }
                 break key.to_vec();
             }
@@ -1209,6 +1235,7 @@ async fn finish<S: AsyncRead + AsyncWrite + Unpin>(
         identity_key,
         prekey_bundle,
         vault_proven: true,
+        by_secret: false,
     })
 }
 
@@ -1461,10 +1488,11 @@ pub(super) fn start_for_account(
     kind: ProviderKind,
     link: bool,
     ip: IpAddr,
+    binding: Option<[u8; BIND_LEN]>,
 ) -> AccountReply {
     let intent = if link { Intent::Link } else { Intent::Reauth };
     let purpose = Purpose::Account { session_id };
-    match relay.flow_begin(kind, purpose, intent, Some(user), ip) {
+    match relay.flow_begin(kind, purpose, intent, Some(user), ip, binding) {
         Ok((url, code, _)) => AccountReply::ProviderBrowser { url, code },
         Err(reason) => refused("ProviderStart", &reason),
     }
@@ -1490,6 +1518,26 @@ pub(super) async fn unlink(
             "That provider is not linked here.",
         ));
     };
+    // Deleting the account later still takes what the move brought under this Discord id
+    // (W1-34): kept before the link goes, read only then and in the account's export
+    if kind_l4f == l4f_accounts::oauth::Kind::Discord {
+        if let Some(dc_id) = std::str::from_utf8(&cred.ext_id)
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+        {
+            db!(relay.store(), pool => {
+                sqlx::query(
+                    "INSERT INTO voipc_dc_unlinked (account, dc_id, at) VALUES ($1, $2, $3)
+                     ON CONFLICT DO NOTHING",
+                )
+                .bind(&user.id.0[..])
+                .bind(dc_id)
+                .bind(util::now())
+                .execute(pool)
+                .await?;
+            });
+        }
+    }
     Ok(
         match relay
             .accounts

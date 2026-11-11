@@ -399,6 +399,13 @@ mod desktop {
                 .as_ref()
                 .is_some_and(|w| !w.answer.is_closed() && w.asked.takes(reply));
             match reply {
+                // Numbered: the page's, whatever it says, since a run's frames go unnumbered
+                // (protocol v22). It was counted with the page's, ahead of a frame or not
+                AccountReply::Asked { .. } => {
+                    self.page_ahead = self.page_ahead.saturating_sub(1);
+                    self.page_out = self.page_out.saturating_sub(1);
+                    false
+                }
                 // A refusal names no step, so it goes by the order they were sent in
                 AccountReply::Error { request, .. } if request == "Admin" => {
                     if self.page_ahead > 0 {
@@ -590,7 +597,13 @@ mod desktop {
             if tcp_tx.send(msg).is_err() {
                 return;
             }
-            if matches!(msg, ClientMessage::Account(AccountRequest::Admin { .. })) {
+            // Numbered or not: an older relay answers `AdminAsk` unnumbered
+            if matches!(
+                msg,
+                ClientMessage::Account(
+                    AccountRequest::Admin { .. } | AccountRequest::AdminAsk { .. }
+                )
+            ) {
                 if let Some(slot) = slots.get_mut(server).filter(|s| s.going.is_some()) {
                     slot.wire.page_out += 1;
                 }
@@ -2377,6 +2390,36 @@ mod desktop {
                 frames.try_recv().is_err(),
                 "nothing was offered to the relay"
             );
+        }
+
+        /// W2-31: the page numbers its asks on a 22 relay. A numbered answer is the page's
+        /// whatever it says, ahead of the run's frame or not, and the run gets its own.
+        #[tokio::test(start_paused = true)]
+        async fn a_numbered_answer_is_the_pages_and_the_count_stays_right() {
+            let s = scene();
+            let _going = s.hub.take_up(SERVER).unwrap();
+            let page_ask = ClientMessage::Account(AccountRequest::AdminAsk {
+                ask: 3,
+                op: AdminOp::MoveExcluded {
+                    after: "1000".into(),
+                },
+                code: None,
+            });
+            s.hub.send_for_page(SERVER, &s.tcp_tx, &page_ask);
+            let mut first = s.frame(AdminOp::MoveExcluded { after: "".into() });
+            let excluded = |id: &str| AdminReply::MoveExcluded {
+                ids: vec![(id.to_string(), true, true, 1)],
+                more: false,
+            };
+            let numbered =
+                voipc_protocol::codec::encode_asked(3, &AccountReply::Admin(excluded("1001")))
+                    .unwrap();
+            assert!(s.hub.on_reply(SERVER, numbered).is_some(), "the page's");
+            assert_eq!(s.hub.lock()[SERVER].wire.page_out, 0);
+            assert!(first.try_recv().is_err(), "the run still waits");
+            // Its refusal now, unnumbered: the run's
+            assert!(s.hub.on_reply(SERVER, refused_op("Too many")).is_none());
+            assert!(matches!(first.try_recv(), Ok(Err(Stop::Said(_)))));
         }
 
         /// W2-29: the page's "Show more" on the left-out list is out when the run reads it

@@ -1359,7 +1359,8 @@ async fn main() -> Result<()> {
                     // A native client's files, or the TCP fallback
                     Some(b"http/1.1") => {
                         tunnel::tune(tls_stream.get_ref().0, peer_addr);
-                        tunnel::serve(tls_stream, http_state, peer_addr).await;
+                        let binding = web::tls_binding(tls_stream.get_ref().1);
+                        tunnel::serve(tls_stream, http_state, peer_addr, binding).await;
                     }
                     _ => debug!(peer = %peer_addr, "no ALPN (a pre-0.5 client?), closing"),
                 },
