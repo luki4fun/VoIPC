@@ -2521,7 +2521,7 @@ dependencies = [
 
 [[package]]
 name = "voipc-audio"
-version = "1.11.0"
+version = "1.11.1-rc.1"
 dependencies = [
  "anyhow",
  "audiopus",
@@ -2540,7 +2540,7 @@ dependencies = [
 
 [[package]]
 name = "voipc-crypto"
-version = "1.11.0"
+version = "1.11.1-rc.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2569,6 +2569,7 @@ dependencies = [
  "libfuzzer-sys",
  "voipc-audio",
  "voipc-crypto",
+ "voipc-import",
  "voipc-media",
  "voipc-opus-wasm",
  "voipc-protocol",
@@ -2576,8 +2577,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "voipc-import"
+version = "1.11.1-rc.1"
+dependencies = [
+ "postcard",
+ "serde",
+ "serde_json",
+ "tokio",
+ "voipc-protocol",
+]
+
+[[package]]
 name = "voipc-media"
-version = "1.11.0"
+version = "1.11.1-rc.1"
 dependencies = [
  "gif",
  "image-webp",
@@ -2596,7 +2608,7 @@ dependencies = [
 
 [[package]]
 name = "voipc-protocol"
-version = "1.11.0"
+version = "1.11.1-rc.1"
 dependencies = [
  "bytes",
  "postcard",
@@ -2607,7 +2619,7 @@ dependencies = [
 
 [[package]]
 name = "voipc-web"
-version = "1.11.0"
+version = "1.11.1-rc.1"
 dependencies = [
  "anyhow",
  "console_error_panic_hook",

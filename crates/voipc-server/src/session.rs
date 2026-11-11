@@ -57,22 +57,8 @@ const MAX_DM_ECHO: usize = 1024;
 /// What channels may fill one list's frame, less what goes around them.
 const CHANNELS_FRAME_BYTES: usize = 60 * 1024;
 
-/// A character no user or channel name may contain: control characters, and
-/// the ones that print as nothing or reorder what follows them — with those,
-/// "admin\u{200B}" passes for "admin" and an RTL override turns a tag around.
-/// Look-alike letters from other scripts are not caught here.
-pub(crate) fn bad_name_char(c: char) -> bool {
-    c.is_control()
-        || matches!(c,
-            '\u{00AD}'                      // soft hyphen
-            | '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}' // Hangul fillers
-            | '\u{200B}'..='\u{200F}'       // zero-width space/joiners, LRM, RLM
-            | '\u{202A}'..='\u{202E}'       // bidi embeddings and overrides
-            | '\u{2060}'..='\u{2064}'       // word joiner, invisible operators
-            | '\u{2066}'..='\u{2069}'       // bidi isolates
-            | '\u{FEFF}'                    // zero-width no-break space
-        )
-}
+/// Shared with the desktop importer (`voipc_protocol::names`).
+pub(crate) use voipc_protocol::names::bad_name_char;
 
 /// Whether a pre-key bundle is the shape a client is supposed to send.
 fn bundle_is_sane(bundle: &PreKeyBundleData) -> bool {
@@ -339,7 +325,9 @@ pub async fn handle_connection<S>(
 }
 
 /// Runs `cleanup_session` if the connection task ends without doing it
-/// itself: only on a panic, since the normal path disarms it first.
+/// itself: on a panic, or when it is cancelled from outside (a relay shutting
+/// down, a handler aborted after its connection ended), since the normal path
+/// disarms it first.
 struct CleanupGuard {
     state: Option<Arc<ServerState>>,
     user_id: UserId,
@@ -350,10 +338,19 @@ impl Drop for CleanupGuard {
     fn drop(&mut self) {
         if let Some(state) = self.state.take() {
             let (user_id, session_id) = (self.user_id, self.session_id);
-            error!(
-                user_id,
-                session_id, "connection task ended without cleaning up; cleaning up now"
-            );
+            // Only a panic is an error: a shutdown cancels every connection's task, and
+            // said one ERROR per client
+            if std::thread::panicking() {
+                error!(
+                    user_id,
+                    session_id, "connection task ended without cleaning up; cleaning up now"
+                );
+            } else {
+                debug!(
+                    user_id,
+                    session_id, "connection task cancelled; cleaning up"
+                );
+            }
             tokio::spawn(async move { cleanup_session(&state, user_id, session_id).await });
         }
     }
@@ -619,7 +616,16 @@ where
         // Account names are ASCII (`normalize_username`), so a guest's in
         // another script can only pass for one: a Cyrillic `а` for `a`. The
         // name its look-alikes spell is checked like the name itself (S-014).
-        if let Some(look) = ascii_look_alike(name) {
+        let look = ascii_look_alike(name);
+        if [Some(name), look.as_deref()]
+            .into_iter()
+            .flatten()
+            .any(crate::accounts::placeholder::kept_for_the_move)
+        {
+            refuse(stream, crate::accounts::placeholder::KEPT_FOR_THE_MOVE).await?;
+            anyhow::bail!("guest took the move's name shape");
+        }
+        if let Some(look) = look {
             if relay.is_account_name(&look).await? {
                 refuse(stream, "that name looks like an account's on this server").await?;
                 anyhow::bail!("guest name looks like an account's");
@@ -945,6 +951,13 @@ async fn handle_message(
         }
         // One token however many: it tells nobody, which is what the budget pays for
         ClientMessage::JoinTextChannels { channels, quiet } => {
+            // A line that says which path a client's text goes by: a device pass found none
+            debug!(
+                user_id,
+                channels = channels.len(),
+                quiet = quiet.len(),
+                "following text channels on the live path"
+            );
             if state.spend(session_id, |s| &mut s.join_rate) {
                 state
                     .follow_text_channels(user_id, &channels, &quiet, tx)
@@ -2241,7 +2254,7 @@ async fn handle_create_channel(
 ) -> Result<()> {
     // Validate and sanitize name
     let name = name.trim().to_string();
-    if name.is_empty() || name.len() > state.settings.max_channel_name_len {
+    if name.is_empty() || name.chars().count() > state.settings.max_channel_name_len {
         channel_error(
             tx,
             format!(
@@ -2253,7 +2266,8 @@ async fn handle_create_channel(
         return Ok(());
     }
 
-    if name.chars().any(bad_name_char) {
+    // One of only what draws nothing is a blank row in everyone's list (W1-36)
+    if name.chars().any(bad_name_char) || !voipc_protocol::names::draws_something(&name) {
         channel_error(tx, "channel name contains invalid characters").await;
         return Ok(());
     }
@@ -2328,6 +2342,9 @@ async fn handle_set_channel_password(
                 crate::accounts::locked_log(state, channel_id).await;
             }
             channel_updated(state, updated_info).await;
+            if locks {
+                crate::layout::welcome_locked(state, channel_id).await;
+            }
         }
         Err(e) => {
             channel_error(tx, e.to_string()).await;
@@ -2394,6 +2411,24 @@ async fn handle_set_channel_options(
             channel_error(
                 tx,
                 "only an admin or the channel's creator can turn anonymity off".to_string(),
+            )
+            .await;
+            return Ok(());
+        }
+    }
+    // A hidden member list is the admins' to see (THREAT-MODEL): switched off for a moment,
+    // it would hand the list to someone standing outside, with no row in the log (W1-26)
+    if request.hide_members == Some(false) && !state.is_admin(session_id) {
+        let shows = state
+            .channels
+            .read()
+            .await
+            .get(&channel_id)
+            .is_some_and(|c| c.info.hide_members && c.info.created_by != Some(user_id));
+        if shows {
+            channel_error(
+                tx,
+                "only an admin or the channel's creator can show its member list again".to_string(),
             )
             .await;
             return Ok(());

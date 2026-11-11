@@ -85,6 +85,16 @@ pub enum ProviderAnswer {
     KeySaved,
 }
 
+/// The refusal of a page no provider's, or nothing (W3-10: the check was tested as a function,
+/// and the command that must call it was not). The command goes through here.
+fn page_to_open(url: &str) -> Result<(), String> {
+    if provider_page_ok(url) {
+        Ok(())
+    } else {
+        Err("This server named a page that is no provider's: not opening it.".into())
+    }
+}
+
 /// What this ends with when the person chose their password; the name follows.
 pub const USE_PASSWORD: &str = "Sign in with your password: ";
 
@@ -101,9 +111,7 @@ pub enum ProviderAsk {
 #[tauri::command]
 pub async fn account_open_page(app: tauri::AppHandle, url: String) -> Result<(), String> {
     use tauri_plugin_opener::OpenerExt;
-    if !provider_page_ok(&url) {
-        return Err("This server named a page that is no provider's: not opening it.".into());
-    }
+    page_to_open(&url)?;
     app.opener()
         .open_url(url, None::<&str>)
         .map_err(|e| format!("Could not open the browser: {e}"))
@@ -1344,6 +1352,17 @@ pub async fn forget_device(
 
 #[cfg(test)]
 mod tests {
+
+    /// W3-10: the command's own check, which a hostile relay's page meets.
+    #[test]
+    fn the_command_opens_no_page_that_is_no_providers() {
+        assert!(super::page_to_open("https://evil.example/oauth2/authorize?x").is_err());
+        assert!(
+            super::page_to_open("https://www.facebook.com/l.php?u=https://evil.example").is_err()
+        );
+        // The control
+        assert!(super::page_to_open("https://discord.com/oauth2/authorize?client_id=1").is_ok());
+    }
     use super::*;
     use voipc_protocol::codec::{encode_server_msg, PROTOCOL_VERSION};
 

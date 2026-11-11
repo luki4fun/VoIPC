@@ -578,8 +578,9 @@ VoIPC is MIT licensed. Contributions are welcome.
 4. Run the checks CI runs:
    - `cargo fmt --all` and `cargo clippy --workspace --all-targets -- -D warnings`;
    - `cargo test --workspace --locked` and `npm --prefix client test`;
-   - `./test-web.sh` after `VOIPC_SELFTEST=1 npm run web`, for anything the browser client
-     touches.
+   - `./test-web.sh` after `VOIPC_SELFTEST=1 npm run web` and
+     `cargo build --release --locked -p voipc-server --example import_replay`, for anything the
+     browser client touches.
 
    [BUILDING.md](BUILDING.md#toolchain-all-platforms) lists the full gate.
 5. Submit a pull request

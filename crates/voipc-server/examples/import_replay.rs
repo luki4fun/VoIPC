@@ -183,9 +183,9 @@ impl RelayLink for Link {
 struct Named(Vec<String>);
 
 impl EmoteSink for Named {
-    async fn add(&mut self, emote: &PlannedEmote) -> Result<(), String> {
+    async fn add(&mut self, emote: &PlannedEmote) -> Result<String, String> {
         self.0.push(emote.name.clone());
-        Ok(())
+        Ok(emote.name.clone())
     }
 }
 

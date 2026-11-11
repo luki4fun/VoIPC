@@ -366,16 +366,19 @@ impl Relay {
 
     /// The category goes; its channels stay, outside any. An import's row stays too, so that
     /// a delta does not make it again, but names nothing now: the next category made may
-    /// get this id, and is nobody's import.
+    /// get this id, and is nobody's import. All three or none: a row still naming the id
+    /// past the delete had an undo take the next category made by hand (W2-28).
     pub async fn category_delete(&self, id: u32) -> Result<()> {
         db!(self.store(), pool => {
-            sqlx::query("UPDATE voipc_channels SET category = NULL WHERE category = $1").bind(id as i32).execute(pool).await?;
-            sqlx::query("DELETE FROM voipc_categories WHERE id = $1").bind(id as i32).execute(pool).await?;
+            let mut tx = pool.begin().await?;
+            sqlx::query("UPDATE voipc_channels SET category = NULL WHERE category = $1").bind(id as i32).execute(&mut *tx).await?;
+            sqlx::query("DELETE FROM voipc_categories WHERE id = $1").bind(id as i32).execute(&mut *tx).await?;
             sqlx::query("UPDATE voipc_import_items SET local = '' WHERE kind = $1 AND local = $2")
                 .bind(KIND_CATEGORY)
                 .bind(id.to_string())
-                .execute(pool)
+                .execute(&mut *tx)
                 .await?;
+            tx.commit().await?;
         });
         Ok(())
     }

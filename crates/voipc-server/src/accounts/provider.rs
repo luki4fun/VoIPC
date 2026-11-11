@@ -627,6 +627,22 @@ pub async fn confirm(state: &Arc<ServerState>, body: &[u8], ip: IpAddr) -> Respo
             flow.purpose,
         )
     };
+    // In its own task: a browser that goes away mid-way (a closed tab, a phone off its
+    // network) drops this request, and with it the flow stayed Asking until it expired (W2-19)
+    let state = state.clone();
+    tokio::spawn(async move { exchange(&state, &relay, ticket, taken, ip).await })
+        .await
+        .unwrap_or_else(|_| ended_page())
+}
+
+/// What the provider's code comes to, past the tap.
+async fn exchange(
+    state: &Arc<ServerState>,
+    relay: &Arc<Relay>,
+    ticket: [u8; 32],
+    taken: (Kind, String, String, String, Purpose),
+    ip: IpAddr,
+) -> Response<Full<Bytes>> {
     let (kind, cookie, oauth_state, provider_code, purpose) = taken;
     let ctx = relay.ctx(ip, "web");
     match purpose {
@@ -655,19 +671,15 @@ pub async fn confirm(state: &Arc<ServerState>, body: &[u8], ip: IpAddr) -> Respo
                 flow.stage = Stage::Done(outcome);
             }
             match failed {
-                Some(reason) => page(
-                    StatusCode::OK,
-                    "That did not work",
-                    &format!("<p>{}</p>", html_text(&reason)),
-                ),
+                Some(reason) => did_not_work(&reason),
                 None => back_to_the_app(),
             }
         }
         Purpose::Account { session_id } => {
             relay.providers.remove(&ticket);
-            finish_for_account(
+            let done = finish_for_account(
                 state,
-                &relay,
+                relay,
                 session_id,
                 kind,
                 &cookie,
@@ -676,10 +688,26 @@ pub async fn confirm(state: &Arc<ServerState>, body: &[u8], ip: IpAddr) -> Respo
                 ip,
             )
             .await;
-            back_to_the_app()
+            match done {
+                Ok(()) => back_to_the_app(),
+                Err(reason) => did_not_work(&reason),
+            }
         }
     }
 }
+
+fn did_not_work(reason: &str) -> Response<Full<Bytes>> {
+    page(
+        StatusCode::OK,
+        "That did not work",
+        &format!("<p>{}</p>", html_text(reason)),
+    )
+}
+
+/// A link or proof whose connection ended before the tap: a phone's app goes to sleep
+/// while the browser is up, and comes back as a new session.
+pub(crate) const APP_GONE: &str =
+    "The app was no longer connected, so nothing changed. Start again in the app.";
 
 fn html_text(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -695,8 +723,9 @@ fn back_to_the_app() -> Response<Full<Bytes>> {
     )
 }
 
-/// A signed-in connection's link or proof. What it comes to reaches the
-/// connection; if that is gone, the next `ProviderList` shows a link.
+/// A signed-in connection's link or proof. What it comes to reaches the connection,
+/// and the page: `Err` is what to show there, since "Done" over nothing done misleads
+/// (W2-20). With the connection gone the provider is not asked at all.
 #[allow(clippy::too_many_arguments)]
 async fn finish_for_account(
     state: &Arc<ServerState>,
@@ -707,14 +736,14 @@ async fn finish_for_account(
     oauth_state: &str,
     provider_code: &str,
     ip: IpAddr,
-) {
+) -> Result<(), String> {
     let session = state.sessions.get(&session_id).and_then(|s| {
         s.account
             .as_ref()
             .map(|a| (a.user.clone(), a.info.clone(), s.control_tx.clone()))
     });
     let Some((user, info, tx)) = session else {
-        return;
+        return Err(APP_GONE.into());
     };
     let ctx = relay.ctx(ip, "web");
     let done = relay
@@ -728,22 +757,35 @@ async fn finish_for_account(
             Some((&user, &info)),
         )
         .await;
-    let answer = match done {
-        Ok((SocialOutcome::Linked, _)) => AccountReply::ProviderDone {
-            kind: kind_from(kind),
-            link: true,
-        },
-        Ok((SocialOutcome::SteppedUp(fresh), _)) => {
-            put_session(state, session_id, fresh);
+    let (answer, out) = match done {
+        Ok((SocialOutcome::Linked, _)) => (
             AccountReply::ProviderDone {
                 kind: kind_from(kind),
-                link: false,
-            }
+                link: true,
+            },
+            Ok(()),
+        ),
+        Ok((SocialOutcome::SteppedUp(fresh), _)) => {
+            put_session(state, session_id, fresh);
+            (
+                AccountReply::ProviderDone {
+                    kind: kind_from(kind),
+                    link: false,
+                },
+                Ok(()),
+            )
         }
-        Ok(_) => refused("ProviderStart", "unexpected sign-in step"),
-        Err(e) => refused("ProviderStart", e.message()),
+        Ok(_) => {
+            let why = "unexpected sign-in step";
+            (refused("ProviderStart", why), Err(why.to_string()))
+        }
+        Err(e) => (
+            refused("ProviderStart", e.message()),
+            Err(e.message().to_string()),
+        ),
     };
     let _ = crate::session::send_msg(&tx, &ServerMessage::Account(answer));
+    out
 }
 
 /// A step-up gave this session a new token; the old one no longer resolves, so
@@ -890,6 +932,11 @@ async fn signup<S: AsyncRead + AsyncWrite + Unpin>(
         };
         if altcha.is_empty() {
             return Err("The sign-up puzzle was not solved.".into());
+        }
+        // Asked again, as for a name that is taken; a shape, so it tells nothing (W1-30)
+        if super::placeholder::kept_for_the_move(&name) {
+            problem = super::placeholder::KEPT_FOR_THE_MOVE.to_string();
+            continue;
         }
         let proof = pow::Proof {
             altcha: &altcha,
@@ -1457,6 +1504,38 @@ pub(super) async fn unlink(
 
 #[cfg(test)]
 mod tests {
+
+    /// W3-35: anyone on the internet reaches these at `/account/oauth/`, and no fuzz target
+    /// can, the relay being a binary. Many generated inputs instead: no panic, a value is
+    /// a piece of what came, and text with no `%` decodes to itself.
+    #[test]
+    fn the_callbacks_query_reading_takes_anything() {
+        let alphabet: Vec<char> = "%=&ab09AF-_.~+/?é漢😀\u{0}".chars().collect();
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..20_000 {
+            let len = (next() % 24) as usize;
+            let s: String = (0..len)
+                .map(|_| alphabet[(next() % alphabet.len() as u64) as usize])
+                .collect();
+            let decoded = super::percent_decode(&s);
+            if !s.contains('%') {
+                assert_eq!(decoded, s);
+            }
+            for key in ["state", "code", "a", ""] {
+                if let Some(v) = super::query_param(&s, key) {
+                    assert!(s.contains(v), "{s:?} {key:?} {v:?}");
+                }
+            }
+        }
+        assert_eq!(super::percent_decode("a%20b%zz%"), "a b%zz%");
+        assert_eq!(super::query_param("x=1&code=ab%2F", "code"), Some("ab%2F"));
+    }
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
 

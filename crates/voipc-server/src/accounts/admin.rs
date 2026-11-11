@@ -236,9 +236,14 @@ pub(super) async fn handle(
             if let Err(e) = r {
                 return Ok(no(e));
             }
-            // Its holders' privileges and badges, wherever they are
-            super::revalidate(state).await;
-            crate::gates::prune_soon(state);
+            // Its holders' privileges and badges, wherever they are: in its own task, since it
+            // reads every connected account, and in this frame it held the admin's own
+            // connection for as long
+            let all = state.clone();
+            tokio::spawn(async move {
+                super::revalidate(&all).await;
+                crate::gates::prune_soon(&all);
+            });
             crate::layout::send_styles_all(state).await;
             Ok(groups_reply(relay, actor).await)
         }
@@ -353,7 +358,7 @@ pub(super) async fn handle(
                     "",
                 )
                 .await?;
-            super::profile::tell_everyone(state, relay, id).await;
+            super::profile::tell(state, relay, id).await;
             Ok(AccountReply::ProfileDone)
         }
         AdminOp::ServerProfileSet { name, description } => {

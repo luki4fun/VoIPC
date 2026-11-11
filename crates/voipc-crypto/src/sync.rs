@@ -67,6 +67,10 @@ const LOST_AFTER_TICKS: u32 = 3;
 /// And before what went out to be kept counts as lost, at about 30 s. Sent again it would
 /// be kept twice if only the answer was lost, so this waits longer than a read does.
 const APPEND_LOST_AFTER_TICKS: u32 = 15;
+/// Joiners waiting for our answer, across every log, at most; and those seen before that set
+/// starts over, which only says whether one is new.
+const MOST_PENDING: usize = 65_536;
+
 /// How the relay says its budget ran out for now (`accounts.rs`).
 const SLOW_DOWN: &str = "slow down";
 
@@ -2252,7 +2256,19 @@ impl AccountSync {
             }
             AccountReply::LogKeysFound { keys } => {
                 self.idle = 0;
-                self.learn(keys, &mut out, &mut events);
+                // What was asked, or someone known already: keys of strangers nobody asked
+                // for filled peers and pins without end from a relay that sent them (R1 F8).
+                // A known person's key, swapped, is still weighed against the pin
+                let asked: Vec<LogKeyInfo> = keys
+                    .iter()
+                    .filter(|k| {
+                        self.asked_keys.contains(&k.account)
+                            || self.peers.contains_key(&k.account)
+                            || self.pinned(&k.account).is_some()
+                    })
+                    .cloned()
+                    .collect();
+                self.learn(&asked, &mut out, &mut events);
                 // Answers come in order, so an ask ahead of the one this answers
                 // was lost, which says nothing about the accounts it named.
                 let at = self
@@ -2380,13 +2396,26 @@ impl AccountSync {
                 out.extend(self.answer());
             }
             AccountReply::LogPending { conv, joiners } => {
+                // So many at most, across every log: a relay's pushes grew both lists without
+                // end (R1 F8). They come with the index too, before any log is joined, so
+                // what bounds them is their number. An answer takes its joiners off
+                if self.pending_seen.len() >= MOST_PENDING {
+                    self.pending_seen.clear();
+                }
                 for j in joiners {
                     self.pending_new |= self.pending_seen.insert((conv.clone(), *j));
                 }
-                self.joiners
-                    .entry(conv.clone())
-                    .or_default()
-                    .extend(joiners.iter().copied().filter(|j| *j != self.me));
+                let mut room =
+                    MOST_PENDING.saturating_sub(self.joiners.values().map(HashSet::len).sum());
+                let waiting = self.joiners.entry(conv.clone()).or_default();
+                for j in joiners.iter().copied().filter(|j| *j != self.me) {
+                    if room == 0 {
+                        break;
+                    }
+                    if waiting.insert(j) {
+                        room -= 1;
+                    }
+                }
                 // The members we knew are from before they joined.
                 self.members.remove(conv);
                 self.asked_members.remove(conv);
@@ -2711,15 +2740,54 @@ mod tests {
         );
     }
 
+    /// Keys as the relay answers them, to what this session asked: it learns no others.
+    fn keys_answer(s: &mut AccountSync, keys: Vec<LogKeyInfo>) -> (Vec<ClientMessage>, Vec<Event>) {
+        let _ = s.ask_keys(keys.iter().map(|k| k.account).collect::<Vec<_>>());
+        s.on_reply(&AccountReply::LogKeysFound { keys }).unwrap()
+    }
+
+    /// R1 F8: frames nobody asked for grew what a session holds without end.
+    #[test]
+    fn keys_and_joiners_nobody_asked_for_are_not_kept() {
+        let (me, bob) = (account(1), account(2));
+        let mut s = sync_for(&me);
+        s.on_reply(&AccountReply::LogKeysFound {
+            keys: vec![bob.info("bob")],
+        })
+        .unwrap();
+        assert!(s.peers.is_empty(), "never asked for");
+        keys_answer(&mut s, vec![bob.info("bob")]);
+        assert!(s.peers.contains_key(&bob.id), "the control");
+
+        let joiners = |from: u32, n: u32| -> Vec<[u8; 16]> {
+            (from..from + n)
+                .map(|i| {
+                    let mut id = [0u8; 16];
+                    id[..4].copy_from_slice(&i.to_be_bytes());
+                    id[15] = 0xee;
+                    id
+                })
+                .collect()
+        };
+        let half = MOST_PENDING as u32 / 2;
+        for (conv, from) in [("c:one", 0), ("c:two", half), ("c:three", 2 * half)] {
+            s.on_reply(&AccountReply::LogPending {
+                conv: conv.into(),
+                joiners: joiners(from, half + 10),
+            })
+            .unwrap();
+        }
+        let held: usize = s.joiners.values().map(HashSet::len).sum();
+        assert_eq!(held, MOST_PENDING, "across every log");
+        assert!(s.pending_seen.len() <= MOST_PENDING);
+    }
+
     #[test]
     fn a_direct_message_only_comes_from_its_two_parties() {
         let (me, bob, carol) = (account(1), account(2), account(3));
         let mut s = sync_for(&me);
         let conv = dm_conv(&me.id, &bob.id);
-        s.on_reply(&AccountReply::LogKeysFound {
-            keys: vec![bob.info("bob"), carol.info("carol")],
-        })
-        .unwrap();
+        keys_answer(&mut s, vec![bob.info("bob"), carol.info("carol")]);
         let page = |s: &mut AccountSync, owner: &Account, epoch: u32, seq: i64, text: &str| {
             let k = epoch_key();
             let wrapped = wrap(&me.logkey.public(), &k, &conv, &owner.id, epoch, &me.id).unwrap();
@@ -3005,10 +3073,7 @@ mod tests {
         let (me, bob) = (account(1), account(2));
         let mut s = sync_for(&me);
         let conv = dm_conv(&me.id, &bob.id);
-        s.on_reply(&AccountReply::LogKeysFound {
-            keys: vec![bob.info("bob")],
-        })
-        .unwrap();
+        keys_answer(&mut s, vec![bob.info("bob")]);
         let (out, _) = s
             .on_reply(&AccountReply::LogConvs {
                 convs: vec![(conv.clone(), 9)],
@@ -3163,10 +3228,7 @@ mod tests {
         let (me, bob) = (account(1), account(2));
         let mut s = sync_for(&me);
         let conv = dm_conv(&me.id, &bob.id);
-        s.on_reply(&AccountReply::LogKeysFound {
-            keys: vec![bob.info("bob")],
-        })
-        .unwrap();
+        keys_answer(&mut s, vec![bob.info("bob")]);
         let news = AccountReply::LogNews { conv: conv.clone() };
         assert_eq!(
             wraps_asked(&s.on_reply(&news).unwrap().0),
@@ -3217,10 +3279,7 @@ mod tests {
         let (me, bob) = (account(1), account(2));
         let mut s = sync_for(&me);
         let conv = dm_conv(&me.id, &bob.id);
-        s.on_reply(&AccountReply::LogKeysFound {
-            keys: vec![bob.info("bob")],
-        })
-        .unwrap();
+        keys_answer(&mut s, vec![bob.info("bob")]);
         let news = AccountReply::LogNews { conv: conv.clone() };
         s.on_reply(&news).unwrap();
         s.on_reply(&empty_wraps(&conv)).unwrap();
@@ -3355,15 +3414,13 @@ mod tests {
         let (me, bob) = (account(1), account(2));
         let mut s = sync_for(&me);
         let conv = "c:gone".to_string();
+        s.joined.insert(conv.clone());
         s.on_reply(&AccountReply::LogPending {
             conv: conv.clone(),
             joiners: vec![bob.id],
         })
         .unwrap();
-        s.on_reply(&AccountReply::LogKeysFound {
-            keys: vec![bob.info("bob")],
-        })
-        .unwrap();
+        keys_answer(&mut s, vec![bob.info("bob")]);
         assert_eq!(s.fetch_asks.len(), 1, "the wraps its answer needs");
         s.on_reply(&AccountReply::Error {
             request: "WrapsFetch".into(),

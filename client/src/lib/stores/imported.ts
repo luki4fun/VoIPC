@@ -279,10 +279,10 @@ function reload(server: string): void {
   say(server, { threadRow: v.threadRow && takenBack(v.threadRow), back: v.back && askedAgain(v.back) });
   askOpening(server, v);
   if (v.search) importedSearch(server, v.search.query);
-  else {
-    say(server, { asking: v.from, replacing: true });
-    fetchPage(server, v, v.from);
-  }
+  // The list under a search too: Clear search showed it as it was, removed posts and all
+  // (W2-32)
+  say(server, { asking: v.from, replacing: true });
+  fetchPage(server, v, v.from);
 }
 
 // ── Search: the relay gets the words ───────────────────────────────────────

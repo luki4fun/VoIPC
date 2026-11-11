@@ -30,7 +30,9 @@ why the rest is on the desktop.
 
   The backups are what fills a small disk. See [OPERATING.md](OPERATING.md) §7.
 - **A copy of the database.** On SQLite the relay makes one itself when a run begins, beside the database, named
-  `<database>.before-import-<run>`. A new run drops all but the last two, and nothing else on the relay removes them:
+  `<database>.before-import-<run>`. A run resumed after its copy was dropped gets a new one,
+  `<database>.before-resuming-import-<run>`, holding what that run had done before it stopped. A new run drops all but
+  the last two, and nothing else on the relay removes them:
   they stay until you delete them, and they hold everything, so treat them like the database. Postgres has nothing to
   make one from here: run `pg_dump` yourself, and tick that you did.
 - **`signups_per_hour`, if you expect newcomers.** People who already have an imported account do not count towards it.
@@ -216,7 +218,8 @@ The dashboard says "412 of 1,530 signed in".
   The Bans tab holds your own bans, not these. The end screen says who is no longer banned there. **Lift ban** on their
   row ends it here, with a code: they can come in the way anyone new can, and what they wrote stays. They move to *Left
   out* as held, so no later import bans them again or makes them an account. *Let back in* there undoes that, and the
-  next import bans them again if Discord still does.
+  next import bans them again if Discord still does. Someone who deleted their account themselves is the exception for
+  now: the lift holds until the next import, which bans them again while Discord does.
 - **Someone who signed in and is banned on Discord too** keeps their account: an import never suspends anyone who has
   opened one, nor links Discord back to someone who took it off, undo or no undo. Ban them by name if you mean it.
   Someone who deleted their account here and is banned on Discord gets the disabled row.

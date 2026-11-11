@@ -93,6 +93,7 @@
     flushChatSave,
     quietBlockedDms,
     receivedNow,
+    noteChannelLogNames,
   } from "./lib/stores/chat.js";
   import ChatHistorySetup from "./lib/components/ChatHistorySetup.svelte";
   import AudioSetup from "./lib/components/AudioSetup.svelte";
@@ -174,6 +175,7 @@
   import { community, livePath } from "./lib/relay-rules.js";
   import { askArchiveChannels } from "./lib/stores/imported.js";
   import { noteMemberGone, onSweepPage, startSweeps, sweepForAsker } from "./lib/stores/sweep.js";
+  import { afterJoin, joinedNow } from "./lib/stores/join-wait.js";
   import { goesByList, marksChannel } from "./lib/follow-rules.js";
   import { gateNoted, noteReaders, relayWentBack, type NamedReader } from "./lib/stores/noticing.js";
   import { forgetHandOff, handOffAnswered } from "./lib/stores/handoff.js";
@@ -195,6 +197,7 @@
     settingsAsk,
     channelNotify,
     channelRenamed,
+    channelsListed,
     firstVisit,
     forgetAutoJoinAsk,
     markKicked,
@@ -618,15 +621,20 @@
       sweepForAsker(server, () => answerHandOff(server, data, false));
       return;
     }
+    const ours = channelId === get(currentChannelId.peek(server)) || get(joinedTextChannelIds.peek(server)).has(channelId);
+    // Before its join: on a one-page account the relay answers the page first, so a held ask
+    // always came early and was dropped with no word. It goes on at the join (device pass)
+    if (mayWait && right && !ours && channel?.text) {
+      afterJoin(server, channelId, () => answerHandOff(server, data, true));
+      return;
+    }
     const answer = answersHandOff({
       switchOn: $shareChannelHistory,
       right: get(shareRight.peek(server)),
       anonymous: !!channel?.anonymous,
       listenOnly: get(listenOnly.peek(server)).has(channelId),
       held: !!hold?.text || !!hold?.direct,
-      ours:
-        channelId === get(currentChannelId.peek(server)) ||
-        get(joinedTextChannelIds.peek(server)).has(channelId),
+      ours,
       swept,
       askerOnline: onlineById(server).has(data.from_user_id),
       askerOnSweep: !!asker,
@@ -1018,6 +1026,8 @@
       listenServer<ChannelInfo[]>("channel-list", (server, raw) => {
         const list = eachOnce(raw, (c) => c.channel_id);
         channels.of(server).set(list);
+        // Renamed while this device was away: what it keeps by name follows
+        channelsListed(server, list);
         // A reconnect waits for this before deciding where to put the user back
         channelListArrived(server, list);
         // The sidebar draws the people under every channel, and the names for
@@ -1639,6 +1649,7 @@
       listenServer<ChannelInfo>("channel-updated", (server, updated) => {
         const before = get(channels.peek(server)).find((c) => c.channel_id === updated.channel_id);
         if (before && before.name !== updated.name) channelRenamed(server, before.name, updated.name);
+        noteChannelLogNames(server, [updated]);
         channels.of(server).update((chs) =>
           chs.map((ch) => (ch.channel_id === updated.channel_id ? updated : ch)),
         );
@@ -1672,6 +1683,7 @@
       }>("text-joined", (server, data) => {
         const ids = data.joined.map((row) => row.channel_id);
         joinedTextChannelIds.of(server).update((had) => new Set([...had, ...ids]));
+        joinedNow(server, ids);
         textSeats.of(server).update((had) => {
           const next = new Map(had);
           for (const row of data.joined) next.set(row.channel_id, { gated: row.gated, lastPost: row.last_post_ms });

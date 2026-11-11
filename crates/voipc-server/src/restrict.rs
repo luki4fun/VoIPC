@@ -78,6 +78,8 @@ pub struct Silence {
     pub(crate) direct_until: i64,
     pub(crate) by: String,
     pub(crate) reason: String,
+    /// When `by`'s own restriction ends, whatever the new-member wait adds.
+    pub(crate) by_until: i64,
 }
 
 /// The clock is read only for someone held: this runs per voice packet.
@@ -112,13 +114,18 @@ impl Silence {
     }
 
     /// As a row on the wire. With several ends, the nearest: that is when the row
-    /// next changes.
+    /// next changes. A moderator's row ends when theirs does: with the new-member wait also
+    /// running, the wait's end read as theirs, "Timed out by @mod until" ten minutes on for
+    /// a day's time-out (W3-17). The wait's end is told when it comes, as any lapse is.
     fn row(&self, user_id: UserId, now: i64) -> Restriction {
-        let next = self
-            .untils()
-            .into_iter()
-            .filter(|u| *u > now && *u != i64::MAX)
-            .min();
+        let next = if self.by.is_empty() {
+            self.untils()
+                .into_iter()
+                .filter(|u| *u > now && *u != i64::MAX)
+                .min()
+        } else {
+            Some(self.by_until).filter(|u| *u > now && *u != i64::MAX)
+        };
         Restriction {
             user_id,
             voice: self.voice_until > now,
@@ -191,6 +198,7 @@ fn worked_out(state: &ServerState, s: &UserSession, now: i64) -> Silence {
             let until = r.expires_at.unwrap_or(i64::MAX);
             out.voice_until = if r.voice { until } else { 0 };
             out.text_until = if r.text { until } else { 0 };
+            out.by_until = until;
             out.by.clone_from(&r.by);
             out.reason.clone_from(&r.reason);
         }
@@ -652,4 +660,38 @@ async fn lift(
     }
     state.restrictions.remove(&key);
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// W3-17: a day's time-out while the new-member wait has ten minutes to go.
+    #[test]
+    fn a_moderators_row_ends_when_theirs_does() {
+        let now = 1_000_000;
+        let mut held = Silence {
+            voice_until: now + 86_400,
+            text_until: now + 86_400,
+            direct_until: now + 600,
+            by: "mod".into(),
+            by_until: now + 86_400,
+            ..Default::default()
+        };
+        assert_eq!(held.row(7, now).expires_in_secs, Some(86_400));
+        held.by_until = i64::MAX;
+        assert_eq!(
+            held.row(7, now).expires_in_secs,
+            None,
+            "until someone lifts it"
+        );
+        // The control: the wait alone ends when it does
+        let wait = Silence {
+            voice_until: now + 600,
+            text_until: now + 600,
+            direct_until: now + 600,
+            ..Default::default()
+        };
+        assert_eq!(wait.row(7, now).expires_in_secs, Some(600));
+    }
 }

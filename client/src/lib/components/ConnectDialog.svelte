@@ -153,12 +153,20 @@
     const [h, p, m] = [host, port, mode];
     providers = [];
     if (m !== "account" || !h.trim() || !p) return;
+    // An answer for the host typed before goes nowhere: it put that server's buttons on this
+    // one's form (W2-38)
+    let gone = false;
     const t = setTimeout(() => {
       invoke<{ providers: string[] }>("account_provider_ask", { address: serverId(h, p), ask: { kind: "providers" } })
-        .then((r) => (providers = [...new Set(r.providers)]))
+        .then((r) => {
+          if (!gone) providers = [...new Set(r.providers)];
+        })
         .catch(() => {});
     }, 500);
-    return () => clearTimeout(t);
+    return () => {
+      gone = true;
+      clearTimeout(t);
+    };
   });
 
   async function startProvider(provider: string) {

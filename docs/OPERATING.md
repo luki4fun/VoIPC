@@ -175,11 +175,15 @@ WantedBy=multi-user.target
       sudo -u voipc voipc-server --config /etc/voipc/server.toml db backup /var/backups/voipc/voipc-$(date +%F).db
 
 - **Postgres:** `pg_dump -Fc`, as the unit below runs it. A dump holds no index and no dead rows.
-- **Also back up** `server.toml`, `channels.json`, `server_settings.json` and `bans.json`.
+- **Also back up** `server.toml`, `channels.json`, `server_settings.json`, `bans.json` and
+  `emotes/`. After a move from Discord the database records each emote as brought, so a later
+  run skips it: a database restored without its `emotes/` keeps the move's emotes away for
+  good, and posts show their names as plain words.
 - **How long to keep backups: 30 days at most.** A person who deletes their account or their
   kept messages expects them gone. A backup brings them back until it is itself deleted.
 - **A run from Discord** copies a SQLite database first, beside it, as `<database>.before-import-<run>`,
-  readable by the owner only. A new run drops all but the last two, and nothing in the relay removes them otherwise: they
+  readable by the owner only. A run resumed after its copy was dropped gets a new one, `<database>.before-resuming-import-<run>`,
+  which holds what the run had done before it stopped. A new run drops all but the last two, and nothing in the relay removes them otherwise: they
   stay until you delete them. Postgres has nothing to make one from here: `pg_dump` first, and tick that you did. These
   hold everything, so the 30 days apply to them too: delete them when you know the move went well. The daily timer below
   does it at 30 days if you have not.
@@ -294,6 +298,19 @@ and the apps right after (the way back: [COMPATIBILITY.md](COMPATIBILITY.md) §4
 
 The apps go back by hand too ([COMPATIBILITY.md](COMPATIBILITY.md) §4).
 
+**From 1.6 to 1.11** (protocol 15 to 21), the step most relays take, since 1.7 to 1.10 were
+release candidates only. The notes below for 1.9 to 1.10 and 1.10 to 1.11 hold for it too; on top
+of them:
+- **Apps first:** a 1.11 app talks to the 1.6 relay meanwhile, with a banner saying what is off;
+  a 1.6 app cannot talk to a 1.11 relay.
+- **Three more migrations:** `0005_gates.sql` (who may see and join a channel, and speak in it),
+  `0006_community.sql` (channels made in the app, and where each channel sits) and
+  `0007_group_sections.sql`. Going back takes the 1.6 binary and the backup.
+- **New keys, with defaults that change nothing:** `public_url` (empty: no sign-in with Discord,
+  Google or Facebook) and `signups_per_hour` (60) in `[accounts]`, and `server_name` and
+  `server_description` in `server_settings.json` (for a relay without accounts). A 1.6 relay
+  refuses the first two ([COMPATIBILITY.md](COMPATIBILITY.md)).
+
 **From 1.9 to 1.10** (protocol 18 to 19):
 - **A migration:** `0008_moderation.sql` adds the moderation log and the restrictions, so going back takes the old binary
   and the backup.
@@ -347,7 +364,7 @@ The simplest way is a host directory that user 65532 owns:
     install -d -o 65532 -g 65532 -m 0700 /srv/voipc
     install -o 65532 -g 65532 -m 0600 server.toml cert.pem key.pem /srv/voipc/
     docker run -d --name voipc -v /srv/voipc:/data \
-      -p 9987:9987/tcp -p 9987:9987/udp ghcr.io/luki4fun/voipc-server:1.11.0
+      -p 9987:9987/tcp -p 9987:9987/udp ghcr.io/luki4fun/voipc-server:1.11.1-rc.1
     docker exec voipc /voipc-server --config /data/server.toml admin grant <name> admin
 
 With a named volume instead, copy the files in with a throwaway container first, then run the
@@ -643,6 +660,10 @@ Runtime settings in `server_settings.json`:
   "new_member_wait_mins": 0
 }
 ```
+
+`max_channels` and `max_channel_name_len` (in characters) bind the temporary channels any member can make. Channels
+from `channels.json`, the admin panel and a move from Discord are not counted in `max_channels`, and their names go by
+their own limit of 64 characters.
 
 `new_member_wait_mins` (0, off, by default; at most 10080, a week; read at start) holds new members back from speaking, posting and writing direct messages for that long, against raids. An account counts from when it was made; a guest from when that address first came, and a guest counts as new again once the wait and one more day have gone by since their last visit. Someone a move from Discord brought counts from their Discord join date if that covers the whole wait when the import ran, and otherwise from when they open the account. Admins, holders of a privilege and anyone in a group other than the built-in `user` do not wait, so someone you invite into a call cannot talk until the wait ends unless you give them a group, and an invite link that hands one out skips it. A plain group made by a move does not lift it. A guest's clock lives in memory: a restart, a self-update included, starts it again for every guest there. An account's does not. It keeps at most 100,000 addresses: when it is full, a guest from a new address waits from when they connect and again after a reload, and the next sweep, within five minutes, keeps only the clocks still inside the wait.
 

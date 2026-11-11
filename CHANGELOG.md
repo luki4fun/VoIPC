@@ -2,6 +2,164 @@
 
 All notable changes to VoIPC are documented here.
 
+## [1.11.1] - release candidate
+
+Protocol 21, as 1.11.0: apps and relays of both versions talk to each other.
+
+### Fixed
+- **A new display name or picture reaches everyone connected.** It went only to the people in the person's own channels,
+  so someone who saw them from outside, under a public channel's list or in older messages, kept the old one until they
+  reconnected. Going to all, it ties nobody to a channel that hides its members or names them by alias.
+- **Only an admin or the channel's creator can show a hidden member list again**, as with anonymity. Someone allowed to
+  edit channels could switch it off for a moment and read from outside who was in there, with no row in the moderation log.
+- **Names like `dc-<number>` are the move's alone.** A guest, a new account and a display name can no longer take one,
+  whether or not an account has it, so trying no longer tells anyone which Discord ids were banned on the old server.
+  An account that already has such a name keeps it.
+- **A message someone deleted from what came from Discord no longer comes back as a thread's title.** When someone else
+  opened a thread on it afterwards, the next import filed that thread under its title, which Discord takes from the
+  message's words. It is named "Thread" now, as when the thread was there first.
+- **`archive_days` no longer cuts a thread off from its newer replies.** A thread whose first message was past the limit
+  lost the row that leads into it, while its replies inside the limit stayed out of reach. That row now stays while the
+  thread has replies inside the limit, named "Thread" and with none of the old message's words.
+- **Undoing an import takes off the threads it opened on an earlier import's messages.** Their names and reply counts
+  stayed, and each thread opened empty.
+- **Leaving out someone who is banned here by name says why it cannot.** The ban holds their account, so their name and
+  Discord id stayed while the dashboard answered done. It asks you to lift that ban under *Bans* first.
+
+- **A sign-in with Facebook opens only Facebook's sign-in dialog.** Any page on www.facebook.com passed the app's check,
+  so a hostile relay could open Facebook's link redirector or a page of its own there instead.
+- **A Discord name that shows nothing no longer makes a blank row.** A nickname, channel or thread named with only U+2800
+  (the usual blank name) or similar characters came over as an empty author, a blank channel row or a blank title. Such
+  a name now counts as none: the person's username, `channel-<number>`, or "Thread". A channel made in the app cannot
+  have one either.
+- **An email-shaped nickname, or an address in a file, sticker or poll name, stays words in what came from Discord.** It
+  became a link in someone else's row.
+- **The move wizard's lists and notes show Discord's names without what could reorder its own words.** A role named with
+  a right-to-left override turned the privileges after it around, under *Power waits for your OK*.
+- **A self-signed relay at a link-local IPv6 address with its interface (`fe80::1%eth0`) connects again.** The app had
+  refused it since 1.7, before even dialling.
+
+- **An import stopped in the desktop app no longer holds the relay for other admins.** Stop ends only the app's side, so
+  while that app stayed connected another admin could neither begin a run nor undo one. A run that sends nothing for 15
+  minutes can now be taken over; if its app was only waiting on Discord, it stops at its next step.
+- **A sign-in by provider finishes when the browser goes away at the last moment.** Closing the tab, or a phone losing
+  its network, while the relay asked the provider left the app waiting until the sign-in expired, up to ten minutes.
+- **The provider page says what came of a link or a proof.** It said "Done" when the provider refused, or when the app's
+  connection had ended meanwhile, as a phone's app does while the browser is up, and nothing had been linked.
+- **A channel delete cut short still finishes.** When the deleting admin's connection ended while members were being put
+  out, the channel could stay half deleted, refused as one from channels.json, until the relay restarted. The same held
+  for a channel taken by an import's undo.
+- **A Discord ban stopped halfway is finished by the next run.** A run stopped between marking an unopened account banned
+  and renaming it left the person's real name on it for good.
+- **A group a stopped run made is taken up by the next run**, where a second one named `<name>-<number>` came beside it
+  and no undo removed the first. One made by hand under that name stays its owner's.
+- **A run resumed after its copy of the database was dropped keeps a new one**, `<database>.before-resuming-import-<run>`,
+  holding what the run had done before it stopped. The copy it made was named as one from before the run, and deleted at
+  once.
+- **An emote cut between its upload and the import's record of it is filed under its first name**, also when the server
+  was read again before going on. It came a second time as `<name>_2`, and no undo took the first. The desktop app
+  remembers this while it stays open.
+- **Deleting a category is all or nothing.** A failure halfway could leave its channels moved out with the category still
+  there, or the import's record of it naming the next category made by hand, which an undo then took.
+
+- **A channel renamed while you were away keeps what this device holds for it**: its history, its notification level, the
+  mark that you left it, and what you deleted there. The app now knows a channel by its stored log as well as its name.
+- **A channel renamed onto the name of one deleted earlier no longer wipes that one's history on this device.** The two
+  are kept together, as for a channel made again under that name, and nothing deleted in either comes back.
+- **An account panel shows its own server's sign-in ways.** With two servers open, one server's answer could land on the
+  other's panel, with its linked providers and whether it has a password, and then the panel's steps were refused.
+- **A code setup given up by a lost connection no longer comes back later**, unasked, when a provider link finishes on
+  that server.
+- **A provider list that answers late no longer lands on the server typed since** on the account form.
+- **The importer reads the whole left-out list, even while the panel pages through it.** The panel's page answered
+  first and passed for the run's, which then stopped reading early and could miss people whose posts were to go.
+- **A refused read of the left-out list no longer leaves the next "Leave them out" at Sending…** with Run shut.
+- **What came from Discord, after a removal with a search up, shows the removal under the search too**, once you clear
+  it.
+- **The Users tab keeps its search and its page** when the move dashboard refreshes. It showed the dashboard's first page
+  of the same filter.
+
+- **A password on the welcome channel ends it as the welcome**, so new devices no longer land on a channel they cannot
+  open. The panel also offers "Not the welcome" on such a channel kept by an older server.
+- **A category whose channels are all hidden no longer shows members an empty heading.** It shows for whoever manages
+  channels or stands in one of them, as the channels do.
+- **A channel made in the app goes below the channels from `channels.json`**, not above every one that had not been
+  moved with the arrows yet. Those get their place once, at the next start, in the order they show in.
+- **Channel names and descriptions are counted in characters**, as their limits say: 25 Japanese characters were
+  refused as over 64. A category's name stays at 64 bytes, since every category goes in one message, and its error now
+  says so.
+- **A temporary text channel may share the lobby's name**, as a channel made in the panel may.
+- **A time-out's line names the moderator's end** while the new-member wait also runs, not the wait's.
+- **A group with Manage accounts gets See accounts with it** in the group editor: alone it opened the admin panel on
+  the Bans form, with no way to the account list. A panel with no tab for what you hold says so.
+- **Your own message forwarded into another channel no longer counts as unread there.**
+- **The moderation log no longer calls a deleted channel "a channel you cannot see".**
+- **A key in `server_settings.json` that no setting goes by is named in the log** at start: a typo such as
+  `new_member_wait_min` turned the raid wait off with nothing to say so. `max_channel_name_len` is documented as what
+  it is, the limit for temporary channels.
+
+- **The picture and emote pickers work from the keyboard**: the server icon, your profile picture, and the emote
+  manager's files and folder. They could not take focus at all.
+- **A mute, time-out or block mark says what it means to a screen reader and on a touch screen.** The words showed only
+  on hover; the member menu now shows them too.
+- **Unlocking an account on a new device says what is left without a recovery key, another device or a password**:
+  nobody can open what it kept, and whoever runs the server can reset it.
+- **The admin lists' repeated buttons name their row** to a screen reader ("Delete #news", "Lift the ban on ann").
+- **Hide, Delete and Show on what came from Discord, and the group order arrows, are a finger's size** on a touch
+  screen.
+- **The empty ban list mentions the member list's Actions button**, not right-click alone.
+- **A member's group badge stays in sight** when a display name and an @username both show: the name clips instead.
+- **A channel's first post rings** for someone who saw the channel while it was still empty.
+- **The quiet mode setting has room around its menu** on a phone.
+- **The question about keeping copies says what it decides**: whether what you write gets a copy. What others keep
+  reaches you either way.
+- **In a short window, notifications show at the top**, where they no longer cover a dialog's buttons or its error, such
+  as Next on the first-run microphone check at 800x600. A failed connect is also written in the desktop app's log.
+- **A newcomer's request for a channel's history is answered when it arrives before the channel is joined** on your
+  side, as it can just after you connect. It went unanswered.
+
+- **A relay holds at most 2,000 channels kept here**, from the file, the app and moves together: past some 7,000 the
+  list of where each sits no longer fitted one message, and every member's channel list quietly stopped updating. Four
+  times Discord's own limit; `channels.json` is counted, never refused.
+- **An account's log key can change once a minute, then the wait doubles with each change, up to a day.** Each change
+  makes the relay walk every writer and costs every writer in its channels a step at their next post.
+- **Saving a group answers at once.** Working out its holders' privileges, which reads every connected account, no
+  longer holds the admin's own connection.
+- **A server given up on forgets what its sessions kept for a reconnect**, after the reconnect budget runs out or a key
+  is refused. It stayed in memory until the app quit.
+- **A late yes to "this costs mobile data" goes by what is true then**: someone who left meanwhile is not handed a key,
+  and a key that went stale meanwhile is asked for again rather than used.
+- **The apps keep only what they asked a relay for, and only so much**: keys nobody asked for, and no end of people
+  waiting for an answer, and on a long connection each reconnect another person made.
+- **A relay's shutdown no longer logs an error for every connected client.**
+- **A relay on SQLite commits without waiting for the disk** (l4f-accounts 0.13.1, `synchronous=NORMAL` beside its
+  WAL mode). A move from Discord writes a row at a time, and each commit waited for the disk: the relay's own import
+  tests ran in 28 s on an NVMe disk, 47 to 54 s before. A power cut can now lose the last moments of writes; it cannot
+  damage the database, and a crash of the relay alone loses nothing.
+
+### Tests
+- Rules that held with no test to say so now have one: a gate on a channel's proximity, four admin steps tried by a
+  plain member, every `<img>` and picture URL drawing only what a sanitizer wrote, and both commands that open a
+  provider's page refusing any other.
+- Three new fuzz targets, run each night: an older relay's messages (`compat`), a pairing's frames (`pair`), and
+  Discord's JSON and a member's words through the importer (`import`). The relay's provider callback, which no target
+  can reach, gets many generated inputs in its tests.
+
+### Documentation
+- **Upgrading from 1.6 to 1.11**, the step most relays take, has its own note in [OPERATING.md](docs/OPERATING.md) §8,
+  and [COMPATIBILITY.md](docs/COMPATIBILITY.md) lists the keys 1.7 to 1.9 added.
+- **Back up `emotes/` with the rest**: after a move from Discord, a database restored without it keeps the move's
+  emotes away for good.
+- The moderation log's list of rows names the move's; the archive is for accounts, not guests; THREAT-MODEL says 1.11 and
+  names the tests that exist.
+
+### Known limits
+- **Lift ban** does not hold for someone who deleted their account themselves: the next import bans them again while
+  Discord does ([MOVING.md](docs/MOVING.md)).
+- Someone who unlinked Discord before deleting their account, and whom the move never knew as a member, keeps the posts
+  filed under their Discord id: delete them before unlinking, or an admin removes them by that id
+  ([ACCOUNTS.md](docs/ACCOUNTS.md)).
+
 ## [1.11.0] - 2026-11-10
 
 Protocol 21 (20 in rc.1, which nothing else speaks: update apps and relay together). This app still talks to relays back to 1.0 (protocol 12), and on an older relay holds back what its

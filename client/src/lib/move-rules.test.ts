@@ -462,42 +462,60 @@ test("an undo that stopped says how many runs did not finish, and why if the con
 test("the Users tab asks again when the dashboard's page takes the place of its own", () => {
   const own = ownPage<{ filter: "All" | "Waiting" | "Claimed" | "Banned"; offset: number }>();
   const all = { filter: "All" as const, offset: 100 };
-  assert.equal(own.page("Waiting"), null, "nothing asked for yet");
+  const dashboards = { filter: "Waiting" as const, offset: 0 };
+  assert.equal(own.page(dashboards), null, "nothing asked for yet");
   own.asking(all);
-  assert.equal(own.page("Waiting"), null, "its own is on its way, and will take the place of that");
-  assert.equal(own.page("All"), null, "its own");
-  assert.equal(own.page("All"), null, "and again");
-  assert.equal(own.page("Waiting"), all, "the dashboard's: the same page again");
+  assert.equal(own.page(dashboards), null, "its own is on its way, and will take the place of that");
+  assert.equal(own.page({ ...all }), null, "its own");
+  assert.equal(own.page({ ...all }), null, "and again");
+  assert.equal(own.page(dashboards), all, "the dashboard's: the same page again");
   // The answer ends it: no loop, however long it goes on
-  assert.equal(own.page("All"), null);
-  assert.equal(own.page("All"), null);
+  assert.equal(own.page({ ...all }), null);
+  assert.equal(own.page({ ...all }), null);
+});
+
+// W2-33
+test("the dashboard's first page of a filter is not a search or a later page of it", () => {
+  const own = ownPage<{ search: string; offset: number; filter: "All" | "Waiting" }>();
+  const searched = { search: "ann", offset: 0, filter: "Waiting" as const };
+  own.asking(searched);
+  assert.equal(own.mine({ ...searched }), true);
+  assert.equal(own.page({ ...searched }), null);
+  const dashboards = { search: "", offset: 0, filter: "Waiting" as const };
+  assert.equal(own.mine(dashboards), false, "not shown under the search");
+  assert.deepEqual(own.page(dashboards), searched, "and asked again");
+  const later = { search: "", offset: 50, filter: "Waiting" as const };
+  own.asking(later);
+  own.page({ ...later });
+  assert.equal(own.mine(dashboards), false);
+  assert.deepEqual(own.page(dashboards), later);
 });
 
 test("asked again once, whatever comes meanwhile, and never for an answer of another filter", () => {
   const own = ownPage<{ filter: "All" | "Waiting" }>();
   own.asking({ filter: "All" });
-  own.page("All");
-  assert.ok(own.page("Waiting"));
+  own.page({ filter: "All" });
+  assert.ok(own.page({ filter: "Waiting" }));
   // A relay that never answers with what was asked for cannot make this go round
-  for (let i = 0; i < 5; i++) assert.equal(own.page("Waiting"), null);
+  for (let i = 0; i < 5; i++) assert.equal(own.page({ filter: "Waiting" }), null);
 });
 
 test("a change of filter asks once: the old filter's answer on its way is no reason to ask again", () => {
   const own = ownPage<{ filter: "All" | "Banned" }>();
   own.asking({ filter: "All" });
   own.asking({ filter: "Banned" });
-  assert.equal(own.page("All"), null);
-  assert.equal(own.page("Banned"), null);
+  assert.equal(own.page({ filter: "All" }), null);
+  assert.equal(own.page({ filter: "Banned" }), null);
   // With nothing on its way it would: the control
-  assert.ok(own.page("All"));
+  assert.ok(own.page({ filter: "All" }));
 });
 
 test("while the plain list is shown there is nothing to ask again for", () => {
   const own = ownPage<{ filter: "All" }>();
   own.asking({ filter: "All" });
-  own.page("All");
+  own.page({ filter: "All" });
   own.asking(null);
-  assert.equal(own.page("Waiting" as never), null);
+  assert.equal(own.page({ filter: "Waiting" } as never), null);
 });
 
 test("the link for newcomers comes and goes, and nothing else of the post moves", () => {

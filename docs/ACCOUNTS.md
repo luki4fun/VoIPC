@@ -292,7 +292,10 @@ gates go by the name.
 `voipc:modlog`. A row is written for a kick from the server, a ban (one row, also when
 it covers both an address and an account) and a lifted ban, in the app or from the
 server's shell, a moderator's kick from a channel, a cleared profile, a deleted
-channel, a banned member's posts removed, and a moderator's invite to a room. A channel's creator kicking or inviting someone takes no privilege and writes
+channel, a banned member's posts removed, and a moderator's invite to a room. On a server moved from Discord
+([MOVING.md](MOVING.md)) also each run that begins and ends, an undo, someone left out of the move or let back in, an
+admin's OK or no to someone keeping what they could do on Discord, naming them, posts deleted from what came from
+Discord, and accounts nobody opened removed after `unclaimed_days`. A channel's creator kicking or inviting someone takes no privilege and writes
 no row. Each step writes its row first: if the row cannot be kept, the step does not
 happen. A hide and a restore are different: the server cannot see them, so the row is
 the moderator's own app saying so, marked as such. It can be left out by a changed app,
@@ -314,8 +317,9 @@ and at most 120 of one moderator's stay per hour.
   as it does on the person's mark. Every other row's reason shows to every reader.
 - **A channel shows by name only to someone who can see it**: an admin, or someone its
   gate lets in, and for a channel that hides its members only an admin. To everyone
-  else the row says "a channel you cannot see". A temporary or deleted channel shows to
-  admins only. The row itself is there for every reader.
+  else the row says "a channel you cannot see now", and a deletion's own row names no
+  channel. A temporary or deleted channel shows to admins only. The row itself is there for
+  every reader.
 - **Hiding a message is the moderator's own word.** The relay cannot see inside
   messages, so its row only says what the moderator's app reported, and is marked so. It
   always names the account that sent it, so it cannot accuse anyone else, but a modified
@@ -406,8 +410,8 @@ What is done in the app counts at once.
 - **What came from Discord.** On a server moved from Discord, a channel with old messages
   offers them in a pane of its own, beside the conversation, labelled *Imported from Discord,
   unverified. This server can read it.* They were never encrypted, and nobody signed them:
-  whoever runs the server could have changed them. Anyone standing in the channel can read and
-  search them, and the server sees what you search. It is not kept, nor who opened what. Your
+  whoever runs the server could have changed them. Anyone signed in to an account and standing
+  in the channel can read and search them, a guest not, and the server sees what you search. It is not kept, nor who opened what. Your
   device keeps none of it, and a reload forgets it. Sign in with that Discord, or link it, and
   your own posts offer *Hide* and *Delete*, one by one or all at once under *Settings → Privacy
   & data*. Hidden, only you see them, and whoever runs the server still has them; *Show* brings
@@ -418,7 +422,9 @@ What is done in the app counts at once.
   can bring more of them, and you would have to delete them again. Someone else's post that names you or
   forwards yours stays: it is theirs. A post of yours that
   opened a thread stays for the replies in it, for others with no author and no words, and named
-  "Thread". Deleting your account takes them too. A moderator's
+  "Thread". Deleting your account takes them too, unless you unlinked Discord first and the move never knew
+  you as a member (you had left Discord by then, or linked after its last run): then the server cannot tell
+  which are yours. Delete them before you unlink, or ask an admin to remove them by your Discord id. A moderator's
   *Hide*, your block list and *Report* do not reach these rows; removing a banned member's posts
   does, by when they were written. Only an admin deletes someone else's, and it takes a code.
 - **A new password.** *Your account → Password: Change* asks for the current one,

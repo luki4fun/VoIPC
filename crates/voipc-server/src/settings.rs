@@ -12,7 +12,8 @@ pub struct ServerSettings {
     #[serde(default = "default_max_channels")]
     pub max_channels: u32,
 
-    /// Maximum channel name length.
+    /// Maximum length, in characters, of the name of a temporary channel, the kind any member
+    /// may make. Channels from channels.json, the admin panel and a move go by 64 (W3-29).
     #[serde(default = "default_max_channel_name_len")]
     pub max_channel_name_len: usize,
 
@@ -81,6 +82,12 @@ impl Default for ServerSettings {
 impl ServerSettings {
     pub fn load_from_file(path: &Path) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
+        for key in unknown_keys(&content) {
+            tracing::warn!(
+                "{}: no setting is called {key:?}, so it does nothing: a typo, or one of a newer version's",
+                path.display()
+            );
+        }
         let mut settings: Self = serde_json::from_str(&content)?;
         settings.normalise();
         // A preset's stand-in, copied by hand: as a token it would be the same
@@ -125,8 +132,36 @@ impl ServerSettings {
     }
 }
 
+/// The file's keys that no setting goes by. Warned, not refused: an older relay takes a newer
+/// version's file (COMPATIBILITY.md), but a typo passed in silence, and
+/// `"new_member_wait_min"` turned the raid wait off with nothing to say so (W3-28).
+pub fn unknown_keys(content: &str) -> Vec<String> {
+    let Ok(serde_json::Value::Object(given)) = serde_json::from_str(content) else {
+        return Vec::new();
+    };
+    let Ok(serde_json::Value::Object(known)) = serde_json::to_value(ServerSettings::default())
+    else {
+        return Vec::new();
+    };
+    given
+        .keys()
+        .filter(|k| !known.contains_key(*k))
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
+    /// W3-28
+    #[test]
+    fn a_key_no_setting_goes_by_is_named() {
+        let file = r#"{"new_member_wait_min": 30, "max_channels": 5, "game_token": null}"#;
+        assert_eq!(super::unknown_keys(file), ["new_member_wait_min"]);
+        // The control: every key of the documented file is one
+        let documented = serde_json::to_string(&super::ServerSettings::default()).unwrap();
+        assert!(super::unknown_keys(&documented).is_empty());
+    }
+
     use super::*;
 
     #[test]

@@ -474,6 +474,11 @@ function onUndone(server: string, r: Extract<AdminReply, { ImportUndone: unknown
 export function onMoveReply(server: string, raw: unknown): void {
   const r = raw as { Admin?: AdminReply; Error?: { request: string; reason: string } };
   if (r.Error?.request === "Admin") {
+    // A read of the left-out list refused stayed counted, and the next exclusion's answer
+    // passed for it: the list sat at "Sending…" (W2-30). With no exclusion out, who asked
+    // a read does not matter, so one less is safe whoever this refusal was for
+    const reads = get(excludedReads.of(server));
+    if (reads > 0 && !get(excludeOut.of(server))) excludedReads.of(server).set(reads - 1);
     if (!codeAskedAgain(server)) idsBack(server, { refused: r.Error.reason });
     moveRefused(server);
     undoAsked.of(server).set(null);

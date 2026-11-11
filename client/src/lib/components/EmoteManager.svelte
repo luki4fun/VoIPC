@@ -6,6 +6,7 @@
   // sanitizer wrote (emote-import.ts), never a picked file's own bytes. The
   // panel closes on a server switch (admin-ui.ts), so the server it opened on
   // is the one it changes.
+  import { filePick } from "../actions/file-pick.js";
   import { onDestroy, tick } from "svelte";
   import { focusNow } from "../actions/focus.js";
   import { get } from "svelte/store";
@@ -694,13 +695,13 @@
     <div class="em-pick">
       <!-- No type filter: some systems' pickers then hide .zip and .wastickers.
            What is not a picture is set aside below, saying why. -->
-      <label class="btn btn-secondary">
+      <label class="btn btn-secondary" use:filePick>
         Pictures or a .zip…
         <input type="file" multiple hidden onchange={pickedFiles} />
       </label>
       <!-- Android picks no folder and takes no drop -->
       {#if !isAndroidApp}
-        <label class="btn btn-secondary">
+        <label class="btn btn-secondary" use:filePick>
           A folder…
           <input type="file" hidden webkitdirectory onchange={pickedFiles} />
         </label>

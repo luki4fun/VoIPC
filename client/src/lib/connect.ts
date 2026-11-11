@@ -10,6 +10,7 @@
 // Nothing here decides where voice is. The backend does, and channels.ts
 // mirrors it; closing the server that carries voice only lets go of the mirror.
 
+import { dropJoinWaits } from "./stores/join-wait.js";
 import { hasNsfwConsent } from "./stores/channel-ui.js";
 import { account as signedInAccount, dropPrompts, takeLook } from "./stores/account.js";
 import { isWeb } from "./stores/platform.js";
@@ -466,6 +467,7 @@ export async function saveOpenServers(): Promise<void> {
 export function resetServer(server: string): void {
   clearRosters(server);
   clearSweeps(server);
+  dropJoinWaits(server);
   clearNoticing(server);
   clearQuiet(server);
   clearProfiles(server);
@@ -487,8 +489,9 @@ export function resetServer(server: string): void {
   if (get(voice)?.server === server) voice.set(null);
 }
 
-/** Take a server out of the list, and put the next one on screen if it was. */
-function removeServer(server: string): void {
+/** Take a server out of the list, and put the next one on screen if it was. `told`: the
+ *  caller disconnects it itself. */
+function removeServer(server: string, told = false): void {
   const run = reconnectRuns.get(server);
   if (run) run.cancelled = true;
   reconnectRuns.delete(server);
@@ -499,6 +502,9 @@ function removeServer(server: string): void {
   openAtDrop.delete(server);
   // The bot's token goes with the wizard that holds it. A cut keeps both, for a run to go on
   invoke("import_forget", { server }).catch(() => {});
+  // What its sessions kept for a reconnect goes too, ratchets and all: given up on after the
+  // reconnect budget, or refused for good, nothing else wiped it until the app quit (R3 F10).
+  if (!told) invoke("disconnect", { server }).catch(() => {});
   details.delete(server);
   // What it sent can no longer be answered: its connection is gone
   pendingInvites.update((list) => list.filter((i) => i.server !== server));
@@ -528,7 +534,7 @@ export async function disconnectServer(
   server: string,
   { save = true }: { save?: boolean } = {},
 ): Promise<void> {
-  removeServer(server);
+  removeServer(server, true);
   try {
     await invoke("disconnect", { server });
   } catch (e) {

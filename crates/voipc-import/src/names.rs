@@ -10,20 +10,8 @@ pub const NAME_BYTES: usize = 64;
 /// The lobby's name. A voice channel may not have it; a text channel may.
 const LOBBY: &str = "general";
 
-/// The relay's `session::bad_name_char`, which this crate cannot reach: control characters,
-/// and the ones that print as nothing or reorder what follows them.
-pub fn bad_name_char(c: char) -> bool {
-    c.is_control()
-        || matches!(c,
-            '\u{00AD}'
-            | '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}'
-            | '\u{200B}'..='\u{200F}'
-            | '\u{202A}'..='\u{202E}'
-            | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{2069}'
-            | '\u{FEFF}'
-        )
-}
+pub use voipc_protocol::names::bad_name_char;
+use voipc_protocol::names::draws_something;
 
 /// The start of `s`, at most `max` bytes, never half a character.
 pub fn clip_bytes(s: &str, max: usize) -> &str {
@@ -45,9 +33,16 @@ pub fn clip_chars(s: &str, max: usize) -> &str {
     }
 }
 
+/// A name of only what draws nothing counts as none, so the caller's fallback stands
+/// (W1-36): the username, `channel-<id>`.
 fn clean(raw: &str, max: usize) -> String {
     let kept: String = raw.chars().filter(|c| !bad_name_char(*c)).collect();
-    clip_bytes(kept.trim(), max).trim().to_string()
+    let name = clip_bytes(kept.trim(), max).trim();
+    if draws_something(name) {
+        name.to_string()
+    } else {
+        String::new()
+    }
 }
 
 /// A category's name. Two may share one.
@@ -62,7 +57,12 @@ pub fn category_name(raw: &str, id: u64) -> String {
 /// A name with nothing invisible, at most `max` characters.
 pub fn clean_chars(raw: &str, max: usize) -> String {
     let kept: String = raw.chars().filter(|c| !bad_name_char(*c)).collect();
-    clip_chars(kept.trim(), max).trim().to_string()
+    let name = clip_chars(kept.trim(), max).trim();
+    if draws_something(name) {
+        name.to_string()
+    } else {
+        String::new()
+    }
 }
 
 /// What a person is shown as: at most 64 characters.
@@ -221,6 +221,21 @@ mod tests {
         // A relay with a text `general` of its own
         let mut taken = Taken::new([("General", false), ("general", true)]);
         assert_eq!(taken.channel_name("general", 1, true), "general-2");
+    }
+
+    /// W1-36: U+2800 is the usual blank Discord name. A name of only what draws nothing
+    /// is none, so the fallback stands; inside a real name it stays, as an emoji needs it.
+    #[test]
+    fn a_name_that_draws_nothing_falls_back() {
+        let mut taken = lobby();
+        assert_eq!(taken.channel_name("\u{2800}", 1234, true), "channel-1234");
+        assert_eq!(category_name("\u{fe0f}\u{34f}", 77), "category-0077");
+        assert_eq!(display_name("\u{2800} \u{2800}"), "");
+        assert_eq!(display_name("Dan\u{2800}"), "Dan\u{2800}");
+        assert_eq!(
+            display_name("\u{1f469}\u{200d}\u{1f4bb}"),
+            "\u{1f469}\u{1f4bb}"
+        );
     }
 
     #[test]

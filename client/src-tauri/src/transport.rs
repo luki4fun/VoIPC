@@ -804,7 +804,12 @@ pub(crate) fn accept_key(key: &str) -> String {
 }
 
 fn server_name(host: &str) -> Result<ServerName<'static>, String> {
-    if let Ok(ip) = host.parse::<IpAddr>() {
+    // A link-local address names its interface (`fe80::1%eth0`), which no name and no
+    // certificate holds: the address without it (W2-36). An IP literal sends no SNI.
+    let address = host.split_once('%').map_or(host, |(ip, _)| ip);
+    if let Ok(ip) = address.parse::<std::net::Ipv6Addr>() {
+        Ok(ServerName::IpAddress(IpAddr::V6(ip).into()))
+    } else if let Ok(ip) = host.parse::<IpAddr>() {
         Ok(ServerName::IpAddress(ip.into()))
     } else {
         ServerName::try_from(host.to_string())
@@ -1178,6 +1183,20 @@ mod tests {
 
     fn ring() -> Arc<rustls::crypto::CryptoProvider> {
         Arc::new(rustls::crypto::ring::default_provider())
+    }
+
+    /// W2-36: a link-local address with its interface, as a LAN link gives one. No name and
+    /// no certificate holds the interface, and the self-signed path still connects.
+    #[test]
+    fn a_link_local_address_with_its_interface_is_a_server_name() {
+        let ip: IpAddr = "fe80::1".parse().unwrap();
+        assert_eq!(
+            server_name("fe80::1%eth0").unwrap(),
+            ServerName::IpAddress(ip.into())
+        );
+        assert!(tls_config("fe80::1%eth0", 9987, true, b"h3").is_ok());
+        // Only an address: a name holding a `%` stays refused
+        assert!(server_name("evil%example").is_err());
     }
 
     /// The real roots: nothing a test makes passes them.

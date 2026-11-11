@@ -53,6 +53,7 @@
   import { community, moderation, moves } from "../relay-rules.js";
   import { removalHint, removalWindows } from "../modlog-rules.js";
   import { restrictions } from "../stores/restrictions.js";
+  import { markTitle } from "../restrict-rules.js";
   import { splitName, shortName } from "../username.js";
   import { invoke } from "@tauri-apps/api/core";
   import { account as ownAccount, showPrompt } from "../stores/account.js";
@@ -152,6 +153,10 @@
     >
       <!-- Who exactly: the one place a name's tag is spelled out -->
       <div class="ctx-title"><MemberName username={menu.user.username} account={menu.user.account} />{#if who.tag}<span class="ctx-tag">#{who.tag}</span>{/if}</div>
+      <!-- The mark's words, for a touch screen that has no hover (W3-13) -->
+      {#if $restrictions.has(menu.user.user_id)}
+        <div class="ctx-note">{markTitle($restrictions.get(menu.user.user_id)!, Date.now())}</div>
+      {/if}
       <div class="ctx-separator"></div>
       <!-- Watching, the mixer and the volume are the call's, so only for
            somebody on the server carrying it: an id on another server is a
@@ -442,6 +447,13 @@
   .ctx-tag {
     font-weight: 400;
     color: var(--text-secondary);
+  }
+
+  .ctx-note {
+    padding: 2px 12px 6px;
+    font-size: 12px;
+    color: var(--text-secondary);
+    overflow-wrap: anywhere;
   }
 
   .ctx-item {

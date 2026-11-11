@@ -533,7 +533,10 @@ export function populateFromArchive(archive: {
   adoptLegacyKeys();
   // It replaced the store: what is in it now has not seen what was said of it
   for (const [server, marks] of postsMarks) markChannels(server, marks);
-  for (const server of get(openServers)) seedArchivedDms(server);
+  for (const server of get(openServers)) {
+    seedArchivedDms(server);
+    afterArchive?.(server);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1220,15 +1223,19 @@ export function incrementChannelUnread(server: string, channelName: string, at =
 /** A channel has a new name: what is filed under the old one moves. */
 export function renameChannelChat(server: string, from: string, to: string) {
   const [old, next] = [chatKey(server, from), chatKey(server, to)];
-  const move = <T>(map: Map<string, T>) => {
+  // Onto a name this device still holds a chat for (a channel deleted, its chat kept on
+  // purpose) the two go together, as with a channel made again under that name: the moved
+  // one written over it lost it for good, and its deletion marks with it (W2-12)
+  const move = <T>(map: Map<string, T>, both?: (kept: T, moved: T) => T) => {
     if (!map.has(old)) return map;
     const out = new Map(map);
-    out.set(next, out.get(old) as T);
+    const [kept, moved] = [out.get(next), out.get(old) as T];
+    out.set(next, kept !== undefined && both ? both(kept, moved) : moved);
     out.delete(old);
     return out;
   };
-  channelMessages.update(move);
-  unreadPerChannel.update(move);
+  channelMessages.update((map) => move(map, mergedChat));
+  unreadPerChannel.update((map) => move(map, (a, b) => a + b));
   unseenChannels.update((set) => {
     if (!set.has(old)) return set;
     const moved = new Set(set);
@@ -1243,13 +1250,14 @@ export function renameChannelChat(server: string, from: string, to: string) {
   // With what its writers deleted, kept beside it: without those their messages
   // would be taken back from a member's copy
   clearedBefore.update((map) => {
-    const out = move(map);
+    const out = move(map, Math.max);
     const marks = `${old}\u0001`;
     const moved = new Map(out);
     for (const [k, v] of out) {
       if (k.startsWith(marks)) {
         moved.delete(k);
-        moved.set(`${next}\u0001${k.slice(marks.length)}`, v);
+        const to = `${next}\u0001${k.slice(marks.length)}`;
+        moved.set(to, Math.max(v, moved.get(to) ?? 0));
       }
     }
     return moved;
@@ -1261,6 +1269,57 @@ export function renameChannelChat(server: string, from: string, to: string) {
     unreadSince.set(next, since);
     unreadSince.delete(old);
   }
+}
+
+/** One name's two chats as one, by time, each message once, and no more than one keeps. */
+function mergedChat(kept: ChatMessage[], moved: ChatMessage[]): ChatMessage[] {
+  const out = [...kept];
+  for (const m of moved) if (!held(kept, m)) out.push(m);
+  out.sort((a, b) => a.timestamp - b.timestamp);
+  return out.slice(-MAX_MESSAGES);
+}
+
+/** Where this device keeps the name a channel's stored log last went by, beside the
+ *  deletion marks in the same encrypted map: it goes where the chat filed under that name
+ *  goes. No name holds a control character. */
+const LOG_MARK = "\u0003";
+
+/** The name each logged channel on `server` last had here, by its log. */
+export function channelLogNames(server: string): Map<string, string> {
+  const out = new Map<string, string>();
+  const key = serverKey(server);
+  if (!key) return out;
+  const prefix = `${key}/`;
+  for (const mark of get(clearedBefore).keys()) {
+    const at = mark.indexOf(LOG_MARK);
+    if (at > prefix.length && mark.startsWith(prefix)) out.set(mark.slice(at + 1), mark.slice(prefix.length, at));
+  }
+  return out;
+}
+
+/** These channels' names, kept by their logs, each log's older name dropped. */
+export function noteChannelLogNames(server: string, listed: { log?: string; name: string }[]): void {
+  if (!serverKey(server)) return;
+  const known = channelLogNames(server);
+  const changed = listed.filter((c) => c.log && known.get(c.log) !== c.name);
+  if (changed.length === 0) return;
+  clearedBefore.update((marks) => {
+    const next = new Map(marks);
+    for (const c of changed) {
+      const was = known.get(c.log!);
+      if (was !== undefined) next.delete(`${chatKey(server, was)}${LOG_MARK}${c.log}`);
+      next.set(`${chatKey(server, c.name)}${LOG_MARK}${c.log}`, Date.now());
+    }
+    return next;
+  });
+  scheduleSave();
+}
+
+/** Run when an archive has just been read in, for each open server: what it keeps by a
+ *  channel's name has not seen the list that came first. */
+let afterArchive: ((server: string) => void) | null = null;
+export function onArchiveRead(run: (server: string) => void): void {
+  afterArchive = run;
 }
 
 /** Not counted (`notify-rules.ts`), though "New" still begins here. */

@@ -368,6 +368,9 @@ pub struct Relay {
     pub kept_seats: i64,
     /// What each account that posted lately has left under `quota`, and when it was counted.
     pub kept_room: DashMap<[u8; 16], (i64, i64)>,
+    /// Each account's log key changes lately: how many, and the last (`log::publish`). In
+    /// memory: a restart forgets them, which costs one more change at the short wait.
+    pub(crate) logkey_changes: DashMap<[u8; 16], (u32, i64)>,
     /// How long the moderation log keeps a row.
     pub modlog_days: u32,
     /// How long an account the move made waits for someone to open it. 0: for good.
@@ -527,6 +530,7 @@ impl Relay {
             pairs: DashMap::new(),
             pair_asks: DashMap::new(),
             claiming: tokio::sync::Mutex::new(()),
+            logkey_changes: DashMap::new(),
         };
         placeholder::load(&relay).await?;
         archive::load(&relay).await?;
@@ -1224,6 +1228,10 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
             return Err(ANSWERED.into());
         }
         AccountStart::Register { invite } => {
+            // A shape, so it says nothing about who is here (W1-30)
+            if placeholder::kept_for_the_move(name) {
+                return Err(placeholder::KEPT_FOR_THE_MOVE.into());
+            }
             let invite = invite.filter(|c| !c.trim().is_empty());
             if invite.is_none() && relay.registration != RegistrationMode::Open {
                 return Err("Making an account here needs an invite.".into());

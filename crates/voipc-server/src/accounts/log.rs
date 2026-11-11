@@ -88,8 +88,20 @@ const RESEAT_WAIT_SECS: i64 = 600;
 const RESEAT_WAIT_MAX_SECS: i64 = 86_400;
 /// Writers one walk takes at a time (`walk`).
 const WALK_BATCH: i64 = 500;
-/// How often an account's log key may change: each change walks every writer.
+/// How often an account's log key may change: each change walks every writer, and gives every
+/// writer in every channel the account sits in a step at their next post. The wait doubles
+/// with each change, up to a day, as a reseat's does, and starts over after a day with none:
+/// at a flat minute one account kept the whole relay walking (R2 F7). Honest apps change it
+/// only on a vault reset.
 const NEW_LOGKEY_SECS: i64 = 60;
+const NEW_LOGKEY_MAX_SECS: i64 = 86_400;
+
+/// How long `strikes` changes in a row ask to wait before the next.
+fn logkey_wait(strikes: u32) -> i64 {
+    NEW_LOGKEY_SECS
+        .saturating_mul(1i64 << strikes.min(16))
+        .min(NEW_LOGKEY_MAX_SECS)
+}
 const EMPTY: &[u8] = &[];
 /// How long what a count left under the quota stands (`room_for`).
 const ROOM_SECS: i64 = 3600;
@@ -232,11 +244,22 @@ pub(super) async fn publish(
     // which must count as missing now there is a key to give a real row to. A new account
     // sits nowhere, and walks no writer.
     let blanks_held = old.is_none() && sat_anywhere(relay.store(), &me.0).await?;
-    if changed && old.is_some_and(|(_, at)| util::now() - at < NEW_LOGKEY_SECS) {
+    let now = util::now();
+    // Changes in a row, as long as each came within a day of the one before
+    let strikes = relay
+        .logkey_changes
+        .get(&me.0)
+        .filter(|e| now - e.1 < NEW_LOGKEY_MAX_SECS)
+        .map_or(0, |e| e.0);
+    let last = old.as_ref().map_or(0, |(_, at)| *at);
+    if changed && now - last < logkey_wait(strikes) {
         return Ok(refused(
             "LogKeyPublish",
-            "That log key changed a moment ago; try again in a minute.",
+            "That log key changed a moment ago; try again later.",
         ));
+    }
+    if changed {
+        relay.logkey_changes.insert(me.0, (strikes + 1, now));
     }
     // The mark goes in with the key: from here the walk is owed, whatever happens to it
     let walk_from = (changed || blanks_held).then_some(0i32);

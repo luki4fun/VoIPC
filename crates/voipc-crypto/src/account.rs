@@ -919,14 +919,28 @@ pub enum Method {
 /// a hostile one would sooner name a copy of it that asks for the password:
 /// nothing else is opened.
 pub fn provider_page_ok(url: &str) -> bool {
-    const PAGES: [&str; 3] = [
+    const PAGES: [&str; 2] = [
         "https://discord.com/oauth2/authorize?",
         "https://accounts.google.com/o/oauth2/v2/auth?",
-        "https://www.facebook.com/",
     ];
-    PAGES.iter().any(|p| url.starts_with(p))
+    (PAGES.iter().any(|p| url.starts_with(p)) || facebook_dialog(url))
         && url.len() <= 2048
         && url.bytes().all(|b| b.is_ascii_graphic())
+}
+
+/// Facebook's sign-in dialog, `/v<major>.<minor>/dialog/oauth?`, at whichever Graph API
+/// version l4f asks for. Its host alone is not enough (W1-20): it also serves the link
+/// redirector and pages anyone can run.
+fn facebook_dialog(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://www.facebook.com/v") else {
+        return false;
+    };
+    let Some((version, rest)) = rest.split_once('/') else {
+        return false;
+    };
+    let number = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    matches!(version.split_once('.'), Some((major, minor)) if number(major) && number(minor))
+        && rest.starts_with("dialog/oauth?")
 }
 
 /// What `Authenticate` asks for a provider's sign-in, before there is a
@@ -1779,10 +1793,19 @@ mod tests {
             "https://discord.com/oauth2/authorize?response_type=code&state=a",
             "https://accounts.google.com/o/oauth2/v2/auth?client_id=x",
             "https://www.facebook.com/v21.0/dialog/oauth?client_id=x",
+            "https://www.facebook.com/v22.1/dialog/oauth?client_id=x",
         ] {
             assert!(provider_page_ok(good), "{good}");
         }
         for bad in [
+            // Facebook's own host, not its sign-in page (W1-20): its link redirector, a page
+            // the relay runs there, and a path a browser folds back to the redirector
+            "https://www.facebook.com/l.php?u=https%3A%2F%2Fevil.example%2F",
+            "https://www.facebook.com/a.page.the.relay.runs",
+            "https://www.facebook.com/v21.0/dialog/oauth/../../l.php?u=x",
+            "https://www.facebook.com/v21/dialog/oauth?x",
+            "https://www.facebook.com/v.1/dialog/oauth?x",
+            "https://www.facebook.com/",
             "https://discord.com.evil.example/oauth2/authorize?x",
             "https://evil.example/https://discord.com/oauth2/authorize?x",
             "http://discord.com/oauth2/authorize?x",

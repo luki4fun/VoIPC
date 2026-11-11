@@ -31,12 +31,21 @@ use crate::state::{Channel, ServerState};
 const GONE: &str = "Something went wrong. Please try again.";
 const NOT_THE_APPS: &str = "This channel comes from channels.json: change it there.";
 const NAME_TAKEN: &str = "a channel with that name already exists";
-const BAD_CATEGORY: &str = "A category's name is 1 to 64 characters, none of them invisible.";
+/// In bytes, unlike a channel's name: every category goes in one frame of the layout. Said so,
+/// where it read "characters" and refused 25 Japanese ones (W3-22).
+const BAD_CATEGORY: &str =
+    "A category's name is 1 to 64 bytes: 64 letters of the Latin alphabet, about 21 Chinese or Japanese characters. None of them may be invisible.";
 const PRIVATE_NOW: &str = "Private on Discord now and open here. Give it a gate, then run again.";
 /// Categories a server may have. With its channels' places they fit one message
 /// (some 70 bytes each), and one that does not fit is not sent: whoever manages
 /// channels would see nothing to delete, and it would hold until someone edits the database.
 pub(crate) const MAX_CATEGORIES: usize = 200;
+/// Channels kept here at most, from the file, the app and moves alike. Every place goes in one
+/// layout frame, about 7 bytes each, so past some 7,000 it framed no more and every member's
+/// layout quietly stopped updating; nothing refused a holder of `voipc:channels` on the way
+/// (R2 F10). Four times Discord's own 500. The file's are counted, never refused: a start
+/// takes channels.json as it is.
+pub(crate) const MAX_KEPT_CHANNELS: usize = 2000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Place {
@@ -104,11 +113,47 @@ pub async fn load(state: &ServerState, kept: KeptRows, apps: &[String]) {
             },
         );
     }
-    {
+    let unplaced: Vec<String> = {
         let mut channels = state.channels.write().await;
         for c in channels.values_mut() {
             c.kept = apps.contains(&c.gate_key);
         }
+        let mut unplaced: Vec<_> = channels
+            .values()
+            .filter(|c| {
+                c.persistent
+                    && c.info.channel_id != 0
+                    && !c.gate_key.is_empty()
+                    && !layout.places.contains_key(&c.gate_key)
+            })
+            .map(|c| (c.info.channel_id, c.gate_key.clone()))
+            .collect();
+        unplaced.sort();
+        unplaced.into_iter().map(|(_, conv)| conv).collect()
+    };
+    // A file channel with no row sorted after every row, so each channel made since, at the
+    // next position, went above them all (W3-23). Rows now, after the rest, in the order
+    // they showed in: once, and the same at every start after
+    let mut next = layout
+        .places
+        .values()
+        .map(|p| p.position)
+        .max()
+        .unwrap_or(0);
+    for conv in unplaced {
+        next += 1;
+        if let Some(relay) = &state.accounts {
+            if let Err(e) = relay.layout_put(&conv, None, next, None).await {
+                warn!(conv, "placing a channel from the file: {e:#}");
+            }
+        }
+        layout.places.insert(
+            conv,
+            Place {
+                position: next,
+                category: None,
+            },
+        );
     }
     *state.layout.write().await = layout;
 }
@@ -185,12 +230,20 @@ pub async fn for_session(state: &ServerState, session_id: SessionId) -> ServerMe
         .collect();
     seen.sort_by_key(|(position, p)| (*position, p.channel_id));
     let manages = state.can(session_id, Powers::CHANNELS);
+    // What this person's sidebar lists (`visibleChannels`): a hidden channel only for
+    // whoever manages channels or stands in it. A category of hidden ones showed everyone
+    // else its name over nothing (W3-20)
+    let here = state.sessions.get(&session_id).map(|s| s.channel_id);
+    let listed = |id: ChannelId| {
+        manages || here == Some(id) || channels.get(&id).is_some_and(|c| !c.info.hidden)
+    };
     ServerMessage::ChannelLayout {
         categories: layout
             .categories
             .iter()
             .filter(|c| {
-                seen.iter().any(|(_, p)| p.category == Some(c.id))
+                seen.iter()
+                    .any(|(_, p)| p.category == Some(c.id) && listed(p.channel_id))
                     || (manages
                         && category_view(state, session_id, &layout, &channels, c.id)
                             != CategoryView::Hidden)
@@ -361,7 +414,9 @@ pub(crate) fn name_taken(
 }
 
 fn category_name_ok(name: &str) -> bool {
-    !name.is_empty() && name.len() <= 64 && !name.chars().any(crate::session::bad_name_char)
+    name.len() <= 64
+        && !name.chars().any(crate::session::bad_name_char)
+        && voipc_protocol::names::draws_something(name)
 }
 
 /// A new channel, or changes to one made in the app.
@@ -428,24 +483,9 @@ async fn channel_create(
     let conv = entry.log_conv();
     let gate =
         crate::gates::checked(state, session_id, &conv, &[], gate.unwrap_or_default()).await?;
-    let channel_id = state.next_channel_id();
-    let mut channel = Channel::from_entry(
-        &entry,
-        channel_id,
-        relay.cloud,
-        state.settings.proximity_enabled,
-    );
-    channel.kept = true;
-    channel.gate = gate.clone();
-    channel.refresh_log();
+    let (channel_id, channel) = kept(state, &relay, &entry, &gate);
     let info = channel.info.clone();
-    {
-        let mut channels = state.channels.write().await;
-        if name_taken(&channels, &entry.name.to_lowercase(), text, None) {
-            return Err(NAME_TAKEN.into());
-        }
-        channels.insert(channel_id, channel);
-    }
+    take_place(state, channel_id, channel).await?;
     let position = next_position(state).await;
     // The gate first: a crash between the two leaves a gate naming nothing, where
     // the other order would bring back a channel meant to be private, open to all
@@ -462,27 +502,80 @@ async fn channel_create(
         let _ = relay.channel_purge(&conv).await;
         return Err(GONE.into());
     }
-    one_more_channel(state);
-    state
-        .layout
-        .write()
-        .await
-        .places
-        .insert(conv, Place { position, category });
-    // Told only to who may see it: announcing it first and gating it after would
-    // say that it exists.
-    for s in state.sessions.iter() {
-        if crate::gates::passes(s.value(), &gate.groups) {
-            let _ = send_msg(
-                &s.value().control_tx,
-                &ServerMessage::ChannelCreated {
-                    channel: info.clone(),
-                },
-            );
-        }
-    }
+    placed(state, conv, Place { position, category }).await;
+    tell_who_passes(
+        state,
+        &gate.groups,
+        &ServerMessage::ChannelCreated { channel: info },
+    );
     send_all(state).await;
     Ok(channel_id)
+}
+
+// What a channel made in the panel and one a move makes go through alike (W3-31): written
+// twice, a rule added to one missed the other.
+
+/// A channel the database keeps, as the state holds it.
+fn kept(
+    state: &ServerState,
+    relay: &Relay,
+    entry: &ChannelEntry,
+    gate: &ChannelGate,
+) -> (ChannelId, Channel) {
+    let channel_id = state.next_channel_id();
+    let mut channel = Channel::from_entry(
+        entry,
+        channel_id,
+        relay.cloud,
+        state.settings.proximity_enabled,
+    );
+    channel.kept = true;
+    channel.gate = gate.clone();
+    channel.refresh_log();
+    (channel_id, channel)
+}
+
+/// Into the state, unless its log or its name is another's, or the server is full.
+async fn take_place(
+    state: &ServerState,
+    channel_id: ChannelId,
+    channel: Channel,
+) -> Result<(), String> {
+    let mut channels = state.channels.write().await;
+    if channels.values().filter(|c| c.persistent).count() >= MAX_KEPT_CHANNELS {
+        return Err(format!(
+            "A server has {MAX_KEPT_CHANNELS} channels at most."
+        ));
+    }
+    if channels.values().any(|c| c.gate_key == channel.gate_key) {
+        return Err("A channel here already goes by this id.".into());
+    }
+    if name_taken(
+        &channels,
+        &channel.info.name.to_lowercase(),
+        channel.info.text,
+        None,
+    ) {
+        return Err(NAME_TAKEN.into());
+    }
+    channels.insert(channel_id, channel);
+    Ok(())
+}
+
+/// Stored: counted, and given its place in the list.
+async fn placed(state: &ServerState, conv: String, place: Place) {
+    one_more_channel(state);
+    state.layout.write().await.places.insert(conv, place);
+}
+
+/// To each session the gate lets see the channel, and nobody else: told first and gated
+/// after, a channel would say that it exists.
+fn tell_who_passes(state: &ServerState, groups: &[String], msg: &ServerMessage) {
+    for s in state.sessions.iter() {
+        if crate::gates::passes(s.value(), groups) {
+            let _ = send_msg(&s.value().control_tx, msg);
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -644,6 +737,13 @@ async fn import_channel(
     if let Err(e) = validate_entries(std::slice::from_ref(&entry)) {
         return Ok(Err(e.to_string()));
     }
+    // channels.json is the operator's own and keeps what it had; a move's is not (W1-36)
+    if !voipc_protocol::names::draws_something(&entry.name) {
+        return Ok(Err(format!(
+            "channel {} has a name that shows nothing",
+            row.dc_id
+        )));
+    }
     let gate = ChannelGate {
         groups: import_list(relay, &row.see).await?,
         speakers: import_list(relay, &row.speak).await?,
@@ -668,26 +768,10 @@ async fn import_channel(
         _ => None,
     };
     let conv = entry.log_conv();
-    let channel_id = state.next_channel_id();
-    let mut channel = Channel::from_entry(
-        &entry,
-        channel_id,
-        relay.cloud,
-        state.settings.proximity_enabled,
-    );
-    channel.kept = true;
-    channel.gate = gate.clone();
-    channel.refresh_log();
+    let (channel_id, channel) = kept(state, relay, &entry, &gate);
     let info = channel.info.clone();
-    {
-        let mut channels = state.channels.write().await;
-        if channels.values().any(|c| c.gate_key == conv) {
-            return Ok(Err("A channel here already goes by this id.".into()));
-        }
-        if name_taken(&channels, &entry.name.to_lowercase(), entry.text, None) {
-            return Ok(Err(NAME_TAKEN.into()));
-        }
-        channels.insert(channel_id, channel);
+    if let Err(e) = take_place(state, channel_id, channel).await {
+        return Ok(Err(e));
     }
     let position = next_position(state).await;
     let private = row.see != ImportGate::Open;
@@ -698,23 +782,12 @@ async fn import_channel(
         state.channels.write().await.remove(&channel_id);
         return Err(e);
     }
-    one_more_channel(state);
-    state
-        .layout
-        .write()
-        .await
-        .places
-        .insert(conv, Place { position, category });
-    for s in state.sessions.iter() {
-        if crate::gates::passes(s.value(), &gate.groups) {
-            let _ = send_msg(
-                &s.value().control_tx,
-                &ServerMessage::ChannelCreated {
-                    channel: info.clone(),
-                },
-            );
-        }
-    }
+    placed(state, conv, Place { position, category }).await;
+    tell_who_passes(
+        state,
+        &gate.groups,
+        &ServerMessage::ChannelCreated { channel: info },
+    );
     Ok(Ok(()))
 }
 
@@ -874,17 +947,25 @@ pub async fn channel_delete(
         warn!(conv, "keeping a channel's deletion: {e:#}");
         return Err("That could not be kept.".into());
     }
-    channel_gone(state, &relay, channel_id, &conv, &gate)
-        .await
-        .map_err(|_| GONE.to_string())?;
-    send_all(state).await;
-    // Whatever a member still in it wrote while they were being put out
-    if let Err(e) = relay.channel_purge(&conv).await {
-        warn!(conv, "clearing a deleted channel's last messages: {e}");
-    }
-    // What it kept from Discord: nobody can reach that any more, and it need not wait
-    relay.archive_kick.notify_one();
-    Ok(())
+    // The rest in its own task, so that it ends however this session does: a handler is
+    // aborted 10 s after its connection ends (`web.rs`), and one stopped halfway left a
+    // channel nobody could delete until a restart (W2-21)
+    let state = state.clone();
+    tokio::spawn(async move {
+        channel_gone(&state, &relay, channel_id, &conv, &gate)
+            .await
+            .map_err(|_| GONE.to_string())?;
+        send_all(&state).await;
+        // Whatever a member still in it wrote while they were being put out
+        if let Err(e) = relay.channel_purge(&conv).await {
+            warn!(conv, "clearing a deleted channel's last messages: {e}");
+        }
+        // What it kept from Discord: nobody can reach that any more, and it need not wait
+        relay.archive_kick.notify_one();
+        Ok(())
+    })
+    .await
+    .unwrap_or_else(|_| Err(GONE.into()))
 }
 
 /// A channel of the app's goes for good, and everybody who could see it is told. The list's
@@ -954,14 +1035,11 @@ async fn channel_gone(
     // However that went: everyone is about to be told it is gone
     state.channels.write().await.remove(&channel_id);
     state.routing.clear_channel(channel_id, []);
-    for s in state.sessions.iter() {
-        if crate::gates::passes(s.value(), &gate.groups) {
-            let _ = send_msg(
-                &s.value().control_tx,
-                &ServerMessage::ChannelDeleted { channel_id },
-            );
-        }
-    }
+    tell_who_passes(
+        state,
+        &gate.groups,
+        &ServerMessage::ChannelDeleted { channel_id },
+    );
     let mut layout = state.layout.write().await;
     layout.places.remove(conv);
     if layout.welcome.as_deref() == Some(conv) {
@@ -994,9 +1072,19 @@ pub async fn import_purge(
     if !kept {
         return Ok(false);
     }
-    channel_gone(state, relay, channel_id, conv, &gate).await?;
-    relay.channel_purge(conv).await?;
-    Ok(true)
+    // In its own task, as `channel_delete`'s: an undo step stopped halfway left the channel
+    // here with `kept` off, which the next step then skipped
+    let (state, conv) = (state.clone(), conv.to_string());
+    tokio::spawn(async move {
+        let relay = state
+            .accounts
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("no accounts"))?;
+        channel_gone(&state, &relay, channel_id, &conv, &gate).await?;
+        relay.channel_purge(&conv).await?;
+        Ok(true)
+    })
+    .await?
 }
 
 /// A new category, or a new name.
@@ -1224,6 +1312,35 @@ pub async fn layout_set(
 }
 
 /// The channel someone lands in the first time they come here, or none.
+/// A password on the welcome channel ends it as the welcome: new devices would land on a
+/// channel they cannot open, and the rule `welcome_set` asks for held no more (W3-19).
+pub async fn welcome_locked(state: &ServerState, channel_id: ChannelId) {
+    let Some(relay) = state.accounts.clone() else {
+        return;
+    };
+    let Some(conv) = state
+        .channels
+        .read()
+        .await
+        .get(&channel_id)
+        .map(|c| c.gate_key.clone())
+    else {
+        return;
+    };
+    {
+        let mut layout = state.layout.write().await;
+        if conv.is_empty() || layout.welcome.as_deref() != Some(conv.as_str()) {
+            return;
+        }
+        if let Err(e) = relay.welcome_put(None).await {
+            warn!(conv, "unsetting a locked welcome channel: {e:#}");
+            return;
+        }
+        layout.welcome = None;
+    }
+    send_all(state).await;
+}
+
 pub async fn welcome_set(
     state: &ServerState,
     session_id: SessionId,

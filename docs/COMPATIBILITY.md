@@ -122,6 +122,15 @@ shape (`w`, `h`); a 1.4 manifest reads as it was, with no shape.
 itself ([OPERATING.md](OPERATING.md) §14). With it on, the relay refuses to start where it
 cannot replace its own binary.
 
+**What changed in 1.7:** no new keys. The database gains channel gates (`0005_gates.sql`).
+
+**What changed in 1.8:** `public_url` (empty: no sign-in with a provider) and `signups_per_hour` (60) in
+`[accounts]`. An older relay refuses both.
+
+**What changed in 1.9:** `server_name` and `server_description` in `server_settings.json`, which an
+older relay ignores. The database gains the channels made in the app (`0006_community.sql`) and
+groups that stand in no section of their own (`0007_group_sections.sql`).
+
 **What changed in 1.10:** `modlog_days` in `[accounts]` (180), and `new_member_wait_mins` in
 `server_settings.json` (0, off). A `modlog_days` of 0 stops the start: it would throw the log
 away at once. An older relay refuses the first and ignores the second.

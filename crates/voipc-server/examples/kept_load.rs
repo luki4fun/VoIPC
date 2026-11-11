@@ -62,6 +62,7 @@ pub struct Relay {
     pub kept_window: i64,
     pub kept_seats: i64,
     pub kept_room: dashmap::DashMap<[u8; 16], (i64, i64)>,
+    pub logkey_changes: dashmap::DashMap<[u8; 16], (u32, i64)>,
 }
 
 pub struct NoScopes;
@@ -1013,6 +1014,7 @@ async fn main() -> Result<()> {
         kept_window: args.window as i64,
         kept_seats: 0,
         kept_room: Default::default(),
+        logkey_changes: Default::default(),
     });
     let store = relay.store();
     let mut rng = StdRng::seed_from_u64(21);
@@ -1096,6 +1098,7 @@ async fn main() -> Result<()> {
         kept_window: relay.kept_window,
         kept_seats: relay.kept_seats,
         kept_room: Default::default(),
+        logkey_changes: Default::default(),
     };
     let (floor, floor_p95) = bare_commits(store).await?;
     println!(

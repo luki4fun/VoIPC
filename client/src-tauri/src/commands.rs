@@ -56,6 +56,9 @@ pub async fn connect(
     // Install the ring crypto provider (idempotent — only the first call succeeds)
     let _ = rustls::crypto::ring::default_provider().install_default();
 
+    // In the app's log too: on screen alone, below a short window's fold, it left nothing to
+    // read afterwards (device pass)
+    let host = address.clone();
     network::connect_to_server(
         &state,
         app_handle,
@@ -65,6 +68,7 @@ pub async fn connect(
         account,
     )
     .await
+    .inspect_err(|e| tracing::warn!(server = %host, "connecting failed: {e}"))
 }
 
 /// Disconnect from one server. The others stay connected.

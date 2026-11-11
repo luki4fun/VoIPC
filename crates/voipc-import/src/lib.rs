@@ -9,6 +9,8 @@
 pub mod api;
 pub mod batch;
 pub mod fit;
+#[cfg(any(test, fuzzing))]
+pub mod fuzz;
 pub mod gates;
 pub mod model;
 pub mod names;
@@ -40,7 +42,7 @@ impl Note {
     pub fn kept(kind: &'static str, channel: Option<u64>, text: String) -> Self {
         Note {
             kind,
-            text,
+            text: words_only(text),
             keep: true,
             channel,
         }
@@ -50,9 +52,20 @@ impl Note {
     pub fn screen(kind: &'static str, channel: Option<u64>, text: String) -> Self {
         Note {
             kind,
-            text,
+            text: words_only(text),
             keep: false,
             channel,
         }
     }
+}
+
+/// A line of the importer's words with Discord's names in it, without what could turn those
+/// words around or hide in them (W1-38). Its own words hold none of these; a line break stays.
+pub fn words_only(text: String) -> String {
+    if !text.chars().any(|c| c != '\n' && names::bad_name_char(c)) {
+        return text;
+    }
+    text.chars()
+        .filter(|c| *c == '\n' || !names::bad_name_char(*c))
+        .collect()
 }

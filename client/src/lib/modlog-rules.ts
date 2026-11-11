@@ -42,13 +42,15 @@ export function modAction(action: string): [string, string] {
   return ACTIONS.get(action) ?? [action, ""];
 }
 
-const IN_A_CHANNEL = new Set(["channel_kick", "channel_delete", "summon", "hide", "unhide"]);
+const IN_A_CHANNEL = new Set(["channel_kick", "summon", "hide", "unhide"]);
 
 /** Where it happened, or null for what is server-wide. The relay says no channel
- *  both for those and for one this reader cannot see. */
+ *  both for those and for one this reader cannot see, which includes one deleted since. A
+ *  deletion's own row says so already: it read "a channel you cannot see" for a public
+ *  channel read the day before (W3-30). */
 export function modPlace(row: Pick<ModRow, "action" | "channel">): string | null {
   if (row.channel != null) return `#${row.channel}`;
-  return IN_A_CHANNEL.has(row.action) ? "a channel you cannot see" : null;
+  return IN_A_CHANNEL.has(row.action) ? "a channel you cannot see now" : null;
 }
 
 /** How far back a removal can go, as `window_secs`, for a holder of the ban

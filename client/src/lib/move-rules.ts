@@ -450,22 +450,29 @@ export function idsBackLine(refused: { id: string; reason: string } | null, unse
 }
 
 /** When a list asks again, for one that shares its store with someone else's (the Users tab
- *  and the dashboard): a page for another filter took the place of its own, which had come.
- *  Not while its own is on its way, which would ask twice on a change of filter, and never
- *  for the answer to itself, which could go round for ever. */
+ *  and the dashboard): another page took the place of its own, which had come. Another by
+ *  any of what was asked for: the dashboard's first page of Waiting, with no search, passed
+ *  for a search or a later page of Waiting (W2-33). Not while its own is on its way, which
+ *  would ask twice on a change of filter, and never for the answer to itself, which could go
+ *  round for ever. */
 export function ownPage<T extends { filter: MoveFilter }>() {
   let asked: T | null = null;
   let came = false;
+  const same = (got: T): boolean => !!asked && (Object.keys(asked) as (keyof T)[]).every((k) => got[k] === asked![k]);
   return {
     /** What was asked for just now; null: nothing this watches. */
     asking(ask: T | null): void {
       asked = ask;
       came = false;
     },
-    /** A page for this filter has come. What to ask for again, or null. */
-    page(filter: MoveFilter): T | null {
+    /** Whether this page is the one asked for. */
+    mine(got: T): boolean {
+      return same(got);
+    },
+    /** A page has come. What to ask for again, or null. */
+    page(got: T): T | null {
       if (!asked) return null;
-      if (filter === asked.filter) {
+      if (same(got)) {
         came = true;
         return null;
       }

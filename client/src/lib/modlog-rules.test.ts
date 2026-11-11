@@ -76,19 +76,18 @@ test("every row the relay writes has its words here", () => {
 
 test("no channel is either server-wide or one this reader cannot see", () => {
   assert.equal(modPlace({ action: "channel_kick", channel: "lobby" }), "#lobby");
-  assert.equal(modPlace({ action: "channel_kick", channel: null }), "a channel you cannot see");
+  assert.equal(modPlace({ action: "channel_kick", channel: null }), "a channel you cannot see now");
   assert.equal(modPlace({ action: "summon", channel: "vault" }), "#vault");
-  assert.equal(modPlace({ action: "summon", channel: null }), "a channel you cannot see");
-  assert.equal(modPlace({ action: "hide", channel: null }), "a channel you cannot see");
+  assert.equal(modPlace({ action: "summon", channel: null }), "a channel you cannot see now");
+  assert.equal(modPlace({ action: "hide", channel: null }), "a channel you cannot see now");
   assert.equal(modPlace({ action: "kick", channel: null }), null);
   assert.equal(modPlace({ action: "ban", channel: null }), null);
   assert.equal(modPlace({ action: "restrict", channel: null }), null);
   // The browser's decoder gives undefined for None
   assert.equal(modPlace({ action: "kick", channel: undefined as unknown as null }), null);
-  assert.equal(
-    modPlace({ action: "channel_delete", channel: undefined as unknown as null }),
-    "a channel you cannot see",
-  );
+  // W3-30: a deleted channel is one nobody sees now, and its row says it was deleted
+  assert.equal(modPlace({ action: "channel_delete", channel: undefined as unknown as null }), null);
+  assert.equal(modPlace({ action: "channel_delete", channel: "news" }), "#news", "the control: `*` reads its name");
 });
 
 test("a removal reads as what it is, and is server-wide", () => {

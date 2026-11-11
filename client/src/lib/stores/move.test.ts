@@ -249,6 +249,19 @@ test("ids left out go one at a time, each waiting for the last", () => {
   assert.equal(asks()[0], "MoveStatus", "and at the end the dashboard is read afresh");
 });
 
+// W2-30
+test("a refused read of the left-out list does not take the next exclusion's answer", () => {
+  fresh();
+  onMoveReply(S, { Admin: { MoveExcluded: { ids: [["11", false, true, 1]], more: true } } });
+  excludedNextPage(S);
+  onMoveReply(S, { Error: { request: "Admin", reason: "Too many requests." } });
+  excludeIds(S, ["21"]);
+  invoked().length = 0;
+  onMoveReply(S, { Admin: { MoveExcluded: { ids: [["21", false, true, 1]], more: false } } });
+  assert.deepEqual(wizard().leaving, [], "answered, not left at Sending");
+  assert.equal(asks()[0], "MoveStatus", "and the dashboard read afresh");
+});
+
 test("a refused one stops the rest", () => {
   fresh();
   excludeIds(S, ["11", "12"]);

@@ -23,6 +23,14 @@ pub fn fuzz_codec(data: &[u8]) {
     }
 }
 
+/// An older relay's messages, as the app reads them through `compat` for each protocol it
+/// still talks to (W3-35: `fuzz_codec` reached today's decoders only).
+pub fn fuzz_compat(data: &[u8]) {
+    for proto in crate::compat::OLDEST_RELAY_PROTOCOL..codec::PROTOCOL_VERSION {
+        let _ = crate::compat::decode_server_msg_from(data, proto);
+    }
+}
+
 /// Voice, position, video and screen-audio packets as the relay forwards them.
 pub fn fuzz_media_packets(data: &[u8]) {
     if let Ok(p) = voice::VoicePacket::from_bytes(data) {
@@ -141,6 +149,7 @@ mod tests {
         let ping = codec::encode_client_msg(&crate::messages::ClientMessage::Ping { timestamp: 1 })
             .unwrap();
         replay("codec", &ping, fuzz_codec);
+        replay("compat", &ping, fuzz_compat);
         replay(
             "media_packets",
             &voice::VoicePacket::voice(1, 2, vec![1, 2, 3]).to_bytes(),

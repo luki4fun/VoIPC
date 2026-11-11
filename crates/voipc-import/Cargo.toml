@@ -20,3 +20,7 @@ tokio = { version = "1", default-features = false, features = ["macros", "rt", "
 [dev-dependencies]
 # Waits run on tokio's paused clock, so a test of an hour's wait takes no time.
 tokio = { version = "1", features = ["macros", "rt", "test-util"] }
+
+# fuzz/ builds this crate with --cfg fuzzing (src/fuzz.rs)
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }

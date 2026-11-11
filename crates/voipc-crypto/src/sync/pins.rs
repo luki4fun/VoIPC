@@ -927,6 +927,8 @@ mod tests {
         assert!(!s.pins_in());
         assert_eq!(asks(&s.pins_first()), ["pins.0"]);
 
+        // Asked for, as a session asks: it learns no key it did not
+        let _ = s.ask_keys(vec![id(1)]);
         let (out, events) = s.on_reply(&keys_found(1, &liar)).unwrap();
         assert!(out.is_empty() && events.is_empty(), "{out:?}");
         assert!(s.pinned(&id(1)).is_none(), "decided on empty pins");

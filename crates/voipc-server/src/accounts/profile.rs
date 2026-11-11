@@ -2,15 +2,13 @@
 //! `display_name`, which a provider sign-up fills with a real name from Google:
 //! only what somebody typed here becomes public.
 //!
-//! Asked for by account and told to the people whose rosters show that account:
-//! a channel that hides its members, or names them by alias, shows no account,
-//! so nobody can put a display name to one of its rows. A moderator's clear goes
-//! to everyone wherever the account stands, since old rows may be on anyone's screen.
+//! Asked for by account, and a change is told to everyone connected (`tell`): a
+//! channel that hides its members, or names them by alias, shows no account, and a
+//! change that goes to all puts a display name to none of its rows.
 //!
 //! The relay never decodes a picture. It checks what kind of file it says it is
 //! and how big; every client sanitizes what it receives before showing it.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -29,6 +27,7 @@ use super::{refused, Relay};
 use crate::control::ControlTx;
 use crate::session::{ascii_look_alike, bad_name_char, send_msg};
 use crate::state::ServerState;
+use voipc_protocol::names::draws_nothing;
 
 type Row = (Vec<u8>, Option<String>, Option<Vec<u8>>);
 
@@ -200,31 +199,15 @@ impl Relay {
         let like = ascii_look_alike(bare);
         for shape in [Some(bare), like.as_deref()].into_iter().flatten() {
             let someone_else = !shape.eq_ignore_ascii_case(&user.username);
+            if someone_else && super::placeholder::kept_for_the_move(shape) {
+                return Err(super::placeholder::KEPT_FOR_THE_MOVE.into());
+            }
             if someone_else && self.is_account_name(shape).await.unwrap_or(true) {
                 return Err("That is another account's name.".into());
             }
         }
         Ok(Some(name.to_string()))
     }
-}
-
-/// What a name is read without when comparing it to others: these draw nothing, so
-/// `bobby` with one in it looks like `bobby`. Allowed in a name, since an emoji or a
-/// Persian spelling needs some. l4f's `blank` less what `bad_name_char` refuses, and
-/// `DRAWS_NOTHING` in profile-rules.ts.
-fn draws_nothing(c: char) -> bool {
-    matches!(c,
-        '\u{034f}'
-        | '\u{17b4}' | '\u{17b5}'
-        | '\u{180b}'..='\u{180f}'
-        | '\u{200c}' | '\u{200d}'
-        | '\u{2800}'
-        | '\u{fe00}'..='\u{fe0f}'
-        | '\u{fff0}'..='\u{fff8}'
-        | '\u{13430}'..='\u{1343f}'
-        | '\u{1bca0}'..='\u{1bca3}'
-        | '\u{e0000}'..='\u{e0fff}'
-    )
 }
 
 /// `bad_name_char`, but for what joins an emoji or spells a word in some scripts:
@@ -362,41 +345,12 @@ pub async fn answer_picture(
     }
 }
 
-/// A change, to the account itself and the people whose rosters show it: everyone
-/// in a channel it is in, unless that channel hides its people or their names.
+/// A change, to everyone connected, also when the account has gone (a moderator's clear).
+/// Whoever may ask about it is anyone, since `ProfilesGet` answers any id, and whoever sees the
+/// account may stand outside its channels: under a public roster, or with its old messages
+/// open (W3-21). Going to all, it says nothing of where that account stands, so it ties no
+/// row of a channel that hides its people, or names them by alias, to the account.
 pub async fn tell(state: &ServerState, relay: &Relay, account: [u8; 16]) {
-    let profiles = match relay.profiles(&[account]).await {
-        Ok(p) => p,
-        Err(e) => {
-            warn!("reading a profile: {e:#}");
-            return;
-        }
-    };
-    let Some(user_id) = state
-        .account_sessions
-        .get(&account)
-        .and_then(|sid| state.sessions.get(&*sid).map(|s| s.user_id))
-    else {
-        return;
-    };
-    let mut audience = HashSet::from([user_id]);
-    for c in state.channels.read().await.values() {
-        if c.members.contains(&user_id) && !c.info.anonymous && !c.info.hide_members {
-            audience.extend(c.members.iter().copied());
-        }
-    }
-    let msg = ServerMessage::Profiles { profiles };
-    for s in state.sessions.iter() {
-        if audience.contains(&s.user_id) {
-            let _ = send_msg(&s.control_tx, &msg);
-        }
-    }
-}
-
-/// A moderator's clear, to everyone connected, also when the account has gone. Going
-/// to all, it says nothing of where that account stands, and `ProfilesGet` already
-/// answers anyone about any id.
-pub async fn tell_everyone(state: &ServerState, relay: &Relay, account: [u8; 16]) {
     match relay.profiles(&[account]).await {
         Ok(profiles) => {
             let msg = ServerMessage::Profiles { profiles };

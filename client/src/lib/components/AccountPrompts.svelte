@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { filePick } from "../actions/file-pick.js";
   import { dialog } from "../actions/dialog.js";
   // The dialogs a relay account needs: the code a sign-in waits for, a new
   // account's recovery key (shown once), setting up the authenticator app
@@ -24,6 +25,7 @@
     lookOver,
     pairCodeCame,
     providerDone,
+    providerFlowOf,
     providerPage,
     providerRefused,
     providerStarted,
@@ -84,6 +86,8 @@
   const provable = $derived(error === PROVE_FIRST ? [...new Set<string>(providers?.linked.map((l) => l.kind))] : []);
   /** The setup a proof took off the screen. It comes back after: the key is in their app by then. */
   let setupToProve: Extract<AccountPrompt, { kind: "totp-setup" }> | null = null;
+  /** The provider flow `setupToProve` waits on. */
+  let setupFlow = 0;
   let qr = $state("");
   let copied = $state(false);
   /** Whether this prompt's yes is live (`armsSlowly`). */
@@ -429,12 +433,16 @@
         if (codesTurnedOn(server, body.recovery_codes)) reset();
         break;
       case "Providers":
+        // Only for the panel that asked: another server's answer landing while this one is up
+        // showed its rows and its password here, and steps then went without one (W2-9)
+        if (server !== providersOf) break;
         providers = { offered: [...new Set<string>(body.offered)], linked: body.linked, hasPassword: body.has_password };
         break;
       case "ProviderBrowser":
         if (providerPage(server, body.url, body.code)) reset();
         break;
       case "ProviderDone": {
+        const flow = providerFlowOf(server);
         if (!providerDone(server)) break;
         const now = get(accountPrompt);
         if (now?.kind === "provider-page" && now.server === server) closePrompt(now);
@@ -444,7 +452,11 @@
           "info",
         );
         listProviders(server);
-        if (setupToProve?.server === server) backToSetup();
+        // A cut ended the proof it waited for: its setup, from that connection, goes too
+        if (setupToProve?.server === server) {
+          if (flow === setupFlow) backToSetup();
+          else setupToProve = null;
+        }
         break;
       }
       case "ProviderUnlinked":
@@ -551,6 +563,8 @@
   let providersOf = "";
   $effect(() => {
     const p = $accountPrompt;
+    // Closed: the next time it opens it asks again, as after a reconnect
+    if (!p) providersOf = "";
     if ((p?.kind !== "account" && p?.kind !== "totp-setup") || p.server === providersOf) return;
     providersOf = p.server;
     providers = null;
@@ -687,6 +701,8 @@
   function proveForSetup(p: Extract<AccountPrompt, { kind: "totp-setup" }>, provider: string) {
     setupToProve = p;
     void runProvider(p.server, provider, "prove");
+    // Started before its first wait
+    setupFlow = providerFlowOf(p.server);
   }
 
   function backToSetup() {
@@ -929,6 +945,14 @@
             Your provider says who you are. Your messages and keys are encrypted with a key only your devices hold,
             so this new device needs one of these.
           </p>
+          <!-- W3-16: nothing said what is left to someone with none of them. A reset
+               (`admin reclaim`) refuses an account with a password -->
+          {#if !p.hasPassword}
+            <p class="hint">
+              None of them? Then nobody can open what this account kept, the server included. Whoever runs this
+              server can reset the account, so that it starts again empty: ask them.
+            </p>
+          {/if}
           {#if p.problem}<div class="error" role="alert">{p.problem}</div>{/if}
           <div class="field">
             <label for="acct-provider-recovery">Recovery key</label>
@@ -1127,8 +1151,9 @@
       {:else if p.kind === "cloud"}
         <h2>Keep your messages here too?</h2>
         <p class="hint">
-          With a copy on {fromServer(p.server).replace(/: $/, "") || "this server"}, you can read your messages on
-          your other devices, and what people write while you are away waits for you. {isWeb
+          With a copy on {fromServer(p.server).replace(/: $/, "") || "this server"}, what you write reaches your
+          other devices, and the people it is for read it when they come back. What others keep here reaches you
+          either way. {isWeb
             ? "A browser keeps no chat of its own: a reload brings back what has a copy here, and whoever writes a message decides whether it gets one."
             : "This device keeps them only in its own chat history, if that is on."}
         </p>
@@ -1176,7 +1201,7 @@
             </form>
             <div class="row">
               <span>Profile picture{#if profilePicture}: <strong>set</strong>{/if}. Anyone on this server can see it, and the server knows who fetched it.</span>
-              <label class="secondary file-pick">
+              <label class="secondary file-pick" use:filePick>
                 Choose…
                 <input type="file" accept="image/*" hidden onchange={(e) => pickPicture(p.server, e.currentTarget)} />
               </label>

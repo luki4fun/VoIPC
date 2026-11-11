@@ -53,8 +53,10 @@ export function arrival(
 ): { count: boolean; sound: boolean; os: boolean } {
   if (level === "nothing") return { count: false, sound: false, os: false };
   const wanted = level === "all" || m.forMe;
+  // What you wrote yourself is not news to you, forwarded into another channel or from your
+  // other device, as `dmCountsUnread` has it for direct messages (W3-26)
   return {
-    count: !m.onScreen && wanted,
+    count: !m.onScreen && wanted && !m.mine,
     sound: !m.onScreen && wanted && !m.mine,
     os: m.forMe && !m.mine,
   };

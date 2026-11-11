@@ -74,6 +74,22 @@ export function privilegesOn(p: number | null): readonly (typeof PRIVILEGES)[num
   return PRIVILEGES.filter((x) => p === null || !x.since || p >= x.since);
 }
 
+/** A group's privileges with `scope` ticked or not. Manage accounts works from the account
+ *  list, which See accounts opens: one without the other opened the panel on nothing it
+ *  could use (W3-25). So they go together, either way round. */
+export function toggledScope(scopes: readonly string[], scope: string, on: boolean): string[] {
+  const pair = scope === "users:admin" && on ? ["users:read"] : scope === "users:read" && !on ? ["users:admin"] : [];
+  const rest = scopes.filter((x) => x !== scope && !pair.includes(x));
+  return (on ? [...rest, scope, ...pair] : rest).sort();
+}
+
+/** What the admin panel says when what an account holds opens none of its tabs. */
+export function noTabLine(can: (scope: string) => boolean): string {
+  return can("users:admin") && !can("users:read")
+    ? "Managing accounts works from the account list, which needs See accounts too. Ask an admin to add it to your group."
+    : "Nothing here is open to what you hold on this server.";
+}
+
 /** The admin panel's tabs, and what opens each. */
 export const PANEL_SCOPES = ["voipc:bans", "voipc:emotes", "users:read", "users:admin", "roles:admin"] as const;
 

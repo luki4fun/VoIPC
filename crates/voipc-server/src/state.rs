@@ -2060,11 +2060,10 @@ impl ServerState {
 
         // Check for duplicate names, ignoring case as channels.json does: a
         // made-up "Announcements" beside the real "announcements" is a look-alike.
+        // By the one rule a channel made in the panel goes by, where a text channel
+        // may share the lobby's name (W3-32)
         let lower = name.to_lowercase();
-        if channels
-            .values()
-            .any(|ch| ch.info.name.to_lowercase() == lower)
-        {
+        if crate::layout::name_taken(&channels, &lower, text, None) {
             anyhow::bail!("a channel with that name already exists");
         }
 
@@ -3202,6 +3201,31 @@ mod tests {
     }
 
     // ── Channel operations ─────────────────────────────────────────────
+
+    /// W3-32: a temporary channel went by a copy of the name rule that had drifted from
+    /// `layout::name_taken`, and refused a text `general` that one from the panel may have.
+    #[tokio::test]
+    async fn a_temporary_channel_goes_by_the_one_name_rule() {
+        let state = make_state();
+        let (uid, _) = add_user(&state, "alice");
+        let lobby = state.channels.read().await[&0].info.name.to_lowercase();
+        let made = |name: String, text: bool| {
+            state.create_channel(name, None, ProximityMode::Off, false, text, uid)
+        };
+        assert!(
+            made(lobby.clone(), true).await.is_ok(),
+            "text beside the lobby"
+        );
+        assert!(
+            made(lobby.to_uppercase(), false).await.is_err(),
+            "the control: voice"
+        );
+        assert!(made("Open".into(), false).await.is_ok());
+        assert!(
+            made("open".into(), true).await.is_err(),
+            "any other name, whatever the kind"
+        );
+    }
 
     #[tokio::test]
     async fn validate_join_open_channel() {
