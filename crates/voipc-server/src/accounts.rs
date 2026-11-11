@@ -2905,6 +2905,9 @@ pub async fn handle_request(
         }
         // Made `Admin` above
         AccountRequest::AdminAsk { .. } => refused("Admin", "Something went wrong."),
+        AccountRequest::KeyChallenge if relay.accounts.hostkey(user.id).await?.is_none() => {
+            refused("KeyChallenge", voipc_protocol::messages::NOT_KEYED)
+        }
         AccountRequest::KeyChallenge => {
             let nonce: [u8; 16] = rand::random();
             let challenge = relay.accounts.hostkey_challenge(Some(&user), &nonce);

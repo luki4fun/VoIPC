@@ -129,6 +129,15 @@ impl Client {
             .unwrap();
     }
 
+    /// `send` to a relay that may have ended the connection already, its last word still to
+    /// be read: whether it went.
+    async fn send_unless_closed(&mut self, msg: &ClientMessage) -> bool {
+        self.stream
+            .write_all(&encode_client_msg(msg).unwrap())
+            .await
+            .is_ok()
+    }
+
     /// Next server message, or None once the server closed the stream.
     async fn next(&mut self) -> Option<ServerMessage> {
         loop {
@@ -3997,6 +4006,133 @@ async fn a_device_that_holds_the_vault_key_cannot_reset_the_password() {
     reset_with(&state, "ida", &recovery, "a brand new password", None)
         .await
         .unwrap();
+}
+
+/// W3, as the browser lane found it: a session that signed in with a remembered device does
+/// not know whether the password is a login key. It asks; an account with a key steps up with
+/// it, one without proves the old way, and both change their password and recovery key.
+#[tokio::test]
+async fn a_device_signed_in_session_proves_the_password_either_way() {
+    use voipc_crypto::account::{derive, stretch, DeviceEnrol, DeviceKey, Method, SignIn};
+    use voipc_crypto::account_session::AccountSession;
+    let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+    for legacy in [false, true] {
+        let name = if legacy { "lea" } else { "kai" };
+        let (mut c, _, signed) = register_with(&state, name).await;
+        let relay = state.accounts.as_ref().unwrap();
+        let id = relay
+            .store()
+            .user_by_username(name)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        let (enrol, ask) = DeviceEnrol::start(signed.relay_id);
+        c.send(&ask).await;
+        let ServerMessage::Account(r) = c.expect("challenge", |m| reply(m).is_some()).await else {
+            unreachable!()
+        };
+        c.send(&enrol.on_reply(&r).unwrap()).await;
+        c.expect("added", |m| reply(m).is_some()).await;
+        drop(c);
+        if legacy {
+            // As before 1.12: the password's secret under Argon2
+            let ctx = relay.ctx(IpAddr::V4(Ipv4Addr::LOCALHOST), "test");
+            let secret = derive("correct horse battery", &signed.relay_id, name).auth_secret;
+            relay
+                .accounts
+                .password_set_as_host(&ctx, id, &l4f_accounts::util::b64u(&secret))
+                .await
+                .unwrap();
+            // A set password forgets every device: remember this one again
+            let mut c = password_sign_in_open(&state, name).await;
+            let (enrol2, ask) = DeviceEnrol::start(signed.relay_id);
+            c.send(&ask).await;
+            let ServerMessage::Account(r) = c.expect("challenge", |m| reply(m).is_some()).await
+            else {
+                unreachable!()
+            };
+            c.send(&enrol2.on_reply(&r).unwrap()).await;
+            c.expect("added", |m| reply(m).is_some()).await;
+            drop(c);
+            assert!(relay.accounts.hostkey(id).await.unwrap().is_none());
+            enrol_device_signs_in(&state, name, &signed, enrol2.key, legacy).await;
+        } else {
+            enrol_device_signs_in(&state, name, &signed, enrol.key, legacy).await;
+        }
+    }
+
+    async fn enrol_device_signs_in(
+        state: &Arc<ServerState>,
+        name: &str,
+        signed: &voipc_crypto::account::SignedIn,
+        key: DeviceKey,
+        legacy: bool,
+    ) {
+        let key = DeviceKey::from_parts(key.device_id, key.pkcs8().to_vec()).unwrap();
+        let (mut m, first) = SignIn::start(
+            name,
+            Method::Device {
+                key,
+                relay_id: signed.relay_id,
+                dek: signed.vault.dek(),
+            },
+            PROTOCOL_VERSION,
+            APP_VERSION,
+        );
+        m.bind(Binding::Tls(TEST_BIND));
+        let mut c = open_raw(state, &first).await;
+        let info = drive(&mut c, &mut m).await.unwrap();
+        let by_device = m.finish().unwrap();
+        assert!(
+            !by_device.keyed && by_device.login_key.is_none(),
+            "it cannot know"
+        );
+        let (mut session, _) = AccountSession::start(
+            by_device,
+            &info,
+            Default::default(),
+            false,
+            false,
+            PROTOCOL_VERSION,
+        );
+        let old = stretch("correct horse battery", &signed.relay_id, name);
+        let new = stretch("another good password", &signed.relay_id, name);
+        let a = session.password_change(&old, &new, None, None);
+        let (r, page, _) = through(&mut c, &mut session, a).await;
+        assert!(
+            matches!(r, AccountReply::PasswordChanged),
+            "{name}: {r:?} {page}"
+        );
+        // The recovery key needs the password again: a step-up is one request
+        let (a, _) = session.recovery_key_new(Some(&new), None, None);
+        let (r, page, _) = through(&mut c, &mut session, a).await;
+        assert!(
+            matches!(r, AccountReply::RecoveryKeyChanged),
+            "{name}: {r:?} {page}"
+        );
+        // The new password signs in, by its key or its secret
+        let again = password_sign_in(state, name, "another good password")
+            .await
+            .unwrap();
+        assert_eq!(again.keyed, !legacy, "{name}");
+    }
+
+    /// The password sign-in's connection, kept open.
+    async fn password_sign_in_open(state: &Arc<ServerState>, name: &str) -> Client {
+        let (mut m, first) = SignIn::start(
+            name,
+            Method::Password {
+                password: zeroize::Zeroizing::new("correct horse battery".into()),
+            },
+            PROTOCOL_VERSION,
+            APP_VERSION,
+        );
+        m.bind(Binding::Tls(TEST_BIND));
+        let mut c = open_raw(state, &first).await;
+        drive(&mut c, &mut m).await.unwrap();
+        c
+    }
 }
 
 /// S-006: a new recovery key, with the password, replaces the old one:
@@ -10319,7 +10455,10 @@ mod providers {
             assert!(relay.spend_pair_ask(user.id));
         }
         for _ in 0..8 {
-            c.send(&m.pair_start().unwrap()).await;
+            // Past the last answer it allows, the relay ends the sign-in without reading
+            // on: on a slow machine the connection is gone before this goes (CI run
+            // 43094865296), and its words are what the next read gets
+            c.send_unless_closed(&m.pair_start().unwrap()).await;
             match c.next().await {
                 Some(ServerMessage::AuthStep(AuthStep::PairRefused { reason })) => {
                     assert!(reason.contains("Too many"), "{reason}")

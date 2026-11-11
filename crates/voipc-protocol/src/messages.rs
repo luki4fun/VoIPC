@@ -2303,6 +2303,11 @@ pub enum ServerMessage {
     },
 }
 
+/// A relay's refusal of `AccountRequest::KeyChallenge` for an account whose password is not a
+/// login key yet (protocol v22): a session that does not know (signed in with a remembered
+/// device or a provider) proves the password the old way, with its secret, on hearing this.
+pub const NOT_KEYED: &str = "This account's password has not moved to its login key yet.";
+
 pub const PAIR_SAID_NO: &str = "Your other device said no.";
 pub const PAIR_NO_ANSWER: &str = "Your other device did not answer.";
 pub const PAIR_TOO_LATE: &str = "Your other device did not answer in time.";

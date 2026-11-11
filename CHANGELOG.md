@@ -16,8 +16,8 @@ Protocol 22. A 1.12 app talks to relays back to 1.0 (protocol 12); update the ap
   ([THREAT-MODEL.md](docs/THREAT-MODEL.md)).
 - **The password never leaves the app.** It signs in with a key derived from the password, and the server keeps only the
   key's public half. A new password, deleting the account, a new recovery key and linking a provider prove the password
-  the same way. An account from before 1.12 moves at its first sign-in with a 1.12 app; from then on its old secret opens
-  nothing.
+  the same way. An account from before 1.12 moves at its first sign-in with its password in a 1.12 app; from then on its
+  old secret opens nothing. Until then, a device signed in by its remembered key confirms the password the old way.
 - **The relay must end TLS itself**: a proxy that ends it in front of the TCP fallback breaks app sign-ins there.
 
 ### Changed

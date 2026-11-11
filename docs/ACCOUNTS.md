@@ -396,7 +396,9 @@ What is done in the app counts at once.
   that stands in for it leaves your device: since 1.12 the server keeps only that signing key's
   public half, and each signature names the connection it was made on, so a server you were
   lured to cannot pass your sign-in on. An account from before 1.12 moves to this at its first
-  sign-in with a 1.12 app. A new account is shown a recovery key once; write it down.
+  sign-in with its password in a 1.12 app; until then, confirming the password again (for a new
+  one, a new recovery key, deleting the account or linking a provider) sends its secret as
+  before. A new account is shown a recovery key once; write it down.
 - **Reporting a message** (from its menu, not on your own). The dialog names who takes
   reports here and who of them is away, and you can untick anyone you would rather not
   tell, and say why. They see your name and the message as you have it; the server sees

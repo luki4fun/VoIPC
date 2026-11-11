@@ -105,9 +105,10 @@ pub struct AccountSession {
     pins_out: bool,
     /// What this connection's proofs are bound to (`crate::bind`).
     binding: Option<crate::bind::Binding>,
-    /// The password is the account's login key here (protocol v22): a request that wants
-    /// it again goes after a `KeyStepUp` (`confirmed`).
-    keyed: bool,
+    /// Whether the password is the account's login key here (protocol v22), so a request
+    /// that wants it again goes after a `KeyStepUp` (`confirmed`). None: not known, after a
+    /// sign-in with a remembered device or a provider; the relay says at the first ask.
+    keyed: Option<bool>,
     /// A request waiting for its `KeyStepUp`.
     stepping: Option<Stepping>,
     /// A `LoginKeySet` out: `Some("PasswordChange")` for a new password (its refusal is
@@ -115,13 +116,16 @@ pub struct AccountSession {
     key_set: Option<&'static str>,
 }
 
-/// A request that wants the password again, on a keyed account: the key that signs the
-/// challenge, the codes, what goes once the step-up held, and the request's name.
+/// A request that wants the password again, on an account that is keyed or may be: the key
+/// that signs the challenge, the codes, what goes once the step-up held, what goes instead if
+/// the relay says the account is not keyed (the request with the password's secret), and the
+/// request's name.
 struct Stepping {
     key: LoginKey,
     totp: Option<String>,
     recovery_code: Option<String>,
     then: ClientMessage,
+    fallback: ClientMessage,
     request: &'static str,
 }
 
@@ -244,7 +248,13 @@ impl AccountSession {
             }
             _ => None,
         };
-        let keyed = signed.keyed || upgrade.is_some();
+        let keyed = if signed.keyed || upgrade.is_some() {
+            Some(true)
+        } else if proto >= 22 {
+            None
+        } else {
+            Some(false)
+        };
         let (mut sync, mut first) = AccountSync::start(&signed, info.id, memory, switch && right);
         let key_set = upgrade.as_ref().map(|_| "");
         first.extend(upgrade);
@@ -541,15 +551,16 @@ impl AccountSession {
     }
 
     /// A request that wants the password again (`master`, stretched) and the second
-    /// factor where there is one. On a keyed account at 22 the password never goes: a
-    /// challenge, `KeyStepUp` with the login key and the codes, then the request without
-    /// them (`on_key_reply`). Otherwise the request with the password's secret, as before.
+    /// factor where there is one. On an account that is keyed at 22, or may be, the password
+    /// never goes: a challenge, `KeyStepUp` with the login key and the codes, then the
+    /// request without them (`on_key_reply`); a relay that says the account is not keyed gets
+    /// the request with the password's secret instead. Otherwise that, as before.
     fn confirmed(
         &mut self,
         master: Option<&[u8; 32]>,
         (totp, recovery_code): (Option<String>, Option<String>),
         request: &'static str,
-        then: impl FnOnce(Option<Vec<u8>>, Option<String>, Option<String>) -> AccountRequest,
+        then: impl Fn(Option<Vec<u8>>, Option<String>, Option<String>) -> AccountRequest,
     ) -> Actions {
         let totp = totp
             .map(|c| c.trim().replace(' ', ""))
@@ -557,26 +568,44 @@ impl AccountSession {
         let recovery_code = recovery_code
             .map(|c| c.trim().to_string())
             .filter(|c| !c.is_empty());
+        let fallback =
+            ClientMessage::Account(then(secret_of(master), totp.clone(), recovery_code.clone()));
         match master {
-            Some(m) if self.keyed && self.proto >= 22 => {
-                if self.binding.is_none() {
-                    return self.refusal(request, NO_BINDING);
-                }
-                self.stepping = Some(Stepping {
-                    key: LoginKey::from_master(m),
-                    totp,
-                    recovery_code,
-                    then: ClientMessage::Account(then(None, None, None)),
-                    request,
-                });
-                Actions::sending(vec![ClientMessage::Account(AccountRequest::KeyChallenge)])
+            Some(m) if self.may_be_keyed() => {
+                let keyed = ClientMessage::Account(then(None, None, None));
+                self.step_up_then(m, (totp, recovery_code), request, keyed, fallback)
             }
-            _ => Actions::sending(vec![ClientMessage::Account(then(
-                secret_of(master),
-                totp,
-                recovery_code,
-            ))]),
+            _ => Actions::sending(vec![fallback]),
         }
+    }
+
+    /// Whether a request that wants the password may have to go as a step-up (22).
+    fn may_be_keyed(&self) -> bool {
+        self.proto >= 22 && self.keyed != Some(false)
+    }
+
+    /// The challenge asked for, and what the step-up then sends (`then`) or the relay's
+    /// "not keyed" makes it send (`fallback`).
+    fn step_up_then(
+        &mut self,
+        master: &[u8; 32],
+        (totp, recovery_code): (Option<String>, Option<String>),
+        request: &'static str,
+        then: ClientMessage,
+        fallback: ClientMessage,
+    ) -> Actions {
+        if self.binding.is_none() {
+            return self.refusal(request, NO_BINDING);
+        }
+        self.stepping = Some(Stepping {
+            key: LoginKey::from_master(master),
+            totp,
+            recovery_code,
+            then,
+            fallback,
+            request,
+        });
+        Actions::sending(vec![ClientMessage::Account(AccountRequest::KeyChallenge)])
     }
 
     /// The page hears `reason` as the answer to `request`.
@@ -596,6 +625,8 @@ impl AccountSession {
         match reply {
             AccountReply::KeyChallenge { challenge } => {
                 let st = self.stepping.as_ref()?;
+                // The relay holds a key for the account: it is keyed
+                self.keyed = Some(true);
                 let Some(b) = self.binding else {
                     let request = self.stepping.take()?.request;
                     return Some(self.refusal(request, NO_BINDING));
@@ -614,6 +645,18 @@ impl AccountSession {
                 let st = self.stepping.take()?;
                 Some(Actions::sending(vec![st.then]))
             }
+            // Not keyed yet (signed in another way than with the password): the request
+            // goes with the password's secret, as on a relay before 22
+            AccountReply::Error { request, reason }
+                if request == "KeyChallenge" && reason == voipc_protocol::messages::NOT_KEYED =>
+            {
+                let st = self.stepping.take()?;
+                self.keyed = Some(false);
+                if st.request == "PasswordChange" {
+                    self.key_set = None;
+                }
+                Some(Actions::sending(vec![st.fallback]))
+            }
             AccountReply::Error { request, reason }
                 if request == "KeyChallenge" || request == "KeyStepUp" =>
             {
@@ -625,14 +668,14 @@ impl AccountSession {
             }
             AccountReply::LoginKeySaved => {
                 self.key_set = None;
-                self.keyed = true;
+                self.keyed = Some(true);
                 Some(Actions::default())
             }
             AccountReply::Error { request, reason } if request == "LoginKeySet" => {
                 match self.key_set.take()? {
                     // The move after a sign-in: the account stays as it was
                     "" => {
-                        self.keyed = false;
+                        self.keyed = Some(false);
                         Some(Actions::default())
                     }
                     r => Some(self.refusal(r, reason)),
@@ -1144,14 +1187,28 @@ impl AccountSession {
             derive_from_master(new_master),
         );
         let vault = Vault::from_dek(self.relay_id, &self.name, *self.dek);
-        // A keyed account (22): the old key steps up, then the new key goes in, signed by
-        // the identity with the new slot over this connection. Neither secret goes.
-        if self.keyed && self.proto >= 22 {
+        let totp = totp
+            .map(|c| c.trim().replace(' ', ""))
+            .filter(|c| !c.is_empty());
+        let recovery_code = recovery_code
+            .map(|c| c.trim().to_string())
+            .filter(|c| !c.is_empty());
+        let slot = vault.pass_slot(&new.vault_key).v;
+        let legacy = ClientMessage::Account(AccountRequest::PasswordChange {
+            old_secret: old.auth_secret.to_vec(),
+            new_secret: new.auth_secret.to_vec(),
+            pass_slot: slot.clone(),
+            totp: totp.clone(),
+            recovery_code: recovery_code.clone(),
+        });
+        // Keyed, or maybe (22): the old key steps up, then the new key goes in, signed by the
+        // identity with the new slot over this connection. Neither secret goes. An account
+        // that is not keyed yet changes the old way.
+        if self.may_be_keyed() {
             let Some(b) = self.binding else {
                 return self.refusal("PasswordChange", NO_BINDING);
             };
             let key = LoginKey::from_master(new_master).public_key();
-            let slot = vault.pass_slot(&new.vault_key).v;
             let identity_sig = login_key_proof(
                 self.sync.identity(),
                 &self.relay_id,
@@ -1161,31 +1218,21 @@ impl AccountSession {
                 &b,
             );
             self.key_set = Some("PasswordChange");
-            return self.confirmed(
-                Some(old_master),
+            let keyed = ClientMessage::Account(AccountRequest::LoginKeySet {
+                login_key: key.to_vec(),
+                identity_sig,
+                pass_slot: Some(slot),
+                web: b.web(),
+            });
+            return self.step_up_then(
+                old_master,
                 (totp, recovery_code),
                 "PasswordChange",
-                |_, _, _| AccountRequest::LoginKeySet {
-                    login_key: key.to_vec(),
-                    identity_sig,
-                    pass_slot: Some(slot),
-                    web: b.web(),
-                },
+                keyed,
+                legacy,
             );
         }
-        Actions::sending(vec![ClientMessage::Account(
-            AccountRequest::PasswordChange {
-                old_secret: old.auth_secret.to_vec(),
-                new_secret: new.auth_secret.to_vec(),
-                pass_slot: vault.pass_slot(&new.vault_key).v,
-                totp: totp
-                    .map(|c| c.trim().replace(' ', ""))
-                    .filter(|c| !c.is_empty()),
-                recovery_code: recovery_code
-                    .map(|c| c.trim().to_string())
-                    .filter(|c| !c.is_empty()),
-            },
-        )])
+        Actions::sending(vec![legacy])
     }
 
     /// A new recovery key, confirmed by the password (and the second factor
@@ -1208,8 +1255,8 @@ impl AccountSession {
             "RecoveryKeyNew",
             |secret, totp, recovery_code| AccountRequest::RecoveryKeyNew {
                 secret: secret.unwrap_or_default(),
-                recovery_slot,
-                reset_key: reset,
+                recovery_slot: recovery_slot.clone(),
+                reset_key: reset.clone(),
                 totp,
                 recovery_code,
             },
@@ -2131,6 +2178,91 @@ mod tests {
         assert!(matches!(
             &a.send[..],
             [ClientMessage::Account(AccountRequest::DeleteAccount { secret, .. })] if secret.len() == 32
+        ));
+    }
+
+    /// After a sign-in with a remembered device or a provider the session does not know
+    /// whether the password is a login key yet: it asks, and a relay that says no gets the
+    /// request with the secret, once; a challenge says yes.
+    #[test]
+    fn a_session_that_does_not_know_asks_and_falls_back_to_the_secret() {
+        use crate::bind::Binding;
+        let session = || {
+            let signed = SignedIn {
+                relay_id: RELAY,
+                name: "me".into(),
+                vault: Vault::create(RELAY, "me"),
+                identity: IdentityKeyPair::generate(&mut crate::rng()),
+                recovery: None,
+                binding: Some(Binding::Tls([5; 32])),
+                keyed: false,
+                login_key: None,
+                blobs: Vec::new(),
+            };
+            AccountSession::start(signed, &info(false), LogMemory::default(), false, false, 22).0
+        };
+        let master = [3u8; 32];
+        let not_keyed = AccountReply::Error {
+            request: "KeyChallenge".into(),
+            reason: voipc_protocol::messages::NOT_KEYED.into(),
+        };
+        let mut s = session();
+        let a = s.delete_account(Some(&master), Some("123456".into()), None);
+        assert!(matches!(
+            &a.send[..],
+            [ClientMessage::Account(AccountRequest::KeyChallenge)]
+        ));
+        let a = s.on_reply(&not_keyed);
+        assert!(
+            matches!(&a.send[..], [ClientMessage::Account(AccountRequest::DeleteAccount { secret, totp: Some(c), .. })]
+                if secret.len() == 32 && c == "123456"),
+            "{:?}",
+            a.send
+        );
+        assert!(a.emit.is_empty(), "the page hears nothing of the ask");
+        // Known now: the next one goes straight
+        let a = s.provider_unlink(ProviderKind::Discord, Some(&master), None, None);
+        assert!(matches!(
+            &a.send[..],
+            [ClientMessage::Account(AccountRequest::ProviderUnlink {
+                secret: Some(_),
+                ..
+            })]
+        ));
+        let a = s.password_change(&master, &[4; 32], None, None);
+        assert!(matches!(
+            &a.send[..],
+            [ClientMessage::Account(
+                AccountRequest::PasswordChange { .. }
+            )]
+        ));
+
+        // A challenge says it is keyed, and a password change goes as the new key
+        let mut s = session();
+        let a = s.password_change(&master, &[4; 32], None, None);
+        assert!(matches!(
+            &a.send[..],
+            [ClientMessage::Account(AccountRequest::KeyChallenge)]
+        ));
+        let a = s.on_reply(&AccountReply::KeyChallenge {
+            challenge: "tok".into(),
+        });
+        assert!(matches!(
+            &a.send[..],
+            [ClientMessage::Account(AccountRequest::KeyStepUp { .. })]
+        ));
+        let a = s.on_reply(&AccountReply::SteppedUp);
+        assert!(matches!(
+            &a.send[..],
+            [ClientMessage::Account(AccountRequest::LoginKeySet {
+                pass_slot: Some(_),
+                ..
+            })]
+        ));
+        let a = s.delete_account(Some(&master), None, None);
+        assert!(matches!(
+            &a.send[..],
+            [ClientMessage::Account(AccountRequest::KeyChallenge)]
         ));
     }
 
