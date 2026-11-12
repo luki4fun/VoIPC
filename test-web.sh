@@ -233,14 +233,14 @@ for _ in $(seq 1 50); do
   sleep 0.2
 done
 
-run_browser() { # name role extra-params logfile browser
+run_browser() { # name role extra-params logfile browser [profile-suffix]
   local url="https://127.0.0.1:$TCP_PORT/?selftest=1&name=$1&role=$2&duration=$DURATION$3"
   local engine="${5:-$BROWSER}"
   if [ "$engine" = firefox ]; then
     # Firefox has no --ignore-certificate-errors: the test CA goes into the
     # profile's own NSS database. console.log goes to stdout here (Chromium
     # logs it to stderr), so both streams land in the log file.
-    local profile="$WORK/profile-$1"
+    local profile="$WORK/profile-$1${6:-}"
     mkdir -p "$profile"
     cat > "$profile/user.js" <<EOF
 user_pref("media.navigator.streams.fake", true);
@@ -255,15 +255,46 @@ EOF
     "$CHROME" --headless=new --no-sandbox --disable-gpu --ignore-certificate-errors \
       --use-fake-ui-for-media-stream --use-fake-device-for-media-stream \
       --autoplay-policy=no-user-gesture-required --enable-logging=stderr --v=0 \
-      --user-data-dir="$WORK/profile-$1" \
+      --user-data-dir="$WORK/profile-$1${6:-}" \
       "$url" > /dev/null 2> "$4" &
   fi
+  browser_pid=$!
+}
+
+# A self-test page writes a line of its own (the app's version, then SELFTEST lines) within a
+# second or two of its browser's start. One that writes nothing for LOAD_WAIT s stayed blank, as
+# a first load now and then does on CI (run 43121449320: alice's Chromium ran for 90 s, her page
+# never ran a line and the relay never saw her). Why is not known yet, so it says what it can:
+# what the relay serves for the page right then, and the browser's last lines, in a NOTE; that
+# browser goes (its log kept as <name>-blank.log) and one more starts with a fresh profile. The
+# lanes on test-cdp.mjs do the same (`loadPage` with `retry`). The count is in the verdict.
+LOAD_WAIT=45
+blank_loads=0
+page_up() { grep -qaE 'VoIPC [0-9]|SELFTEST ' "$1" 2>/dev/null; }
+start_page() { # as run_browser
+  run_browser "$@"
+  local pid=$browser_pid
+  for _ in $(seq 1 $((LOAD_WAIT * 10))); do
+    page_up "$4" && return 0
+    sleep 0.1
+  done
+  page_up "$4" && return 0
+  blank_loads=$((blank_loads + 1))
+  {
+    echo "NOTE a first page load stayed blank and is tried again: $1, browser $(kill -0 "$pid" 2>/dev/null && echo running || echo gone)"
+    echo "  the relay's page now: $(curl -sk -o /dev/null -w '%{http_code}, %{size_download} bytes in %{time_total} s' "https://127.0.0.1:$TCP_PORT/" 2>&1 || echo 'no answer')"
+    echo "  the browser's last lines:"
+    grep -av 'dbus' "$4" | tail -5 | sed 's/^/    /'
+  } | tee -a "$WORK/notes.txt"
+  kill "$pid" 2>/dev/null || true
+  mv "$4" "${4%.log}-blank.log"
+  run_browser "$@" -again
 }
 
 # alice creates the channel, becomes admin at the end and kicks bob; bob joins
 # through an invite-link fragment (#channel=…) and expects the kick
 # alice also shares her (synthetic) screen; bob watches it
-run_browser alice talker "&channel=e2e&textchannel=e2e-text&dm=bob&admin=e2e-admin-token-0001&kick=bob&share=1&proximity=2d&pos=3,0,0&spatialtest=3d&file=$FILE_KIB$(via "$TRANSPORT_ALICE")" \
+start_page alice talker "&channel=e2e&textchannel=e2e-text&dm=bob&admin=e2e-admin-token-0001&kick=bob&share=1&proximity=2d&pos=3,0,0&spatialtest=3d&file=$FILE_KIB$(via "$TRANSPORT_ALICE")" \
   "$WORK/alice.log" "$BROWSER_ALICE"
 # Not a fixed stagger: the run asserts that a message alice sent *before* bob
 # arrived reaches him as channel history, so the harness has to make "before"
@@ -281,7 +312,7 @@ for _ in $(seq 1 900); do
 done
 grep -q 'SELFTEST early-chat-sent' "$WORK/alice.log" ||
   echo "warning: alice never reported her first message — bob starts anyway, expect a history failure"
-run_browser bob listener "&textchannel=e2e-text&dm=alice&expect_kick=1&watch=1&pos=-3,0,0$(via "$TRANSPORT_BOB")#channel=e2e" \
+start_page bob listener "&textchannel=e2e-text&dm=alice&expect_kick=1&watch=1&pos=-3,0,0$(via "$TRANSPORT_BOB")#channel=e2e" \
   "$WORK/bob.log" "$BROWSER_BOB"
 
 deadline=$(( $(date +%s) + DURATION / 1000 + 30 ))
@@ -295,6 +326,7 @@ done
 extract() { grep -ao 'SELFTEST .*' "$1" | sed 's/", source:.*$//; s/\\"/"/g' > "$2" || true; }
 extract "$WORK/alice.log" "$WORK/alice.txt"
 extract "$WORK/bob.log" "$WORK/bob.txt"
+echo "--- self-test: $blank_loads blank first load(s) tried again"
 echo "--- alice"; cat "$WORK/alice.txt"
 echo "--- bob";   cat "$WORK/bob.txt"
 
