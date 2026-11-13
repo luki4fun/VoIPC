@@ -37,6 +37,8 @@ interface Run {
   bytes: number;
   /** Part of the schedule, not a person's Refresh. */
   scheduled: boolean;
+  /** It had something to ask: one with nothing is no sweep, and the first is still to come. */
+  asked: boolean;
   stuck: ReturnType<typeof setTimeout>;
 }
 
@@ -51,13 +53,15 @@ interface Sweeps {
   quiet: ReadonlySet<number>;
   /** Hand-offs that wait to see whether their asker is on the next list. */
   waiting: { at: number; retry: () => void }[];
+  /** Text channels this person made, until their join: their list is asked then. */
+  made: Set<number>;
 }
 
 const sweeps = new Map<string, Sweeps>();
 
 function stateOf(server: string): Sweeps {
   let s = sweeps.get(server);
-  if (!s) sweeps.set(server, (s = { started: false, timer: null, lastAt: 0, lastBytes: 0, run: null, quiet: new Set(), waiting: [] }));
+  if (!s) sweeps.set(server, (s = { started: false, timer: null, lastAt: 0, lastBytes: 0, run: null, quiet: new Set(), waiting: [], made: new Set() }));
   return s;
 }
 
@@ -90,7 +94,7 @@ function startRun(server: string, queue: number[], scheduled: boolean): void {
     s.run.scheduled ||= scheduled;
     return;
   }
-  s.run = { queue, people: [], gone: new Set(), pages: 0, after: 0, bytes: 0, scheduled, stuck: setTimeout(() => finishRun(server), STUCK_MS) };
+  s.run = { queue, people: [], gone: new Set(), pages: 0, after: 0, bytes: 0, scheduled, asked: queue.length > 0, stuck: setTimeout(() => finishRun(server), STUCK_MS) };
   if (queue.length === 0) finishRun(server);
   else ask(server, queue[0], 0);
 }
@@ -101,10 +105,14 @@ function finishRun(server: string): void {
   if (!s || !run) return;
   clearTimeout(run.stuck);
   s.run = null;
-  if (run.scheduled) {
+  if (run.scheduled && run.asked) {
     s.lastAt = Date.now();
     s.lastBytes = run.bytes;
     arm(server, s, nextSweepDelay(run.bytes));
+  } else if (run.scheduled) {
+    // Nothing went by a list yet (the first join came before any such channel): asking
+    // nothing is no sweep, and ten minutes on would leave the next one's list empty that long
+    arm(server, s, firstSweepDelay(Math.random()));
   }
   const waiting = s.waiting;
   s.waiting = [];
@@ -122,6 +130,19 @@ export function startSweeps(server: string, random = Math.random()): void {
 /** The list of one channel now, because a person asked to see it, or just entered it. */
 export function refreshList(server: string, channelId: number): void {
   startRun(server, [channelId], false);
+}
+
+/** `ChannelCreated` for a text channel this person made: the relay joins them to it next. */
+export function noteMade(server: string, channelId: number): void {
+  stateOf(server).made.add(channelId);
+}
+
+/** Text channels just followed. One this person made is theirs to have entered, as a join by
+ *  hand is, so its list is asked now: nobody's join is told, not even their own. */
+export function joinedMade(server: string, ids: readonly number[]): void {
+  const made = sweeps.get(server)?.made;
+  if (!made) return;
+  for (const id of ids) if (made.delete(id)) refreshList(server, id);
 }
 
 /**

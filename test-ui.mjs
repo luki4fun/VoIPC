@@ -692,6 +692,28 @@ check(
   await bob.evaluate(`!document.querySelector(".users .user .crown, .users .user .shield, .users .user .sharing-history")`),
   await bob.evaluate(`[...document.querySelectorAll(".users .user")].map((u) => u.innerHTML.slice(0, 120)).join(" | ")`),
 );
+// Her switch, turned on while she stands there, is announced to everyone by id, and her
+// pseudonym's row has that id: an honest app keeps the mark off that row too. These tabs
+// share one switch (config.ts), so bob's goes on with hers and his own row may show it
+const sharingHeard = `window.__voipc_heard.filter(([kind]) => kind === "UserHistorySharing").length`;
+const markedRows = `JSON.stringify([...document.querySelectorAll(".users .user")].map((u) => u.textContent.trim().replace(/\\s+/g, " ") + (u.querySelector(".sharing-history") ? " [mark]" : "")))`;
+const sharingBefore = await bob.evaluate(sharingHeard);
+await alice.evaluate(`window.__voipc_said.splice(0); 0`);
+await shareSwitch(alice, true);
+await waitFor(alice, sentKind("SetHistorySharing"));
+check("past alice and bob's barrier", await barrier(SERVER, alice, bob));
+check("the control: her switch's announcement reached bob", (await bob.evaluate(sharingHeard)) > sharingBefore);
+check(
+  "and puts no history mark on her pseudonym",
+  await bob.evaluate(`![...document.querySelectorAll(".users .user")].some((u) => !u.textContent.includes("(you)") && u.querySelector(".sharing-history"))`),
+  await bob.evaluate(markedRows),
+);
+check(
+  "while her own row shows it to her",
+  await seen(alice, `[...document.querySelectorAll(".users .user")].some((u) => u.textContent.includes("(you)") && u.querySelector(".sharing-history"))`),
+  await alice.evaluate(markedRows),
+);
+await shareSwitch(alice, false);
 
 // Hidden + no sharing + hidden members, set through the settings dialog
 await alice.evaluate(`(() => { const el = document.querySelector('.channel-row:has(> .channel.active) .settings-icon[title="Channel settings"]'); if (!el) return false; el.click(); return true; })()`);

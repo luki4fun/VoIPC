@@ -512,6 +512,8 @@ async function lane() {
   }
   const toastSaid = (tab, words) => tab.evaluate(`window.__toasts.some((t) => t.includes(${JSON.stringify(words)}))`);
   const memberRow = (name) => `[...document.querySelectorAll(".user-list.modern .user")].find((u) => u.textContent.includes(${JSON.stringify(name)}))`;
+  // On the channel's own list, never the "Online" block a list-based channel shows under it
+  const listRow = (name) => `[...document.querySelectorAll(".user-list.modern .users .user")].find((u) => u.textContent.includes(${JSON.stringify(name)}))`;
   const menuItem = (label) => byText(".ctx-item", label);
   const openMenuOn = async (tab, name) => {
     await tab.evaluate(`document.querySelector(".ctx-overlay")?.click(); 0`);
@@ -716,12 +718,15 @@ async function lane() {
   await waitFor(fay, `document.querySelector(".join-text-btn")`);
   await fay.evaluate(`document.querySelector(".join-text-btn").click()`);
   await waitFor(fay, `document.querySelector(".input-bar .chat-input")`);
-  // His post goes to whom his app knows is in: fay, once she is on his list
-  await waitFor(gus, memberRow("fay"));
+  // Her compose box comes with the relay's TextJoined, so his post's key check names her.
+  // His list is not what decides it: a text join tells nobody, and only a sweep would show
+  // her there before he posts (a random moment in the first minute, then ten minutes on)
+  check("the maker's own list is there at once", await seen(gus, listRow("gus")), await pageText(gus));
   await say(gus, "only gus holds this");
   await waitFor(fay, lastMessage("only gus holds this"), 30_000);
+  check("handing her his key puts her on his list", await seen(gus, listRow("fay")), await pageText(gus));
   await fay.evaluate(`${notesRow}.parentElement.querySelector('.settings-icon[title^="Leave this channel"]').click()`);
-  await waitFor(gus, `!${memberRow("fay")}`);
+  await waitFor(gus, `!${listRow("fay")}`);
   await waitFor(han, notesRow);
   await han.evaluate(`${notesRow}.click()`);
   await waitFor(han, `document.querySelector(".join-text-btn")`);
@@ -1110,9 +1115,8 @@ async function lane() {
   await waitFor(ivy, ivyNotes);
   await ivy.evaluate(`${ivyNotes}.click()`);
   await waitFor(ivy, composer);
+  // His compose box comes with the relay's TextJoined, so her post's key check names him
   await joinRoom(bob, "ivy-notes");
-  // Her posts go to whom her app knows is in
-  await waitFor(ivy, memberRow("bobby"));
   await say(ivy, "hand me on");
   await waitFor(bob, lastMessage("hand me on"), 60_000);
   await say(ivy, "take me down");
@@ -1141,10 +1145,8 @@ async function lane() {
 
   // Slow mode does not hold back a moderator, whose hide is a post
   const held = `document.querySelector('.input-bar .send-btn[title^="Slow mode"]')`;
+  // Each joined by the relay's TextJoined, so each post's key check names the other
   for (const tab of [bob, ivy]) await joinRoom(tab, "slow-chat");
-  // Each one's posts go to whom their app knows is in
-  await waitFor(ivy, memberRow("bobby"));
-  await waitFor(bob, memberRow("ivy"));
   await say(ivy, "slow from ivy");
   check("the control: a member's post starts the wait", await seen(ivy, held), await pageText(ivy));
   await say(bob, "slow one from bobby");

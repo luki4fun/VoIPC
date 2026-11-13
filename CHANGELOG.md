@@ -65,6 +65,13 @@ Measured on a disk-backed relay before and after; each one has a test.
   the history icon and the maker's crown; everyone heard who made the room and, outside it, who went in; a list with
   their name showed them muted or sharing as they did in the room. None of it goes to anyone but admins now. A modified
   app can still tie a pseudonym to a person by its user id and key ([THREAT-MODEL.md](docs/THREAT-MODEL.md)).
+- **Turning history sharing on or off inside an anonymous room** put the history icon back on your pseudonym's row
+  for everyone there, undoing the fix above. It stays off that row now.
+- **Someone who shares history could show as not sharing** to people outside their voice room, with no Resync button
+  and no automatic ask for recent messages, when they turned sharing on within a quarter second of joining the room.
+  The switch is no longer lost while their join is still being applied.
+- **A text channel you had just made listed nobody, not even you,** for up to ten minutes. Its list is asked as you
+  join it now, and a first look that found nothing to ask no longer puts the next one ten minutes away.
 - **A new direct-message key put while under a pseudonym** told the other party at that moment; they learn of it at their
   next read now.
 - **Lift ban holds for someone who deleted their account themselves**: the next import made their banned row again.

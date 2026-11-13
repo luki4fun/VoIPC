@@ -175,9 +175,10 @@
   import { olderRelay } from "./lib/stores/relay.js";
   import { community, livePath } from "./lib/relay-rules.js";
   import { askArchiveChannels } from "./lib/stores/imported.js";
-  import { noteMemberGone, onSweepPage, startSweeps, sweepForAsker } from "./lib/stores/sweep.js";
+  import { joinedMade, noteMade, noteMemberGone, onSweepPage, startSweeps, sweepForAsker } from "./lib/stores/sweep.js";
   import { afterJoin, joinedNow } from "./lib/stores/join-wait.js";
   import { goesByList, marksChannel } from "./lib/follow-rules.js";
+  import { takesSwitch } from "./lib/roster-rules.js";
   import { gateNoted, noteReaders, relayWentBack, type NamedReader } from "./lib/stores/noticing.js";
   import { forgetHandOff, handOffAnswered } from "./lib/stores/handoff.js";
   import { clearRing, flushMarks, moveRead, noteLastPost, ringBack, ringForPost } from "./lib/stores/marks.js";
@@ -1234,12 +1235,18 @@
       }),
 
       listenServer<{ user_id: number; enabled: boolean }>("user-history-sharing", (server, data) => {
+        // Never onto a pseudonym's row: that one keeps it off, as the relay told it (G1)
+        const list = get(channels.peek(server));
+        const me = get(userId.peek(server));
+        const admin = get(isAdmin.peek(server));
+        const takes = (channelId: number) =>
+          takesSwitch(list.find((c) => c.channel_id === channelId), data.user_id, me, admin);
         users.of(server).update((u) =>
           u.map((user) =>
-            user.user_id === data.user_id ? { ...user, shares_history: data.enabled } : user,
+            user.user_id === data.user_id && takes(user.channel_id) ? { ...user, shares_history: data.enabled } : user,
           ),
         );
-        patchRosters(server, data.user_id, { shares_history: data.enabled });
+        patchRosters(server, data.user_id, { shares_history: data.enabled }, takes);
       }),
 
       listenServer<{ user_id: number; deafened: boolean }>("user-deafened", (server, data) => {
@@ -1553,6 +1560,9 @@
       listenServer<ChannelInfo>("channel-created", (server, created) => {
         // Idempotent: the channel list snapshot may already contain it
         channels.of(server).update((chs) => upsertById(chs, created, (c) => c.channel_id).list);
+        if (created.text && created.created_by !== null && created.created_by === get(userId.peek(server))) {
+          noteMade(server, created.channel_id);
+        }
       }),
 
       listenServer<{ channel_id: number }>("channel-deleted", (server, data) => {
@@ -1705,6 +1715,7 @@
           if (name) clearChannelUnread(server, name);
         }
         askArchiveChannels(server);
+        joinedMade(server, ids);
         startSweeps(server);
       }),
 
