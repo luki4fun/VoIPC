@@ -460,6 +460,22 @@ const LARGE_ARCHIVE_BYTES = 5_000_000;
 const LARGE_SAVE_EVERY_MS = 5 * 60_000;
 let lastSaveBytes = 0;
 let lastSaveAt = 0;
+/** The last read of a stored log filed here (`log-read-upto`, desktop). Its posts came as
+ *  events before it, so a save that takes the stores after it holds them: the backend puts
+ *  that read's cursors on disk only with such a save, never ahead of the posts. */
+let readUpto = 0;
+
+/** A read of a stored log was filed. Its cursors reach disk with the next save. */
+export function noteReadUpto(gen: number): void {
+  if (!Number.isSafeInteger(gen) || gen <= readUpto) return;
+  readUpto = gen;
+  // History off keeps no posts to wait for: the cursors go as they are
+  if (get(chatHistoryDisabled)) {
+    if (get(chatUnlocked)) void invoke("log_read_saved", { upto: gen }).catch(() => {});
+    return;
+  }
+  scheduleSave();
+}
 
 function scheduleSave() {
   if (saveTimeout) {
@@ -505,6 +521,8 @@ async function saveNow() {
   // over IPC that the backend throws away does not happen (H5-06).
   if (get(chatHistoryDisabled) || !get(chatUnlocked)) return;
 
+  // Taken with the stores, below: what was filed by then is in them
+  const upto = readUpto;
   // Convert Maps to plain objects for serde
   const channelObj: Record<string, ChatMessage[]> = {};
   chMap.forEach((msgs, name) => {
@@ -530,6 +548,7 @@ async function saveNow() {
       channelMessages: channelObj,
       dmMessages: dmObj,
       cleared: clearedObj,
+      readUpto: upto,
     });
   } catch (e) {
     console.error("Failed to save chat history:", e);

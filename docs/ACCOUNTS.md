@@ -395,10 +395,11 @@ What is done in the app counts at once.
   it signs your sign-ins with, and the key to your vault. Neither the password nor anything
   that stands in for it leaves your device: since 1.12 the server keeps only that signing key's
   public half, and each signature names the connection it was made on, so a server you were
-  lured to cannot pass your sign-in on. An account from before 1.12 moves to this at its first
-  sign-in with its password in a 1.12 app; until then, confirming the password again (for a new
-  one, a new recovery key, deleting the account or linking a provider) sends its secret as
-  before. A new account is shown a recovery key once; write it down.
+  lured to cannot pass your sign-in on. An account from before 1.12 moves to this the first
+  time it gives its password to a 1.12 app: a sign-in with it, or confirming it on a device
+  signed in another way (a new recovery key, linking or unlinking a provider). That once, its
+  secret goes as before; so does a new password or deleting the account before the move. A new
+  account is shown a recovery key once; write it down.
 - **Reporting a message** (from its menu, not on your own). The dialog names who takes
   reports here and who of them is away, and you can untick anyone you would rather not
   tell, and say why. They see your name and the message as you have it; the server sees
@@ -657,7 +658,8 @@ From accounts:
 - for a linked provider, the provider's id for you and the name it gives. Never your email, and no provider
   token is kept
 - for each password, the public half of the key derived from it (since 1.12; an account
-  nobody signed in to with a 1.12 app keeps an Argon2id hash of a secret derived from it)
+  that has not given its password to a 1.12 app yet keeps an Argon2id hash of a secret
+  derived from it)
 - the Discord ids an account unlinked, kept only so that deleting it takes their posts too
 - identity public keys
 - the public keys of remembered devices

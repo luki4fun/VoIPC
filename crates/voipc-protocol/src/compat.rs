@@ -275,6 +275,12 @@ pub const RESHAPED: &[(u32, Side, u32, &str)] = &[
         "AccountReply and AdminReply: the import and archive replies never come from it",
     ),
     (
+        19,
+        Side::Server,
+        68,
+        "Restrictions without the moderator's part and the wait's end",
+    ),
+    (
         20,
         Side::Client,
         40,
@@ -298,6 +304,12 @@ pub const RESHAPED: &[(u32, Side, u32, &str)] = &[
         Side::Server,
         46,
         "AccountReply: ArchiveChannels and the kept frames never come from it",
+    ),
+    (
+        20,
+        Side::Server,
+        68,
+        "Restrictions without the moderator's part and the wait's end",
     ),
     (
         21,
@@ -325,6 +337,18 @@ pub const RESHAPED: &[(u32, Side, u32, &str)] = &[
         46,
         "AccountReply: Asked and the login key's replies never come from it",
     ),
+    (
+        21,
+        Side::Server,
+        68,
+        "Restrictions without the moderator's part and the wait's end",
+    ),
+    (
+        22,
+        Side::Server,
+        68,
+        "Restrictions without the moderator's part and the wait's end",
+    ),
 ];
 
 /// How many messages each side had at a protocol: an index at or past it is
@@ -338,7 +362,7 @@ fn client_messages(proto: u32) -> u32 {
         18 => 52,
         19 => 54,
         20 => 55,
-        21 => 64,
+        21..=22 => 64,
         _ => u32::MAX,
     }
 }
@@ -353,6 +377,7 @@ const USER_LIST: u32 = 5;
 const CHANNEL_USERS: u32 = 18;
 const EMOTE_LIST: u32 = 56;
 const EMOTE_TICKET: u32 = 57;
+const RESTRICTIONS: u32 = 68;
 
 /// `encode_client_msg` for a relay at `proto`: the frames to send, one each
 /// so a sender's pacer counts them as the relay does (`EmoteRemove` of many
@@ -594,6 +619,13 @@ pub fn decode_server_msg_from(payload: &[u8], proto: u32) -> Result<ServerMessag
                 emotes: list.emotes.into_iter().map(Emote::from).collect(),
             }
         }
+        (RESTRICTIONS, 19..=22) => ServerMessage::Restrictions {
+            list: postcard::from_bytes::<Restrictions22>(rest)?
+                .list
+                .into_iter()
+                .map(Restriction::from)
+                .collect(),
+        },
         (EMOTE_TICKET, 14) => {
             let t: EmoteTicket14 = postcard::from_bytes(rest)?;
             // The app matches a ticket by its hash alone when the name is empty
@@ -609,6 +641,45 @@ pub fn decode_server_msg_from(payload: &[u8], proto: u32) -> Result<ServerMessag
 
 // The old shapes, each as `tests/golden/v<N>.json` recorded it. The renames
 // make their traced names match the golden ones.
+
+/// `Restriction` from 1.10 to 1.12.0-rc.1: one `by` for the whole row.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename = "Restriction")]
+struct Restriction22 {
+    user_id: UserId,
+    voice: bool,
+    text: bool,
+    direct: bool,
+    expires_in_secs: Option<u32>,
+    by: String,
+    reason: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename = "Restrictions")]
+struct Restrictions22 {
+    list: Vec<Restriction22>,
+}
+
+impl From<Restriction22> for Restriction {
+    /// The row as that relay meant it: a moderator's `by` for all it holds, and only a row
+    /// without one is the wait's, ending when the row does.
+    fn from(r: Restriction22) -> Restriction {
+        let by = !r.by.is_empty();
+        Restriction {
+            by_voice: by && r.voice,
+            by_text: by && r.text,
+            wait_in_secs: if by { None } else { r.expires_in_secs },
+            user_id: r.user_id,
+            voice: r.voice,
+            text: r.text,
+            direct: r.direct,
+            expires_in_secs: r.expires_in_secs,
+            by: r.by,
+            reason: r.reason,
+        }
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename = "Reset")]
@@ -1698,6 +1769,43 @@ mod tests {
         }
     }
 
+    /// A relay before 23 says one `by` for the whole row: the app reads it so, and a row
+    /// without one as the wait's, ending with the row (W3-17).
+    #[test]
+    fn restrictions_from_a_relay_before_23() {
+        let row = |by: &str, voice: bool, text: bool, direct: bool| Restriction22 {
+            user_id: 7,
+            voice,
+            text,
+            direct,
+            expires_in_secs: Some(600),
+            by: by.into(),
+            reason: String::new(),
+        };
+        let frame = postcard::to_allocvec(&(
+            RESTRICTIONS,
+            Restrictions22 {
+                list: vec![row("mod", true, false, false), row("", true, true, true)],
+            },
+        ))
+        .unwrap();
+        for v in 19..=22 {
+            let ServerMessage::Restrictions { list } = decode_server_msg_from(&frame, v).unwrap()
+            else {
+                panic!("not Restrictions")
+            };
+            assert_eq!(
+                (list[0].by_voice, list[0].by_text, list[0].wait_in_secs),
+                (true, false, None),
+                "protocol {v}"
+            );
+            assert_eq!(
+                (list[1].by_voice, list[1].by_text, list[1].wait_in_secs),
+                (false, false, Some(600))
+            );
+        }
+    }
+
     #[test]
     fn a_bound_proof_reaches_an_older_relay_only_where_it_means_the_same() {
         use crate::types::VaultBlob;
@@ -1709,17 +1817,22 @@ mod tests {
         let plain = ClientMessage::AuthContinue(AuthContinue::DeviceSig {
             signature: vec![1, 2, 3],
         });
-        for v in OLDEST_RELAY_PROTOCOL..PROTOCOL_VERSION {
+        // Bound proofs came with 22
+        const BOUND: u32 = 22;
+        for v in OLDEST_RELAY_PROTOCOL..BOUND {
             assert_eq!(
                 frames(encode_client_msg_for(&bound, v).unwrap()),
                 frames(encode_client_msg_for(&plain, v).unwrap()),
                 "protocol {v}"
             );
         }
-        assert_ne!(
-            frames(encode_client_msg_for(&bound, PROTOCOL_VERSION).unwrap()),
-            frames(encode_client_msg_for(&plain, PROTOCOL_VERSION).unwrap()),
-        );
+        for v in BOUND..=PROTOCOL_VERSION {
+            assert_ne!(
+                frames(encode_client_msg_for(&bound, v).unwrap()),
+                frames(encode_client_msg_for(&plain, v).unwrap()),
+                "protocol {v}"
+            );
+        }
         let refused = [
             ClientMessage::AuthContinue(AuthContinue::ResetBound {
                 signature: vec![],
@@ -1760,7 +1873,7 @@ mod tests {
             }),
         ];
         for msg in &refused {
-            for v in OLDEST_RELAY_PROTOCOL..PROTOCOL_VERSION {
+            for v in OLDEST_RELAY_PROTOCOL..BOUND {
                 assert!(
                     matches!(
                         encode_client_msg_for(msg, v),
@@ -1769,7 +1882,9 @@ mod tests {
                     "{msg:?} at {v}"
                 );
             }
-            assert!(encode_client_msg_for(msg, PROTOCOL_VERSION).is_ok());
+            for v in BOUND..=PROTOCOL_VERSION {
+                assert!(encode_client_msg_for(msg, v).is_ok(), "{msg:?} at {v}");
+            }
         }
     }
 

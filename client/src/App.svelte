@@ -106,6 +106,7 @@
     listenServer,
     reconnectAll,
     withReloadServers,
+    autoConnectList,
     serverId,
     resetServer,
     sayConnectionLost,
@@ -951,27 +952,8 @@
       }
 
       // Schedule auto-connect — will trigger after chat history is unlocked.
-      // Every server that was open, or, in a config written before there was
-      // a list, the one server it remembered.
-      let list: SavedServer[] = [];
-      if (config.auto_connect) {
-        const open = config.open_servers ?? [];
-        list =
-          open.length > 0
-            ? open
-            : config.last_host && config.last_username
-              ? [
-                  {
-                    name: config.last_host,
-                    host: config.last_host,
-                    port: config.last_port ?? 9987,
-                    username: config.last_username,
-                    accept_self_signed: config.last_accept_self_signed ?? false,
-                  },
-                ]
-              : [];
-      }
-      list = withReloadServers(list);
+      // Every server that was open, none after the last was closed.
+      let list: SavedServer[] = withReloadServers(autoConnectList(config));
       if (list.length > 0) pendingAutoConnect = list;
     } catch (e) {
       console.error("Failed to load config:", e);

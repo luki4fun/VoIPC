@@ -575,8 +575,41 @@ impl AccountSession {
                 let keyed = ClientMessage::Account(then(None, None, None));
                 self.step_up_then(m, (totp, recovery_code), request, keyed, fallback)
             }
+            // Not keyed, as the relay said: the password the old way, and then it moves
+            Some(m) if self.proto >= 22 => {
+                let mut send = vec![fallback];
+                send.extend(self.move_to_key(&LoginKey::from_master(m), request));
+                Actions::sending(send)
+            }
             _ => Actions::sending(vec![fallback]),
         }
+    }
+
+    /// Behind a request that proves the password with its secret (a relay at 22, an account
+    /// not keyed yet): the password moves to its login key, as after a sign-in with it. An
+    /// account that signs in only by a remembered device or a provider gets there too. The
+    /// relay takes it only once that request held (`by_secret`); refused, it stays as it was.
+    fn move_to_key(&mut self, key: &LoginKey, request: &str) -> Option<ClientMessage> {
+        // A new password moves with its own key; a deleted account has none to move
+        if matches!(request, "PasswordChange" | "DeleteAccount") || self.key_set.is_some() {
+            return None;
+        }
+        let b = self.binding?;
+        let login_key = key.public_key();
+        self.key_set = Some("");
+        Some(ClientMessage::Account(AccountRequest::LoginKeySet {
+            login_key: login_key.to_vec(),
+            identity_sig: login_key_proof(
+                self.sync.identity(),
+                &self.relay_id,
+                &self.name,
+                &login_key,
+                None,
+                &b,
+            ),
+            pass_slot: None,
+            web: b.web(),
+        }))
     }
 
     /// Whether a request that wants the password may have to go as a step-up (22).
@@ -655,7 +688,9 @@ impl AccountSession {
                 if st.request == "PasswordChange" {
                     self.key_set = None;
                 }
-                Some(Actions::sending(vec![st.fallback]))
+                let mut send = vec![st.fallback];
+                send.extend(self.move_to_key(&st.key, st.request));
+                Some(Actions::sending(send))
             }
             AccountReply::Error { request, reason }
                 if request == "KeyChallenge" || request == "KeyStepUp" =>
@@ -2181,6 +2216,99 @@ mod tests {
         ));
     }
 
+    /// An account that signs in only by a remembered device or a provider: the first request
+    /// that proves its password the old way moves it to its login key, as a sign-in with the
+    /// password would (1.12 gap). Not behind a deletion.
+    #[test]
+    fn a_password_proven_the_old_way_moves_to_its_login_key() {
+        use crate::bind::Binding;
+        let identity = IdentityKeyPair::generate(&mut crate::rng());
+        let public = identity.identity_key().serialize().to_vec();
+        let signed = SignedIn {
+            relay_id: RELAY,
+            name: "me".into(),
+            vault: Vault::create(RELAY, "me"),
+            identity,
+            recovery: None,
+            binding: Some(Binding::Tls([5; 32])),
+            keyed: false,
+            login_key: None,
+            blobs: Vec::new(),
+        };
+        let mut s =
+            AccountSession::start(signed, &info(false), LogMemory::default(), false, false, 22).0;
+        let master = [3u8; 32];
+        let (a, _) = s.recovery_key_new(Some(&master), None, None);
+        assert!(matches!(
+            &a.send[..],
+            [ClientMessage::Account(AccountRequest::KeyChallenge)]
+        ));
+        let a = s.on_reply(&AccountReply::Error {
+            request: "KeyChallenge".into(),
+            reason: voipc_protocol::messages::NOT_KEYED.into(),
+        });
+        let [ClientMessage::Account(AccountRequest::RecoveryKeyNew { secret, .. }), ClientMessage::Account(AccountRequest::LoginKeySet {
+            login_key,
+            identity_sig,
+            pass_slot: None,
+            web: false,
+        })] = &a.send[..]
+        else {
+            panic!("{:?}", a.send)
+        };
+        assert_eq!(secret.len(), 32);
+        let key = LoginKey::from_master(&master).public_key();
+        assert_eq!(
+            login_key[..],
+            key[..],
+            "the key of the password just proven"
+        );
+        assert!(crate::account::login_key_proof_ok(
+            &public,
+            &RELAY,
+            "me",
+            &key,
+            None,
+            &Binding::Tls([5; 32]),
+            identity_sig,
+        ));
+        // Moved: the next request that wants the password steps up with the key
+        let a = s.on_reply(&AccountReply::LoginKeySaved);
+        assert!(a.send.is_empty() && a.emit.is_empty());
+        let a = s.provider_start(ProviderKind::Discord, true, Some(&master), None, None);
+        assert!(matches!(
+            &a.send[..],
+            [ClientMessage::Account(AccountRequest::KeyChallenge)]
+        ));
+
+        // A relay before 22 has no login key: the secret goes alone, as ever
+        let signed = SignedIn {
+            relay_id: RELAY,
+            name: "me".into(),
+            vault: Vault::create(RELAY, "me"),
+            identity: IdentityKeyPair::generate(&mut crate::rng()),
+            recovery: None,
+            binding: Some(Binding::Tls([5; 32])),
+            keyed: false,
+            login_key: None,
+            blobs: Vec::new(),
+        };
+        let mut old =
+            AccountSession::start(signed, &info(false), LogMemory::default(), false, false, 21).0;
+        let a = old.provider_unlink(ProviderKind::Discord, Some(&master), None, None);
+        assert!(
+            matches!(
+                &a.send[..],
+                [ClientMessage::Account(AccountRequest::ProviderUnlink {
+                    secret: Some(_),
+                    ..
+                })]
+            ),
+            "{:?}",
+            a.send
+        );
+    }
+
     /// After a sign-in with a remembered device or a provider the session does not know
     /// whether the password is a login key yet: it asks, and a relay that says no gets the
     /// request with the secret, once; a challenge says yes.
@@ -2220,15 +2348,27 @@ mod tests {
             a.send
         );
         assert!(a.emit.is_empty(), "the page hears nothing of the ask");
-        // Known now: the next one goes straight
+        // Known now: the next one goes straight, and the password moves behind it
         let a = s.provider_unlink(ProviderKind::Discord, Some(&master), None, None);
         assert!(matches!(
             &a.send[..],
-            [ClientMessage::Account(AccountRequest::ProviderUnlink {
-                secret: Some(_),
-                ..
-            })]
+            [
+                ClientMessage::Account(AccountRequest::ProviderUnlink {
+                    secret: Some(_),
+                    ..
+                }),
+                ClientMessage::Account(AccountRequest::LoginKeySet {
+                    pass_slot: None,
+                    ..
+                })
+            ]
         ));
+        // The relay says no (that request did not hold): nothing on the page
+        let a = s.on_reply(&AccountReply::Error {
+            request: "LoginKeySet".into(),
+            reason: "Sign in with your password first.".into(),
+        });
+        assert!(a.emit.is_empty() && a.send.is_empty());
         let a = s.password_change(&master, &[4; 32], None, None);
         assert!(matches!(
             &a.send[..],

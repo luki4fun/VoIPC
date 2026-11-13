@@ -188,6 +188,16 @@ function saveReloadList(): void {
 }
 
 /**
+ * The servers a start with `auto_connect` opens: those open when the app was last left, and
+ * none once the last was closed. Not the last server the connect dialog used, whatever
+ * name it remembers: that took someone who pressed Disconnect back in at F5, as a guest
+ * with their account's name (every config since 0.10 keeps the list, so none needs it).
+ */
+export function autoConnectList(config: { auto_connect: boolean; open_servers?: SavedServer[] | null }): SavedServer[] {
+  return config.auto_connect ? [...(config.open_servers ?? [])] : [];
+}
+
+/**
  * The servers to open at the start: on a reload of this tab its account servers,
  * then `list`. Only on a reload: a new visit starts at the dialog, and a duplicated
  * or discarded tab has no business taking an account from wherever it went since.

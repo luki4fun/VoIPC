@@ -2127,7 +2127,7 @@ async fn broadcast_user(state: &Arc<ServerState>, user: UserInfo, updated: bool)
             told_name && alias.is_none(),
             session.is_admin,
         );
-        let info = UserInfo {
+        let mut info = UserInfo {
             username,
             user_id: roster.tell(may_name, user.user_id),
             account,
@@ -2139,6 +2139,10 @@ async fn broadcast_user(state: &Arc<ServerState>, user: UserInfo, updated: bool)
             },
             ..user.clone()
         };
+        // Under a pseudonym, no role or switch of the person behind it (G1)
+        if alias.is_some() && !session.is_admin {
+            crate::state::masked(&mut info);
+        }
         let msg = if updated {
             ServerMessage::UserUpdated { user: info }
         } else {
@@ -2232,7 +2236,11 @@ async fn roster_audience(state: &ServerState, channel_id: ChannelId) -> RosterAu
     match channels.get(&channel_id) {
         Some(channel) => RosterAudience {
             members: channel.members.clone(),
-            private: channel.info.hide_members || channel.password.is_some(),
+            // An anonymous room's outsiders learn the count, never who: the id they would be
+            // told is the one every other roster shows with the name (G1)
+            private: channel.info.hide_members
+                || channel.password.is_some()
+                || channel.info.anonymous,
             public: !channel.info.text
                 && !channel.info.anonymous
                 && !channel.info.hide_members
@@ -2290,9 +2298,18 @@ async fn handle_create_channel(
     {
         Ok(info) => {
             let channel_id = info.channel_id;
-            // Broadcast ChannelCreated to all users
-            let msg = ServerMessage::ChannelCreated { channel: info };
-            broadcast_to_all(state, &msg, None).await;
+            // Broadcast ChannelCreated to all users; an anonymous room names its creator to
+            // them and to admins only (`channel_seen_by`)
+            if info.anonymous {
+                for entry in state.sessions.iter() {
+                    let s = entry.value();
+                    let channel = crate::state::channel_seen_as(&info, s.user_id, s.is_admin);
+                    let _ = send_msg(&s.control_tx, &ServerMessage::ChannelCreated { channel });
+                }
+            } else {
+                let msg = ServerMessage::ChannelCreated { channel: info };
+                broadcast_to_all(state, &msg, None).await;
+            }
 
             // Before the auto-join, not after it: the join below can be
             // refused — the creator is out of join budget, the password they
@@ -2902,6 +2919,20 @@ pub(crate) async fn channel_updated(state: &Arc<ServerState>, channel: ChannelIn
             .map(|c| c.gate.groups.clone())
             .unwrap_or_default()
     };
+    if channel.anonymous && channel.created_by.is_some() {
+        // Its creator named to them and to admins only (`channel_seen_by`)
+        for entry in state.sessions.iter() {
+            let s = entry.value();
+            if crate::gates::passes(s, &gate) {
+                let seen = crate::state::channel_seen_as(&channel, s.user_id, s.is_admin);
+                let _ = send_msg(
+                    &s.control_tx,
+                    &ServerMessage::ChannelUpdated { channel: seen },
+                );
+            }
+        }
+        return;
+    }
     let Ok(data) = encode_server_msg(&ServerMessage::ChannelUpdated { channel }) else {
         return;
     };

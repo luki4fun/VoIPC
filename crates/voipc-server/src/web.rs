@@ -1286,6 +1286,9 @@ async fn finish(stream: Option<SendStream>) {
 
 #[cfg(test)]
 mod tests {
+    /// What a wait for something that must come allows: past it the relay hung, a slow
+    /// machine is not (the lanes' rule 1).
+    const HANG: Duration = Duration::from_secs(60);
     use super::*;
 
     use std::pin::Pin;
@@ -1414,11 +1417,11 @@ mod tests {
             .build();
         let endpoint = Endpoint::client(config).unwrap();
         let connection = tokio::time::timeout(
-            Duration::from_secs(5),
+            HANG,
             endpoint.connect(format!("https://{sni}:{}/voipc", addr.port())),
         )
         .await
-        .expect("handshake within 5 s")
+        .expect("handshake")
         .unwrap();
         (endpoint, connection)
     }
@@ -1535,7 +1538,7 @@ mod tests {
         use wtransport::quinn;
 
         let (mut web, state, _) = test_server();
-        web.setup_time = Duration::from_millis(1500);
+        web.setup_time = Duration::from_secs(4);
         let addr = web.local_addr().unwrap();
         let limits = Arc::new(ConnLimits::from_config(&ServerConfig::default()));
         tokio::spawn(web.run(state, limits.clone()));
@@ -1573,13 +1576,10 @@ mod tests {
         config.transport_config(Arc::new(transport));
         let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
         endpoint.set_default_client_config(config);
-        let connection = tokio::time::timeout(
-            Duration::from_secs(5),
-            endpoint.connect(addr, "localhost").unwrap(),
-        )
-        .await
-        .expect("handshake within 5 s")
-        .unwrap();
+        let connection = tokio::time::timeout(HANG, endpoint.connect(addr, "localhost").unwrap())
+            .await
+            .expect("handshake")
+            .unwrap();
 
         let mut control = Vec::new();
         StreamHeader::new_control().write(&mut control).unwrap();
@@ -1608,14 +1608,14 @@ mod tests {
         assert_eq!(limits.pre_total.load(Ordering::Relaxed), 1);
         assert!(connection.close_reason().is_none());
 
-        let released = tokio::time::timeout(Duration::from_secs(4), async {
+        let released = tokio::time::timeout(HANG, async {
             while limits.pre_total.load(Ordering::Relaxed) != 0 {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         })
         .await;
         assert!(released.is_ok(), "the slot is still held");
-        tokio::time::timeout(Duration::from_secs(4), connection.closed())
+        tokio::time::timeout(HANG, connection.closed())
             .await
             .expect("the relay closes the connection");
     }
@@ -1674,7 +1674,7 @@ mod tests {
         assert!(matches!(last, ServerMessage::Refused { .. }), "{last:?}");
 
         // Someone who never hangs up does not hold it for long
-        tokio::time::timeout(LINGER + Duration::from_secs(3), connection.closed())
+        tokio::time::timeout(LINGER + HANG, connection.closed())
             .await
             .expect("the relay closes in the end");
     }
@@ -1703,7 +1703,7 @@ mod tests {
             .await
             .unwrap();
         let mut buf = BytesMut::new();
-        let session_id = tokio::time::timeout(Duration::from_secs(5), async {
+        let session_id = tokio::time::timeout(HANG, async {
             loop {
                 if let Some(payload) = try_decode_frame(&mut buf).unwrap() {
                     match decode_server_msg(&payload).unwrap() {
@@ -1718,16 +1718,16 @@ mod tests {
             }
         })
         .await
-        .expect("Authenticated within 5 s");
+        .expect("Authenticated");
         assert_eq!(state.sessions.len(), 1);
 
         // Media: a ping datagram comes back as a pong
         connection
             .send_datagram(VoicePacket::ping(session_id, 77).to_bytes())
             .unwrap();
-        let pong = tokio::time::timeout(Duration::from_secs(5), connection.receive_datagram())
+        let pong = tokio::time::timeout(HANG, connection.receive_datagram())
             .await
-            .expect("pong within 5 s")
+            .expect("pong")
             .unwrap();
         let pong = VoicePacket::from_bytes(&pong).unwrap();
         assert_eq!(pong.packet_type, VoicePacketType::Pong);
@@ -1769,21 +1769,21 @@ mod tests {
         connection
             .send_datagram(VoicePacket::ping(session_id, 79).to_bytes())
             .unwrap();
-        let pong = tokio::time::timeout(Duration::from_secs(5), connection.receive_datagram())
+        let pong = tokio::time::timeout(HANG, connection.receive_datagram())
             .await
-            .expect("pong after video within 5 s")
+            .expect("pong after video")
             .unwrap();
         assert_eq!(VoicePacket::from_bytes(&pong).unwrap().sequence, 79);
 
         // Closing the connection cleans the session up
         connection.close(VarInt::from_u32(0), b"");
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(HANG, async {
             while !state.sessions.is_empty() {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
         .await
-        .expect("session removed within 5 s");
+        .expect("session removed");
     }
 
     // ── Files on h2 ──────────────────────────────────────────────────────

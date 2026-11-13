@@ -334,15 +334,23 @@ of them:
   stood three days, and `kept_seats` (5000) lifts what was fixed at 256.
 - A relay that never moves a server does no new work.
 
-**From 1.11 to 1.12** (protocol 21 to 22):
+**From 1.11 to 1.12** (protocol 21 to 23; 1.12.0-rc.1 was 22, so its apps and relays update too):
 - **Apps first**, as for any protocol: a 1.12 app talks to the 1.11 relay meanwhile.
 - **A migration:** `0011_promises.sql` remembers a ban lifted for someone who deleted their own
   account, and the Discord ids an account unlinked, so that deleting it later still takes what the
   move filed under them. Going back takes the old binary and the backup.
-- **The password never leaves an app again.** At each account's first sign-in with a 1.12 app,
-  the app moves its password to a key derived from it (l4f-accounts 0.14 keeps that key in the
-  password's place); from then on that account's password is checked as a signature and its
-  secret opens nothing. An account nobody signs in to stays as it was.
+- **A second migration (rc.2):** `0012_round_c.sql` builds three indexes on the moved Discord
+  archive and one on the old log's direct messages, and adds a table for channel deletions in
+  progress. Building an index reads the whole table once, so on a relay holding millions of
+  archived or old direct rows the first start takes longer than usual (seconds per million rows
+  on SQLite); it is one transaction, and a stop halfway leaves nothing done. Deleting a channel
+  with a large kept log now takes its rows a few thousand at a time in the background, and a
+  start finishes what a stop left; until then nothing of the channel can be read.
+- **The password never leaves an app again.** The first time an account gives its password to a
+  1.12 app (a sign-in, or confirming it on a device signed in another way), the app moves it to
+  a key derived from it (l4f-accounts 0.14 keeps that key in the password's place); from then on
+  that account's password is checked as a signature and its secret opens nothing. An account
+  that never gives its password again stays as it was.
 - **The relay must end TLS itself** (§4): an app's sign-in is bound to its own TLS session. A
   proxy that passes TLS through is fine; one that ends it in front of the TCP fallback makes
   app sign-ins over that fallback fail.
@@ -381,7 +389,7 @@ The simplest way is a host directory that user 65532 owns:
     install -d -o 65532 -g 65532 -m 0700 /srv/voipc
     install -o 65532 -g 65532 -m 0600 server.toml cert.pem key.pem /srv/voipc/
     docker run -d --name voipc -v /srv/voipc:/data \
-      -p 9987:9987/tcp -p 9987:9987/udp ghcr.io/luki4fun/voipc-server:1.12.0-rc.1
+      -p 9987:9987/tcp -p 9987:9987/udp ghcr.io/luki4fun/voipc-server:1.12.0-rc.2
     docker exec voipc /voipc-server --config /data/server.toml admin grant <name> admin
 
 With a named volume instead, copy the files in with a throwaway container first, then run the

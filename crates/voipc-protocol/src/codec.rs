@@ -103,7 +103,7 @@ pub const CONTROL_MSGS_PER_SEC: u32 = 50;
 ///
 /// A relay admits only its own protocol; an app speaks its own down to
 /// `compat::OLDEST_RELAY_PROTOCOL` (1.6).
-pub const PROTOCOL_VERSION: u32 = 22;
+pub const PROTOCOL_VERSION: u32 = 23;
 
 /// Application version, read from Cargo.toml at compile time.
 /// Single source of truth: workspace root `Cargo.toml` `[workspace.package] version`.

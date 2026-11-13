@@ -44,6 +44,7 @@
     joinedTextChannelIds,
     decideLegacyHistory,
     loadBrowserMarks,
+    noteReadUpto,
     purgeWritten,
     releaseBrowserMarks,
   } from "../stores/chat.js";
@@ -335,6 +336,8 @@
           liveIdOf(m.peer_name, get(users.peek(server)), get(channelRosters.peek(server))),
         );
       }),
+      // A read's posts are filed (they came before this): its cursors may go to disk with them
+      listenServer<{ gen: number }>("log-read-upto", (_server, d) => noteReadUpto(d.gen)),
       // A tombstone: its writer deleted what they wrote there up to `before`.
       listenServer<{ conv: string; name: string; account: string; from_me: boolean; before: number }>("stored-purge", (server, t) => {
         const me = get(account.peek(server));

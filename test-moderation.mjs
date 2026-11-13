@@ -23,10 +23,12 @@ import { mkdirSync, mkdtempSync, openSync, rmSync, writeFileSync } from "node:fs
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { frameSummary, loadPage, openTab, probe, seen, sleep, startChromium, waitFor } from "./test-cdp.mjs";
+import { barrier, frameSummary, loadPage, openTab, probe, seen, sentKind, sleep, startChromium, waitFor } from "./test-cdp.mjs";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.argv[2] ?? 49992);
+/** The relay, as every page names it. */
+const SERVER = `127.0.0.1:${PORT}`;
 const CHROME = process.env.CHROME ?? "chromium";
 const ORIGIN = `https://127.0.0.1:${PORT}`;
 const WORK = mkdtempSync(join(tmpdir(), "voipc-moderation-"));
@@ -203,9 +205,16 @@ async function turnOnSharing(tab) {
   await waitFor(tab, byText(".tabs .tab", "Privacy"));
   await tab.evaluate(`${byText(".tabs .tab", "Privacy")}.click()`);
   await waitFor(tab, box);
-  if (!(await tab.evaluate(`${box}.checked`))) await tab.evaluate(`${box}.click()`);
+  const off = !(await tab.evaluate(`${box}.checked`));
+  if (off) {
+    await tab.evaluate(`window.__voipc_said.splice(0); 0`);
+    await tab.evaluate(`${box}.click()`);
+  }
   await tab.evaluate(`document.querySelector(".panel .close-btn").click()`);
-  await sleep(300);
+  // The switch tells the relay at once (SetHistorySharing), so who is here learns whom to ask
+  if (off) await waitFor(tab, sentKind("SetHistorySharing"));
+  // and past its barrier the relay has it, which the timer only hoped for
+  if (off && !(await barrier(SERVER, tab))) throw new Error("turnOnSharing: no answer to the barrier");
 }
 
 async function createAccount(tab, name) {
@@ -275,7 +284,8 @@ async function turnOnCodes(tab) {
   await tab.evaluate(`document.querySelector('${dialogOf("totp-setup")} .submit-btn').click()`);
   await waitFor(tab, `document.querySelector('${dialogOf("recovery-codes")}')`);
   await tab.evaluate(`document.querySelector('${dialogOf("recovery-codes")} .submit-btn').click()`);
-  await sleep(500);
+  // The codes came with the relay's TotpEnabled; Done closes them (closePrompt)
+  await waitFor(tab, `!document.querySelector('${dialogOf("recovery-codes")}')`);
   return secret;
 }
 
@@ -317,8 +327,11 @@ async function lane() {
   await serverMenu(ann, "Admin login");
   await waitFor(ann, `document.querySelector(".admin-dialog .admin-input")`);
   await ann.evaluate(setInput('.admin-dialog input[type="password"]', TOKEN));
+  await ann.evaluate(`window.__voipc_said.splice(0); 0`);
   await ann.evaluate(`document.querySelector(".admin-dialog .admin-ok").click()`);
-  await sleep(1500);
+  // The token is out; past her barrier the relay's answer to it is in
+  await waitFor(ann, sentKind("AdminLogin"));
+  check("past annika's admin login barrier", await barrier(SERVER, ann));
   await serverMenu(ann, "Server admin");
   await waitFor(ann, `document.querySelector(".admin-tabs")`);
 
@@ -515,6 +528,8 @@ async function lane() {
   const folds = `document.querySelectorAll(".msg-folded").length`;
   const unreadOn = (name) => `(() => { const row = ${byText(".channel-list.modern .channels.text .channel", name)}; return row?.querySelector(".channel-unread")?.textContent.trim() ?? (row?.querySelector(".channel-dot") ? "dot" : ""); })()`;
   const dmRow = (name) => `[...document.querySelectorAll(".dm-entry")].find((d) => d.textContent.includes(${JSON.stringify(name)}))`;
+  /** The conversation with `name` on screen: its own compose box, which the channel's was before. */
+  const dmOpen = (name) => `document.querySelector(".input-bar .chat-input")?.placeholder.startsWith(${JSON.stringify(`Message ${name}`)})`;
   const invited = `document.querySelector(".invite")`;
   const poked = `document.querySelector(".poke")`;
   const pageText = (tab) => tab.evaluate(`document.body.innerText`);
@@ -552,10 +567,12 @@ async function lane() {
 
   // No count from gus in a channel fay is not reading. hana's message is the control
   await openChat(fay, "side-chat");
-  await sleep(300);
+  // openChat finds lobby-chat's compose box too: the row says side-chat is the one on screen
+  await waitFor(fay, `${byText(".channel-list.modern .channels.text .channel", "side-chat")}?.classList.contains("active")`);
   await say(gus, "gus says three");
   check("hana gets a third", await seen(han, lastMessage("gus says three"), 30_000));
-  await sleep(1500);
+  // Rule 5: hana has it, so the relay passed it on to fay too, if it did; past her barrier it is in
+  check("past fay's barrier", await barrier(SERVER, fay));
   check("a blocked person's message counts for nothing", (await fay.evaluate(unreadOn("lobby-chat"))) === "", await fay.evaluate(unreadOn("lobby-chat")));
   await say(han, "hana says hello");
   // A dot: a channel the server asks everyone to follow counts only what is for you
@@ -564,16 +581,17 @@ async function lane() {
 
   // A direct message: delivered and kept, with no row, no count and no notice for gus
   await choose(gus, "fay", "Direct message");
-  await waitFor(gus, `document.querySelector(".input-bar .chat-input")`);
-  await sleep(500);
+  await waitFor(gus, dmOpen("fay"));
+  await gus.evaluate(`window.__voipc_said.splice(0); 0`);
   await say(gus, "gus writes to fay");
   check("gus's message goes out", await seen(gus, lastMessage("gus writes to fay"), 30_000));
-  await sleep(3000);
+  // His row shows before the bundle comes; the message itself goes after it
+  await waitFor(gus, sentKind("SendEncryptedDirectMessage"));
+  check("past gus, fay and gus's barrier", await barrier(SERVER, gus, fay, gus));
   check("no row for it at fay", await fay.evaluate(`!${dmRow("gus")}`), await fay.evaluate(`document.querySelector(".dm-section")?.innerText ?? ""`));
   check("no undelivered notice at gus", !/Not delivered|left the server/.test(await pageText(gus)), await pageText(gus));
   await choose(han, "fay", "Direct message");
-  await waitFor(han, `document.querySelector(".input-bar .chat-input")`);
-  await sleep(500);
+  await waitFor(han, dmOpen("fay"));
   await say(han, "hana writes to fay");
   check("the control: hana's gets a row", await seen(fay, dmRow("hana"), 30_000), await pageText(fay));
 
@@ -592,7 +610,8 @@ async function lane() {
   await sleep(500);
   await gus.evaluate(`${roomRow}.click()`);
   await choose(gus, "fay", "Invite to Channel");
-  await sleep(3000);
+  // The poke and the invite go as they are chosen; a decline would be fay's answer to gus
+  check("past gus, fay and gus's barrier", await barrier(SERVER, gus, fay, gus));
   check("a blocked person's poke raises nothing", await fay.evaluate(`!${poked}`));
   check("nor does their invite", await fay.evaluate(`!${invited}`), await pageText(fay));
   check("and gus hears no decline", !(await toastSaid(gus, "declined")), await gus.evaluate(`JSON.stringify(window.__toasts)`));
@@ -649,7 +668,11 @@ async function lane() {
   await gus.evaluate(`${roomRow}.click()`);
   await waitFor(gus, `document.querySelector(".join-voice-btn")`);
   await gus.evaluate(`document.querySelector(".join-voice-btn").click()`);
-  await sleep(1500);
+  // His room shows from the relay's answer (UserList), so his join is being handled. The
+  // relay tells fay (UserJoined) only after that answer, still within the join: past
+  // gus's barrier it is in her queue, past hers she has handled it
+  await waitFor(gus, inRoom);
+  check("past gus and fay's barrier", await barrier(SERVER, gus, fay));
   await waitFor(fay, memberRow("gus"));
   check("and when they come back under a new id", await mutedInMenu("gus"));
 
@@ -682,7 +705,7 @@ async function lane() {
   await waitFor(gus, `document.querySelector(".create-form")`);
   await gus.evaluate(setInput(".create-form input[type=text]", "gus-notes"));
   await gus.evaluate(`document.querySelector('.create-form input[data-kind="text"]').click()`);
-  await sleep(300);
+  await waitFor(gus, `document.querySelector('.create-form input[data-kind="text"]')?.checked`);
   await gus.evaluate(`document.querySelector(".create-form .create-btn").click()`);
   const notesRow = byText(".channel-list.modern .channels.text .channel", "gus-notes");
   await waitFor(gus, notesRow);
@@ -693,7 +716,8 @@ async function lane() {
   await waitFor(fay, `document.querySelector(".join-text-btn")`);
   await fay.evaluate(`document.querySelector(".join-text-btn").click()`);
   await waitFor(fay, `document.querySelector(".input-bar .chat-input")`);
-  await sleep(500);
+  // His post goes to whom his app knows is in: fay, once she is on his list
+  await waitFor(gus, memberRow("fay"));
   await say(gus, "only gus holds this");
   await waitFor(fay, lastMessage("only gus holds this"), 30_000);
   await fay.evaluate(`${notesRow}.parentElement.querySelector('.settings-icon[title^="Leave this channel"]').click()`);
@@ -715,9 +739,9 @@ async function lane() {
   await choose(han, "gus", "Block");
   check("which folds again when he is blocked, by the name it gives", await seen(han, `(${folds}) === 1 && (${noteRows}) === 1`), await pageText(han));
 
-  await sleep(800);
-  const kept = await han.evaluate(`JSON.stringify(JSON.parse(localStorage.getItem("voipc.settings") ?? "{}").ui_prefs?.blocked ?? {})`);
-  check("in this browser's settings", kept.includes("a:") && kept.includes("gus"), kept);
+  // Saved on the app's own debounce: waited for as what is stored, before the reload below
+  const keptExpr = `JSON.stringify(JSON.parse(localStorage.getItem("voipc.settings") ?? "{}").ui_prefs?.blocked ?? {})`;
+  check("in this browser's settings", await seen(han, `(${keptExpr}).includes("a:") && (${keptExpr}).includes("gus")`), await han.evaluate(keptExpr));
   await connectGuest(han, "hana");
   await openChat(han, "lobby-chat");
   check("which a new connection reads", await seen(han, marked("gus"), 30_000), await pageText(han));
@@ -990,8 +1014,10 @@ async function lane() {
       JSON.stringify = (v, ...rest) => real(v && v.kind === "react" ? { kind: "hide", target: v.target, on: true } : v, ...rest); })()`);
     await tab.evaluate(`${lastMessage(words)}.querySelector('button[title="React"]').click()`);
     await waitFor(tab, `document.querySelector(".react-item")`);
+    await tab.evaluate(`window.__voipc_said.splice(0); 0`);
     await tab.evaluate(`document.querySelector(".react-item").click()`);
-    await sleep(300);
+    // The event is written out before its post goes, a raw #27 after the key check
+    await waitFor(tab, sentKind("#27"));
     await tab.evaluate(`JSON.stringify = window.__stringify; 0`);
   };
   await sendsHide(ivy, "something fine");
@@ -1078,14 +1104,15 @@ async function lane() {
   await waitFor(ivy, `document.querySelector(".create-form")`);
   await ivy.evaluate(setInput(".create-form input[type=text]", "ivy-notes"));
   await ivy.evaluate(`document.querySelector('.create-form input[data-kind="text"]').click()`);
-  await sleep(300);
+  await waitFor(ivy, `document.querySelector('.create-form input[data-kind="text"]')?.checked`);
   await ivy.evaluate(`document.querySelector(".create-form .create-btn").click()`);
   const ivyNotes = byText(".channel-list.modern .channels.text .channel", "ivy-notes");
   await waitFor(ivy, ivyNotes);
   await ivy.evaluate(`${ivyNotes}.click()`);
   await waitFor(ivy, composer);
   await joinRoom(bob, "ivy-notes");
-  await sleep(500);
+  // Her posts go to whom her app knows is in
+  await waitFor(ivy, memberRow("bobby"));
   await say(ivy, "hand me on");
   await waitFor(bob, lastMessage("hand me on"), 60_000);
   await say(ivy, "take me down");
@@ -1115,7 +1142,9 @@ async function lane() {
   // Slow mode does not hold back a moderator, whose hide is a post
   const held = `document.querySelector('.input-bar .send-btn[title^="Slow mode"]')`;
   for (const tab of [bob, ivy]) await joinRoom(tab, "slow-chat");
-  await sleep(500);
+  // Each one's posts go to whom their app knows is in
+  await waitFor(ivy, memberRow("bobby"));
+  await waitFor(bob, memberRow("ivy"));
   await say(ivy, "slow from ivy");
   check("the control: a member's post starts the wait", await seen(ivy, held), await pageText(ivy));
   await say(bob, "slow one from bobby");
@@ -1165,8 +1194,7 @@ async function lane() {
 
   // What he writes to carla directly is hers too, and stays
   await choose(ned, "carla", "Direct message");
-  await waitFor(ned, composer);
-  await sleep(500);
+  await waitFor(ned, dmOpen("carla"));
   await say(ned, "ned writes to carla directly");
   check("a direct message reaches her", await seen(car, dmRow("ned"), 30_000), await pageText(car));
   await openChat(ned, "lobby-chat");
@@ -1416,7 +1444,8 @@ async function lane() {
   check("bobby holds a group it lets in, and stays", await bob.evaluate(standsIn("crew-room")), await pageText(bob));
   await choose(bob, "ivy", "Invite to Channel");
   check("now she is refused, and he is told", await seen(bob, `window.__toasts.some((t) => t.includes("they cannot join this channel"))`), await bob.evaluate(`window.__toasts.join(" | ")`));
-  await sleep(1000);
+  // The refusal came back to him: the relay is past the invite, and anything to ivy is queued
+  check("past ivy's barrier", await barrier(SERVER, ivy));
   check("she gets no popup", await ivy.evaluate(`!${invited}`), await pageText(ivy));
   check("and nothing on her screen names the room", await ivy.evaluate(`!document.body.innerText.includes("crew-room") && !window.__toasts.some((t) => t.includes("crew-room"))`), await pageText(ivy));
 
@@ -1517,7 +1546,8 @@ async function lane() {
   await sleep(2200);
   await say(car, "a second plain word for bobby");
   check("the control: a plain message does say what it says", await seen(bob, `window.__notes.join(" ").includes("plain word for bobby")`), await bob.evaluate(`window.__notes.join(" || ")`));
-  await sleep(1500);
+  // What carla sent before these reached bobby, so the relay is past the report too
+  check("past annika's barrier", await barrier(SERVER, ann));
   check("annika, unticked, got nothing", await ann.evaluate(`!${dmRow("carla")}`), await pageText(ann));
 
   // Reported once
@@ -1662,7 +1692,8 @@ async function lane() {
   await dan.evaluate(`(() => { const input = document.querySelector(".chat-main .input-bar .file-picker");
     const dt = new DataTransfer(); dt.items.add(new File(["what dan attached"], "attached.txt", { type: "text/plain" })); input.files = dt.files;
     input.dispatchEvent(new Event("change", { bubbles: true })); })()`);
-  await sleep(300);
+  // Staged when its chip shows (Composer addFiles)
+  await waitFor(dan, `[...document.querySelectorAll(".chat-main .file-chips .chip-name")].some((e) => e.textContent === "attached.txt")`);
   await say(dan, "dan attaches this");
   await waitFor(han, `${rowWith("dan attaches this")}?.querySelector(".file-card")`, 60_000);
   await askReport(han, "dan attaches this");
@@ -1793,7 +1824,8 @@ async function lane() {
   check("the stream view starts with nothing new", await fay.evaluate(`!document.querySelector(".stream-stage .stream-chat") && !${chatDot}`), await pageText(fay));
   await say(dan, "dan writes over the share");
   await waitFor(car, rowWith("dan writes over the share"), 60_000);
-  await sleep(2500);
+  // carla has it, so fay's copy is in her queue if it was sent at all
+  check("past fay's barrier", await barrier(SERVER, fay));
   check("someone blocked lights nothing on the chat toggle", await fay.evaluate(`!${chatDot}`), await pageText(fay));
   await say(car, "carla writes over the share");
   check("the control: anyone else does", await seen(fay, chatDot, 30_000), await pageText(fay));

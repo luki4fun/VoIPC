@@ -432,6 +432,9 @@ async fn send<W: AsyncWrite + Unpin>(stream: &mut W, frame: &[u8]) -> std::io::R
 
 #[cfg(test)]
 mod tests {
+    /// What a wait for something that must come allows: past it the relay hung, a slow
+    /// machine is not (the lanes' rule 1).
+    const HANG: Duration = Duration::from_secs(60);
     use super::*;
 
     use bytes::BytesMut;
@@ -542,7 +545,7 @@ mod tests {
 
         /// The next message, `None` once the tunnel is closed.
         async fn next(&mut self) -> Option<Message> {
-            tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::time::timeout(HANG, async {
                 loop {
                     if let Some(message) = self.decoder.next().unwrap() {
                         return Some(message);
@@ -607,10 +610,7 @@ mod tests {
         client
             .send(&[&VoicePacket::ping(session_id, 77).to_bytes()])
             .await;
-        let pong = client
-            .next_media(Duration::from_secs(5))
-            .await
-            .expect("pong");
+        let pong = client.next_media(HANG).await.expect("pong");
         let pong = VoicePacket::from_bytes(&pong).unwrap();
         assert_eq!(pong.packet_type, VoicePacketType::Pong);
         assert_eq!(pong.sequence, 77);
@@ -644,10 +644,7 @@ mod tests {
         client
             .send(&[&VoicePacket::ping(session_id, 79).to_bytes()])
             .await;
-        let pong = client
-            .next_media(Duration::from_secs(5))
-            .await
-            .expect("pong after video");
+        let pong = client.next_media(HANG).await.expect("pong after video");
         assert_eq!(VoicePacket::from_bytes(&pong).unwrap().sequence, 79);
 
         // Closing the tunnel cleans the session up
@@ -659,13 +656,13 @@ mod tests {
             Some(KEY),
         );
         client.io.write_all(&close).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(HANG, async {
             while !state.sessions.is_empty() {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
         .await
-        .expect("session removed within 5 s");
+        .expect("session removed");
     }
 
     /// The handler's last word must not be lost to a reset: the client reads
@@ -934,7 +931,7 @@ mod tests {
         assert_eq!(limits.files_total.load(Ordering::Relaxed), 1);
 
         drop(io);
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(HANG, async {
             while limits.files_total.load(Ordering::Relaxed) != 0 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }

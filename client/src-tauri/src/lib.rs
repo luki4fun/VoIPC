@@ -458,6 +458,7 @@ pub fn run() {
             commands::create_chat_history,
             commands::move_chat_history_aside,
             commands::save_chat_messages,
+            commands::log_read_saved,
             commands::clear_chat_history,
             commands::delete_chat_history,
             commands::browse_chat_history_directory,

@@ -743,6 +743,149 @@ async fn a_channel_name_that_shows_nothing_is_refused() {
         .any(|c| c.info.name.contains('\u{2800}')));
 }
 
+/// The hourly sweep that takes a removal mark past `modlog_days` drops the copy every connect
+/// is told before its join (`at_connect`): the next one reads again, not the kept copy.
+#[tokio::test]
+async fn the_sweep_that_takes_a_mark_drops_the_copy_connects_are_told() {
+    let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+    let relay = state.accounts.clone().unwrap();
+    crate::accounts::raw(
+        &relay,
+        "INSERT INTO voipc_modlog (at, action, actor_name, target_name, since_ms, before_ms) \
+         VALUES (1, 'remove_posts', 'mod', 'someone', 1, 2)",
+    )
+    .await
+    .unwrap();
+    let marks_told = || async {
+        let (tx, mut rx) = crate::control::control_queue(Arc::new(tokio::sync::Notify::new()));
+        crate::accounts::modlog::send_marks(&state, &tx).await;
+        drop(tx);
+        let mut n = 0;
+        while let Some(data) = rx.recv().await {
+            let mut buf = BytesMut::from(&data[..]);
+            while let Some(payload) = try_decode_frame(&mut buf).unwrap() {
+                if let ServerMessage::PostsHidden { marks } = decode_server_msg(&payload).unwrap() {
+                    n += marks.len();
+                }
+            }
+        }
+        n
+    };
+    assert_eq!(marks_told().await, 1);
+    assert_eq!(crate::accounts::modlog::sweep(&relay).await.unwrap(), 1);
+    assert_eq!(marks_told().await, 0, "not the copy from before the sweep");
+}
+
+/// G1's per-viewer sends go out while other tasks change sessions. They read the viewer from
+/// the entry the loop holds rather than a second `sessions.get` inside `sessions.iter()`,
+/// the re-entry DashMap warns of (not seen to hang here either way).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_anonymous_rooms_news_goes_out_while_sessions_change() {
+    use crate::state::test_support::{add_user, make_state};
+    let state = Arc::new(make_state());
+    let ids: Vec<UserId> = (0..64)
+        .map(|i| add_user(&state, &format!("u{i}")).0)
+        .collect();
+    let info = state
+        .create_channel(
+            "masks".into(),
+            None,
+            ProximityMode::Off,
+            true,
+            false,
+            ids[0],
+        )
+        .await
+        .unwrap();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writers: Vec<_> = (0..3)
+        .map(|_| {
+            let (state, ids, stop) = (state.clone(), ids.clone(), stop.clone());
+            tokio::spawn(async move {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    for id in &ids {
+                        if let Some(mut s) = state.sessions.get_mut(id) {
+                            s.is_muted = !s.is_muted;
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+        })
+        .collect();
+    for _ in 0..200 {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::session::channel_updated(&state, info.clone()),
+        )
+        .await
+        .expect("the update went out: no deadlock");
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for w in writers {
+        w.await.unwrap();
+    }
+}
+
+/// G1: outside an anonymous room nobody learns who stands in it, and only its maker (and
+/// admins) hear who made it: the creator's join right after `ChannelCreated` told everyone.
+#[tokio::test]
+async fn an_anonymous_rooms_maker_and_members_stay_unnamed_outside_it() {
+    let state = admin_state();
+    let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    let mut owner = connect(&state, "owner", lo).await; // user 1
+    let mut other = connect(&state, "other", lo).await; // user 2
+    let mut third = connect(&state, "third", lo).await; // user 3
+                                                        // One room each: one creation a moment per person
+    for (maker, uid, name, anonymous) in [
+        (&mut owner, 1, "masks", true),
+        (&mut third, 3, "plain", false),
+    ] {
+        maker
+            .send(&ClientMessage::CreateChannel {
+                name: name.into(),
+                password: None,
+                proximity: ProximityMode::Off,
+                anonymous,
+                text: false,
+            })
+            .await;
+        let created = |m: &ServerMessage| matches!(m, ServerMessage::ChannelCreated { channel } if channel.name == name);
+        let ServerMessage::ChannelCreated { channel: mine } = maker
+            .expect("its maker", |m| {
+                created(m) || matches!(m, ServerMessage::ChannelError { .. })
+            })
+            .await
+        else {
+            panic!("{name}: refused")
+        };
+        assert_eq!(mine.created_by, Some(uid), "{name}: its maker is told");
+        let ServerMessage::ChannelCreated { channel: theirs } =
+            other.expect("everyone", created).await
+        else {
+            unreachable!()
+        };
+        let id = mine.channel_id;
+        let ServerMessage::UserJoined { user } = other
+            .expect(
+                "the maker's join",
+                |m| matches!(m, ServerMessage::UserJoined { user } if user.channel_id == id),
+            )
+            .await
+        else {
+            unreachable!()
+        };
+        if anonymous {
+            assert_eq!(theirs.created_by, None, "nobody else hears who made it");
+            assert_eq!(user.user_id, 0, "nor who went in");
+        } else {
+            // The control: an ordinary room tells both, as ever
+            assert_eq!(theirs.created_by, Some(uid));
+            assert_eq!(user.user_id, uid);
+        }
+    }
+}
+
 /// `voipc:channels` changes any channel's options, but showing real names
 /// behind a pseudonym is an admin's or the creator's alone.
 #[tokio::test]
@@ -2763,6 +2906,169 @@ async fn an_account_moves_to_its_login_key_once_after_a_sign_in_with_its_secret(
     drop(other);
 }
 
+/// A direct conversation's new key, put while its writer goes by a pseudonym, tells the other
+/// party nothing at that moment: the news would tie the alias writing to them to the account
+/// (pseudonym review, 1.7). The key is kept as ever.
+#[tokio::test]
+async fn a_direct_key_put_under_a_pseudonym_tells_the_other_party_nothing_then() {
+    let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+    let (mut a, ai) = register(&state, "amy").await;
+    let (mut b, bi) = register(&state, "ben").await;
+    let conv = voipc_protocol::conv::dm_conv(&ai.id, &bi.id);
+    let put = |epoch: u32| {
+        ClientMessage::Account(AccountRequest::EpochPut {
+            conv: conv.clone(),
+            epoch,
+            wraps: vec![
+                voipc_protocol::messages::WrapIn {
+                    recipient: ai.id,
+                    wrapped: vec![1; 64],
+                },
+                voipc_protocol::messages::WrapIn {
+                    recipient: bi.id,
+                    wrapped: vec![2; 64],
+                },
+            ],
+        })
+    };
+    let news = async |b: &mut Client| loop {
+        match tokio::time::timeout(Duration::from_millis(300), b.next()).await {
+            Ok(Some(ServerMessage::Account(AccountReply::LogNews { .. }))) => return true,
+            Ok(Some(_)) => continue,
+            _ => return false,
+        }
+    };
+    // The control: as herself, he hears at once
+    a.send(&put(1)).await;
+    let r = a.expect("stored", |m| reply(m).is_some()).await;
+    assert!(
+        matches!(r, ServerMessage::Account(AccountReply::EpochStored { .. })),
+        "{r:?}"
+    );
+    assert!(news(&mut b).await);
+
+    // Under a pseudonym in an anonymous channel she is in
+    let uid = state
+        .sessions
+        .get(&*state.account_sessions.get(&ai.id).unwrap())
+        .unwrap()
+        .user_id;
+    {
+        let mut channels = state.channels.write().await;
+        let lobby = channels.get_mut(&0).unwrap();
+        lobby.info.anonymous = true;
+        lobby.members.insert(uid);
+        lobby.pseudonyms.insert(uid, "Quiet Fox".into());
+    }
+    assert!(state.names_of(uid).await.1.is_some());
+    a.send(&put(2)).await;
+    let r = a.expect("stored", |m| reply(m).is_some()).await;
+    assert!(
+        matches!(r, ServerMessage::Account(AccountReply::EpochStored { .. })),
+        "{r:?}"
+    );
+    assert!(
+        !news(&mut b).await,
+        "nothing told while she goes by the alias"
+    );
+}
+
+/// The 1.12 gap: an account that signs in only by a remembered device or a provider never
+/// gave its password's secret at a sign-in. A request that proves it the old way (a relay
+/// that said `NOT_KEYED`) lets it move, once; a wrong one does not.
+#[tokio::test]
+async fn a_password_proven_again_moves_an_account_that_signed_in_another_way() {
+    let (state, _db_state) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+    let relay = state.accounts.clone().unwrap();
+    let id = legacy_account(&state, "ivy").await;
+    let public = id.identity_key().serialize().to_vec();
+    let key = test_key().public_key();
+    let set = ClientMessage::Account(AccountRequest::LoginKeySet {
+        login_key: key.to_vec(),
+        identity_sig: voipc_crypto::account::login_key_proof(
+            &id,
+            &relay.relay_id,
+            "ivy",
+            &key,
+            None,
+            &Binding::Tls(TEST_BIND),
+        ),
+        pass_slot: None,
+        web: false,
+    });
+    let again = |secret: &[u8]| {
+        ClientMessage::Account(AccountRequest::RecoveryKeyNew {
+            secret: secret.to_vec(),
+            recovery_slot: vec![1; 101],
+            reset_key: vec![2; 32],
+            totp: None,
+            recovery_code: None,
+        })
+    };
+    let answer = |m: ServerMessage| match m {
+        ServerMessage::Account(r) => r,
+        other => panic!("{other:?}"),
+    };
+    let mut c = login(&state, "ivy", &public, false).await;
+    c.expect("signed in", |m| {
+        matches!(
+            m,
+            ServerMessage::Authenticated {
+                account: Some(_),
+                ..
+            }
+        )
+    })
+    .await;
+    // As after a sign-in by a remembered device or a provider: no secret on this connection
+    let account = relay
+        .store()
+        .user_by_username("ivy")
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    let sid = *state.account_sessions.get(&account.0).unwrap();
+    state
+        .sessions
+        .get_mut(&sid)
+        .unwrap()
+        .account
+        .as_mut()
+        .unwrap()
+        .by_secret = false;
+    let password_first = |r: AccountReply| {
+        matches!(r, AccountReply::Error { ref request, ref reason }
+            if request == "LoginKeySet" && reason.contains("password first"))
+    };
+
+    // The control: nothing proven, no move
+    c.send(&set).await;
+    assert!(password_first(answer(
+        c.expect("refused", |m| reply(m).is_some()).await
+    )));
+    // A wrong password proves nothing
+    c.send(&again(&[9; 32])).await;
+    let r = answer(c.expect("refused", |m| reply(m).is_some()).await);
+    assert!(
+        matches!(&r, AccountReply::Error { request, .. } if request == "RecoveryKeyNew"),
+        "{r:?}"
+    );
+    c.send(&set).await;
+    assert!(password_first(answer(
+        c.expect("refused", |m| reply(m).is_some()).await
+    )));
+    assert!(relay.accounts.hostkey(account).await.unwrap().is_none());
+
+    // The right one, and the move right behind it
+    c.send(&again(&SECRET)).await;
+    c.expect("its answer", |m| reply(m).is_some()).await;
+    c.send(&set).await;
+    let r = answer(c.expect("saved", |m| reply(m).is_some()).await);
+    assert!(matches!(r, AccountReply::LoginKeySaved), "{r:?}");
+    assert_eq!(relay.accounts.hostkey(account).await.unwrap(), Some(key));
+}
+
 /// W3, end to end with the app's own code: an account whose password l4f holds as Argon2
 /// signs in with its secret, its session moves it to the login key at once, and the next
 /// sign-in is by the key.
@@ -4111,11 +4417,43 @@ async fn a_device_signed_in_session_proves_the_password_either_way() {
             matches!(r, AccountReply::RecoveryKeyChanged),
             "{name}: {r:?} {page}"
         );
-        // The new password signs in, by its key or its secret
+        // An account not keyed yet moved behind the request that proved it the old way (the
+        // recovery key's): its answer comes next
+        if legacy {
+            let ServerMessage::Account(r) = c.expect("the move", |m| reply(m).is_some()).await
+            else {
+                unreachable!()
+            };
+            assert!(matches!(r, AccountReply::LoginKeySaved), "{name}: {r:?}");
+            session.on_reply(&r);
+        }
+        // The new password signs in by its key, either way
         let again = password_sign_in(state, name, "another good password")
             .await
             .unwrap();
-        assert_eq!(again.keyed, !legacy, "{name}");
+        assert!(again.keyed, "{name}");
+        let id = state
+            .accounts
+            .as_ref()
+            .unwrap()
+            .store()
+            .user_by_username(name)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        assert!(
+            state
+                .accounts
+                .as_ref()
+                .unwrap()
+                .accounts
+                .hostkey(id)
+                .await
+                .unwrap()
+                .is_some(),
+            "{name}: legacy {legacy}"
+        );
     }
 
     /// The password sign-in's connection, kept open.
@@ -8189,9 +8527,8 @@ async fn a_gated_channels_log_keeps_only_who_passes() {
         .unwrap();
     }
     relay
-        .prune_log("c:aa", &["crew".into()], &mut Default::default())
-        .await
-        .unwrap();
+        .prune_gated(&[("c:aa".into(), vec!["crew".into()])])
+        .await;
     let count = |sql: String| {
         let relay = relay.clone();
         async move { crate::accounts::raw(&relay, &sql).await.unwrap() }
@@ -8211,43 +8548,59 @@ async fn a_gated_channels_log_keeps_only_who_passes() {
     );
 }
 
-/// The same people sit in every gated log, and reading what one holds is four queries.
+/// The same people sit in every gated log: a pass decides each account once, and keeps it to
+/// each log's own groups (W2-1).
 #[tokio::test]
 async fn a_pass_decides_each_account_once_however_many_logs_it_sits_in() {
     let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
     group(&state, "crew", None, &[]).await;
+    group(&state, "band", None, &[]).await;
     let (_bob, bi) = register(&state, "bob").await;
     let (_cat, ci) = register(&state, "cat").await;
+    let (_dan, di) = register(&state, "dan").await;
     give(&state, bi.id, "crew", true).await;
+    give(&state, ci.id, "band", true).await;
     let relay = state.accounts.clone().unwrap();
-    for conv in ["c:aa", "c:bb"] {
-        for a in [bi.id, ci.id] {
+    for conv in ["c:aa", "c:bb", "c:cc"] {
+        for a in [bi.id, ci.id, di.id] {
             seat_in_log(&relay, conv, a).await;
         }
     }
-    let seats = async |conv: &str| {
-        crate::accounts::raw(
-            &relay,
-            &format!("SELECT COUNT(*) FROM voipc_members WHERE conv = '{conv}'"),
-        )
-        .await
-        .unwrap()
+    let seated = async |conv: &str| {
+        let mut who = Vec::new();
+        for (name, id) in [("bob", bi.id), ("cat", ci.id), ("dan", di.id)] {
+            let n = crate::accounts::raw(
+                &relay,
+                &format!(
+                    "SELECT COUNT(*) FROM voipc_members WHERE conv = '{conv}' AND account = X'{}'",
+                    hex::encode(id)
+                ),
+            )
+            .await
+            .unwrap();
+            if n == 1 {
+                who.push(name);
+            }
+        }
+        who
     };
-    let crew = ["crew".to_string()];
-    let mut decided = std::collections::HashMap::new();
-    relay.prune_log("c:aa", &crew, &mut decided).await.unwrap();
-    assert_eq!(decided.len(), 2);
-    assert_eq!(seats("c:aa").await, 1, "the one outside is out");
-    // Bob loses the group now: this pass read him once, the next one sees it
-    give(&state, bi.id, "crew", false).await;
-    relay.prune_log("c:bb", &crew, &mut decided).await.unwrap();
-    assert_eq!(decided.len(), 2);
-    assert_eq!(seats("c:bb").await, 1);
+    let gated = |groups: &[&str]| groups.iter().map(|g| g.to_string()).collect::<Vec<_>>();
     relay
-        .prune_log("c:bb", &crew, &mut Default::default())
-        .await
-        .unwrap();
-    assert_eq!(seats("c:bb").await, 0);
+        .prune_gated(&[
+            ("c:aa".into(), gated(&["crew"])),
+            ("c:bb".into(), gated(&["band"])),
+            ("c:cc".into(), gated(&["band", "crew"])),
+        ])
+        .await;
+    assert_eq!(seated("c:aa").await, ["bob"]);
+    assert_eq!(seated("c:bb").await, ["cat"]);
+    assert_eq!(seated("c:cc").await, ["bob", "cat"]);
+    // The next pass reads again
+    give(&state, bi.id, "crew", false).await;
+    relay
+        .prune_gated(&[("c:cc".into(), gated(&["band", "crew"]))])
+        .await;
+    assert_eq!(seated("c:cc").await, ["cat"]);
 }
 
 async fn seat_in_log(relay: &crate::accounts::Relay, conv: &str, account: [u8; 16]) {
@@ -23285,6 +23638,18 @@ mod layouts {
                 .collect::<Vec<_>>()
         };
         assert_eq!(order(state.clone()).await, ["rules", "news", "later"]);
+        // Each row its own place: a tie is decided by the conversation's name at the next start
+        let rows = state
+            .accounts
+            .as_ref()
+            .unwrap()
+            .layout_rows()
+            .await
+            .unwrap();
+        let places: Vec<i64> = rows.rows.iter().map(|r| r.position).collect();
+        let mut unique = places.clone();
+        unique.dedup();
+        assert_eq!(unique, places, "no two rows share a place");
         drop(state);
         let again = restart(&db, file()).await;
         let (_kim2, _) = register(&again, "kim2").await;
@@ -25060,6 +25425,18 @@ mod layout_limits {
         let news: Vec<_> = channels.iter().filter(|p| p.channel_id == id).collect();
         assert_eq!(news.len(), 1);
         assert_eq!(news[0].category, Some(b), "the first naming counts");
+        // And kept so: the next start reads that order (one write of what moved, W2-14)
+        let kept = state
+            .accounts
+            .as_ref()
+            .unwrap()
+            .layout_rows()
+            .await
+            .unwrap();
+        assert_eq!(
+            kept.categories.iter().map(|c| c.id).collect::<Vec<_>>(),
+            [b, a]
+        );
     }
 
     #[tokio::test]
@@ -25310,12 +25687,12 @@ mod layout_limits {
         )
         .await
         .unwrap();
-        assert!(relay.category_delete(cat).await.is_err());
+        assert!(relay.category_delete(cat, &[]).await.is_err());
         assert_eq!(category_of().await, Some(cat), "the channel stays in it");
         crate::accounts::raw(relay, "DROP TRIGGER held")
             .await
             .unwrap();
-        relay.category_delete(cat).await.unwrap();
+        relay.category_delete(cat, &[]).await.unwrap();
         assert_eq!(category_of().await, None, "the control");
     }
 
@@ -27329,6 +27706,44 @@ mod moderation {
         // Read afresh: her group changed nothing that would have asked for it
         crate::accounts::refresh_chat_mods(&state).await;
         assert_eq!(*state.chat_mods.read().await, want);
+    }
+
+    /// A group edit's pass reads who holds what once, not once per holder it changed: each
+    /// read goes through every holder (W2-2).
+    #[tokio::test]
+    async fn a_pass_over_many_changed_holders_reads_the_list_once() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        group(&state, "crew", None, &["voipc:kick"]).await;
+        let mut here = Vec::new();
+        for name in ["ana", "ben", "cid", "dee"] {
+            let (mut c, info) = register(&state, name).await;
+            totp_on(&mut c).await;
+            give(&state, info.id, "crew", true).await;
+            here.push(c);
+        }
+        assert!(state.chat_mods.read().await.iter().all(|m| !m.hide));
+        let relay = state.accounts.clone().unwrap();
+        let crew = relay.store().role_by_name("crew").await.unwrap().unwrap();
+        crate::accounts::raw(
+            &relay,
+            &format!(
+                "INSERT INTO acct_role_scopes (role_id, scope) VALUES (X'{}', 'voipc:hide')",
+                hex::encode(crew.id.0)
+            ),
+        )
+        .await
+        .unwrap();
+        let reads = || {
+            state
+                .chat_mods_reads
+                .load(std::sync::atomic::Ordering::SeqCst)
+        };
+        let before = reads();
+        crate::accounts::revalidate(&state).await;
+        assert_eq!(reads() - before, 1, "one read for the four");
+        let mods = state.chat_mods.read().await.clone();
+        assert_eq!(mods.len(), 4);
+        assert!(mods.iter().all(|m| m.hide), "{mods:?}");
     }
 
     #[tokio::test]
@@ -30002,6 +30417,36 @@ mod restriction {
         list.into_iter().find(|r| r.user_id == user).unwrap()
     }
 
+    /// W3-17: a moderator's voice-only mute on someone still in the new-member wait goes out
+    /// as the moderator's voice and the wait's writing, each with its own end.
+    #[tokio::test]
+    async fn a_mute_during_the_wait_is_told_as_a_mute() {
+        let (state, _db) = relay_state_then(AccountsMode::Optional, RegistrationMode::Open, |s| {
+            s.settings.new_member_wait_mins = 60;
+        })
+        .await;
+        let (mut ann, ai) = register(&state, "ann").await;
+        let sid = *state.account_sessions.get(&ai.id).unwrap();
+        let until = crate::bans::now_secs() + 86_400;
+        state.restrictions.insert(
+            crate::bans::Key::Account(ai.id),
+            crate::restrict::Held {
+                voice: true,
+                text: false,
+                by: "mod".into(),
+                reason: String::new(),
+                expires_at: Some(until),
+            },
+        );
+        crate::restrict::settle(&state, sid).await;
+        let r = row_of(&mut ann, sid).await;
+        assert!(r.voice && r.text && r.direct, "{r:?}");
+        assert_eq!((r.by.as_str(), r.by_voice, r.by_text), ("mod", true, false));
+        let wait = r.wait_in_secs.expect("the wait's own end");
+        assert!((3500..=3600).contains(&wait), "{wait}");
+        assert!(r.expires_in_secs.unwrap() > 86_000, "the mod's end");
+    }
+
     async fn admin_error(c: &mut Client) -> String {
         let m = c
             .expect("AdminError", |m| {
@@ -32087,9 +32532,8 @@ mod share_history {
         );
         crate::accounts::raw(&relay, &seat).await.unwrap();
         relay
-            .prune_log("c:aa", &["sharers".into()], &mut Default::default())
-            .await
-            .unwrap();
+            .prune_gated(&[("c:aa".into(), vec!["sharers".into()])])
+            .await;
         assert_eq!(
             crate::accounts::raw(
                 &relay,
@@ -38033,4 +38477,744 @@ mod kept_chains {
         assert_eq!(pages[0].len(), 512);
         assert_eq!(pages[1].len(), 10, "all of them, in several answers");
     }
+}
+
+/// W2-17: a deleted channel goes at once, its rows a batch at a time; a purge a stop cut
+/// short is finished at the next start, and one whose channel is back stops and keeps its rows.
+#[tokio::test]
+async fn a_channel_purge_goes_in_batches_and_a_restart_finishes_it() {
+    let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+    let (reader_c, info) = register(&state, "owner").await;
+    let relay = state.accounts.clone().unwrap();
+    let pool = match relay.store() {
+        l4f_accounts::store::Store::Lite(b) => b.0.clone(),
+        _ => panic!("SQLite"),
+    };
+    let count = |conv: &'static str| {
+        let pool = pool.clone();
+        async move {
+            let mut n = 0i64;
+            for t in ["voipc_log", "voipc_writers", "voipc_purging"] {
+                n += sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!(
+                    "SELECT COUNT(*) FROM {t} WHERE conv = $1"
+                )))
+                .bind(conv)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            }
+            n += sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM voipc_chain_steps s JOIN voipc_chains c ON c.id = s.chain_id
+                 JOIN voipc_writers w ON w.id = c.writer WHERE w.conv = $1",
+            )
+            .bind(conv)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            n
+        }
+    };
+    let fill = |conv: &'static str, rows: i64| {
+        let (pool, owner) = (pool.clone(), info.id);
+        async move {
+            sqlx::query("INSERT INTO voipc_writers (conv, owner) VALUES ($1, $2)")
+                .bind(conv)
+                .bind(&owner[..])
+                .execute(&pool)
+                .await
+                .unwrap();
+            let writer: i64 = sqlx::query_scalar("SELECT id FROM voipc_writers WHERE conv = $1")
+                .bind(conv)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            for c in 0..rows / 100 {
+                sqlx::query("INSERT INTO voipc_chains (writer, chain, top, self_wrap, created_at) VALUES ($1, $2, 99, x'00', 0)")
+                    .bind(writer).bind(c).execute(&pool).await.unwrap();
+                let id: i64 = sqlx::query_scalar(
+                    "SELECT id FROM voipc_chains WHERE writer = $1 AND chain = $2",
+                )
+                .bind(writer)
+                .bind(c)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                for i in 0..100i16 {
+                    sqlx::query("INSERT INTO voipc_chain_steps (chain_id, idx, sealed) VALUES ($1, $2, x'01')")
+                        .bind(id).bind(i).execute(&pool).await.unwrap();
+                }
+            }
+            for i in 0..rows {
+                sqlx::query("INSERT INTO voipc_log (conv, sender, epoch, ct, server_at, keep_until) VALUES ($1, $2, 0, x'02', $3, 9999999999999)")
+                    .bind(conv).bind(&owner[..]).bind(i).execute(&pool).await.unwrap();
+            }
+        }
+    };
+    // More than a batch of each, and another channel's rows beside them
+    fill("c:gone", 4500).await;
+    fill("c:stays", 300).await;
+    relay.channel_purge("c:gone").await.unwrap();
+    assert_eq!(
+        count("c:gone").await,
+        0,
+        "every row, and the purge's own note"
+    );
+    assert_eq!(count("c:stays").await, 300 + 1 + 300);
+
+    // Its readers are out with the channel, before the first row goes: nobody reads what is
+    // left of it while the rows go
+    fill("c:read", 300).await;
+    sqlx::query("INSERT INTO voipc_members (conv, account, joined_at) VALUES ('c:read', $1, 1)")
+        .bind(&info.id[..])
+        .execute(&pool)
+        .await
+        .unwrap();
+    relay.purge_begin("c:read").await.unwrap();
+    let members: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM voipc_members WHERE conv = 'c:read'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(members, 0);
+    assert!(count("c:read").await > 300, "the rows are still to go");
+    let mut reader = reader_c;
+    reader
+        .send(&ClientMessage::Account(AccountRequest::LogFetch {
+            conv: "c:read".into(),
+            after: 0,
+        }))
+        .await;
+    let r = reader.expect("refused", |m| reply(m).is_some()).await;
+    assert!(
+        matches!(&r, ServerMessage::Account(AccountReply::Error { request, .. }) if request == "LogFetch"),
+        "{r:?}"
+    );
+    assert_eq!(relay.purge_unfinished().await.unwrap(), 1);
+    assert_eq!(count("c:read").await, 0);
+
+    // A stop after the channel went: its note and rows are there at the next start
+    fill("c:cut", 2500).await;
+    sqlx::query("INSERT INTO voipc_purging (conv, at) VALUES ('c:cut', 1)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(relay.purge_unfinished().await.unwrap(), 1);
+    assert_eq!(count("c:cut").await, 0);
+    // A channel of that log back before the purge ran: what is there is its own
+    fill("c:back", 200).await;
+    sqlx::query("INSERT INTO voipc_purging (conv, at) VALUES ('c:back', 1)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO voipc_channels (conv, entry, position) VALUES ('c:back', '{}', 0)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    relay.purge_unfinished().await.unwrap();
+    assert_eq!(
+        count("c:back").await,
+        200 + 1 + 200,
+        "kept, and the note gone"
+    );
+}
+
+/// Round C measurement (W2-17), not a check: how long deleting a channel holding `N` kept posts
+/// takes on SQLite, and how long another writer waits meanwhile. Run on a disk:
+/// `TMPDIR=target/scratch/tmpdisk ROUND_C_N=100000 cargo test -p voipc-server --bin voipc-server
+/// -- --ignored measure_channel_purge --nocapture`.
+#[tokio::test]
+#[ignore]
+async fn measure_channel_purge() {
+    let n: i64 = std::env::var("ROUND_C_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100_000);
+    let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+    let (_c, info) = register(&state, "owner").await;
+    let relay = state.accounts.clone().unwrap();
+    let conv = "c:big";
+    let filled = std::time::Instant::now();
+    let pool = match relay.store() {
+        l4f_accounts::store::Store::Lite(b) => b.0.clone(),
+        _ => panic!("a SQLite measurement"),
+    };
+    {
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("INSERT INTO voipc_writers (conv, owner) VALUES ($1, $2)")
+            .bind(conv)
+            .bind(&info.id[..])
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let writer: i64 = sqlx::query_scalar("SELECT id FROM voipc_writers WHERE conv = $1")
+            .bind(conv)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        // 200 steps a chain, as a chain's top allows
+        let chains = n / 200 + 1;
+        for c in 0..chains {
+            sqlx::query("INSERT INTO voipc_chains (writer, chain, top, self_wrap, created_at) VALUES ($1, $2, 199, $3, 0)")
+                .bind(writer).bind(c).bind(vec![1u8; 80]).execute(&mut *tx).await.unwrap();
+        }
+        let first: i64 = sqlx::query_scalar("SELECT MIN(id) FROM voipc_chains WHERE writer = $1")
+            .bind(writer)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        for i in 0..n {
+            sqlx::query(
+                "INSERT INTO voipc_chain_steps (chain_id, idx, sealed) VALUES ($1, $2, $3)",
+            )
+            .bind(first + i / 200)
+            .bind((i % 200) as i16)
+            .bind(vec![7u8; 300])
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        }
+        // And as many rows kept before 1.11, in the old log
+        for i in 0..n {
+            sqlx::query("INSERT INTO voipc_log (conv, sender, epoch, ct, server_at, keep_until) VALUES ($1, $2, 0, $3, $4, 9999999999999)")
+                .bind(conv).bind(&info.id[..]).bind(vec![9u8; 300]).bind(i)
+                .execute(&mut *tx).await.unwrap();
+        }
+        tx.commit().await.unwrap();
+    }
+    eprintln!("filled {n} steps + {n} old rows in {:?}", filled.elapsed());
+    // Another writer, every 50 ms, as a sign-in or a post would be
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let waits = {
+        let (pool, stop) = (pool.clone(), stop.clone());
+        tokio::spawn(async move {
+            let mut worst = std::time::Duration::ZERO;
+            let mut failed = 0;
+            let mut i = 0i64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let t = std::time::Instant::now();
+                let r = sqlx::query("INSERT INTO voipc_log_floors (conv, floor) VALUES ($1, 0) ON CONFLICT (conv) DO UPDATE SET floor = excluded.floor")
+                    .bind(format!("c:other{i}")).execute(&pool).await;
+                if r.is_err() {
+                    failed += 1;
+                }
+                worst = worst.max(t.elapsed());
+                i += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            (worst, failed)
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let t = std::time::Instant::now();
+    relay.channel_purge(conv).await.unwrap();
+    let took = t.elapsed();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let (worst, failed) = waits.await.unwrap();
+    eprintln!("ROUND-C W2-17 n={n}: purge {took:?}; another writer waited at most {worst:?}, {failed} failed");
+}
+
+/// Round C measurement (W2-3), not a check: a tidy pass over `ROUND_C_N` archive rows with
+/// `ROUND_C_W` delete wishes already done (what every later pass repeats), and how long another
+/// writer waits meanwhile. `TMPDIR=target/scratch/tmpdisk ROUND_C_N=2000000 cargo test -p
+/// voipc-server --bin voipc-server -- --ignored measure_archive_tidy --nocapture`.
+#[tokio::test]
+#[ignore]
+async fn measure_archive_tidy() {
+    let n: i64 = std::env::var("ROUND_C_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2_000_000);
+    let w: i64 = std::env::var("ROUND_C_W")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300);
+    let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+    let relay = state.accounts.clone().unwrap();
+    let pool = match relay.store() {
+        l4f_accounts::store::Store::Lite(b) => b.0.clone(),
+        _ => panic!("SQLite"),
+    };
+    let filled = std::time::Instant::now();
+    {
+        let mut tx = pool.begin().await.unwrap();
+        for ch in 1..=4i64 {
+            sqlx::query("INSERT INTO voipc_channels (conv, entry, position) VALUES ($1, '{}', 0)")
+                .bind(format!("c:dc-{ch}"))
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+        }
+        let per = n / 4;
+        for ch in 1..=4i64 {
+            let mut i = 0;
+            while i < per {
+                let mut q = String::from("INSERT INTO voipc_archive (channel, thread, dc_id, author_dc_id, author_name, body, import_id) VALUES ");
+                let chunk = (per - i).min(500);
+                for j in 0..chunk {
+                    let id = 1_000_000 + ch * 10_000_000_000 + (i + j) * 1000;
+                    if j > 0 {
+                        q.push(',');
+                    }
+                    q.push_str(&format!("({ch}, 0, {id}, {}, 'name', 'some words of a message, as people write them', 1)", (i + j) % 997 + 1));
+                }
+                sqlx::query(sqlx::AssertSqlSafe(q))
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+                i += chunk;
+            }
+        }
+        // Wishes whose rows are gone already: single messages by anyone, and spans by an author
+        for k in 0..w {
+            let id = 1_000_000 + 10_000_000_000 + k * 1000 + 1;
+            sqlx::query("INSERT INTO voipc_archive_wishes (author_dc_id, channel, low, high, erase, at) VALUES (0, 1, $1, $1, TRUE, 0)")
+                .bind(id).execute(&mut *tx).await.unwrap();
+            sqlx::query("INSERT INTO voipc_archive_wishes (author_dc_id, channel, low, high, erase, at) VALUES (5000, 0, $1, $2, TRUE, 0)")
+                .bind(id).bind(id + 500).execute(&mut *tx).await.unwrap();
+        }
+        tx.commit().await.unwrap();
+    }
+    eprintln!(
+        "filled {n} rows, {} wishes in {:?}",
+        2 * w,
+        filled.elapsed()
+    );
+    for q in crate::accounts::archive::PLANNED {
+        let plan: Vec<(i64, i64, i64, String)> =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {q}")))
+                .bind(1i64)
+                .bind(1i64)
+                .bind(1i64)
+                .bind(1i64)
+                .bind(1i64)
+                .bind(1i64)
+                .bind(1i64)
+                .fetch_all(&pool)
+                .await
+                .unwrap_or_default();
+        eprintln!(
+            "PLAN {}…\n  {}",
+            &q[..60.min(q.len())],
+            plan.iter()
+                .map(|p| p.3.clone())
+                .collect::<Vec<_>>()
+                .join("\n  ")
+        );
+    }
+    crate::accounts::archive::tidy(&state, &relay)
+        .await
+        .unwrap();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let waits = {
+        let (pool, stop) = (pool.clone(), stop.clone());
+        tokio::spawn(async move {
+            let (mut worst, mut failed, mut i) = (std::time::Duration::ZERO, 0, 0i64);
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let t = std::time::Instant::now();
+                let r = sqlx::query("INSERT INTO voipc_log_floors (conv, floor) VALUES ($1, 0) ON CONFLICT (conv) DO UPDATE SET floor = excluded.floor")
+                    .bind(format!("c:other{i}")).execute(&pool).await;
+                if r.is_err() {
+                    failed += 1;
+                }
+                worst = worst.max(t.elapsed());
+                i += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            (worst, failed)
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let t = std::time::Instant::now();
+    crate::accounts::archive::tidy(&state, &relay)
+        .await
+        .unwrap();
+    let took = t.elapsed();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let (worst, failed) = waits.await.unwrap();
+    eprintln!("ROUND-C W2-3 n={n} wishes={}: a repeated pass {took:?}; another writer waited at most {worst:?}, {failed} failed", 2 * w);
+}
+
+/// Round C measurement (W2-1), not a check: a pass of `prune_logs` over `ROUND_C_G` gated logs
+/// of 256 members each, every member another account, a quarter of them outside the gate.
+/// `TMPDIR=$PWD/target/scratch/tmpdisk ROUND_C_G=50 cargo test -p voipc-server --bin
+/// voipc-server -- --ignored measure_gate_pass --nocapture`.
+#[tokio::test]
+#[ignore]
+async fn measure_gate_pass() {
+    let g: usize = std::env::var("ROUND_C_G")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+    let per = 256usize;
+    let mut config = ServerConfig::default();
+    config.accounts.mode = AccountsMode::Optional;
+    config.accounts.registration = RegistrationMode::Open;
+    let db = TempDb(std::env::temp_dir().join(format!(
+        "voipc-relay-{}.db",
+        hex::encode(rand::random::<[u8; 8]>())
+    )));
+    let store = l4f_accounts::store::Store::connect(&format!("sqlite://{}", db.0.display()))
+        .await
+        .unwrap();
+    let relay = crate::accounts::Relay::open_with(&config.accounts, store, &[9u8; 32])
+        .await
+        .unwrap();
+    let entries: Vec<_> = (0..g)
+        .map(|i| crate::channels::ChannelEntry {
+            name: format!("g{i}"),
+            text: true,
+            ..Default::default()
+        })
+        .collect();
+    let mut state = ServerState::new(&config, ServerSettings::default(), entries, "t".into());
+    state.accounts = Some(Arc::new(relay));
+    let convs: Vec<String> = state
+        .channels
+        .get_mut()
+        .values_mut()
+        .filter(|c| !c.log_conv.is_empty())
+        .map(|c| {
+            c.gate.groups = vec!["crew".into()];
+            c.log_conv.clone()
+        })
+        .collect();
+    assert_eq!(convs.len(), g);
+    let state = Arc::new(state);
+    let relay = state.accounts.clone().unwrap();
+    group(&state, "crew", Some("C"), &[]).await;
+    group(&state, "other", Some("O"), &[]).await;
+    let crew = relay
+        .store()
+        .role_by_name("crew")
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    let other = relay
+        .store()
+        .role_by_name("other")
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    let pool = match relay.store() {
+        l4f_accounts::store::Store::Lite(b) => b.0.clone(),
+        _ => panic!("a SQLite measurement"),
+    };
+    let filled = std::time::Instant::now();
+    let mut outside = 0;
+    for (ci, conv) in convs.iter().enumerate() {
+        for m in 0..per {
+            let id = l4f_accounts::model::AccountId::new();
+            let new = l4f_accounts::model::NewUser {
+                id,
+                username: format!("u{ci}x{m}"),
+                display_name: format!("u{ci}x{m}"),
+                email_pending: None,
+                password_hash: None,
+                created_at: 0,
+            };
+            relay.store().create_user(&new, Some("user")).await.unwrap();
+            relay.store().grant_role(id, other, None).await.unwrap();
+            if m % 4 != 0 {
+                relay.store().grant_role(id, crew, None).await.unwrap();
+            } else {
+                outside += 1;
+            }
+            sqlx::query("INSERT INTO voipc_members (conv, account, joined_at) VALUES ($1, $2, 0)")
+                .bind(conv)
+                .bind(&id.0[..])
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+    }
+    eprintln!("filled {g} logs x {per} in {:?}", filled.elapsed());
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let waits = {
+        let (pool, stop) = (pool.clone(), stop.clone());
+        tokio::spawn(async move {
+            let mut worst = std::time::Duration::ZERO;
+            let mut failed = 0;
+            let mut i = 0i64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let t = std::time::Instant::now();
+                let r = sqlx::query("INSERT INTO voipc_log_floors (conv, floor) VALUES ($1, 0) ON CONFLICT (conv) DO UPDATE SET floor = excluded.floor")
+                    .bind(format!("c:other{i}")).execute(&pool).await;
+                if r.is_err() {
+                    failed += 1;
+                }
+                worst = worst.max(t.elapsed());
+                i += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            (worst, failed)
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let t = std::time::Instant::now();
+    crate::gates::prune_logs(&state).await;
+    let first = t.elapsed();
+    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM voipc_members")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(left as usize, g * per - outside);
+    let t = std::time::Instant::now();
+    crate::gates::prune_logs(&state).await;
+    let again = t.elapsed();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let (worst, failed) = waits.await.unwrap();
+    eprintln!("ROUND-C W2-1 g={g} members={}: first pass {first:?} ({outside} out), a pass with nobody out {again:?}; another writer waited at most {worst:?}, {failed} failed", g * per);
+}
+
+/// Round C measurement (W2-2), not a check: a group of `ROUND_C_H` privilege holders away and
+/// `ROUND_C_O` online (at most 10: sign-ups from one address) gains a scope that changes how
+/// they are listed; `revalidate` as the group edit runs it, and the longest a connect waits for
+/// the list (`chat_mods_at_connect`). `TMPDIR=$PWD/target/scratch/tmpdisk ROUND_C_PAGE=500
+/// ROUND_C_H=2990 ROUND_C_O=10 cargo test -p voipc-server --bin voipc-server -- --ignored
+/// measure_group_edit --nocapture`.
+#[tokio::test]
+#[ignore]
+async fn measure_group_edit() {
+    let var = |k: &str, d: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
+    let (h, o) = (var("ROUND_C_H", 200), var("ROUND_C_O", 20));
+    let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+    group(&state, "mods", None, &["voipc:kick"]).await;
+    let relay = state.accounts.clone().unwrap();
+    let mods = relay
+        .store()
+        .role_by_name("mods")
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    let pool = match relay.store() {
+        l4f_accounts::store::Store::Lite(b) => b.0.clone(),
+        _ => panic!("a SQLite measurement"),
+    };
+    let filled = std::time::Instant::now();
+    for i in 0..h {
+        let id = l4f_accounts::model::AccountId::new();
+        let new = l4f_accounts::model::NewUser {
+            id,
+            username: format!("away{i}"),
+            display_name: format!("away{i}"),
+            email_pending: None,
+            password_hash: None,
+            created_at: 0,
+        };
+        relay.store().create_user(&new, Some("user")).await.unwrap();
+        relay.store().grant_role(id, mods, None).await.unwrap();
+        sqlx::query("UPDATE acct_users SET totp_enc = X'00' WHERE id = $1")
+            .bind(&id.0[..])
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let mut here = Vec::new();
+    for i in 0..o {
+        let (mut c, info) = register(&state, &format!("here{i}")).await;
+        totp_on(&mut c).await;
+        give(&state, info.id, "mods", true).await;
+        here.push(c);
+    }
+    crate::accounts::refresh_chat_mods(&state).await;
+    assert_eq!(state.chat_mods.read().await.len(), h + o);
+    eprintln!("{h} away, {o} here in {:?}", filled.elapsed());
+    // Each of them now hides too: how every one of them is listed changes
+    sqlx::query("INSERT INTO acct_role_scopes (role_id, scope) VALUES ($1, 'voipc:hide')")
+        .bind(&mods.0[..])
+        .execute(&pool)
+        .await
+        .unwrap();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let waits = {
+        let (state, stop) = (state.clone(), stop.clone());
+        tokio::spawn(async move {
+            let mut worst = std::time::Duration::ZERO;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let t = std::time::Instant::now();
+                drop(state.chat_mods.read().await);
+                worst = worst.max(t.elapsed());
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            worst
+        })
+    };
+    let t = std::time::Instant::now();
+    crate::accounts::revalidate(&state).await;
+    let took = t.elapsed();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let worst = waits.await.unwrap();
+    assert!(state.chat_mods.read().await.iter().all(|m| m.hide));
+    eprintln!("ROUND-C W2-2 holders={h} away + {o} here: the group edit's pass {took:?}; a connect waited at most {worst:?} for the list");
+}
+
+/// Round C measurement (W2-14), not a check: `ROUND_C_N` kept channels put in the reverse
+/// order (`layout_set`), and 200 categories with the first deleted (`category_delete`); the
+/// longest a connect waits for the layout meanwhile. `TMPDIR=$PWD/target/scratch/tmpdisk
+/// ROUND_C_N=2000 cargo test -p voipc-server --bin voipc-server -- --ignored
+/// measure_layout_moves --nocapture`.
+#[tokio::test]
+#[ignore]
+async fn measure_layout_moves() {
+    let n: usize = std::env::var("ROUND_C_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(500);
+    let mut config = ServerConfig::default();
+    config.accounts.mode = AccountsMode::Optional;
+    config.accounts.registration = RegistrationMode::Open;
+    let db = TempDb(std::env::temp_dir().join(format!(
+        "voipc-relay-{}.db",
+        hex::encode(rand::random::<[u8; 8]>())
+    )));
+    let store = l4f_accounts::store::Store::connect(&format!("sqlite://{}", db.0.display()))
+        .await
+        .unwrap();
+    let relay = crate::accounts::Relay::open_with(&config.accounts, store, &[9u8; 32])
+        .await
+        .unwrap();
+    let entries: Vec<_> = (0..n)
+        .map(|i| crate::channels::ChannelEntry {
+            name: format!("c{i}"),
+            text: true,
+            ..Default::default()
+        })
+        .collect();
+    let mut state = ServerState::new(&config, ServerSettings::default(), entries, "t".into());
+    state.accounts = Some(Arc::new(relay));
+    let state = Arc::new(state);
+    let relay = state.accounts.clone().unwrap();
+    let t = std::time::Instant::now();
+    crate::layout::load(&state, relay.layout_rows().await.unwrap(), &[]).await;
+    eprintln!("first start placed {n} in {:?}", t.elapsed());
+    let mut ids: Vec<u32> = state
+        .channels
+        .read()
+        .await
+        .values()
+        .filter(|c| c.persistent && c.info.channel_id != 0)
+        .map(|c| c.info.channel_id)
+        .collect();
+    ids.sort_unstable();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let waiting = || {
+        let (state, stop) = (state.clone(), stop.clone());
+        tokio::spawn(async move {
+            let mut worst = std::time::Duration::ZERO;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let t = std::time::Instant::now();
+                drop(state.layout.read().await);
+                worst = worst.max(t.elapsed());
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            worst
+        })
+    };
+    let waits = waiting();
+    let wanted: Vec<(u32, Option<u32>)> = ids.iter().rev().map(|id| (*id, None)).collect();
+    let t = std::time::Instant::now();
+    crate::layout::layout_set(&state, 0, &[], &wanted)
+        .await
+        .unwrap();
+    let moved = t.elapsed();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let worst_moved = waits.await.unwrap();
+    for i in 0..200 {
+        crate::layout::category_save(&state, 0, None, &format!("k{i}"))
+            .await
+            .unwrap();
+    }
+    stop.store(false, std::sync::atomic::Ordering::Relaxed);
+    let waits = waiting();
+    let first = state.layout.read().await.categories[0].id;
+    let t = std::time::Instant::now();
+    crate::layout::category_delete(&state, 0, first)
+        .await
+        .unwrap();
+    let deleted = t.elapsed();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let worst_deleted = waits.await.unwrap();
+    let rows = relay.layout_rows().await.unwrap();
+    assert_eq!(rows.categories.len(), 199);
+    // The rows read back in the order the list now has
+    let kept = state.layout.read().await.places.clone();
+    let mut by_place: Vec<&String> = kept.keys().collect();
+    by_place.sort_by_key(|c| kept[*c].position);
+    let read: Vec<&String> = rows.rows.iter().map(|r| &r.conv).collect();
+    assert_eq!(read, by_place);
+    eprintln!("ROUND-C W2-14 n={n}: reversed in {moved:?} (a connect waited at most {worst_moved:?}); a category of 200 deleted in {deleted:?} (waited at most {worst_deleted:?})");
+}
+
+/// Round C measurement (W2-16), not a check: what a connect reads before its join (group
+/// styles, the server's profile, removal marks) with 400 styled groups and 2000 marks, once
+/// and for `ROUND_C_N` connects at once. `TMPDIR=$PWD/target/scratch/tmpdisk ROUND_C_N=500
+/// cargo test -p voipc-server --bin voipc-server -- --ignored measure_connect_reads
+/// --nocapture`.
+#[tokio::test]
+#[ignore]
+async fn measure_connect_reads() {
+    let n: usize = std::env::var("ROUND_C_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100);
+    let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+    let relay = state.accounts.clone().unwrap();
+    for i in 0..400 {
+        group(&state, &format!("g{i}"), Some(&format!("B{i}")), &[]).await;
+        let id = relay
+            .store()
+            .role_by_name(&format!("g{i}"))
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        relay.group_style_put(id, Some(i), true).await.unwrap();
+    }
+    let pool = match relay.store() {
+        l4f_accounts::store::Store::Lite(b) => b.0.clone(),
+        _ => panic!("a SQLite measurement"),
+    };
+    for i in 0..2000i64 {
+        sqlx::query("INSERT INTO voipc_modlog (at, action, actor_name, target, target_name, since_ms, before_ms) VALUES ($1, 'remove_posts', 'mod', $2, 'someone', 1, 2)")
+            .bind(i)
+            .bind(vec![(i % 251) as u8; 16])
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let reads = |state: Arc<ServerState>| async move {
+        let (tx, _rx) = crate::control::control_queue(Arc::new(tokio::sync::Notify::new()));
+        let t = std::time::Instant::now();
+        crate::layout::send_styles(&state, &tx).await;
+        crate::accounts::profile::send_server_profile(&state, &tx).await;
+        crate::accounts::modlog::send_marks(&state, &tx).await;
+        t.elapsed()
+    };
+    reads(state.clone()).await;
+    let one = reads(state.clone()).await;
+    // The crowd comes to nothing kept, as after a start
+    relay.at_connect.styles.changed();
+    relay.at_connect.profile.changed();
+    relay.at_connect.marks.changed();
+    let t = std::time::Instant::now();
+    let mut all = tokio::task::JoinSet::new();
+    for _ in 0..n {
+        all.spawn(reads(state.clone()));
+    }
+    let mut worst = std::time::Duration::ZERO;
+    while let Some(r) = all.join_next().await {
+        worst = worst.max(r.unwrap());
+    }
+    eprintln!("ROUND-C W2-16: one connect's reads {one:?}; {n} at once {:?} in all, the slowest {worst:?}", t.elapsed());
 }

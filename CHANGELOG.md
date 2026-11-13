@@ -4,8 +4,10 @@ All notable changes to VoIPC are documented here.
 
 ## [1.12.0] - release candidate
 
-Protocol 22. A 1.12 app talks to relays back to 1.0 (protocol 12); update the apps first, then the relay
-([OPERATING.md](docs/OPERATING.md) §8). One database migration (`0011_promises.sql`) and l4f-accounts 0.14.
+Protocol 23 (rc.1 was 22: its apps and relays update too). A 1.12 app talks to relays back to 1.0 (protocol 12); update
+the apps first, then the relay
+([OPERATING.md](docs/OPERATING.md) §8). Two database migrations (`0011_promises.sql`, and `0012_round_c.sql` in rc.2) and
+l4f-accounts 0.14.1.
 
 ### Security
 - **A sign-in is bound to the connection it was made on.** A server you are lured to, which passes your sign-in on to
@@ -16,8 +18,9 @@ Protocol 22. A 1.12 app talks to relays back to 1.0 (protocol 12); update the ap
   ([THREAT-MODEL.md](docs/THREAT-MODEL.md)).
 - **The password never leaves the app.** It signs in with a key derived from the password, and the server keeps only the
   key's public half. A new password, deleting the account, a new recovery key and linking a provider prove the password
-  the same way. An account from before 1.12 moves at its first sign-in with its password in a 1.12 app; from then on its
-  old secret opens nothing. Until then, a device signed in by its remembered key confirms the password the old way.
+  the same way. An account from before 1.12 moves the first time it gives its password to a 1.12 app, at a sign-in or
+  when a device signed in by its remembered key or a provider confirms it (rc.2: such accounts never moved); from then on
+  its old secret opens nothing. That once, the password is confirmed the old way.
 - **The relay must end TLS itself**: a proxy that ends it in front of the TCP fallback breaks app sign-ins there.
 
 ### Changed
@@ -30,7 +33,40 @@ Protocol 22. A 1.12 app talks to relays back to 1.0 (protocol 12); update the ap
 - **An admin step's refusal ends only that step** (protocol 22): the move's wizard and an undo no longer stop for another
   step's refusal.
 
+### Large servers (rc.2)
+Measured on a disk-backed relay before and after; each one has a test.
+- **Deleting a channel with a large kept log no longer stops the relay's other writes.** One transaction over a million
+  rows held SQLite's only writer for seconds, and sign-ins and posts failed meanwhile. The channel and its readers go at
+  once, its rows a few thousand at a time, and a start finishes what a stop left. A second migration,
+  `0012_round_c.sql`, keeps that note and adds the indexes below.
+- **The archive's tidy pass** went through every row of a channel for each delete wish, every hour (54 s and failed
+  writes at 2 million rows); it now reads only the rows a wish names (0.2 s).
+- **Reading who keeps a gated channel's log** at start and after group changes asks less per member and decides several at
+  once (2.75 s to 0.7 s for 50 full gated channels); the start still waits for it.
+- **A group edit** read the list of privilege holders once for every holder online, and every new connection waited for
+  each read (2.9 s and 300 ms with 3,000 holders); now once, and nobody waits.
+- **Moving many channels or deleting a category** is one database commit instead of one per row.
+- **What every connection is told before it joins** (group colours, the server's profile, removal marks) is read once for
+  everyone who connects within ten seconds: 500 connections at once waited up to 5.2 s, now 20 ms. A change made in the
+  app reaches the next connection at once; one made from the server's shell within ten seconds.
+- **Listing an account's direct conversations** at every connect went through every direct message on the server
+  (340 ms at a million); now only that account's (5 ms).
+
 ### Fixed
+- **A voice-only mute during the new-member wait read "Timed out"** until the wait ended (protocol 23): a restriction now
+  says what the moderator holds and when the wait ends, each with its own end.
+- **A crash right after reading back messages lost them on that device** (desktop): the read position reached the disk
+  before the messages did, so they were never read again. It now waits for them.
+- **A sign-in through a provider could fail once** when the provider closed a connection as it was reused: l4f-accounts
+  0.14.1 opens one per call.
+- **Disconnecting and pressing F5 with auto-connect on** took the browser back to the last server as a guest with the
+  account's name. Auto-connect opens only what was open.
+- **An anonymous room told more than names** (rc.2): a pseudonym's row showed the admin's shield, a moderator's mark,
+  the history icon and the maker's crown; everyone heard who made the room and, outside it, who went in; a list with
+  their name showed them muted or sharing as they did in the room. None of it goes to anyone but admins now. A modified
+  app can still tie a pseudonym to a person by its user id and key ([THREAT-MODEL.md](docs/THREAT-MODEL.md)).
+- **A new direct-message key put while under a pseudonym** told the other party at that moment; they learn of it at their
+  next read now.
 - **Lift ban holds for someone who deleted their account themselves**: the next import made their banned row again.
 - **Deleting an account takes its imported posts also after it unlinked Discord**: unlinking forgot the Discord id.
 - `voipc-import`'s check that it touches no disk failed on the fuzz replay added in 1.11.1.

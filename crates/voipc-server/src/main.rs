@@ -1042,6 +1042,15 @@ async fn main() -> Result<()> {
             relay_id = %hex::encode(relay.relay_id),
             "accounts on"
         );
+        // A deleted channel's rows that a stop cut short (`channel_purge`)
+        let purger = relay.clone();
+        tokio::spawn(async move {
+            match purger.purge_unfinished().await {
+                Ok(n) if n > 0 => info!(channels = n, "finished taking deleted channels' rows"),
+                Ok(_) => {}
+                Err(e) => warn!("finishing deleted channels' rows: {e:#}"),
+            }
+        });
         // Expired sessions, invites, old audit rows and unused device keys.
         let sweeper = relay.clone();
         tokio::spawn(async move {

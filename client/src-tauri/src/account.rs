@@ -323,6 +323,20 @@ pub async fn run(
     }
     let state = app.state::<AppState>();
     let mut chat = state.chat.write().await;
+    // After the posts of this read, which the front end files as they come: when it saves
+    // with this number, they are on disk, and the cursors may follow
+    if let Some((key, memory)) = a.memory {
+        let gen = chat.read_moved(key, memory);
+        emit_server(
+            app,
+            server,
+            "log-read-upto",
+            serde_json::json!({ "gen": gen }),
+        );
+    }
+    if a.remember.is_none() {
+        return;
+    }
     if let Some(r) = a.remember {
         chat.archive
             .devices
@@ -336,9 +350,6 @@ pub async fn run(
             dek: *r.dek,
         });
         info!(server, "this device is remembered");
-    }
-    if let Some((key, memory)) = a.memory {
-        chat.archive.cursors.insert(key, memory);
     }
     chat.dirty = true;
 }
@@ -651,11 +662,7 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
         .chat
         .read()
         .await
-        .archive
-        .cursors
-        .get(&memory_key(&signed.relay_id, &signed.name))
-        .cloned()
-        .unwrap_or_default();
+        .log_memory(&memory_key(&signed.relay_id, &signed.name));
     // Joiners of a channel's log get our older keys on the same consent as
     // handing them the channel's history in person.
     let share = state.config().share_channel_history;
@@ -1352,7 +1359,9 @@ pub async fn forget_device(
         .map(|d| d.relay_id)
         .collect();
     for relay_id in relays {
-        chat.archive.cursors.remove(&memory_key(&relay_id, &name));
+        let key = memory_key(&relay_id, &name);
+        chat.archive.cursors.remove(&key);
+        chat.pending_reads.remove(&key);
     }
     chat.archive
         .devices

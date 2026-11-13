@@ -462,16 +462,33 @@ pub async fn server_profile(state: &ServerState) -> ServerMessage {
 
 /// At connect, when it says anything.
 pub async fn send_server_profile(state: &ServerState, tx: &ControlTx) {
-    let msg = server_profile(state).await;
-    if matches!(&msg, ServerMessage::ServerProfile { name, description, icon }
-        if !name.is_empty() || !description.is_empty() || icon.is_some())
-    {
-        let _ = send_msg(tx, &msg);
+    let read = || async {
+        let msg = server_profile(state).await;
+        if !matches!(&msg, ServerMessage::ServerProfile { name, description, icon }
+            if !name.is_empty() || !description.is_empty() || icon.is_some())
+        {
+            return Some(Vec::new());
+        }
+        voipc_protocol::codec::encode_server_msg(&msg)
+            .inspect_err(|e| warn!("telling the server's profile: {e:#}"))
+            .ok()
+            .map(|data| vec![data])
+    };
+    // Read once for all who connect a while (`at_connect`)
+    let frames = match state.accounts.as_ref() {
+        Some(relay) => relay.at_connect.profile.frames(read).await,
+        None => read().await.map(Arc::new),
+    };
+    for data in frames.iter().flat_map(|f| f.iter()) {
+        let _ = tx.try_send(data.clone());
     }
 }
 
-/// After a change, to everybody.
+/// After a change, to everybody. Those who connect next read again.
 pub async fn send_server_profile_all(state: &ServerState) {
+    if let Some(relay) = state.accounts.as_ref() {
+        relay.at_connect.profile.changed();
+    }
     let msg = server_profile(state).await;
     for s in state.sessions.iter() {
         let _ = send_msg(&s.control_tx, &msg);

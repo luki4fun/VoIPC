@@ -131,10 +131,17 @@ const ERASE_BY: &str = "DELETE FROM voipc_archive WHERE (channel, thread, dc_id)
      (SELECT channel, thread, dc_id FROM voipc_archive \
       WHERE author_dc_id = $1 AND channel BETWEEN $2 AND $3 AND dc_id BETWEEN $4 AND $5 \
       AND thread_name IS NULL LIMIT $6)";
+/// By anyone, in one channel (`$1`) or in all (`ERASE_ANYONE_ALL`): two statements, so that
+/// each is a range of an index, `(channel, dc_id)` or `(dc_id)`. With `channel BETWEEN` the
+/// planner walked the primary key over the whole channel, every pass (W2-3).
 const ERASE_ANYONE: &str = "DELETE FROM voipc_archive WHERE (channel, thread, dc_id) IN \
      (SELECT channel, thread, dc_id FROM voipc_archive \
-      WHERE channel BETWEEN $1 AND $2 AND dc_id BETWEEN $3 AND $4 \
-      AND thread_name IS NULL LIMIT $5)";
+      WHERE channel = $1 AND dc_id BETWEEN $2 AND $3 \
+      AND thread_name IS NULL LIMIT $4)";
+const ERASE_ANYONE_ALL: &str = "DELETE FROM voipc_archive WHERE (channel, thread, dc_id) IN \
+     (SELECT channel, thread, dc_id FROM voipc_archive \
+      WHERE dc_id BETWEEN $1 AND $2 \
+      AND thread_name IS NULL LIMIT $3)";
 
 /// A thread's opening row someone took back keeps only that a thread is here: the replies in
 /// it are other people's, and it is the way in to them. A macro so that each statement stays
@@ -154,12 +161,19 @@ macro_rules! root_taken_back {
 const ROOT_BY: &str = root_taken_back!(
     "author_dc_id = $2 AND channel BETWEEN $3 AND $4 AND dc_id BETWEEN $5 AND $6 LIMIT $7"
 );
-/// Only what is not that already: this wish still covers the row afterwards.
+/// Only what is not that already: this wish still covers the row afterwards. In one channel
+/// or in all, as `ERASE_ANYONE`.
 const ROOT_ANYONE: &str = root_taken_back!(
-    "channel BETWEEN $2 AND $3 AND dc_id BETWEEN $4 AND $5 \
+    "channel = $2 AND dc_id BETWEEN $3 AND $4 \
      AND (author_dc_id IS NOT NULL OR author_name <> '' OR body <> '' OR reply_to IS NOT NULL \
      OR reactions IS NOT NULL OR attachments IS NOT NULL OR pinned = TRUE OR thread_name <> $1) \
-     LIMIT $6"
+     LIMIT $5"
+);
+const ROOT_ANYONE_ALL: &str = root_taken_back!(
+    "dc_id BETWEEN $2 AND $3 \
+     AND (author_dc_id IS NOT NULL OR author_name <> '' OR body <> '' OR reply_to IS NOT NULL \
+     OR reactions IS NOT NULL OR attachments IS NOT NULL OR pinned = TRUE OR thread_name <> $1) \
+     LIMIT $4"
 );
 /// A row a frame dropped, if a thread opens on it: a run files its threads first.
 const ROOT_ONE: &str = root_taken_back!("channel = $2 AND thread = 0 AND dc_id = $3");
@@ -180,6 +194,19 @@ const ERASE_OLD: &str = "DELETE FROM voipc_archive WHERE (channel, thread, dc_id
      (SELECT a.channel, a.thread, a.dc_id FROM voipc_archive a WHERE a.channel = $1 AND a.dc_id < $2 \
       AND NOT (a.thread = 0 AND a.thread_name IS NOT NULL AND EXISTS (SELECT 1 FROM voipc_archive r \
         WHERE r.channel = $1 AND r.thread = a.dc_id AND r.dc_id >= $2)) LIMIT $3)";
+
+/// The statements a tidy pass repeats, for the Round C measurement's query plans.
+#[cfg(test)]
+pub(crate) const PLANNED: [&str; 8] = [
+    ERASE_BY,
+    ERASE_ANYONE,
+    ERASE_ANYONE_ALL,
+    ROOT_BY,
+    ROOT_ANYONE,
+    ROOT_ANYONE_ALL,
+    ROOT_OLD,
+    ERASE_OLD,
+];
 
 const FILE_ROW: &str =
     "INSERT INTO voipc_archive (channel, thread, dc_id, author_dc_id, author_name, \
@@ -1606,19 +1633,23 @@ enum Going<'a> {
 async fn batch(relay: &Relay, going: Going<'_>) -> Result<u64> {
     Ok(db!(relay.store(), pool => {
         match going {
-            Going::Roots(0, wish) => {
-                let (first, last) = channels_of(wish.channel);
-                sqlx::query(ROOT_ANYONE)
-                    .bind(THREAD_TAKEN_BACK)
-                    .bind(first)
-                    .bind(last)
-                    .bind(wish.low)
-                    .bind(wish.high)
-                    .bind(BATCH)
-                    .execute(pool)
-                    .await?
-                    .rows_affected()
-            }
+            Going::Roots(0, wish) if wish.channel == 0 => sqlx::query(ROOT_ANYONE_ALL)
+                .bind(THREAD_TAKEN_BACK)
+                .bind(wish.low)
+                .bind(wish.high)
+                .bind(BATCH)
+                .execute(pool)
+                .await?
+                .rows_affected(),
+            Going::Roots(0, wish) => sqlx::query(ROOT_ANYONE)
+                .bind(THREAD_TAKEN_BACK)
+                .bind(wish.channel)
+                .bind(wish.low)
+                .bind(wish.high)
+                .bind(BATCH)
+                .execute(pool)
+                .await?
+                .rows_affected(),
             Going::Roots(author, wish) => {
                 let (first, last) = channels_of(wish.channel);
                 sqlx::query(ROOT_BY)
@@ -1633,18 +1664,21 @@ async fn batch(relay: &Relay, going: Going<'_>) -> Result<u64> {
                     .await?
                     .rows_affected()
             }
-            Going::Wished(0, wish) => {
-                let (first, last) = channels_of(wish.channel);
-                sqlx::query(ERASE_ANYONE)
-                    .bind(first)
-                    .bind(last)
-                    .bind(wish.low)
-                    .bind(wish.high)
-                    .bind(BATCH)
-                    .execute(pool)
-                    .await?
-                    .rows_affected()
-            }
+            Going::Wished(0, wish) if wish.channel == 0 => sqlx::query(ERASE_ANYONE_ALL)
+                .bind(wish.low)
+                .bind(wish.high)
+                .bind(BATCH)
+                .execute(pool)
+                .await?
+                .rows_affected(),
+            Going::Wished(0, wish) => sqlx::query(ERASE_ANYONE)
+                .bind(wish.channel)
+                .bind(wish.low)
+                .bind(wish.high)
+                .bind(BATCH)
+                .execute(pool)
+                .await?
+                .rows_affected(),
             Going::Wished(author, wish) => {
                 let (first, last) = channels_of(wish.channel);
                 sqlx::query(ERASE_BY)

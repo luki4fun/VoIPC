@@ -3528,10 +3528,31 @@ mod tests {
             assert_eq!(gated.speakers, ["crew"]);
             assert_eq!(of(format!("c:dc-{}", TOP + 2)).unwrap().groups, ["admin"]);
 
-            // A category gone by hand: the ledger keeps its row, naming nothing
-            r.category_delete(2).await.unwrap();
+            // A new order is one transaction, rows and categories together (W2-14)
+            let one = voipc_protocol::types::ChannelCategory {
+                id: 1,
+                name: "first".into(),
+            };
+            r.layout_write(
+                &[(format!("c:dc-{}", TOP + 2), None, -5, Some(1))],
+                &[(one.clone(), 7)],
+            )
+            .await
+            .unwrap();
+            let back = r.layout_rows().await.unwrap();
+            assert_eq!(back.rows[0].conv, format!("c:dc-{}", TOP + 2));
+            assert_eq!(back.rows[0].category, Some(1));
+            assert_eq!(back.categories.last().map(|c| c.id), Some(1));
+
+            // A category gone by hand: the ledger keeps its row, naming nothing, and the rest
+            // take the places the list gives them
+            r.category_delete(2, std::slice::from_ref(&one))
+                .await
+                .unwrap();
             let held = r.import_items(import::KIND_CATEGORY).await.unwrap();
             assert_eq!((held[&501].as_str(), held[&502].as_str()), ("1", ""));
+            let back = r.layout_rows().await.unwrap();
+            assert_eq!(back.categories, [one]);
 
             // A private channel with its gate opened takes nothing; one that was open does
             let top = TOP as i64;

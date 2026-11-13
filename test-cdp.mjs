@@ -338,6 +338,28 @@ export const probe = (tab, expression, timeoutMs) =>
  * NOTE line, with its diagnosis, and tried once more; the lanes that have always done that
  * (move, moderation) keep it, the others fail with the diagnosis instead.
  */
+/** An expression: this page has queued a frame of `kind` since `__voipc_said` was emptied
+ *  (a variant name, or "#27" for a live post, which goes raw). */
+export const sentKind = (kind) => `window.__voipc_said.some((m) => m && typeof m === "object" && ${JSON.stringify(kind)} in m)`;
+
+/**
+ * Rule 5's barrier: each tab in turn has the relay answer a Ping (the self-test build's
+ * `__voipc_barrier`). After it, everything the earlier tabs sent has been handled, and what
+ * the relay passed on from it is in the later tabs' queues and recorded (`__voipc_heard`).
+ * Only for what an app sends as part of a step: a send behind an app's own timer is not
+ * covered. False: a tab had no session there.
+ */
+export async function barrier(server, ...tabs) {
+  for (const tab of tabs) {
+    const ok = await Promise.race([
+      tab.evaluate(`window.__voipc_barrier(${JSON.stringify(server)})`),
+      sleep(HANG_MS).then(() => false),
+    ]);
+    if (!ok) return false;
+  }
+  return true;
+}
+
 export async function loadPage(tab, url, shown, { retry = false, timeoutMs = 25_000 } = {}) {
   const before = tab.errors.length;
   await tab.send("Page.navigate", { url });

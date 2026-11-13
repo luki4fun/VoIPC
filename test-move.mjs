@@ -25,10 +25,12 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { loadPage, openTab, probe, seen, sleep, startChromium, waitFor } from "./test-cdp.mjs";
+import { barrier, loadPage, openTab, probe, seen, sleep, startChromium, waitFor } from "./test-cdp.mjs";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.argv[2] ?? 49993);
+/** The relay, as every page names it (`SERVER` is its binary here). */
+const RELAY = `127.0.0.1:${PORT}`;
 const CHROME = process.env.CHROME ?? "chromium";
 const ORIGIN = `https://127.0.0.1:${PORT}`;
 const WORK = mkdtempSync(join(tmpdir(), "voipc-move-"));
@@ -237,7 +239,9 @@ async function forgeFetches(tab) {
     await tab.evaluate(`window.__control.write(new Uint8Array(${JSON.stringify(archiveFetch(channel))})).then(() => 0)`);
     await sleep(40);
   }
-  await sleep(600);
+  // Rule 5: each write above was on the control stream before the barrier's Ping, and the relay
+  // answers an AccountRequest inline, in order, so every answer is read (`__heard`) before its Pong
+  check("past the forged fetches' barrier", await barrier(RELAY, tab));
   return tab.evaluate(`window.__heard`);
 }
 
@@ -608,7 +612,6 @@ async function lane() {
   check("a forum is a text channel here", annList.includes("help"), annList.join());
   await tabTo(ann, "Users");
   await waitFor(ann, q(".admin-dialog .move-filter"));
-  await sleep(500);
   check("Users lists with chips", await seen(ann, `document.querySelector(".move-chip[data-state='Waiting']")`), await panelText(ann));
   await click(ann, ".admin-dialog .move-filter");
   await key(ann, "Escape", 27);
@@ -635,15 +638,18 @@ async function lane() {
   // ── dan comes, through the stand-in Discord, and changes the name ───────
   const three = await browser(PORT + 102);
   const dan = await comeWithDiscord(three, DAN, "dan_d", { rename: "danny" });
-  await sleep(500);
   check("he is in under the name he chose", await seen(dan, memberRow("danny")), await pageText(dan));
   const badgeOf = (name) => `${memberRow(name)}?.querySelector(".badge")`;
   check("with his badge, on his screen", await seen(dan, badgeOf("danny")), await pageText(dan));
   check("and annika's", await seen(ann, badgeOf("danny")), await ann.evaluate(`${memberRow("danny")}?.textContent ?? "(not there)"`));
-  check("in the colour it had", await dan.evaluate(`!!${badgeOf("danny")}.getAttribute("style")`));
-  check("and the name he went by, beside his own", await ann.evaluate(`${memberRow("danny")}?.textContent.includes("Dan D")`), await ann.evaluate(`${memberRow("danny")}?.textContent ?? ""`));
+  // With no pause before them: the colour comes with the group styles and the name with a
+  // profile fetch, each after the row, so both are waited for
+  check("in the colour it had", await seen(dan, `!!${badgeOf("danny")}?.getAttribute("style")`), await dan.evaluate(`${badgeOf("danny")}?.outerHTML ?? "(no badge)"`));
+  check("and the name he went by, beside his own", await seen(ann, `${memberRow("danny")}?.textContent.includes("Dan D")`), await ann.evaluate(`${memberRow("danny")}?.textContent ?? ""`));
+  check("the gate passes him into #staff", await seen(dan, `!!${channelRow("staff")}`), (await textChannels(dan)).join());
+  // Rule 5: whatever the relay had queued for him by now is in
+  check("past dan's barrier", await barrier(RELAY, dan));
   const danList = await textChannels(dan);
-  check("the gate passes him into #staff", danList.includes("staff"), danList.join());
   check("no one passes #vault", !danList.includes("vault"), danList.join());
   await mouse(ann, byText(".admin-tabs button", "Users"), "Users");
   await mouse(ann, byText(".admin-tabs button", "Discord move"), "back to Discord move");
@@ -777,7 +783,9 @@ async function lane() {
   check("no error in the panel", await ann.evaluate(`!document.querySelector(".admin-error")`), await panelText(ann));
   check("dan is asked for codes, now a group of his holds power", await seen(dan, `document.querySelector('${dialogOf("totp-setup")}')?.innerText.includes("needs a second factor")`, 10_000), await pageText(dan));
   await dan.evaluate(`${byText(".account-dialog button", "Later")}?.click(); 0`);
-  await sleep(400);
+  // Rule 5: annika has her answer, so the relay is past the OK; past her barrier and then his,
+  // anything it sent him for it is in
+  check("past annika and dan's barrier", await barrier(RELAY, ann, dan));
   check("its rights wait for them", !(await canKick(dan)), await pageText(dan));
   await turnOnCodes(dan);
   await sleep(500);
@@ -839,8 +847,7 @@ async function lane() {
   check("a thread shows on its row", await seen(dan, opener), await dan.evaluate(`document.querySelector("${rowOf("1200000000000005005")}")?.textContent`));
   await mouse(dan, opener, "thread opener");
   check("the thread opens in the pane, with a way back", await seen(dan, q(".archive-back")));
-  await sleep(500);
-  check("the header names the thread", (await dan.evaluate(`${q(".archive-title")}.textContent`)) === "movie night", await paneText(dan));
+  check("the header names the thread", await seen(dan, `${q(".archive-title")}?.textContent === "movie night"`), await paneText(dan));
   await click(dan, ".archive-back");
   check("back at the list", await seen(dan, `!document.querySelector(".archive-back") && document.querySelectorAll(".archive-rows .row").length > 50`));
 
@@ -1316,7 +1323,8 @@ async function lane() {
   await waitFor(tess, `document.querySelector(".admin-dialog .admin-input")`);
   await tess.evaluate(setInput('.admin-dialog input[type="password"]', TOKEN));
   await tess.evaluate(`document.querySelector(".admin-dialog .admin-ok").click()`);
-  await sleep(1000);
+  // A login that takes closes its own dialog (admin-ui.ts `panelAllowed`); one refused leaves it up
+  await waitFor(tess, `!document.querySelector(".admin-dialog.login")`);
   await serverMenu(tess, "Server admin");
   const banRows = `document.querySelectorAll(".ban-list .ban-label").length`;
   const banLabels = `[...document.querySelectorAll(".ban-list .ban-label")].map((b) => b.textContent)`;

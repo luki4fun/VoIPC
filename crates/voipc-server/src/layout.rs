@@ -13,6 +13,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use tracing::{error, warn};
+use voipc_protocol::codec::encode_server_msg;
 use voipc_protocol::messages::ServerMessage;
 use voipc_protocol::types::{
     ChannelCategory, ChannelGate, ChannelId, ChannelInfo, ChannelPlace, ImportCategory,
@@ -140,13 +141,10 @@ pub async fn load(state: &ServerState, kept: KeptRows, apps: &[String]) {
         .map(|p| p.position)
         .max()
         .unwrap_or(0);
+    let mut rows = Vec::with_capacity(unplaced.len());
     for conv in unplaced {
         next += 1;
-        if let Some(relay) = &state.accounts {
-            if let Err(e) = relay.layout_put(&conv, None, next, None).await {
-                warn!(conv, "placing a channel from the file: {e:#}");
-            }
-        }
+        rows.push((conv.clone(), None, next, None));
         layout.places.insert(
             conv,
             Place {
@@ -154,6 +152,11 @@ pub async fn load(state: &ServerState, kept: KeptRows, apps: &[String]) {
                 category: None,
             },
         );
+    }
+    if let Some(relay) = &state.accounts {
+        if let Err(e) = relay.layout_write(&rows, &[]).await {
+            warn!("placing the channels from the file: {e:#}");
+        }
     }
     *state.layout.write().await = layout;
 }
@@ -273,24 +276,39 @@ pub async fn send_all(state: &ServerState) {
     }
 }
 
-/// The groups' colours and order, to one connection.
+/// The groups' colours and order, to one connection: read once for all who connect a while
+/// (`at_connect`).
 pub async fn send_styles(state: &ServerState, tx: &ControlTx) {
     let Some(relay) = state.accounts.as_ref() else {
         return;
     };
-    match relay.group_styles().await {
-        Ok(groups) => {
-            let _ = send_msg(tx, &ServerMessage::GroupStyles { groups });
-        }
-        Err(e) => warn!("reading group styles: {e:#}"),
+    let frames = relay
+        .at_connect
+        .styles
+        .frames(|| async {
+            match relay.group_styles().await {
+                Ok(groups) => encode_server_msg(&ServerMessage::GroupStyles { groups })
+                    .inspect_err(|e| warn!("telling group styles: {e:#}"))
+                    .ok()
+                    .map(|data| vec![data]),
+                Err(e) => {
+                    warn!("reading group styles: {e:#}");
+                    None
+                }
+            }
+        })
+        .await;
+    for data in frames.iter().flat_map(|f| f.iter()) {
+        let _ = tx.try_send(data.clone());
     }
 }
 
-/// After a change, to everybody: one read and one message.
+/// After a change, to everybody: one read and one message. Those who connect next read again.
 pub async fn send_styles_all(state: &ServerState) {
     let Some(relay) = state.accounts.as_ref() else {
         return;
     };
+    relay.at_connect.styles.changed();
     match relay.group_styles().await {
         Ok(groups) => {
             let msg = ServerMessage::GroupStyles { groups };
@@ -1170,16 +1188,19 @@ pub async fn category_delete(
 
 /// A category goes; its channels stay, outside any.
 async fn category_gone(relay: &Relay, layout: &mut Layout, id: u32) -> anyhow::Result<()> {
-    relay.category_delete(id).await?;
-    layout.categories.retain(|c| c.id != id);
+    // Positions stay what the list says: a tie would flip the order at a restart
+    let rest: Vec<ChannelCategory> = layout
+        .categories
+        .iter()
+        .filter(|c| c.id != id)
+        .cloned()
+        .collect();
+    relay.category_delete(id, &rest).await?;
+    layout.categories = rest;
     for p in layout.places.values_mut() {
         if p.category == Some(id) {
             p.category = None;
         }
-    }
-    // Positions stay what the list says: a tie would flip the order at a restart
-    for (i, c) in layout.categories.iter().enumerate() {
-        relay.category_put(c, i as i64).await?;
     }
     Ok(())
 }
@@ -1248,19 +1269,13 @@ pub async fn layout_set(
         .unwrap_or(0);
     let spare = (1..=listed.len() as i64).map(|i| top + i);
     let slots: Vec<i64> = slots.into_iter().chain(spare).collect();
-    for ((conv, category, entry), position) in listed.iter().zip(slots) {
-        let place = Place {
-            position,
-            category: *category,
-        };
-        if layout.places.get(conv) == Some(&place) {
-            continue;
+    // Written once, rows and categories together, below (W2-14)
+    let mut rows = Vec::new();
+    for ((conv, category, entry), position) in listed.into_iter().zip(slots) {
+        let place = Place { position, category };
+        if layout.places.get(&conv) != Some(&place) {
+            rows.push((conv, entry, position, category));
         }
-        relay
-            .layout_put(conv, entry.as_ref(), position, *category)
-            .await
-            .map_err(|_| GONE.to_string())?;
-        layout.places.insert(conv.clone(), place);
     }
     // Categories: those named go first, in that order, then the rest they can see.
     // One holding only what is hidden from them keeps its slot, as such a channel does.
@@ -1297,13 +1312,18 @@ pub async fn layout_set(
             }
         })
         .collect();
-    for (i, c) in order.iter().enumerate() {
-        if layout.categories.get(i).map(|k| k.id) != Some(c.id) {
-            relay
-                .category_put(c, i as i64)
-                .await
-                .map_err(|_| GONE.to_string())?;
-        }
+    let moved: Vec<(ChannelCategory, i64)> = order
+        .iter()
+        .enumerate()
+        .filter(|(i, c)| layout.categories.get(*i).map(|k| k.id) != Some(c.id))
+        .map(|(i, c)| (c.clone(), i as i64))
+        .collect();
+    relay
+        .layout_write(&rows, &moved)
+        .await
+        .map_err(|_| GONE.to_string())?;
+    for (conv, _, position, category) in rows {
+        layout.places.insert(conv, Place { position, category });
     }
     layout.categories = order;
     drop(layout);

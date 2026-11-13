@@ -239,6 +239,7 @@ macro_rules! db {
 
 mod admin;
 pub mod archive;
+pub mod at_connect;
 pub mod bans;
 pub mod gates;
 pub mod import;
@@ -440,6 +441,8 @@ pub struct Relay {
     pair_asks: DashMap<AccountId, crate::state::RateLimiter>,
     /// One claim of a provider's account at a time (`provider::claim`).
     claiming: tokio::sync::Mutex<()>,
+    /// What every connect is told before its join, kept a while (W2-16).
+    pub(crate) at_connect: at_connect::AtConnect,
 }
 
 /// A key slot as `voipc_crypto::account::Vault` writes it: version byte,
@@ -563,6 +566,7 @@ impl Relay {
             pair_asks: DashMap::new(),
             claiming: tokio::sync::Mutex::new(()),
             logkey_changes: DashMap::new(),
+            at_connect: Default::default(),
         };
         placeholder::load(&relay).await?;
         archive::load(&relay).await?;
@@ -780,10 +784,7 @@ impl Relay {
     pub async fn standing(&self, user: &User, scopes: &[String]) -> Result<Standing> {
         let mut standing = Standing::default();
         let roles = self.store().user_roles(user.id).await?;
-        let counted: Vec<_> = roles
-            .iter()
-            .filter(|r| scope::covers(scopes, &r.scopes))
-            .collect();
+        let counted = counted(&roles, scopes);
         standing.groups = counted.iter().map(|r| r.name.clone()).collect();
         standing.my_badges = self.badges_in_order(counted).await?;
         // The top ones, when there are more than a row shows
@@ -801,6 +802,18 @@ impl Relay {
             totp_enabled: user.totp_enabled,
         })
     }
+}
+
+/// The groups of `roles` that count: those whose scopes `scopes` (the account's effective
+/// ones) cover. A group a missing second factor withholds counts for nothing, a gate included.
+pub(crate) fn counted<'a>(
+    roles: &'a [l4f_accounts::model::Role],
+    scopes: &[String],
+) -> Vec<&'a l4f_accounts::model::Role> {
+    roles
+        .iter()
+        .filter(|r| scope::covers(scopes, &r.scopes))
+        .collect()
 }
 
 async fn identity_of(store: &Store, user: AccountId) -> sqlx::Result<Option<Vec<u8>>> {
@@ -1107,8 +1120,9 @@ pub struct SignedIn {
     pub prekey_bundle: PreKeyBundleData,
     /// This connection's device opened the vault (`AccountSession::vault_proven`).
     pub vault_proven: bool,
-    /// This connection signed in with the password's secret: it may move the password to
-    /// its login key (`AccountRequest::LoginKeySet` without a slot), once.
+    /// This connection signed in with the password's secret, or proved it again since
+    /// (`confirm_again`): it may move the password to its login key
+    /// (`AccountRequest::LoginKeySet` without a slot), once.
     pub by_secret: bool,
 }
 
@@ -2029,6 +2043,10 @@ async fn confirm_again(
     {
         a.token = fresh.token.clone();
         a.info = fresh.info.clone();
+        // The password's secret, proven on this connection as at a sign-in with it: an
+        // account that signs in only by device or provider moves to its login key here
+        // (the client's `LoginKeySet` right behind this request)
+        a.by_secret = true;
     }
     Ok((user, fresh))
 }
@@ -2719,8 +2737,17 @@ pub async fn handle_request(
             .unwrap_or_else(|e| read_failed("LogKeys", e)),
         AccountRequest::EpochPut { conv, epoch, wraps } => {
             let (out, told) = log::epoch_put(&relay, user.id, &conv, epoch, &wraps).await?;
-            for r in told {
-                tell(state, &r, AccountReply::LogNews { conv: conv.clone() }).await;
+            // A direct conversation's news, told the moment its writer goes by a pseudonym,
+            // would tie the two for the other party: the keys wait for its next read
+            let behind = !conv.starts_with("c:")
+                && match state.sessions.get(&session_id).map(|s| s.user_id) {
+                    Some(uid) => state.names_of(uid).await.1.is_some(),
+                    None => false,
+                };
+            if !behind {
+                for r in told {
+                    tell(state, &r, AccountReply::LogNews { conv: conv.clone() }).await;
+                }
             }
             out
         }
@@ -3311,7 +3338,10 @@ pub async fn revalidate(state: &Arc<ServerState>) {
                         .await
                         .is_ok_and(|s| s != standing);
                 if changed {
-                    if let Err(e) = apply_scopes(state, &relay, session_id, user, now, read).await {
+                    // The list of who holds what is read once, below
+                    if let Err(e) =
+                        apply_scopes_then(state, &relay, session_id, user, now, read).await
+                    {
                         warn!("a change from the server's shell: {e}");
                     }
                 }
@@ -3319,7 +3349,8 @@ pub async fn revalidate(state: &Arc<ServerState>) {
             Err(e) => warn!("checking a signed-in connection: {e}"),
         }
     }
-    // Holders who are not here too: a stored hide is read against them
+    // Holders who are not here too, and every change above: a stored hide is read
+    // against them
     refresh_chat_mods(state).await;
     // And the share flag of someone away, whose session cannot clear it
     if let Err(e) = log::recheck_shares(&relay).await {
@@ -3422,7 +3453,7 @@ pub(crate) const CHAT_MODS_MAX: usize = 3000;
 /// Every account holding a privilege (`holds_power`), whether or not it is here,
 /// by account id so that repeated reads compare equal.
 pub async fn read_chat_mods(relay: &Relay) -> Result<Vec<ChatMod>> {
-    const PAGE: u32 = if cfg!(test) { 2 } else { 500 };
+    let page = chat_mods_page();
     let mut read = std::collections::BTreeSet::new();
     let mut mods = std::collections::BTreeMap::new();
     for role in relay.store().roles().await? {
@@ -3431,7 +3462,7 @@ pub async fn read_chat_mods(relay: &Relay) -> Result<Vec<ChatMod>> {
         }
         let mut offset = 0;
         loop {
-            let (users, total) = relay.store().role_members(role.id, PAGE, offset).await?;
+            let (users, total) = relay.store().role_members(role.id, page, offset).await?;
             for user in &users {
                 if !read.insert(user.id.0) {
                     continue;
@@ -3463,13 +3494,31 @@ pub async fn read_chat_mods(relay: &Relay) -> Result<Vec<ChatMod>> {
     Ok(mods.into_values().take(CHAT_MODS_MAX).collect())
 }
 
-/// Reads who holds what and tells everybody, if that changed. The list stays locked
-/// throughout, so that two reads at once cannot end with the older one's answer.
+/// Holders are read a page at a time: 500, and two in tests, to see the pages join up (a
+/// measurement sets the real one with `ROUND_C_PAGE`). One function for both, so what the
+/// tests run is what the relay runs.
+fn chat_mods_page() -> u32 {
+    if !cfg!(test) {
+        return 500;
+    }
+    std::env::var("ROUND_C_PAGE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2)
+}
+
+/// Reads who holds what and tells everybody, if that changed. One read at a time, so that
+/// two at once cannot end with the older one's answer; a connect waits for the list only
+/// while it is swapped and told, never while it is read (W2-2).
 pub async fn refresh_chat_mods(state: &ServerState) {
     let Some(relay) = state.accounts.as_ref() else {
         return;
     };
-    let mut held = state.chat_mods.write().await;
+    let _reading = state.chat_mods_reading.lock().await;
+    #[cfg(test)]
+    state
+        .chat_mods_reads
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let mods = match read_chat_mods(relay).await {
         Ok(mods) => mods,
         Err(e) => {
@@ -3477,6 +3526,7 @@ pub async fn refresh_chat_mods(state: &ServerState) {
             return;
         }
     };
+    let mut held = state.chat_mods.write().await;
     if *held == mods {
         return;
     }
@@ -3546,6 +3596,22 @@ pub(crate) async fn apply_scopes(
     scopes: Vec<String>,
     read: u64,
 ) -> Result<()> {
+    if apply_scopes_then(state, relay, session_id, user, scopes, read).await? {
+        refresh_chat_mods(state).await;
+    }
+    Ok(())
+}
+
+/// `apply_scopes`, leaving the list of who holds what to the caller: true when it is to be
+/// read again. A pass over many sessions reads it once at its end, not once each (W2-2).
+async fn apply_scopes_then(
+    state: &Arc<ServerState>,
+    relay: &Relay,
+    session_id: u32,
+    user: User,
+    scopes: Vec<String>,
+    read: u64,
+) -> Result<bool> {
     let info = relay.info_of(&user, &scopes).await?;
     let account = info.id;
     let standing = relay.standing(&user, &scopes).await?;
@@ -3553,10 +3619,10 @@ pub(crate) async fn apply_scopes(
     let stopped_sharing;
     let (tx, user_id, channel_id, is_admin, became_admin, regated, shown) = {
         let Some(mut s) = state.sessions.get_mut(&session_id) else {
-            return Ok(());
+            return Ok(false);
         };
         if read < s.scope_written {
-            return Ok(());
+            return Ok(false);
         }
         s.scope_written = read;
         let (was_admin, was_editor) = (s.is_admin, s.powers.has(Powers::CHANNELS));
@@ -3632,10 +3698,7 @@ pub(crate) async fn apply_scopes(
     if reads_restrictions {
         crate::restrict::reasons_for(state, &tx);
     }
-    if listed_changed {
-        refresh_chat_mods(state).await;
-    }
-    Ok(())
+    Ok(listed_changed)
 }
 
 #[cfg(test)]
@@ -4479,6 +4542,64 @@ mod tests {
             }
         }
 
+        /// Round C measurement, not a check: `log::index` (every connect) with `ROUND_C_N`
+        /// direct rows, 50 a conversation, among 250 accounts. `TMPDIR=$PWD/target/scratch/
+        /// tmpdisk ROUND_C_N=1000000 cargo test -p voipc-server --bin voipc-server -- --ignored
+        /// measure_log_index --nocapture`.
+        #[tokio::test]
+        #[ignore]
+        async fn measure_log_index() {
+            let n: usize = std::env::var("ROUND_C_N")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(100_000);
+            let dbs = databases().await;
+            let store = &dbs.stores[0];
+            let relay = kept_relay(store, 250).await;
+            let Store::Lite(b) = store else {
+                panic!("SQLite")
+            };
+            let t = std::time::Instant::now();
+            let mut tx = b.0.begin().await.unwrap();
+            let mut convs = 0;
+            'fill: for a in 1..=250u8 {
+                for c in (a + 1)..=250u8 {
+                    let conv = voipc_protocol::conv::dm_conv(&[a; 16], &[c; 16]);
+                    for i in 0..50 {
+                        if convs * 50 + i >= n {
+                            break 'fill;
+                        }
+                        sqlx::query("INSERT INTO voipc_log (conv, sender, epoch, server_at, keep_until, ct) VALUES ($1, $2, 0, 1, 9007199254740991, $3)")
+                            .bind(&conv)
+                            .bind(&[if i % 2 == 0 { a } else { c }; 16][..])
+                            .bind(&[1u8; 64][..])
+                            .execute(&mut *tx)
+                            .await
+                            .unwrap();
+                    }
+                    convs += 1;
+                }
+            }
+            tx.commit().await.unwrap();
+            eprintln!(
+                "filled {n} rows, {convs} conversations in {:?}",
+                t.elapsed()
+            );
+            for who in [1u8, 125, 250] {
+                log::index(&relay, AccountId([who; 16])).await.unwrap();
+                let t = std::time::Instant::now();
+                let (out, _) = log::index(&relay, AccountId([who; 16])).await.unwrap();
+                let AccountReply::LogConvs { convs } = out else {
+                    panic!("{out:?}");
+                };
+                eprintln!(
+                    "ROUND-C LogIndex n={n}: account {who} ({} conversations) {:?}",
+                    convs.len(),
+                    t.elapsed()
+                );
+            }
+        }
+
         /// Listing someone's direct conversations reads no channel's rows, and finds them
         /// wherever the account's id falls in the conversation's name.
         #[tokio::test]
@@ -4521,17 +4642,25 @@ mod tests {
                     let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(
                         format!("EXPLAIN QUERY PLAN {}", log::DIRECT_CONVS),
                     ))
-                    .bind("d:aa:%")
-                    .bind("d:%:aa")
+                    .bind("d:aa:")
+                    .bind("d:aa;")
+                    .bind("aa")
                     .bind(0i64)
                     .fetch_all(&b.0)
                     .await
                     .unwrap();
+                    // Each half a range of an index, neither a read of every direct row
                     assert!(
                         plan.iter()
                             .any(|p| p.3.contains("voipc_log_conv_seq (conv>? AND conv<?)")),
                         "{plan:?}"
                     );
+                    assert!(
+                        plan.iter()
+                            .any(|p| p.3.contains("voipc_log_dm_second (<expr>=?")),
+                        "{plan:?}"
+                    );
+                    assert!(!plan.iter().any(|p| p.3.starts_with("SCAN")), "{plan:?}");
                     let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(
                         "EXPLAIN QUERY PLAN SELECT SUM(LENGTH(wrapped)) FROM voipc_wraps WHERE owner = $1",
                     )

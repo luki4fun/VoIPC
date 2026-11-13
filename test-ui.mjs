@@ -25,9 +25,11 @@ import { createHmac } from "node:crypto";
 import { mkdtempSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { openTab, probe, sleep, waitFor as waitUntil } from "./test-cdp.mjs";
+import { HANG_MS, barrier, openTab, probe, seen, sentKind, sleep, waitFor as waitUntil } from "./test-cdp.mjs";
 
 const PORT = process.argv[2] ?? "19987";
+/** The relay, as every page names it (connect() types 127.0.0.1 and PORT). */
+const SERVER = `127.0.0.1:${PORT}`;
 const CDP = process.argv[3] ?? "9222";
 /** A second, empty server for the multi-server lane; that lane is skipped without one. */
 const PORT2 = process.argv[4] ?? "";
@@ -97,6 +99,17 @@ const setSelect = (selector, value) =>
 const click = (selector) =>
   `(() => { const el = document.querySelector(${JSON.stringify(selector)}); if (!el) return false; el.click(); return true; })()`;
 
+/** The relay lets one session make a channel every 5 s (`create_channel_rate`, burst 1, 0.2 a
+ *  second): a page's next one waits out the rest, or the relay refuses it and the page stays
+ *  where it was. A rule of the relay's, so a wait on the clock, not a sleep for an event. */
+const lastCreate = new WeakMap();
+const createChannel = async (tab) => {
+  const since = Date.now() - (lastCreate.get(tab) ?? 0);
+  if (since < 5_200) await sleep(5_200 - since);
+  lastCreate.set(tab, Date.now());
+  await tab.evaluate(click(".create-form .create-btn"));
+};
+
 /** Centre of an element in viewport coordinates, after scrolling it into view. */
 const centre = (selector) =>
   `(() => { const el = document.querySelector(${JSON.stringify(selector)}); if (!el) return null;
@@ -126,7 +139,7 @@ async function shareSwitch(tab, on) {
   await waitFor(tab, box);
   if ((await tab.evaluate(`${box}.checked`)) !== on) await tab.evaluate(`${box}.click()`);
   await tab.evaluate(`document.querySelector(".panel .close-btn")?.click()`);
-  await sleep(300);
+  await waitFor(tab, `!document.querySelector(".panel")`);
 }
 
 async function realClick(tab, selector) {
@@ -385,7 +398,9 @@ check(
   "and it put us in the layout that was picked",
   await alice.evaluate(`!!document.querySelector(".modern-shell")`),
 );
-await sleep(800);
+// Rule 5: both connects are long done (the first-run dialogs came after them); past bob's
+// and alice's barrier, all the relay sent alice about either is in
+check("past bob and alice's barrier", await barrier(SERVER, bob, alice));
 
 // 0. Arriving on a server is not walking into a voice channel. The server still
 //    parks every session in its lobby, channel 0, but that is "not in voice"
@@ -398,7 +413,7 @@ check(
 check("the lobby is not drawn as a channel", !(await alice.evaluate(channelNames)).includes("General"));
 check(
   "the others on the server are listed as online",
-  (await alice.evaluate(userNames)).some((u) => u.includes("ui-bob")),
+  await seen(alice, `(${userNames}).some((u) => u.includes("ui-bob"))`),
   (await alice.evaluate(userNames)).join(","),
 );
 
@@ -408,12 +423,17 @@ await alice.evaluate(click('button[title="Create channel"]'));
 await waitFor(alice, `document.querySelector(".create-form")`);
 await alice.evaluate(setInput(".create-form input[type=text]", CHANNEL));
 await alice.evaluate(setSelect(".create-form select", "2d"));
-await alice.evaluate(click(".create-form .create-btn"));
-await sleep(2500);
-
+await createChannel(alice);
+check(
+  "the creator's sidebar lists the new channel",
+  await seen(alice, `(${channelNames}).includes(${JSON.stringify(CHANNEL)})`),
+  (await alice.evaluate(channelNames)).join(","),
+);
+// Rule 5: the relay answered the create (alice lists it), so past alice's and bob's barrier
+// every copy it sent either of them, a second one included, is in
+check("past alice and bob's barrier", await barrier(SERVER, alice, bob));
 const aliceChannels = await alice.evaluate(channelNames);
 const bobChannels = await bob.evaluate(channelNames);
-check("the creator's sidebar lists the new channel", aliceChannels.includes(CHANNEL), aliceChannels.join(","));
 check("the creator's sidebar lists it once", aliceChannels.filter((c) => c === CHANNEL).length === 1, aliceChannels.join(","));
 check("the observer's sidebar lists it once", bobChannels.filter((c) => c === CHANNEL).length === 1, bobChannels.join(","));
 check("the channel is tagged 2D", (await alice.evaluate(ownProximityTag)) === "2D");
@@ -427,8 +447,7 @@ await sleep(300);
 await alice.evaluate(click(".sync input"));
 await sleep(600);
 await alice.evaluate(setSelect(".room select.control", "round"));
-await sleep(300);
-check("an avatar is drawn in the room", await alice.evaluate(`document.querySelectorAll(".avatar").length >= 1`));
+check("an avatar is drawn in the room", await seen(alice, `document.querySelectorAll(".avatar").length >= 1`));
 // The room is a full-window activity, over the header the mixer button is in
 await alice.evaluate(click('button[title="Close the virtual room"]'));
 await probe(alice, `!document.querySelector(".room")`, 5_000);
@@ -438,10 +457,12 @@ await bob.evaluate(
   `(() => { const el = [...document.querySelectorAll(".channel")].find((e) => e.textContent.includes(${JSON.stringify(CHANNEL)}));
      if (!el) return false; el.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })); return true; })()`,
 );
-await sleep(2500);
+check("the joiner is in the member list", await seen(alice, `(${userNames}).some((u) => u.includes("ui-bob"))`), (await alice.evaluate(userNames)).join(","));
+// Rule 5: alice lists bob, so the relay handled his join; past his and her barrier every
+// roster frame it sent her for it, a duplicate included, is in
+check("past bob and alice's barrier", await barrier(SERVER, bob, alice));
 const aliceUsers = await alice.evaluate(userNames);
 check("both members are listed once", new Set(aliceUsers).size === aliceUsers.length, aliceUsers.join(","));
-check("the joiner is in the member list", aliceUsers.some((u) => u.includes("ui-bob")), aliceUsers.join(","));
 
 // The number on the row is arithmetic over join and leave broadcasts, so it
 // drifts away from the roster the moment one of them goes missing. Both sides
@@ -451,9 +472,10 @@ const ownCount = `(() => { const row = [...document.querySelectorAll(".channel")
   const text = row?.querySelector(".user-count")?.textContent ?? "";
   const first = text.match(/[0-9]+/);
   return first ? Number(first[0]) : -1; })()`;
+// The count comes from the roster's coalesced asks, on a timer of the app's: waited for
 check(
   "the member count matches the list",
-  (await alice.evaluate(ownCount)) === aliceUsers.length,
+  await seen(alice, `(${ownCount}) === ${aliceUsers.length}`),
   `count ${await alice.evaluate(ownCount)}, listed ${aliceUsers.length}`,
 );
 
@@ -520,17 +542,17 @@ await alice.evaluate(
   `(() => { const el = [...document.querySelectorAll(".users .user")].find((e) => e.textContent.includes("ui-bob"));
      if (!el) return false; el.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, clientX: 40, clientY: 40 })); return true; })()`,
 );
-await sleep(300);
-const menuValue = await alice.evaluate(
-  `(() => { const el = document.querySelector(".ctx-vol-slider"); return el ? Number(el.value) : null; })()`,
-);
+const menuVolume = `(() => { const el = document.querySelector(".ctx-vol-slider"); return el ? Number(el.value) : null; })()`;
+const sameVolume = await seen(alice, `(() => { const v = ${menuVolume}; return v !== null && Math.abs(v - ${stripValue}) < 0.001; })()`);
+const menuValue = await alice.evaluate(menuVolume);
 check(
   "the member menu shows the same volume as the strip",
-  menuValue !== null && Math.abs(menuValue - stripValue) < 0.001,
+  sameVolume,
   `strip ${stripValue}, menu ${menuValue}`,
 );
 await alice.evaluate(click(".ctx-overlay"));
-await sleep(200);
+// The backdrop's own click closes it (actions/dialog.ts backdrop)
+await waitFor(alice, `!document.querySelector(".ctx-overlay")`);
 
 // 3a3. The mixer at a narrow width. This lane exists because the first version
 //      of the mixer was only ever tested at 1280 px: at 700 the centre column
@@ -583,44 +605,43 @@ for (const width of [1280, 900, 700, 600]) {
   );
 }
 await alice.send("Emulation.setDeviceMetricsOverride", { width: 1280, height: 800, deviceScaleFactor: 1, mobile: false });
-await sleep(500);
+await waitFor(alice, `window.innerWidth === 1280`);
 
 // The mixer is a full-window activity, and Escape is the way out of one
 await realKey(alice, "Escape");
-await sleep(500);
-check("Escape closes the mixer", await alice.evaluate(`!document.querySelector(".mixer")`));
+check("Escape closes the mixer", await seen(alice, `!document.querySelector(".mixer")`));
 
 // 3b. Muting yourself has to show on your own row straight away. The server
 //     never sends UserMuted back to the session that caused it, so only the
 //     local update can put the marker there — it used to appear on the next
 //     UserList, i.e. not before the next channel switch.
 await alice.evaluate(click('button[title^="Mute"]'));
-await sleep(800);
-check("muting yourself marks your own row", (await alice.evaluate(rowMuted(null))) === true);
-check("the other client sees the mute too", (await bob.evaluate(rowMuted("ui-alice"))) === true);
+check("muting yourself marks your own row", await seen(alice, `(${rowMuted(null)}) === true`));
+check("the other client sees the mute too", await seen(bob, `(${rowMuted("ui-alice")}) === true`));
 await alice.evaluate(click('button[title^="Unmute"]'));
-await sleep(800);
-check("unmuting clears your own row again", (await alice.evaluate(rowMuted(null))) === false);
+check("unmuting clears your own row again", await seen(alice, `(${rowMuted(null)}) === false`));
 
 // 4. Channel settings: change the proximity mode (and leave the password alone)
 await alice.evaluate(`(() => { const el = document.querySelector('.channel-row:has(> .channel.active) .settings-icon[title="Channel settings"]'); if (!el) return false; el.click(); return true; })()`);
-await sleep(400);
-if (await alice.evaluate(`!!document.querySelector(".password-dialog select")`)) {
+if (await seen(alice, `!!document.querySelector(".password-dialog select")`)) {
   await alice.evaluate(setSelect(".password-dialog select", "3d"));
   await alice.evaluate(click(".password-dialog .create-btn"));
-  await sleep(1200);
+  const reached = await seen(alice, `(${ownProximityTag}) === "3D"`);
   const tag = await alice.evaluate(ownProximityTag);
-  check("the mode change reaches the sidebar", tag === "3D", `tag is "${tag}"`);
+  check("the mode change reaches the sidebar", reached, `tag is "${tag}"`);
 } else {
   check("the channel settings dialog opens", false);
 }
 
 // 5. Switching the channel off closes the room again
 await alice.evaluate(`(() => { const el = document.querySelector('.channel-row:has(> .channel.active) .settings-icon[title="Channel settings"]'); if (!el) return false; el.click(); return true; })()`);
-await sleep(400);
+await waitFor(alice, `document.querySelector(".password-dialog select")`);
 await alice.evaluate(setSelect(".password-dialog select", "off"));
 await alice.evaluate(click(".password-dialog .create-btn"));
-await sleep(1200);
+// Rule 5: the dialog closes only after its last send (channel-ui submitChannelSettings), so
+// past alice's barrier the relay's ChannelUpdated is in
+await waitFor(alice, `!document.querySelector(".password-dialog")`);
+check("past alice's barrier", await barrier(SERVER, alice));
 check("the room closes when proximity is switched off", await alice.evaluate(`!document.querySelector(".room")`));
 
 // 6. The channel options: an anonymous, hidden, share-less room where the
@@ -631,13 +652,15 @@ await alice.evaluate(click('button[title="Create channel"]'));
 await waitFor(alice, `document.querySelector(".create-form")`);
 await alice.evaluate(setInput(".create-form input[type=text]", SECRET));
 await alice.evaluate(click(".create-form .dialog-check input"));
-await alice.evaluate(click(".create-form .create-btn"));
-await sleep(2500);
-
+await createChannel(alice);
+// The list turns to pseudonyms once the relay seated her; past her barrier it has sent all
+const pseudonyms = (tab) => seen(tab, `(() => { const u = ${userNames}; return u.length > 0 && u.every((n) => /^Guest-\\d{4}/.test(n)); })()`);
+const renamed = await pseudonyms(alice);
+check("past alice's barrier", await barrier(SERVER, alice));
 const secretUsers = await alice.evaluate(userNames);
 check(
   "an anonymous channel renames its members",
-  secretUsers.length > 0 && secretUsers.every((u) => /^Guest-\d{4}/.test(u)),
+  renamed && secretUsers.length > 0 && secretUsers.every((u) => /^Guest-\d{4}/.test(u)),
   secretUsers.join(","),
 );
 check(
@@ -651,19 +674,28 @@ await bob.evaluate(
   `(() => { const el = [...document.querySelectorAll(".channel")].find((e) => e.textContent.includes(${JSON.stringify(SECRET)}));
      if (!el) return false; el.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })); return true; })()`,
 );
-await sleep(2500);
+// His list turns to pseudonyms once the relay seated him; past his barrier it has sent all
+const bobRenamed = await pseudonyms(bob);
+check("past bob's barrier", await barrier(SERVER, bob));
 const bobSees = await bob.evaluate(userNames);
-check("the observer sees pseudonyms", bobSees.every((u) => /^Guest-\d{4}/.test(u)), bobSees.join(","));
+check("the observer sees pseudonyms", bobRenamed && bobSees.every((u) => /^Guest-\d{4}/.test(u)), bobSees.join(","));
 check("the observer never receives a real name", !bobSees.some((u) => u.includes("ui-")), bobSees.join(","));
 // The store holds what the wire delivered, so this catches a leak the DOM hides
 const wireNames = await bob.evaluate(
   `JSON.stringify([...document.querySelectorAll(".users .user .name")].map((e) => e.textContent))`,
 );
 check("no real name reached the observer's client", !wireNames.includes("ui-alice"), wireNames);
+// G1: nothing on a pseudonym's row narrows who it is: alice made the room, and the crown
+// (and an admin's shield, a sharer's history mark) on her row told the observer so
+check(
+  "no crown, shield or history mark on a pseudonym",
+  await bob.evaluate(`!document.querySelector(".users .user .crown, .users .user .shield, .users .user .sharing-history")`),
+  await bob.evaluate(`[...document.querySelectorAll(".users .user")].map((u) => u.innerHTML.slice(0, 120)).join(" | ")`),
+);
 
 // Hidden + no sharing + hidden members, set through the settings dialog
 await alice.evaluate(`(() => { const el = document.querySelector('.channel-row:has(> .channel.active) .settings-icon[title="Channel settings"]'); if (!el) return false; el.click(); return true; })()`);
-await sleep(400);
+await waitFor(alice, `document.querySelector('.password-dialog input[data-opt="hidden"]')`);
 // By data-opt, not by position: these used to be b[0], b[2] and b[3] of the
 // checkbox list, so inserting an option — or moving this dialog into its own
 // component, which is how it nearly happened — silently set the wrong ones and
@@ -677,17 +709,21 @@ await alice.evaluate(`(() => {
   }
   return true; })()`);
 await alice.evaluate(click(".password-dialog .create-btn"));
-await sleep(1500);
+// Rule 5: the dialog closes only after its last send (channel-ui submitChannelSettings), so
+// past alice's and bob's barrier the relay's ChannelUpdated is in at both
+await waitFor(alice, `!document.querySelector(".password-dialog")`);
+check("past alice and bob's barrier", await barrier(SERVER, alice, bob));
 
 check(
   "the share button is gone where sharing is off",
   !(await alice.evaluate(`!!document.querySelector('button[title="Share your screen"]')`)),
 );
+const onlyYou = await seen(alice, `(${userNames}).length === 1`);
 const hiddenList = await alice.evaluate(userNames);
-check("hidden members leave only yourself listed", hiddenList.length === 1, hiddenList.join(","));
+check("hidden members leave only yourself listed", onlyYou && hiddenList.length === 1, hiddenList.join(","));
 check(
   "the reason is spelled out",
-  await alice.evaluate(`!!document.querySelector(".hidden-note")`),
+  await seen(alice, `!!document.querySelector(".hidden-note")`),
 );
 const bobChannelsAfter = await bob.evaluate(channelNames);
 check(
@@ -701,10 +737,9 @@ check(
 //    that it appears at all — which is how it came to be missing entirely.
 {
   const fresh = await connectRaw(`ui-setup-${process.pid % 1000}`, true);
-  await sleep(1200);
   check(
     "a new user is offered the audio setup",
-    await fresh.evaluate(`!!document.querySelector(".audio-setup")`),
+    await seen(fresh, `!!document.querySelector(".audio-setup")`),
   );
 
   // Web starts at the permission step; Chromium is run with a fake device and
@@ -713,17 +748,16 @@ check(
     const heading = await fresh.evaluate(`document.querySelector(".audio-setup h2").textContent`);
     if (/hear you/i.test(heading)) {
       await realClick(fresh, ".audio-setup .submit-btn");
-      await sleep(1500);
     }
   }
 
   check(
     "it asks which microphone",
-    /microphone/i.test(await fresh.evaluate(`document.querySelector(".audio-setup h2").textContent`)),
+    await seen(fresh, `/microphone/i.test(document.querySelector(".audio-setup h2")?.textContent ?? "")`),
   );
   check(
     "the fake capture device is listed",
-    (await fresh.evaluate(`document.querySelectorAll(".audio-setup select option").length`)) > 0,
+    await seen(fresh, `document.querySelectorAll(".audio-setup select option").length > 0`),
   );
   // The meter is the whole point of the step: it is fed by mic-test-level,
   // which only arrives if the wizard actually started a capture. The fake
@@ -745,49 +779,45 @@ check(
   );
 
   await realClick(fresh, ".audio-setup .submit-btn");
-  await sleep(600);
   check(
     "it asks about the speakers next",
-    /ear/i.test(await fresh.evaluate(`document.querySelector(".audio-setup h2").textContent`)),
+    await seen(fresh, `/ear/i.test(document.querySelector(".audio-setup h2")?.textContent ?? "")`),
   );
   await realClick(fresh, ".audio-setup .play");
-  await sleep(400);
-  const firstSide = await fresh.evaluate(`document.querySelector(".audio-setup .verdict").textContent`);
-  check("the output test names the side it is playing", /left|right/i.test(firstSide), firstSide);
+  const verdict = `document.querySelector(".audio-setup .verdict")?.textContent ?? ""`;
+  const named = await seen(fresh, `/left|right/i.test(${verdict})`);
+  const firstSide = await fresh.evaluate(verdict);
+  check("the output test names the side it is playing", named && /left|right/i.test(firstSide), firstSide);
   // It alternates every 1.2 s, so this is the swap, not a still frame
-  await sleep(1600);
-  const secondSide = await fresh.evaluate(`document.querySelector(".audio-setup .verdict").textContent`);
-  check("and swaps to the other ear", firstSide.trim() !== secondSide.trim(), `${firstSide} -> ${secondSide}`);
+  const swapped = await seen(fresh, `(${verdict}).trim() !== ${JSON.stringify(firstSide.trim())}`);
+  const secondSide = await fresh.evaluate(verdict);
+  check("and swaps to the other ear", swapped && firstSide.trim() !== secondSide.trim(), `${firstSide} -> ${secondSide}`);
 
   await realClick(fresh, ".audio-setup .submit-btn");
-  await sleep(600);
   check(
     "it asks how the microphone should open",
-    (await fresh.evaluate(`document.querySelectorAll(".audio-setup .choice").length`)) === 3,
+    await seen(fresh, `document.querySelectorAll(".audio-setup .choice").length === 3`),
   );
   await realClick(fresh, ".audio-setup .choice:nth-of-type(2)");
-  await sleep(400);
   check(
     "voice activation offers a threshold",
-    await fresh.evaluate(`!!document.querySelector(".audio-setup input.threshold")`),
+    await seen(fresh, `!!document.querySelector(".audio-setup input.threshold")`),
   );
 
   await realClick(fresh, ".audio-setup .submit-btn");
-  await sleep(300);
+  await waitFor(fresh, `/Ready/.test(document.querySelector(".audio-setup h2")?.textContent ?? "")`);
   await realClick(fresh, ".audio-setup .submit-btn");
-  await sleep(600);
-  check("finishing closes it", !(await fresh.evaluate(`!!document.querySelector(".audio-setup")`)));
+  check("finishing closes it", await seen(fresh, `!document.querySelector(".audio-setup")`));
   check(
     "and it is remembered",
-    (await fresh.evaluate(`JSON.parse(localStorage.getItem("voipc.settings")).audio_setup_version`)) >= 1,
+    await seen(fresh, `JSON.parse(localStorage.getItem("voipc.settings")).audio_setup_version >= 1`),
   );
 
   // The layout picker comes next on this fresh profile — it is the one lane
   // that reaches it with nothing already answered.
-  await sleep(500);
   check(
     "a new user is asked which layout to use",
-    await fresh.evaluate(`!!document.querySelector(".layout-setup")`),
+    await seen(fresh, `!!document.querySelector(".layout-setup")`),
   );
   check(
     "it offers both layouts",
@@ -828,27 +858,25 @@ check(
 {
   await realClick(alice, ".settings-btn");
   await waitFor(alice, `document.querySelector(".settings-panel, .panel")`);
-  await sleep(400);
-  const selected = await alice.evaluate(
-    `(() => { const s = document.querySelectorAll(".section select"); return s.length ? s[0].value : null; })()`,
-  );
-  check("the settings panel shows a chosen input device", !!selected, String(selected));
+  const firstDevice = `(() => { const s = document.querySelectorAll(".section select"); return s.length ? s[0].value : null; })()`;
+  const chosen = await seen(alice, firstDevice);
+  const selected = await alice.evaluate(firstDevice);
+  check("the settings panel shows a chosen input device", chosen && !!selected, String(selected));
 
   const micBtn = `[...document.querySelectorAll("button")].find((b) => /test microphone/i.test(b.textContent))`;
   if (await alice.evaluate(`!!(${micBtn})`)) {
     await alice.evaluate(`(${micBtn}).click()`);
-    await sleep(1500);
     check(
       "the settings mic test shows a meter",
-      await alice.evaluate(`!!document.querySelector(".level-track")`),
+      await seen(alice, `!!document.querySelector(".level-track")`),
     );
     const stopBtn = `[...document.querySelectorAll("button")].find((b) => /stop test/i.test(b.textContent))`;
     await alice.evaluate(`(${stopBtn})?.click()`);
-    await sleep(300);
+    await waitFor(alice, `!(${stopBtn})`);
   }
   const close = `document.querySelector(".close-btn")?.click()`;
   await alice.evaluate(close);
-  await sleep(400);
+  await waitFor(alice, `!document.querySelector(".panel")`);
 }
 
 // 9b. Keyboard (H5-04). Every overlay shares one modal behaviour
@@ -868,12 +896,11 @@ check(
 
   await realClick(alice, ".settings-btn");
   await waitFor(alice, modal);
-  await sleep(300);
-  const title = await alice.evaluate(
-    `(() => { const d = ${modal}; return document.getElementById(d?.getAttribute("aria-labelledby"))?.textContent.trim() ?? null; })()`,
-  );
-  check("Settings is a modal dialog named after its title", title === "Settings", String(title));
-  check("opening it puts focus inside", await alice.evaluate(inside));
+  const titleOf = `(() => { const d = ${modal}; return document.getElementById(d?.getAttribute("aria-labelledby"))?.textContent.trim() ?? null; })()`;
+  const titled = await seen(alice, `${titleOf} === "Settings"`);
+  const title = await alice.evaluate(titleOf);
+  check("Settings is a modal dialog named after its title", titled && title === "Settings", String(title));
+  check("opening it puts focus inside", await seen(alice, inside));
   let stayed = true;
   for (let i = 0; i < 3; i++) {
     await press("Tab", "Tab", 9, SHIFT);
@@ -929,29 +956,29 @@ check(
   const appearanceTab = `[...document.querySelectorAll(".tab")].find((b) => /appearance/i.test(b.textContent))`;
   check("Settings has an Appearance tab", await alice.evaluate(`!!(${appearanceTab})`));
   await alice.evaluate(`(${appearanceTab}).click()`);
-  await sleep(300);
 
   // By id, not by label: a label is copy and gets edited ("VoIPC dark" became
   // "Navy" when VoIPC night became the default)
   const pickPalette = (id) => `document.querySelector('.swatch[data-palette="${id}"]')`;
-  check("the palettes are offered", await alice.evaluate(`!!(${pickPalette("slate-light")})`));
+  check("the palettes are offered", await seen(alice, `!!(${pickPalette("slate-light")})`));
 
   // Start from a dark palette on purpose. Which palette a fresh client opens in
   // follows the machine's light/dark setting now, so "switch to the light one
   // and watch it change" only means something from a known dark starting point
   // — and this headless browser reports a light preference.
+  // theme.ts applyTheme sets the tokens and data-theme in one go, and the body has no
+  // transition: once data-theme says dark, the dark background is the one painted
   await alice.evaluate(`(${pickPalette("voipc-dark")}).click()`);
-  await sleep(400);
+  await waitFor(alice, `document.documentElement.dataset.theme === "dark"`);
   const before = await alice.evaluate(`getComputedStyle(document.body).backgroundColor`);
   await alice.evaluate(`(${pickPalette("slate-light")}).click()`);
-  await sleep(400);
+  check(
+    "a light palette says so on the document",
+    await seen(alice, `document.documentElement.dataset.theme === "light"`),
+  );
 
   const after = await alice.evaluate(`getComputedStyle(document.body).backgroundColor`);
   check("switching palette repaints the app", before !== after, `${before} -> ${after}`);
-  check(
-    "a light palette says so on the document",
-    (await alice.evaluate(`document.documentElement.dataset.theme`)) === "light",
-  );
 
   // The contrast probe. theme.test.ts holds every *shipped palette* to this,
   // but only the live DOM can say whether the token actually reached the rule
@@ -978,10 +1005,9 @@ check(
   // Zoom is left at 1 deliberately: it shifts getBoundingClientRect, and the
   // mixer geometry audit above measures real pixels.
   await alice.evaluate(`(${pickPalette("voipc-dark")}).click()`);
-  await sleep(400);
   check(
     "switching back restores the dark document",
-    (await alice.evaluate(`document.documentElement.dataset.theme`)) === "dark",
+    await seen(alice, `document.documentElement.dataset.theme === "dark"`),
   );
   // Waited for, not slept on: saving is debounced by as long as the sleep
   // above (SAVE_DELAY_MS, 400 ms), and a tab Chrome has put in the background
@@ -994,7 +1020,7 @@ check(
   );
 
   await alice.evaluate(`document.querySelector(".close-btn")?.click()`);
-  await sleep(400);
+  await waitFor(alice, `!document.querySelector(".panel")`);
 }
 
 // 11. The modern layout. Switched through Settings rather than a query
@@ -1012,22 +1038,20 @@ check(
     await alice.evaluate(
       `[...document.querySelectorAll(".tab")].find((b) => /appearance/i.test(b.textContent)).click()`,
     );
-    await sleep(300);
   };
   const pickLayout = (id) => `document.querySelector('.layout-choice[data-layout="${id}"]')`;
 
   await openAppearance();
   check(
     "Appearance offers both layouts",
-    (await alice.evaluate(`!!(${pickLayout("modern")})`)) &&
-      (await alice.evaluate(`!!(${pickLayout("stage")})`)),
+    await seen(alice, `!!(${pickLayout("modern")}) && !!(${pickLayout("stage")})`),
   );
+  // Modern is the layout already on screen: picking it swaps no shell
   await alice.evaluate(`(${pickLayout("modern")}).click()`);
-  await sleep(500);
   await alice.evaluate(`document.querySelector(".close-btn")?.click()`);
-  await sleep(500);
+  await waitFor(alice, `!document.querySelector(".panel")`);
 
-  check("the modern shell is on screen", await alice.evaluate(`!!document.querySelector(".modern-shell")`));
+  check("the modern shell is on screen", await seen(alice, `!!document.querySelector(".modern-shell")`));
   check("it has a server rail", await alice.evaluate(`!!document.querySelector(".server-rail")`));
   check("it has a user panel", await alice.evaluate(`!!document.querySelector(".user-panel")`));
   check("the voice bar is gone", !(await alice.evaluate(`!!document.querySelector(".voice-controls")`)));
@@ -1059,26 +1083,29 @@ check(
   await bob.evaluate(click('button[title="Create channel"]'));
   await waitFor(bob, `document.querySelector(".create-form")`);
   await bob.evaluate(setInput(".create-form input[type=text]", SPARE));
-  await bob.evaluate(click(".create-form .create-btn"));
-  await sleep(2000);
+  await createChannel(bob);
+  await waitFor(alice, `(${channelNames}).includes(${JSON.stringify(SPARE)})`);
 
   // Assert against the row that was acted on, not merely "something is active":
   // "a channel is active" is true whether or not the click did anything.
   const startedIn = await activeChannel();
   const firstTarget = await nextChannel();
   await realClick(alice, ".channel-list.modern .channels.voice .channel:not(.active)");
-  await sleep(1000);
+  const previewExpr = `document.querySelector(".channel-list.modern .channels.voice .channel.previewing .channel-name")?.textContent`;
+  const previewed = await seen(alice, `${previewExpr} === ${JSON.stringify(firstTarget)}`);
+  // Rule 5: the click is handled (the row previews), so a join it sent would be answered by now
+  check("past alice's barrier", await barrier(SERVER, alice));
   check(
     "one click only previews the channel",
-    (await activeChannel()) === startedIn && (await previewing()) === firstTarget,
+    previewed && (await activeChannel()) === startedIn && (await previewing()) === firstTarget,
     `active ${await activeChannel()} (was ${startedIn}), previewing ${await previewing()}, wanted preview of ${firstTarget}`,
   );
 
   await realDoubleClick(alice, ".channel-list.modern .channels.voice .channel:not(.active)");
-  await sleep(1400);
+  const activeExpr = `document.querySelector(".channel-list.modern .channels.voice .channel.active .channel-name")?.textContent`;
   check(
     "a double click joins it",
-    (await activeChannel()) === firstTarget,
+    await seen(alice, `${activeExpr} === ${JSON.stringify(firstTarget)}`),
     `wanted ${firstTarget}, in ${await activeChannel()}`,
   );
 
@@ -1089,16 +1116,14 @@ check(
   // between two.
   const secondTarget = await nextChannel();
   await realClick(alice, ".channel-list.modern .channels.voice .channel:not(.active)");
-  await sleep(900);
   check(
     "the pane offers the way into a previewed voice channel",
-    await alice.evaluate(`!!document.querySelector(".join-voice-btn")`),
+    await seen(alice, `!!document.querySelector(".join-voice-btn")`),
   );
   await realClick(alice, ".join-voice-btn");
-  await sleep(1400);
   check(
     "the pane's button joins it",
-    (await activeChannel()) === secondTarget,
+    await seen(alice, `${activeExpr} === ${JSON.stringify(secondTarget)}`),
     `wanted ${secondTarget} (started in ${startedIn}), in ${await activeChannel()}`,
   );
 
@@ -1137,32 +1162,33 @@ check(
         await sleep(120);
         return true;
       });
+  const textRowIs = (cls, on) => `(${rowByName(TEXT_CHANNEL)})?.classList.contains(${JSON.stringify(cls)}) === ${on}`;
   if ((await textRowState())?.unjoined) {
     await clickTextRow();
-    await sleep(900);
+    const offered = await seen(alice, `!!document.querySelector(".join-text-btn")`);
+    // Rule 5: the click is handled (the pane offers the way in), so a join it sent would be
+    // answered by now
+    check("past alice's barrier", await barrier(SERVER, alice));
     check(
       "a click on a text channel reads it instead of joining",
       (await textRowState())?.unjoined === true,
     );
-    check("the chat pane offers the way in", await alice.evaluate(
-      `!!document.querySelector(".join-text-btn")`,
-    ));
+    check("the chat pane offers the way in", offered);
     await realClick(alice, ".join-text-btn");
-    await sleep(1500);
-    check("the button joins it", (await textRowState())?.unjoined === false);
+    check("the button joins it", await seen(alice, textRowIs("unjoined", false)));
 
     // Looking at another channel must not wedge the pane there. A preview
     // outranks the open text channel in what the pane shows, so until
     // `openTextChannel` dropped it, one click on a voice channel made every
     // later click on a text channel we are *in* do nothing visible.
     await realClick(alice, ".channel-list.modern .channels.voice .channel:not(.active)");
-    await sleep(800);
+    await waitFor(alice, `document.querySelector(".channel-list.modern .channels.voice .channel.previewing")`);
     await clickTextRow();
-    await sleep(800);
+    const opensText = await seen(alice, `document.querySelector(".chat-title")?.textContent.trim() === ${JSON.stringify(TEXT_CHANNEL)} && !document.querySelector(".preview-label")`);
     const paneTitle = await alice.evaluate(`document.querySelector(".chat-title")?.textContent.trim()`);
     check(
       "a previewed voice channel does not block opening a text channel",
-      paneTitle === TEXT_CHANNEL && !(await alice.evaluate(`!!document.querySelector(".preview-label")`)),
+      opensText && paneTitle === TEXT_CHANNEL && !(await alice.evaluate(`!!document.querySelector(".preview-label")`)),
       `the pane shows ${paneTitle}`,
     );
     // The leave glyph only exists while the row is hovered
@@ -1173,7 +1199,9 @@ check(
       return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) };
     })()`);
     await alice.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: leaveAt.x, y: leaveAt.y, buttons: 0 });
-    await sleep(200);
+    // The glyph is always in the row, display: none until it is hovered (ChannelSidebar CSS)
+    await seen(alice, `(() => { const g = (${rowByName(TEXT_CHANNEL)})?.parentElement.querySelector('.settings-icon[title="Leave this channel"]');
+      return !!g && getComputedStyle(g).display !== "none"; })()`);
     const glyphAt = await alice.evaluate(`(() => {
       const row = ${rowByName(TEXT_CHANNEL)}; if (!row) return null;
       const g = row.parentElement.querySelector('.settings-icon[title="Leave this channel"]'); if (!g) return null;
@@ -1186,14 +1214,12 @@ check(
       await alice.send("Input.dispatchMouseEvent", { type: "mousePressed", ...base, buttons: 1 });
       await alice.send("Input.dispatchMouseEvent", { type: "mouseReleased", ...base, buttons: 1 });
     }
-    await sleep(1500);
-    const afterLeave = await textRowState();
-    check("leaving puts it back out of reach", afterLeave?.unjoined === true);
-    check("and the row says it was left", afterLeave?.left === true);
+    check("leaving puts it back out of reach", await seen(alice, textRowIs("unjoined", true)));
+    check("and the row says it was left", await seen(alice, textRowIs("left", true)));
     // Back to our own channel: reading another one holds the pane and the
     // member list, and the checks below are about ourselves.
     await realClick(alice, ".channel-list.modern .channels.voice .channel.active");
-    await sleep(600);
+    await waitFor(alice, `document.querySelector(".chat-title")?.textContent.trim() === ${activeExpr}?.trim() && !document.querySelector(".preview-label")`);
   } else {
     check("a text channel row to test with", false, "no unjoined text channel listed");
   }
@@ -1221,17 +1247,18 @@ check(
          if (!el) return false; el.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })); return true; })()`,
     );
   }
-  await sleep(1500);
-  const nestedUnder = await alice.evaluate(`(() => {
+  const nestedExpr = `(() => {
     const row = [...document.querySelectorAll(".channel-list.modern .channel")]
       .find((r) => r.querySelector(".channel-name")?.textContent === ${JSON.stringify(bobRoom)});
     const nested = row?.parentElement?.nextElementSibling;
     return nested && nested.classList.contains("nested")
       ? [...nested.querySelectorAll(".nested-name")].map((e) => e.textContent.trim())
-      : []; })()`);
+      : []; })()`;
+  const nestedSeen = await seen(alice, `${nestedExpr}.some((n) => n.includes("ui-bob"))`);
+  const nestedUnder = await alice.evaluate(nestedExpr);
   check(
     "a channel we are not in lists its members",
-    nestedUnder.some((n) => n.includes("ui-bob")),
+    nestedSeen && nestedUnder.some((n) => n.includes("ui-bob")),
     `${bobRoom}: ${JSON.stringify(nestedUnder)}`,
   );
 
@@ -1239,8 +1266,7 @@ check(
   const mixerBtn = `[...document.querySelectorAll(".header-btn")].find((b) => /mixing desk|mixer/i.test(b.title))`;
   if (await alice.evaluate(`!!(${mixerBtn})`)) {
     await alice.evaluate(`(${mixerBtn}).click()`);
-    await sleep(600);
-    check("the mixer opens as an activity", await alice.evaluate(
+    check("the mixer opens as an activity", await seen(alice,
       `!!document.querySelector(".activity .mixer")`,
     ));
     await alice.send("Input.dispatchKeyEvent", {
@@ -1249,28 +1275,24 @@ check(
     await alice.send("Input.dispatchKeyEvent", {
       type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27,
     });
-    await sleep(500);
-    check("Escape closes the activity", !(await alice.evaluate(`!!document.querySelector(".activity")`)));
+    check("Escape closes the activity", await seen(alice, `!document.querySelector(".activity")`));
   }
 
   // Dragging a sidebar edge, with real pointer events and real pointer capture.
   const sidebarWidth = `document.querySelector(".modern-shell .sidebar").getBoundingClientRect().width`;
   const widthBefore = await alice.evaluate(sidebarWidth);
   await realDragX(alice, ".modern-shell .resize-handle", 60);
-  await sleep(400);
+  const wider = await seen(alice, `${sidebarWidth} > ${widthBefore + 20}`);
   const widthAfter = await alice.evaluate(sidebarWidth);
-  check("the sidebar can be dragged wider", widthAfter > widthBefore + 20, `${widthBefore} -> ${widthAfter}`);
+  check("the sidebar can be dragged wider", wider && widthAfter > widthBefore + 20, `${widthBefore} -> ${widthAfter}`);
   // The save is debounced, so this waits for it rather than racing it. Against
   // the width actually on screen, not against a bar the default already clears.
   const readStoredWidth = () =>
     alice.evaluate(
       `JSON.parse(localStorage.getItem("voipc.settings")).ui_prefs?.panels?.modern?.sidebar`,
     );
-  let storedWidth = await readStoredWidth();
-  for (let i = 0; i < 20 && Math.abs(storedWidth - widthAfter) >= 4; i++) {
-    await sleep(200);
-    storedWidth = await readStoredWidth();
-  }
+  await seen(alice, `Math.abs(JSON.parse(localStorage.getItem("voipc.settings")).ui_prefs?.panels?.modern?.sidebar - ${widthAfter}) < 4`);
+  const storedWidth = await readStoredWidth();
   check(
     "the new width is remembered",
     Math.abs(storedWidth - widthAfter) < 4,
@@ -1280,27 +1302,26 @@ check(
   // The Stage layout (2026-10-26): the call in the middle. Switched the same
   // way, from inside a call, so the grid has somebody to draw.
   await openAppearance();
-  check("Appearance offers the stage layout", await alice.evaluate(`!!(${pickLayout("stage")})`));
+  check("Appearance offers the stage layout", await seen(alice, `!!(${pickLayout("stage")})`));
   await alice.evaluate(`(${pickLayout("stage")}).click()`);
-  await sleep(500);
+  await waitFor(alice, `document.querySelector(".stage-shell")`);
   await alice.evaluate(`document.querySelector(".close-btn")?.click()`);
-  await sleep(500);
-  check("the stage shell replaces the modern one", await alice.evaluate(
+  await waitFor(alice, `!document.querySelector(".panel")`);
+  check("the stage shell replaces the modern one", await seen(alice,
     `!!document.querySelector(".stage-shell") && !document.querySelector(".modern-shell")`,
   ));
-  check("the call fills the stage: there is a tile for each person in it", await alice.evaluate(
+  check("the call fills the stage: there is a tile for each person in it", await seen(alice,
     `document.querySelectorAll("[data-stage-grid] [data-stage-tile]").length >= 1`,
   ));
-  check("the voice bar is the dock under it", await alice.evaluate(`!!document.querySelector(".dock .voice-controls")`));
+  check("the voice bar is the dock under it", await seen(alice, `!!document.querySelector(".dock .voice-controls")`));
+  // StageShell: the chat is open only from the stored panels or a new request, both read at mount
   check("the chat starts closed", await alice.evaluate(`!document.querySelector("[data-stage-chat]")`));
   await realClick(alice, "[data-stage-chat-toggle]");
-  await sleep(400);
-  check("the chat button opens the chat beside the stage", await alice.evaluate(
+  check("the chat button opens the chat beside the stage", await seen(alice,
     `!!document.querySelector("[data-stage-chat] .chat-panel")`,
   ));
   await realClick(alice, "[data-stage-chat-toggle]");
-  await sleep(400);
-  check("and closes it again", await alice.evaluate(`!document.querySelector("[data-stage-chat]")`));
+  check("and closes it again", await seen(alice, `!document.querySelector("[data-stage-chat]")`));
   check("the stage layout is what is stored", await waitFor(
     alice,
     `JSON.parse(localStorage.getItem("voipc.settings") ?? "{}").ui_prefs?.layout === "stage"`,
@@ -1309,30 +1330,33 @@ check(
 
   // Back to modern, in the same tab and with no reload.
   await openAppearance();
+  await waitFor(alice, pickLayout("modern"));
   await alice.evaluate(`(${pickLayout("modern")}).click()`);
-  await sleep(500);
+  await waitFor(alice, `document.querySelector(".modern-shell")`);
   await alice.evaluate(`document.querySelector(".close-btn")?.click()`);
-  await sleep(500);
-  check("switching back restores the modern shell", await alice.evaluate(
+  await waitFor(alice, `!document.querySelector(".panel")`);
+  check("switching back restores the modern shell", await seen(alice,
     `!!document.querySelector(".modern-shell") && !document.querySelector(".stage-shell")`,
   ));
+  // The relay still answers her: a link the switches dropped would leave this unanswered
+  check("past alice's barrier", await barrier(SERVER, alice));
   check("the connection survived both switches", await alice.evaluate(connectedHere));
 
   // Push-to-talk lives outside the shells precisely so a switch cannot drop it.
   await alice.evaluate(click('button[title^="Mute"]'));
-  await sleep(600);
-  check("mute still works after switching layouts", await alice.evaluate(rowMuted(null)) === true);
+  check("mute still works after switching layouts", await seen(alice, `(${rowMuted(null)}) === true`));
   await alice.evaluate(click('button[title^="Unmute"]'));
-  await sleep(600);
-  check("and unmute too", await alice.evaluate(rowMuted(null)) === false);
+  check("and unmute too", await seen(alice, `(${rowMuted(null)}) === false`));
 
   // Out of the voice channel without leaving the server. A real click: the
   // voice bar this used to sit in grew pointer behaviour once.
   check("a real click reaches Leave voice", await realClick(alice, ".voice-panel .leave-btn"));
-  await sleep(1200);
-  check("Leave voice takes you out of the channel", await alice.evaluate(
+  check("Leave voice takes you out of the channel", await seen(alice,
     `!document.querySelector(".voice-panel .leave-btn")`,
   ));
+  // Rule 5: the leave went with the click; past her barrier the relay has handled it and
+  // still answers her
+  check("past alice's barrier", await barrier(SERVER, alice));
   check("and keeps you on the server", await alice.evaluate(connectedHere));
 }
 
@@ -1345,51 +1369,51 @@ check(
     width: 390, height: 844, deviceScaleFactor: 1, mobile: true,
   });
   await alice.send("Emulation.setTouchEmulationEnabled", { enabled: true, maxTouchPoints: 1 });
-  await sleep(400);
 
   // The panes stack on the container's width, not the device's — which is why
   // this also appears in a narrow desktop window.
-  check("the panes stack at phone width", await alice.evaluate(
+  check("the panes stack at phone width", await seen(alice,
     `getComputedStyle(document.querySelector(".pane-main")).width === "390px"`,
   ));
-  check("a drawer button appears", await alice.evaluate(
+  check("a drawer button appears", await seen(alice,
     `getComputedStyle(document.querySelector(".drawer-btn")).display !== "none"`,
   ));
 
   const paneLeftVisible = `document.querySelector(".pane-left").getBoundingClientRect().right > 8`;
-  check("the channel drawer starts closed", !(await alice.evaluate(paneLeftVisible)));
+  /** The panes' track has stopped sliding (its CSS transition is over), so what is drawn is
+   *  where a tap lands. */
+  const trackStill = `document.querySelector(".track").getAnimations().length === 0`;
+  check("the channel drawer starts closed", await seen(alice, `!(${paneLeftVisible})`));
 
   await realClick(alice, ".drawer-btn");
-  await sleep(500);
-  check("the button opens the channel drawer", await alice.evaluate(paneLeftVisible));
+  check("the button opens the channel drawer", await seen(alice, paneLeftVisible));
 
   // …and the button closes it again.
   await realClick(alice, ".drawer-btn");
-  await sleep(500);
-  check("the button closes it again", !(await alice.evaluate(paneLeftVisible)));
+  check("the button closes it again", await seen(alice, `!(${paneLeftVisible})`));
 
   // Picking a channel from the drawer has to show the chat: the drawer covers
   // it, so a tap that only changes what is behind it reads as a tap that did
   // nothing. This is the phone's main path now that this layout is the default.
   await realClick(alice, ".drawer-btn");
-  await sleep(500);
+  await waitFor(alice, `${paneLeftVisible} && ${trackStill}`);
   await realClick(alice, ".pane-left .channels.text .channel");
-  await sleep(700);
-  check("picking a channel closes the drawer", !(await alice.evaluate(paneLeftVisible)));
+  check("picking a channel closes the drawer", await seen(alice, `!(${paneLeftVisible})`));
 
   // Settings is reachable on a phone — through the drawer, which is where the
   // user panel lives. Worth its own check: a layout that hides its own settings
   // behind a gesture is one you cannot get out of.
   await realClick(alice, ".drawer-btn");
-  await sleep(500);
-  check("settings is reachable from the drawer", await alice.evaluate(
+  // The drawer open and still, as it was half a second on
+  const drawerOpen = await seen(alice, `${paneLeftVisible} && ${trackStill}`);
+  check("settings is reachable from the drawer", drawerOpen && await alice.evaluate(
     `(() => { const el = document.querySelector(".user-panel .settings-btn");
       if (!el) return false;
       const r = el.getBoundingClientRect();
       return r.left >= 0 && r.right <= window.innerWidth && r.width > 0; })()`,
   ));
   await realClick(alice, ".drawer-btn");
-  await sleep(400);
+  await waitFor(alice, `!(${paneLeftVisible}) && ${trackStill}`);
 
   // NOT TESTED HERE: closing it with a finger.
   //
@@ -1407,8 +1431,7 @@ check(
 
   await alice.send("Emulation.clearDeviceMetricsOverride");
   await alice.send("Emulation.setTouchEmulationEnabled", { enabled: false });
-  await sleep(400);
-  check("the desktop layout comes back at desktop width", await alice.evaluate(
+  check("the desktop layout comes back at desktop width", await seen(alice,
     `!!document.querySelector(".modern-shell") && getComputedStyle(document.querySelector(".drawer-btn") ?? document.body).display === "none"`,
   ));
 }
@@ -1424,16 +1447,16 @@ check(
   await waitFor(alice, `document.querySelector(".create-form")`);
   await alice.evaluate(setInput(".create-form input[type=text]", TIMED));
   await alice.evaluate(click('.create-form input[data-kind="text"]'));
-  await sleep(300);
-  await alice.evaluate(click(".create-form .create-btn"));
-  await sleep(2000);
+  await waitFor(alice, `document.querySelector('.create-form input[data-kind="text"]')?.checked`);
+  await createChannel(alice);
+  await seen(alice, `[...document.querySelectorAll(".channel")].find((e) => e.textContent.includes(${JSON.stringify(TIMED)}))?.parentElement?.querySelector('[title="Channel settings"]')`);
 
   const opened = await alice.evaluate(
     `(() => { const row = [...document.querySelectorAll(".channel")].find((e) => e.textContent.includes(${JSON.stringify(TIMED)}));
        const gear = row?.parentElement?.querySelector('[title="Channel settings"]');
        if (!gear) return false; gear.dispatchEvent(new MouseEvent("click", { bubbles: true })); return true; })()`,
   );
-  await sleep(500);
+  await seen(alice, `document.querySelector('select[data-opt="message-ttl"]')`);
   // Svelte binds a select through each option's own value, so the choice is
   // made by selecting the option — assigning `el.value` matches nothing.
   const picked = await alice.evaluate(`(() => {
@@ -1447,18 +1470,15 @@ check(
   check("a channel's destruction timer is in its settings dialog", opened && picked);
   await alice.evaluate(`(() => { const form = document.querySelector('select[data-opt="message-ttl"]')?.closest("form");
     form?.querySelector(".create-btn")?.dispatchEvent(new MouseEvent("click", { bubbles: true })); return true; })()`);
-  await sleep(1500);
+  // The dialog closes once its last send is out (channel-ui submitChannelSettings)
+  await seen(alice, `!document.querySelector('select[data-opt="message-ttl"]')`);
 
   const showsTimer = async (tab) => {
     await tab.evaluate(
       `(() => { const el = [...document.querySelectorAll(".channel")].find((e) => e.textContent.includes(${JSON.stringify(TIMED)}));
          el?.dispatchEvent(new MouseEvent("click", { bubbles: true })); return true; })()`,
     );
-    for (let i = 0; i < 20; i++) {
-      if (await tab.evaluate(`document.querySelector(".ttl-label")?.textContent?.includes("5 minutes") ?? false`)) return true;
-      await sleep(300);
-    }
-    return false;
+    return seen(tab, `document.querySelector(".ttl-label")?.textContent?.includes("5 minutes") ?? false`);
   };
   check("the writer is told what the channel's timer is", await showsTimer(alice));
   check("and so is somebody only reading it", await showsTimer(bob));
@@ -1489,11 +1509,10 @@ check(
     `(() => { const el = ${row}?.closest(".user"); if (!el) return false;
        el.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, clientX: 40, clientY: 40 })); return true; })()`,
   );
-  await sleep(300);
   check(
     "the member menu spells the tag out",
-    (await first.evaluate(`document.querySelector(".ctx-title")?.textContent ?? ""`)) === other &&
-      (await first.evaluate(`document.querySelector(".ctx-tag")?.textContent ?? ""`)) === `#${tag}`,
+    await seen(first, `(document.querySelector(".ctx-title")?.textContent ?? "") === ${JSON.stringify(other)} &&
+      (document.querySelector(".ctx-tag")?.textContent ?? "") === ${JSON.stringify(`#${tag}`)}`),
   );
   await first.evaluate(
     `(() => { const b = [...document.querySelectorAll(".ctx-item")].find((e) => /direct message/i.test(e.textContent));
@@ -1552,11 +1571,11 @@ check(
     await tab.evaluate(
       `[...document.querySelectorAll(".tab")].find((b) => /appearance/i.test(b.textContent)).click()`,
     );
-    await sleep(300);
+    await waitFor(tab, `document.querySelector('.layout-choice[data-layout="${id}"]')`);
     await tab.evaluate(`document.querySelector('.layout-choice[data-layout="${id}"]').click()`);
-    await sleep(500);
+    await waitFor(tab, `document.querySelector(".${id}-shell")`);
     await tab.evaluate(`document.querySelector(".close-btn")?.click()`);
-    await sleep(500);
+    await waitFor(tab, `!document.querySelector(".panel")`);
   };
   /** A real click on whatever `expr` evaluates to, near its left edge — on a
    *  member row that is the avatar, clear of the buttons at its end. */
@@ -1583,12 +1602,8 @@ check(
     tab.evaluate(`JSON.parse(localStorage.getItem("voipc.settings")).ui_prefs?.${path}`);
   /** The debounced save, waited for rather than raced. */
   const storedSoon = async (tab, path, want) => {
-    let v = await stored(tab, path);
-    for (let i = 0; i < 20 && Math.abs(v - want) >= 4; i++) {
-      await sleep(200);
-      v = await stored(tab, path);
-    }
-    return v;
+    await seen(tab, `Math.abs(JSON.parse(localStorage.getItem("voipc.settings")).ui_prefs?.${path} - ${want}) < 4`);
+    return stored(tab, path);
   };
 
   await useLayout(host, "modern");
@@ -1596,20 +1611,19 @@ check(
   await host.evaluate(click('button[title="Create channel"]'));
   await waitFor(host, `document.querySelector(".create-form")`);
   await host.evaluate(setInput(".create-form input[type=text]", SHOW));
-  await host.evaluate(click(".create-form .create-btn"));
-  await sleep(2000);
+  await createChannel(host);
+  await waitFor(guest, `(${channelNames}).includes(${JSON.stringify(SHOW)})`);
   await guest.evaluate(
     `(() => { const el = [...document.querySelectorAll(".channel")].find((e) => e.querySelector(".channel-name")?.textContent === ${JSON.stringify(SHOW)});
        if (!el) return false; el.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })); return true; })()`,
   );
   await probe(guest, `document.querySelector(".voice-panel")`, 20_000);
-  await sleep(1500);
 
   // ── Member rows ──
   const rowOf = (who) =>
     `[...document.querySelectorAll(".user-list.modern .users .user")].find((e) => e.querySelector(".name")?.title.startsWith(${JSON.stringify(who)}))`;
   const ownRow = `[...document.querySelectorAll(".user-list.modern .users .user")].find((e) => e.querySelector(".you"))`;
-  await probe(host, rowOf(`ui-guest-${n}`), 20_000);
+  await waitFor(host, rowOf(`ui-guest-${n}`));
   check(
     "a member row with a menu shows the pointer",
     (await host.evaluate(`getComputedStyle(${rowOf(`ui-guest-${n}`)}).cursor`)) === "pointer",
@@ -1752,8 +1766,7 @@ check(
   );
 
   await realClick(host, ".voice-panel .share-btn.active");
-  await sleep(1200);
-  check("stopping the share takes the preview away", !(await host.evaluate(`!!document.querySelector(".share-preview")`)));
+  check("stopping the share takes the preview away", await seen(host, `!document.querySelector(".share-preview")`));
   check("and the viewer's stream view closes", !(await guest.evaluate(`!!document.querySelector(".stream-stage")`)));
 
   // ── A share this browser cannot decode, watched while sharing (B1-N1) ──
@@ -1814,9 +1827,10 @@ check(
   await waitFor(host, `document.querySelector(".create-form")`);
   await host.evaluate(setInput(".create-form input[type=text]", NOTES));
   await host.evaluate(click('.create-form input[data-kind="text"]'));
-  await sleep(300);
-  await host.evaluate(click(".create-form .create-btn"));
-  await sleep(2000);
+  await waitFor(host, `document.querySelector('.create-form input[data-kind="text"]')?.checked`);
+  await createChannel(host);
+  // The link below finds it only once the relay has it
+  await waitFor(host, `(${channelNames}).includes(${JSON.stringify(NOTES)})`);
   // Connected through the dialog of a page opened on the link. The first-run
   // dialogs are answered after the question, which a new user gets on top
   const byInvite = async (name, channel) => {
@@ -1843,8 +1857,11 @@ check(
     await no.evaluate(`document.querySelector(".chat-header")?.textContent.trim().slice(0, 120) ?? "no chat header"`));
   await no.evaluate(`[...document.querySelectorAll(".confirm button")].find((b) => b.textContent.trim() === "Cancel")?.click()`);
   await answerFirstRun(no, "invited");
-  await sleep(500);
-  check("Cancel leaves you out of voice", asked && !(await no.evaluate(`!!document.querySelector(".confirm")`)) && !(await no.evaluate(inVoice)));
+  const cancelled = await seen(no, `!document.querySelector(".confirm")`);
+  // Rule 5: the Cancel went over a second ago (answerFirstRun waits that long); past the
+  // barrier a seat it asked for would be answered
+  check("past the invited tab's barrier", await barrier(SERVER, no));
+  check("Cancel leaves you out of voice", asked && cancelled && !(await no.evaluate(`!!document.querySelector(".confirm")`)) && !(await no.evaluate(inVoice)));
   const yes = await byInvite(`ui-inv2-${n}`, SHOW);
   await probe(yes, `${confirmTitle}.startsWith("Join voice")`, 10_000);
   await yes.evaluate(`[...document.querySelectorAll(".confirm button")].find((b) => b.textContent.trim() === "Join voice")?.click()`);
@@ -1879,14 +1896,15 @@ async function chatLane() {
   await ann.evaluate(click('button[title="Create channel"]'));
   await waitFor(ann, `document.querySelector(".create-form")`);
   await ann.evaluate(setInput(".create-form input[type=text]", ROOM));
-  await ann.evaluate(click(".create-form .create-btn"));
-  await sleep(2000);
+  await createChannel(ann);
+  await waitFor(ben, `(${channelNames}).includes(${JSON.stringify(ROOM)})`);
   await ben.evaluate(
     `(() => { const el = [...document.querySelectorAll(".channel")].find((e) => e.querySelector(".channel-name")?.textContent === ${JSON.stringify(ROOM)});
        if (!el) return false; el.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })); return true; })()`,
   );
   await probe(ben, `document.querySelector(".input-bar .chat-input")`, 20_000);
-  await sleep(1500);
+  // ann writes first: she has to know ben is in the room
+  await waitFor(ann, `(${userNames}).some((u) => u.includes(${JSON.stringify(`ui-ben-${n}`)}))`);
 
   const say = (tab, text, where = ".chat-main") =>
     tab.evaluate(`(() => { const input = document.querySelector(${JSON.stringify(`${where} .input-bar .chat-input`)}); if (!input) return false;
@@ -1991,7 +2009,7 @@ async function chatLane() {
   check("the summary opens the thread", await ann.evaluate(
     `[...document.querySelectorAll(".thread-pane .msg .msg-content")].some((e) => e.textContent.includes("third answer here"))`));
   await ann.evaluate(`document.querySelector(".thread-pane .thread-close")?.click()`);
-  await sleep(300);
+  await waitFor(ann, `!document.querySelector(".thread-pane")`);
 
   // ── An answer sent into a thread ──
   await say(ann, "start a thread on me");
@@ -2018,18 +2036,16 @@ async function chatLane() {
       await ann.send("Input.dispatchMouseEvent", { type, x: lineAt.x, y: lineAt.y, button: "right", clickCount: 1, buttons: 2 });
     }
   }
-  await sleep(300);
-  check("a right click on a message opens its menu", await ann.evaluate(
+  check("a right click on a message opens its menu", await seen(ann,
     `[...document.querySelectorAll(".msg-menu [role=menuitem]")].map((b) => b.textContent.trim()).join(",") === "React,Reply,Reply in thread,Forward,Report,Pin,Copy text"`),
     await ann.evaluate(`document.querySelector(".msg-menu")?.textContent ?? "no menu"`));
   // At the pointer, or ending there where there is no room below it
-  check("where the pointer is", !!lineAt && (await ann.evaluate(`(() => { const r = document.querySelector(".msg-menu")?.getBoundingClientRect();
+  check("where the pointer is", !!lineAt && (await seen(ann, `(() => { const r = document.querySelector(".msg-menu")?.getBoundingClientRect();
     return !!r && Math.abs(r.left - ${lineAt?.x ?? 0}) < 4 && (Math.abs(r.top - ${lineAt?.y ?? 0}) < 4 || Math.abs(r.bottom - ${lineAt?.y ?? 0}) < 4); })()`)),
     await ann.evaluate(`JSON.stringify(document.querySelector(".msg-menu")?.getBoundingClientRect())`) + ` vs ${JSON.stringify(lineAt)}`);
   await ann.send("Input.dispatchKeyEvent", { type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
   await ann.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
-  await sleep(200);
-  check("and Escape closes it", !(await ann.evaluate(`!!document.querySelector(".msg-menu")`)));
+  check("and Escape closes it", await seen(ann, `!document.querySelector(".msg-menu")`));
 
   // ── The list is one Tab stop: its links, spoilers and Copy buttons too (R2-06) ──
   await say(ann, "see [the site](https://\u0430pple.com/login) and ||hidden words||");
@@ -2043,12 +2059,11 @@ async function chatLane() {
 
   // ── The link popup names where a look-alike host really goes (R2-12) ──
   await ben.evaluate(`${rowWith("see the site")}?.querySelector(".msg-link")?.click()`);
-  await sleep(200);
-  check("the link popup shows a look-alike host as the punycode it is", await ben.evaluate(
+  check("the link popup shows a look-alike host as the punycode it is", await seen(ben,
     `document.querySelector(".link-input")?.value === "https://xn--pple-43d.com/login" && /Goes to xn--pple-43d\\.com/.test(document.querySelector(".link-host")?.textContent ?? "")`),
     await ben.evaluate(`(document.querySelector(".link-input")?.value ?? "no popup") + " / " + (document.querySelector(".link-host")?.textContent ?? "")`));
   await ben.evaluate(`document.querySelector(".link-close-btn")?.click()`);
-  await sleep(200);
+  await waitFor(ben, `!document.querySelector(".link-input")`);
 
   // ── A long press on a touch screen is the message menu, whatever it selected (D1-01) ──
   // The phone's web view selects the word under the finger first, then asks
@@ -2064,14 +2079,13 @@ async function chatLane() {
     p.dispatchEvent(new PointerEvent("pointerdown", at));
     p.dispatchEvent(new PointerEvent("contextmenu", at));
     return true; })()`);
-  await sleep(200);
   check("a long press opens the message menu, even over the word it selected", pressed &&
-    (await ben.evaluate(`!!document.querySelector(".msg-menu") && getSelection().toString() === ""`)),
+    (await seen(ben, `!!document.querySelector(".msg-menu") && getSelection().toString() === ""`)),
     await ben.evaluate(`(document.querySelector(".msg-menu") ? "menu" : "no menu") + ", selection: " + JSON.stringify(getSelection().toString())`));
   for (const type of ["keyDown", "keyUp"]) {
     await ben.send("Input.dispatchKeyEvent", { type, key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
   }
-  await sleep(200);
+  await waitFor(ben, `!document.querySelector(".msg-menu")`);
 
   // ── A tap leaves no tool bar over the text: a finger's hover sticks (D2-09) ──
   await ben.toFront();
@@ -2081,7 +2095,6 @@ async function chatLane() {
     await ben.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [tapAt] });
     await ben.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
   }
-  await sleep(400);
   // A phone keeps :hover on what the finger touched; this browser does not,
   // so the row is held hovered the way the phone holds it
   await ben.evaluate(`${rowWith("after the deep one")}?.setAttribute("data-tapped", "")`);
@@ -2089,7 +2102,9 @@ async function chatLane() {
   const nodeId = root && (await ben.send("DOM.querySelector", { nodeId: root.nodeId, selector: ".chat-main .msg[data-tapped]" })).result?.nodeId;
   await ben.send("CSS.enable", {});
   if (nodeId) await ben.send("CSS.forcePseudoState", { nodeId, forcedPseudoClasses: ["hover"] });
-  check("a tap on a message leaves no tool bar standing over it", !!tapAt && !!nodeId && (await ben.evaluate(
+  // Held hovered, a row shows its tools unless the tap told it otherwise: this cannot pass
+  // before the tap is handled
+  check("a tap on a message leaves no tool bar standing over it", !!tapAt && !!nodeId && (await seen(ben,
     `(() => { const t = document.querySelector(".chat-main .msg[data-tapped] .msg-tools"); return !!t && getComputedStyle(t).display === "none"; })()`)),
     await ben.evaluate(`document.querySelector(".chat-main .msg[data-tapped]")?.matches(":hover") ? "hovered" : "not hovered"`));
   if (nodeId) await ben.send("CSS.forcePseudoState", { nodeId, forcedPseudoClasses: [] });
@@ -2115,8 +2130,7 @@ async function chatLane() {
   // ── @ completes a name, and the person named sees it ──
   await ben.evaluate(`document.querySelector(".chat-main .input-bar .chat-input").focus()`);
   await ben.send("Input.insertText", { text: "@ui-a" });
-  await sleep(200);
-  check("@ offers the names that start so", await ben.evaluate(
+  check("@ offers the names that start so", await seen(ben,
     `[...document.querySelectorAll(".chat-main .mention-option")].some((e) => e.textContent.includes("ui-ann-${n}"))`));
   await ben.send("Input.dispatchKeyEvent", { type: "keyDown", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
   await ben.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
@@ -2132,14 +2146,15 @@ async function chatLane() {
   const openChannel = (tab, name) => tab.evaluate(
     `(() => { const el = [...document.querySelectorAll(".channel")].find((e) => e.querySelector(".channel-name")?.textContent === ${JSON.stringify(name)});
        if (!el) return false; el.dispatchEvent(new MouseEvent("click", { bubbles: true })); return true; })()`);
+  const titleIs = (name) => `document.querySelector(".chat-title")?.textContent.trim() === ${JSON.stringify(name)}`;
   await openChannel(ann, "lobby-chat");
-  await sleep(600);
+  await waitFor(ann, titleIs("lobby-chat"));
   await say(ben, "while you were reading elsewhere");
   await say(ben, "and one more");
-  await sleep(1200);
+  // Both are in at ann, unread, before she goes back
+  await seen(ann, `Number([...document.querySelectorAll(".channel")].find((e) => e.querySelector(".channel-name")?.textContent === ${JSON.stringify(ROOM)})?.querySelector(".channel-unread")?.textContent ?? 0) >= 2`);
   await openChannel(ann, ROOM);
-  await sleep(800);
-  check("the first unread message gets a New divider", await ann.evaluate(
+  check("the first unread message gets a New divider", await seen(ann,
     `(() => { const d = document.querySelector(".chat-main .new-divider"); const next = d?.nextElementSibling;
        return !!next && next.querySelector(".msg-content")?.textContent.includes("while you were reading elsewhere"); })()`));
 
@@ -2147,19 +2162,16 @@ async function chatLane() {
   await ann.evaluate(`document.querySelector(".search-btn")?.click()`);
   await probe(ann, `document.querySelector(".search-pane .search-input")`, 5_000);
   await ann.evaluate(setInput(".search-pane .search-input", "BOLD"));
-  await sleep(300);
-  check("search finds a message, whatever its case", await ann.evaluate(
+  check("search finds a message, whatever its case", await seen(ann,
     `[...document.querySelectorAll(".search-pane .result")].some((e) => e.textContent.includes("bold move"))`));
   await ann.evaluate(`[...document.querySelectorAll(".search-pane .result")].find((e) => e.textContent.includes("bold move"))?.click()`);
-  await sleep(500);
-  check("picking a result goes to the message", await ann.evaluate(
+  check("picking a result goes to the message", await seen(ann,
     `!document.querySelector(".search-pane") && (${rowWith("bold move")}?.classList.contains("flash") ?? false)`));
   await ann.evaluate(`document.querySelector(".search-btn")?.click()`);
   await probe(ann, `document.querySelector(".search-pane .search-input")`, 5_000);
   await ann.evaluate(`[...document.querySelectorAll(".search-pane .scope")].find((b) => /everywhere/i.test(b.textContent))?.click()`);
   await ann.evaluate(setInput(".search-pane .search-input", "inside the thread"));
-  await sleep(300);
-  check("everywhere names the conversation a result is in", await ann.evaluate(
+  check("everywhere names the conversation a result is in", await seen(ann,
     `[...document.querySelectorAll(".search-pane .result")].some((e) => e.querySelector(".result-conv")?.textContent.includes(${JSON.stringify(ROOM)}))`));
   await ann.evaluate(`document.querySelector(".search-pane .search-close")?.click()`);
 
@@ -2167,7 +2179,7 @@ async function chatLane() {
   // Only a modified client sends one; the reader keeps 16 KiB of it. Last
   // here: a row that long changes where the others sit
   await openChannel(ann, ROOM);
-  await sleep(500);
+  await waitFor(ann, `${titleIs(ROOM)} && !document.querySelector(".search-pane")`);
   await say(ann, `long${"z".repeat(20_000)}`);
   check("a message past 16 KiB arrives cut to 16 KiB", (await arrived(ben, "longzzz")) &&
     (await ben.evaluate(`${rowWith("longzzz")}?.querySelector(".msg-content")?.textContent.trim().length === 16 * 1024`)),
@@ -2180,7 +2192,9 @@ async function chatLane() {
     await probe(ann, `document.querySelector('select[data-opt="message-ttl"]')`, 5_000);
     await ann.evaluate(set);
     await ann.evaluate(`document.querySelector('select[data-opt="message-ttl"]')?.closest("form")?.querySelector(".create-btn")?.dispatchEvent(new MouseEvent("click", { bubbles: true }))`);
-    await sleep(1200);
+    // The dialog closes once its last send is out (channel-ui submitChannelSettings); what
+    // the relay makes of it each caller waits for
+    await seen(ann, `!document.querySelector('select[data-opt="message-ttl"]')`);
   };
   const timer = (words) => `(() => { const el = document.querySelector('select[data-opt="message-ttl"]');
     el.selectedIndex = [...el.options].findIndex((o) => o.textContent.includes(${JSON.stringify(words)}));
@@ -2223,7 +2237,7 @@ async function chatLane() {
     await sleep(600);
     const found = await ben.evaluate(`[...document.querySelectorAll(".search-pane .result")].map((e) => e.textContent.slice(0, 80))`);
     await ben.evaluate(`document.querySelector(".search-pane .search-close")?.click()`);
-    await sleep(200);
+    await waitFor(ben, `!document.querySelector(".search-pane")`);
     return found;
   };
   const before18 = await search("Everywhere", "bold move");
@@ -2257,8 +2271,8 @@ async function chatLane() {
   await ann.evaluate(click('button[title="Create channel"]'));
   await waitFor(ann, `document.querySelector(".create-form")`);
   await ann.evaluate(setInput(".create-form input[type=text]", ROOM));
-  await ann.evaluate(click(".create-form .create-btn"));
-  await sleep(2000);
+  await createChannel(ann);
+  await waitFor(ben, `(${channelNames}).includes(${JSON.stringify(ROOM)})`);
   const enter = (tab) =>
     tab.evaluate(
       `(() => { const el = [...document.querySelectorAll(".channel")].find((e) => e.querySelector(".channel-name")?.textContent === ${JSON.stringify(ROOM)});
@@ -2266,7 +2280,8 @@ async function chatLane() {
     );
   await enter(ben);
   await probe(ben, `document.querySelector(".chat-main .input-bar .chat-input")`, 20_000);
-  await sleep(1500);
+  // ann writes first: she has to know ben is in the room
+  await waitFor(ann, `(${userNames}).some((u) => u.includes(${JSON.stringify(`ui-fb-${n}`)}))`);
 
   const say = (tab, text) =>
     tab.evaluate(`(() => { const input = document.querySelector(".chat-main .input-bar .chat-input"); if (!input) return false;
@@ -2318,8 +2333,7 @@ async function chatLane() {
   check("a loaded picture opens big", await waitFor(ben, `document.querySelector(".lightbox img")`, 5_000).then(() => true, () => false));
   await ben.send("Input.dispatchKeyEvent", { type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
   await ben.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
-  await sleep(300);
-  check("and Escape closes it", !(await ben.evaluate(`!!document.querySelector(".lightbox")`)));
+  check("and Escape closes it", await seen(ben, `!document.querySelector(".lightbox")`));
 
   // ── The original, exactly ──
   await attach(ann, picture("image/jpeg", "orig.jpg"));
@@ -2388,7 +2402,7 @@ async function chatLane() {
   // From another conversation, so going to a message has to open its own
   await ann.evaluate(`[...document.querySelectorAll(".channel")].find((e) => e.querySelector(".channel-name")?.textContent === "lobby-chat")
     ?.dispatchEvent(new MouseEvent("click", { bubbles: true }))`);
-  await sleep(600);
+  await waitFor(ann, `document.querySelector(".chat-title")?.textContent.trim() === "lobby-chat"`);
   const away = !(await ann.evaluate(`!!${rowWith("the original")}`));
   await realClick(ann, ".settings-btn");
   await waitFor(ann, `document.querySelector(".tab")`, 8_000);
@@ -2397,20 +2411,23 @@ async function chatLane() {
   const everything = await fmNames(ann);
   check("Settings → Files lists every file the chat here names", listed && ["orig.jpg", "notes.txt", "pic.png"].every((f) => everything.includes(f)) &&
     /\.webp/.test(everything), everything);
-  await sleep(1500);
+  // FileManager reads what this tab keeps in one go (`cache`), and the usage is drawn from it
+  await waitFor(ann, `document.querySelector(".fm-usage .num")`);
   const before = await usedNow(ann);
+  const fmNamesAre = (names) => `[...document.querySelectorAll(".fm-row .fm-name")].map((e) => e.textContent).sort().join(",") === ${JSON.stringify(names)}`;
+  /** The chip is down: the list is derived from it in the same update (FileManager `sections`). */
+  const chipOn = (value) => `[...document.querySelectorAll(".fm-chip")].find((b) => b.textContent.trim().startsWith(${JSON.stringify(CHIP[value])}))?.getAttribute("aria-pressed") === "true"`;
   await fmShow(ann, "local");
-  await sleep(200);
+  await waitFor(ann, chipOn("local"));
   check("with what this tab keeps of them: the files it sent and loaded", (await fmNames(ann)) === everything && !before.startsWith("0 B"), `${await fmNames(ann)} · ${before}`);
   await fmShow(ann, "other");
-  await sleep(200);
-  check("filtered by type, from what the message says", (await fmNames(ann)) === "notes.txt", await fmNames(ann));
+  check("filtered by type, from what the message says", await seen(ann, `${chipOn("other")} && ${fmNamesAre("notes.txt")}`), await fmNames(ann));
   await fmShow(ann, "all");
+  await waitFor(ann, chipOn("all"));
   await ann.evaluate(setInput(".fm-query", "ORIG"));
-  await sleep(200);
-  check("a search narrows the list to what it names, case aside", (await fmNames(ann)) === "orig.jpg", await fmNames(ann));
+  check("a search narrows the list to what it names, case aside", await seen(ann, fmNamesAre("orig.jpg")), await fmNames(ann));
   await ann.evaluate(setInput(".fm-query", ""));
-  await sleep(200);
+  await waitFor(ann, fmRow("notes.txt"));
   await fmPress(ann, "notes.txt", "Remove copy");
   const removed = await waitFor(ann, `!${fmRow("notes.txt")}?.querySelector(".fm-local")`, 5_000).then(() => true, () => false);
   check("Remove copy takes a file off this tab, and the space it took", removed && (await usedNow(ann)) !== before, `${before} → ${await usedNow(ann)}`);
@@ -2422,8 +2439,7 @@ async function chatLane() {
   check("a row opens the chat's card, and Load draws it from this tab's copy", local && (await fetched(ann)) === fetchedBefore);
   await fmPress(ann, "orig.jpg", "Go to message");
   const closed = await waitFor(ann, `!document.querySelector(".fm-row")`, 5_000).then(() => true, () => false);
-  await sleep(800);
-  check("Go to message closes Settings, opens its conversation and brings the message into view", away && closed && (await ann.evaluate(
+  check("Go to message closes Settings, opens its conversation and brings the message into view", away && closed && (await seen(ann,
     `(() => { const r = ${rowWith("the original")}; const a = document.activeElement; return !!r && !!a && (r === a || r.contains(a) || a.contains(r)); })()`)),
     await ann.evaluate(`document.activeElement?.className ?? "nothing"`));
 
@@ -2437,7 +2453,7 @@ async function chatLane() {
   await probe(ann, deeRow, 20_000);
   await ann.evaluate(`(() => { const el = ${deeRow}?.closest(".user"); if (!el) return false;
     el.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, clientX: 40, clientY: 40 })); return true; })()`);
-  await sleep(300);
+  await waitFor(ann, `[...document.querySelectorAll(".ctx-item")].find((e) => /direct message/i.test(e.textContent))`);
   await ann.evaluate(`[...document.querySelectorAll(".ctx-item")].find((e) => /direct message/i.test(e.textContent))?.click()`);
   await probe(ann, `document.querySelector(".chat-main .input-bar .chat-input")?.placeholder.includes("ui-fd-")`, 5_000);
   await say(ann, "hi dee");
@@ -2447,9 +2463,11 @@ async function chatLane() {
   await dee.evaluate(click('button[title="Create channel"]'));
   await probe(dee, `document.querySelector(".create-form")`, 20_000);
   await dee.evaluate(setInput(".create-form input[type=text]", `elsewhere-${n}`));
-  await dee.evaluate(click(".create-form .create-btn"));
+  await createChannel(dee);
   const parted = await waitFor(ann, `!${deeRow}`, 10_000).then(() => true, () => false);
-  await sleep(1000);
+  // Rule 5: ann saw dee go, so the relay handled the move; past dee's and ann's barrier
+  // whatever it sent ann about it is in
+  check("past dee and ann's barrier", await barrier(SERVER, dee, ann));
   await dee.evaluate(`${annEntry}?.click()`);
   check("a direct message to someone in another room offers attaching", parted &&
     (await ann.evaluate(`!!document.querySelector(".chat-main .input-bar .file-picker")`)));
@@ -2486,7 +2504,7 @@ async function chatLane() {
       await ann.send("Input.dispatchMouseEvent", { type, x: origAt.x, y: origAt.y, button: "right", clickCount: 1, buttons: 2 });
     }
   }
-  await sleep(300);
+  await seen(ann, `[...document.querySelectorAll(".msg-menu [role=menuitem]")].find((e) => e.textContent.trim() === "Forward")`);
   await ann.evaluate(`[...document.querySelectorAll(".msg-menu [role=menuitem]")].find((e) => e.textContent.trim() === "Forward")?.click()`);
   await probe(ann, `document.querySelector(".forward-dialog .forward-dest")`, 3_000);
   await ann.evaluate(`[...document.querySelectorAll(".forward-dialog .forward-dest")].find((b) => b.textContent.includes("@ui-fd-${n}"))?.click()`);
@@ -2562,14 +2580,15 @@ async function editsLane() {
   await ann.evaluate(click('button[title="Create channel"]'));
   await waitFor(ann, `document.querySelector(".create-form")`);
   await ann.evaluate(setInput(".create-form input[type=text]", ROOM));
-  await ann.evaluate(click(".create-form .create-btn"));
-  await sleep(2000);
+  await createChannel(ann);
+  await waitFor(ben, `(${channelNames}).includes(${JSON.stringify(ROOM)})`);
   const openChannel = (tab, name, how = "click") => tab.evaluate(
     `(() => { const el = [...document.querySelectorAll(".channel")].find((e) => e.querySelector(".channel-name")?.textContent === ${JSON.stringify(name)});
        if (!el) return false; el.dispatchEvent(new MouseEvent(${JSON.stringify(how)}, { bubbles: true })); return true; })()`);
   await openChannel(ben, ROOM, "dblclick");
   await probe(ben, `document.querySelector(".chat-main .input-bar .chat-input")`, 20_000);
-  await sleep(1500);
+  // ann writes first: she has to know ben is in the room
+  await waitFor(ann, `(${userNames}).some((u) => u.includes(${JSON.stringify(`ui-eb-${n}`)}))`);
 
   const say = (tab, text) =>
     tab.evaluate(`(() => { const input = document.querySelector(".chat-main .input-bar .chat-input"); if (!input) return false;
@@ -2639,13 +2658,13 @@ async function editsLane() {
   for (const type of ["keyDown", "keyUp"]) {
     await ben.send("Input.dispatchKeyEvent", { type, key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
   }
-  await sleep(300);
+  await waitFor(ben, `!document.querySelector(".react-picker")`);
 
   // Send with a real pointer leaves the focus in the box: on a phone a focus
   // move dropped the keyboard, the shell reflowed, and the tap missed Send
   await ben.evaluate(`(() => { const input = document.querySelector(".chat-main .input-bar .chat-input"); input.focus();
     input.value = "sent by a tap"; input.dispatchEvent(new Event("input", { bubbles: true })); })()`);
-  await sleep(200);
+  await waitFor(ben, `(() => { const b = document.querySelector(".chat-main .input-bar .send-btn"); return !!b && !b.disabled; })()`);
   const tapped = await realClick(ben, ".chat-main .input-bar .send-btn");
   check("a tap on Send sends, and the text field keeps the focus",
     tapped && (await arrived(ann, "sent by a tap")) &&
@@ -2689,7 +2708,7 @@ async function editsLane() {
   check("someone else's message offers no Delete, and a member no Pin", !/Delete|Pin/.test(await menuItems(ben)), await menuItems(ben));
   await ben.send("Input.dispatchKeyEvent", { type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
   await ben.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
-  await sleep(200);
+  await waitFor(ben, `!document.querySelector(".msg-menu")`);
   await useTool(ann, "delete me soon", "More");
   check("your own message's menu has Edit and Delete, and a manager's has Pin",
     (await menuItems(ann)) === "React,Reply,Reply in thread,Forward,Edit,Pin,Copy text,Delete", await menuItems(ann));
@@ -2706,12 +2725,10 @@ async function editsLane() {
     await waitFor(ben, `!!${rowWith("react to this one")}?.querySelector(".pinned-tag") && document.querySelector(".chat-header .pins-btn")?.textContent.trim() === "1"`, 10_000)
       .then(() => true, () => false));
   await ben.evaluate(`document.querySelector(".chat-header .pins-btn")?.click()`);
-  await sleep(200);
-  check("the header lists what is pinned", await ben.evaluate(
+  check("the header lists what is pinned", await seen(ben,
     `[...document.querySelectorAll(".pins-menu .pin-row")].some((b) => b.textContent.includes("react to this one"))`));
   await ben.evaluate(`[...document.querySelectorAll(".pins-menu .pin-row")].find((b) => b.textContent.includes("react to this one"))?.click()`);
-  await sleep(500);
-  check("and a pin leads to its message", await ben.evaluate(`${rowWith("react to this one")}?.classList.contains("flash") ?? false`));
+  check("and a pin leads to its message", await seen(ben, `${rowWith("react to this one")}?.classList.contains("flash") ?? false`));
 
   // ── Sharing starts off, and every tab here shares one localStorage, so one switch moves them all ──
   const marks = `document.querySelectorAll(".user-list.modern .sharing-history").length`;
@@ -2733,7 +2750,7 @@ async function editsLane() {
   for (const type of ["keyDown", "keyUp"]) {
     await cy.send("Input.dispatchKeyEvent", { type, key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
   }
-  await sleep(200);
+  await waitFor(cy, `!document.querySelector(".msg-menu")`);
   await shareSwitch(ann, false);
   check("off in one tab, the other tab stops too", await waitFor(cy, `${marks} === 0`, 8_000).then(() => true, () => false), await cy.evaluate(marks));
   await say(ben, "and it stays off");
@@ -2796,8 +2813,8 @@ async function emotesLane() {
   await ann.evaluate(click('button[title="Create channel"]'));
   await waitFor(ann, `document.querySelector(".create-form")`);
   await ann.evaluate(setInput(".create-form input[type=text]", ROOM));
-  await ann.evaluate(click(".create-form .create-btn"));
-  await sleep(2000);
+  await createChannel(ann);
+  await waitFor(ben, `(${channelNames}).includes(${JSON.stringify(ROOM)})`);
   await ben.evaluate(`[...document.querySelectorAll(".channel")].find((e) => e.querySelector(".channel-name")?.textContent === ${JSON.stringify(ROOM)})
     ?.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }))`);
   await probe(ben, `document.querySelector(".chat-main .input-bar .chat-input")`, 20_000);
@@ -2836,7 +2853,7 @@ async function emotesLane() {
     .then(() => true, () => false);
   check("added, it is in the server's list", listed, await ann.evaluate(`(window.__toasts ?? []).slice(-3).join(" | ")`));
   await ann.evaluate(`document.querySelector(".admin-dialog .admin-close")?.click()`);
-  await sleep(300);
+  await waitFor(ann, `!document.querySelector(".admin-dialog")`);
   await ann.evaluate(`(() => { const input = document.querySelector(".chat-main .input-bar .chat-input"); if (!input) return false;
     input.value = ${JSON.stringify(`look :${name}:`)}; input.dispatchEvent(new Event("input", { bubbles: true }));
     input.closest("form").requestSubmit(); return true; })()`);
@@ -2855,7 +2872,8 @@ async function emotesLane() {
   await realClick(ann, '.chat-main .input-bar button[aria-label="Emoji, emotes and stickers"]');
   const searching = await waitFor(ann, `!!document.activeElement?.classList.contains("ep-search")`, 3_000).then(() => true, () => false);
   await ann.send("Input.insertText", { text: name });
-  await sleep(200);
+  // The picker's list is derived from its search as typed (EmotePicker `q`): its first cell is the match
+  await waitFor(ann, `document.querySelector(".chat-main .ep-cell:not([disabled])")?.getAttribute("aria-label") === ${JSON.stringify(`:${name}:`)}`);
   await realKey(ann, "Enter");
   await sleep(500);
   check("the picker's search takes its first match into the draft on Enter, and sends nothing",
@@ -2878,12 +2896,14 @@ if (PORT2) {
   await alice.send("Emulation.setDeviceMetricsOverride", {
     width: 1280, height: 800, deviceScaleFactor: 1, mobile: false,
   });
-  await sleep(400);
+  await waitFor(alice, `window.innerWidth === 1280`);
   const S1 = `127.0.0.1:${PORT}`;
   const S2 = `127.0.0.1:${PORT2}`;
   const railItem = (id) => `.server-rail .rail-item[data-server="${id}"]`;
-  const openIds = () =>
-    alice.evaluate(`[...document.querySelectorAll(".server-rail .rail-item.open")].map((e) => e.dataset.server)`);
+  const openIdsExpr = `[...document.querySelectorAll(".server-rail .rail-item.open")].map((e) => e.dataset.server)`;
+  const openIds = () => alice.evaluate(openIdsExpr);
+  /** The open servers are exactly `ids`, in that order, once the rail shows it. */
+  const openAre = (ids) => seen(alice, `JSON.stringify(${openIdsExpr}) === ${JSON.stringify(JSON.stringify(ids))}`);
   const railTitle = (id) => alice.evaluate(`document.querySelector('${railItem(id)}')?.title ?? ""`);
   const onScreen = () => alice.evaluate(`document.querySelector(".server-rail .rail-item.active")?.dataset.server`);
   const voiceRowActive = (name) => alice.evaluate(`(() => {
@@ -2898,17 +2918,19 @@ if (PORT2) {
   await alice.evaluate(click('button[title="Create channel"]'));
   await waitFor(alice, `document.querySelector(".create-form")`);
   await alice.evaluate(setInput(".create-form input[type=text]", HOME));
-  await alice.evaluate(click(".create-form .create-btn"));
-  await sleep(2500);
+  await createChannel(alice);
+  await waitFor(bob, `(${channelNames}).includes(${JSON.stringify(HOME)})`);
   // bob joins her there, so he can witness her leaving it
   await bob.evaluate(
     `(() => { const el = [...document.querySelectorAll(".channel")].find((e) => e.querySelector(".channel-name")?.textContent === ${JSON.stringify(HOME)});
        if (!el) return false; el.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })); return true; })()`,
   );
-  await sleep(1500);
-  check("the other client sees alice in the channel", (await bob.evaluate(userNames)).some((u) => u.includes("ui-alice")));
+  // bob's join done first (his HOME row active): till then his list may be another
+  // conversation's (he last read TIMED, which alice is in), naming her already
+  const bobInHome = `[...document.querySelectorAll(".channel")].find((e) => e.querySelector(".channel-name")?.textContent === ${JSON.stringify(HOME)})?.classList.contains("active") === true`;
+  check("the other client sees alice in the channel", await seen(bob, `${bobInHome} && (${userNames}).some((u) => u.includes("ui-alice"))`));
   check("the rail lists the server we are on", JSON.stringify(await openIds()) === JSON.stringify([S1]), JSON.stringify(await openIds()));
-  check("and says we are in voice there", /in voice/.test(await railTitle(S1)), await railTitle(S1));
+  check("and says we are in voice there", await seen(alice, `/in voice/.test(document.querySelector('${railItem(S1)}')?.title ?? "")`), await railTitle(S1));
 
   check("a real click reaches the rail's +", await realClick(alice, ".server-rail .rail-item.add"));
   await waitFor(alice, `document.querySelector(".connect-btn")`, 8_000);
@@ -2923,48 +2945,48 @@ if (PORT2) {
   await alice.evaluate(setInput('input[placeholder="Your name"]', "ui-alice"));
   await alice.evaluate(click(".connect-btn"));
   await waitFor(alice, `!document.querySelector(".connect-btn") && document.querySelectorAll(".server-rail .rail-item.open").length === 2`);
-  await sleep(800);
-  check("the second server opens beside the first", JSON.stringify(await openIds()) === JSON.stringify([S1, S2]), JSON.stringify(await openIds()));
-  check("and it is the one on screen", (await onScreen()) === S2, await onScreen());
-  check("its channel list is its own", !(await alice.evaluate(channelNames)).includes(HOME));
+  check("the second server opens beside the first", await openAre([S1, S2]), JSON.stringify(await openIds()));
+  const onScreenIs = (id) => `document.querySelector(".server-rail .rail-item.active")?.dataset.server === ${JSON.stringify(id)}`;
+  check("and it is the one on screen", await seen(alice, onScreenIs(S2)), await onScreen());
+  check("its channel list is its own", await seen(alice, `!(${channelNames}).includes(${JSON.stringify(HOME)})`));
   check("the call on server 1 carried on", /in voice/.test(await railTitle(S1)), await railTitle(S1));
   check("and the voice panel still offers to leave it", await alice.evaluate(`!!document.querySelector(".voice-panel .leave-btn")`));
 
   await realClick(alice, railItem(S1));
-  await sleep(800);
-  check("the rail brings server 1 back", (await onScreen()) === S1 && (await alice.evaluate(channelNames)).includes(HOME));
+  check("the rail brings server 1 back", await seen(alice, `${onScreenIs(S1)} && (${channelNames}).includes(${JSON.stringify(HOME)})`));
   check("still standing in the same channel", (await voiceRowActive(HOME)) === true);
 
   // Voice follows the last join: a room on server 2 ends the call on server 1
   await realClick(alice, railItem(S2));
-  await sleep(600);
+  await waitFor(alice, onScreenIs(S2));
   const MS = `multi-${process.pid % 10000}`;
   await alice.evaluate(click('button[title="Create channel"]'));
   await waitFor(alice, `document.querySelector(".create-form")`);
   await alice.evaluate(setInput(".create-form input[type=text]", MS));
-  await alice.evaluate(click(".create-form .create-btn"));
-  await sleep(2500);
-  check("joining voice on server 2 moves the call there", /in voice/.test(await railTitle(S2)), await railTitle(S2));
-  check("and out of server 1", !/in voice/.test(await railTitle(S1)), await railTitle(S1));
+  await createChannel(alice);
+  check("joining voice on server 2 moves the call there", await seen(alice, `/in voice/.test(document.querySelector('${railItem(S2)}')?.title ?? "")`), await railTitle(S2));
+  check("and out of server 1", await seen(alice, `!/in voice/.test(document.querySelector('${railItem(S1)}')?.title ?? "")`), await railTitle(S1));
   check("server 1 stays connected", JSON.stringify(await openIds()) === JSON.stringify([S1, S2]), JSON.stringify(await openIds()));
   check(
     "the other client sees alice leave her channel on server 1",
-    !(await bob.evaluate(userNames)).some((u) => u.includes("ui-alice")),
+    await seen(bob, `!(${userNames}).some((u) => u.includes("ui-alice"))`),
     (await bob.evaluate(userNames)).join(","),
   );
 
   // Mute is global and reaches the call wherever it is
   await alice.evaluate(click('button[title^="Mute"]'));
-  await sleep(600);
-  check("mute works in a call on the second server", (await alice.evaluate(rowMuted(null))) === true);
+  check("mute works in a call on the second server", await seen(alice, `(${rowMuted(null)}) === true`));
   await alice.evaluate(click('button[title^="Unmute"]'));
-  await sleep(600);
+  await waitFor(alice, `(${rowMuted(null)}) === false`);
 
   // Disconnect is per server
   check("a real click reaches server 2's disconnect", await serverMenu(alice, "Disconnect"));
-  await sleep(1200);
-  check("disconnecting server 2 closes only that one", JSON.stringify(await openIds()) === JSON.stringify([S1]), JSON.stringify(await openIds()));
-  check("server 1 is on screen and connected", (await onScreen()) === S1 && await alice.evaluate(connectedHere));
+  check("disconnecting server 2 closes only that one", await openAre([S1]), JSON.stringify(await openIds()));
+  check(
+    "server 1 is on screen and connected",
+    await seen(alice, `document.querySelector(".server-rail .rail-item.active")?.dataset.server === ${JSON.stringify(S1)} && (${connectedHere})`),
+    `${await onScreen()} ${await alice.evaluate(connectedHere)}`,
+  );
   check("and no connect dialog came up", !(await alice.evaluate(`!!document.querySelector(".connect-btn")`)));
 
   // Starting up with both servers remembered and auto-connect on: every one of
@@ -3017,6 +3039,8 @@ async function accountsLane() {
     return;
   }
   const URL3 = `https://127.0.0.1:${PORT3}/`;
+  /** The accounts relay, as these pages name it. */
+  const SERVER3 = `127.0.0.1:${PORT3}`;
   const acct = `ui${process.pid % 100000}`;
   const pw = "correct horse battery staple";
   const openDialog = async () => {
@@ -3074,7 +3098,9 @@ async function accountsLane() {
       r.onsuccess = () => { const q = r.result.transaction("devices").objectStore("devices").count();
         q.onsuccess = () => done(q.result); q.onerror = () => done(-1); };
       r.onerror = () => done(-1); })`);
-  for (let i = 0; i < 40 && (await remembered(up)) < 1; i++) await sleep(150);
+  // A poll, not a wait on a timer: IndexedDB answers asynchronously, which seen() cannot
+  // read, so this polls it, for as long as a hang takes (rule 1)
+  for (const end = Date.now() + HANG_MS; Date.now() < end && (await remembered(up)) < 1; ) await sleep(150);
   check("this browser is remembered for the account", (await remembered(up)) === 1);
   await up.send("Page.close").catch(() => {});
 
@@ -3116,7 +3142,7 @@ async function accountsLane() {
     for (let i = 0; i < 3 && !(await tab.evaluate(`!!document.querySelector('.account-dialog[data-kind="safety"] .secret')`)); i++) {
       await tab.evaluate(`(() => { const el = ${row}?.closest(".user"); if (!el) return false;
         el.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, clientX: 40, clientY: 40 })); return true; })()`);
-      await sleep(300);
+      await probe(tab, `[...document.querySelectorAll(".ctx-item")].some((e) => e.textContent.includes("Verify identity"))`, 2_000);
       await tab.evaluate(`(() => { const b = [...document.querySelectorAll(".ctx-item")].find((e) => e.textContent.includes("Verify identity"));
         if (!b) return false; b.click(); return true; })()`);
       await probe(tab, `document.querySelector('.account-dialog[data-kind="safety"] .secret')`, 2_000);
@@ -3154,7 +3180,7 @@ async function accountsLane() {
     await waitFor(tab, them, 15_000);
     await tab.evaluate(`(() => { const el = ${them}?.closest(".user"); if (!el) return false;
       el.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, clientX: 40, clientY: 40 })); return true; })()`);
-    await sleep(300);
+    await waitFor(tab, `[...document.querySelectorAll(".ctx-item")].some((e) => /direct message/i.test(e.textContent))`);
     await tab.evaluate(`(() => { const b = [...document.querySelectorAll(".ctx-item")].find((e) => /direct message/i.test(e.textContent));
       if (!b) return false; b.click(); return true; })()`);
     await waitFor(tab, `document.querySelector(".input-bar .chat-input")`, 10_000);
@@ -3173,9 +3199,10 @@ async function accountsLane() {
   // After a reload: signed back in, not at the dialog (which has a channel
   // list behind it)
   const reload = async (tab) => {
+    // Marked, so the page read after it is the new one: the old one is signed in too
+    await tab.evaluate(`window.__beforeReload = true`);
     await tab.send("Page.reload");
-    await sleep(1000);
-    const signedIn = await waitFor(tab, `document.querySelector(".channel-list") && !document.querySelector(".connect-btn")`, 30_000).then(() => true, () => false);
+    const signedIn = await waitFor(tab, `!window.__beforeReload && document.querySelector(".channel-list") && !document.querySelector(".connect-btn")`, 30_000).then(() => true, () => false);
     if (signedIn) await answerFirstRun(tab, "accounts", 15_000);
     return signedIn;
   };
@@ -3219,10 +3246,16 @@ async function accountsLane() {
   // Their turn, with the conversation open here: the next message goes to who
   // they are now, not who they were.
   await reload(two);
-  await sleep(1500); // the roster that says who they are now
+  // Rule 5, for the roster that says who they are now: two is signed in again, so its
+  // sign-in is queued; past its barrier and back's, what the relay told back of it is in
+  check("past two and back's barrier", await barrier(SERVER3, two, back));
   const afterReload = `after your reload ${process.pid}`;
+  await back.evaluate(`window.__voipc_said.splice(0); 0`);
   await sayIn(back, afterReload);
-  await sleep(1000);
+  // The message goes after the bundle fetch; once it is out, a "left" answer to it is in
+  // past back's barrier
+  await waitFor(back, sentKind("SendEncryptedDirectMessage"));
+  check("past back's barrier", await barrier(SERVER3, back));
   const leftNotice = async () => (await markers(back)).includes("left the server");
   check("somebody who just reloaded is not said to have left", !(await leftNotice()), await markers(back));
   await openDmRow(two, acct).catch(() => {});
@@ -3242,7 +3275,8 @@ async function accountsLane() {
   check("what was cleared does not come back with a reload", !clearedRow || !(await reads(back, toB, 2_000)), await texts(back));
   await dmWith(back, acctB);
   await two.send("Page.close").catch(() => {});
-  await sleep(1000);
+  // The relay has let go of the closed page once back's list drops it
+  await waitFor(back, `!(${row})`);
   const dmNote = `a word for later ${process.pid}`;
   await sayIn(back, dmNote);
   const dmKept = await waitFor(

@@ -80,6 +80,11 @@ pub struct Silence {
     pub(crate) reason: String,
     /// When `by`'s own restriction ends, whatever the new-member wait adds.
     pub(crate) by_until: i64,
+    /// What `by`'s own restriction holds, apart from the wait (W3-17).
+    pub(crate) by_voice: bool,
+    pub(crate) by_text: bool,
+    /// When the new-member wait ends; 0: none.
+    pub(crate) wait_until: i64,
 }
 
 /// The clock is read only for someone held: this runs per voice packet.
@@ -126,14 +131,21 @@ impl Silence {
         } else {
             Some(self.by_until).filter(|u| *u > now && *u != i64::MAX)
         };
+        let secs = |u: i64| (u - now).min(i64::from(u32::MAX)) as u32;
+        // Each part as its own: a voice-only mute during the wait is a mute, and the wait's
+        // own end says when writing comes back (W3-17)
+        let by = !self.by.is_empty() && self.by_until > now;
         Restriction {
             user_id,
             voice: self.voice_until > now,
             text: self.text_until > now,
             direct: self.direct_until > now,
-            expires_in_secs: next.map(|u| (u - now).min(i64::from(u32::MAX)) as u32),
+            expires_in_secs: next.map(secs),
             by: self.by.clone(),
             reason: self.reason.clone(),
+            by_voice: by && self.by_voice,
+            by_text: by && self.by_text,
+            wait_in_secs: Some(self.wait_until).filter(|u| *u > now).map(secs),
         }
     }
 }
@@ -199,6 +211,8 @@ fn worked_out(state: &ServerState, s: &UserSession, now: i64) -> Silence {
             out.voice_until = if r.voice { until } else { 0 };
             out.text_until = if r.text { until } else { 0 };
             out.by_until = until;
+            out.by_voice = r.voice;
+            out.by_text = r.text;
             out.by.clone_from(&r.by);
             out.reason.clone_from(&r.reason);
         }
@@ -207,6 +221,7 @@ fn worked_out(state: &ServerState, s: &UserSession, now: i64) -> Silence {
         out.voice_until = out.voice_until.max(until);
         out.text_until = out.text_until.max(until);
         out.direct_until = until;
+        out.wait_until = until;
     }
     out
 }
@@ -693,5 +708,67 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(wait.row(7, now).expires_in_secs, Some(600));
+    }
+
+    /// W3-17, the rest: a voice-only mute during the wait says it is the moderator's voice and
+    /// the wait's writing, each with its own end (protocol 23).
+    #[test]
+    fn each_part_of_a_row_says_whose_it_is() {
+        let now = 1_000_000;
+        let muted_new = Silence {
+            voice_until: now + 86_400,
+            text_until: now + 600,
+            direct_until: now + 600,
+            by: "mod".into(),
+            by_until: now + 86_400,
+            by_voice: true,
+            by_text: false,
+            wait_until: now + 600,
+            ..Default::default()
+        };
+        let r = muted_new.row(7, now);
+        assert!(r.voice && r.text && r.direct);
+        assert_eq!(
+            (r.by_voice, r.by_text),
+            (true, false),
+            "the mod muted, the wait holds text"
+        );
+        assert_eq!(
+            (r.expires_in_secs, r.wait_in_secs),
+            (Some(86_400), Some(600))
+        );
+        // At the very second each ends, it holds no more (a mutant's `>=` kept both a second)
+        let r = muted_new.row(7, now + 600);
+        assert_eq!(r.wait_in_secs, None, "the wait ends at its end");
+        let r = muted_new.row(7, now + 86_400);
+        assert_eq!(
+            (r.by_voice, r.by_text),
+            (false, false),
+            "and theirs at theirs"
+        );
+        // The wait over: the mute alone
+        let r = muted_new.row(7, now + 601);
+        assert!(r.voice && !r.text && !r.direct);
+        assert_eq!(r.wait_in_secs, None);
+        // A moderator's row run out names nothing of theirs, whatever the wait still holds
+        let ran_out = Silence {
+            by_until: now - 1,
+            ..muted_new.clone()
+        };
+        let r = ran_out.row(7, now);
+        assert_eq!((r.by_voice, r.by_text), (false, false));
+        // The wait alone
+        let wait = Silence {
+            voice_until: now + 600,
+            text_until: now + 600,
+            direct_until: now + 600,
+            wait_until: now + 600,
+            ..Default::default()
+        };
+        let r = wait.row(7, now);
+        assert_eq!(
+            (r.by_voice, r.by_text, r.wait_in_secs),
+            (false, false, Some(600))
+        );
     }
 }

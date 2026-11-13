@@ -757,9 +757,15 @@ pub(super) async fn fetch(
 /// An account's direct conversations (`index`). The range keeps channels' rows out on both
 /// databases: SQLite cannot narrow by a LIKE on a BINARY index, and a pattern starting
 /// `d:%` narrows no further on Postgres. Within it this reads every direct row on the relay.
+/// An account's direct conversations with something kept: where its id is the first in the
+/// name, a range of `voipc_log_conv_seq` (`$1`..`$2`); the second (`$3`), one of
+/// `voipc_log_dm_second` (0012). Not one read of every direct row (Round C).
 pub(super) const DIRECT_CONVS: &str = "SELECT conv, MAX(seq) FROM voipc_log
-     WHERE conv >= 'd:' AND conv < 'd;' AND (conv LIKE $1 OR conv LIKE $2) AND keep_until > $3
-     GROUP BY conv ORDER BY conv";
+     WHERE conv >= $1 AND conv < $2 AND keep_until > $4 GROUP BY conv
+     UNION
+     SELECT conv, MAX(seq) FROM voipc_log
+     WHERE conv >= 'd:' AND conv < 'd;' AND substr(conv, 36) = $3 AND keep_until > $4 GROUP BY conv
+     ORDER BY 1";
 
 /// The conversations with something for us, direct ones first, past 512 in several
 /// answers, and every joiner still waiting for our keys (one `LogPending` per
@@ -773,8 +779,9 @@ pub(super) async fn index(
     let now_ms = now_ms();
     let mut convs: Vec<(String, i64)> = db!(relay.store(), pool => {
         sqlx::query_as(DIRECT_CONVS)
-        .bind(format!("d:{hex}:%"))
-        .bind(format!("d:%:{hex}"))
+        .bind(format!("d:{hex}:"))
+        .bind(format!("d:{hex};"))
+        .bind(&hex)
         .bind(now_ms)
         .fetch_all(pool)
         .await?

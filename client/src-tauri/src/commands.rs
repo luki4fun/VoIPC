@@ -3577,6 +3577,9 @@ pub async fn save_chat_messages(
     // Chat key → newest deleted timestamp. What keeps a cleared channel from
     // filling back up the next time a member offers their history.
     cleared: Option<HashMap<String, u64>>,
+    // The last `log-read-upto` the front end had filed when it took these: the log's
+    // cursors up to that read go to disk with them, never ahead of them.
+    read_upto: Option<u64>,
 ) -> Result<(), String> {
     let mut chat = state.chat.write().await;
 
@@ -3590,6 +3593,9 @@ pub async fn save_chat_messages(
     if let Some(cleared) = cleared {
         chat.archive.cleared = cleared;
     }
+    if let Some(upto) = read_upto {
+        chat.commit_reads(upto);
+    }
     // Whatever the front end handed us, nothing already past its destruction
     // deadline is written to disk. The sweep on screen and this one are the
     // same rule applied to the two copies.
@@ -3602,6 +3608,17 @@ pub async fn save_chat_messages(
 }
 
 /// Clear all chat history: empties the archive and re-encrypts the file.
+/// With chat history off nothing of a read is kept here, so its cursors go to disk as it
+/// is filed (`log-read-upto`): what was read is not read back at the next start.
+#[tauri::command]
+pub async fn log_read_saved(state: State<'_, AppState>, upto: u64) -> Result<(), String> {
+    let mut chat = state.chat.write().await;
+    if chat.commit_reads(upto) && chat.sealing_key.is_some() {
+        chat.dirty = true;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn clear_chat_history(state: State<'_, AppState>) -> Result<(), String> {
     let mut chat = state.chat.write().await;

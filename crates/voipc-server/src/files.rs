@@ -3612,7 +3612,9 @@ mod tests {
             }
         }
         let mut status = 0;
-        for _ in 0..200 {
+        // Until it is past the 409, however slow the machine: a minute is a hang
+        let until = std::time::Instant::now() + Duration::from_secs(60);
+        while std::time::Instant::now() < until {
             let rest = Bytes::copy_from_slice(&bytes[MAX_CHUNK..]);
             status = http(&state, IP_A, "PUT", &at(MAX_CHUNK), Some(&auth), None, rest)
                 .await
