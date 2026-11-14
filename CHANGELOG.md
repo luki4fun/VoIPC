@@ -77,6 +77,9 @@ Measured on a disk-backed relay before and after; each one has a test.
 - **Lift ban holds for someone who deleted their account themselves**: the next import made their banned row again.
 - **Deleting an account takes its imported posts also after it unlinked Discord**: unlinking forgot the Discord id.
 - `voipc-import`'s check that it touches no disk failed on the fuzz replay added in 1.11.1.
+- The relay logged "session established over the TCP fallback" also for a tunnel the app opened in its QUIC/TCP race
+  and closed again unused; on a slow network that failed the browser test's QUIC run. It is logged once the app sends
+  on the tunnel now.
 
 ## [1.11.1] - release candidate
 

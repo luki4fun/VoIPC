@@ -240,8 +240,7 @@ async fn run<S>(
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let label = format!("tcp:{}", peer.ip());
-    // test-web.sh counts this line; the address only at debug
-    info!("session established over the TCP fallback");
+    // A client that won the race on QUIC closes this unused: "established" waits for its first word
     debug!(peer = %label, "tunnel opened");
 
     let SessionStart {
@@ -323,6 +322,7 @@ async fn read_side<R: AsyncRead + Unpin>(
     decoder.feed(&leftover);
     let mut session: Option<SessionId> = None;
     let mut bridge_open = true;
+    let mut spoke = false;
     let mut chunk = vec![0u8; 16 * 1024];
     loop {
         loop {
@@ -337,6 +337,12 @@ async fn read_side<R: AsyncRead + Unpin>(
             match message {
                 Message::Binary(data) => match data.split_first() {
                     Some((0x00, control)) => {
+                        if !spoke {
+                            spoke = true;
+                            // test-web.sh counts this line: a session the client runs here,
+                            // not a race loser it closed unused
+                            info!("session established over the TCP fallback");
+                        }
                         // A write fails once the handler is gone: what the
                         // client still says goes nowhere, but it is read
                         if bridge_open && bridge.write_all(control).await.is_err() {
