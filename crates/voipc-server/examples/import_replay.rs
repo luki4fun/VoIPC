@@ -119,8 +119,16 @@ struct Codes {
 
 impl Codes {
     async fn next(&mut self) -> String {
-        let now = l4f_accounts::util::now() / PERIOD;
-        let step = (self.last + 1).max(now - 1);
+        let secs = l4f_accounts::util::now();
+        let now = secs / PERIOD;
+        // The step before only while this one has 10 s left: made at :59 and checked at :00,
+        // it is two steps old at the relay and refused
+        let oldest = if secs % PERIOD < PERIOD - 10 {
+            now - 1
+        } else {
+            now
+        };
+        let step = (self.last + 1).max(oldest);
         if step > now + 1 {
             let wait = (step - 1) * PERIOD - l4f_accounts::util::now();
             tokio::time::sleep(Duration::from_secs(wait.max(0) as u64 + 1)).await;

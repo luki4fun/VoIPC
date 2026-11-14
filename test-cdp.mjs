@@ -180,10 +180,31 @@ export async function openTab(cdpPort, opts = {}) {
   // Chrome changes its certificate verifier once, soon after it starts, and a load still being
   // verified then fails with net::ERR_CERT_VERIFIER_CHANGED: no script or style, a blank page.
   // CI runs 43121449320, 43247162522 and 43582560287 failed so, each on a browser's first load,
-  // 0.4 s after its start. That is the browser, not the app: the tab loads again, once, and
+  // 0.4 s after its start. Soak run 43620651318 lost a first load's chunks as net::ERR_FAILED,
+  // 4 s in, with nothing at the relay. Neither is the app (the relay's failures are statuses,
+  // resets and closes; Chrome's own cancels are ERR_ABORTED): the tab loads again, once, and
   // says so (test-web.sh counts it); what the broken load threw is not the page's error.
+  // A file that failed for a reason of its own (a reset, a close, a timeout) is the relay's or the
+  // link's: once one has, no ERR_FAILED alongside it loads the tab again either.
   const verifierFailed = new Set();
   let reloaded = false;
+  let ownCause = false;
+  const ownAsset = (url) => {
+    try {
+      return new URL(url).pathname.startsWith("/assets/");
+    } catch {
+      return false;
+    }
+  };
+  const lostFile = (p, url) => {
+    if (p.errorText === "net::ERR_CERT_VERIFIER_CHANGED") return !!url;
+    if (p.canceled || p.blockedReason || p.corsErrorStatus || !ownAsset(url)) return false;
+    if (p.errorText !== "net::ERR_FAILED") {
+      ownCause = true;
+      return false;
+    }
+    return !ownCause;
+  };
   const byVerifier = (text) =>
     [...verifierFailed].some((url) => {
       try {
@@ -215,11 +236,11 @@ export async function openTab(cdpPort, opts = {}) {
       net.failed.push(`${clock()} ${p.errorText}${p.canceled ? " (canceled)" : ""}${p.blockedReason ? ` (blocked: ${p.blockedReason})` : ""} ${url}`);
       net.failed.splice(0, net.failed.length - 12);
       net.open.delete(p.requestId);
-      if (p.errorText === "net::ERR_CERT_VERIFIER_CHANGED" && url) {
+      if (lostFile(p, url)) {
         verifierFailed.add(url);
         if (!reloaded) {
           reloaded = true;
-          console.log(`NOTE chrome changed its certificate verifier during a load (${url}): the tab loads again`);
+          console.log(`NOTE chrome lost a file of the page (${p.errorText} ${url}): the tab loads again`);
           send("Page.reload", { ignoreCache: true }).catch(() => {});
         }
       }

@@ -405,8 +405,11 @@ async function turnOnCodes(tab) {
 let codeStepUsed = 0;
 async function nextCode() {
   for (;;) {
-    const now = Math.floor(Date.now() / 30_000);
-    const step = Math.max(codeStepUsed + 1, now - 1);
+    const at = Date.now() / 30_000;
+    const now = Math.floor(at);
+    // The step before only while this one has 10 s left: a code made at :59 and checked at :00
+    // is two steps old there, refused, and its question back (soak run 43620651318)
+    const step = Math.max(codeStepUsed + 1, at - now < 2 / 3 ? now - 1 : now);
     if (step <= now + 1) {
       codeStepUsed = step;
       return step;
