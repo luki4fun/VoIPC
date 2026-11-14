@@ -1035,8 +1035,26 @@ async function lane() {
   // the writer of it (her chain ends at its next post) is in at cathy's
   await waitFor(plain, sentKind("LeaveChannel"));
   check("past oskar and cathy's barrier", await barrier(SERVER, plain, cat));
+  // Soak run 43620651318: paula's page held this post a minute with no key that opened it ("Nobody
+  // online shares it"), a second after her sign-in, and nothing told which step of the hand-off
+  // failed: the browser build logs none of it. A miss prints what reached her and what cathy
+  // sent from here on, and both pages' warnings, then stops the lane as before.
+  const heardFrom = await held.evaluate(`window.__voipc_heard.length`);
+  const saidFrom = await cat.evaluate(`window.__voipc_said.length`);
   await say(cat, "after someone left");
-  await waitFor(held, lastMessage("after someone left"), 60_000);
+  if (!(await seen(held, lastMessage("after someone left"), 60_000))) {
+    // Pings and Pongs out, bytes as a count, and a frame's ids are BigInts JSON cannot write
+    const frames = (tab, list, from) =>
+      tab
+        .evaluate(`JSON.stringify(window.${list}.slice(${from}).filter((f) => !/^(Ping|Pong)$/.test(Array.isArray(f) ? f[0] : typeof f === "string" ? f : Object.keys(f ?? {})[0])),
+          (k, v) => typeof v === "bigint" ? String(v) : v instanceof Uint8Array || (Array.isArray(v) && v.length > 16 && v.every((x) => typeof x === "number")) ? "<" + v.length + " bytes>" : v)`)
+        .then((s) => s.slice(0, 4000), (e) => `(${e.message.slice(0, 200)})`);
+    console.log(`--- paula heard since cathy's post: ${await frames(held, "__voipc_heard", heardFrom)}`);
+    console.log(`--- cathy sent since her post: ${await frames(cat, "__voipc_said", saidFrom)}`);
+    console.log(`--- paula's page said: ${held.net.said.join(" | ") || "nothing"}`);
+    console.log(`--- cathy's page said: ${cat.net.said.join(" | ") || "nothing"}`);
+    throw new Error(`paula never read cathy's post past the leave\n${await diagnose(held)}`);
+  }
   await sleep(1500);
   await reloaded(held);
   check("kept: past a leave, a reload still reads it back", await seen(held, lastMessage("after someone left"), 60_000), await messagesOf(held));
