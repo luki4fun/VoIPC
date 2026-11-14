@@ -177,6 +177,21 @@ export async function openTab(cdpPort, opts = {}) {
   // In a plain object, so a lane's wrapper ({ ...tab }) still sees the live state
   // `said`: the page's last console warnings and errors, counted or not, for a report
   const net = { open: new Map(), failed: [], navigation: null, said: [] };
+  // Chrome changes its certificate verifier once, soon after it starts, and a load still being
+  // verified then fails with net::ERR_CERT_VERIFIER_CHANGED: no script or style, a blank page.
+  // CI runs 43121449320, 43247162522 and 43582560287 failed so, each on a browser's first load,
+  // 0.4 s after its start. That is the browser, not the app: the tab loads again, once, and
+  // says so (test-web.sh counts it); what the broken load threw is not the page's error.
+  const verifierFailed = new Set();
+  let reloaded = false;
+  const byVerifier = (text) =>
+    [...verifierFailed].some((url) => {
+      try {
+        return text.includes(new URL(url).pathname);
+      } catch {
+        return false;
+      }
+    });
   const foreign = (url) => ownCodeOnly && !!url && !/^https?:/.test(url);
   const where = (at) => (detailed && at ? ` @${at.url}:${at.lineNumber + 1}` : "");
   const preview = (o) =>
@@ -200,12 +215,21 @@ export async function openTab(cdpPort, opts = {}) {
       net.failed.push(`${clock()} ${p.errorText}${p.canceled ? " (canceled)" : ""}${p.blockedReason ? ` (blocked: ${p.blockedReason})` : ""} ${url}`);
       net.failed.splice(0, net.failed.length - 12);
       net.open.delete(p.requestId);
+      if (p.errorText === "net::ERR_CERT_VERIFIER_CHANGED" && url) {
+        verifierFailed.add(url);
+        if (!reloaded) {
+          reloaded = true;
+          console.log(`NOTE chrome changed its certificate verifier during a load (${url}): the tab loads again`);
+          send("Page.reload", { ignoreCache: true }).catch(() => {});
+        }
+      }
     } else if (msg.method === "Runtime.exceptionThrown") {
       // A rejection with a plain object describes itself as "Object": its
       // preview and where it was thrown are what make the report readable (detailed)
       const d = p.exceptionDetails;
       const at = d.stackTrace?.callFrames?.[0] ?? (d.url ? { url: d.url, lineNumber: d.lineNumber ?? 0 } : null);
       if (foreign(at?.url)) return;
+      if (byVerifier(`${d.text ?? ""} ${d.exception?.description ?? ""}`)) return;
       // A file that did not load says why it did not, from the network's side
       const why = /dynamically imported module|preload CSS/.test(`${d.exception?.description}`)
         ? ` [failed loads: ${net.failed.join("; ")}]`
@@ -219,6 +243,7 @@ export async function openTab(cdpPort, opts = {}) {
     if (msg.method === "Runtime.consoleAPICalled" && p.type === "error" && consoleErrors) {
       const at = p.stackTrace?.callFrames?.[0];
       if (foreign(at?.url)) return;
+      if (byVerifier(p.args.map((a) => a.value ?? a.description ?? "").join(" "))) return;
       // test-ui's lines never had the prefix, test-move's always did
       errors.push(`${detailed ? "" : "console: "}${p.args.map((a) => a.value ?? (preview(a) || a.description) ?? "").join(" ")}${where(at)}`);
     }

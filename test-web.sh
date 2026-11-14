@@ -471,12 +471,13 @@ elif [ "$BROWSER_ALICE" = chromium ] || [ "$BROWSER_BOB" = chromium ]; then
       refused=$(sed 's/\x1b\[[0-9;]*m//g' "$WORK/$1-relay.log" | grep -cE 'rejecting (connection|session)' || true)
     fi
     blank=$(grep -c '^NOTE a first page load stayed blank' "$WORK/$1.txt" 2>/dev/null || true)
+    verifier=$(grep -c '^NOTE chrome changed its certificate verifier' "$WORK/$1.txt" 2>/dev/null || true)
     # test-cdp.mjs: waits over 10 s (SLOW), and waits that ran out (TIMEOUT: in a run that
     # passes, a probe in disguise that costs its full limit)
     local slow timeout
     slow=$(grep -c '^SLOW ' "$WORK/$1.txt" 2>/dev/null || true)
     timeout=$(grep -c '^TIMEOUT ' "$WORK/$1.txt" 2>/dev/null || true)
-    echo "--- $1: relay refused ${refused:-0} connection(s) or session(s), ${blank:-0} blank first load(s) tried again, ${slow:-0} slow wait(s), ${timeout:-0} wait(s) ran out"
+    echo "--- $1: relay refused ${refused:-0} connection(s) or session(s), ${blank:-0} blank first load(s) tried again, ${verifier:-0} load(s) again after chrome changed its certificate verifier, ${slow:-0} slow wait(s), ${timeout:-0} wait(s) ran out"
     if [ "${refused:-0}" != 0 ]; then
       sed 's/\x1b\[[0-9;]*m//g' "$WORK/$1-relay.log" | grep -E 'rejecting (connection|session)' | sed -E 's/.*rejecting (connection|session): /\1: /' | sort | uniq -c
     fi
