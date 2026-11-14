@@ -20,10 +20,12 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { deflateSync } from "node:zlib";
-import { diagnose, loadPage, openTab, probe, seen, sleep, startChromium, waitFor } from "./test-cdp.mjs";
+import { barrier, diagnose, loadPage, openTab, probe, seen, sentKind, sleep, startChromium, waitFor } from "./test-cdp.mjs";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.argv[2] ?? 49991);
+/** The relay, as every page names it. */
+const SERVER = `127.0.0.1:${PORT}`;
 const CHROME = process.env.CHROME ?? "chromium";
 const ORIGIN = `https://127.0.0.1:${PORT}`;
 const WORK = mkdtempSync(join(tmpdir(), "voipc-community-"));
@@ -266,7 +268,8 @@ async function turnOnCodes(tab) {
   await tab.evaluate(`document.querySelector('${dialogOf("totp-setup")} .submit-btn').click()`);
   await waitFor(tab, `document.querySelector('${dialogOf("recovery-codes")}')`);
   await tab.evaluate(`document.querySelector('${dialogOf("recovery-codes")} .submit-btn').click()`);
-  await sleep(500);
+  // Its Done closes it (AccountPrompts `closePrompt`); the codes came with the server's yes
+  await waitFor(tab, `!document.querySelector('${dialogOf("recovery-codes")}')`);
   return secret;
 }
 
@@ -311,7 +314,8 @@ async function lane() {
   await waitFor(ann, `document.querySelector(".admin-dialog .admin-input")`);
   await ann.evaluate(setInput('.admin-dialog input[type="password"]', TOKEN));
   await ann.evaluate(`document.querySelector(".admin-dialog .admin-ok").click()`);
-  await sleep(1500);
+  // The login's yes is what closes it (admin-ui.ts `panelAllowed`), and turns the menu's entry
+  await waitFor(ann, `!document.querySelector('.admin-dialog input[aria-label="Admin token"]')`);
   await serverMenu(ann, "Server admin");
   await waitFor(ann, `document.querySelector(".admin-tabs")`);
 
@@ -319,6 +323,10 @@ async function lane() {
   await createAccount(bob, "bobby");
 
   const tabTo = (name) => ann.evaluate(`${byText(".admin-tabs button", name)}.click()`);
+  /** A tab is up: its button selected, and the old tab's view gone with it (one render). */
+  const tabShown = (name) => `${byText(".admin-tabs button", name)}?.getAttribute("aria-selected") === "true"`;
+  /** The Users tab is up, on its list or on the account last looked at (a store: no read). */
+  const usersShown = `${tabShown("Users")} && !!(document.querySelector(".admin-dialog .btn-back") || document.querySelector('.admin-dialog input[aria-label="Search accounts"]'))`;
   /** The panel's step-up: a code one step ahead each time, since a code is good once. */
   let codeStep = Math.floor(Date.now() / 30_000);
   const stepUp = async () => {
@@ -366,10 +374,9 @@ async function lane() {
   const dungeonRow = `[...document.querySelectorAll(".admin-dialog button")].find((b) => b.getAttribute("aria-label") === "Move dungeon up")`;
   check("a channel outside any category has its row in the panel", await seen(ann, dungeonRow), await ann.evaluate(`document.querySelector(".admin-dialog")?.innerText.slice(0, 500) ?? ""`));
   await ann.evaluate(`${dungeonRow}?.parentElement.querySelector("button[title^='Opens the first time']")?.click(); 0`);
-  await sleep(300);
   check(
     "and can be made the welcome channel",
-    await seen(ann, `${dungeonRow}?.parentElement.textContent.includes("Not the welcome")`, 5_000),
+    await seen(ann, `${dungeonRow}?.parentElement.textContent.includes("Not the welcome")`),
     await ann.evaluate(`${dungeonRow}?.parentElement.textContent ?? "no row"`),
   );
 
@@ -402,7 +409,9 @@ async function lane() {
   await waitFor(ann, `document.querySelector('.admin-dialog input[data-group="crew"]')`);
   await ann.evaluate(`document.querySelector('.admin-dialog input[data-group="crew"]').click()`);
   await stepUp();
-  await sleep(500);
+  // The grant goes out with the click, or with Confirm's (adminOp sends at once): past her
+  // barrier the relay has done it
+  check("past annika's grant barrier", await barrier(SERVER, ann));
   // Out of the panel for the member list
   await ann.evaluate(`document.querySelector(".admin-dialog .close-btn, .admin-dialog [aria-label='Close']")?.click(); 0`);
 
@@ -418,9 +427,12 @@ async function lane() {
   await openAccountPanel(bob);
   await bob.evaluate(setInput(`${dialogOf("account")} input[aria-label="Display name"]`, "Robert Example"));
   await bob.evaluate(`document.querySelector('${dialogOf("account")} form.row button[type=submit]').click()`);
-  await sleep(300);
   const rowName = `[...document.querySelectorAll(".user-list.modern .user .name")].find((n) => n.textContent.includes("@bobby"))`;
   check("a display name reaches the others", await seen(ann, `${rowName}?.textContent.includes("Robert Example")`), await ann.evaluate(`document.querySelector(".user-list.modern")?.innerText ?? ""`));
+  // His own field is set back from his profile (AccountPrompts `displayName`), and the relay
+  // tells him in its own turn (profile.rs `tell`, to all): once his own row has the name, that
+  // answer is in, and cannot put the name back over what is typed next
+  await waitFor(bob, `${rowName}?.textContent.includes("Robert Example")`);
   await bob.evaluate(setInput(`${dialogOf("account")} input[aria-label="Display name"]`, "annika"));
   await bob.evaluate(`document.querySelector('${dialogOf("account")} form.row button[type=submit]').click()`);
   check(
@@ -463,11 +475,12 @@ async function lane() {
   await waitFor(ann, `document.querySelector(".admin-tabs")`);
   await tabTo("Users");
   // It reopens on the account last looked at
-  await sleep(300);
+  await waitFor(ann, usersShown);
   await ann.evaluate(`document.querySelector(".admin-dialog .btn-back")?.click(); 0`);
   await waitFor(ann, `document.querySelector('.admin-dialog select[aria-label="Starting group"]')`);
   await ann.evaluate(setInput('.admin-dialog select[aria-label="Starting group"]', "crew"));
-  await sleep(200);
+  // A select's change is bound at once: it holds the group before Make link reads it
+  await waitFor(ann, `document.querySelector('.admin-dialog select[aria-label="Starting group"]').value === "crew"`);
   await ann.evaluate(`${byText(".admin-dialog button", "Make link")}.click()`);
   await waitFor(ann, `[...document.querySelectorAll(".admin-dialog .code")].find((c) => c.textContent.includes("#join="))`);
   const link = await ann.evaluate(`[...document.querySelectorAll(".admin-dialog .code")].find((c) => c.textContent.includes("#join=")).textContent`);
@@ -490,7 +503,7 @@ async function lane() {
   await settle(cat);
   // The list is read when the tab opens
   await tabTo("Groups");
-  await sleep(300);
+  await waitFor(ann, tabShown("Groups"));
   await tabTo("Users");
   check(
     "someone new lands in the welcome channel, whenever its layout came",
@@ -508,7 +521,7 @@ async function lane() {
   await serverMenu(ann, "Server admin");
   await waitFor(ann, `document.querySelector(".admin-tabs")`);
   await tabTo("Users");
-  await sleep(300);
+  await waitFor(ann, usersShown);
   await ann.evaluate(`document.querySelector(".admin-dialog .btn-back")?.click(); 0`);
   await waitFor(ann, `document.querySelector('.admin-dialog input[aria-label="Search accounts"]')`);
   await ann.evaluate(setInput('.admin-dialog input[aria-label="Search accounts"]', "cathy"));
@@ -570,7 +583,7 @@ async function lane() {
   };
   const closeShare = async (tab) => {
     await tab.evaluate(`document.querySelector(".panel .close-btn").click()`);
-    await sleep(200);
+    await waitFor(tab, `!(${shareBox})`);
   };
   const rowOf = (name) => `[...document.querySelectorAll(".user-list.modern .user")].find((u) => u.textContent.includes(${JSON.stringify(name)}))`;
   const marked = (name) => `!!${rowOf(name)}?.querySelector(".sharing-history")`;
@@ -591,8 +604,12 @@ async function lane() {
   check("no frame of the old way reaches anyone", ![...reader, ...writer].some((t) => ["EncryptedChannelChatMessage", "SenderKeyReceived"].includes(t)), [...reader, ...writer].join(" "));
 
   // On, without the privilege: nothing changes, and the switch says why
+  await cat.evaluate(`window.__voipc_said.splice(0); 0`);
   await openShare(cat);
-  await sleep(800);
+  // The tab asks by itself (SettingsPanel `askMine`): once that is out, past her barrier its
+  // answer is in
+  await waitFor(cat, `window.__voipc_said.some((m) => m?.Account?.ArchiveMine)`);
+  check("past cathy's barrier", await barrier(SERVER, cat));
   check(
     "a tab that asks about Discord posts by itself gives no toast for an account with none linked",
     !(await cat.evaluate(`[...document.querySelectorAll(".toast")].some((t) => t.textContent.includes("Link your Discord"))`)),
@@ -669,7 +686,7 @@ async function lane() {
   const sharersRow = `[...document.querySelectorAll(".admin-dialog .list-row")].find((r) => r.querySelector(".row-name")?.textContent.trim().startsWith("sharers"))`;
   await waitFor(ann, sharersRow);
   await tabTo("Users");
-  await sleep(300);
+  await waitFor(ann, usersShown);
   await ann.evaluate(`document.querySelector(".admin-dialog .btn-back")?.click(); 0`);
   await waitFor(ann, `document.querySelector('.admin-dialog input[aria-label="Search accounts"]')`);
   await ann.evaluate(setInput('.admin-dialog input[aria-label="Search accounts"]', "deedee"));
@@ -718,17 +735,18 @@ async function lane() {
   await waitFor(nilsTab, `document.querySelector(".channel-list")`, 60_000);
   await settle(nilsTab);
   await heard(dee);
-  await sleep(1500);
+  // Rule 5: what nils sent by now, and what the relay passed on to dee, is in (test-cdp `barrier`)
+  check("past nils and dee's barrier", await barrier(SERVER, nilsTab, dee));
   check("connecting asked nobody for history", !tagsOf(await heard(dee)).includes("EncryptedDirectChatMessage"));
   await openChat(nilsTab, "lobby-chat");
   check("a first opening asks, with no click", await seen(nilsTab, lastMessage("for whoever comes later"), 30_000));
   await openChat(nilsTab, "side-a");
   await openChat(nilsTab, "lobby-chat");
-  await sleep(2000);
+  check("past the first ask's barrier", await barrier(SERVER, nilsTab, dee));
   await heard(dee);
   await openChat(nilsTab, "side-a");
   await openChat(nilsTab, "lobby-chat");
-  await sleep(1500);
+  check("past the second opening's barrier", await barrier(SERVER, nilsTab, dee));
   check("a second opening asks nothing", !tagsOf(await heard(dee)).includes("EncryptedDirectChatMessage"));
   check(`no page error on nils's side`, nilsTab.errors.length === 0, nilsTab.errors.join(" | ").slice(0, 400));
 
@@ -868,7 +886,9 @@ async function lane() {
   await sleep(2500);
   await say(cat, "and again");
   await waitFor(dee, lastMessage("and again"), 60_000);
-  await sleep(500);
+  // Its key check came back before it went out, and she has it: past the barrier whatever she,
+  // or the relay, had for cathy has reached her
+  check("past deedee and cathy's barrier", await barrier(SERVER, dee, cat));
   check("once", (await cat.evaluate(`[...document.querySelectorAll(".history-marker")].filter((m) => m.textContent.includes("can now read what you write here")).length`)) === 1);
   await openChat(dee, "lobby-chat");
   await say(cat, "a dot on the row");
@@ -904,14 +924,13 @@ async function lane() {
   check("the Users tab offers to clear someone who has gone", await seen(ann, clearIt), await ann.evaluate(`document.querySelector(".admin-dialog")?.innerText.slice(0, 400) ?? ""`));
   check("under the name they chose", await ann.evaluate(`document.querySelector(".admin-dialog .section-title")?.textContent.includes("Robert Example")`));
   await ann.send("Emulation.setDeviceMetricsOverride", { width: 360, height: 800, deviceScaleFactor: 1, mobile: false });
-  await sleep(300);
   check(
     "beside the other actions, all on a phone's screen",
-    await ann.evaluate(`[...document.querySelectorAll(".admin-dialog .account-actions button")].every((b) => b.getBoundingClientRect().right <= innerWidth && b.getBoundingClientRect().left >= 0)`),
+    await seen(ann, `innerWidth === 360 && [...document.querySelectorAll(".admin-dialog .account-actions button")].every((b) => b.getBoundingClientRect().right <= innerWidth && b.getBoundingClientRect().left >= 0)`),
     await ann.evaluate(`JSON.stringify([...document.querySelectorAll(".admin-dialog .account-actions button")].map((b) => [b.textContent.trim(), Math.round(b.getBoundingClientRect().left), Math.round(b.getBoundingClientRect().right)]))`),
   );
   await ann.send("Emulation.setDeviceMetricsOverride", { width: 1280, height: 900, deviceScaleFactor: 1, mobile: false });
-  await sleep(300);
+  await waitFor(ann, `innerWidth === 1280`);
   await ann.evaluate(`${clearIt}.click()`);
   await waitFor(ann, byText(".confirm button", "Clear them"));
   await ann.evaluate(`${byText(".confirm button", "Clear them")}.click()`);
@@ -923,7 +942,9 @@ async function lane() {
   check("the button going is what says it worked", await seen(ann, `!${clearIt}`));
   check("and their history says so in words", await seen(ann, `document.querySelector(".admin-dialog .history")?.textContent.includes("Display name or picture cleared")`), await ann.evaluate(`document.querySelector(".admin-dialog .history")?.textContent ?? ""`));
   await openOnUsers("cathy");
-  await sleep(500);
+  // Her account is on screen, so its read came back; the button goes by what is known of her
+  // profile (AdminUsers `mayClear`), and past the barrier anything the relay had for annika is in
+  check("past annika's barrier", await barrier(SERVER, ann));
   check("someone with nothing chosen has no such button", await ann.evaluate(`!${clearIt}`));
   await ann.evaluate(`document.querySelector(".admin-dialog .close-btn, .admin-dialog [aria-label='Close']")?.click(); 0`);
 
@@ -1008,10 +1029,32 @@ async function lane() {
   const leaveRow = `[...${byText(".channel-list.modern .channels.text .channel", "lobby-chat")}.parentElement.querySelectorAll(".settings-icon")].find((b) => b.title.startsWith("Leave this channel"))`;
   await openChat(plain, "lobby-chat");
   await waitFor(plain, leaveRow);
+  await plain.evaluate(`window.__voipc_said.splice(0); 0`);
   await plain.evaluate(`${leaveRow}.click()`);
-  await sleep(1500);
+  // Rule 5: once her LeaveChannel is out, past the barrier the relay has done it, and what it told
+  // the writer of it (her chain ends at its next post) is in at cathy's
+  await waitFor(plain, sentKind("LeaveChannel"));
+  check("past oskar and cathy's barrier", await barrier(SERVER, plain, cat));
+  // Soak run 43620651318: paula's page held this post a minute with no key that opened it ("Nobody
+  // online shares it"), a second after her sign-in, and nothing told which step of the hand-off
+  // failed: the browser build logs none of it. A miss prints what reached her and what cathy
+  // sent from here on, and both pages' warnings, then stops the lane as before.
+  const heardFrom = await held.evaluate(`window.__voipc_heard.length`);
+  const saidFrom = await cat.evaluate(`window.__voipc_said.length`);
   await say(cat, "after someone left");
-  await waitFor(held, lastMessage("after someone left"), 60_000);
+  if (!(await seen(held, lastMessage("after someone left"), 60_000))) {
+    // Pings and Pongs out, bytes as a count, and a frame's ids are BigInts JSON cannot write
+    const frames = (tab, list, from) =>
+      tab
+        .evaluate(`JSON.stringify(window.${list}.slice(${from}).filter((f) => !/^(Ping|Pong)$/.test(Array.isArray(f) ? f[0] : typeof f === "string" ? f : Object.keys(f ?? {})[0])),
+          (k, v) => typeof v === "bigint" ? String(v) : v instanceof Uint8Array || (Array.isArray(v) && v.length > 16 && v.every((x) => typeof x === "number")) ? "<" + v.length + " bytes>" : v)`)
+        .then((s) => s.slice(0, 4000), (e) => `(${e.message.slice(0, 200)})`);
+    console.log(`--- paula heard since cathy's post: ${await frames(held, "__voipc_heard", heardFrom)}`);
+    console.log(`--- cathy sent since her post: ${await frames(cat, "__voipc_said", saidFrom)}`);
+    console.log(`--- paula's page said: ${held.net.said.join(" | ") || "nothing"}`);
+    console.log(`--- cathy's page said: ${cat.net.said.join(" | ") || "nothing"}`);
+    throw new Error(`paula never read cathy's post past the leave\n${await diagnose(held)}`);
+  }
   await sleep(1500);
   await reloaded(held);
   check("kept: past a leave, a reload still reads it back", await seen(held, lastMessage("after someone left"), 60_000), await messagesOf(held));
@@ -1037,16 +1080,25 @@ async function lane() {
     await waitFor(tab, box);
     await tab.evaluate(`(() => { const b = ${box}; b.value = ${JSON.stringify(mode)}; b.dispatchEvent(new Event("change", { bubbles: true })); })()`);
     await tab.evaluate(`document.querySelector(".panel .close-btn")?.click()`);
-    await sleep(500);
+    await waitFor(tab, `!${box}`);
   };
   await openChat(cat, "side-c");
   await say(cat, "side-c has a chain now");
   await sleep(1500);
+  await held.evaluate(`window.__voipc_said.splice(0); 0`);
   await quietMode(held, "always");
-  await sleep(1500);
+  // Rule 5: the mode goes out as SetQuiet (quiet.ts `applyQuiet`); past her barrier the relay
+  // holds side-c quiet for her
+  await waitFor(held, sentKind("SetQuiet"));
+  check("past paula's quiet barrier", await barrier(SERVER, held));
   await held.evaluate(`window.__voipc_heard?.splice(0); 0`);
+  await said(cat);
   await say(cat, "while it slept");
-  await sleep(4000);
+  // The post goes after the writer's key check: once it is out, the barrier holds what the
+  // relay would have passed on
+  // `SendEncryptedChannelMessage` is ClientMessage #27 (golden), and goes as a raw frame
+  await waitFor(cat, sentKind("#27"));
+  check("past cat and held's barrier", await barrier(SERVER, cat, held));
   const asleep = tagsOf(await heard(held));
   check("kept: a channel asleep is sent no post", !asleep.includes("TextPost"), asleep.join(" "));
   await openChat(held, "side-c");
@@ -1095,7 +1147,8 @@ async function lane() {
     await waitFor(ann, box);
     if ((await ann.evaluate(`${box}.checked`)) !== on) await ann.evaluate(`${box}.click()`);
     await stepUp();
-    await sleep(500);
+    // The change goes out with the click, or with Confirm's: past her barrier the relay has done it
+    check("past annika's group barrier", await barrier(SERVER, ann));
     await ann.evaluate(`document.querySelector(".admin-dialog .close-btn, .admin-dialog [aria-label='Close']")?.click(); 0`);
   };
   const sideC = byText(".channel-list.modern .channels.text .channel", "side-c");
@@ -1107,7 +1160,10 @@ async function lane() {
   await ann.evaluate(`${gateCrew}.click()`);
   await ann.evaluate(`document.querySelector(".password-dialog button[type=submit]").click()`);
   await stepUp();
-  await sleep(1000);
+  // The dialog closes once its GateSet is out (channel-ui.ts `submitChannelSettings`): past the
+  // barrier the relay holds the gate, and what it told the writer and the reader of it is in
+  await waitFor(ann, `!document.querySelector('.password-dialog .gate-groups[data-gate="groups"]')`);
+  check("past the gate's barrier", await barrier(SERVER, ann, cat, held));
   await openChat(cat, "side-c");
   await openChat(held, "side-c");
   await say(cat, "for the crew");
@@ -1116,7 +1172,9 @@ async function lane() {
   await held.evaluate(`window.__toasts.length = 0; 0`);
   await inCrew2(false);
   check("out of its group, the channel goes from her list", await seen(held, `!${sideC}`), await held.evaluate(`document.querySelector(".channel-list.modern")?.innerText ?? ""`));
-  await sleep(1000);
+  // Both toasts come of relay frames (Kicked, Evicted), shown as they come: past annika's and
+  // her barrier every frame the change sent her has been
+  check("past annika and paula's barrier", await barrier(SERVER, ann, held));
   const lostToasts = (await held.evaluate(`window.__toasts`)).filter((t) => t.includes("side-c"));
   check("and she is told, with exactly one toast", lostToasts.length === 1 && lostToasts[0].includes("You were removed from #side-c"), JSON.stringify(await held.evaluate(`window.__toasts`)));
   await inCrew2(true);
@@ -1170,7 +1228,9 @@ async function lane() {
   };
   await said(gina);
   await choose(gina, "oskar", "Verify identity");
-  await sleep(1500);
+  // The first asks for the key (session.ts `safetyNumber`): past her barrier the bundle is in
+  await waitFor(gina, sentKind("RequestPreKeyBundle"));
+  check("past gina's barrier", await barrier(SERVER, gina));
   await choose(gina, "oskar", "Verify identity");
   check("Verify shows the number with someone never met", await seen(gina, `document.querySelector('${dialogOf("safety")}')`), await gina.evaluate(`document.body.innerText.slice(-200)`));
   await gina.evaluate(`document.querySelector('${dialogOf("safety")} .submit-btn')?.click(); 0`);

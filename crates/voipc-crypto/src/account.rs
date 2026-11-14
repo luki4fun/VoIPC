@@ -130,6 +130,79 @@ pub fn derive_from_master(master: &[u8; 32]) -> Derived {
     }
 }
 
+/// The password's login key (protocol v22): Ed25519 from the same stretch as the vault key,
+/// never sent. The relay keeps its public half in the password's place (l4f's host key)
+/// and checks a signature over its challenge and this connection (`crate::bind`), so
+/// neither the password nor anything that stands in for it leaves the device.
+pub struct LoginKey(Ed25519KeyPair);
+
+impl LoginKey {
+    pub fn from_master(master: &[u8; 32]) -> LoginKey {
+        let seed = Zeroizing::new(hkdf32(master, b"", "voipc-login-key/v1"));
+        LoginKey(Ed25519KeyPair::from_seed_unchecked(&seed[..]).expect("a 32-byte seed"))
+    }
+
+    pub fn public_key(&self) -> [u8; 32] {
+        self.0
+            .public_key()
+            .as_ref()
+            .try_into()
+            .expect("an Ed25519 public key is 32 bytes")
+    }
+
+    /// The answer to a challenge (`AuthStep::KeyChallenge`, `AccountReply::KeyChallenge`).
+    pub fn sign(
+        &self,
+        relay_id: &[u8; 16],
+        name: &str,
+        challenge: &str,
+        b: &crate::bind::Binding,
+    ) -> Vec<u8> {
+        self.0
+            .sign(&crate::bind::login_message(relay_id, name, challenge, b))
+            .as_ref()
+            .to_vec()
+    }
+}
+
+/// The identity's signature over a new login key (`AccountRequest::LoginKeySet`): what
+/// only a device that opened the vault can make, so a server that got a session out of
+/// the password's secret cannot put its own key in.
+pub fn login_key_proof(
+    identity: &IdentityKeyPair,
+    relay_id: &[u8; 16],
+    name: &str,
+    login_key: &[u8],
+    pass_slot: Option<&[u8]>,
+    b: &crate::bind::Binding,
+) -> Vec<u8> {
+    identity
+        .private_key()
+        .calculate_signature(
+            &crate::bind::login_key_message(relay_id, name, login_key, pass_slot, b),
+            &mut crate::rng(),
+        )
+        .expect("sign")
+        .to_vec()
+}
+
+pub fn login_key_proof_ok(
+    identity_key: &[u8],
+    relay_id: &[u8; 16],
+    name: &str,
+    login_key: &[u8],
+    pass_slot: Option<&[u8]>,
+    b: &crate::bind::Binding,
+    signature: &[u8],
+) -> bool {
+    libsignal_protocol::IdentityKey::decode(identity_key).is_ok_and(|k| {
+        k.public_key().verify_signature(
+            &crate::bind::login_key_message(relay_id, name, login_key, pass_slot, b),
+            signature,
+        )
+    })
+}
+
 /// `password` as the person typed it, NFC-normalised by the caller (the
 /// browser and the desktop share one front end, which does it); `name`
 /// normalised (`normalize_name`).
@@ -671,6 +744,81 @@ pub fn reset_key_proof(
         .to_vec()
 }
 
+/// `reset_key_proof`, bound (protocol v22): over the challenge, the new login key and the
+/// connection, so neither a server between nor anyone who sees it can put in another key.
+pub fn reset_key_proof_bound(
+    recovery: &[u8; 32],
+    relay_id: &[u8; 16],
+    name: &str,
+    challenge: &[u8],
+    login_key: &[u8],
+    b: &crate::bind::Binding,
+) -> Vec<u8> {
+    reset_signing_key(recovery, relay_id, name)
+        .sign(&crate::bind::reset_message(
+            "voipc-reset/v4",
+            relay_id,
+            name,
+            challenge,
+            login_key,
+            b,
+        ))
+        .as_ref()
+        .to_vec()
+}
+
+pub fn reset_key_proof_bound_ok(
+    reset_key: &[u8],
+    relay_id: &[u8; 16],
+    name: &str,
+    challenge: &[u8],
+    login_key: &[u8],
+    b: &crate::bind::Binding,
+    signature: &[u8],
+) -> bool {
+    crate::bind::ed25519_ok(
+        reset_key,
+        &crate::bind::reset_message("voipc-reset/v4", relay_id, name, challenge, login_key, b),
+        signature,
+    )
+}
+
+/// `reset_proof`, bound: the identity's, for an account made before 1.3.
+pub fn reset_proof_bound(
+    identity: &IdentityKeyPair,
+    relay_id: &[u8; 16],
+    name: &str,
+    challenge: &[u8],
+    login_key: &[u8],
+    b: &crate::bind::Binding,
+) -> Vec<u8> {
+    identity
+        .private_key()
+        .calculate_signature(
+            &crate::bind::reset_message("voipc-reset/v3", relay_id, name, challenge, login_key, b),
+            &mut crate::rng(),
+        )
+        .expect("sign")
+        .to_vec()
+}
+
+pub fn reset_proof_bound_ok(
+    identity_key: &[u8],
+    relay_id: &[u8; 16],
+    name: &str,
+    challenge: &[u8],
+    login_key: &[u8],
+    b: &crate::bind::Binding,
+    signature: &[u8],
+) -> bool {
+    libsignal_protocol::IdentityKey::decode(identity_key).is_ok_and(|k| {
+        k.public_key().verify_signature(
+            &crate::bind::reset_message("voipc-reset/v3", relay_id, name, challenge, login_key, b),
+            signature,
+        )
+    })
+}
+
 /// The relay's check of `reset_key_proof` against `slot.reset`.
 pub fn reset_key_proof_ok(
     reset_key: &[u8],
@@ -739,6 +887,49 @@ pub fn provider_proof_ok(
     libsignal_protocol::IdentityKey::decode(identity_key).is_ok_and(|k| {
         k.public_key()
             .verify_signature(&provider_message(relay_id, name, challenge), signature)
+    })
+}
+
+/// `provider_message`, bound to the connection (protocol v22).
+fn provider_message_bound(
+    relay_id: &[u8; 16],
+    name: &str,
+    challenge: &[u8],
+    b: &crate::bind::Binding,
+) -> Vec<u8> {
+    crate::bind::message("voipc-provider/v2", relay_id, name, &[challenge], b)
+}
+
+pub fn provider_proof_bound(
+    identity: &IdentityKeyPair,
+    relay_id: &[u8; 16],
+    name: &str,
+    challenge: &[u8],
+    b: &crate::bind::Binding,
+) -> Vec<u8> {
+    identity
+        .private_key()
+        .calculate_signature(
+            &provider_message_bound(relay_id, name, challenge, b),
+            &mut crate::rng(),
+        )
+        .expect("sign")
+        .to_vec()
+}
+
+pub fn provider_proof_bound_ok(
+    identity_key: &[u8],
+    relay_id: &[u8; 16],
+    name: &str,
+    challenge: &[u8],
+    b: &crate::bind::Binding,
+    signature: &[u8],
+) -> bool {
+    libsignal_protocol::IdentityKey::decode(identity_key).is_ok_and(|k| {
+        k.public_key().verify_signature(
+            &provider_message_bound(relay_id, name, challenge, b),
+            signature,
+        )
     })
 }
 
@@ -832,6 +1023,26 @@ impl DeviceKey {
             .to_vec()
     }
 
+    /// The device key over `voipc-devkey/v1|…`: the device and the challenge, bound to the
+    /// connection (`bind::devkey_ok` checks it).
+    pub fn sign_bound(
+        &self,
+        relay_id: &[u8; 16],
+        challenge: &str,
+        b: &crate::bind::Binding,
+    ) -> Vec<u8> {
+        Ed25519KeyPair::from_pkcs8(&self.pkcs8)
+            .expect("checked")
+            .sign(&crate::bind::devkey_message(
+                relay_id,
+                &self.device_id,
+                challenge,
+                b,
+            ))
+            .as_ref()
+            .to_vec()
+    }
+
     /// l4f's `devkey::message`: `"l4f-devkey-v1\0" || origin || "\0" ||
     /// device_id || "\0" || SHA-256(challenge)`.
     pub fn sign(&self, relay_id: &[u8; 16], challenge: &str) -> Vec<u8> {
@@ -919,14 +1130,28 @@ pub enum Method {
 /// a hostile one would sooner name a copy of it that asks for the password:
 /// nothing else is opened.
 pub fn provider_page_ok(url: &str) -> bool {
-    const PAGES: [&str; 3] = [
+    const PAGES: [&str; 2] = [
         "https://discord.com/oauth2/authorize?",
         "https://accounts.google.com/o/oauth2/v2/auth?",
-        "https://www.facebook.com/",
     ];
-    PAGES.iter().any(|p| url.starts_with(p))
+    (PAGES.iter().any(|p| url.starts_with(p)) || facebook_dialog(url))
         && url.len() <= 2048
         && url.bytes().all(|b| b.is_ascii_graphic())
+}
+
+/// Facebook's sign-in dialog, `/v<major>.<minor>/dialog/oauth?`, at whichever Graph API
+/// version l4f asks for. Its host alone is not enough (W1-20): it also serves the link
+/// redirector and pages anyone can run.
+fn facebook_dialog(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://www.facebook.com/v") else {
+        return false;
+    };
+    let Some((version, rest)) = rest.split_once('/') else {
+        return false;
+    };
+    let number = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    matches!(version.split_once('.'), Some((major, minor)) if number(major) && number(minor))
+        && rest.starts_with("dialog/oauth?")
 }
 
 /// What `Authenticate` asks for a provider's sign-in, before there is a
@@ -957,6 +1182,8 @@ struct ProviderSigned {
 /// What waits for the stretched password (`Step::Stretch`).
 enum Pending {
     Salt(Option<PowChallenge>),
+    /// `AuthStep::KeyChallenge`: the login key signs it.
+    Key(String),
     Reset {
         challenge: Vec<u8>,
         blobs: Vec<VaultBlob>,
@@ -1028,6 +1255,14 @@ pub struct SignedIn {
     pub recovery: Option<String>,
     /// The vault items as the relay has them (with their versions).
     pub blobs: Vec<VaultBlob>,
+    /// What the connection's proofs were bound to (`SignIn::bind`), for those after it.
+    pub binding: Option<crate::bind::Binding>,
+    /// The password is the account's login key here (protocol v22): signed in with it,
+    /// registered with it, or reset to it.
+    pub keyed: bool,
+    /// The password's login key, for an account that signed in with its secret at 22: it
+    /// moves to the key at once (`AccountSession::start` sends `LoginKeySet`).
+    pub login_key: Option<[u8; 32]>,
 }
 
 /// One account sign-in, from `Authenticate` to `Authenticated`, as a state
@@ -1065,6 +1300,13 @@ pub struct SignIn {
     claim: Option<AuthContinue>,
     /// Accounts this device remembers on this relay (`remembered_here`).
     remembered: Vec<(String, [u8; 32])>,
+    /// The relay's protocol: from 22 every proof is bound (`bind`).
+    protocol: u32,
+    /// What this connection's proofs are bound to (`bind`).
+    binding: Option<crate::bind::Binding>,
+    /// See `SignedIn::keyed`, `SignedIn::login_key`.
+    keyed: bool,
+    login_key: Option<[u8; 32]>,
 }
 
 impl SignIn {
@@ -1132,8 +1374,28 @@ impl SignIn {
             pair_refused: false,
             claim: None,
             remembered: Vec::new(),
+            protocol: protocol_version,
+            binding: None,
+            keyed: false,
+            login_key: None,
         };
         (m, auth)
+    }
+
+    /// What this connection's proofs are bound to: its TLS exporter, or `Web` in a browser.
+    /// The host says, right after `start`; a relay at 22 or later gets no proof without it.
+    pub fn bind(&mut self, b: crate::bind::Binding) {
+        self.binding = Some(b);
+    }
+
+    /// The binding a proof needs: None below 22, where the relay knows no other shape.
+    fn bound(&self) -> Result<Option<crate::bind::Binding>, String> {
+        if self.protocol < 22 {
+            return Ok(None);
+        }
+        self.binding
+            .map(Some)
+            .ok_or_else(|| "This connection cannot be checked. Nothing was sent.".to_string())
     }
 
     /// The host runs PBKDF2 itself (the browser, with WebCrypto): the machine
@@ -1216,43 +1478,58 @@ impl SignIn {
 
     pub fn totp(&self, code: &str) -> ClientMessage {
         let code = code.trim().replace(' ', "");
-        match &self.reset {
-            Some(AuthContinue::Reset {
-                signature,
-                key_signature,
-                auth_secret,
-                pass_slot,
-                ..
-            }) => ClientMessage::AuthContinue(AuthContinue::Reset {
-                signature: signature.clone(),
-                key_signature: key_signature.clone(),
-                auth_secret: auth_secret.clone(),
-                pass_slot: pass_slot.clone(),
-                totp: Some(code),
-                recovery_code: None,
-            }),
-            _ => ClientMessage::AuthContinue(AuthContinue::Totp { code }),
+        match self.reset_with(Some(code.clone()), None) {
+            Some(reset) => ClientMessage::AuthContinue(reset),
+            None => ClientMessage::AuthContinue(AuthContinue::Totp { code }),
         }
     }
 
     pub fn recovery_code(&self, code: &str) -> ClientMessage {
         let code = code.trim().to_string();
-        match &self.reset {
-            Some(AuthContinue::Reset {
+        match self.reset_with(None, Some(code.clone())) {
+            Some(reset) => ClientMessage::AuthContinue(reset),
+            None => ClientMessage::AuthContinue(AuthContinue::Recovery { code }),
+        }
+    }
+
+    /// The reset that waits for a code, with the code in.
+    fn reset_with(
+        &self,
+        totp: Option<String>,
+        recovery_code: Option<String>,
+    ) -> Option<AuthContinue> {
+        match self.reset.clone()? {
+            AuthContinue::Reset {
                 signature,
                 key_signature,
                 auth_secret,
                 pass_slot,
                 ..
-            }) => ClientMessage::AuthContinue(AuthContinue::Reset {
-                signature: signature.clone(),
-                key_signature: key_signature.clone(),
-                auth_secret: auth_secret.clone(),
-                pass_slot: pass_slot.clone(),
-                totp: None,
-                recovery_code: Some(code),
+            } => Some(AuthContinue::Reset {
+                signature,
+                key_signature,
+                auth_secret,
+                pass_slot,
+                totp,
+                recovery_code,
             }),
-            _ => ClientMessage::AuthContinue(AuthContinue::Recovery { code }),
+            AuthContinue::ResetBound {
+                signature,
+                key_signature,
+                login_key,
+                pass_slot,
+                web,
+                ..
+            } => Some(AuthContinue::ResetBound {
+                signature,
+                key_signature,
+                login_key,
+                pass_slot,
+                totp,
+                recovery_code,
+                web,
+            }),
+            _ => None,
         }
     }
 
@@ -1266,9 +1543,26 @@ impl SignIn {
         ) {
             (Pending::Salt(_), Method::Password { .. }) => {
                 self.vault_key = Some(d.vault_key);
+                // An account that has not moved to its login key yet: it does, once signed
+                // in (22)
+                if self.bound()?.is_some() {
+                    self.login_key = Some(LoginKey::from_master(master).public_key());
+                }
                 Ok(vec![Step::Send(ClientMessage::AuthContinue(
                     AuthContinue::Secret {
                         auth_secret: d.auth_secret.to_vec(),
+                    },
+                ))])
+            }
+            (Pending::Key(challenge), Method::Password { .. }) => {
+                let b = self.bound()?.ok_or("unexpected sign-in step")?;
+                self.vault_key = Some(d.vault_key);
+                self.keyed = true;
+                Ok(vec![Step::Send(ClientMessage::AuthContinue(
+                    AuthContinue::KeySig {
+                        signature: LoginKey::from_master(master)
+                            .sign(&relay_id, &self.name, &challenge, &b),
+                        web: b.web(),
                     },
                 ))])
             }
@@ -1297,11 +1591,22 @@ impl SignIn {
                 self.vault = Some(vault);
                 self.identity = Some(identity);
                 self.blobs = blobs.clone();
-                let register = AuthContinue::Register {
-                    auth_secret: d.auth_secret.to_vec(),
-                    altcha,
-                    ts,
-                    vault: blobs,
+                let register = match self.bound()? {
+                    Some(_) => {
+                        self.keyed = true;
+                        AuthContinue::RegisterKey {
+                            login_key: LoginKey::from_master(master).public_key().to_vec(),
+                            altcha,
+                            ts,
+                            vault: blobs,
+                        }
+                    }
+                    None => AuthContinue::Register {
+                        auth_secret: d.auth_secret.to_vec(),
+                        altcha,
+                        ts,
+                        vault: blobs,
+                    },
                 };
                 // The relay sends no vault back to a new account: the keys follow at once.
                 Ok(vec![
@@ -1330,13 +1635,31 @@ impl SignIn {
                     .payload;
                 let identity = IdentityKeyPair::try_from(&identity[..])
                     .map_err(|_| "The vault's identity key is damaged.".to_string())?;
-                let reset = AuthContinue::Reset {
-                    signature: reset_proof(&identity, &relay_id, &self.name, &challenge),
-                    key_signature: reset_key_proof(recovery, &relay_id, &self.name, &challenge),
-                    auth_secret: d.auth_secret.to_vec(),
-                    pass_slot: vault.pass_slot(&d.vault_key).v,
-                    totp: None,
-                    recovery_code: None,
+                let reset = match self.bound()? {
+                    Some(b) => {
+                        let key = LoginKey::from_master(master).public_key();
+                        AuthContinue::ResetBound {
+                            signature: reset_proof_bound(
+                                &identity, &relay_id, &self.name, &challenge, &key, &b,
+                            ),
+                            key_signature: reset_key_proof_bound(
+                                recovery, &relay_id, &self.name, &challenge, &key, &b,
+                            ),
+                            login_key: key.to_vec(),
+                            pass_slot: vault.pass_slot(&d.vault_key).v,
+                            totp: None,
+                            recovery_code: None,
+                            web: b.web(),
+                        }
+                    }
+                    None => AuthContinue::Reset {
+                        signature: reset_proof(&identity, &relay_id, &self.name, &challenge),
+                        key_signature: reset_key_proof(recovery, &relay_id, &self.name, &challenge),
+                        auth_secret: d.auth_secret.to_vec(),
+                        pass_slot: vault.pass_slot(&d.vault_key).v,
+                        totp: None,
+                        recovery_code: None,
+                    },
                 };
                 if second_factor {
                     self.reset = Some(reset);
@@ -1422,15 +1745,27 @@ impl SignIn {
             .payload;
         let identity = IdentityKeyPair::try_from(&identity[..])
             .map_err(|_| "The vault's identity key is damaged.".to_string())?;
-        let signature = provider_proof(&identity, &relay_id, &self.name, &signed.challenge);
+        let proof = match self.bound()? {
+            Some(b) => AuthContinue::ProviderProofBound {
+                signature: provider_proof_bound(
+                    &identity,
+                    &relay_id,
+                    &self.name,
+                    &signed.challenge,
+                    &b,
+                ),
+                web: b.web(),
+            },
+            None => AuthContinue::ProviderProof {
+                signature: provider_proof(&identity, &relay_id, &self.name, &signed.challenge),
+            },
+        };
         self.blobs = signed.blobs.clone();
         self.vault = Some(vault);
         self.identity = Some(identity);
         self.pair_refused = false;
         Ok(vec![
-            Step::Send(ClientMessage::AuthContinue(AuthContinue::ProviderProof {
-                signature,
-            })),
+            Step::Send(ClientMessage::AuthContinue(proof)),
             Step::Keys,
         ])
     }
@@ -1535,6 +1870,17 @@ impl SignIn {
                 self.relay_id = Some(*relay_id);
                 self.stretch_then(Pending::Salt(pow.clone()))
             }
+            ServerMessage::AuthStep(AuthStep::KeyChallenge {
+                relay_id,
+                challenge,
+            }) => {
+                if !matches!(self.method, Method::Password { .. }) || self.relay_id.is_some() {
+                    return Err("unexpected sign-in step".into());
+                }
+                self.relay_ok(relay_id)?;
+                self.relay_id = Some(*relay_id);
+                self.stretch_then(Pending::Key(challenge.clone()))
+            }
             ServerMessage::AuthStep(AuthStep::ResetChallenge {
                 relay_id,
                 challenge,
@@ -1565,11 +1911,18 @@ impl SignIn {
                     key,
                     relay_id: known,
                     ..
-                } if known == relay_id => Ok(vec![Step::Send(ClientMessage::AuthContinue(
-                    AuthContinue::DeviceSig {
-                        signature: key.sign(relay_id, challenge),
-                    },
-                ))]),
+                } if known == relay_id => {
+                    let signature = key.sign(relay_id, challenge);
+                    let sig = match self.bound()? {
+                        Some(b) => AuthContinue::DeviceSigBound {
+                            signature,
+                            bind: key.sign_bound(relay_id, challenge, &b),
+                            web: b.web(),
+                        },
+                        None => AuthContinue::DeviceSig { signature },
+                    };
+                    Ok(vec![Step::Send(ClientMessage::AuthContinue(sig))])
+                }
                 Method::Device { .. } => {
                     Err("This server is not the one this device was remembered by.".into())
                 }
@@ -1729,6 +2082,9 @@ impl SignIn {
             identity: self.identity.ok_or("no identity")?,
             recovery: self.recovery,
             blobs: self.blobs,
+            binding: self.binding,
+            keyed: self.keyed,
+            login_key: self.login_key,
         })
     }
 }
@@ -1779,10 +2135,19 @@ mod tests {
             "https://discord.com/oauth2/authorize?response_type=code&state=a",
             "https://accounts.google.com/o/oauth2/v2/auth?client_id=x",
             "https://www.facebook.com/v21.0/dialog/oauth?client_id=x",
+            "https://www.facebook.com/v22.1/dialog/oauth?client_id=x",
         ] {
             assert!(provider_page_ok(good), "{good}");
         }
         for bad in [
+            // Facebook's own host, not its sign-in page (W1-20): its link redirector, a page
+            // the relay runs there, and a path a browser folds back to the redirector
+            "https://www.facebook.com/l.php?u=https%3A%2F%2Fevil.example%2F",
+            "https://www.facebook.com/a.page.the.relay.runs",
+            "https://www.facebook.com/v21.0/dialog/oauth/../../l.php?u=x",
+            "https://www.facebook.com/v21/dialog/oauth?x",
+            "https://www.facebook.com/v.1/dialog/oauth?x",
+            "https://www.facebook.com/",
             "https://discord.com.evil.example/oauth2/authorize?x",
             "https://evil.example/https://discord.com/oauth2/authorize?x",
             "http://discord.com/oauth2/authorize?x",
@@ -1841,15 +2206,27 @@ mod tests {
 
     /// A machine that asked its other device, and the commitment the relay saw.
     fn asking(known: Vec<(String, [u8; 32])>, blobs: Vec<VaultBlob>) -> (SignIn, Vec<u8>) {
+        asking_at(20, None, known, blobs)
+    }
+
+    fn asking_at(
+        proto: u32,
+        b: Option<crate::bind::Binding>,
+        known: Vec<(String, [u8; 32])>,
+        blobs: Vec<VaultBlob>,
+    ) -> (SignIn, Vec<u8>) {
         let (mut m, _) = SignIn::start(
             "",
             Method::Provider {
                 ticket: vec![],
                 invite: None,
             },
-            20,
+            proto,
             "test",
         );
+        if let Some(b) = b {
+            m.bind(b);
+        }
         m.remembered_here(known);
         m.on_message(&ServerMessage::AuthStep(AuthStep::ProviderSigned {
             relay_id: RELAY,
@@ -1940,6 +2317,330 @@ mod tests {
             ]
         ));
         assert!(m.identity().is_some());
+    }
+
+    /// W1-24: from 22 the identity signs this connection's exporter with the challenge,
+    /// so a server passing the sign-in on holds a proof for another connection.
+    #[test]
+    fn a_providers_proof_is_bound_to_the_connection_from_22() {
+        use crate::bind::Binding;
+        let opened = |proto, b| {
+            let (vault, blobs) = relays_vault();
+            let identity = IdentityKeyPair::try_from(
+                &vault.open_item(&blobs, ITEM_IDENTITY).unwrap().payload[..],
+            )
+            .unwrap();
+            let (mut m, commitment) = asking_at(proto, b, Vec::new(), blobs);
+            let (own, raw) = crate::pair::answer_key();
+            let (ephemeral, _) = answered(&mut m, &raw);
+            let wrap =
+                crate::pair::wrap_dek(&own, &ephemeral, &vault.dek(), &RELAY, "luki", &commitment)
+                    .unwrap();
+            m.on_message(&wrapped(wrap)).unwrap();
+            (m.pair_same(true), identity)
+        };
+        let public = |id: &IdentityKeyPair| id.identity_key().serialize().to_vec();
+
+        let (steps, id) = opened(22, Some(Binding::Tls([5; 32])));
+        let steps = steps.unwrap();
+        let [Step::Send(ClientMessage::AuthContinue(AuthContinue::ProviderProofBound {
+            signature,
+            web: false,
+        })), Step::Keys] = &steps[..]
+        else {
+            panic!("no bound proof")
+        };
+        let ok = |b| provider_proof_bound_ok(&public(&id), &RELAY, "luki", &[0; 32], &b, signature);
+        assert!(ok(Binding::Tls([5; 32])));
+        // At the far end of a forwarder: the relay's own exporter is another
+        assert!(!ok(Binding::Tls([6; 32])));
+        assert!(!ok(Binding::Web), "an app's proof is never a browser's");
+        assert!(!provider_proof_ok(
+            &public(&id),
+            &RELAY,
+            "luki",
+            &[0; 32],
+            signature
+        ));
+
+        // A browser says so
+        let (steps, _) = opened(22, Some(Binding::Web));
+        assert!(matches!(
+            &steps.unwrap()[..],
+            [
+                Step::Send(ClientMessage::AuthContinue(
+                    AuthContinue::ProviderProofBound { web: true, .. }
+                )),
+                Step::Keys
+            ]
+        ));
+        // A host that said nothing sends nothing
+        let (steps, _) = opened(22, None);
+        assert!(steps.err().unwrap().contains("Nothing was sent"));
+        // An older relay knows the old shape only
+        let (steps, _) = opened(21, None);
+        assert!(matches!(
+            &steps.unwrap()[..],
+            [
+                Step::Send(ClientMessage::AuthContinue(
+                    AuthContinue::ProviderProof { .. }
+                )),
+                Step::Keys
+            ]
+        ));
+    }
+
+    /// W3: from 22 the password's secret goes nowhere but to an account that has not moved
+    /// yet (and then the key follows); a relay before 22 gets the old shapes.
+    #[test]
+    fn the_password_goes_as_its_login_key_from_22() {
+        use crate::bind::{login_ok, Binding};
+        let pw = || Zeroizing::new("correct horse battery".to_string());
+        let master = stretch("correct horse battery", &RELAY, "luki");
+        let key = LoginKey::from_master(&master).public_key();
+        let machine = |method: Method, proto: u32| {
+            let (mut m, _) = SignIn::start("luki", method, proto, "test");
+            m.bind(Binding::Tls([5; 32]));
+            m
+        };
+        // A keyed account: the key over the challenge and this connection
+        let mut m = machine(Method::Password { password: pw() }, 22);
+        let steps = m
+            .on_message(&ServerMessage::AuthStep(AuthStep::KeyChallenge {
+                relay_id: RELAY,
+                challenge: "tok".into(),
+            }))
+            .unwrap();
+        let [Step::Send(ClientMessage::AuthContinue(AuthContinue::KeySig {
+            signature,
+            web: false,
+        }))] = &steps[..]
+        else {
+            panic!("no key answer")
+        };
+        assert!(login_ok(
+            &key,
+            &RELAY,
+            "luki",
+            "tok",
+            &Binding::Tls([5; 32]),
+            signature
+        ));
+        assert!(!login_ok(
+            &key,
+            &RELAY,
+            "luki",
+            "tok",
+            &Binding::Tls([6; 32]),
+            signature
+        ));
+        assert!(m.keyed && m.login_key.is_none());
+        // Not before 22, and not for anything but a password
+        let mut m = machine(Method::Password { password: pw() }, 21);
+        assert!(m
+            .on_message(&ServerMessage::AuthStep(AuthStep::KeyChallenge {
+                relay_id: RELAY,
+                challenge: "tok".into(),
+            }))
+            .is_err());
+        let mut m = machine(
+            Method::Register {
+                password: pw(),
+                invite: None,
+            },
+            22,
+        );
+        assert!(m
+            .on_message(&ServerMessage::AuthStep(AuthStep::KeyChallenge {
+                relay_id: RELAY,
+                challenge: "tok".into(),
+            }))
+            .is_err());
+
+        // An account that has not moved: its secret once more, and the key to move it to
+        let salt = ServerMessage::AuthStep(AuthStep::Salt {
+            relay_id: RELAY,
+            pow: None,
+        });
+        let mut m = machine(Method::Password { password: pw() }, 22);
+        let steps = m.on_message(&salt).unwrap();
+        assert!(matches!(
+            &steps[..],
+            [Step::Send(ClientMessage::AuthContinue(
+                AuthContinue::Secret { .. }
+            ))]
+        ));
+        assert_eq!((m.login_key, m.keyed), (Some(key), false));
+        let mut m = machine(Method::Password { password: pw() }, 21);
+        m.on_message(&salt).unwrap();
+        assert_eq!(m.login_key, None, "an older relay keeps the secret");
+
+        // Sign-up: the key, never the secret
+        let pow = ServerMessage::AuthStep(AuthStep::Salt {
+            relay_id: RELAY,
+            pow: None,
+        });
+        let mut m = machine(
+            Method::Register {
+                password: pw(),
+                invite: None,
+            },
+            22,
+        );
+        let steps = m.on_message(&pow).unwrap();
+        let Step::Send(ClientMessage::AuthContinue(AuthContinue::RegisterKey {
+            login_key, ..
+        })) = &steps[0]
+        else {
+            panic!("no keyed sign-up")
+        };
+        assert_eq!(login_key[..], key[..]);
+        assert!(m.keyed);
+        let mut m = machine(
+            Method::Register {
+                password: pw(),
+                invite: None,
+            },
+            21,
+        );
+        let steps = m.on_message(&pow).unwrap();
+        assert!(matches!(
+            &steps[0],
+            Step::Send(ClientMessage::AuthContinue(AuthContinue::Register { .. }))
+        ));
+    }
+
+    /// W1-24 and W3: a reset is bound to its connection and names the new login key; a
+    /// code for an account with a second factor goes into the same shape.
+    #[test]
+    fn a_reset_is_bound_and_carries_the_key_from_22() {
+        use crate::bind::Binding;
+        let recovery = [9u8; 32];
+        let vault = Vault::create(RELAY, "luki");
+        let identity = IdentityKeyPair::generate(&mut crate::rng());
+        let blobs = vec![
+            vault.recovery_slot(&recovery),
+            vault.seal_item(ITEM_IDENTITY, 1, &identity.serialize()),
+        ];
+        let reset = |proto: u32, second_factor: bool| {
+            let (mut m, _) = SignIn::start(
+                "luki",
+                Method::Reset {
+                    recovery: Zeroizing::new(recovery),
+                    password: Zeroizing::new("a brand new password".into()),
+                },
+                proto,
+                "test",
+            );
+            m.bind(Binding::Tls([5; 32]));
+            let steps = m
+                .on_message(&ServerMessage::AuthStep(AuthStep::ResetChallenge {
+                    relay_id: RELAY,
+                    challenge: vec![1; 32],
+                    blobs: blobs.clone(),
+                    second_factor,
+                }))
+                .unwrap();
+            (m, steps)
+        };
+        let key =
+            LoginKey::from_master(&stretch("a brand new password", &RELAY, "luki")).public_key();
+        let public = reset_key(&recovery, &RELAY, "luki");
+        let (_, steps) = reset(22, false);
+        let [Step::Send(ClientMessage::AuthContinue(AuthContinue::ResetBound {
+            key_signature,
+            login_key,
+            web: false,
+            ..
+        }))] = &steps[..]
+        else {
+            panic!("no bound reset")
+        };
+        assert_eq!(login_key[..], key[..]);
+        let ok = |b, k: &[u8]| {
+            reset_key_proof_bound_ok(&public, &RELAY, "luki", &[1; 32], k, &b, key_signature)
+        };
+        assert!(ok(Binding::Tls([5; 32]), &key));
+        assert!(!ok(Binding::Tls([6; 32]), &key), "another connection");
+        assert!(!ok(Binding::Tls([5; 32]), &[0; 32]), "another key");
+        let (m, steps) = reset(22, true);
+        assert!(matches!(&steps[..], [Step::NeedTotp]));
+        assert!(matches!(
+            m.totp("123 456"),
+            ClientMessage::AuthContinue(AuthContinue::ResetBound { totp: Some(ref c), .. }) if c == "123456"
+        ));
+        let (_, steps) = reset(21, false);
+        assert!(matches!(
+            &steps[..],
+            [Step::Send(ClientMessage::AuthContinue(
+                AuthContinue::Reset { .. }
+            ))]
+        ));
+    }
+
+    #[test]
+    fn a_device_keys_answer_is_bound_to_the_connection_from_22() {
+        use crate::bind::Binding;
+        let answer = |proto, b: Option<Binding>| {
+            let key = DeviceKey::generate();
+            let (device, public) = (key.device_id, key.public_key());
+            let (mut m, _) = SignIn::start(
+                "luki",
+                Method::Device {
+                    key,
+                    relay_id: RELAY,
+                    dek: [0; 32],
+                },
+                proto,
+                "test",
+            );
+            if let Some(b) = b {
+                m.bind(b);
+            }
+            let steps = m.on_message(&ServerMessage::AuthStep(AuthStep::DeviceChallenge {
+                relay_id: RELAY,
+                challenge: "tok".into(),
+            }));
+            (steps, device, public)
+        };
+        let (steps, device, public) = answer(22, Some(Binding::Tls([5; 32])));
+        let steps = steps.unwrap();
+        let [Step::Send(ClientMessage::AuthContinue(AuthContinue::DeviceSigBound {
+            bind,
+            web: false,
+            ..
+        }))] = &steps[..]
+        else {
+            panic!("no bound answer")
+        };
+        let ok = |b, challenge: &str, device: &[u8]| {
+            crate::bind::devkey_ok(&public, &RELAY, device, challenge, &b, bind)
+        };
+        assert!(ok(Binding::Tls([5; 32]), "tok", &device));
+        assert!(
+            !ok(Binding::Tls([6; 32]), "tok", &device),
+            "another connection"
+        );
+        assert!(!ok(Binding::Web, "tok", &device));
+        assert!(!ok(Binding::Tls([5; 32]), "other", &device));
+        assert!(!ok(Binding::Tls([5; 32]), "tok", &[0; 16]));
+
+        let (steps, ..) = answer(22, Some(Binding::Web));
+        assert!(matches!(
+            &steps.unwrap()[..],
+            [Step::Send(ClientMessage::AuthContinue(
+                AuthContinue::DeviceSigBound { web: true, .. }
+            ))]
+        ));
+        let (steps, ..) = answer(22, None);
+        assert!(steps.err().unwrap().contains("Nothing was sent"));
+        let (steps, ..) = answer(21, None);
+        assert!(matches!(
+            &steps.unwrap()[..],
+            [Step::Send(ClientMessage::AuthContinue(
+                AuthContinue::DeviceSig { .. }
+            ))]
+        ));
     }
 
     #[test]

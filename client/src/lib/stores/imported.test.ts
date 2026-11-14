@@ -439,6 +439,24 @@ const nothingOf = (r: { author: string; author_id: string; body: string; thread_
   assert.equal(r?.mine, false, "and nothing left to press");
 };
 
+// W2-32
+test("a removal under a search asks again for the list beneath it too", () => {
+  fresh();
+  openImported(S, CHANNEL);
+  onImportedReply(S, page());
+  importedSearch(S, "word");
+  invoked().length = 0;
+  lastOp.set(S, { ArchiveDelete: { target: { Author: { id: "123" } } } });
+  onImportedReply(S, { Admin: { ArchiveDeleted: { rows: 1 } } });
+  assert.deepEqual(asks(), [
+    { ArchiveSearch: { channel_id: CHANNEL, query: "word", from: "" } },
+    { ArchiveFetch: { channel_id: CHANNEL, thread: "", before: "", pinned: false } },
+  ]);
+  onImportedReply(S, page({ rows: [row("8")] }));
+  importedSearch(S, "");
+  assert.deepEqual(view()?.rows.map((r) => r.id), ["8"], "Clear search shows what the relay serves now");
+});
+
 test("Delete everything by this author on an opening row leaves none of it drawn", () => {
   fresh();
   inThread();

@@ -103,7 +103,7 @@ pub const CONTROL_MSGS_PER_SEC: u32 = 50;
 ///
 /// A relay admits only its own protocol; an app speaks its own down to
 /// `compat::OLDEST_RELAY_PROTOCOL` (1.6).
-pub const PROTOCOL_VERSION: u32 = 21;
+pub const PROTOCOL_VERSION: u32 = 23;
 
 /// Application version, read from Cargo.toml at compile time.
 /// Single source of truth: workspace root `Cargo.toml` `[workspace.package] version`.
@@ -157,6 +157,28 @@ pub fn encode_server_msg(msg: &ServerMessage) -> Result<Vec<u8>, ProtocolError> 
 /// Decode a `ServerMessage` from a postcard-encoded payload (without length prefix).
 pub fn decode_server_msg(payload: &[u8]) -> Result<ServerMessage, ProtocolError> {
     Ok(postcard::from_bytes(payload)?)
+}
+
+/// `AccountReply::Asked` around `reply`, which goes in it as its bytes.
+pub fn encode_asked(
+    ask: u32,
+    reply: &crate::messages::AccountReply,
+) -> Result<crate::messages::AccountReply, ProtocolError> {
+    Ok(crate::messages::AccountReply::Asked {
+        ask,
+        reply: postcard::to_allocvec(reply)?,
+    })
+}
+
+/// What an `AccountReply::Asked` holds. One more `Asked` inside is refused: an answer is
+/// numbered once.
+pub fn decode_asked(bytes: &[u8]) -> Result<crate::messages::AccountReply, ProtocolError> {
+    match postcard::from_bytes(bytes)? {
+        crate::messages::AccountReply::Asked { .. } => Err(ProtocolError::Serialization(
+            postcard::Error::DeserializeBadEnum,
+        )),
+        reply => Ok(reply),
+    }
 }
 
 /// Attempt to extract one complete length-prefixed frame from a byte buffer.

@@ -1183,7 +1183,7 @@
           {#each [...$blocked] as [key, label] (key)}
             <div class="device-row blocked-row">
               <span title={label}>{shortName(label)}</span>
-              <button class="danger-btn btn btn-danger-outline" onclick={() => void unblock($serverAddress, key, label)}>Unblock</button>
+              <button class="danger-btn btn btn-danger-outline" aria-label="Unblock {label}" onclick={() => void unblock($serverAddress, key, label)}>Unblock</button>
             </div>
           {/each}
         {/if}
@@ -1285,7 +1285,7 @@
           {/if}
         </label>
         {#if $connectionState === "connected" && livePath($olderRelay?.protocol ?? null)}
-          <div class="ptt-config">
+          <div class="ptt-config quiet-mode">
             <span class="hotkey-label">Quiet mode on this server</span>
             <select aria-label="Quiet mode on this server" value={quietNow.mode} onchange={(e) => setQuietMode($serverAddress, (e.target as HTMLSelectElement).value as QuietMode)}>
               <option value="off">Off</option>
@@ -1818,6 +1818,16 @@
 
   .ptt-config + .ptt-config {
     margin-top: 8px;
+  }
+
+  /* Room for the select's focus ring: on a phone it touched the text above and below, and
+     its ring covered both (device pass) */
+  .quiet-mode {
+    margin: 8px 0 6px;
+  }
+
+  .quiet-picks {
+    margin-top: 6px;
   }
 
   .hotkey-label {

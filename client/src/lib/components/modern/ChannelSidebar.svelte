@@ -256,13 +256,14 @@
               >
               <span class="nested-name" title={member.username}><MemberName username={member.username} account={member.account} /></span>
               {#if $blockedMember(member)}
-                <span class="blocked-mark" title="You blocked this person"><Icon name="ban" size={12} /></span>
+                <span class="blocked-mark" role="img" title="You blocked this person" aria-label="You blocked this person"><Icon name="ban" size={12} /></span>
               {/if}
               {#if member.is_muted}
                 <span class="status-icon muted" title="Muted"><Icon name="mic-off" size={12} /></span>
               {/if}
               {#if $restrictions.has(member.user_id)}
-                <span class="status-icon restricted-mark" title={markTitle($restrictions.get(member.user_id)!, Date.now())}><Icon name="hourglass" size={12} /></span>
+                {@const held = markTitle($restrictions.get(member.user_id)!, Date.now())}
+                <span class="status-icon restricted-mark" role="img" title={held} aria-label={held}><Icon name="hourglass" size={12} /></span>
               {/if}
               {#if member.is_deafened}
                 <span class="status-icon deafened" title="Deafened"><Icon name="headphones-off" size={12} /></span>

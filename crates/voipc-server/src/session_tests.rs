@@ -5,6 +5,11 @@ use voipc_protocol::codec::{decode_server_msg, encode_client_msg};
 
 use crate::config::ServerConfig;
 use crate::settings::ServerSettings;
+use voipc_crypto::bind::Binding;
+
+/// Every test connection's TLS exporter (`voipc_crypto::bind`): what a client in a test
+/// binds its proofs to, as an app does to its own end of the TLS session.
+pub(crate) const TEST_BIND: [u8; 32] = [0x5a; 32];
 
 /// How long a test waits for something that has to happen before it calls it hung. A limit,
 /// not a speed check: on a CI runner's disk one 200-member import batch took past the 5 s
@@ -55,6 +60,7 @@ async fn authenticates_over_duplex() {
         media_tx,
         sid_tx,
         state.clone(),
+        Some(TEST_BIND),
     ));
 
     let auth = ClientMessage::Authenticate {
@@ -121,6 +127,15 @@ impl Client {
             .write_all(&encode_client_msg(msg).unwrap())
             .await
             .unwrap();
+    }
+
+    /// `send` to a relay that may have ended the connection already, its last word still to
+    /// be read: whether it went.
+    async fn send_unless_closed(&mut self, msg: &ClientMessage) -> bool {
+        self.stream
+            .write_all(&encode_client_msg(msg).unwrap())
+            .await
+            .is_ok()
     }
 
     /// Next server message, or None once the server closed the stream.
@@ -236,6 +251,7 @@ async fn open(state: &Arc<ServerState>, username: &str, ip: IpAddr) -> Client {
         media_tx,
         sid_tx,
         state.clone(),
+        Some(TEST_BIND),
     ));
     let mut client = Client {
         stream,
@@ -337,6 +353,7 @@ async fn an_oversized_prekey_bundle_is_refused_at_the_door() {
         media_tx,
         sid_tx,
         state.clone(),
+        Some(TEST_BIND),
     ));
     let mut client = Client {
         stream,
@@ -454,6 +471,7 @@ async fn connect_with_bundle(
         media_tx,
         sid_tx,
         state.clone(),
+        Some(TEST_BIND),
     ));
     let mut client = Client {
         stream,
@@ -691,6 +709,183 @@ async fn each_privilege_grants_its_own_step_only() {
         .await;
 }
 
+/// W1-36: a name of only what draws nothing (U+2800, the usual blank Discord name) would
+/// be a blank row in everyone's channel list.
+#[tokio::test]
+async fn a_channel_name_that_shows_nothing_is_refused() {
+    let state = admin_state();
+    // One each: making channels has a budget of its own
+    for (who, name) in [("ann", "\u{2800}"), ("bob", "\u{fe0f}\u{34f} \u{2800}")] {
+        let mut ann = connect(&state, who, IpAddr::V4(Ipv4Addr::LOCALHOST)).await;
+        ann.send(&ClientMessage::CreateChannel {
+            name: name.into(),
+            password: None,
+            proximity: ProximityMode::Off,
+            anonymous: false,
+            text: true,
+        })
+        .await;
+        let ServerMessage::ChannelError { reason } = ann
+            .expect("refused", |m| {
+                matches!(m, ServerMessage::ChannelError { .. })
+            })
+            .await
+        else {
+            unreachable!()
+        };
+        assert!(reason.contains("invalid characters"), "{reason}");
+    }
+    assert!(!state
+        .channels
+        .read()
+        .await
+        .values()
+        .any(|c| c.info.name.contains('\u{2800}')));
+}
+
+/// The hourly sweep that takes a removal mark past `modlog_days` drops the copy every connect
+/// is told before its join (`at_connect`): the next one reads again, not the kept copy.
+#[tokio::test]
+async fn the_sweep_that_takes_a_mark_drops_the_copy_connects_are_told() {
+    let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+    let relay = state.accounts.clone().unwrap();
+    crate::accounts::raw(
+        &relay,
+        "INSERT INTO voipc_modlog (at, action, actor_name, target_name, since_ms, before_ms) \
+         VALUES (1, 'remove_posts', 'mod', 'someone', 1, 2)",
+    )
+    .await
+    .unwrap();
+    let marks_told = || async {
+        let (tx, mut rx) = crate::control::control_queue(Arc::new(tokio::sync::Notify::new()));
+        crate::accounts::modlog::send_marks(&state, &tx).await;
+        drop(tx);
+        let mut n = 0;
+        while let Some(data) = rx.recv().await {
+            let mut buf = BytesMut::from(&data[..]);
+            while let Some(payload) = try_decode_frame(&mut buf).unwrap() {
+                if let ServerMessage::PostsHidden { marks } = decode_server_msg(&payload).unwrap() {
+                    n += marks.len();
+                }
+            }
+        }
+        n
+    };
+    assert_eq!(marks_told().await, 1);
+    assert_eq!(crate::accounts::modlog::sweep(&relay).await.unwrap(), 1);
+    assert_eq!(marks_told().await, 0, "not the copy from before the sweep");
+}
+
+/// G1's per-viewer sends go out while other tasks change sessions. They read the viewer from
+/// the entry the loop holds rather than a second `sessions.get` inside `sessions.iter()`,
+/// the re-entry DashMap warns of (not seen to hang here either way).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_anonymous_rooms_news_goes_out_while_sessions_change() {
+    use crate::state::test_support::{add_user, make_state};
+    let state = Arc::new(make_state());
+    let ids: Vec<UserId> = (0..64)
+        .map(|i| add_user(&state, &format!("u{i}")).0)
+        .collect();
+    let info = state
+        .create_channel(
+            "masks".into(),
+            None,
+            ProximityMode::Off,
+            true,
+            false,
+            ids[0],
+        )
+        .await
+        .unwrap();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writers: Vec<_> = (0..3)
+        .map(|_| {
+            let (state, ids, stop) = (state.clone(), ids.clone(), stop.clone());
+            tokio::spawn(async move {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    for id in &ids {
+                        if let Some(mut s) = state.sessions.get_mut(id) {
+                            s.is_muted = !s.is_muted;
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+        })
+        .collect();
+    for _ in 0..200 {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::session::channel_updated(&state, info.clone()),
+        )
+        .await
+        .expect("the update went out: no deadlock");
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for w in writers {
+        w.await.unwrap();
+    }
+}
+
+/// G1: outside an anonymous room nobody learns who stands in it, and only its maker (and
+/// admins) hear who made it: the creator's join right after `ChannelCreated` told everyone.
+#[tokio::test]
+async fn an_anonymous_rooms_maker_and_members_stay_unnamed_outside_it() {
+    let state = admin_state();
+    let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    let mut owner = connect(&state, "owner", lo).await; // user 1
+    let mut other = connect(&state, "other", lo).await; // user 2
+    let mut third = connect(&state, "third", lo).await; // user 3
+                                                        // One room each: one creation a moment per person
+    for (maker, uid, name, anonymous) in [
+        (&mut owner, 1, "masks", true),
+        (&mut third, 3, "plain", false),
+    ] {
+        maker
+            .send(&ClientMessage::CreateChannel {
+                name: name.into(),
+                password: None,
+                proximity: ProximityMode::Off,
+                anonymous,
+                text: false,
+            })
+            .await;
+        let created = |m: &ServerMessage| matches!(m, ServerMessage::ChannelCreated { channel } if channel.name == name);
+        let ServerMessage::ChannelCreated { channel: mine } = maker
+            .expect("its maker", |m| {
+                created(m) || matches!(m, ServerMessage::ChannelError { .. })
+            })
+            .await
+        else {
+            panic!("{name}: refused")
+        };
+        assert_eq!(mine.created_by, Some(uid), "{name}: its maker is told");
+        let ServerMessage::ChannelCreated { channel: theirs } =
+            other.expect("everyone", created).await
+        else {
+            unreachable!()
+        };
+        let id = mine.channel_id;
+        let ServerMessage::UserJoined { user } = other
+            .expect(
+                "the maker's join",
+                |m| matches!(m, ServerMessage::UserJoined { user } if user.channel_id == id),
+            )
+            .await
+        else {
+            unreachable!()
+        };
+        if anonymous {
+            assert_eq!(theirs.created_by, None, "nobody else hears who made it");
+            assert_eq!(user.user_id, 0, "nor who went in");
+        } else {
+            // The control: an ordinary room tells both, as ever
+            assert_eq!(theirs.created_by, Some(uid));
+            assert_eq!(user.user_id, uid);
+        }
+    }
+}
+
 /// `voipc:channels` changes any channel's options, but showing real names
 /// behind a pseudonym is an admin's or the creator's alone.
 #[tokio::test]
@@ -751,6 +946,24 @@ async fn a_channel_editor_cannot_switch_anonymity_off() {
             |m| matches!(m, ServerMessage::ChannelUpdated { channel } if channel.hide_members),
         )
         .await;
+    // Showing a hidden member list again is the creator's too (W1-26): switched off for a
+    // moment, it would hand the list to someone standing outside, with no row in the log
+    editor
+        .send(&set(ChannelOptions {
+            hide_members: Some(false),
+            ..Default::default()
+        }))
+        .await;
+    let ServerMessage::ChannelError { reason } = editor
+        .expect("refused", |m| {
+            matches!(m, ServerMessage::ChannelError { .. })
+        })
+        .await
+    else {
+        unreachable!()
+    };
+    assert!(reason.contains("member list"), "{reason}");
+    assert!(state.channels.read().await[&id].info.hide_members);
     // The creator may
     owner
         .send(&set(ChannelOptions {
@@ -762,6 +975,18 @@ async fn a_channel_editor_cannot_switch_anonymity_off() {
         .expect(
             "ChannelUpdated",
             |m| matches!(m, ServerMessage::ChannelUpdated { channel } if !channel.anonymous),
+        )
+        .await;
+    owner
+        .send(&set(ChannelOptions {
+            hide_members: Some(false),
+            ..Default::default()
+        }))
+        .await;
+    owner
+        .expect(
+            "ChannelUpdated",
+            |m| matches!(m, ServerMessage::ChannelUpdated { channel } if !channel.hide_members),
         )
         .await;
 }
@@ -2216,8 +2441,10 @@ impl Drop for TempDb {
         // The copies an import makes beside it (`accounts::import`)
         for run in 1..=8 {
             for suffix in ["", ".part"] {
-                let copy = format!("{}.before-import-{run}{suffix}", self.0.display());
-                let _ = std::fs::remove_file(copy);
+                for infix in [".before-import-", ".before-resuming-import-"] {
+                    let copy = format!("{}{infix}{run}{suffix}", self.0.display());
+                    let _ = std::fs::remove_file(copy);
+                }
             }
         }
     }
@@ -2296,6 +2523,7 @@ async fn open_account(state: &Arc<ServerState>, name: &str, start: AccountStart)
         media_tx,
         sid_tx,
         state.clone(),
+        Some(TEST_BIND),
     ));
     let mut client = Client {
         stream,
@@ -2367,8 +2595,8 @@ async fn register(state: &Arc<ServerState>, name: &str) -> (Client, AccountInfo)
         reset_slot(),
     ];
     let altcha = solve(&pow.altcha);
-    c.send(&ClientMessage::AuthContinue(AuthContinue::Register {
-        auth_secret: SECRET.to_vec(),
+    c.send(&ClientMessage::AuthContinue(AuthContinue::RegisterKey {
+        login_key: test_key().public_key().to_vec(),
         altcha,
         ts: pow.ts,
         vault,
@@ -2391,19 +2619,596 @@ async fn register(state: &Arc<ServerState>, name: &str) -> (Client, AccountInfo)
     (c, info)
 }
 
-/// Signs `name` in with the password secret; answers a code with `code`.
+/// The test accounts' password, as its login key (protocol v22). An account `register`
+/// made signs in with it; one made by hand with `SECRET` signs in with that.
+fn test_key() -> voipc_crypto::account::LoginKey {
+    voipc_crypto::account::LoginKey::from_master(&[0x4b; 32])
+}
+
+/// The login key's answer to `challenge`, for `name`, on a test connection.
+fn key_sig(state: &Arc<ServerState>, name: &str, challenge: &str) -> ClientMessage {
+    let relay_id = state.accounts.as_ref().unwrap().relay_id;
+    ClientMessage::AuthContinue(AuthContinue::KeySig {
+        signature: test_key().sign(&relay_id, name, challenge, &Binding::Tls(TEST_BIND)),
+        web: false,
+    })
+}
+
+/// Signs `name` in with the password: its login key where the relay asks for that, else
+/// its secret.
 async fn login(state: &Arc<ServerState>, name: &str, identity: &[u8], reset: bool) -> Client {
     let mut c = open_account(state, name, AccountStart::Login).await;
-    assert!(matches!(
-        c.next().await,
-        Some(ServerMessage::AuthStep(AuthStep::Salt { pow: None, .. }))
+    match c.next().await {
+        Some(ServerMessage::AuthStep(AuthStep::KeyChallenge { challenge, .. })) => {
+            c.send(&key_sig(state, name, &challenge)).await
+        }
+        Some(ServerMessage::AuthStep(AuthStep::Salt { pow: None, .. })) => {
+            c.send(&ClientMessage::AuthContinue(AuthContinue::Secret {
+                auth_secret: SECRET.to_vec(),
+            }))
+            .await
+        }
+        other => panic!("{other:?}"),
+    }
+    c.send(&keys(identity, reset)).await;
+    c
+}
+
+/// The password again on a signed-in connection of a keyed account (protocol v22): a
+/// challenge, the login key's answer, and the second factor where there is one. The next
+/// request that wants the password takes it.
+async fn step_up(c: &mut Client, state: &Arc<ServerState>, name: &str, totp: Option<String>) {
+    let r = step_up_with(c, state, name, &test_key(), totp).await;
+    assert!(
+        matches!(r, ServerMessage::Account(AccountReply::SteppedUp)),
+        "{r:?}"
+    );
+}
+
+/// `step_up` for an account `register_with` made: its password's login key.
+async fn password_again(c: &mut Client, state: &Arc<ServerState>, name: &str) {
+    let relay_id = state.accounts.as_ref().unwrap().relay_id;
+    let key = voipc_crypto::account::LoginKey::from_master(&voipc_crypto::account::stretch(
+        "correct horse battery",
+        &relay_id,
+        name,
     ));
+    let r = step_up_with(c, state, name, &key, None).await;
+    assert!(
+        matches!(r, ServerMessage::Account(AccountReply::SteppedUp)),
+        "{r:?}"
+    );
+}
+
+/// `step_up` with `key`; the relay's answer.
+async fn step_up_with(
+    c: &mut Client,
+    state: &Arc<ServerState>,
+    name: &str,
+    key: &voipc_crypto::account::LoginKey,
+    totp: Option<String>,
+) -> ServerMessage {
+    c.send(&ClientMessage::Account(AccountRequest::KeyChallenge))
+        .await;
+    let ServerMessage::Account(AccountReply::KeyChallenge { challenge }) =
+        c.expect("a challenge", |m| reply(m).is_some()).await
+    else {
+        panic!("no challenge")
+    };
+    let relay_id = state.accounts.as_ref().unwrap().relay_id;
+    c.send(&ClientMessage::Account(AccountRequest::KeyStepUp {
+        signature: key.sign(&relay_id, name, &challenge, &Binding::Tls(TEST_BIND)),
+        challenge,
+        totp,
+        recovery_code: None,
+        web: false,
+    }))
+    .await;
+    c.expect("stepped up", |m| reply(m).is_some()).await
+}
+
+/// Sends what an app's session asks, and feeds it the relay's answers, until one reaches
+/// the page: that answer, what the page hears of it, and what the session did with it.
+async fn through(
+    c: &mut Client,
+    session: &mut voipc_crypto::account_session::AccountSession,
+    mut a: voipc_crypto::account_session::Actions,
+) -> (
+    AccountReply,
+    serde_json::Value,
+    voipc_crypto::account_session::Actions,
+) {
+    loop {
+        for m in std::mem::take(&mut a.send) {
+            c.send(&m).await;
+        }
+        let ServerMessage::Account(r) = c.expect("an answer", |m| reply(m).is_some()).await else {
+            unreachable!()
+        };
+        a = session.on_reply(&r);
+        if let Some((_, page)) = a.emit.iter().find(|(n, _)| *n == "account-reply") {
+            let page = page.clone();
+            return (r, page, a);
+        }
+    }
+}
+
+/// After `AccountStart::Login`: the password, as the relay asks for it.
+async fn password_answer(c: &mut Client, state: &Arc<ServerState>, name: &str) {
+    match c.next().await {
+        Some(ServerMessage::AuthStep(AuthStep::KeyChallenge { challenge, .. })) => {
+            c.send(&key_sig(state, name, &challenge)).await
+        }
+        Some(ServerMessage::AuthStep(AuthStep::Salt { pow: None, .. })) => {
+            c.send(&ClientMessage::AuthContinue(AuthContinue::Secret {
+                auth_secret: SECRET.to_vec(),
+            }))
+            .await
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// An account made before 1.12, whose password l4f holds as Argon2 of its secret, with a
+/// real identity (the move to the login key is signed by it).
+async fn legacy_account(state: &Arc<ServerState>, name: &str) -> voipc_crypto::IdentityKeyPair {
+    let relay = state.accounts.as_ref().unwrap();
+    let ctx = relay.ctx(IpAddr::V4(Ipv4Addr::LOCALHOST), "test");
+    let code = relay
+        .accounts
+        .invite_create_as_host(&ctx, Some(name), 1)
+        .await
+        .unwrap();
+    let form = l4f_accounts::service::InviteForm {
+        code: &code,
+        username: name,
+        password: &l4f_accounts::util::b64u(&SECRET),
+        email: None,
+        display_name: None,
+    };
+    relay.accounts.register_invite(&ctx, form).await.unwrap();
+    assert!(relay
+        .accounts
+        .hostkey(
+            relay
+                .store()
+                .user_by_username(name)
+                .await
+                .unwrap()
+                .unwrap()
+                .id
+        )
+        .await
+        .unwrap()
+        .is_none());
+    voipc_crypto::generate_identity_key_pair()
+}
+
+/// W3: the password never leaves the device. An account made before 1.12 signs in with
+/// its secret once more, and its app moves it to the login key at once, signed by the
+/// identity over this connection; from then on the key is the only password there is.
+#[tokio::test]
+async fn an_account_moves_to_its_login_key_once_after_a_sign_in_with_its_secret() {
+    let (state, _db_state) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+    let relay_id = state.accounts.as_ref().unwrap().relay_id;
+    let id = legacy_account(&state, "lex").await;
+    let public = id.identity_key().serialize().to_vec();
+    let key = test_key().public_key();
+    let set = |id: &voipc_crypto::IdentityKeyPair, b: Binding, slot: Option<Vec<u8>>| {
+        ClientMessage::Account(AccountRequest::LoginKeySet {
+            login_key: key.to_vec(),
+            identity_sig: voipc_crypto::account::login_key_proof(
+                id,
+                &relay_id,
+                "lex",
+                &key,
+                slot.as_deref(),
+                &b,
+            ),
+            pass_slot: slot,
+            web: b.web(),
+        })
+    };
+    let refused = |m: ServerMessage| match m {
+        ServerMessage::Account(AccountReply::Error { request, reason }) => {
+            assert_eq!(request, "LoginKeySet");
+            reason
+        }
+        other => panic!("{other:?}"),
+    };
+
+    // The secret, one more time (the relay asks for nothing else of this account)
+    let mut c = login(&state, "lex", &public, false).await;
+    c.expect("signed in", |m| {
+        matches!(
+            m,
+            ServerMessage::Authenticated {
+                account: Some(_),
+                ..
+            }
+        )
+    })
+    .await;
+    let mut other = login(&state, "lex", &public, false).await;
+    other
+        .expect("signed in", |m| {
+            matches!(
+                m,
+                ServerMessage::Authenticated {
+                    account: Some(_),
+                    ..
+                }
+            )
+        })
+        .await;
+    c = login(&state, "lex", &public, false).await;
+    c.expect("signed in", |m| {
+        matches!(
+            m,
+            ServerMessage::Authenticated {
+                account: Some(_),
+                ..
+            }
+        )
+    })
+    .await;
+    // A server between holds no identity, and its own connection
+    c.send(&set(
+        &voipc_crypto::generate_identity_key_pair(),
+        Binding::Tls(TEST_BIND),
+        None,
+    ))
+    .await;
+    assert!(refused(c.expect("refused", |m| reply(m).is_some()).await).contains("not signed"));
+    c.send(&set(&id, Binding::Tls([0x77; 32]), None)).await;
+    assert!(refused(c.expect("refused", |m| reply(m).is_some()).await).contains("not signed"));
+    // The account's own, over this connection
+    c.send(&set(&id, Binding::Tls(TEST_BIND), None)).await;
+    let r = c.expect("saved", |m| reply(m).is_some()).await;
+    assert!(
+        matches!(r, ServerMessage::Account(AccountReply::LoginKeySaved)),
+        "{r:?}"
+    );
+    // Once per sign-in with the secret
+    c.send(&set(&id, Binding::Tls(TEST_BIND), None)).await;
+    assert!(refused(c.expect("refused", |m| reply(m).is_some()).await).contains("password first"));
+
+    // The secret opens nothing now, and the key does
+    let mut old = open_account(&state, "lex", AccountStart::Login).await;
+    let Some(ServerMessage::AuthStep(AuthStep::KeyChallenge { .. })) = old.next().await else {
+        panic!("the relay still asks for the secret")
+    };
+    old.send(&ClientMessage::AuthContinue(AuthContinue::Secret {
+        auth_secret: SECRET.to_vec(),
+    }))
+    .await;
+    assert!(matches!(
+        old.next().await,
+        Some(ServerMessage::AuthError { .. })
+    ));
+    let mut keyed = login(&state, "lex", &public, false).await;
+    keyed
+        .expect("signed in with the key", |m| {
+            matches!(
+                m,
+                ServerMessage::Authenticated {
+                    account: Some(_),
+                    ..
+                }
+            )
+        })
+        .await;
+    // A key sign-in moves nothing: it never held the secret
+    keyed.send(&set(&id, Binding::Tls(TEST_BIND), None)).await;
+    assert!(
+        refused(keyed.expect("refused", |m| reply(m).is_some()).await).contains("password first")
+    );
+    drop(other);
+}
+
+/// A direct conversation's new key, put while its writer goes by a pseudonym, tells the other
+/// party nothing at that moment: the news would tie the alias writing to them to the account
+/// (pseudonym review, 1.7). The key is kept as ever.
+#[tokio::test]
+async fn a_direct_key_put_under_a_pseudonym_tells_the_other_party_nothing_then() {
+    let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+    let (mut a, ai) = register(&state, "amy").await;
+    let (mut b, bi) = register(&state, "ben").await;
+    let conv = voipc_protocol::conv::dm_conv(&ai.id, &bi.id);
+    let put = |epoch: u32| {
+        ClientMessage::Account(AccountRequest::EpochPut {
+            conv: conv.clone(),
+            epoch,
+            wraps: vec![
+                voipc_protocol::messages::WrapIn {
+                    recipient: ai.id,
+                    wrapped: vec![1; 64],
+                },
+                voipc_protocol::messages::WrapIn {
+                    recipient: bi.id,
+                    wrapped: vec![2; 64],
+                },
+            ],
+        })
+    };
+    let news = async |b: &mut Client| loop {
+        match tokio::time::timeout(Duration::from_millis(300), b.next()).await {
+            Ok(Some(ServerMessage::Account(AccountReply::LogNews { .. }))) => return true,
+            Ok(Some(_)) => continue,
+            _ => return false,
+        }
+    };
+    // The control: as herself, he hears at once
+    a.send(&put(1)).await;
+    let r = a.expect("stored", |m| reply(m).is_some()).await;
+    assert!(
+        matches!(r, ServerMessage::Account(AccountReply::EpochStored { .. })),
+        "{r:?}"
+    );
+    assert!(news(&mut b).await);
+
+    // Under a pseudonym in an anonymous channel she is in
+    let uid = state
+        .sessions
+        .get(&*state.account_sessions.get(&ai.id).unwrap())
+        .unwrap()
+        .user_id;
+    {
+        let mut channels = state.channels.write().await;
+        let lobby = channels.get_mut(&0).unwrap();
+        lobby.info.anonymous = true;
+        lobby.members.insert(uid);
+        lobby.pseudonyms.insert(uid, "Quiet Fox".into());
+    }
+    assert!(state.names_of(uid).await.1.is_some());
+    a.send(&put(2)).await;
+    let r = a.expect("stored", |m| reply(m).is_some()).await;
+    assert!(
+        matches!(r, ServerMessage::Account(AccountReply::EpochStored { .. })),
+        "{r:?}"
+    );
+    assert!(
+        !news(&mut b).await,
+        "nothing told while she goes by the alias"
+    );
+}
+
+/// The 1.12 gap: an account that signs in only by a remembered device or a provider never
+/// gave its password's secret at a sign-in. A request that proves it the old way (a relay
+/// that said `NOT_KEYED`) lets it move, once; a wrong one does not.
+#[tokio::test]
+async fn a_password_proven_again_moves_an_account_that_signed_in_another_way() {
+    let (state, _db_state) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+    let relay = state.accounts.clone().unwrap();
+    let id = legacy_account(&state, "ivy").await;
+    let public = id.identity_key().serialize().to_vec();
+    let key = test_key().public_key();
+    let set = ClientMessage::Account(AccountRequest::LoginKeySet {
+        login_key: key.to_vec(),
+        identity_sig: voipc_crypto::account::login_key_proof(
+            &id,
+            &relay.relay_id,
+            "ivy",
+            &key,
+            None,
+            &Binding::Tls(TEST_BIND),
+        ),
+        pass_slot: None,
+        web: false,
+    });
+    let again = |secret: &[u8]| {
+        ClientMessage::Account(AccountRequest::RecoveryKeyNew {
+            secret: secret.to_vec(),
+            recovery_slot: vec![1; 101],
+            reset_key: vec![2; 32],
+            totp: None,
+            recovery_code: None,
+        })
+    };
+    let answer = |m: ServerMessage| match m {
+        ServerMessage::Account(r) => r,
+        other => panic!("{other:?}"),
+    };
+    let mut c = login(&state, "ivy", &public, false).await;
+    c.expect("signed in", |m| {
+        matches!(
+            m,
+            ServerMessage::Authenticated {
+                account: Some(_),
+                ..
+            }
+        )
+    })
+    .await;
+    // As after a sign-in by a remembered device or a provider: no secret on this connection
+    let account = relay
+        .store()
+        .user_by_username("ivy")
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    let sid = *state.account_sessions.get(&account.0).unwrap();
+    state
+        .sessions
+        .get_mut(&sid)
+        .unwrap()
+        .account
+        .as_mut()
+        .unwrap()
+        .by_secret = false;
+    let password_first = |r: AccountReply| {
+        matches!(r, AccountReply::Error { ref request, ref reason }
+            if request == "LoginKeySet" && reason.contains("password first"))
+    };
+
+    // The control: nothing proven, no move
+    c.send(&set).await;
+    assert!(password_first(answer(
+        c.expect("refused", |m| reply(m).is_some()).await
+    )));
+    // A wrong password proves nothing
+    c.send(&again(&[9; 32])).await;
+    let r = answer(c.expect("refused", |m| reply(m).is_some()).await);
+    assert!(
+        matches!(&r, AccountReply::Error { request, .. } if request == "RecoveryKeyNew"),
+        "{r:?}"
+    );
+    c.send(&set).await;
+    assert!(password_first(answer(
+        c.expect("refused", |m| reply(m).is_some()).await
+    )));
+    assert!(relay.accounts.hostkey(account).await.unwrap().is_none());
+
+    // The right one, and the move right behind it
+    c.send(&again(&SECRET)).await;
+    c.expect("its answer", |m| reply(m).is_some()).await;
+    c.send(&set).await;
+    let r = answer(c.expect("saved", |m| reply(m).is_some()).await);
+    assert!(matches!(r, AccountReply::LoginKeySaved), "{r:?}");
+    assert_eq!(relay.accounts.hostkey(account).await.unwrap(), Some(key));
+}
+
+/// W3, end to end with the app's own code: an account whose password l4f holds as Argon2
+/// signs in with its secret, its session moves it to the login key at once, and the next
+/// sign-in is by the key.
+#[tokio::test]
+async fn an_apps_first_sign_in_at_22_moves_its_account_to_the_login_key() {
+    use voipc_crypto::account::{derive, stretch, LoginKey, Method, SignIn};
+    use voipc_crypto::account_session::AccountSession;
+    let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+    let (_c, _, signed) = register_with(&state, "moe").await;
+    let relay = state.accounts.as_ref().unwrap();
+    let id = relay
+        .store()
+        .user_by_username("moe")
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    // As before 1.12: the password's secret, under Argon2
+    let ctx = relay.ctx(IpAddr::V4(Ipv4Addr::LOCALHOST), "test");
+    let secret = derive("correct horse battery", &signed.relay_id, "moe").auth_secret;
+    relay
+        .accounts
+        .password_set_as_host(&ctx, id, &l4f_accounts::util::b64u(&secret))
+        .await
+        .unwrap();
+    assert!(relay.accounts.hostkey(id).await.unwrap().is_none());
+
+    let (mut m, first) = SignIn::start(
+        "moe",
+        Method::Password {
+            password: zeroize::Zeroizing::new("correct horse battery".into()),
+        },
+        PROTOCOL_VERSION,
+        APP_VERSION,
+    );
+    m.bind(Binding::Tls(TEST_BIND));
+    let mut c = open_raw(&state, &first).await;
+    let info = drive(&mut c, &mut m).await.unwrap();
+    let signed = m.finish().unwrap();
+    assert!(signed.login_key.is_some() && !signed.keyed);
+    let (mut session, _) = AccountSession::start(
+        signed,
+        &info,
+        Default::default(),
+        false,
+        true,
+        PROTOCOL_VERSION,
+    );
+    let a = session.after_connect();
+    assert!(a.send.iter().any(|m| matches!(
+        m,
+        ClientMessage::Account(AccountRequest::LoginKeySet {
+            pass_slot: None,
+            ..
+        })
+    )));
+    for m in a.send {
+        c.send(&m).await;
+    }
+    c.expect("saved", |m| {
+        matches!(m, ServerMessage::Account(AccountReply::LoginKeySaved))
+    })
+    .await;
+    let key = LoginKey::from_master(&stretch("correct horse battery", &relay.relay_id, "moe"));
+    assert_eq!(
+        relay.accounts.hostkey(id).await.unwrap(),
+        Some(key.public_key())
+    );
+    // The next sign-in is by the key, and opens the same vault
+    let again = password_sign_in(&state, "moe", "correct horse battery")
+        .await
+        .unwrap();
+    assert!(again.keyed && again.login_key.is_none());
+}
+
+/// W3 and W1-24: the login key's answer is bound to the connection. A browser's says it
+/// is one, and an app never makes that shape.
+#[tokio::test]
+async fn a_login_key_answer_holds_only_on_its_own_connection() {
+    let (state, _db_state) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+    let relay_id = state.accounts.as_ref().unwrap().relay_id;
+    let (_c, _) = register(&state, "kay").await;
+    for (b, holds) in [
+        (Binding::Tls([0x77; 32]), false),
+        (Binding::Tls(TEST_BIND), true),
+        (Binding::Web, true),
+    ] {
+        let mut c = open_account(&state, "kay", AccountStart::Login).await;
+        let Some(ServerMessage::AuthStep(AuthStep::KeyChallenge { challenge, .. })) =
+            c.next().await
+        else {
+            panic!("no key challenge")
+        };
+        c.send(&ClientMessage::AuthContinue(AuthContinue::KeySig {
+            signature: test_key().sign(&relay_id, "kay", &challenge, &b),
+            web: b.web(),
+        }))
+        .await;
+        c.send(&keys(&IDENTITY, false)).await;
+        let m = c
+            .expect("an end", |m| {
+                matches!(
+                    m,
+                    ServerMessage::Authenticated { .. } | ServerMessage::AuthError { .. }
+                )
+            })
+            .await;
+        assert_eq!(
+            matches!(m, ServerMessage::Authenticated { .. }),
+            holds,
+            "{b:?}: {m:?}"
+        );
+    }
+    // The 21 shapes are refused at 22: no secret, no unbound sign-up
+    let mut c = open_account(&state, "kay", AccountStart::Login).await;
+    c.next().await;
     c.send(&ClientMessage::AuthContinue(AuthContinue::Secret {
         auth_secret: SECRET.to_vec(),
     }))
     .await;
-    c.send(&keys(identity, reset)).await;
-    c
+    assert!(matches!(
+        c.next().await,
+        Some(ServerMessage::AuthError { .. })
+    ));
+    let mut c = open_account(&state, "kim", AccountStart::Register { invite: None }).await;
+    let Some(ServerMessage::AuthStep(AuthStep::Salt { pow: Some(pow), .. })) = c.next().await
+    else {
+        panic!("a puzzle")
+    };
+    c.send(&ClientMessage::AuthContinue(AuthContinue::Register {
+        auth_secret: SECRET.to_vec(),
+        altcha: solve(&pow.altcha),
+        ts: pow.ts,
+        vault: vec![reset_slot()],
+    }))
+    .await;
+    let Some(ServerMessage::AuthError { reason }) = c.next().await else {
+        panic!("signed up with a secret")
+    };
+    assert!(reason.contains("unexpected"), "{reason}");
 }
 
 #[tokio::test]
@@ -2472,11 +3277,24 @@ async fn an_account_signs_up_and_signs_in_with_its_vault_and_identity() {
         Some(vec![6; 33])
     );
 
+    // Another password is another key
     let mut wrong = open_account(&state, "alice", AccountStart::Login).await;
-    wrong.next().await;
+    let Some(ServerMessage::AuthStep(AuthStep::KeyChallenge {
+        challenge,
+        relay_id,
+    })) = wrong.next().await
+    else {
+        panic!("a keyed account is asked for its key")
+    };
     wrong
-        .send(&ClientMessage::AuthContinue(AuthContinue::Secret {
-            auth_secret: vec![8; 32],
+        .send(&ClientMessage::AuthContinue(AuthContinue::KeySig {
+            signature: voipc_crypto::account::LoginKey::from_master(&[8; 32]).sign(
+                &relay_id,
+                "alice",
+                &challenge,
+                &Binding::Tls(TEST_BIND),
+            ),
+            web: false,
         }))
         .await;
     assert!(
@@ -2533,6 +3351,17 @@ async fn guests_need_a_tag_and_cannot_take_an_accounts_name() {
     assert!(refusal(&state, "c\u{430}rol#1234")
         .await
         .contains("looks like"));
+    // W1-30: the move's names, refused alike whether such an account is here or not, so
+    // the answer does not say which Discord ids were banned there; sign-up keeps them too
+    for name in ["dc-1003#1234", "DC-5#1234", "d\u{441}-5#1234"] {
+        let why = refusal(&state, name).await;
+        assert!(why.contains("moved from Discord"), "{name}: {why}");
+    }
+    let mut c = open_account(&state, "dc-77", AccountStart::Register { invite: None }).await;
+    assert!(
+        matches!(c.next().await, Some(ServerMessage::AuthError { reason }) if reason.contains("moved from Discord"))
+    );
+    connect(&state, "dc-cat#1234", IpAddr::V4(Ipv4Addr::LOCALHOST)).await;
     connect(&state, "J\u{fc}rgen#1234", IpAddr::V4(Ipv4Addr::LOCALHOST)).await;
     connect(
         &state,
@@ -2602,8 +3431,8 @@ async fn invites_are_the_way_in_when_sign_up_is_not_open() {
         ),
         "no proof of work with an invite"
     );
-    c.send(&ClientMessage::AuthContinue(AuthContinue::Register {
-        auth_secret: SECRET.to_vec(),
+    c.send(&ClientMessage::AuthContinue(AuthContinue::RegisterKey {
+        login_key: test_key().public_key().to_vec(),
         altcha: String::new(),
         ts: String::new(),
         vault: vec![reset_slot()],
@@ -2703,11 +3532,7 @@ async fn the_admin_token_makes_the_first_admin_whose_rights_wait_for_codes() {
 
     // A new device: password, then a code; a wrong code asks again.
     let mut c = open_account(&state, "gina", AccountStart::Login).await;
-    c.next().await;
-    c.send(&ClientMessage::AuthContinue(AuthContinue::Secret {
-        auth_secret: SECRET.to_vec(),
-    }))
-    .await;
+    password_answer(&mut c, &state, "gina").await;
     assert!(matches!(
         c.next().await,
         Some(ServerMessage::AuthStep(AuthStep::NeedTotp))
@@ -2777,6 +3602,19 @@ async fn a_remembered_device_signs_in_alone_and_its_signature_does_not_replay() 
         );
         key.sign(&msg).as_ref().to_vec()
     };
+    let device = voipc_crypto::account::DeviceKey::from_parts(
+        device_id.clone().try_into().unwrap(),
+        pkcs8.as_ref().to_vec(),
+    )
+    .unwrap();
+    // l4f's signature, and the device key over this connection (22)
+    let answer = |challenge: &str, b: Binding| {
+        ClientMessage::AuthContinue(AuthContinue::DeviceSigBound {
+            signature: sign(challenge),
+            bind: device.sign_bound(&relay_id, challenge, &b),
+            web: b.web(),
+        })
+    };
     ivy.send(&ClientMessage::Account(AccountRequest::DeviceChallenge))
         .await;
     let ServerMessage::Account(AccountReply::DeviceChallenge { challenge }) =
@@ -2812,11 +3650,8 @@ async fn a_remembered_device_signs_in_alone_and_its_signature_does_not_replay() 
         panic!("a device challenge")
     };
     assert_eq!(rid, relay_id);
-    let first_sig = sign(&challenge);
-    d.send(&ClientMessage::AuthContinue(AuthContinue::DeviceSig {
-        signature: first_sig.clone(),
-    }))
-    .await;
+    let first = answer(&challenge, Binding::Tls(TEST_BIND));
+    d.send(&first).await;
     d.expect("Vault", |m| {
         matches!(m, ServerMessage::AuthStep(AuthStep::Vault { .. }))
     })
@@ -2843,15 +3678,52 @@ async fn a_remembered_device_signs_in_alone_and_its_signature_does_not_replay() 
     )
     .await;
     replay.next().await;
-    replay
-        .send(&ClientMessage::AuthContinue(AuthContinue::DeviceSig {
-            signature: first_sig,
-        }))
-        .await;
+    replay.send(&first).await;
     assert!(
         matches!(replay.next().await, Some(ServerMessage::AuthError { .. })),
         "a replayed signature is refused"
     );
+
+    // W1-24: what a server between the app and this relay holds. Each with l4f's signature
+    // right for this challenge, so only the binding stops it.
+    let forwarded = [
+        // The app's end of a forwarder's connection has another exporter
+        answer("", Binding::Tls([0x77; 32])),
+        // The unbound shape, as a 21 relay takes it
+        ClientMessage::AuthContinue(AuthContinue::DeviceSig {
+            signature: Vec::new(),
+        }),
+    ];
+    for (i, msg) in forwarded.into_iter().enumerate() {
+        let mut c = open_account(
+            &state,
+            "ivy",
+            AccountStart::DeviceKey {
+                device_id: device_id.clone(),
+            },
+        )
+        .await;
+        let Some(ServerMessage::AuthStep(AuthStep::DeviceChallenge { challenge, .. })) =
+            c.next().await
+        else {
+            panic!("a device challenge")
+        };
+        let msg = match msg {
+            ClientMessage::AuthContinue(AuthContinue::DeviceSigBound { .. }) => {
+                answer(&challenge, Binding::Tls([0x77; 32]))
+            }
+            _ => ClientMessage::AuthContinue(AuthContinue::DeviceSig {
+                signature: sign(&challenge),
+            }),
+        };
+        c.send(&msg).await;
+        let Some(ServerMessage::AuthError { reason }) = c.next().await else {
+            panic!("case {i}: a forwarded answer signed in")
+        };
+        if i == 0 {
+            assert_eq!(reason, crate::accounts::NOT_THIS_CONNECTION);
+        }
+    }
 
     // H1-14: a remembered device alone cannot replace the identity every
     // contact pinned; that takes the password
@@ -2869,9 +3741,7 @@ async fn a_remembered_device_signs_in_alone_and_its_signature_does_not_replay() 
         panic!("a device challenge")
     };
     reset
-        .send(&ClientMessage::AuthContinue(AuthContinue::DeviceSig {
-            signature: sign(&challenge),
-        }))
+        .send(&answer(&challenge, Binding::Tls(TEST_BIND)))
         .await;
     reset
         .expect("Vault", |m| {
@@ -2910,6 +3780,7 @@ async fn a_pre_1_0_client_is_told_to_update() {
         media_tx,
         sid_tx,
         state.clone(),
+        Some(TEST_BIND),
     ));
     let payload = postcard::to_allocvec(&Old::Authenticate {
         username: "old".into(),
@@ -3034,6 +3905,7 @@ async fn slow_reader(state: &Arc<ServerState>, name: &str) -> Client {
         media_tx,
         sid_tx,
         state.clone(),
+        Some(TEST_BIND),
     ));
     let mut c = Client {
         stream,
@@ -3165,6 +4037,7 @@ async fn reset_with(
         password: zeroize::Zeroizing::new(password.into()),
     };
     let (mut m, first) = SignIn::start(name, method, PROTOCOL_VERSION, APP_VERSION);
+    m.bind(Binding::Tls(TEST_BIND));
     let mut c = open_raw(state, &first).await;
     loop {
         let msg = c.next().await.ok_or("closed")?;
@@ -3193,6 +4066,7 @@ async fn password_sign_in(
         PROTOCOL_VERSION,
         APP_VERSION,
     );
+    m.bind(Binding::Tls(TEST_BIND));
     drive(&mut open_raw(state, &first).await, &mut m).await?;
     m.finish()
 }
@@ -3241,19 +4115,22 @@ async fn the_recovery_key_sets_a_new_password_and_signs_every_device_out() {
             && blobs.len() == 2,
         "{blobs:?}"
     );
-    let forged = voipc_crypto::account::reset_proof(
+    let forged = voipc_crypto::account::reset_proof_bound(
         &voipc_crypto::generate_identity_key_pair(),
         &signed.relay_id,
         "kim",
         b"x",
+        &[3; 32],
+        &Binding::Tls(TEST_BIND),
     );
-    raw.send(&ClientMessage::AuthContinue(AuthContinue::Reset {
+    raw.send(&ClientMessage::AuthContinue(AuthContinue::ResetBound {
         signature: forged,
         key_signature: vec![0; 64],
-        auth_secret: SECRET.to_vec(),
+        login_key: vec![3; 32],
         pass_slot: vec![1; 101],
         totp: None,
         recovery_code: None,
+        web: false,
     }))
     .await;
     let ServerMessage::AuthError { reason } = raw
@@ -3287,6 +4164,7 @@ async fn the_recovery_key_sets_a_new_password_and_signs_every_device_out() {
         PROTOCOL_VERSION,
         APP_VERSION,
     );
+    m.bind(Binding::Tls(TEST_BIND));
     assert!(
         drive(&mut open_raw(&state, &first).await, &mut m)
             .await
@@ -3300,12 +4178,95 @@ async fn the_recovery_key_sets_a_new_password_and_signs_every_device_out() {
     assert_eq!(again.identity.public_key().serialize().to_vec(), identity);
 }
 
+/// W1-24 and W3: a reset is bound to its connection and carries the new password's login
+/// key, never its secret. What a server between holds opens nothing here.
+#[tokio::test]
+async fn a_reset_holds_only_on_its_own_connection_and_names_its_key() {
+    use voipc_crypto::account::{recovery_parse, reset_key_proof, reset_key_proof_bound};
+    let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+    let (_c, _, signed) = register_with(&state, "ria").await;
+    let recovery = recovery_parse(signed.recovery.as_deref().unwrap()).unwrap();
+    let key = [4u8; 32];
+    let bound = |challenge: &[u8], b: Binding, signed_key: [u8; 32]| {
+        ClientMessage::AuthContinue(AuthContinue::ResetBound {
+            signature: Vec::new(),
+            key_signature: reset_key_proof_bound(
+                &recovery,
+                &signed.relay_id,
+                "ria",
+                challenge,
+                &signed_key,
+                &b,
+            ),
+            login_key: key.to_vec(),
+            pass_slot: vec![1; 101],
+            totp: None,
+            recovery_code: None,
+            web: b.web(),
+        })
+    };
+    let challenge = |m: Option<ServerMessage>| match m {
+        Some(ServerMessage::AuthStep(AuthStep::ResetChallenge { challenge, .. })) => challenge,
+        other => panic!("{other:?}"),
+    };
+    // Another connection's
+    let mut raw = open_account(&state, "ria", AccountStart::Reset).await;
+    let ch = challenge(raw.next().await);
+    raw.send(&bound(&ch, Binding::Tls([0x77; 32]), key)).await;
+    let Some(ServerMessage::AuthError { reason }) = raw.next().await else {
+        panic!("a forwarded reset went through")
+    };
+    assert!(reason.contains("not this account's"), "{reason}");
+    // Another key in place of the one signed
+    let mut raw = open_account(&state, "ria", AccountStart::Reset).await;
+    let ch = challenge(raw.next().await);
+    raw.send(&bound(&ch, Binding::Tls(TEST_BIND), [5; 32]))
+        .await;
+    assert!(matches!(
+        raw.next().await,
+        Some(ServerMessage::AuthError { .. })
+    ));
+    // The unbound shape, with a right signature
+    let mut raw = open_account(&state, "ria", AccountStart::Reset).await;
+    let ch = challenge(raw.next().await);
+    raw.send(&ClientMessage::AuthContinue(AuthContinue::Reset {
+        signature: Vec::new(),
+        key_signature: reset_key_proof(&recovery, &signed.relay_id, "ria", &ch),
+        auth_secret: SECRET.to_vec(),
+        pass_slot: vec![1; 101],
+        totp: None,
+        recovery_code: None,
+    }))
+    .await;
+    let Some(ServerMessage::AuthError { reason }) = raw.next().await else {
+        panic!("an unbound reset went through")
+    };
+    assert!(reason.contains("unexpected"), "{reason}");
+    // The control: bound to this connection, with the key it names
+    let mut raw = open_account(&state, "ria", AccountStart::Reset).await;
+    let ch = challenge(raw.next().await);
+    raw.send(&bound(&ch, Binding::Tls(TEST_BIND), key)).await;
+    assert!(matches!(
+        raw.next().await,
+        Some(ServerMessage::AuthStep(AuthStep::ResetDone))
+    ));
+    let relay = state.accounts.as_ref().unwrap();
+    let id = relay
+        .store()
+        .user_by_username("ria")
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    assert_eq!(relay.accounts.hostkey(id).await.unwrap(), Some(key));
+}
+
 /// S-006: the vault's DEK, which a remembered device keeps, opens the
 /// identity, so it can make the old reset proof. An account with a reset
 /// key refuses that proof: only the recovery key resets its password.
 #[tokio::test]
 async fn a_device_that_holds_the_vault_key_cannot_reset_the_password() {
-    use voipc_crypto::account::{reset_proof, Vault};
+    use voipc_crypto::account::{reset_proof_bound, Vault};
     let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
     let (_c, _, signed) = register_with(&state, "ida").await;
     let mut raw = open_account(&state, "ida", AccountStart::Reset).await;
@@ -3323,13 +4284,21 @@ async fn a_device_that_holds_the_vault_key_cannot_reset_the_password() {
         .unwrap()
         .payload;
     assert_eq!(opened, signed.identity.serialize().to_vec());
-    raw.send(&ClientMessage::AuthContinue(AuthContinue::Reset {
-        signature: reset_proof(&signed.identity, &relay_id, "ida", &challenge),
+    raw.send(&ClientMessage::AuthContinue(AuthContinue::ResetBound {
+        signature: reset_proof_bound(
+            &signed.identity,
+            &relay_id,
+            "ida",
+            &challenge,
+            &[3; 32],
+            &Binding::Tls(TEST_BIND),
+        ),
         key_signature: vec![0; 64],
-        auth_secret: SECRET.to_vec(),
+        login_key: vec![3; 32],
         pass_slot: vec![1; 101],
         totp: None,
         recovery_code: None,
+        web: false,
     }))
     .await;
     let ServerMessage::AuthError { reason } = raw
@@ -3345,37 +4314,210 @@ async fn a_device_that_holds_the_vault_key_cannot_reset_the_password() {
         .unwrap();
 }
 
+/// W3, as the browser lane found it: a session that signed in with a remembered device does
+/// not know whether the password is a login key. It asks; an account with a key steps up with
+/// it, one without proves the old way, and both change their password and recovery key.
+#[tokio::test]
+async fn a_device_signed_in_session_proves_the_password_either_way() {
+    use voipc_crypto::account::{derive, stretch, DeviceEnrol, DeviceKey, Method, SignIn};
+    use voipc_crypto::account_session::AccountSession;
+    let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+    for legacy in [false, true] {
+        let name = if legacy { "lea" } else { "kai" };
+        let (mut c, _, signed) = register_with(&state, name).await;
+        let relay = state.accounts.as_ref().unwrap();
+        let id = relay
+            .store()
+            .user_by_username(name)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        let (enrol, ask) = DeviceEnrol::start(signed.relay_id);
+        c.send(&ask).await;
+        let ServerMessage::Account(r) = c.expect("challenge", |m| reply(m).is_some()).await else {
+            unreachable!()
+        };
+        c.send(&enrol.on_reply(&r).unwrap()).await;
+        c.expect("added", |m| reply(m).is_some()).await;
+        drop(c);
+        if legacy {
+            // As before 1.12: the password's secret under Argon2
+            let ctx = relay.ctx(IpAddr::V4(Ipv4Addr::LOCALHOST), "test");
+            let secret = derive("correct horse battery", &signed.relay_id, name).auth_secret;
+            relay
+                .accounts
+                .password_set_as_host(&ctx, id, &l4f_accounts::util::b64u(&secret))
+                .await
+                .unwrap();
+            // A set password forgets every device: remember this one again
+            let mut c = password_sign_in_open(&state, name).await;
+            let (enrol2, ask) = DeviceEnrol::start(signed.relay_id);
+            c.send(&ask).await;
+            let ServerMessage::Account(r) = c.expect("challenge", |m| reply(m).is_some()).await
+            else {
+                unreachable!()
+            };
+            c.send(&enrol2.on_reply(&r).unwrap()).await;
+            c.expect("added", |m| reply(m).is_some()).await;
+            drop(c);
+            assert!(relay.accounts.hostkey(id).await.unwrap().is_none());
+            enrol_device_signs_in(&state, name, &signed, enrol2.key, legacy).await;
+        } else {
+            enrol_device_signs_in(&state, name, &signed, enrol.key, legacy).await;
+        }
+    }
+
+    async fn enrol_device_signs_in(
+        state: &Arc<ServerState>,
+        name: &str,
+        signed: &voipc_crypto::account::SignedIn,
+        key: DeviceKey,
+        legacy: bool,
+    ) {
+        let key = DeviceKey::from_parts(key.device_id, key.pkcs8().to_vec()).unwrap();
+        let (mut m, first) = SignIn::start(
+            name,
+            Method::Device {
+                key,
+                relay_id: signed.relay_id,
+                dek: signed.vault.dek(),
+            },
+            PROTOCOL_VERSION,
+            APP_VERSION,
+        );
+        m.bind(Binding::Tls(TEST_BIND));
+        let mut c = open_raw(state, &first).await;
+        let info = drive(&mut c, &mut m).await.unwrap();
+        let by_device = m.finish().unwrap();
+        assert!(
+            !by_device.keyed && by_device.login_key.is_none(),
+            "it cannot know"
+        );
+        let (mut session, _) = AccountSession::start(
+            by_device,
+            &info,
+            Default::default(),
+            false,
+            false,
+            PROTOCOL_VERSION,
+        );
+        let old = stretch("correct horse battery", &signed.relay_id, name);
+        let new = stretch("another good password", &signed.relay_id, name);
+        let a = session.password_change(&old, &new, None, None);
+        let (r, page, _) = through(&mut c, &mut session, a).await;
+        assert!(
+            matches!(r, AccountReply::PasswordChanged),
+            "{name}: {r:?} {page}"
+        );
+        // The recovery key needs the password again: a step-up is one request
+        let (a, _) = session.recovery_key_new(Some(&new), None, None);
+        let (r, page, _) = through(&mut c, &mut session, a).await;
+        assert!(
+            matches!(r, AccountReply::RecoveryKeyChanged),
+            "{name}: {r:?} {page}"
+        );
+        // An account not keyed yet moved behind the request that proved it the old way (the
+        // recovery key's): its answer comes next
+        if legacy {
+            let ServerMessage::Account(r) = c.expect("the move", |m| reply(m).is_some()).await
+            else {
+                unreachable!()
+            };
+            assert!(matches!(r, AccountReply::LoginKeySaved), "{name}: {r:?}");
+            session.on_reply(&r);
+        }
+        // The new password signs in by its key, either way
+        let again = password_sign_in(state, name, "another good password")
+            .await
+            .unwrap();
+        assert!(again.keyed, "{name}");
+        let id = state
+            .accounts
+            .as_ref()
+            .unwrap()
+            .store()
+            .user_by_username(name)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        assert!(
+            state
+                .accounts
+                .as_ref()
+                .unwrap()
+                .accounts
+                .hostkey(id)
+                .await
+                .unwrap()
+                .is_some(),
+            "{name}: legacy {legacy}"
+        );
+    }
+
+    /// The password sign-in's connection, kept open.
+    async fn password_sign_in_open(state: &Arc<ServerState>, name: &str) -> Client {
+        let (mut m, first) = SignIn::start(
+            name,
+            Method::Password {
+                password: zeroize::Zeroizing::new("correct horse battery".into()),
+            },
+            PROTOCOL_VERSION,
+            APP_VERSION,
+        );
+        m.bind(Binding::Tls(TEST_BIND));
+        let mut c = open_raw(state, &first).await;
+        drive(&mut c, &mut m).await.unwrap();
+        c
+    }
+}
+
 /// S-006: a new recovery key, with the password, replaces the old one:
 /// the old stops working, the new resets. It is how an account made
 /// before 1.3 gets its reset key.
 #[tokio::test]
 async fn a_new_recovery_key_replaces_the_old_one() {
-    use voipc_crypto::account::{derive_from_master, recovery_text, reset_key, stretch, Vault};
+    use voipc_crypto::account::{recovery_text, reset_key, stretch, LoginKey, Vault};
     let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
     let (mut c, _, signed) = register_with(&state, "joe").await;
     let old = signed.recovery.clone().unwrap();
     let fresh = [9u8; 32];
-    let ask = |password: &str| {
-        let master = stretch(password, &signed.relay_id, "joe");
-        let vault = Vault::from_dek(signed.relay_id, "joe", signed.vault.dek());
-        ClientMessage::Account(AccountRequest::RecoveryKeyNew {
-            secret: derive_from_master(&master).auth_secret.to_vec(),
-            recovery_slot: vault.recovery_slot(&fresh).v,
-            reset_key: reset_key(&fresh, &signed.relay_id, "joe").to_vec(),
-            totp: None,
-            recovery_code: None,
-        })
-    };
-    c.send(&ask("not the password")).await;
-    assert!(matches!(
-        c.expect("refused", |m| reply(m).is_some()).await,
-        ServerMessage::Account(AccountReply::Error { .. })
+    let vault = Vault::from_dek(signed.relay_id, "joe", signed.vault.dek());
+    // The password goes as its login key's step-up (22), never in the request
+    let ask = ClientMessage::Account(AccountRequest::RecoveryKeyNew {
+        secret: Vec::new(),
+        recovery_slot: vault.recovery_slot(&fresh).v,
+        reset_key: reset_key(&fresh, &signed.relay_id, "joe").to_vec(),
+        totp: None,
+        recovery_code: None,
+    });
+    let key = |password: &str| LoginKey::from_master(&stretch(password, &signed.relay_id, "joe"));
+    let refused =
+        |m: ServerMessage| matches!(m, ServerMessage::Account(AccountReply::Error { .. }));
+    c.send(&ask).await;
+    assert!(
+        refused(c.expect("refused", |m| reply(m).is_some()).await),
+        "not without the password again, though the sign-in is recent"
+    );
+    assert!(refused(
+        step_up_with(&mut c, &state, "joe", &key("not the password"), None).await
     ));
-    c.send(&ask("correct horse battery")).await;
+    c.send(&ask).await;
+    assert!(refused(c.expect("refused", |m| reply(m).is_some()).await));
+    let r = step_up_with(&mut c, &state, "joe", &key("correct horse battery"), None).await;
+    assert!(
+        matches!(r, ServerMessage::Account(AccountReply::SteppedUp)),
+        "{r:?}"
+    );
+    c.send(&ask).await;
     assert!(matches!(
         c.expect("changed", |m| reply(m).is_some()).await,
         ServerMessage::Account(AccountReply::RecoveryKeyChanged)
     ));
+    // One step-up is one request
+    c.send(&ask).await;
+    assert!(refused(c.expect("refused", |m| reply(m).is_some()).await));
     assert!(
         reset_with(&state, "joe", &old, "a brand new password", None)
             .await
@@ -3469,27 +4611,29 @@ async fn a_password_change_keeps_this_connection_and_forgets_the_device_keys() {
     );
     let old = stretch("correct horse battery", &relay_id, "max");
     let new = stretch("another good password", &relay_id, "max");
-    for m in session.password_change(&new, &new, None, None).send {
-        c.send(&m).await;
-    }
-    let msg = c.expect("refused", |m| reply(m).is_some()).await;
+    // Neither password's secret goes (22): the old key steps up, the new key goes in
+    let wrong = session.password_change(&new, &new, None, None);
     assert!(
-        matches!(msg, ServerMessage::Account(AccountReply::Error { ref request, .. }) if request == "PasswordChange"),
-        "the old password must be right: {msg:?}"
+        matches!(
+            &wrong.send[..],
+            [ClientMessage::Account(AccountRequest::KeyChallenge)]
+        ),
+        "{:?}",
+        wrong.send
     );
-    for m in session.password_change(&old, &new, None, None).send {
-        c.send(&m).await;
-    }
-    let ServerMessage::Account(changed) = c.expect("changed", |m| reply(m).is_some()).await else {
-        unreachable!()
-    };
+    let (_, page, _) = through(&mut c, &mut session, wrong).await;
+    assert_eq!(
+        page["Error"]["request"], "PasswordChange",
+        "the old password must be right, and the page hears it as its own: {page}"
+    );
+    let right = session.password_change(&old, &new, None, None);
+    let (changed, _, again) = through(&mut c, &mut session, right).await;
     assert!(
         matches!(changed, AccountReply::PasswordChanged),
         "{changed:?}"
     );
     // Every device key went with the old password, this one's too: the
     // session asks to remember this device again.
-    let again = session.on_reply(&changed);
     assert!(again
         .send
         .iter()
@@ -3513,6 +4657,7 @@ async fn a_password_change_keeps_this_connection_and_forgets_the_device_keys() {
         PROTOCOL_VERSION,
         APP_VERSION,
     );
+    m.bind(Binding::Tls(TEST_BIND));
     assert!(
         drive(&mut open_raw(&state, &first).await, &mut m)
             .await
@@ -3566,6 +4711,7 @@ async fn open_raw_from(state: &Arc<ServerState>, first: &ClientMessage, ip: IpAd
         media_tx,
         sid_tx,
         state.clone(),
+        Some(TEST_BIND),
     ));
     let mut c = Client {
         stream,
@@ -3699,6 +4845,7 @@ async fn stalled_sign_ins_hold_no_permit() {
         PROTOCOL_VERSION,
         APP_VERSION,
     );
+    m.bind(Binding::Tls(TEST_BIND));
     drive(&mut open_raw(&state, &first).await, &mut m)
         .await
         .unwrap();
@@ -3709,7 +4856,7 @@ async fn stalled_sign_ins_hold_no_permit() {
         let mut c = open_account(&state, "kim", AccountStart::Login).await;
         assert!(matches!(
             c.next().await,
-            Some(ServerMessage::AuthStep(AuthStep::Salt { .. }))
+            Some(ServerMessage::AuthStep(AuthStep::KeyChallenge { .. }))
         ));
         stalled.push(c);
     }
@@ -3719,6 +4866,7 @@ async fn stalled_sign_ins_hold_no_permit() {
         PROTOCOL_VERSION,
         APP_VERSION,
     );
+    m.bind(Binding::Tls(TEST_BIND));
     drive(&mut open_raw(&state, &first).await, &mut m)
         .await
         .expect("signs in beside the stalled ones");
@@ -3740,6 +4888,7 @@ async fn the_clients_sign_in_machine_signs_up_remembers_the_device_and_signs_in_
         PROTOCOL_VERSION,
         APP_VERSION,
     );
+    m.bind(Binding::Tls(TEST_BIND));
     let mut c = open_raw(&state, &first).await;
     drive(&mut c, &mut m).await.unwrap();
     let signed = m.finish().unwrap();
@@ -3770,6 +4919,7 @@ async fn the_clients_sign_in_machine_signs_up_remembers_the_device_and_signs_in_
         PROTOCOL_VERSION,
         APP_VERSION,
     );
+    m.bind(Binding::Tls(TEST_BIND));
     let mut c2 = open_raw(&state, &first).await;
     drive(&mut c2, &mut m).await.unwrap();
     assert_eq!(
@@ -3798,6 +4948,7 @@ async fn the_clients_sign_in_machine_signs_up_remembers_the_device_and_signs_in_
         PROTOCOL_VERSION,
         APP_VERSION,
     );
+    m.bind(Binding::Tls(TEST_BIND));
     let mut c3 = open_raw(&state, &first).await;
     drive(&mut c3, &mut m).await.unwrap();
     assert_eq!(
@@ -3819,6 +4970,7 @@ async fn the_clients_sign_in_machine_signs_up_remembers_the_device_and_signs_in_
         PROTOCOL_VERSION,
         APP_VERSION,
     );
+    m.bind(Binding::Tls(TEST_BIND));
     let mut c4 = open_raw(&state, &first).await;
     assert!(drive(&mut c4, &mut m).await.unwrap_err().contains("Wrong"));
 }
@@ -4027,6 +5179,7 @@ async fn register_with(
         PROTOCOL_VERSION,
         APP_VERSION,
     );
+    m.bind(Binding::Tls(TEST_BIND));
     let mut c = open_raw(state, &first).await;
     let info = drive(&mut c, &mut m).await.unwrap();
     (c, info, m.finish().unwrap())
@@ -4311,6 +5464,7 @@ async fn sign_in_password(
         PROTOCOL_VERSION,
         APP_VERSION,
     );
+    m.bind(Binding::Tls(TEST_BIND));
     let mut c = open_raw(state, &first).await;
     let info = drive(&mut c, &mut m).await.unwrap();
     (c, info, m.finish().unwrap())
@@ -4945,8 +6099,8 @@ async fn an_open_sign_up_needs_its_puzzle_solved() {
     else {
         panic!("an open relay hands out a proof of work");
     };
-    let register = AuthContinue::Register {
-        auth_secret: SECRET.to_vec(),
+    let register = AuthContinue::RegisterKey {
+        login_key: test_key().public_key().to_vec(),
         altcha: String::new(),
         ts: pow.ts,
         vault: vec![reset_slot()],
@@ -5041,11 +6195,7 @@ async fn account_bans_follow_the_account_and_roles_pass_address_bans() {
 
     // The admin signs in again from the banned address: password, code, in.
     let mut c = open_account(&state, "gina", AccountStart::Login).await;
-    c.next().await;
-    c.send(&ClientMessage::AuthContinue(AuthContinue::Secret {
-        auth_secret: SECRET.to_vec(),
-    }))
-    .await;
+    password_answer(&mut c, &state, "gina").await;
     assert!(matches!(
         c.next().await,
         Some(ServerMessage::AuthStep(AuthStep::NeedTotp))
@@ -5904,19 +7054,24 @@ async fn an_account_deletes_itself_and_its_name_is_free() {
     let out = sd.send_channel(&log, say("d1", "bye"), 1, None);
     pump(&mut dora, &mut sd, out).await;
     let relay = state.accounts.clone().unwrap();
-    let secret = |pw: &str| {
-        voipc_crypto::account::derive(pw, &relay.relay_id, "dora")
-            .auth_secret
-            .to_vec()
+    let key = |pw: &str| {
+        voipc_crypto::account::LoginKey::from_master(&voipc_crypto::account::stretch(
+            pw,
+            &relay.relay_id,
+            "dora",
+        ))
     };
-    let delete = |secret: Vec<u8>| {
-        ClientMessage::Account(AccountRequest::DeleteAccount {
-            secret,
-            totp: None,
-            recovery_code: None,
-        })
-    };
-    dora.send(&delete(secret("not her password"))).await;
+    let delete = ClientMessage::Account(AccountRequest::DeleteAccount {
+        secret: Vec::new(),
+        totp: None,
+        recovery_code: None,
+    });
+    let msg = step_up_with(&mut dora, &state, "dora", &key("not her password"), None).await;
+    assert!(
+        matches!(&msg, ServerMessage::Account(AccountReply::Error { request, .. }) if request == "KeyStepUp"),
+        "{msg:?}"
+    );
+    dora.send(&delete).await;
     let msg = dora.expect("refused", |m| reply(m).is_some()).await;
     assert!(
         matches!(&msg, ServerMessage::Account(AccountReply::Error { request, .. }) if request == "DeleteAccount"),
@@ -5929,7 +7084,19 @@ async fn an_account_deletes_itself_and_its_name_is_free() {
     }))
     .await;
     dora.expect("stored", |m| reply(m).is_some()).await;
-    dora.send(&delete(secret("correct horse battery"))).await;
+    let msg = step_up_with(
+        &mut dora,
+        &state,
+        "dora",
+        &key("correct horse battery"),
+        None,
+    )
+    .await;
+    assert!(
+        matches!(msg, ServerMessage::Account(AccountReply::SteppedUp)),
+        "{msg:?}"
+    );
+    dora.send(&delete).await;
     assert!(matches!(
         dora.expect("deleted", |m| reply(m).is_some()).await,
         ServerMessage::Account(AccountReply::AccountDeleted)
@@ -5974,9 +7141,10 @@ async fn an_account_deletes_itself_and_its_name_is_free() {
         "{:06}",
         l4f_accounts::totp::code_at(&secret, l4f_accounts::util::now() / 30 + 1)
     );
+    step_up(&mut gina, &state, "gina", Some(code)).await;
     gina.send(&ClientMessage::Account(AccountRequest::DeleteAccount {
-        secret: SECRET.to_vec(),
-        totp: Some(code),
+        secret: Vec::new(),
+        totp: None,
         recovery_code: None,
     }))
     .await;
@@ -7359,9 +8527,8 @@ async fn a_gated_channels_log_keeps_only_who_passes() {
         .unwrap();
     }
     relay
-        .prune_log("c:aa", &["crew".into()], &mut Default::default())
-        .await
-        .unwrap();
+        .prune_gated(&[("c:aa".into(), vec!["crew".into()])])
+        .await;
     let count = |sql: String| {
         let relay = relay.clone();
         async move { crate::accounts::raw(&relay, &sql).await.unwrap() }
@@ -7381,43 +8548,59 @@ async fn a_gated_channels_log_keeps_only_who_passes() {
     );
 }
 
-/// The same people sit in every gated log, and reading what one holds is four queries.
+/// The same people sit in every gated log: a pass decides each account once, and keeps it to
+/// each log's own groups (W2-1).
 #[tokio::test]
 async fn a_pass_decides_each_account_once_however_many_logs_it_sits_in() {
     let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
     group(&state, "crew", None, &[]).await;
+    group(&state, "band", None, &[]).await;
     let (_bob, bi) = register(&state, "bob").await;
     let (_cat, ci) = register(&state, "cat").await;
+    let (_dan, di) = register(&state, "dan").await;
     give(&state, bi.id, "crew", true).await;
+    give(&state, ci.id, "band", true).await;
     let relay = state.accounts.clone().unwrap();
-    for conv in ["c:aa", "c:bb"] {
-        for a in [bi.id, ci.id] {
+    for conv in ["c:aa", "c:bb", "c:cc"] {
+        for a in [bi.id, ci.id, di.id] {
             seat_in_log(&relay, conv, a).await;
         }
     }
-    let seats = async |conv: &str| {
-        crate::accounts::raw(
-            &relay,
-            &format!("SELECT COUNT(*) FROM voipc_members WHERE conv = '{conv}'"),
-        )
-        .await
-        .unwrap()
+    let seated = async |conv: &str| {
+        let mut who = Vec::new();
+        for (name, id) in [("bob", bi.id), ("cat", ci.id), ("dan", di.id)] {
+            let n = crate::accounts::raw(
+                &relay,
+                &format!(
+                    "SELECT COUNT(*) FROM voipc_members WHERE conv = '{conv}' AND account = X'{}'",
+                    hex::encode(id)
+                ),
+            )
+            .await
+            .unwrap();
+            if n == 1 {
+                who.push(name);
+            }
+        }
+        who
     };
-    let crew = ["crew".to_string()];
-    let mut decided = std::collections::HashMap::new();
-    relay.prune_log("c:aa", &crew, &mut decided).await.unwrap();
-    assert_eq!(decided.len(), 2);
-    assert_eq!(seats("c:aa").await, 1, "the one outside is out");
-    // Bob loses the group now: this pass read him once, the next one sees it
-    give(&state, bi.id, "crew", false).await;
-    relay.prune_log("c:bb", &crew, &mut decided).await.unwrap();
-    assert_eq!(decided.len(), 2);
-    assert_eq!(seats("c:bb").await, 1);
+    let gated = |groups: &[&str]| groups.iter().map(|g| g.to_string()).collect::<Vec<_>>();
     relay
-        .prune_log("c:bb", &crew, &mut Default::default())
-        .await
-        .unwrap();
-    assert_eq!(seats("c:bb").await, 0);
+        .prune_gated(&[
+            ("c:aa".into(), gated(&["crew"])),
+            ("c:bb".into(), gated(&["band"])),
+            ("c:cc".into(), gated(&["band", "crew"])),
+        ])
+        .await;
+    assert_eq!(seated("c:aa").await, ["bob"]);
+    assert_eq!(seated("c:bb").await, ["cat"]);
+    assert_eq!(seated("c:cc").await, ["bob", "cat"]);
+    // The next pass reads again
+    give(&state, bi.id, "crew", false).await;
+    relay
+        .prune_gated(&[("c:cc".into(), gated(&["band", "crew"]))])
+        .await;
+    assert_eq!(seated("c:cc").await, ["cat"]);
 }
 
 async fn seat_in_log(relay: &crate::accounts::Relay, conv: &str, account: [u8; 16]) {
@@ -7631,10 +8814,16 @@ mod providers {
                     let body = if got.starts_with(b"POST") {
                         r#"{"access_token":"at","token_type":"Bearer"}"#.to_string()
                     } else {
-                        format!(
-                            r#"{{"id":"{}","username":"dee_d","global_name":"Dee D"}}"#,
-                            who.lock().unwrap()
-                        )
+                        let who = who.lock().unwrap().clone();
+                        // "slow-<id>": the provider takes its time over the profile
+                        let id = match who.strip_prefix("slow-") {
+                            Some(id) => {
+                                tokio::time::sleep(Duration::from_millis(300)).await;
+                                id.to_string()
+                            }
+                            None => who,
+                        };
+                        format!(r#"{{"id":"{id}","username":"dee_d","global_name":"Dee D"}}"#)
                     };
                     let answer = format!(
                         "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -7712,6 +8901,11 @@ mod providers {
         let mut c = open_raw_from(state, &first, ip).await;
         match c.next().await {
             Some(ServerMessage::AuthStep(AuthStep::OpenBrowser { url, code, ticket })) => {
+                // W1-24: what an app derives from its own end of this connection
+                assert_eq!(
+                    code,
+                    voipc_crypto::bind::provider_code(&TEST_BIND, url.as_bytes())
+                );
                 Ok((url, code, ticket))
             }
             Some(ServerMessage::AuthError { reason }) => Err(reason),
@@ -7808,6 +9002,7 @@ mod providers {
             PROTOCOL_VERSION,
             APP_VERSION,
         );
+        m.bind(Binding::Tls(TEST_BIND));
         let mut c = open_raw(state, &first).await;
         let mut shown = None;
         loop {
@@ -7978,15 +9173,12 @@ mod providers {
     async fn a_link_is_not_tied_by_someone_else_tapping() {
         let (state, _db, subject) = relay(RegistrationMode::Open).await;
         *subject.lock().unwrap() = "3003".into();
-        let (mut c, _, signed) = register_with(&state, "wendy").await;
-        let secret =
-            voipc_crypto::account::derive("correct horse battery", &signed.relay_id, "wendy")
-                .auth_secret
-                .to_vec();
+        let (mut c, _, _) = register_with(&state, "wendy").await;
+        password_again(&mut c, &state, "wendy").await;
         c.send(&ClientMessage::Account(AccountRequest::ProviderStart {
             kind: ProviderKind::Discord,
             link: true,
-            secret: Some(secret),
+            secret: None,
             totp: None,
             recovery_code: None,
         }))
@@ -7996,6 +9188,11 @@ mod providers {
         else {
             panic!("no page")
         };
+        // The signed-in connection's exporter, as for a sign-in's page
+        assert_eq!(
+            code,
+            voipc_crypto::bind::provider_code(&TEST_BIND, url.as_bytes())
+        );
         let s = state_in(&url).to_string();
         let page = back(&state, &s, "abc");
         assert_eq!(page.status(), StatusCode::OK);
@@ -8043,6 +9240,116 @@ mod providers {
         assert!(matches!(
             c.expect("done", |m| reply(m).is_some()).await,
             ServerMessage::Account(AccountReply::ProviderDone { link: false, .. })
+        ));
+    }
+
+    /// W2-19: the tap's request ends while the relay asks the provider (a closed tab, a phone
+    /// off its network). The exchange went with it, and the app heard "pending" until the
+    /// flow expired.
+    #[tokio::test]
+    async fn a_browser_gone_mid_exchange_still_finishes_the_sign_in() {
+        let (state, _db, subject) = relay(RegistrationMode::Open).await;
+        *subject.lock().unwrap() = "slow-2002".into();
+        let (url, code, ticket) = open_page(&state).await;
+        let s = state_in(&url).to_string();
+        let came_back = back(&state, &s, "abc");
+        let key = page_key(came_back).await;
+        let form = format!("state={s}&pick={code}&key={key}");
+        let cut = tokio::time::timeout(
+            Duration::from_millis(50),
+            provider::confirm(&state, form.as_bytes(), LO),
+        )
+        .await;
+        assert!(cut.is_err(), "the browser left before the answer");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !status(&state, &ticket).await {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the flow finished without the browser");
+        sign_in(&state, ticket, Choice::Claim).await.unwrap();
+    }
+
+    /// The text of the page a tap gets back.
+    async fn tap_page(state: &Arc<ServerState>, url: &str, pick: &str) -> String {
+        let s = state_in(url);
+        let came_back = back(state, s, "abc");
+        let key = page_key(came_back).await;
+        let form = format!("state={s}&pick={pick}&key={key}");
+        let page = provider::confirm(state, form.as_bytes(), LO).await;
+        assert_eq!(page.status(), StatusCode::OK);
+        let body = page.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8_lossy(&body).into_owned()
+    }
+
+    /// W2-20: a link whose app went away, or that failed, said "Done" on the page.
+    #[tokio::test]
+    async fn a_link_that_did_not_happen_does_not_say_done() {
+        let (state, _db, subject) = relay(RegistrationMode::Open).await;
+        async fn start_link(c: &mut Client, state: &Arc<ServerState>, name: &str) {
+            password_again(c, state, name).await;
+            c.send(&ClientMessage::Account(AccountRequest::ProviderStart {
+                kind: ProviderKind::Discord,
+                link: true,
+                secret: None,
+                totp: None,
+                recovery_code: None,
+            }))
+            .await;
+        }
+        // The Discord account is someone else's already
+        let (_xan, xi) = register(&state, "xan").await;
+        link_directly(&state, AccountId(xi.id), "3003").await;
+        *subject.lock().unwrap() = "3003".into();
+        let (mut c, _, _) = register_with(&state, "wendy").await;
+        start_link(&mut c, &state, "wendy").await;
+        let ServerMessage::Account(AccountReply::ProviderBrowser { url, code }) =
+            c.expect("page", |m| reply(m).is_some()).await
+        else {
+            panic!("no page")
+        };
+        let page = tap_page(&state, &url, &code).await;
+        assert!(page.contains("did not work"), "{page}");
+        assert!(!page.contains("go back to the app"), "{page}");
+        assert!(matches!(
+            c.expect("refused", |m| reply(m).is_some()).await,
+            ServerMessage::Account(AccountReply::Error { .. })
+        ));
+
+        // The app went away while the browser was up
+        *subject.lock().unwrap() = "3004".into();
+        start_link(&mut c, &state, "wendy").await;
+        let ServerMessage::Account(AccountReply::ProviderBrowser { url, code }) =
+            c.expect("page", |m| reply(m).is_some()).await
+        else {
+            panic!("no page")
+        };
+        let before = state.sessions.len();
+        drop(c);
+        tokio::time::timeout(HANG, async {
+            while state.sessions.len() >= before {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let page = tap_page(&state, &url, &code).await;
+        assert!(page.contains(provider::APP_GONE), "{page}");
+
+        // The control: one that happens says so
+        let (mut c, _, _) = register_with(&state, "yuri").await;
+        start_link(&mut c, &state, "yuri").await;
+        let ServerMessage::Account(AccountReply::ProviderBrowser { url, code }) =
+            c.expect("page", |m| reply(m).is_some()).await
+        else {
+            panic!("no page")
+        };
+        let page = tap_page(&state, &url, &code).await;
+        assert!(page.contains("go back to the app"), "{page}");
+        assert!(matches!(
+            c.expect("done", |m| reply(m).is_some()).await,
+            ServerMessage::Account(AccountReply::ProviderDone { link: true, .. })
         ));
     }
 
@@ -8305,9 +9612,12 @@ mod providers {
         );
 
         let (mut c, _, _, _) = at_the_choice(&state).await;
-        c.send(&ClientMessage::AuthContinue(AuthContinue::ProviderProof {
-            signature: vec![0; 64],
-        }))
+        c.send(&ClientMessage::AuthContinue(
+            AuthContinue::ProviderProofBound {
+                signature: vec![0; 64],
+                web: false,
+            },
+        ))
         .await;
         let Some(ServerMessage::AuthError { reason }) = c.next().await else {
             panic!("a made-up signature is no way in")
@@ -8318,20 +9628,68 @@ mod providers {
         let (mut c, challenge, _, _) = at_the_choice(&state).await;
         let stranger = voipc_crypto::generate_identity_key_pair();
         let relay_id = relay_of(&state).relay_id;
-        c.send(&ClientMessage::AuthContinue(AuthContinue::ProviderProof {
-            signature: voipc_crypto::account::provider_proof(
-                &stranger, &relay_id, "deedee", &challenge,
-            ),
-        }))
-        .await;
+        let sign = |id, challenge: &[u8], b: Binding| {
+            ClientMessage::AuthContinue(AuthContinue::ProviderProofBound {
+                signature: voipc_crypto::account::provider_proof_bound(
+                    id, &relay_id, "deedee", challenge, &b,
+                ),
+                web: b.web(),
+            })
+        };
+        c.send(&sign(&stranger, &challenge, Binding::Tls(TEST_BIND)))
+            .await;
         assert!(matches!(
             c.next().await,
             Some(ServerMessage::AuthError { .. })
         ));
 
+        // W1-24: the person's own proof, as a server between their app and this relay
+        // holds it: bound to that server's connection, or in the unbound shape
+        let (mut c, challenge, _, _) = at_the_choice(&state).await;
+        c.send(&sign(
+            &signed.identity,
+            &challenge,
+            Binding::Tls([0x77; 32]),
+        ))
+        .await;
+        let Some(ServerMessage::AuthError { reason }) = c.next().await else {
+            panic!("a proof for another connection opened it")
+        };
+        assert!(reason.contains("not made on this connection"), "{reason}");
+        let (mut c, challenge, _, _) = at_the_choice(&state).await;
+        c.send(&ClientMessage::AuthContinue(AuthContinue::ProviderProof {
+            signature: voipc_crypto::account::provider_proof(
+                &signed.identity,
+                &relay_id,
+                "deedee",
+                &challenge,
+            ),
+        }))
+        .await;
+        assert!(
+            matches!(c.next().await, Some(ServerMessage::AuthError { .. })),
+            "the unbound shape opened it"
+        );
+
         real.send(&ClientMessage::Ping { timestamp: 7 }).await;
         real.expect("the real connection lives on", |m| {
             matches!(m, ServerMessage::Pong { timestamp: 7 })
+        })
+        .await;
+
+        // The control: the same proof, bound to this connection, opens it
+        let (mut c, challenge, _, _) = at_the_choice(&state).await;
+        c.send(&sign(&signed.identity, &challenge, Binding::Tls(TEST_BIND)))
+            .await;
+        c.send(&keys(&public, false)).await;
+        c.expect("signed in", |m| {
+            matches!(
+                m,
+                ServerMessage::Authenticated {
+                    account: Some(_),
+                    ..
+                }
+            )
         })
         .await;
     }
@@ -8442,6 +9800,7 @@ mod providers {
             PROTOCOL_VERSION,
             APP_VERSION,
         );
+        m.bind(Binding::Tls(TEST_BIND));
         m.on_message(&msg).unwrap();
         // The vault opened and proved, as the real person's device would
         let Step::Send(proof) = m.provider_recovery(&key).unwrap().remove(0) else {
@@ -8700,6 +10059,7 @@ mod providers {
             PROTOCOL_VERSION,
             APP_VERSION,
         );
+        m.bind(Binding::Tls(TEST_BIND));
         let mut c = open_raw(&state, &first).await;
         drive(&mut c, &mut m).await.unwrap();
         assert_eq!(
@@ -8728,6 +10088,7 @@ mod providers {
             PROTOCOL_VERSION,
             APP_VERSION,
         );
+        m.bind(Binding::Tls(TEST_BIND));
         let mut c = open_raw(&state, &first).await;
         let msg = c.next().await.unwrap();
         for s in m.on_message(&msg).unwrap() {
@@ -8977,6 +10338,7 @@ mod providers {
             PROTOCOL_VERSION,
             APP_VERSION,
         );
+        m.bind(Binding::Tls(TEST_BIND));
         let mut c = open_raw(&state, &first).await;
         drive(&mut c, &mut m).await.unwrap();
         c.send(&ClientMessage::Account(AccountRequest::DeviceChallenge))
@@ -9117,6 +10479,7 @@ mod providers {
             PROTOCOL_VERSION,
             APP_VERSION,
         );
+        m.bind(Binding::Tls(TEST_BIND));
         let mut c = open_raw(state, &first).await;
         let msg = c.next().await.unwrap();
         let steps = m.on_message(&msg).unwrap();
@@ -9445,7 +10808,10 @@ mod providers {
             assert!(relay.spend_pair_ask(user.id));
         }
         for _ in 0..8 {
-            c.send(&m.pair_start().unwrap()).await;
+            // Past the last answer it allows, the relay ends the sign-in without reading
+            // on: on a slow machine the connection is gone before this goes (CI run
+            // 43094865296), and its words are what the next read gets
+            c.send_unless_closed(&m.pair_start().unwrap()).await;
             match c.next().await {
                 Some(ServerMessage::AuthStep(AuthStep::PairRefused { reason })) => {
                     assert!(reason.contains("Too many"), "{reason}")
@@ -9544,6 +10910,7 @@ mod providers {
             PROTOCOL_VERSION,
             APP_VERSION,
         );
+        m.bind(Binding::Tls(TEST_BIND));
         let mut c = open_raw(state, &first).await;
         let msg = c.next().await.unwrap();
         let steps = m.on_message(&msg).unwrap();
@@ -9567,6 +10934,7 @@ mod providers {
             PROTOCOL_VERSION,
             APP_VERSION,
         );
+        m.bind(Binding::Tls(TEST_BIND));
         let mut c = open_raw(state, &first).await;
         let msg = c.next().await.unwrap();
         let mut steps = m.on_message(&msg).unwrap();
@@ -9707,11 +11075,7 @@ mod providers {
     async fn a_password_account_links_with_its_password_and_unlinks_again() {
         let (state, _db, subject) = relay(RegistrationMode::Open).await;
         *subject.lock().unwrap() = "3003".into();
-        let (mut c, _, signed) = register_with(&state, "wendy").await;
-        let secret =
-            voipc_crypto::account::derive("correct horse battery", &signed.relay_id, "wendy")
-                .auth_secret
-                .to_vec();
+        let (mut c, _, _) = register_with(&state, "wendy").await;
         c.send(&ClientMessage::Account(AccountRequest::ProviderList))
             .await;
         let ServerMessage::Account(AccountReply::Providers {
@@ -9739,10 +11103,11 @@ mod providers {
             ServerMessage::Account(AccountReply::Error { .. })
         ));
 
+        password_again(&mut c, &state, "wendy").await;
         c.send(&ClientMessage::Account(AccountRequest::ProviderStart {
             kind: ProviderKind::Discord,
             link: true,
-            secret: Some(secret.clone()),
+            secret: None,
             totp: None,
             recovery_code: None,
         }))
@@ -9767,9 +11132,10 @@ mod providers {
         assert_eq!(linked.len(), 1);
         assert_eq!(linked[0].kind, ProviderKind::Discord);
 
+        password_again(&mut c, &state, "wendy").await;
         c.send(&ClientMessage::Account(AccountRequest::ProviderUnlink {
             kind: ProviderKind::Discord,
-            secret: Some(secret),
+            secret: None,
             totp: None,
             recovery_code: None,
         }))
@@ -10126,6 +11492,16 @@ mod providers {
                 .unwrap();
         }
 
+        /// An account that chose a `dc-` name when sign-up still took one: 1.11.1 refuses
+        /// those (W1-30), and an older database can hold one, so the move's second name stays.
+        async fn chose_before(state: &Arc<ServerState>, name: &str) {
+            let stand_in = format!("pre-{}", &name[3..]);
+            register(state, &stand_in).await;
+            let rename =
+                format!("UPDATE acct_users SET username = '{name}' WHERE username = '{stand_in}'");
+            sql(state, &rename).await;
+        }
+
         async fn account(state: &ServerState, name: &str) -> l4f_accounts::model::User {
             relay_of(state)
                 .store()
@@ -10187,6 +11563,7 @@ mod providers {
                 PROTOCOL_VERSION,
                 APP_VERSION,
             );
+            m.bind(Binding::Tls(TEST_BIND));
             let mut c = open_raw(state, &first).await;
             let msg = c.next().await.unwrap();
             let mut steps = m.on_message(&msg).unwrap();
@@ -10221,8 +11598,8 @@ mod providers {
                 c.next().await,
                 Some(ServerMessage::AuthStep(AuthStep::Salt { .. }))
             ));
-            c.send(&ClientMessage::AuthContinue(AuthContinue::Register {
-                auth_secret: SECRET.to_vec(),
+            c.send(&ClientMessage::AuthContinue(AuthContinue::RegisterKey {
+                login_key: test_key().public_key().to_vec(),
                 altcha: String::new(),
                 ts: String::new(),
                 vault: vec![reset_slot()],
@@ -10269,14 +11646,6 @@ mod providers {
             let secret = totp_on(&mut c).await;
             settled(&mut c).await;
             (c, info, secret)
-        }
-
-        /// What `register_with`'s password comes to.
-        fn the_secret(state: &ServerState, name: &str) -> Vec<u8> {
-            let relay_id = relay_of(state).relay_id;
-            voipc_crypto::account::derive("correct horse battery", &relay_id, name)
-                .auth_secret
-                .to_vec()
         }
 
         // ── A run ──
@@ -10481,6 +11850,64 @@ mod providers {
             assert_eq!(done.made, 0);
         }
 
+        /// W2-31: a refusal named no step, and an app asking from two places could not tell
+        /// whose it was. `AdminAsk` numbers every answer, the late `ImportBegun` too.
+        #[tokio::test]
+        async fn every_answer_to_a_numbered_ask_carries_its_number() {
+            let (state, _db, _) = relay(RegistrationMode::Open).await;
+            let (mut ann, _, secret) = admin_account(&state, "ann").await;
+            let numbered = |ask: u32, op: AdminOp, code: Option<String>| {
+                ClientMessage::Account(AccountRequest::AdminAsk { ask, op, code })
+            };
+            async fn next(c: &mut Client) -> (u32, AccountReply) {
+                let ServerMessage::Account(AccountReply::Asked { ask, reply }) = c
+                    .expect("a numbered answer", |m| {
+                        matches!(m, ServerMessage::Account(AccountReply::Asked { .. }))
+                    })
+                    .await
+                else {
+                    unreachable!()
+                };
+                (ask, voipc_protocol::codec::decode_asked(&reply).unwrap())
+            }
+            ann.send(&numbered(5, AdminOp::ImportFacts, None)).await;
+            let (ask, r) = next(&mut ann).await;
+            assert_eq!(ask, 5);
+            assert!(
+                matches!(r, AccountReply::Admin(AdminReply::ImportFacts { .. })),
+                "{r:?}"
+            );
+            ann.send(&numbered(6, AdminOp::ImportUndo { run: 999 }, None))
+                .await;
+            let (ask, r) = next(&mut ann).await;
+            assert_eq!(ask, 6);
+            assert!(
+                refusal_of(&r).contains("No such run"),
+                "a refusal too: {r:?}"
+            );
+            // The copy's answer comes later, on its own
+            ann.send(&numbered(7, begin_op(GUILD), Some(code(&secret))))
+                .await;
+            let (ask, r) = next(&mut ann).await;
+            assert_eq!(ask, 7);
+            assert!(
+                matches!(r, AccountReply::Admin(AdminReply::ImportBackingUp { .. })),
+                "{r:?}"
+            );
+            let (ask, r) = next(&mut ann).await;
+            assert_eq!(ask, 7);
+            assert!(
+                matches!(r, AccountReply::Admin(AdminReply::ImportBegun { .. })),
+                "{r:?}"
+            );
+            // The control: unnumbered, as before 22
+            let r = op(&mut ann, AdminOp::ImportFacts, None).await;
+            assert!(matches!(
+                r,
+                AccountReply::Admin(AdminReply::ImportFacts { .. })
+            ));
+        }
+
         #[tokio::test]
         async fn a_wrong_run_id_is_refused() {
             let (state, _db, _) = relay(RegistrationMode::Open).await;
@@ -10563,6 +11990,94 @@ mod providers {
             );
         }
 
+        /// W2-6: Stop on the desktop ends only the driver, its session stays connected, and
+        /// the wire has no word for a stop. The run then held the relay until that session left.
+        #[tokio::test]
+        async fn a_run_that_sends_nothing_for_a_while_can_be_taken_over() {
+            use crate::accounts::import::RUN_IDLE;
+            let quiet_for = |state: &Arc<ServerState>, d: Duration| {
+                let state = state.clone();
+                async move {
+                    let mut active = state.import.lock().await;
+                    let a = active.as_mut().unwrap();
+                    a.last = std::time::Instant::now().checked_sub(d).unwrap();
+                }
+            };
+            let (state, _db, _) = relay(RegistrationMode::Open).await;
+            let (mut ann, _, run) = running(&state).await;
+            assert_eq!(roles(&mut ann, run, vec![]).await.made, 0);
+            let (mut zed, _, secret) = admin_account(&state, "zed").await;
+            // Quiet, but not for long enough: the control
+            quiet_for(&state, RUN_IDLE - Duration::from_secs(60)).await;
+            let r = op(&mut zed, begin_op(GUILD), Some(code(&secret))).await;
+            assert!(refusal_of(&r).contains("Another admin"), "{r:?}");
+            assert!(
+                refusal_of(&r).contains("15 minutes"),
+                "it says how it ends: {r:?}"
+            );
+            let r = op(&mut zed, AdminOp::ImportUndo { run }, Some(code(&secret))).await;
+            assert!(refusal_of(&r).contains("Another admin"), "{r:?}");
+            // A frame starts the wait again
+            quiet_for(&state, RUN_IDLE + Duration::from_secs(60)).await;
+            assert_eq!(roles(&mut ann, run, vec![]).await.made, 0);
+            let r = op(&mut zed, begin_op(GUILD), Some(code(&secret))).await;
+            assert!(refusal_of(&r).contains("Another admin"), "{r:?}");
+
+            quiet_for(&state, RUN_IDLE + Duration::from_secs(60)).await;
+            let AccountReply::Admin(AdminReply::ImportFacts { facts }) =
+                op(&mut zed, AdminOp::ImportFacts, None).await
+            else {
+                panic!("no facts")
+            };
+            assert_eq!(facts.running, None, "nobody is on it now");
+            let r = op(&mut zed, begin_op(GUILD), Some(code(&secret))).await;
+            let AccountReply::Admin(AdminReply::ImportBegun {
+                run: same,
+                resumed: true,
+                ..
+            }) = r
+            else {
+                panic!("not taken over: {r:?}")
+            };
+            assert_eq!(same, run);
+            assert_eq!(roles(&mut zed, run, vec![]).await.made, 0);
+            // The quiet one's next frame finds its run gone, and its driver stops
+            let r = op(&mut ann, AdminOp::ImportRoles { run, roles: vec![] }, None).await;
+            assert!(frame_refusal(&r).contains("not open"), "{r:?}");
+        }
+
+        /// W2-26: a run stopped, two newer runs of another server made their copies, and
+        /// the first one's went. Resumed, it got a copy of what it had done so far, named as
+        /// one from before it, and that went at once too.
+        #[tokio::test]
+        async fn a_run_resumed_after_its_copy_went_keeps_a_new_one_named_for_what_it_is() {
+            let (state, db, _) = relay(RegistrationMode::Open).await;
+            let (mut ann, _, first) = running(&state).await;
+            for _ in 2..=3 {
+                let asked = op(&mut ann, begin_op("42"), None).await;
+                let AccountReply::Admin(AdminReply::ImportBackingUp { run }) = asked else {
+                    panic!("not backing up: {asked:?}")
+                };
+                assert_eq!(begun(&mut ann).await.0, run);
+                end(&mut ann, run).await;
+            }
+            let copy = |infix: &str, run: i64| format!("{}{infix}{run}", db.0.display());
+            let exists = |p: &str| std::path::Path::new(p).exists();
+            assert!(!exists(&copy(".before-import-", first)), "dropped");
+
+            let asked = op(&mut ann, begin_op(GUILD), None).await;
+            assert!(
+                matches!(asked, AccountReply::Admin(AdminReply::ImportBackingUp { run }) if run == first),
+                "{asked:?}"
+            );
+            let (run, resumed, backup) = begun(&mut ann).await;
+            assert_eq!((run, resumed), (first, true));
+            let backup = backup.unwrap();
+            assert_eq!(backup, copy(".before-resuming-import-", first));
+            assert!(exists(&backup), "and it stays");
+            assert!(exists(&copy(".before-import-", 3)));
+        }
+
         #[tokio::test]
         async fn a_cut_begins_again_with_a_code_and_no_second_copy() {
             let (state, db, _) = relay(RegistrationMode::Open).await;
@@ -10585,15 +12100,17 @@ mod providers {
             assert_eq!(rows.len(), 2, "each begin says so");
             assert!(rows[0].detail.contains("again"), "{}", rows[0].detail);
 
-            // Only so many copies are kept: one that went is made again
+            // Only so many copies are kept: one that went is made again, named for what it
+            // holds
             std::fs::remove_file(&copy).unwrap();
             let r = op(&mut ann, begin_op(GUILD), None).await;
             assert!(
                 matches!(r, AccountReply::Admin(AdminReply::ImportBackingUp { run: r }) if r == run),
                 "{r:?}"
             );
-            assert_eq!(begun(&mut ann).await, (run, true, Some(copy.clone())));
-            assert!(std::path::Path::new(&copy).exists());
+            let again = format!("{}.before-resuming-import-{run}", db.0.display());
+            assert_eq!(begun(&mut ann).await, (run, true, Some(again.clone())));
+            assert!(std::path::Path::new(&again).exists());
 
             // Another guild's is a run of its own
             let r = op(&mut ann, begin_op("42"), None).await;
@@ -11302,6 +12819,59 @@ mod providers {
             let top = looks.iter().find(|s| s.badge == "Top").unwrap();
             assert_eq!(top.color, Some(0x11_22_33));
             assert!(top.section, "Discord's hoist");
+        }
+
+        /// W2-24: a run stopped between making a group and its ledger row. The next run got
+        /// "taken", made `<name>-<tail>` beside it, and no undo ever took the first.
+        #[tokio::test]
+        async fn a_group_a_stopped_run_made_is_taken_up_by_the_next() {
+            let (state, _db, _) = relay(RegistrationMode::Open).await;
+            let (mut ann, _, run) = running(&state).await;
+            let names = || async {
+                let mut v: Vec<String> = relay_of(&state)
+                    .store()
+                    .roles()
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|r| r.name)
+                    .collect();
+                v.sort();
+                v
+            };
+            let rows = || vec![role(11, "Mods", discord::KICK_MEMBERS), role(12, "Crew", 0)];
+            assert_eq!(
+                roles(&mut ann, run, rows()).await.made,
+                3,
+                "a twin for Mods"
+            );
+            let before = names().await;
+            // Where it stopped: made, and not written down
+            sql(&state, "DELETE FROM voipc_import_groups").await;
+            // The control: one that differs is someone's own, and stays theirs
+            sql(
+                &state,
+                "UPDATE acct_roles SET description = 'Ours' WHERE name = 'crew'",
+            )
+            .await;
+            assert_eq!(roles(&mut ann, run, rows()).await.made, 3);
+            let after = names().await;
+            let new: Vec<_> = after.iter().filter(|n| !before.contains(n)).collect();
+            assert_eq!(new.len(), 1, "{before:?} -> {after:?}");
+            assert!(new[0].starts_with("crew-"), "{new:?}");
+            assert_eq!(
+                count(
+                    &state,
+                    "SELECT CAST(COUNT(*) AS BIGINT) FROM voipc_import_groups"
+                )
+                .await,
+                3
+            );
+            // And an undo takes what the run made, the first group with it
+            undo_all(&mut ann, run).await;
+            let left = names().await;
+            assert!(!left.iter().any(|n| n.starts_with("mods")), "{left:?}");
+            assert!(left.contains(&"crew".to_string()), "{left:?}");
         }
 
         /// A member limit never comes of this: only a role that would not fit one list.
@@ -12627,11 +14197,11 @@ mod providers {
 
             // Linking it to an account they make otherwise: refused
             let (mut c, _, _) = register_with(&state, "evader").await;
-            let secret = the_secret(&state, "evader");
+            password_again(&mut c, &state, "evader").await;
             c.send(&ClientMessage::Account(AccountRequest::ProviderStart {
                 kind: ProviderKind::Discord,
                 link: true,
-                secret: Some(secret),
+                secret: None,
                 totp: None,
                 recovery_code: None,
             }))
@@ -12701,6 +14271,44 @@ mod providers {
             assert!(!groups_of(&state, "dc-1004")
                 .await
                 .contains(&"mods".to_string()));
+        }
+
+        /// W2-23: a run stopped between marking a waiting row banned and renaming it. The
+        /// next run saw it banned and skipped the rename, so it squatted on the real name.
+        #[tokio::test]
+        async fn a_ban_stopped_before_its_rename_is_renamed_by_the_next_run() {
+            let (state, _db, _) = relay(RegistrationMode::Open).await;
+            let (mut ann, _, run) = running(&state).await;
+            let waiting_one = ImportMember {
+                shown_as: "Nick".into(),
+                ..member(1001, "waits", &[])
+            };
+            members(&mut ann, run, vec![waiting_one]).await;
+            let id = account(&state, "waits").await.id;
+            // Where it stopped: marked, and nothing after
+            sql(
+                &state,
+                "UPDATE voipc_placeholders SET banned = TRUE WHERE dc_id = 1001",
+            )
+            .await;
+            let (made, converted, _) = bans(&mut ann, run, &[1001]).await;
+            assert_eq!((made, converted), (0, 0), "marked already");
+            let user = account(&state, "dc-1001").await;
+            assert_eq!(user.id, id);
+            assert_eq!(
+                relay_of(&state).profiles(&[id.0]).await.unwrap()[0].name,
+                None,
+                "and the nickname gone"
+            );
+            assert!(relay_of(&state)
+                .store()
+                .user_by_username("waits")
+                .await
+                .unwrap()
+                .is_none());
+            // Named, it is left alone from then on
+            assert_eq!(bans(&mut ann, run, &[1001]).await, (0, 0, vec![]));
+            assert_eq!(account(&state, "dc-1001").await.id, id);
         }
 
         #[tokio::test]
@@ -13072,13 +14680,14 @@ mod providers {
         }
 
         fn a_reset_answer() -> ClientMessage {
-            ClientMessage::AuthContinue(AuthContinue::Reset {
+            ClientMessage::AuthContinue(AuthContinue::ResetBound {
                 signature: vec![0; 64],
                 key_signature: vec![0; 64],
-                auth_secret: SECRET.to_vec(),
+                login_key: vec![0; 32],
                 pass_slot: vec![0; 101],
                 totp: None,
                 recovery_code: None,
+                web: false,
             })
         }
 
@@ -13418,9 +15027,14 @@ mod providers {
             );
         }
 
-        async fn delete_own(c: &mut Client, secret: Option<Vec<u8>>) {
+        /// `password`: the account `register_with` made under that name, which proves
+        /// its password again first.
+        async fn delete_own(c: &mut Client, password: Option<(&Arc<ServerState>, &str)>) {
+            if let Some((state, name)) = password {
+                password_again(c, state, name).await;
+            }
             c.send(&ClientMessage::Account(AccountRequest::DeleteAccount {
-                secret: secret.unwrap_or_default(),
+                secret: Vec::new(),
                 totp: None,
                 recovery_code: None,
             }))
@@ -13475,19 +15089,132 @@ mod providers {
             let (mut w, _, _) = register_with(&state, "wendy").await;
             let wid = account(&state, "wendy").await.id;
             link_directly(&state, wid, "2002").await;
-            let secret = the_secret(&state, "wendy");
-            delete_own(&mut w, Some(secret)).await;
+            delete_own(&mut w, Some((&state, "wendy"))).await;
             assert_eq!(excluded_rows(&state).await, 2);
             let done = members(&mut ann, run, vec![member(2002, "wendy", &[])]).await;
             assert_eq!((done.left_out, done.made), (1, 0), "{done:?}");
+        }
+
+        /// W1-34: linked here, then unlinked, then deleted: the account's Discord id was
+        /// forgotten at the unlink, and the delete took none of their imported posts.
+        #[tokio::test]
+        async fn linking_unlinking_then_deleting_still_takes_their_posts() {
+            let (state, _db, _) = relay(RegistrationMode::Open).await;
+            let (mut w, _, _) = register_with(&state, "wendy").await;
+            let wid = account(&state, "wendy").await.id;
+            link_directly(&state, wid, "2002").await;
+            password_again(&mut w, &state, "wendy").await;
+            w.send(&ClientMessage::Account(AccountRequest::ProviderUnlink {
+                kind: ProviderKind::Discord,
+                secret: None,
+                totp: None,
+                recovery_code: None,
+            }))
+            .await;
+            let r = w.expect("unlinked", |m| reply(m).is_some()).await;
+            assert!(
+                matches!(
+                    r,
+                    ServerMessage::Account(AccountReply::ProviderUnlinked { .. })
+                ),
+                "{r:?}"
+            );
+            assert_eq!(excluded_rows(&state).await, 0, "nothing yet: they are here");
+            // Kept in the open: their export names it
+            let exported = state
+                .accounts
+                .as_ref()
+                .unwrap()
+                .accounts
+                .export(wid)
+                .await
+                .unwrap()
+                .to_string();
+            assert!(
+                exported.contains(r#""discord_unlinked":["2002"]"#),
+                "{exported}"
+            );
+            delete_own(&mut w, Some((&state, "wendy"))).await;
+            assert_eq!(excluded_rows(&state).await, 1);
+            assert_eq!(
+                count(
+                    &state,
+                    "SELECT CAST(COUNT(*) AS BIGINT) FROM voipc_import_excluded \
+                     WHERE dc_id = 2002 AND own = TRUE AND erase = TRUE"
+                )
+                .await,
+                1
+            );
+            assert_eq!(
+                count(
+                    &state,
+                    "SELECT CAST(COUNT(*) AS BIGINT) FROM voipc_dc_unlinked"
+                )
+                .await,
+                0,
+                "it went with the account"
+            );
+        }
+
+        /// W1-31: a ban lifted for someone who deleted their own account stays lifted: the
+        /// next run made their banned row anew.
+        #[tokio::test]
+        async fn a_ban_lifted_on_someone_who_left_by_themselves_stays_lifted() {
+            let (state, _db, subject) = relay(RegistrationMode::Open).await;
+            let (mut ann, _, run) = running(&state).await;
+            members(&mut ann, run, vec![member(1001, "dee", &[])]).await;
+            let (mut c, _) = come(&state, &subject, 1001, &["dee"]).await.unwrap();
+            prove_with_discord(&state, &mut c).await;
+            delete_own(&mut c, None).await;
+            // Banned on Discord too: a run makes their banned row
+            let (made, _, _) = bans(&mut ann, run, &[1001]).await;
+            assert_eq!(made, 1);
+            let relay = state.accounts.as_ref().unwrap();
+            assert!(relay
+                .store()
+                .user_by_username("dc-1001")
+                .await
+                .unwrap()
+                .is_some());
+            // The owner lifts it: the row goes, and no later run makes it
+            let r = left_out(&mut ann, "1001", true, false).await;
+            assert_eq!(
+                excluded_ids(&r),
+                [("1001".to_string(), true, true)],
+                "still their own exit, and their posts stay gone"
+            );
+            assert!(relay
+                .store()
+                .user_by_username("dc-1001")
+                .await
+                .unwrap()
+                .is_none());
+            let (made, _, _) = bans(&mut ann, run, &[1001]).await;
+            assert_eq!(made, 0, "lifted for good");
+            assert!(relay
+                .store()
+                .user_by_username("dc-1001")
+                .await
+                .unwrap()
+                .is_none());
+            // Leaving them out again changes nothing of that
+            left_out(&mut ann, "1001", true, true).await;
+            assert_eq!(bans(&mut ann, run, &[1001]).await.0, 0);
+            // The control: someone else's own exit, not lifted, is banned again
+            let (mut e, _) = {
+                members(&mut ann, run, vec![member(1002, "eve", &[])]).await;
+                come(&state, &subject, 1002, &["eve"]).await.unwrap()
+            };
+            prove_with_discord(&state, &mut e).await;
+            delete_own(&mut e, None).await;
+            assert_eq!(bans(&mut ann, run, &[1002]).await.0, 1);
         }
 
         #[tokio::test]
         async fn someone_else_deleted_says_nothing_of_a_discord_id() {
             let (state, _db, _) = relay(RegistrationMode::Open).await;
             let (mut w, _, _) = register_with(&state, "wendy").await;
-            let secret = the_secret(&state, "wendy");
-            delete_own(&mut w, Some(secret)).await;
+            delete_own(&mut w, Some((&state, "wendy"))).await;
             assert_eq!(
                 excluded_rows(&state).await,
                 0,
@@ -16703,8 +18430,7 @@ mod providers {
             let (mut w, _, _) = register_with(&state, "wendy").await;
             let wid = account(&state, "wendy").await.id;
             link_directly(&state, wid, "2002").await;
-            let secret = the_secret(&state, "wendy");
-            delete_own(&mut w, Some(secret)).await;
+            delete_own(&mut w, Some((&state, "wendy"))).await;
             assert_eq!(reads(&mut cal, id).await, ["another's"]);
 
             assert_eq!(tidied(&state).await, 2);
@@ -16752,6 +18478,74 @@ mod providers {
                 assert_eq!(rows_here(&state).await, left, "{days} days");
                 assert!(row_at(&state, 601, 0, young as i64).await.is_some());
             }
+        }
+
+        /// W2-7: a forum post opened before the window with replies inside it. Its opening row
+        /// is the only way in to them, so it stays while they do, with none of its old words.
+        #[tokio::test]
+        async fn a_thread_past_archive_days_keeps_a_way_in_while_its_replies_are_inside() {
+            let (state, _db, _) =
+                relay_then(RegistrationMode::Open, |c, _| c.accounts.archive_days = 30).await;
+            let (mut ann, _, run) = filing(&state).await;
+            let (old, dead) = (
+                at_ms(now_ms() - 40 * 86_400_000),
+                at_ms(now_ms() - 50 * 86_400_000),
+            );
+            let young = at_ms(now_ms() - 86_400_000);
+            let rows = vec![a_row(dead, 7, "dead words"), a_row(old, 7, "old words")];
+            acked(&mut ann, run, 601, None, old, rows).await;
+            let rows = vec![
+                owned(dead, 601, 7, "Dead title", 1),
+                owned(old, 601, 7, "Old title", 2),
+            ];
+            threads(&mut ann, run, rows).await;
+            acked(
+                &mut ann,
+                run,
+                601,
+                Some(dead),
+                dead + 1,
+                vec![a_row(dead + 1, 9, "dead reply")],
+            )
+            .await;
+            let rows = vec![a_row(old + 1, 9, "old reply"), a_row(young, 9, "new reply")];
+            acked(&mut ann, run, 601, Some(old), young, rows).await;
+
+            assert_eq!(
+                tidied(&state).await,
+                3,
+                "the dead thread whole, and the old reply"
+            );
+            let row = row_at(&state, 601, 0, old as i64).await.unwrap();
+            assert_eq!(row.thread_name.as_deref(), Some("Thread"));
+            assert_eq!(
+                (row.author, row.name.as_str(), row.body.as_str()),
+                (None, "", "")
+            );
+            assert_eq!(row.replies, 2);
+            assert_eq!(
+                row_at(&state, 601, old as i64, young as i64)
+                    .await
+                    .unwrap()
+                    .body,
+                "new reply"
+            );
+            assert!(row_at(&state, 601, old as i64, old as i64 + 1)
+                .await
+                .is_none());
+            assert!(row_at(&state, 601, 0, dead as i64).await.is_none());
+            assert_eq!(rows_here(&state).await, 2);
+            // Settled: the next pass finds nothing, and a delta does not name it again
+            assert_eq!(tidied(&state).await, 0);
+            threads(&mut ann, run, vec![owned(old, 601, 7, "Old title", 3)]).await;
+            let row = row_at(&state, 601, 0, old as i64).await.unwrap();
+            assert_eq!(
+                (row.thread_name.as_deref(), row.replies),
+                (Some("Thread"), 3)
+            );
+            let id = lounge(&state).await;
+            let mut bea = standing(&state, "bea", 9, id).await;
+            assert!(found(&mut bea, id, "old").await.is_empty());
         }
 
         #[tokio::test]
@@ -18103,7 +19897,7 @@ mod providers {
             let mut m = moved(&state, &subject).await;
             let (mut reader, _, _) = holder(&state, "reader", &["users:read"]).await;
             let (mut nobody, _) = register(&state, "nobody").await;
-            let (_chose_it, _) = register(&state, "dc-9").await;
+            chose_before(&state, "dc-9").await;
             let banned = account(&state, "dc-1003").await.id;
             let found = |id: AccountId| AdminOp::User { id: id.0 };
             let anyone = AccountId([9; 16]);
@@ -18946,6 +20740,107 @@ mod providers {
             }
         }
 
+        /// The other order (W2-8): Dan's message goes, the worker takes its row, and only then
+        /// does Carol open a thread on it. The delta's frame names Carol, not Dan, and the
+        /// title Discord gives it may be his words.
+        #[tokio::test]
+        async fn a_title_on_a_message_taken_back_before_its_thread_opened_stays_back() {
+            let (state, _db, _) = relay(RegistrationMode::Open).await;
+            let (mut ann, _, run) = filing(&state).await;
+            let title = "My diagnosis is X";
+            let rows = vec![a_row(100, 7, title), a_row(300, 9, "a film")];
+            acked(&mut ann, run, 601, None, 300, rows).await;
+            let id = lounge(&state).await;
+            let mut dan = standing(&state, "dan", 7, id).await;
+            assert_eq!(
+                mine_done(&mut dan, ArchiveAction::Delete, ArchiveScope::Everything).await,
+                1
+            );
+            assert_eq!(
+                tidied(&state).await,
+                1,
+                "his row, whole: no thread on it yet"
+            );
+            assert!(row_at(&state, 601, 0, 100).await.is_none());
+
+            let rows = vec![
+                owned(100, 601, 8, title, 2),
+                // The controls: a thread on Bea's message, and one on a message this run has
+                // not reached yet, which Dan's wish covers by its id alone
+                owned(300, 601, 8, "Movie night", 1),
+                owned(400, 601, 8, "New one", 1),
+            ];
+            assert_eq!(threads(&mut ann, run, rows).await, (2, 1));
+            let row = row_at(&state, 601, 0, 100).await.unwrap();
+            assert_eq!(row.thread_name.as_deref(), Some("Thread"));
+            assert_eq!(
+                (row.author, row.name.as_str(), row.body.as_str()),
+                (None, "", "")
+            );
+            assert_eq!(row.replies, 2);
+            let control = row_at(&state, 601, 0, 300).await.unwrap();
+            assert_eq!(control.thread_name.as_deref(), Some("Movie night"));
+            acked(&mut ann, run, 601, None, 400, vec![a_row(400, 9, "new")]).await;
+            let control = row_at(&state, 601, 0, 400).await.unwrap();
+            assert_eq!(control.thread_name.as_deref(), Some("New one"));
+            assert_eq!(control.author, Some(9));
+            let mut bea = standing(&state, "bea", 9, id).await;
+            assert!(found(&mut bea, id, "diagnosis").await.is_empty());
+        }
+
+        /// W2-25: a delta opens a thread on a message of the run before. Its undo takes the
+        /// thread off that message again, name and count, and leaves the message.
+        #[tokio::test]
+        async fn undoing_a_delta_takes_its_thread_off_an_earlier_runs_message() {
+            let (state, _db, _) = relay(RegistrationMode::Open).await;
+            let (mut ann, secret, first) = filing(&state).await;
+            let rows = vec![a_row(100, 8, "let's talk"), a_row(200, 8, "a film")];
+            acked(&mut ann, first, 601, None, 200, rows).await;
+            // The control: a thread the first run brought
+            threads(&mut ann, first, vec![owned(200, 601, 8, "Movie night", 1)]).await;
+            acked(
+                &mut ann,
+                first,
+                601,
+                Some(200),
+                201,
+                vec![a_row(201, 9, "yes")],
+            )
+            .await;
+            end(&mut ann, first).await;
+
+            let delta = begin(&mut ann, &secret).await;
+            assert!(channels(&mut ann, delta, vec![a_channel(601, "lounge")])
+                .await
+                .is_empty());
+            threads(&mut ann, delta, vec![owned(100, 601, 8, "Talk", 1)]).await;
+            acked(
+                &mut ann,
+                delta,
+                601,
+                Some(100),
+                101,
+                vec![a_row(101, 9, "sure")],
+            )
+            .await;
+            let row = row_at(&state, 601, 0, 100).await.unwrap();
+            assert_eq!((row.thread_name.as_deref(), row.replies), (Some("Talk"), 1));
+            end(&mut ann, delta).await;
+            undo_all(&mut ann, delta).await;
+            tidied(&state).await;
+
+            let row = row_at(&state, 601, 0, 100).await.unwrap();
+            assert_eq!((row.thread_name.as_deref(), row.replies), (None, 0));
+            assert_eq!(row.body, "let's talk");
+            assert!(row_at(&state, 601, 100, 101).await.is_none());
+            let control = row_at(&state, 601, 0, 200).await.unwrap();
+            assert_eq!(
+                (control.thread_name.as_deref(), control.replies),
+                (Some("Movie night"), 1)
+            );
+            assert_eq!(row_at(&state, 601, 200, 201).await.unwrap().body, "yes");
+        }
+
         /// A new run files every thread again, first: what its own message's frame then finds
         /// has to go the same way as what the worker left, in a channel and in a forum post.
         #[tokio::test]
@@ -19272,7 +21167,7 @@ mod providers {
 
             // Its name taken: the one nobody can tell in advance
             members(&mut ann, run, vec![member(1002, "morgan", &[])]).await;
-            register(&state, "dc-1002").await;
+            chose_before(&state, "dc-1002").await;
             assert_eq!(bans(&mut ann, run, &[1002]).await, (0, 1, vec![]));
             let keyed = relay_of(&state).placeholder_id(1002).0;
             let second = format!("dc-1002-{:02x}{:02x}", keyed[0], keyed[1]);
@@ -19283,8 +21178,8 @@ mod providers {
             // Both taken: disabled all the same, and the owner is told
             members(&mut ann, run, vec![member(1003, "nell", &[])]).await;
             let keyed = relay_of(&state).placeholder_id(1003).0;
-            register(&state, "dc-1003").await;
-            register(&state, &format!("dc-1003-{:02x}{:02x}", keyed[0], keyed[1])).await;
+            chose_before(&state, "dc-1003").await;
+            chose_before(&state, &format!("dc-1003-{:02x}{:02x}", keyed[0], keyed[1])).await;
             let r = op(
                 &mut ann,
                 AdminOp::ImportBans {
@@ -19347,7 +21242,7 @@ mod providers {
         async fn holding_the_name_of_a_banned_row_does_not_stop_it() {
             let (state, _db, _) = relay(RegistrationMode::Open).await;
             let (mut ann, _, run) = running(&state).await;
-            register(&state, "dc-1001").await;
+            chose_before(&state, "dc-1001").await;
             let squatter = account(&state, "dc-1001").await;
             assert_eq!(bans(&mut ann, run, &[1001]).await, (1, 0, vec![]));
             let id = relay_of(&state).placeholder_id(1001);
@@ -19521,6 +21416,7 @@ mod providers {
                 PROTOCOL_VERSION,
                 APP_VERSION,
             );
+            m.bind(Binding::Tls(TEST_BIND));
             let mut c = open_raw(state, &first).await;
             drive(&mut c, &mut m).await.unwrap();
             c
@@ -20058,9 +21954,9 @@ mod providers {
                 fn add(
                     &mut self,
                     emote: &PlannedEmote,
-                ) -> impl Future<Output = Result<(), String>> + Send {
+                ) -> impl Future<Output = Result<String, String>> + Send {
                     self.0.push(emote.name.clone());
-                    std::future::ready(Ok(()))
+                    std::future::ready(Ok(emote.name.clone()))
                 }
             }
 
@@ -21705,6 +23601,76 @@ mod layouts {
         Arc::new(state)
     }
 
+    /// W3-23: the file's channels had no place until someone used the arrows, and sorted after
+    /// every channel with one, so the newest channel made in the app came first.
+    #[tokio::test]
+    async fn a_channel_made_in_the_app_goes_below_the_files() {
+        let db = TempDb(std::env::temp_dir().join(format!(
+            "voipc-relay-{}.db",
+            hex::encode(rand::random::<[u8; 8]>())
+        )));
+        let file = || {
+            ["rules", "news"]
+                .map(|name| ChannelEntry {
+                    name: name.into(),
+                    text: true,
+                    ..ChannelEntry::default()
+                })
+                .to_vec()
+        };
+        let state = restart(&db, file()).await;
+        let (_kim, _) = register(&state, "kim").await;
+        let sid = state.sessions.iter().map(|s| *s.key()).next().unwrap();
+        grant(&state, sid, &["voipc:channels"]);
+        crate::layout::channel_save(&state, sid, None, "later", "", true, false, None, None)
+            .await
+            .unwrap();
+        let order = |state: Arc<ServerState>| async move {
+            let ServerMessage::ChannelLayout { channels, .. } =
+                crate::layout::for_session(&state, sid).await
+            else {
+                unreachable!()
+            };
+            let all = state.channels.read().await;
+            channels
+                .iter()
+                .map(|p| all[&p.channel_id].info.name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(order(state.clone()).await, ["rules", "news", "later"]);
+        // Each row its own place: a tie is decided by the conversation's name at the next start
+        let rows = state
+            .accounts
+            .as_ref()
+            .unwrap()
+            .layout_rows()
+            .await
+            .unwrap();
+        let places: Vec<i64> = rows.rows.iter().map(|r| r.position).collect();
+        let mut unique = places.clone();
+        unique.dedup();
+        assert_eq!(unique, places, "no two rows share a place");
+        drop(state);
+        let again = restart(&db, file()).await;
+        let (_kim2, _) = register(&again, "kim2").await;
+        let sid = again.sessions.iter().map(|s| *s.key()).next().unwrap();
+        let ServerMessage::ChannelLayout { channels, .. } =
+            crate::layout::for_session(&again, sid).await
+        else {
+            unreachable!()
+        };
+        let all = again.channels.read().await;
+        let names: Vec<_> = channels
+            .iter()
+            .map(|p| all[&p.channel_id].info.name.clone())
+            .collect();
+        assert_eq!(
+            names,
+            ["rules", "news", "later"],
+            "and the same at the next start"
+        );
+    }
+
     async fn named(state: &ServerState, name: &str) -> Option<(u32, String, ChannelGate, bool)> {
         let channels = state.channels.read().await;
         channels.values().find(|c| c.info.name == name).map(|c| {
@@ -21804,6 +23770,42 @@ mod layouts {
             let why = refused(&mut plain, op).await;
             assert!(why.contains("may not"), "{why}");
         }
+    }
+
+    /// W3-8: these four were tested only as their holders, so dropping a guard left all green.
+    /// The layout's own deletes check only what the person can see.
+    #[tokio::test]
+    async fn the_deletes_the_icon_and_a_link_revoke_are_not_a_plain_members() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let mut m = manager(&state, "mona").await;
+        let id = made(&mut m, save(None, "news", true, None)).await;
+        ok(
+            &mut m,
+            AdminOp::CategorySave {
+                id: None,
+                name: "Info".into(),
+            },
+        )
+        .await;
+        let cat = state.layout.read().await.categories[0].id;
+        let (mut plain, _) = register(&state, "pete").await;
+        for (op, says) in [
+            (AdminOp::ChannelDelete { id }, "may not"),
+            (AdminOp::CategoryDelete { id: cat }, "may not"),
+            (AdminOp::ServerIconSet { image: None }, "Only an admin"),
+            (AdminOp::InviteLinkRevoke { id: "any".into() }, "may not"),
+        ] {
+            let why = refused(&mut plain, op.clone()).await;
+            assert!(why.contains(says), "{op:?}: {why}");
+        }
+        assert!(state.channels.read().await.contains_key(&id));
+        assert!(state
+            .layout
+            .read()
+            .await
+            .categories
+            .iter()
+            .any(|c| c.id == cat));
     }
 
     /// Telling people first and gating after would say the channel exists, and a
@@ -22104,6 +24106,91 @@ mod layouts {
         .await;
         let (_, places) = layout_of(&state, "mona").await;
         assert_eq!(places.iter().find(|p| p.welcome).unwrap().channel_id, text);
+    }
+
+    /// W3-19: a password set on the welcome channel left it the welcome, so new devices landed
+    /// on a channel they could not open, and the panel had no button to unset it.
+    #[tokio::test]
+    async fn a_password_on_the_welcome_channel_ends_it_as_the_welcome() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let mut m = manager(&state, "mona").await;
+        let text = made(&mut m, save(None, "rules", true, None)).await;
+        let other = made(&mut m, save(None, "chat", true, None)).await;
+        ok(
+            &mut m,
+            AdminOp::WelcomeSet {
+                channel_id: Some(text),
+            },
+        )
+        .await;
+        async fn lock(m: &mut Client, id: ChannelId) {
+            m.send(&ClientMessage::SetChannelPassword {
+                channel_id: id,
+                password: Some("pw".into()),
+            })
+            .await;
+        }
+        // The control: another channel's password leaves it
+        lock(&mut m, other).await;
+        m.expect("locked", |x| {
+            matches!(x, ServerMessage::ChannelUpdated { channel } if channel.channel_id == other)
+        })
+        .await;
+        assert!(state.layout.read().await.welcome.is_some());
+        lock(&mut m, text).await;
+        m.expect("locked", |x| {
+            matches!(x, ServerMessage::ChannelUpdated { channel } if channel.channel_id == text)
+        })
+        .await;
+        tokio::time::timeout(HANG, async {
+            while state.layout.read().await.welcome.is_some() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("no welcome now");
+        let kept = state
+            .accounts
+            .as_ref()
+            .unwrap()
+            .layout_rows()
+            .await
+            .unwrap();
+        assert_eq!(kept.welcome, None, "and none at the next start");
+    }
+
+    /// R2 F10: nothing capped the channels a holder of `voipc:channels` could make, and past
+    /// some 7,000 the layout framed no more for anyone.
+    #[tokio::test]
+    async fn a_server_full_of_channels_takes_no_more() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let mut m = manager(&state, "mona").await;
+        {
+            let mut channels = state.channels.write().await;
+            let mut i = 0u32;
+            while channels.values().filter(|c| c.persistent).count()
+                < crate::layout::MAX_KEPT_CHANNELS - 1
+            {
+                let entry = ChannelEntry {
+                    name: format!("filler-{i}"),
+                    ..ChannelEntry::default()
+                };
+                channels.insert(
+                    5000 + i,
+                    crate::state::Channel::from_entry(&entry, 5000 + i, true, true),
+                );
+                i += 1;
+            }
+        }
+        made(&mut m, save(None, "last-one", true, None)).await;
+        let why = refused(&mut m, save(None, "one-too-many", true, None)).await;
+        assert!(why.contains("channels at most"), "{why}");
+        assert!(!state
+            .channels
+            .read()
+            .await
+            .values()
+            .any(|c| c.info.name == "one-too-many"));
     }
 
     #[tokio::test]
@@ -22677,6 +24764,8 @@ mod profiles {
         let sid = *state.account_sessions.get(&ai.id).unwrap();
         state.sessions.get_mut(&sid).unwrap().state_change_rate =
             crate::state::RateLimiter::new(100.0, 100.0);
+        state.sessions.get_mut(&sid).unwrap().account_rate =
+            crate::state::RateLimiter::new(100.0, 100.0);
         for bad in [
             "@bobby",
             "bobby",
@@ -22698,11 +24787,16 @@ mod profiles {
             "Admin\u{202E}nimdA",
             "a\u{200B}b",
             &"x".repeat(33),
+            // The move's names, whether anyone has one or not (W1-30)
+            "dc-1003",
+            "DC-5",
+            "d\u{0441}-5",
         ] {
             let r = name_is(&mut ann, bad).await;
             assert!(matches!(r, AccountReply::Error { .. }), "{bad:?}: {r:?}");
         }
         for fine in [
+            "dc-fan",
             "\u{2764}\u{FE0F} Ann",
             "\u{1F469}\u{200D}\u{1F4BB} Ann",
             "\u{0645}\u{06CC}\u{200C}\u{062E}\u{0648}\u{0627}\u{0647}\u{0645}",
@@ -22805,11 +24899,10 @@ mod profiles {
     }
 
     #[tokio::test]
-    async fn a_change_goes_to_the_people_who_see_the_row_and_to_nobody_else() {
+    async fn a_change_goes_to_everyone_and_ties_the_account_to_no_channel() {
         let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
         let (mut ann, ai) = register(&state, "ann").await;
         let (mut bob, _) = register(&state, "bob").await;
-        // Signing in is told before the join: who hears a change is who is there
         while state.channels.read().await[&0].members.len() < 2 {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -22819,49 +24912,55 @@ mod profiles {
         ));
         assert_eq!(profiles(&mut bob).await[0].name.as_deref(), Some("Annie"));
 
-        // Both are in General, which from here on hides its people
+        // W3-21: someone in no channel of hers sees her row too (a public roster, her old
+        // messages), and hears it as everyone does
+        let mut dave = connect(&state, "dave#1234", IpAddr::V4(Ipv4Addr::LOCALHOST)).await;
         state
             .channels
             .write()
             .await
             .get_mut(&0)
             .unwrap()
-            .info
-            .hide_members = true;
+            .members
+            .remove(&dave_id(&state));
         assert_eq!(
             told_itself(&mut ann, "Annie 2").await.as_deref(),
             Some("Annie 2"),
             "its own other tabs and panels hear it all the same"
         );
-        bob.send(&ClientMessage::ProfilesGet {
-            accounts: vec![ai.id],
-        })
-        .await;
         assert_eq!(
-            profiles(&mut bob).await[0].name.as_deref(),
-            Some("Annie 2"),
-            "what it asked for, and not a change pushed before that"
+            profiles(&mut dave).await[0].name.as_deref(),
+            Some("Annie 2")
         );
-        // Under an alias, the same
-        {
-            let mut channels = state.channels.write().await;
-            let general = channels.get_mut(&0).unwrap();
-            general.info.hide_members = false;
-            general.info.anonymous = true;
+        assert_eq!(profiles(&mut bob).await[0].name.as_deref(), Some("Annie 2"));
+
+        // A channel that hides its people, or names them by alias: the change goes to all
+        // alike, so it puts a name to none of its rows
+        for (hide, alias, name) in [(true, false, "Annie 3"), (false, true, "Annie 4")] {
+            {
+                let mut channels = state.channels.write().await;
+                let general = channels.get_mut(&0).unwrap();
+                general.info.hide_members = hide;
+                general.info.anonymous = alias;
+            }
+            assert!(matches!(
+                name_is(&mut ann, name).await,
+                AccountReply::ProfileDone
+            ));
+            for c in [&mut bob, &mut dave] {
+                let got = profiles(c).await;
+                assert_eq!(
+                    (got[0].account, got[0].name.as_deref()),
+                    (ai.id, Some(name))
+                );
+            }
         }
-        assert!(matches!(
-            name_is(&mut ann, "Annie 3").await,
-            AccountReply::ProfileDone
-        ));
-        bob.send(&ClientMessage::ProfilesGet {
-            accounts: vec![[9; 16]],
-        })
-        .await;
-        assert_eq!(
-            profiles(&mut bob).await[0].account,
-            [9; 16],
-            "no push came first"
-        );
+    }
+
+    /// The guest's user id, for taking it out of General by hand.
+    fn dave_id(state: &ServerState) -> u32 {
+        let sid = *state.username_to_session.get("dave#1234").unwrap();
+        state.sessions.get(&sid).unwrap().user_id
     }
 
     #[tokio::test]
@@ -23326,6 +25425,18 @@ mod layout_limits {
         let news: Vec<_> = channels.iter().filter(|p| p.channel_id == id).collect();
         assert_eq!(news.len(), 1);
         assert_eq!(news[0].category, Some(b), "the first naming counts");
+        // And kept so: the next start reads that order (one write of what moved, W2-14)
+        let kept = state
+            .accounts
+            .as_ref()
+            .unwrap()
+            .layout_rows()
+            .await
+            .unwrap();
+        assert_eq!(
+            kept.categories.iter().map(|c| c.id).collect::<Vec<_>>(),
+            [b, a]
+        );
     }
 
     #[tokio::test]
@@ -23349,6 +25460,54 @@ mod layout_limits {
             encode_server_msg(&msg).is_ok(),
             "or nobody could see them to delete one"
         );
+    }
+
+    /// W3-20: a category of `hidden` channels counted as seen by the gate alone, so every
+    /// member's sidebar drew its name over nothing.
+    #[tokio::test]
+    async fn a_category_of_hidden_channels_shows_only_where_one_is_listed() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let (_kim, ki) = register(&state, "kim").await;
+        let sid = sid_of(&state, ki.id);
+        grant(&state, sid, &["voipc:channels"]);
+        let cat = crate::layout::category_save(&state, sid, None, "Staff")
+            .await
+            .unwrap();
+        let id = crate::layout::channel_save(
+            &state,
+            sid,
+            None,
+            "back",
+            "",
+            true,
+            false,
+            Some(cat),
+            None,
+        )
+        .await
+        .unwrap();
+        let (_bea, bi) = register(&state, "bea").await;
+        let bea = sid_of(&state, bi.id);
+        let shows = |sid: SessionId| {
+            let state = state.clone();
+            async move {
+                let (categories, _) = layout_of(&state, sid).await;
+                categories.iter().any(|c| c.id == cat)
+            }
+        };
+        assert!(shows(bea).await, "the control: listed, so shown");
+        state
+            .channels
+            .write()
+            .await
+            .get_mut(&id)
+            .unwrap()
+            .info
+            .hidden = true;
+        assert!(!shows(bea).await, "nothing under it for her");
+        assert!(shows(sid).await, "who manages channels sees it");
+        state.sessions.get_mut(&bea).unwrap().channel_id = id;
+        assert!(shows(bea).await, "and whoever stands in it");
     }
 
     #[tokio::test]
@@ -23484,6 +25643,59 @@ mod layout_limits {
         );
     }
 
+    /// W2-28: the three writes of a category's delete went one by one, so one that failed
+    /// or a crash between left part of it.
+    #[tokio::test]
+    async fn a_category_delete_that_fails_halfway_changes_nothing() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let (_kim, ki) = register(&state, "kim").await;
+        let sid = sid_of(&state, ki.id);
+        grant(&state, sid, &["voipc:channels"]);
+        let cat = crate::layout::category_save(&state, sid, None, "Info")
+            .await
+            .unwrap();
+        let id = crate::layout::channel_save(
+            &state,
+            sid,
+            None,
+            "news",
+            "",
+            true,
+            false,
+            Some(cat),
+            None,
+        )
+        .await
+        .unwrap();
+        let conv = state.channels.read().await[&id].gate_key.clone();
+        let relay = state.accounts.as_ref().unwrap();
+        let category_of = || async {
+            relay
+                .layout_rows()
+                .await
+                .unwrap()
+                .rows
+                .into_iter()
+                .find(|r| r.conv == conv)
+                .unwrap()
+                .category
+        };
+        assert_eq!(category_of().await, Some(cat));
+        crate::accounts::raw(
+            relay,
+            "CREATE TRIGGER held BEFORE DELETE ON voipc_categories BEGIN SELECT RAISE(ABORT, 'held'); END",
+        )
+        .await
+        .unwrap();
+        assert!(relay.category_delete(cat, &[]).await.is_err());
+        assert_eq!(category_of().await, Some(cat), "the channel stays in it");
+        crate::accounts::raw(relay, "DROP TRIGGER held")
+            .await
+            .unwrap();
+        relay.category_delete(cat, &[]).await.unwrap();
+        assert_eq!(category_of().await, None, "the control");
+    }
+
     #[tokio::test]
     async fn a_category_whose_channel_went_from_the_file_can_still_be_deleted() {
         let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
@@ -23534,6 +25746,46 @@ mod layout_limits {
             .await
             .unwrap();
         assert!(!rows.rows.iter().any(|r| r.conv == conv));
+    }
+
+    /// W2-21: the deleting admin's connection ends while its members are put out, and its
+    /// handler is aborted. Stopped with `kept` off, the panel called it the file's and nobody
+    /// could delete it until a restart. The test stops it at the layout, its last step.
+    #[tokio::test]
+    async fn a_channel_delete_cut_short_still_ends() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let (_kim, ki) = register(&state, "kim").await;
+        let sid = sid_of(&state, ki.id);
+        grant(&state, sid, &["voipc:channels"]);
+        let id =
+            crate::layout::channel_save(&state, sid, None, "going", "", true, false, None, None)
+                .await
+                .unwrap();
+        let conv = state.channels.read().await[&id].gate_key.clone();
+        assert!(state.layout.read().await.places.contains_key(&conv));
+        let held = state.layout.write().await;
+        let handler = tokio::spawn({
+            let state = state.clone();
+            async move { crate::layout::channel_delete(&state, sid, id).await }
+        });
+        tokio::time::timeout(HANG, async {
+            while state.channels.read().await.contains_key(&id) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!handler.is_finished(), "it waits on the layout");
+        // As `web.rs` aborts it, 10 s after its connection ended
+        handler.abort();
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.layout.read().await.places.contains_key(&conv) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the delete ends all the same");
     }
 
     #[tokio::test]
@@ -23602,6 +25854,25 @@ mod layout_limits {
             "the same as for no channel at all"
         );
         assert!(!state.channels.read().await[&id].info.has_password);
+        // W3-7: the proximity half had no test, and dropping its check left all green
+        kim.send(&ClientMessage::SetChannelProximity {
+            channel_id: id,
+            proximity: ProximityMode::TwoD,
+        })
+        .await;
+        let ServerMessage::ChannelError { reason } = kim
+            .expect("refused", |m| {
+                matches!(m, ServerMessage::ChannelError { .. })
+            })
+            .await
+        else {
+            unreachable!()
+        };
+        assert_eq!(reason, "channel does not exist");
+        assert_eq!(
+            state.channels.read().await[&id].info.proximity,
+            ProximityMode::Off
+        );
     }
 
     #[tokio::test]
@@ -25435,6 +27706,44 @@ mod moderation {
         // Read afresh: her group changed nothing that would have asked for it
         crate::accounts::refresh_chat_mods(&state).await;
         assert_eq!(*state.chat_mods.read().await, want);
+    }
+
+    /// A group edit's pass reads who holds what once, not once per holder it changed: each
+    /// read goes through every holder (W2-2).
+    #[tokio::test]
+    async fn a_pass_over_many_changed_holders_reads_the_list_once() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        group(&state, "crew", None, &["voipc:kick"]).await;
+        let mut here = Vec::new();
+        for name in ["ana", "ben", "cid", "dee"] {
+            let (mut c, info) = register(&state, name).await;
+            totp_on(&mut c).await;
+            give(&state, info.id, "crew", true).await;
+            here.push(c);
+        }
+        assert!(state.chat_mods.read().await.iter().all(|m| !m.hide));
+        let relay = state.accounts.clone().unwrap();
+        let crew = relay.store().role_by_name("crew").await.unwrap().unwrap();
+        crate::accounts::raw(
+            &relay,
+            &format!(
+                "INSERT INTO acct_role_scopes (role_id, scope) VALUES (X'{}', 'voipc:hide')",
+                hex::encode(crew.id.0)
+            ),
+        )
+        .await
+        .unwrap();
+        let reads = || {
+            state
+                .chat_mods_reads
+                .load(std::sync::atomic::Ordering::SeqCst)
+        };
+        let before = reads();
+        crate::accounts::revalidate(&state).await;
+        assert_eq!(reads() - before, 1, "one read for the four");
+        let mods = state.chat_mods.read().await.clone();
+        assert_eq!(mods.len(), 4);
+        assert!(mods.iter().all(|m| m.hide), "{mods:?}");
     }
 
     #[tokio::test]
@@ -27653,8 +29962,8 @@ mod invite_links {
             reset_slot(),
         ];
         let altcha = solve(&pow.altcha);
-        c.send(&ClientMessage::AuthContinue(AuthContinue::Register {
-            auth_secret: SECRET.to_vec(),
+        c.send(&ClientMessage::AuthContinue(AuthContinue::RegisterKey {
+            login_key: test_key().public_key().to_vec(),
             altcha,
             ts: pow.ts,
             vault,
@@ -27805,8 +30114,8 @@ mod invite_links {
         else {
             panic!("a link is asked for the work too");
         };
-        c.send(&ClientMessage::AuthContinue(AuthContinue::Register {
-            auth_secret: SECRET.to_vec(),
+        c.send(&ClientMessage::AuthContinue(AuthContinue::RegisterKey {
+            login_key: test_key().public_key().to_vec(),
             altcha: String::new(),
             ts: pow.ts,
             vault: vec![
@@ -28007,8 +30316,8 @@ mod invite_links {
         let Some(ServerMessage::AuthStep(AuthStep::Salt { .. })) = c.next().await else {
             panic!("a code opens the door");
         };
-        c.send(&ClientMessage::AuthContinue(AuthContinue::Register {
-            auth_secret: SECRET.to_vec(),
+        c.send(&ClientMessage::AuthContinue(AuthContinue::RegisterKey {
+            login_key: test_key().public_key().to_vec(),
             altcha: String::new(),
             ts: String::new(),
             vault: vec![
@@ -28106,6 +30415,36 @@ mod restriction {
             unreachable!()
         };
         list.into_iter().find(|r| r.user_id == user).unwrap()
+    }
+
+    /// W3-17: a moderator's voice-only mute on someone still in the new-member wait goes out
+    /// as the moderator's voice and the wait's writing, each with its own end.
+    #[tokio::test]
+    async fn a_mute_during_the_wait_is_told_as_a_mute() {
+        let (state, _db) = relay_state_then(AccountsMode::Optional, RegistrationMode::Open, |s| {
+            s.settings.new_member_wait_mins = 60;
+        })
+        .await;
+        let (mut ann, ai) = register(&state, "ann").await;
+        let sid = *state.account_sessions.get(&ai.id).unwrap();
+        let until = crate::bans::now_secs() + 86_400;
+        state.restrictions.insert(
+            crate::bans::Key::Account(ai.id),
+            crate::restrict::Held {
+                voice: true,
+                text: false,
+                by: "mod".into(),
+                reason: String::new(),
+                expires_at: Some(until),
+            },
+        );
+        crate::restrict::settle(&state, sid).await;
+        let r = row_of(&mut ann, sid).await;
+        assert!(r.voice && r.text && r.direct, "{r:?}");
+        assert_eq!((r.by.as_str(), r.by_voice, r.by_text), ("mod", true, false));
+        let wait = r.wait_in_secs.expect("the wait's own end");
+        assert!((3500..=3600).contains(&wait), "{wait}");
+        assert!(r.expires_in_secs.unwrap() > 86_000, "the mod's end");
     }
 
     async fn admin_error(c: &mut Client) -> String {
@@ -28944,6 +31283,7 @@ mod restriction {
             media_tx,
             sid_tx,
             state.clone(),
+            Some(TEST_BIND),
         ));
         let mut c = Client {
             stream,
@@ -28959,14 +31299,7 @@ mod restriction {
             account: Some(AccountStart::Login),
         })
         .await;
-        assert!(matches!(
-            c.next().await,
-            Some(ServerMessage::AuthStep(AuthStep::Salt { pow: None, .. }))
-        ));
-        c.send(&ClientMessage::AuthContinue(AuthContinue::Secret {
-            auth_secret: SECRET.to_vec(),
-        }))
-        .await;
+        password_answer(&mut c, state, name).await;
         c.send(&keys(&IDENTITY, false)).await;
         (c, sid_rx)
     }
@@ -30199,9 +32532,8 @@ mod share_history {
         );
         crate::accounts::raw(&relay, &seat).await.unwrap();
         relay
-            .prune_log("c:aa", &["sharers".into()], &mut Default::default())
-            .await
-            .unwrap();
+            .prune_gated(&[("c:aa".into(), vec!["sharers".into()])])
+            .await;
         assert_eq!(
             crate::accounts::raw(
                 &relay,
@@ -30360,8 +32692,15 @@ mod share_history {
             !matches!(r, ServerMessage::Account(AccountReply::Error { .. })),
             "{r:?}"
         );
-        assert_eq!(flags(&drained(&mut watcher).await, h), [false]);
-        assert_eq!(flags(&drained(&mut hal).await, h), [false]);
+        // Told once, after the answer: the holders' privileges are worked out in a task of
+        // their own, not in the admin's frame
+        for c in [&mut watcher, &mut hal] {
+            c.expect("told it is off", |m| {
+                matches!(m, ServerMessage::UserHistorySharing { user_id, enabled: false } if *user_id == h)
+            })
+            .await;
+            assert_eq!(flags(&drained(c).await, h), Vec::<bool>::new(), "once");
+        }
         assert!(!state.sessions.get(&h).unwrap().shares_history);
         assert_eq!(
             crate::accounts::raw(
@@ -33531,6 +35870,56 @@ mod kept_chains {
         );
     }
 
+    /// R2 F7: a change every minute kept the whole relay walking and every writer stepping.
+    #[tokio::test]
+    async fn each_log_key_change_waits_twice_as_long_as_the_one_before() {
+        use voipc_crypto::log::LogKey;
+        let (state, _db, _log) = relay_kept(10, 256).await;
+        let (mut m, _info, signed) = register_with(&state, "mallory").await;
+        let publish = |k: &LogKey| AccountRequest::LogKeyPublish {
+            logkey: k.public(),
+            sig: k.endorse(&signed.identity),
+        };
+        assert!(matches!(
+            ask(&mut m, publish(&LogKey::generate())).await,
+            AccountReply::LogKeyStored
+        ));
+        let ago = |secs: i64| {
+            format!(
+                "UPDATE voipc_logkeys SET updated_at = {}",
+                l4f_accounts::util::now() - secs
+            )
+        };
+        for wait in [60, 120, 240, 480] {
+            let next = LogKey::generate();
+            run(&state, &ago(wait - 5)).await;
+            assert!(
+                matches!(
+                    ask(&mut m, publish(&next)).await,
+                    AccountReply::Error { .. }
+                ),
+                "{wait} s: too soon"
+            );
+            run(&state, &ago(wait + 5)).await;
+            assert!(
+                matches!(
+                    ask(&mut m, publish(&next)).await,
+                    AccountReply::LogKeyStored
+                ),
+                "{wait} s: long enough"
+            );
+        }
+        // A day with no change starts it over
+        for mut e in state.accounts.as_ref().unwrap().logkey_changes.iter_mut() {
+            e.1 -= 86_401;
+        }
+        run(&state, &ago(65)).await;
+        assert!(matches!(
+            ask(&mut m, publish(&LogKey::generate())).await,
+            AccountReply::LogKeyStored
+        ));
+    }
+
     #[tokio::test]
     async fn a_new_log_key_brings_a_wrap_at_the_next_post() {
         let (state, _db, log) = relay_kept(10, 256).await;
@@ -34569,13 +36958,9 @@ mod kept_chains {
         ask(&mut d, AccountRequest::LogJoin { conv: log.clone() }).await;
         sealed_chain(&mut a, &log, aid, &[info.id]).await;
         assert!(filed(&post(&mut a, &log, 1, 0).await));
-        let relay = state.accounts.clone().unwrap();
-        let secret =
-            voipc_crypto::account::derive("correct horse battery", &relay.relay_id, "dora")
-                .auth_secret
-                .to_vec();
+        password_again(&mut d, &state, "dora").await;
         d.send(&ClientMessage::Account(AccountRequest::DeleteAccount {
-            secret,
+            secret: Vec::new(),
             totp: None,
             recovery_code: None,
         }))
@@ -36092,4 +38477,744 @@ mod kept_chains {
         assert_eq!(pages[0].len(), 512);
         assert_eq!(pages[1].len(), 10, "all of them, in several answers");
     }
+}
+
+/// W2-17: a deleted channel goes at once, its rows a batch at a time; a purge a stop cut
+/// short is finished at the next start, and one whose channel is back stops and keeps its rows.
+#[tokio::test]
+async fn a_channel_purge_goes_in_batches_and_a_restart_finishes_it() {
+    let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+    let (reader_c, info) = register(&state, "owner").await;
+    let relay = state.accounts.clone().unwrap();
+    let pool = match relay.store() {
+        l4f_accounts::store::Store::Lite(b) => b.0.clone(),
+        _ => panic!("SQLite"),
+    };
+    let count = |conv: &'static str| {
+        let pool = pool.clone();
+        async move {
+            let mut n = 0i64;
+            for t in ["voipc_log", "voipc_writers", "voipc_purging"] {
+                n += sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!(
+                    "SELECT COUNT(*) FROM {t} WHERE conv = $1"
+                )))
+                .bind(conv)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            }
+            n += sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM voipc_chain_steps s JOIN voipc_chains c ON c.id = s.chain_id
+                 JOIN voipc_writers w ON w.id = c.writer WHERE w.conv = $1",
+            )
+            .bind(conv)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            n
+        }
+    };
+    let fill = |conv: &'static str, rows: i64| {
+        let (pool, owner) = (pool.clone(), info.id);
+        async move {
+            sqlx::query("INSERT INTO voipc_writers (conv, owner) VALUES ($1, $2)")
+                .bind(conv)
+                .bind(&owner[..])
+                .execute(&pool)
+                .await
+                .unwrap();
+            let writer: i64 = sqlx::query_scalar("SELECT id FROM voipc_writers WHERE conv = $1")
+                .bind(conv)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            for c in 0..rows / 100 {
+                sqlx::query("INSERT INTO voipc_chains (writer, chain, top, self_wrap, created_at) VALUES ($1, $2, 99, x'00', 0)")
+                    .bind(writer).bind(c).execute(&pool).await.unwrap();
+                let id: i64 = sqlx::query_scalar(
+                    "SELECT id FROM voipc_chains WHERE writer = $1 AND chain = $2",
+                )
+                .bind(writer)
+                .bind(c)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                for i in 0..100i16 {
+                    sqlx::query("INSERT INTO voipc_chain_steps (chain_id, idx, sealed) VALUES ($1, $2, x'01')")
+                        .bind(id).bind(i).execute(&pool).await.unwrap();
+                }
+            }
+            for i in 0..rows {
+                sqlx::query("INSERT INTO voipc_log (conv, sender, epoch, ct, server_at, keep_until) VALUES ($1, $2, 0, x'02', $3, 9999999999999)")
+                    .bind(conv).bind(&owner[..]).bind(i).execute(&pool).await.unwrap();
+            }
+        }
+    };
+    // More than a batch of each, and another channel's rows beside them
+    fill("c:gone", 4500).await;
+    fill("c:stays", 300).await;
+    relay.channel_purge("c:gone").await.unwrap();
+    assert_eq!(
+        count("c:gone").await,
+        0,
+        "every row, and the purge's own note"
+    );
+    assert_eq!(count("c:stays").await, 300 + 1 + 300);
+
+    // Its readers are out with the channel, before the first row goes: nobody reads what is
+    // left of it while the rows go
+    fill("c:read", 300).await;
+    sqlx::query("INSERT INTO voipc_members (conv, account, joined_at) VALUES ('c:read', $1, 1)")
+        .bind(&info.id[..])
+        .execute(&pool)
+        .await
+        .unwrap();
+    relay.purge_begin("c:read").await.unwrap();
+    let members: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM voipc_members WHERE conv = 'c:read'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(members, 0);
+    assert!(count("c:read").await > 300, "the rows are still to go");
+    let mut reader = reader_c;
+    reader
+        .send(&ClientMessage::Account(AccountRequest::LogFetch {
+            conv: "c:read".into(),
+            after: 0,
+        }))
+        .await;
+    let r = reader.expect("refused", |m| reply(m).is_some()).await;
+    assert!(
+        matches!(&r, ServerMessage::Account(AccountReply::Error { request, .. }) if request == "LogFetch"),
+        "{r:?}"
+    );
+    assert_eq!(relay.purge_unfinished().await.unwrap(), 1);
+    assert_eq!(count("c:read").await, 0);
+
+    // A stop after the channel went: its note and rows are there at the next start
+    fill("c:cut", 2500).await;
+    sqlx::query("INSERT INTO voipc_purging (conv, at) VALUES ('c:cut', 1)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(relay.purge_unfinished().await.unwrap(), 1);
+    assert_eq!(count("c:cut").await, 0);
+    // A channel of that log back before the purge ran: what is there is its own
+    fill("c:back", 200).await;
+    sqlx::query("INSERT INTO voipc_purging (conv, at) VALUES ('c:back', 1)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO voipc_channels (conv, entry, position) VALUES ('c:back', '{}', 0)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    relay.purge_unfinished().await.unwrap();
+    assert_eq!(
+        count("c:back").await,
+        200 + 1 + 200,
+        "kept, and the note gone"
+    );
+}
+
+/// Round C measurement (W2-17), not a check: how long deleting a channel holding `N` kept posts
+/// takes on SQLite, and how long another writer waits meanwhile. Run on a disk:
+/// `TMPDIR=target/scratch/tmpdisk ROUND_C_N=100000 cargo test -p voipc-server --bin voipc-server
+/// -- --ignored measure_channel_purge --nocapture`.
+#[tokio::test]
+#[ignore]
+async fn measure_channel_purge() {
+    let n: i64 = std::env::var("ROUND_C_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100_000);
+    let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+    let (_c, info) = register(&state, "owner").await;
+    let relay = state.accounts.clone().unwrap();
+    let conv = "c:big";
+    let filled = std::time::Instant::now();
+    let pool = match relay.store() {
+        l4f_accounts::store::Store::Lite(b) => b.0.clone(),
+        _ => panic!("a SQLite measurement"),
+    };
+    {
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("INSERT INTO voipc_writers (conv, owner) VALUES ($1, $2)")
+            .bind(conv)
+            .bind(&info.id[..])
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let writer: i64 = sqlx::query_scalar("SELECT id FROM voipc_writers WHERE conv = $1")
+            .bind(conv)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        // 200 steps a chain, as a chain's top allows
+        let chains = n / 200 + 1;
+        for c in 0..chains {
+            sqlx::query("INSERT INTO voipc_chains (writer, chain, top, self_wrap, created_at) VALUES ($1, $2, 199, $3, 0)")
+                .bind(writer).bind(c).bind(vec![1u8; 80]).execute(&mut *tx).await.unwrap();
+        }
+        let first: i64 = sqlx::query_scalar("SELECT MIN(id) FROM voipc_chains WHERE writer = $1")
+            .bind(writer)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        for i in 0..n {
+            sqlx::query(
+                "INSERT INTO voipc_chain_steps (chain_id, idx, sealed) VALUES ($1, $2, $3)",
+            )
+            .bind(first + i / 200)
+            .bind((i % 200) as i16)
+            .bind(vec![7u8; 300])
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        }
+        // And as many rows kept before 1.11, in the old log
+        for i in 0..n {
+            sqlx::query("INSERT INTO voipc_log (conv, sender, epoch, ct, server_at, keep_until) VALUES ($1, $2, 0, $3, $4, 9999999999999)")
+                .bind(conv).bind(&info.id[..]).bind(vec![9u8; 300]).bind(i)
+                .execute(&mut *tx).await.unwrap();
+        }
+        tx.commit().await.unwrap();
+    }
+    eprintln!("filled {n} steps + {n} old rows in {:?}", filled.elapsed());
+    // Another writer, every 50 ms, as a sign-in or a post would be
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let waits = {
+        let (pool, stop) = (pool.clone(), stop.clone());
+        tokio::spawn(async move {
+            let mut worst = std::time::Duration::ZERO;
+            let mut failed = 0;
+            let mut i = 0i64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let t = std::time::Instant::now();
+                let r = sqlx::query("INSERT INTO voipc_log_floors (conv, floor) VALUES ($1, 0) ON CONFLICT (conv) DO UPDATE SET floor = excluded.floor")
+                    .bind(format!("c:other{i}")).execute(&pool).await;
+                if r.is_err() {
+                    failed += 1;
+                }
+                worst = worst.max(t.elapsed());
+                i += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            (worst, failed)
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let t = std::time::Instant::now();
+    relay.channel_purge(conv).await.unwrap();
+    let took = t.elapsed();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let (worst, failed) = waits.await.unwrap();
+    eprintln!("ROUND-C W2-17 n={n}: purge {took:?}; another writer waited at most {worst:?}, {failed} failed");
+}
+
+/// Round C measurement (W2-3), not a check: a tidy pass over `ROUND_C_N` archive rows with
+/// `ROUND_C_W` delete wishes already done (what every later pass repeats), and how long another
+/// writer waits meanwhile. `TMPDIR=target/scratch/tmpdisk ROUND_C_N=2000000 cargo test -p
+/// voipc-server --bin voipc-server -- --ignored measure_archive_tidy --nocapture`.
+#[tokio::test]
+#[ignore]
+async fn measure_archive_tidy() {
+    let n: i64 = std::env::var("ROUND_C_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2_000_000);
+    let w: i64 = std::env::var("ROUND_C_W")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300);
+    let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+    let relay = state.accounts.clone().unwrap();
+    let pool = match relay.store() {
+        l4f_accounts::store::Store::Lite(b) => b.0.clone(),
+        _ => panic!("SQLite"),
+    };
+    let filled = std::time::Instant::now();
+    {
+        let mut tx = pool.begin().await.unwrap();
+        for ch in 1..=4i64 {
+            sqlx::query("INSERT INTO voipc_channels (conv, entry, position) VALUES ($1, '{}', 0)")
+                .bind(format!("c:dc-{ch}"))
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+        }
+        let per = n / 4;
+        for ch in 1..=4i64 {
+            let mut i = 0;
+            while i < per {
+                let mut q = String::from("INSERT INTO voipc_archive (channel, thread, dc_id, author_dc_id, author_name, body, import_id) VALUES ");
+                let chunk = (per - i).min(500);
+                for j in 0..chunk {
+                    let id = 1_000_000 + ch * 10_000_000_000 + (i + j) * 1000;
+                    if j > 0 {
+                        q.push(',');
+                    }
+                    q.push_str(&format!("({ch}, 0, {id}, {}, 'name', 'some words of a message, as people write them', 1)", (i + j) % 997 + 1));
+                }
+                sqlx::query(sqlx::AssertSqlSafe(q))
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+                i += chunk;
+            }
+        }
+        // Wishes whose rows are gone already: single messages by anyone, and spans by an author
+        for k in 0..w {
+            let id = 1_000_000 + 10_000_000_000 + k * 1000 + 1;
+            sqlx::query("INSERT INTO voipc_archive_wishes (author_dc_id, channel, low, high, erase, at) VALUES (0, 1, $1, $1, TRUE, 0)")
+                .bind(id).execute(&mut *tx).await.unwrap();
+            sqlx::query("INSERT INTO voipc_archive_wishes (author_dc_id, channel, low, high, erase, at) VALUES (5000, 0, $1, $2, TRUE, 0)")
+                .bind(id).bind(id + 500).execute(&mut *tx).await.unwrap();
+        }
+        tx.commit().await.unwrap();
+    }
+    eprintln!(
+        "filled {n} rows, {} wishes in {:?}",
+        2 * w,
+        filled.elapsed()
+    );
+    for q in crate::accounts::archive::PLANNED {
+        let plan: Vec<(i64, i64, i64, String)> =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {q}")))
+                .bind(1i64)
+                .bind(1i64)
+                .bind(1i64)
+                .bind(1i64)
+                .bind(1i64)
+                .bind(1i64)
+                .bind(1i64)
+                .fetch_all(&pool)
+                .await
+                .unwrap_or_default();
+        eprintln!(
+            "PLAN {}…\n  {}",
+            &q[..60.min(q.len())],
+            plan.iter()
+                .map(|p| p.3.clone())
+                .collect::<Vec<_>>()
+                .join("\n  ")
+        );
+    }
+    crate::accounts::archive::tidy(&state, &relay)
+        .await
+        .unwrap();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let waits = {
+        let (pool, stop) = (pool.clone(), stop.clone());
+        tokio::spawn(async move {
+            let (mut worst, mut failed, mut i) = (std::time::Duration::ZERO, 0, 0i64);
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let t = std::time::Instant::now();
+                let r = sqlx::query("INSERT INTO voipc_log_floors (conv, floor) VALUES ($1, 0) ON CONFLICT (conv) DO UPDATE SET floor = excluded.floor")
+                    .bind(format!("c:other{i}")).execute(&pool).await;
+                if r.is_err() {
+                    failed += 1;
+                }
+                worst = worst.max(t.elapsed());
+                i += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            (worst, failed)
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let t = std::time::Instant::now();
+    crate::accounts::archive::tidy(&state, &relay)
+        .await
+        .unwrap();
+    let took = t.elapsed();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let (worst, failed) = waits.await.unwrap();
+    eprintln!("ROUND-C W2-3 n={n} wishes={}: a repeated pass {took:?}; another writer waited at most {worst:?}, {failed} failed", 2 * w);
+}
+
+/// Round C measurement (W2-1), not a check: a pass of `prune_logs` over `ROUND_C_G` gated logs
+/// of 256 members each, every member another account, a quarter of them outside the gate.
+/// `TMPDIR=$PWD/target/scratch/tmpdisk ROUND_C_G=50 cargo test -p voipc-server --bin
+/// voipc-server -- --ignored measure_gate_pass --nocapture`.
+#[tokio::test]
+#[ignore]
+async fn measure_gate_pass() {
+    let g: usize = std::env::var("ROUND_C_G")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+    let per = 256usize;
+    let mut config = ServerConfig::default();
+    config.accounts.mode = AccountsMode::Optional;
+    config.accounts.registration = RegistrationMode::Open;
+    let db = TempDb(std::env::temp_dir().join(format!(
+        "voipc-relay-{}.db",
+        hex::encode(rand::random::<[u8; 8]>())
+    )));
+    let store = l4f_accounts::store::Store::connect(&format!("sqlite://{}", db.0.display()))
+        .await
+        .unwrap();
+    let relay = crate::accounts::Relay::open_with(&config.accounts, store, &[9u8; 32])
+        .await
+        .unwrap();
+    let entries: Vec<_> = (0..g)
+        .map(|i| crate::channels::ChannelEntry {
+            name: format!("g{i}"),
+            text: true,
+            ..Default::default()
+        })
+        .collect();
+    let mut state = ServerState::new(&config, ServerSettings::default(), entries, "t".into());
+    state.accounts = Some(Arc::new(relay));
+    let convs: Vec<String> = state
+        .channels
+        .get_mut()
+        .values_mut()
+        .filter(|c| !c.log_conv.is_empty())
+        .map(|c| {
+            c.gate.groups = vec!["crew".into()];
+            c.log_conv.clone()
+        })
+        .collect();
+    assert_eq!(convs.len(), g);
+    let state = Arc::new(state);
+    let relay = state.accounts.clone().unwrap();
+    group(&state, "crew", Some("C"), &[]).await;
+    group(&state, "other", Some("O"), &[]).await;
+    let crew = relay
+        .store()
+        .role_by_name("crew")
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    let other = relay
+        .store()
+        .role_by_name("other")
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    let pool = match relay.store() {
+        l4f_accounts::store::Store::Lite(b) => b.0.clone(),
+        _ => panic!("a SQLite measurement"),
+    };
+    let filled = std::time::Instant::now();
+    let mut outside = 0;
+    for (ci, conv) in convs.iter().enumerate() {
+        for m in 0..per {
+            let id = l4f_accounts::model::AccountId::new();
+            let new = l4f_accounts::model::NewUser {
+                id,
+                username: format!("u{ci}x{m}"),
+                display_name: format!("u{ci}x{m}"),
+                email_pending: None,
+                password_hash: None,
+                created_at: 0,
+            };
+            relay.store().create_user(&new, Some("user")).await.unwrap();
+            relay.store().grant_role(id, other, None).await.unwrap();
+            if m % 4 != 0 {
+                relay.store().grant_role(id, crew, None).await.unwrap();
+            } else {
+                outside += 1;
+            }
+            sqlx::query("INSERT INTO voipc_members (conv, account, joined_at) VALUES ($1, $2, 0)")
+                .bind(conv)
+                .bind(&id.0[..])
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+    }
+    eprintln!("filled {g} logs x {per} in {:?}", filled.elapsed());
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let waits = {
+        let (pool, stop) = (pool.clone(), stop.clone());
+        tokio::spawn(async move {
+            let mut worst = std::time::Duration::ZERO;
+            let mut failed = 0;
+            let mut i = 0i64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let t = std::time::Instant::now();
+                let r = sqlx::query("INSERT INTO voipc_log_floors (conv, floor) VALUES ($1, 0) ON CONFLICT (conv) DO UPDATE SET floor = excluded.floor")
+                    .bind(format!("c:other{i}")).execute(&pool).await;
+                if r.is_err() {
+                    failed += 1;
+                }
+                worst = worst.max(t.elapsed());
+                i += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            (worst, failed)
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let t = std::time::Instant::now();
+    crate::gates::prune_logs(&state).await;
+    let first = t.elapsed();
+    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM voipc_members")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(left as usize, g * per - outside);
+    let t = std::time::Instant::now();
+    crate::gates::prune_logs(&state).await;
+    let again = t.elapsed();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let (worst, failed) = waits.await.unwrap();
+    eprintln!("ROUND-C W2-1 g={g} members={}: first pass {first:?} ({outside} out), a pass with nobody out {again:?}; another writer waited at most {worst:?}, {failed} failed", g * per);
+}
+
+/// Round C measurement (W2-2), not a check: a group of `ROUND_C_H` privilege holders away and
+/// `ROUND_C_O` online (at most 10: sign-ups from one address) gains a scope that changes how
+/// they are listed; `revalidate` as the group edit runs it, and the longest a connect waits for
+/// the list (`chat_mods_at_connect`). `TMPDIR=$PWD/target/scratch/tmpdisk ROUND_C_PAGE=500
+/// ROUND_C_H=2990 ROUND_C_O=10 cargo test -p voipc-server --bin voipc-server -- --ignored
+/// measure_group_edit --nocapture`.
+#[tokio::test]
+#[ignore]
+async fn measure_group_edit() {
+    let var = |k: &str, d: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
+    let (h, o) = (var("ROUND_C_H", 200), var("ROUND_C_O", 20));
+    let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+    group(&state, "mods", None, &["voipc:kick"]).await;
+    let relay = state.accounts.clone().unwrap();
+    let mods = relay
+        .store()
+        .role_by_name("mods")
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    let pool = match relay.store() {
+        l4f_accounts::store::Store::Lite(b) => b.0.clone(),
+        _ => panic!("a SQLite measurement"),
+    };
+    let filled = std::time::Instant::now();
+    for i in 0..h {
+        let id = l4f_accounts::model::AccountId::new();
+        let new = l4f_accounts::model::NewUser {
+            id,
+            username: format!("away{i}"),
+            display_name: format!("away{i}"),
+            email_pending: None,
+            password_hash: None,
+            created_at: 0,
+        };
+        relay.store().create_user(&new, Some("user")).await.unwrap();
+        relay.store().grant_role(id, mods, None).await.unwrap();
+        sqlx::query("UPDATE acct_users SET totp_enc = X'00' WHERE id = $1")
+            .bind(&id.0[..])
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let mut here = Vec::new();
+    for i in 0..o {
+        let (mut c, info) = register(&state, &format!("here{i}")).await;
+        totp_on(&mut c).await;
+        give(&state, info.id, "mods", true).await;
+        here.push(c);
+    }
+    crate::accounts::refresh_chat_mods(&state).await;
+    assert_eq!(state.chat_mods.read().await.len(), h + o);
+    eprintln!("{h} away, {o} here in {:?}", filled.elapsed());
+    // Each of them now hides too: how every one of them is listed changes
+    sqlx::query("INSERT INTO acct_role_scopes (role_id, scope) VALUES ($1, 'voipc:hide')")
+        .bind(&mods.0[..])
+        .execute(&pool)
+        .await
+        .unwrap();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let waits = {
+        let (state, stop) = (state.clone(), stop.clone());
+        tokio::spawn(async move {
+            let mut worst = std::time::Duration::ZERO;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let t = std::time::Instant::now();
+                drop(state.chat_mods.read().await);
+                worst = worst.max(t.elapsed());
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            worst
+        })
+    };
+    let t = std::time::Instant::now();
+    crate::accounts::revalidate(&state).await;
+    let took = t.elapsed();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let worst = waits.await.unwrap();
+    assert!(state.chat_mods.read().await.iter().all(|m| m.hide));
+    eprintln!("ROUND-C W2-2 holders={h} away + {o} here: the group edit's pass {took:?}; a connect waited at most {worst:?} for the list");
+}
+
+/// Round C measurement (W2-14), not a check: `ROUND_C_N` kept channels put in the reverse
+/// order (`layout_set`), and 200 categories with the first deleted (`category_delete`); the
+/// longest a connect waits for the layout meanwhile. `TMPDIR=$PWD/target/scratch/tmpdisk
+/// ROUND_C_N=2000 cargo test -p voipc-server --bin voipc-server -- --ignored
+/// measure_layout_moves --nocapture`.
+#[tokio::test]
+#[ignore]
+async fn measure_layout_moves() {
+    let n: usize = std::env::var("ROUND_C_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(500);
+    let mut config = ServerConfig::default();
+    config.accounts.mode = AccountsMode::Optional;
+    config.accounts.registration = RegistrationMode::Open;
+    let db = TempDb(std::env::temp_dir().join(format!(
+        "voipc-relay-{}.db",
+        hex::encode(rand::random::<[u8; 8]>())
+    )));
+    let store = l4f_accounts::store::Store::connect(&format!("sqlite://{}", db.0.display()))
+        .await
+        .unwrap();
+    let relay = crate::accounts::Relay::open_with(&config.accounts, store, &[9u8; 32])
+        .await
+        .unwrap();
+    let entries: Vec<_> = (0..n)
+        .map(|i| crate::channels::ChannelEntry {
+            name: format!("c{i}"),
+            text: true,
+            ..Default::default()
+        })
+        .collect();
+    let mut state = ServerState::new(&config, ServerSettings::default(), entries, "t".into());
+    state.accounts = Some(Arc::new(relay));
+    let state = Arc::new(state);
+    let relay = state.accounts.clone().unwrap();
+    let t = std::time::Instant::now();
+    crate::layout::load(&state, relay.layout_rows().await.unwrap(), &[]).await;
+    eprintln!("first start placed {n} in {:?}", t.elapsed());
+    let mut ids: Vec<u32> = state
+        .channels
+        .read()
+        .await
+        .values()
+        .filter(|c| c.persistent && c.info.channel_id != 0)
+        .map(|c| c.info.channel_id)
+        .collect();
+    ids.sort_unstable();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let waiting = || {
+        let (state, stop) = (state.clone(), stop.clone());
+        tokio::spawn(async move {
+            let mut worst = std::time::Duration::ZERO;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let t = std::time::Instant::now();
+                drop(state.layout.read().await);
+                worst = worst.max(t.elapsed());
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            worst
+        })
+    };
+    let waits = waiting();
+    let wanted: Vec<(u32, Option<u32>)> = ids.iter().rev().map(|id| (*id, None)).collect();
+    let t = std::time::Instant::now();
+    crate::layout::layout_set(&state, 0, &[], &wanted)
+        .await
+        .unwrap();
+    let moved = t.elapsed();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let worst_moved = waits.await.unwrap();
+    for i in 0..200 {
+        crate::layout::category_save(&state, 0, None, &format!("k{i}"))
+            .await
+            .unwrap();
+    }
+    stop.store(false, std::sync::atomic::Ordering::Relaxed);
+    let waits = waiting();
+    let first = state.layout.read().await.categories[0].id;
+    let t = std::time::Instant::now();
+    crate::layout::category_delete(&state, 0, first)
+        .await
+        .unwrap();
+    let deleted = t.elapsed();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let worst_deleted = waits.await.unwrap();
+    let rows = relay.layout_rows().await.unwrap();
+    assert_eq!(rows.categories.len(), 199);
+    // The rows read back in the order the list now has
+    let kept = state.layout.read().await.places.clone();
+    let mut by_place: Vec<&String> = kept.keys().collect();
+    by_place.sort_by_key(|c| kept[*c].position);
+    let read: Vec<&String> = rows.rows.iter().map(|r| &r.conv).collect();
+    assert_eq!(read, by_place);
+    eprintln!("ROUND-C W2-14 n={n}: reversed in {moved:?} (a connect waited at most {worst_moved:?}); a category of 200 deleted in {deleted:?} (waited at most {worst_deleted:?})");
+}
+
+/// Round C measurement (W2-16), not a check: what a connect reads before its join (group
+/// styles, the server's profile, removal marks) with 400 styled groups and 2000 marks, once
+/// and for `ROUND_C_N` connects at once. `TMPDIR=$PWD/target/scratch/tmpdisk ROUND_C_N=500
+/// cargo test -p voipc-server --bin voipc-server -- --ignored measure_connect_reads
+/// --nocapture`.
+#[tokio::test]
+#[ignore]
+async fn measure_connect_reads() {
+    let n: usize = std::env::var("ROUND_C_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100);
+    let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+    let relay = state.accounts.clone().unwrap();
+    for i in 0..400 {
+        group(&state, &format!("g{i}"), Some(&format!("B{i}")), &[]).await;
+        let id = relay
+            .store()
+            .role_by_name(&format!("g{i}"))
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        relay.group_style_put(id, Some(i), true).await.unwrap();
+    }
+    let pool = match relay.store() {
+        l4f_accounts::store::Store::Lite(b) => b.0.clone(),
+        _ => panic!("a SQLite measurement"),
+    };
+    for i in 0..2000i64 {
+        sqlx::query("INSERT INTO voipc_modlog (at, action, actor_name, target, target_name, since_ms, before_ms) VALUES ($1, 'remove_posts', 'mod', $2, 'someone', 1, 2)")
+            .bind(i)
+            .bind(vec![(i % 251) as u8; 16])
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let reads = |state: Arc<ServerState>| async move {
+        let (tx, _rx) = crate::control::control_queue(Arc::new(tokio::sync::Notify::new()));
+        let t = std::time::Instant::now();
+        crate::layout::send_styles(&state, &tx).await;
+        crate::accounts::profile::send_server_profile(&state, &tx).await;
+        crate::accounts::modlog::send_marks(&state, &tx).await;
+        t.elapsed()
+    };
+    reads(state.clone()).await;
+    let one = reads(state.clone()).await;
+    // The crowd comes to nothing kept, as after a start
+    relay.at_connect.styles.changed();
+    relay.at_connect.profile.changed();
+    relay.at_connect.marks.changed();
+    let t = std::time::Instant::now();
+    let mut all = tokio::task::JoinSet::new();
+    for _ in 0..n {
+        all.spawn(reads(state.clone()));
+    }
+    let mut worst = std::time::Duration::ZERO;
+    while let Some(r) = all.join_next().await {
+        worst = worst.max(r.unwrap());
+    }
+    eprintln!("ROUND-C W2-16: one connect's reads {one:?}; {n} at once {:?} in all, the slowest {worst:?}", t.elapsed());
 }

@@ -38,6 +38,9 @@ import {
   openDm,
   openTextChannel,
   renameChannelChat,
+  channelLogNames,
+  noteChannelLogNames,
+  onArchiveRead,
 } from "./chat.js";
 import { openServers } from "./servers.js";
 import { currentRosterOf, onlineById } from "./rosters.js";
@@ -445,6 +448,39 @@ export function channelRenamed(server: string, from: string, to: string): void {
     }
   });
 }
+
+/**
+ * A channel renamed while this device was away comes only as a new list (W3-18), and what
+ * it keeps by the old name stayed there: an empty pane, what was deleted handed back, a
+ * channel left joined again. By its stored log, which a rename keeps, it goes as a live
+ * rename does. Onto a name another one here still moves away from, that one first; a ring
+ * goes through a name no channel can have. A name two logs claim is left alone. Each
+ * logged channel's name is then kept for the next list.
+ */
+export function channelsListed(server: string, list: ChannelInfo[]): void {
+  const known = channelLogNames(server);
+  let todo = list.flatMap((c) => {
+    const was = c.log ? known.get(c.log) : undefined;
+    return was !== undefined && was !== c.name ? [{ from: was, to: c.name }] : [];
+  });
+  todo = todo.filter((r) => todo.filter((o) => o.from === r.from).length === 1);
+  while (todo.length > 0) {
+    const free = todo.filter((r) => !todo.some((o) => o !== r && o.from === r.to));
+    if (free.length === 0) {
+      const [first, ...rest] = todo;
+      const aside = `${first.from}\u0000`;
+      channelRenamed(server, first.from, aside);
+      todo = [{ from: aside, to: first.to }, ...rest];
+      continue;
+    }
+    for (const r of free) channelRenamed(server, r.from, r.to);
+    todo = todo.filter((r) => !free.includes(r));
+  }
+  noteChannelLogNames(server, list);
+}
+
+// Unlocked after the list came: the archive's names had not seen it
+onArchiveRead((server) => channelsListed(server, get(channels.peek(server))));
 
 /** The channel, as far as its notifications go. */
 type NotifyChannel = Pick<ChannelInfo, "name" | "user_count" | "auto_join" | "text">;

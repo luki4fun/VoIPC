@@ -177,6 +177,42 @@ export async function openTab(cdpPort, opts = {}) {
   // In a plain object, so a lane's wrapper ({ ...tab }) still sees the live state
   // `said`: the page's last console warnings and errors, counted or not, for a report
   const net = { open: new Map(), failed: [], navigation: null, said: [] };
+  // Chrome changes its certificate verifier once, soon after it starts, and a load still being
+  // verified then fails with net::ERR_CERT_VERIFIER_CHANGED: no script or style, a blank page.
+  // CI runs 43121449320, 43247162522 and 43582560287 failed so, each on a browser's first load,
+  // 0.4 s after its start. Soak run 43620651318 lost a first load's chunks as net::ERR_FAILED,
+  // 4 s in, with nothing at the relay. Neither is the app (the relay's failures are statuses,
+  // resets and closes; Chrome's own cancels are ERR_ABORTED): the tab loads again, once, and
+  // says so (test-web.sh counts it); what the broken load threw is not the page's error.
+  // A file that failed for a reason of its own (a reset, a close, a timeout) is the relay's or the
+  // link's: once one has, no ERR_FAILED alongside it loads the tab again either.
+  const verifierFailed = new Set();
+  let reloaded = false;
+  let ownCause = false;
+  const ownAsset = (url) => {
+    try {
+      return new URL(url).pathname.startsWith("/assets/");
+    } catch {
+      return false;
+    }
+  };
+  const lostFile = (p, url) => {
+    if (p.errorText === "net::ERR_CERT_VERIFIER_CHANGED") return !!url;
+    if (p.canceled || p.blockedReason || p.corsErrorStatus || !ownAsset(url)) return false;
+    if (p.errorText !== "net::ERR_FAILED") {
+      ownCause = true;
+      return false;
+    }
+    return !ownCause;
+  };
+  const byVerifier = (text) =>
+    [...verifierFailed].some((url) => {
+      try {
+        return text.includes(new URL(url).pathname);
+      } catch {
+        return false;
+      }
+    });
   const foreign = (url) => ownCodeOnly && !!url && !/^https?:/.test(url);
   const where = (at) => (detailed && at ? ` @${at.url}:${at.lineNumber + 1}` : "");
   const preview = (o) =>
@@ -200,12 +236,21 @@ export async function openTab(cdpPort, opts = {}) {
       net.failed.push(`${clock()} ${p.errorText}${p.canceled ? " (canceled)" : ""}${p.blockedReason ? ` (blocked: ${p.blockedReason})` : ""} ${url}`);
       net.failed.splice(0, net.failed.length - 12);
       net.open.delete(p.requestId);
+      if (lostFile(p, url)) {
+        verifierFailed.add(url);
+        if (!reloaded) {
+          reloaded = true;
+          console.log(`NOTE chrome lost a file of the page (${p.errorText} ${url}): the tab loads again`);
+          send("Page.reload", { ignoreCache: true }).catch(() => {});
+        }
+      }
     } else if (msg.method === "Runtime.exceptionThrown") {
       // A rejection with a plain object describes itself as "Object": its
       // preview and where it was thrown are what make the report readable (detailed)
       const d = p.exceptionDetails;
       const at = d.stackTrace?.callFrames?.[0] ?? (d.url ? { url: d.url, lineNumber: d.lineNumber ?? 0 } : null);
       if (foreign(at?.url)) return;
+      if (byVerifier(`${d.text ?? ""} ${d.exception?.description ?? ""}`)) return;
       // A file that did not load says why it did not, from the network's side
       const why = /dynamically imported module|preload CSS/.test(`${d.exception?.description}`)
         ? ` [failed loads: ${net.failed.join("; ")}]`
@@ -219,6 +264,7 @@ export async function openTab(cdpPort, opts = {}) {
     if (msg.method === "Runtime.consoleAPICalled" && p.type === "error" && consoleErrors) {
       const at = p.stackTrace?.callFrames?.[0];
       if (foreign(at?.url)) return;
+      if (byVerifier(p.args.map((a) => a.value ?? a.description ?? "").join(" "))) return;
       // test-ui's lines never had the prefix, test-move's always did
       errors.push(`${detailed ? "" : "console: "}${p.args.map((a) => a.value ?? (preview(a) || a.description) ?? "").join(" ")}${where(at)}`);
     }
@@ -338,6 +384,28 @@ export const probe = (tab, expression, timeoutMs) =>
  * NOTE line, with its diagnosis, and tried once more; the lanes that have always done that
  * (move, moderation) keep it, the others fail with the diagnosis instead.
  */
+/** An expression: this page has queued a frame of `kind` since `__voipc_said` was emptied
+ *  (a variant name, or "#27" for a live post, which goes raw). */
+export const sentKind = (kind) => `window.__voipc_said.some((m) => m && typeof m === "object" && ${JSON.stringify(kind)} in m)`;
+
+/**
+ * Rule 5's barrier: each tab in turn has the relay answer a Ping (the self-test build's
+ * `__voipc_barrier`). After it, everything the earlier tabs sent has been handled, and what
+ * the relay passed on from it is in the later tabs' queues and recorded (`__voipc_heard`).
+ * Only for what an app sends as part of a step: a send behind an app's own timer is not
+ * covered. False: a tab had no session there.
+ */
+export async function barrier(server, ...tabs) {
+  for (const tab of tabs) {
+    const ok = await Promise.race([
+      tab.evaluate(`window.__voipc_barrier(${JSON.stringify(server)})`),
+      sleep(HANG_MS).then(() => false),
+    ]);
+    if (!ok) return false;
+  }
+  return true;
+}
+
 export async function loadPage(tab, url, shown, { retry = false, timeoutMs = 25_000 } = {}) {
   const before = tab.errors.length;
   await tab.send("Page.navigate", { url });

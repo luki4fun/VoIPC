@@ -8,7 +8,7 @@
 //! (`voipc_gates`); one on a channel people made lives as long as it does.
 //! `*` passes every gate; a guest passes none that names a group.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -242,13 +242,9 @@ async fn gate_changed(state: &Arc<ServerState>, channel_id: ChannelId, old: &Cha
             continue;
         }
         if !was && now {
+            let channel = state.channel_seen_by(&info, uid);
             if let Some(s) = state.sessions.get(&uid) {
-                let _ = send_msg(
-                    &s.control_tx,
-                    &ServerMessage::ChannelCreated {
-                        channel: info.clone(),
-                    },
-                );
+                let _ = send_msg(&s.control_tx, &ServerMessage::ChannelCreated { channel });
             }
         }
         if was != now {
@@ -433,10 +429,5 @@ pub async fn prune_logs(state: &ServerState) {
         .filter(|c| !c.log_conv.is_empty() && !c.gate.groups.is_empty())
         .map(|c| (c.log_conv.clone(), c.gate.groups.clone()))
         .collect();
-    let mut decided = HashMap::new();
-    for (conv, groups) in gated {
-        if let Err(e) = relay.prune_log(&conv, &groups, &mut decided).await {
-            warn!("keeping {conv} to its gate: {e:#}");
-        }
-    }
+    relay.prune_gated(&gated).await;
 }

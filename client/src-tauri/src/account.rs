@@ -85,6 +85,16 @@ pub enum ProviderAnswer {
     KeySaved,
 }
 
+/// The refusal of a page no provider's, or nothing (W3-10: the check was tested as a function,
+/// and the command that must call it was not). The command goes through here.
+fn page_to_open(url: &str) -> Result<(), String> {
+    if provider_page_ok(url) {
+        Ok(())
+    } else {
+        Err("This server named a page that is no provider's: not opening it.".into())
+    }
+}
+
 /// What this ends with when the person chose their password; the name follows.
 pub const USE_PASSWORD: &str = "Sign in with your password: ";
 
@@ -101,9 +111,7 @@ pub enum ProviderAsk {
 #[tauri::command]
 pub async fn account_open_page(app: tauri::AppHandle, url: String) -> Result<(), String> {
     use tauri_plugin_opener::OpenerExt;
-    if !provider_page_ok(&url) {
-        return Err("This server named a page that is no provider's: not opening it.".into());
-    }
+    page_to_open(&url)?;
     app.opener()
         .open_url(url, None::<&str>)
         .map_err(|e| format!("Could not open the browser: {e}"))
@@ -144,8 +152,14 @@ pub async fn account_provider_ask(
             ServerMessage::AuthStep(AuthStep::Providers { kinds }) => {
                 return Ok(serde_json::json!({ "providers": kinds }))
             }
-            ServerMessage::AuthStep(AuthStep::OpenBrowser { url, code, ticket }) => {
-                return Ok(serde_json::json!({ "url": url, "code": code, "ticket": ticket }))
+            // The code this app shows is its own, from its end of this connection: through
+            // a server that passes the flow on, the relay's page shows another (W1-24)
+            ServerMessage::AuthStep(AuthStep::OpenBrowser { url, ticket, .. }) => {
+                let x = link
+                    .binding
+                    .ok_or("This connection cannot be checked. Nothing was opened.")?;
+                let code = voipc_crypto::bind::provider_code(&x, url.as_bytes());
+                return Ok(serde_json::json!({ "url": url, "code": code, "ticket": ticket }));
             }
             ServerMessage::AuthStep(AuthStep::ProviderReady) => {
                 return Ok(serde_json::json!({ "ready": true }))
@@ -309,6 +323,20 @@ pub async fn run(
     }
     let state = app.state::<AppState>();
     let mut chat = state.chat.write().await;
+    // After the posts of this read, which the front end files as they come: when it saves
+    // with this number, they are on disk, and the cursors may follow
+    if let Some((key, memory)) = a.memory {
+        let gen = chat.read_moved(key, memory);
+        emit_server(
+            app,
+            server,
+            "log-read-upto",
+            serde_json::json!({ "gen": gen }),
+        );
+    }
+    if a.remember.is_none() {
+        return;
+    }
     if let Some(r) = a.remember {
         chat.archive
             .devices
@@ -322,9 +350,6 @@ pub async fn run(
             dek: *r.dek,
         });
         info!(server, "this device is remembered");
-    }
-    if let Some((key, memory)) = a.memory {
-        chat.archive.cursors.insert(key, memory);
     }
     chat.dirty = true;
 }
@@ -406,6 +431,7 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
     recv: &mut R,
     buf: &mut BytesMut,
     proto: u32,
+    binding: Option<[u8; voipc_crypto::bind::BIND_LEN]>,
 ) -> Result<
     (
         u32,
@@ -464,6 +490,10 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
     };
     let password_based = !matches!(method, Method::Device { .. });
     let (mut machine, first) = SignIn::start(&name, method, proto, APP_VERSION);
+    // Without one, a relay at 22 or later gets no proof (W1-24)
+    if let Some(x) = binding {
+        machine.bind(voipc_crypto::bind::Binding::Tls(x));
+    }
     let known_here = {
         let cfg = state.config();
         let here = cfg.relay_ids.get(server).and_then(|h| unhex16(h));
@@ -632,11 +662,7 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
         .chat
         .read()
         .await
-        .archive
-        .cursors
-        .get(&memory_key(&signed.relay_id, &signed.name))
-        .cloned()
-        .unwrap_or_default();
+        .log_memory(&memory_key(&signed.relay_id, &signed.name));
     // Joiners of a channel's log get our older keys on the same consent as
     // handing them the channel's history in person.
     let share = state.config().share_channel_history;
@@ -1333,7 +1359,9 @@ pub async fn forget_device(
         .map(|d| d.relay_id)
         .collect();
     for relay_id in relays {
-        chat.archive.cursors.remove(&memory_key(&relay_id, &name));
+        let key = memory_key(&relay_id, &name);
+        chat.archive.cursors.remove(&key);
+        chat.pending_reads.remove(&key);
     }
     chat.archive
         .devices
@@ -1344,6 +1372,17 @@ pub async fn forget_device(
 
 #[cfg(test)]
 mod tests {
+
+    /// W3-10: the command's own check, which a hostile relay's page meets.
+    #[test]
+    fn the_command_opens_no_page_that_is_no_providers() {
+        assert!(super::page_to_open("https://evil.example/oauth2/authorize?x").is_err());
+        assert!(
+            super::page_to_open("https://www.facebook.com/l.php?u=https://evil.example").is_err()
+        );
+        // The control
+        assert!(super::page_to_open("https://discord.com/oauth2/authorize?client_id=1").is_ok());
+    }
     use super::*;
     use voipc_protocol::codec::{encode_server_msg, PROTOCOL_VERSION};
 

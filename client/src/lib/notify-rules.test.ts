@@ -44,7 +44,9 @@ test("what I am looking at neither counts nor sounds, and may still notify a win
 });
 
 test("my own message makes no sound, and tells me nothing", () => {
-  assert.deepEqual(arrival("all", { mine: true, onScreen: false, forMe: false }), { count: true, sound: false, os: false });
+  // W3-26: one forwarded into another channel counted as unread there
+  assert.deepEqual(arrival("all", { mine: true, onScreen: false, forMe: false }), { count: false, sound: false, os: false });
+  assert.deepEqual(arrival("all", { mine: false, onScreen: false, forMe: false }), { count: true, sound: true, os: false }, "the control");
 });
 
 test("the page counts as in view only if it is both shown and focused", () => {

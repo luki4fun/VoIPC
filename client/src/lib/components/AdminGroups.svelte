@@ -11,7 +11,7 @@
   import { olderRelay } from "../stores/relay.js";
   import { badgeStyle, colorOf, hexOf, pillStyle } from "../member-sections.js";
   import { community } from "../relay-rules.js";
-  import { privilegeLabel, privilegesOn, SHARE_HISTORY } from "../scopes.js";
+  import { privilegeLabel, privilegesOn, SHARE_HISTORY, toggledScope } from "../scopes.js";
   import Icon from "./Icons.svelte";
   import type { GroupInfo } from "../types.js";
 
@@ -43,8 +43,7 @@
 
   function toggle(scope: string, on: boolean) {
     if (!editing) return;
-    const s = editing.group.scopes.filter((x) => x !== scope);
-    editing.group.scopes = on ? [...s, scope].sort() : s;
+    editing.group.scopes = toggledScope(editing.group.scopes, scope, on);
   }
 
   /** A save or a delete is on its way: its answer is the list, back to it. */
@@ -322,6 +321,13 @@
 
   .move {
     padding: 4px 8px;
+  }
+
+  @media (pointer: coarse) {
+    .move {
+      min-width: var(--hit);
+      min-height: var(--hit);
+    }
   }
 
   .colour-row {

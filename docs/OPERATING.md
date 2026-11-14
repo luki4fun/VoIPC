@@ -98,6 +98,10 @@ WantedBy=multi-user.target
 
 ## 4. TLS
 
+- **The relay ends TLS itself, for QUIC and for the TCP fallback.** Since 1.12 an app binds its
+  sign-in to its own TLS session, and the relay checks that against its end. Port forwarding and
+  proxies that pass TLS through are fine; one that ends TLS in front of the TCP port breaks app
+  sign-ins over the fallback (guests and browsers are unaffected).
 - The certificate and key are read once, at start; there is no reload. A certbot deploy hook
   therefore restarts the service (`systemctl restart voipc`). That drops calls in progress, so
   schedule the renewal for a quiet hour.
@@ -175,11 +179,15 @@ WantedBy=multi-user.target
       sudo -u voipc voipc-server --config /etc/voipc/server.toml db backup /var/backups/voipc/voipc-$(date +%F).db
 
 - **Postgres:** `pg_dump -Fc`, as the unit below runs it. A dump holds no index and no dead rows.
-- **Also back up** `server.toml`, `channels.json`, `server_settings.json` and `bans.json`.
+- **Also back up** `server.toml`, `channels.json`, `server_settings.json`, `bans.json` and
+  `emotes/`. After a move from Discord the database records each emote as brought, so a later
+  run skips it: a database restored without its `emotes/` keeps the move's emotes away for
+  good, and posts show their names as plain words.
 - **How long to keep backups: 30 days at most.** A person who deletes their account or their
   kept messages expects them gone. A backup brings them back until it is itself deleted.
 - **A run from Discord** copies a SQLite database first, beside it, as `<database>.before-import-<run>`,
-  readable by the owner only. A new run drops all but the last two, and nothing in the relay removes them otherwise: they
+  readable by the owner only. A run resumed after its copy was dropped gets a new one, `<database>.before-resuming-import-<run>`,
+  which holds what the run had done before it stopped. A new run drops all but the last two, and nothing in the relay removes them otherwise: they
   stay until you delete them. Postgres has nothing to make one from here: `pg_dump` first, and tick that you did. These
   hold everything, so the 30 days apply to them too: delete them when you know the move went well. The daily timer below
   does it at 30 days if you have not.
@@ -294,6 +302,19 @@ and the apps right after (the way back: [COMPATIBILITY.md](COMPATIBILITY.md) §4
 
 The apps go back by hand too ([COMPATIBILITY.md](COMPATIBILITY.md) §4).
 
+**From 1.6 to 1.11** (protocol 15 to 21), the step most relays take, since 1.7 to 1.10 were
+release candidates only. The notes below for 1.9 to 1.10 and 1.10 to 1.11 hold for it too; on top
+of them:
+- **Apps first:** a 1.11 app talks to the 1.6 relay meanwhile, with a banner saying what is off;
+  a 1.6 app cannot talk to a 1.11 relay.
+- **Three more migrations:** `0005_gates.sql` (who may see and join a channel, and speak in it),
+  `0006_community.sql` (channels made in the app, and where each channel sits) and
+  `0007_group_sections.sql`. Going back takes the 1.6 binary and the backup.
+- **New keys, with defaults that change nothing:** `public_url` (empty: no sign-in with Discord,
+  Google or Facebook) and `signups_per_hour` (60) in `[accounts]`, and `server_name` and
+  `server_description` in `server_settings.json` (for a relay without accounts). A 1.6 relay
+  refuses the first two ([COMPATIBILITY.md](COMPATIBILITY.md)).
+
 **From 1.9 to 1.10** (protocol 18 to 19):
 - **A migration:** `0008_moderation.sql` adds the moderation log and the restrictions, so going back takes the old binary
   and the backup.
@@ -312,6 +333,27 @@ The apps go back by hand too ([COMPATIBILITY.md](COMPATIBILITY.md) §4).
 - **New keys that do:** `kept_window` (10,000). A channel with more than that deletes the rest at the next sweep once it has
   stood three days, and `kept_seats` (5000) lifts what was fixed at 256.
 - A relay that never moves a server does no new work.
+
+**From 1.11 to 1.12** (protocol 21 to 23; 1.12.0-rc.1 was 22, so its apps and relays update too):
+- **Apps first**, as for any protocol: a 1.12 app talks to the 1.11 relay meanwhile.
+- **A migration:** `0011_promises.sql` remembers a ban lifted for someone who deleted their own
+  account, and the Discord ids an account unlinked, so that deleting it later still takes what the
+  move filed under them. Going back takes the old binary and the backup.
+- **A second migration (rc.2):** `0012_round_c.sql` builds three indexes on the moved Discord
+  archive and one on the old log's direct messages, and adds a table for channel deletions in
+  progress. Building an index reads the whole table once, so on a relay holding millions of
+  archived or old direct rows the first start takes longer than usual (seconds per million rows
+  on SQLite); it is one transaction, and a stop halfway leaves nothing done. Deleting a channel
+  with a large kept log now takes its rows a few thousand at a time in the background, and a
+  start finishes what a stop left; until then nothing of the channel can be read.
+- **The password never leaves an app again.** The first time an account gives its password to a
+  1.12 app (a sign-in, or confirming it on a device signed in another way), the app moves it to
+  a key derived from it (l4f-accounts 0.14 keeps that key in the password's place); from then on
+  that account's password is checked as a signature and its secret opens nothing. An account
+  that never gives its password again stays as it was.
+- **The relay must end TLS itself** (§4): an app's sign-in is bound to its own TLS session. A
+  proxy that passes TLS through is fine; one that ends it in front of the TCP fallback makes
+  app sign-ins over that fallback fail.
 
 **A later release that migrates the database** needs the old binary **and** the backup taken
 before the upgrade for a rollback: an older relay refuses a database that a newer one has
@@ -347,7 +389,7 @@ The simplest way is a host directory that user 65532 owns:
     install -d -o 65532 -g 65532 -m 0700 /srv/voipc
     install -o 65532 -g 65532 -m 0600 server.toml cert.pem key.pem /srv/voipc/
     docker run -d --name voipc -v /srv/voipc:/data \
-      -p 9987:9987/tcp -p 9987:9987/udp ghcr.io/luki4fun/voipc-server:1.11.0
+      -p 9987:9987/tcp -p 9987:9987/udp ghcr.io/luki4fun/voipc-server:1.12.0-rc.2
     docker exec voipc /voipc-server --config /data/server.toml admin grant <name> admin
 
 With a named volume instead, copy the files in with a throwaway container first, then run the
@@ -643,6 +685,10 @@ Runtime settings in `server_settings.json`:
   "new_member_wait_mins": 0
 }
 ```
+
+`max_channels` and `max_channel_name_len` (in characters) bind the temporary channels any member can make. Channels
+from `channels.json`, the admin panel and a move from Discord are not counted in `max_channels`, and their names go by
+their own limit of 64 characters.
 
 `new_member_wait_mins` (0, off, by default; at most 10080, a week; read at start) holds new members back from speaking, posting and writing direct messages for that long, against raids. An account counts from when it was made; a guest from when that address first came, and a guest counts as new again once the wait and one more day have gone by since their last visit. Someone a move from Discord brought counts from their Discord join date if that covers the whole wait when the import ran, and otherwise from when they open the account. Admins, holders of a privilege and anyone in a group other than the built-in `user` do not wait, so someone you invite into a call cannot talk until the wait ends unless you give them a group, and an invite link that hands one out skips it. A plain group made by a move does not lift it. A guest's clock lives in memory: a restart, a self-update included, starts it again for every guest there. An account's does not. It keeps at most 100,000 addresses: when it is full, a guest from a new address waits from when they connect and again after a reload, and the next sweep, within five minutes, keeps only the clocks still inside the wait.
 

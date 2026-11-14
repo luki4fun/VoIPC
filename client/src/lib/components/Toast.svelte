@@ -75,6 +75,35 @@
     }
   }
 
+  /* A short window, 800x600 the desktop's first: at the bottom the stack covered a dialog's
+     buttons and its error, Next on the first-run microphone check and the Connect error
+     among them (device pass). At the top it can cover a title for its seconds, no button */
+  @media (max-height: 720px) {
+    .toast-container {
+      top: 12px;
+      bottom: auto;
+      right: auto;
+      left: 50%;
+      transform: translateX(-50%);
+      flex-direction: column;
+    }
+
+    .toast {
+      animation-name: drop-in;
+    }
+  }
+
+  @keyframes drop-in {
+    from {
+      transform: translateY(-100%);
+      opacity: 0;
+    }
+    to {
+      transform: translateY(0);
+      opacity: 1;
+    }
+  }
+
   /* What kind of news, as a dot before the words (the role says it to a
      screen reader) */
   .toast::before {

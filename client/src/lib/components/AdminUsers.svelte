@@ -79,7 +79,7 @@
 
   /** What is listed, whichever way it was asked for. */
   const page = $derived.by<{ search: string; offset: number; total: number; rows: MoveAccount[] } | null>(() => {
-    if (paged) return $moveAccountsPage?.filter === filter ? $moveAccountsPage : null;
+    if (paged) return $moveAccountsPage && own.mine($moveAccountsPage) ? $moveAccountsPage : null;
     const u = $adminUsers;
     if (!u) return null;
     return {
@@ -97,7 +97,7 @@
   // The dashboard's refresh answers in the same store, with its own filter: a ban lifted, a run
   // or an undo ended. A read, so a code being asked for and a refusal shown stay as they are
   $effect(() => {
-    const again = $moveAccountsPage && own.page($moveAccountsPage.filter);
+    const again = $moveAccountsPage && own.page($moveAccountsPage);
     if (again) adminRead({ MoveAccounts: again });
   });
 
@@ -315,7 +315,7 @@
                 <span class="row-chevron"><Icon name="chevron-down" size={16} /></span>
               </button>
               {#if liftable}
-                <button type="button" class="btn btn-secondary move-lift" onclick={() => liftBan(r)}>Lift ban</button>
+                <button type="button" class="btn btn-secondary move-lift" aria-label="Lift the ban on {r.user.name}" onclick={() => liftBan(r)}>Lift ban</button>
               {/if}
             </li>
           {/each}

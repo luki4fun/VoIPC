@@ -146,6 +146,44 @@ DURATION="${DURATION:-15000}"
 FILE_KIB="${FILE_KIB:-10240}"
 WORK="$(mktemp -d)"
 
+# A Chromium side starts here, on a blank page, and is handed its self-test page through
+# DevTools when its turn comes (run_browser). A page a browser loads in its first second can
+# lose its files: Chrome changes its certificate verifier once just after it starts, and a load
+# still being verified fails (net::ERR_CERT_VERIFIER_CHANGED, 0.4 s in, CI runs 43121449320,
+# 43247162522, 43582560287). Loaded from the command line, the page was always in that second;
+# bob's blank page then cost the 45 s below, and alice's 15 s had gone by (soak 43620651318).
+# Now alice's page comes once the relays are up, and bob's after her first message (2 s and
+# more on CI); a blank page of hers is still tried again, which bob waits for.
+declare -A chrome_cdp chrome_pid
+selftest_cdp=9221
+boot_chrome() { # name logfile [profile-suffix]
+  local cdp=$((selftest_cdp++))
+  "$CHROME" --headless=new --no-sandbox --disable-gpu --ignore-certificate-errors \
+    --use-fake-ui-for-media-stream --use-fake-device-for-media-stream \
+    --autoplay-policy=no-user-gesture-required --enable-logging=stderr --v=0 \
+    --remote-debugging-port="$cdp" --user-data-dir="$WORK/profile-$1${3:-}" \
+    about:blank > /dev/null 2> "$2" &
+  chrome_pid[$1]=$!
+  chrome_cdp[$1]=$cdp
+}
+# The page into the browser's own tab, once its DevTools answer (node 22 has WebSocket)
+open_in_chrome() { # cdp-port url
+  for _ in $(seq 1 150); do
+    curl -sf "http://127.0.0.1:$1/json/version" > /dev/null 2>&1 && break
+    sleep 0.2
+  done
+  node --input-type=module -e '
+    const [port, url] = process.argv.slice(1);
+    const tab = (await (await fetch(`http://127.0.0.1:${port}/json/list`)).json()).find((t) => t.type === "page");
+    const ws = new WebSocket(tab.webSocketDebuggerUrl);
+    ws.onopen = () => ws.send(JSON.stringify({ id: 1, method: "Page.navigate", params: { url } }));
+    ws.onmessage = () => { ws.close(); process.exit(0); };
+    setTimeout(() => process.exit(1), 30000);
+  ' "$1" "$2" || echo "warning: the browser on $1 did not take its page"
+}
+[ "$BROWSER_ALICE" = firefox ] || boot_chrome alice "$WORK/alice.log"
+[ "$BROWSER_BOB" = firefox ] || boot_chrome bob "$WORK/bob.log"
+
 # A throwaway CA signs the page certificate. Chromium would take a self-signed
 # one (it is started with --ignore-certificate-errors), but Firefox only trusts
 # an imported *CA*: NSS ignores the "trusted peer" flag for server certificates,
@@ -233,14 +271,14 @@ for _ in $(seq 1 50); do
   sleep 0.2
 done
 
-run_browser() { # name role extra-params logfile browser
+run_browser() { # name role extra-params logfile browser [profile-suffix]
   local url="https://127.0.0.1:$TCP_PORT/?selftest=1&name=$1&role=$2&duration=$DURATION$3"
   local engine="${5:-$BROWSER}"
   if [ "$engine" = firefox ]; then
     # Firefox has no --ignore-certificate-errors: the test CA goes into the
     # profile's own NSS database. console.log goes to stdout here (Chromium
     # logs it to stderr), so both streams land in the log file.
-    local profile="$WORK/profile-$1"
+    local profile="$WORK/profile-$1${6:-}"
     mkdir -p "$profile"
     cat > "$profile/user.js" <<EOF
 user_pref("media.navigator.streams.fake", true);
@@ -252,18 +290,49 @@ EOF
     certutil -A -n voipc-test-ca -t "C,," -i "$WORK/ca.crt" -d "sql:$profile"
     "$FIREFOX" -headless -no-remote -profile "$profile" "$url" > "$4" 2>&1 &
   else
-    "$CHROME" --headless=new --no-sandbox --disable-gpu --ignore-certificate-errors \
-      --use-fake-ui-for-media-stream --use-fake-device-for-media-stream \
-      --autoplay-policy=no-user-gesture-required --enable-logging=stderr --v=0 \
-      --user-data-dir="$WORK/profile-$1" \
-      "$url" > /dev/null 2> "$4" &
+    # Started at the top; a second go (a profile suffix) starts one of its own
+    if [ -n "${6:-}" ] || [ -z "${chrome_cdp[$1]:-}" ]; then boot_chrome "$1" "$4" "${6:-}"; fi
+    open_in_chrome "${chrome_cdp[$1]}" "$url"
+    browser_pid=${chrome_pid[$1]}
+    return
   fi
+  browser_pid=$!
+}
+
+# A self-test page writes a line of its own (the app's version, then SELFTEST lines) within a
+# second or two of its browser's start. One that writes nothing for LOAD_WAIT s stayed blank, as
+# a first load now and then does on CI (run 43121449320: alice's Chromium ran for 90 s, her page
+# never ran a line and the relay never saw her). Why is not known yet, so it says what it can:
+# what the relay serves for the page right then, and the browser's last lines, in a NOTE; that
+# browser goes (its log kept as <name>-blank.log) and one more starts with a fresh profile. The
+# lanes on test-cdp.mjs do the same (`loadPage` with `retry`). The count is in the verdict.
+LOAD_WAIT=45
+blank_loads=0
+page_up() { grep -qaE 'VoIPC [0-9]|SELFTEST ' "$1" 2>/dev/null; }
+start_page() { # as run_browser
+  run_browser "$@"
+  local pid=$browser_pid
+  for _ in $(seq 1 $((LOAD_WAIT * 10))); do
+    page_up "$4" && return 0
+    sleep 0.1
+  done
+  page_up "$4" && return 0
+  blank_loads=$((blank_loads + 1))
+  {
+    echo "NOTE a first page load stayed blank and is tried again: $1, browser $(kill -0 "$pid" 2>/dev/null && echo running || echo gone)"
+    echo "  the relay's page now: $(curl -sk -o /dev/null -w '%{http_code}, %{size_download} bytes in %{time_total} s' "https://127.0.0.1:$TCP_PORT/" 2>&1 || echo 'no answer')"
+    echo "  the browser's last lines:"
+    grep -av 'dbus' "$4" | tail -5 | sed 's/^/    /'
+  } | tee -a "$WORK/notes.txt"
+  kill "$pid" 2>/dev/null || true
+  mv "$4" "${4%.log}-blank.log"
+  run_browser "$@" -again
 }
 
 # alice creates the channel, becomes admin at the end and kicks bob; bob joins
 # through an invite-link fragment (#channel=…) and expects the kick
 # alice also shares her (synthetic) screen; bob watches it
-run_browser alice talker "&channel=e2e&textchannel=e2e-text&dm=bob&admin=e2e-admin-token-0001&kick=bob&share=1&proximity=2d&pos=3,0,0&spatialtest=3d&file=$FILE_KIB$(via "$TRANSPORT_ALICE")" \
+start_page alice talker "&channel=e2e&textchannel=e2e-text&dm=bob&admin=e2e-admin-token-0001&kick=bob&share=1&proximity=2d&pos=3,0,0&spatialtest=3d&file=$FILE_KIB$(via "$TRANSPORT_ALICE")" \
   "$WORK/alice.log" "$BROWSER_ALICE"
 # Not a fixed stagger: the run asserts that a message alice sent *before* bob
 # arrived reaches him as channel history, so the harness has to make "before"
@@ -281,7 +350,7 @@ for _ in $(seq 1 900); do
 done
 grep -q 'SELFTEST early-chat-sent' "$WORK/alice.log" ||
   echo "warning: alice never reported her first message — bob starts anyway, expect a history failure"
-run_browser bob listener "&textchannel=e2e-text&dm=alice&expect_kick=1&watch=1&pos=-3,0,0$(via "$TRANSPORT_BOB")#channel=e2e" \
+start_page bob listener "&textchannel=e2e-text&dm=alice&expect_kick=1&watch=1&pos=-3,0,0$(via "$TRANSPORT_BOB")#channel=e2e" \
   "$WORK/bob.log" "$BROWSER_BOB"
 
 deadline=$(( $(date +%s) + DURATION / 1000 + 30 ))
@@ -295,6 +364,7 @@ done
 extract() { grep -ao 'SELFTEST .*' "$1" | sed 's/", source:.*$//; s/\\"/"/g' > "$2" || true; }
 extract "$WORK/alice.log" "$WORK/alice.txt"
 extract "$WORK/bob.log" "$WORK/bob.txt"
+echo "--- self-test: $blank_loads blank first load(s) tried again"
 echo "--- alice"; cat "$WORK/alice.txt"
 echo "--- bob";   cat "$WORK/bob.txt"
 
@@ -439,12 +509,13 @@ elif [ "$BROWSER_ALICE" = chromium ] || [ "$BROWSER_BOB" = chromium ]; then
       refused=$(sed 's/\x1b\[[0-9;]*m//g' "$WORK/$1-relay.log" | grep -cE 'rejecting (connection|session)' || true)
     fi
     blank=$(grep -c '^NOTE a first page load stayed blank' "$WORK/$1.txt" 2>/dev/null || true)
+    verifier=$(grep -c '^NOTE chrome lost a file of the page' "$WORK/$1.txt" 2>/dev/null || true)
     # test-cdp.mjs: waits over 10 s (SLOW), and waits that ran out (TIMEOUT: in a run that
     # passes, a probe in disguise that costs its full limit)
     local slow timeout
     slow=$(grep -c '^SLOW ' "$WORK/$1.txt" 2>/dev/null || true)
     timeout=$(grep -c '^TIMEOUT ' "$WORK/$1.txt" 2>/dev/null || true)
-    echo "--- $1: relay refused ${refused:-0} connection(s) or session(s), ${blank:-0} blank first load(s) tried again, ${slow:-0} slow wait(s), ${timeout:-0} wait(s) ran out"
+    echo "--- $1: relay refused ${refused:-0} connection(s) or session(s), ${blank:-0} blank first load(s) tried again, ${verifier:-0} load(s) again after chrome lost a file of the page, ${slow:-0} slow wait(s), ${timeout:-0} wait(s) ran out"
     if [ "${refused:-0}" != 0 ]; then
       sed 's/\x1b\[[0-9;]*m//g' "$WORK/$1-relay.log" | grep -E 'rejecting (connection|session)' | sed -E 's/.*rejecting (connection|session): /\1: /' | sort | uniq -c
     fi

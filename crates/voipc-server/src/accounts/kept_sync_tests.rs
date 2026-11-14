@@ -197,6 +197,9 @@ impl World {
             vault,
             identity,
             recovery: None,
+            binding: None,
+            keyed: false,
+            login_key: None,
             blobs,
         }
     }

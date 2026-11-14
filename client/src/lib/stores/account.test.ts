@@ -16,6 +16,7 @@ import {
   codesTurnedOn,
   pairCodeCame,
   providerDone,
+  providerFlowOf,
   providerPage,
   providerRefused,
   providerStarted,
@@ -280,6 +281,26 @@ test("a refused flow, or a server gone, leaves nothing for a later frame to answ
   assert.equal(providerPage("a:1", PAGE, "222"), false);
   assert.equal(providerDone("a:1"), false);
   assert.equal(kind(), null);
+});
+
+// W2-37: a code setup waited on a proof, and a cut ended that flow. A later link's end
+// brought the old setup back, from the old connection.
+test("a flow ended by a cut is not the one a later flow's end answers", () => {
+  providerStarted("a:1");
+  const proof = providerFlowOf("a:1");
+  assert.ok(proof > 0);
+  dropPrompts("a:1");
+  assert.equal(providerFlowOf("a:1"), 0, "gone with the server");
+  providerStarted("a:1");
+  const link = providerFlowOf("a:1");
+  assert.notEqual(link, proof);
+  assert.equal(providerDone("a:1"), true);
+  assert.equal(providerFlowOf("a:1"), 0, "and gone at its end");
+  // The control: one flow, start to end, is itself
+  providerStarted("a:1");
+  const one = providerFlowOf("a:1");
+  assert.equal(providerFlowOf("a:1"), one);
+  providerDone("a:1");
 });
 
 test("a new device's code reaches its window behind another server's prompt", () => {

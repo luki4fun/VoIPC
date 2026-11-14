@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use l4f_accounts::model::AccountId;
@@ -37,6 +38,9 @@ const NOT_KEPT: &str = "That could not be kept.";
 const NO_SUCH_RUN: &str = "No such run.";
 /// What a run's copy is named, after the database file's own name.
 const COPY_INFIX: &str = ".before-import-";
+/// A resumed run's, when its first copy was dropped meanwhile: it holds what the run did
+/// before it stopped, so it is no copy from before the run (W2-26).
+const AGAIN_INFIX: &str = ".before-resuming-import-";
 const PART: &str = ".part";
 /// `voipc_import_items.kind`, a `SMALLINT` on Postgres, so bound as `i16`.
 pub(crate) const KIND_CATEGORY: i16 = 1;
@@ -46,6 +50,10 @@ const KIND_EMOTE: i16 = 3;
 /// so that no later run makes them again.
 pub(super) const KIND_GROUP_DELETED: i16 = 4;
 pub(super) const KIND_TWIN_DELETED: i16 = 5;
+/// A thread a run opened on a message an earlier run filed: by the thread's id, `local` its
+/// channel. The row stays the earlier run's, so only this says the name and count are this
+/// run's, for its undo to take off again (W2-25).
+pub(super) const KIND_THREAD_MADE: i16 = 6;
 /// Rows of `ImportCursors` a reply holds: about 18 bytes each, under one frame.
 const CURSOR_ROWS: i64 = 2000;
 /// Channels one `ImportUndo` call takes: each puts its members out, and a call runs in the
@@ -59,13 +67,37 @@ pub(super) const CURSOR_UP: &str = "INSERT INTO voipc_import_cursors (uid, impor
      SET high = excluded.high WHERE excluded.high > voipc_import_cursors.high";
 
 /// The run this relay is on, one at a time. Only in memory: a restart ends it, and
-/// `ImportBegin` takes the row up again. The session's being there is what makes it
-/// running; a run whose session is gone is free to take over.
+/// `ImportBegin` takes the row up again. The session's being there, and its frames, are
+/// what make it running: a run whose session is gone, or that sent nothing for
+/// `RUN_IDLE`, is free to take over.
 pub struct ActiveRun {
     pub run: i64,
     pub session_id: SessionId,
     /// Its copy of the database is made, or it needs none: frames may come.
     pub ready: bool,
+    /// Its last frame, or when it became ready.
+    pub last: Instant,
+    /// The number its `ImportBegin` was asked with: `ImportBegun` after the copy carries it.
+    pub ask: Option<u32>,
+}
+
+/// How long a ready run may send nothing before another session may take its place. Stop on
+/// the desktop ends only the driver, its session stays, and the wire has no word for a stop
+/// (W2-6). A driver waiting out Discord can be quiet longer: once taken over, its next frame
+/// is refused and it stops, and the next run goes on from what was stored.
+pub(crate) const RUN_IDLE: Duration = Duration::from_secs(15 * 60);
+
+/// What a session hears while another's run holds the relay.
+const RUNNING: &str =
+    "Another admin's import is running here. One that sends nothing for 15 minutes can be taken over.";
+
+impl ActiveRun {
+    /// Whether this run stands in `session_id`'s way.
+    fn holds_against(&self, state: &ServerState, session_id: SessionId) -> bool {
+        self.session_id != session_id
+            && state.sessions.contains_key(&self.session_id)
+            && (!self.ready || self.last.elapsed() < RUN_IDLE)
+    }
 }
 
 /// What `ImportBegin` found, before it asks for the code.
@@ -123,13 +155,16 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
 
 /// Where a run's copy goes: next to the database, named here. Nothing of it comes from a
 /// client.
-fn copy_path(db: &Path, run: i64) -> PathBuf {
-    with_suffix(db, &format!("{COPY_INFIX}{run}"))
+fn copy_path(db: &Path, run: i64, again: bool) -> PathBuf {
+    let infix = if again { AGAIN_INFIX } else { COPY_INFIX };
+    with_suffix(db, &format!("{infix}{run}"))
 }
 
-/// Keeps the newest `COPIES_KEPT` copies of this database, and what a crash left of an
-/// older one. Goes by the exact name: anything else beside it is not ours to touch.
-fn prune_copies(db: &Path) {
+/// Keeps `COPIES_KEPT` copies of this database: `made`, whatever its run (a resumed run's
+/// comes after newer runs' copies, and went at once), then the newest by run; and what a
+/// crash left of a copy at the newest run or later. Goes by the exact name: anything else
+/// beside it is not ours to touch.
+fn prune_copies(db: &Path, made: &Path) {
     let Some(name) = db.file_name().and_then(|n| n.to_str()) else {
         return;
     };
@@ -140,7 +175,10 @@ fn prune_copies(db: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
-    let prefix = format!("{name}{COPY_INFIX}");
+    let prefixes = [
+        format!("{name}{COPY_INFIX}"),
+        format!("{name}{AGAIN_INFIX}"),
+    ];
     let run_of = |s: &str| {
         (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
             .then(|| s.parse::<i64>().ok())
@@ -149,7 +187,10 @@ fn prune_copies(db: &Path) {
     let (mut whole, mut parts) = (Vec::new(), Vec::new());
     for entry in entries.flatten() {
         let file = entry.file_name();
-        let Some(rest) = file.to_str().and_then(|f| f.strip_prefix(&prefix)) else {
+        let Some(rest) = file
+            .to_str()
+            .and_then(|f| prefixes.iter().find_map(|p| f.strip_prefix(p.as_str())))
+        else {
             continue;
         };
         if let Some(run) = rest.strip_suffix(PART).and_then(run_of) {
@@ -158,8 +199,14 @@ fn prune_copies(db: &Path) {
             whole.push((run, entry.path()));
         }
     }
-    whole.sort_by_key(|(run, _)| std::cmp::Reverse(*run));
-    let newest = whole.first().map_or(0, |(run, _)| *run);
+    let newest = whole.iter().map(|(run, _)| *run).max().unwrap_or(0);
+    // The one just made first, then by run
+    whole.sort_by_key(|(run, path)| {
+        (
+            path.file_name() != made.file_name(),
+            std::cmp::Reverse(*run),
+        )
+    });
     let gone = whole
         .into_iter()
         .skip(COPIES_KEPT)
@@ -171,10 +218,10 @@ fn prune_copies(db: &Path) {
     }
 }
 
-/// The copy of the database before a run: private from the start, under its real name
-/// only once it is whole. Its name goes on the run's row.
-async fn take_copy(relay: &Relay, db: &Path, run: i64) -> Result<String> {
-    let to = copy_path(db, run);
+/// The copy of the database before a run, or `again` before the rest of it: private from
+/// the start, under its real name only once it is whole. Its name goes on the run's row.
+async fn take_copy(relay: &Relay, db: &Path, run: i64, again: bool) -> Result<String> {
+    let to = copy_path(db, run, again);
     let part = with_suffix(&to, PART);
     // What a crash left of this one: SQLite copies only into an empty file
     match std::fs::remove_file(&part) {
@@ -195,7 +242,7 @@ async fn take_copy(relay: &Relay, db: &Path, run: i64) -> Result<String> {
             .execute(pool)
             .await?;
     });
-    prune_copies(db);
+    prune_copies(db, &to);
     Ok(text)
 }
 
@@ -381,11 +428,21 @@ impl Relay {
         }))
     }
 
-    /// The end of an undo: the ledger's rows and how far the run read. With these gone, and
-    /// its archive rows, a new run may begin.
+    /// The end of an undo: the threads it opened on earlier runs' messages, the ledger's rows
+    /// and how far the run read. With these gone, and its archive rows, a new run may begin.
     async fn undo_ledger_drop(&self, run: i64) -> Result<()> {
         db!(self.store(), pool => {
             let mut tx = pool.begin().await?;
+            sqlx::query(
+                "UPDATE voipc_archive SET thread_name = NULL, replies = 0 \
+                 WHERE thread = 0 AND import_id <> $1 AND (channel, dc_id) IN \
+                 (SELECT CAST(t.local AS BIGINT), t.dc_id FROM voipc_import_items t \
+                  WHERE t.import_id = $1 AND t.kind = $2)",
+            )
+            .bind(run)
+            .bind(KIND_THREAD_MADE)
+            .execute(&mut *tx)
+            .await?;
             sqlx::query("DELETE FROM voipc_import_items WHERE import_id = $1")
                 .bind(run)
                 .execute(&mut *tx)
@@ -543,7 +600,7 @@ pub(super) async fn facts(
         .lock()
         .await
         .as_ref()
-        .filter(|a| a.session_id != session_id && state.sessions.contains_key(&a.session_id))
+        .filter(|a| a.holds_against(state, session_id))
         .map(|a| a.run);
     let cfg = relay.accounts.host.config();
     let (_, accounts) = relay.store().list_users(None, 1, 0).await?;
@@ -602,9 +659,9 @@ pub(super) async fn before_the_code(
     }
     if active
         .as_ref()
-        .is_some_and(|a| a.session_id != session_id && state.sessions.contains_key(&a.session_id))
+        .is_some_and(|a| a.holds_against(state, session_id))
     {
-        return Ok(Err("Another admin's import is running here.".into()));
+        return Ok(Err(RUNNING.into()));
     }
     if relay.run_clearing(guild).await? {
         return Ok(Err("Still clearing the last undo.".into()));
@@ -620,6 +677,7 @@ pub(super) async fn before_the_code(
 /// `AdminOp::ImportBegin`, past its code: the row in the log first, the run's row, then
 /// its copy of the database, in a task: it can take minutes, and this session's read
 /// loop waits on what runs here.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn begin(
     state: &Arc<ServerState>,
     relay: &Relay,
@@ -628,6 +686,7 @@ pub(super) async fn begin(
     mut active: MutexGuard<'_, Option<ActiveRun>>,
     begin: Begin,
     options: &ImportOptions,
+    ask: Option<u32>,
 ) -> Result<AccountReply> {
     let Begin { guild, resumes } = begin;
     let detail = match &resumes {
@@ -652,7 +711,8 @@ pub(super) async fn begin(
         }
         None => (relay.run_new(guild, by, &options).await?, None),
     };
-    // Its copy may be gone by now: only so many are kept
+    // Its copy may be gone by now: only so many are kept. One made now holds what it did
+    let again = backup.is_some();
     let backup = backup.filter(|b| Path::new(b).exists());
     let copying = active.as_ref().is_some_and(|a| a.run == run && !a.ready);
     let needs_copy = relay.db_file().filter(|_| backup.is_none());
@@ -660,6 +720,8 @@ pub(super) async fn begin(
         run,
         session_id,
         ready: !copying && needs_copy.is_none(),
+        last: Instant::now(),
+        ask,
     });
     drop(active);
     let Some(db) = needs_copy else {
@@ -671,17 +733,17 @@ pub(super) async fn begin(
     };
     // The task tells whoever holds the run by then
     if !copying {
-        copy_then_tell(state.clone(), db, run, resumed);
+        copy_then_tell(state.clone(), db, run, resumed, again);
     }
     Ok(AccountReply::Admin(AdminReply::ImportBackingUp { run }))
 }
 
-fn copy_then_tell(state: Arc<ServerState>, db: PathBuf, run: i64, resumed: bool) {
+fn copy_then_tell(state: Arc<ServerState>, db: PathBuf, run: i64, resumed: bool, again: bool) {
     let Some(relay) = state.accounts.clone() else {
         return;
     };
     tokio::spawn(async move {
-        let made = take_copy(&relay, &db, run).await;
+        let made = take_copy(&relay, &db, run, again).await;
         let mut active = state.import.lock().await;
         let Some(a) = active.as_mut().filter(|a| a.run == run) else {
             return;
@@ -690,9 +752,11 @@ fn copy_then_tell(state: Arc<ServerState>, db: PathBuf, run: i64, resumed: bool)
             .sessions
             .get(&a.session_id)
             .map(|s| s.control_tx.clone());
+        let ask = a.ask;
         let answer = match made {
             Ok(path) => {
                 a.ready = true;
+                a.last = Instant::now();
                 AccountReply::Admin(AdminReply::ImportBegun {
                     run,
                     resumed,
@@ -709,6 +773,7 @@ fn copy_then_tell(state: Arc<ServerState>, db: PathBuf, run: i64, resumed: bool)
             }
         };
         if let Some(tx) = tx {
+            let answer = super::asked(ask, answer);
             let _ = crate::session::send_msg(&tx, &ServerMessage::Account(answer));
         }
     });
@@ -726,13 +791,14 @@ pub(super) async fn frame(
     if !is_star(scopes) {
         return Ok(Err(no_frame("Only an admin may import.")));
     }
-    match state.import.lock().await.as_ref() {
+    match state.import.lock().await.as_mut() {
         Some(a) if a.run == run && a.session_id == session_id => {
             if !a.ready {
                 return Ok(Err(no_frame(
                     "The copy of the database is still being made.",
                 )));
             }
+            a.last = Instant::now();
         }
         _ => return Ok(Err(no_frame(NOT_OPEN))),
     }
@@ -939,10 +1005,11 @@ pub(super) async fn undo_refusal(
     if relay.runs_after(guild, run).await? > 0 {
         return Ok(Some("A later run of this server stands: undo that first."));
     }
-    if active.as_ref().is_some_and(|a| {
-        a.run == run && a.session_id != session_id && state.sessions.contains_key(&a.session_id)
-    }) {
-        return Ok(Some("Another admin's import is running here."));
+    if active
+        .as_ref()
+        .is_some_and(|a| a.run == run && a.holds_against(state, session_id))
+    {
+        return Ok(Some(RUNNING));
     }
     Ok(None)
 }
@@ -1138,12 +1205,21 @@ mod tests {
             "voipc.db.before-import-",
             "voipc.db.before-import-9.bak",
             "other.db.before-import-1",
+            "voipc.db.before-resuming-import-",
+            // A resumed run's copy counts as a copy, and the one just made stays
+            "voipc.db.before-resuming-import-4",
+            "voipc.db.before-resuming-import-5",
         ];
         for n in names {
             std::fs::write(dir.join(n), b"x").unwrap();
         }
-        prune_copies(&db);
-        let gone = ["voipc.db.before-import-9", "voipc.db.before-import-3.part"];
+        prune_copies(&db, &dir.join("voipc.db.before-resuming-import-5"));
+        let gone = [
+            "voipc.db.before-import-9",
+            "voipc.db.before-import-10",
+            "voipc.db.before-import-3.part",
+            "voipc.db.before-resuming-import-4",
+        ];
         for n in names {
             assert_eq!(dir.join(n).exists(), !gone.contains(&n), "{n}");
         }

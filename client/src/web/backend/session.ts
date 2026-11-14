@@ -142,8 +142,28 @@ export function sessionOrSigningIn(server: string): Session | null {
 // to see which frames came and what went, and to cut a link (test-community.mjs).
 const heard: [string, number | undefined][] = [];
 const said: unknown[] = [];
+/** A test build's barriers: a Ping's timestamp, and what its Pong resolves. */
+const barriers = new Map<number, () => void>();
+let barrierNext = 1;
 if (__SELFTEST__) {
-  const page = window as unknown as { __voipc_frame: unknown; __voipc_heard: unknown; __voipc_said: unknown; __voipc_cut: unknown };
+  const page = window as unknown as {
+    __voipc_frame: unknown;
+    __voipc_heard: unknown;
+    __voipc_said: unknown;
+    __voipc_cut: unknown;
+    __voipc_barrier: unknown;
+  };
+  // Resolves once the relay answered a Ping sent now: it handled everything this page
+  // sent before, and whatever it passed on is in the other side's queue (the lanes' rule 5)
+  page.__voipc_barrier = (server: string) =>
+    new Promise<boolean>((resolve) => {
+      const session = sessionFor(server);
+      if (!session) return resolve(false);
+      // Far past any real Ping's milliseconds, and never twice
+      const stamp = 2 ** 52 + barrierNext++;
+      barriers.set(stamp, () => resolve(true));
+      session.sendControl({ Ping: { timestamp: stamp } });
+    });
   page.__voipc_said = said;
   page.__voipc_frame = (server: string, payload: number[]) => {
     const bytes = Uint8Array.from(payload);
@@ -529,6 +549,9 @@ export class Session implements SessionContext, AccountHost {
   /** An already encoded control payload (the account sign-in makes its own). */
   sendRaw(payload: Uint8Array): void {
     if (!this.transport) return;
+    // A test build names a raw frame by its variant's index (a live post is "#27"), as
+    // `said` names the rest by their variant
+    if (__SELFTEST__) said.push({ [`#${payload[0]}`]: null });
     this.controlQueue.push(payload);
     this.drainControl();
   }
@@ -1039,6 +1062,11 @@ export class Session implements SessionContext, AccountHost {
         break;
       case "Pong":
         // Displayed latency comes from the UDP keepalive RTT (see network.rs)
+        if (__SELFTEST__) {
+          const done = barriers.get(Number(b.timestamp));
+          barriers.delete(Number(b.timestamp));
+          done?.();
+        }
         break;
       case "ServerShutdown":
         this.emit("connection-lost", { reason: `Server shutdown: ${b.reason}` });

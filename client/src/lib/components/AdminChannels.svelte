@@ -140,11 +140,13 @@
         </select>
         <button type="button" class="btn btn-ghost" aria-label="Move {c.name} up" onclick={() => sendLayout(movedInCategory($channelLayout.channels, place.channel_id, -1))}>↑</button>
         <button type="button" class="btn btn-ghost" aria-label="Move {c.name} down" onclick={() => sendLayout(movedInCategory($channelLayout.channels, place.channel_id, 1))}>↓</button>
-        {#if c.text && !c.has_password}
+        <!-- Unset too when a password came later: an older server keeps it the welcome (W3-19) -->
+        {#if (c.text && !c.has_password) || place.welcome}
           <button
             type="button"
             class="btn btn-ghost"
             title="Opens the first time someone comes to this server"
+            aria-label={place.welcome ? `${c.name} not the welcome` : `Make ${c.name} the welcome`}
             onclick={() => adminOp({ WelcomeSet: { channel_id: place.welcome ? null : place.channel_id } })}
           >{place.welcome ? "Not the welcome" : "Make welcome"}</button>
         {/if}
@@ -153,12 +155,13 @@
             type="button"
             class="btn btn-ghost"
             title={c.auto_join ? "Apps follow it from the first connect. Turning this off makes nobody leave: their next connect just does not follow it." : "Apps follow it from the first connect, with nobody told. Whoever left it stays out."}
+            aria-label={c.auto_join ? `${c.name} joins by itself` : `${c.name} is joined by hand`}
             onclick={() => toggleFollowed(place.channel_id)}
           >{c.auto_join ? "Joins by itself" : "Joined by hand"}</button>
         {/if}
         {#if place.kept}
-          <button type="button" class="btn btn-ghost" onclick={() => (editing = { id: place.channel_id, name: c.name, description: c.description })}>Edit</button>
-          <button type="button" class="btn btn-ghost danger" onclick={() => remove(place.channel_id)}>Delete</button>
+          <button type="button" class="btn btn-ghost" aria-label="Edit {c.name}" onclick={() => (editing = { id: place.channel_id, name: c.name, description: c.description })}>Edit</button>
+          <button type="button" class="btn btn-ghost danger" aria-label="Delete {c.name}" onclick={() => remove(place.channel_id)}>Delete</button>
         {/if}
       </div>
     {/if}
@@ -206,8 +209,8 @@
       {/if}
       <button type="button" class="btn btn-ghost" aria-label="Move {cat.name} up" onclick={() => sendLayout($channelLayout.channels, movedBy($channelLayout.categories, i, -1).map((c) => c.id))}>↑</button>
       <button type="button" class="btn btn-ghost" aria-label="Move {cat.name} down" onclick={() => sendLayout($channelLayout.channels, movedBy($channelLayout.categories, i, 1).map((c) => c.id))}>↓</button>
-      <button type="button" class="btn btn-ghost" onclick={() => (renaming = { id: cat.id, name: cat.name })}>Rename</button>
-      <button type="button" class="btn btn-ghost danger" onclick={() => removeCategory(cat.id, cat.name)}>Delete</button>
+      <button type="button" class="btn btn-ghost" aria-label="Rename the category {cat.name}" onclick={() => (renaming = { id: cat.id, name: cat.name })}>Rename</button>
+      <button type="button" class="btn btn-ghost danger" aria-label="Delete the category {cat.name}" onclick={() => removeCategory(cat.id, cat.name)}>Delete</button>
     </div>
     {#each rows(cat.id) as place (place.channel_id)}
       {@render channelRow(place)}

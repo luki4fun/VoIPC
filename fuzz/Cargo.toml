@@ -22,6 +22,7 @@ voipc-crypto = { path = "../crates/voipc-crypto" }
 voipc-audio = { path = "../crates/voipc-audio" }
 voipc-web = { path = "../crates/voipc-web" }
 voipc-media = { path = "../crates/voipc-media" }
+voipc-import = { path = "../crates/voipc-import" }
 
 [[bin]]
 name = "opus_decode"
@@ -124,6 +125,27 @@ bench = false
 [[bin]]
 name = "media"
 path = "fuzz_targets/media.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "compat"
+path = "fuzz_targets/compat.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pair"
+path = "fuzz_targets/pair.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "import"
+path = "fuzz_targets/import.rs"
 test = false
 doc = false
 bench = false

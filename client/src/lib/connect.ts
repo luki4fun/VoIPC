@@ -10,6 +10,8 @@
 // Nothing here decides where voice is. The backend does, and channels.ts
 // mirrors it; closing the server that carries voice only lets go of the mirror.
 
+import { setHistoryScope } from "./stores/history-scope.js";
+import { dropJoinWaits } from "./stores/join-wait.js";
 import { hasNsfwConsent } from "./stores/channel-ui.js";
 import { account as signedInAccount, dropPrompts, takeLook } from "./stores/account.js";
 import { isWeb } from "./stores/platform.js";
@@ -48,7 +50,7 @@ import { forgetRings } from "./stores/marks.js";
 import { reopenAfterDrop } from "./stores/handoff.js";
 import { dropEmotes } from "./stores/emotes.js";
 import { dropKept, dropServer, scoped } from "./stores/scoped.js";
-import { lastOp, removalWithCode } from "./stores/admin-ops.js";
+import { lastOp, forgetAsks, removalWithCode } from "./stores/admin-ops.js";
 import {
   buildEntries,
   openServers,
@@ -186,6 +188,16 @@ function saveReloadList(): void {
 }
 
 /**
+ * The servers a start with `auto_connect` opens: those open when the app was last left, and
+ * none once the last was closed. Not the last server the connect dialog used, whatever
+ * name it remembers: that took someone who pressed Disconnect back in at F5, as a guest
+ * with their account's name (every config since 0.10 keeps the list, so none needs it).
+ */
+export function autoConnectList(config: { auto_connect: boolean; open_servers?: SavedServer[] | null }): SavedServer[] {
+  return config.auto_connect ? [...(config.open_servers ?? [])] : [];
+}
+
+/**
  * The servers to open at the start: on a reload of this tab its account servers,
  * then `list`. Only on a reload: a new visit starts at the dialog, and a duplicated
  * or discarded tab has no business taking an account from wherever it went since.
@@ -303,6 +315,9 @@ export async function connectTo(
   openServers.update((list) => [...list, server]);
   connectionState.of(server).set("connecting");
   loadGuestBlocks(server);
+  // A guest's history is the server's guest history, whatever name and tag (1.12); an
+  // account's is set at its sign-in (`account-signed-in`)
+  if (!account) setHistoryScope(server, null);
 
   let id: number;
   for (let tries = 0; ; tries++) {
@@ -466,6 +481,7 @@ export async function saveOpenServers(): Promise<void> {
 export function resetServer(server: string): void {
   clearRosters(server);
   clearSweeps(server);
+  dropJoinWaits(server);
   clearNoticing(server);
   clearQuiet(server);
   clearProfiles(server);
@@ -474,6 +490,7 @@ export function resetServer(server: string): void {
   // Not scoped, and as much the connection's: what they name gets no answer now, and a later
   // refusal must not bring it back
   lastOp.delete(server);
+  forgetAsks(server);
   removalWithCode.delete(server);
   dropPrompts(server);
   if (takeLook(server)) {
@@ -487,8 +504,9 @@ export function resetServer(server: string): void {
   if (get(voice)?.server === server) voice.set(null);
 }
 
-/** Take a server out of the list, and put the next one on screen if it was. */
-function removeServer(server: string): void {
+/** Take a server out of the list, and put the next one on screen if it was. `told`: the
+ *  caller disconnects it itself. */
+function removeServer(server: string, told = false): void {
   const run = reconnectRuns.get(server);
   if (run) run.cancelled = true;
   reconnectRuns.delete(server);
@@ -499,6 +517,9 @@ function removeServer(server: string): void {
   openAtDrop.delete(server);
   // The bot's token goes with the wizard that holds it. A cut keeps both, for a run to go on
   invoke("import_forget", { server }).catch(() => {});
+  // What its sessions kept for a reconnect goes too, ratchets and all: given up on after the
+  // reconnect budget, or refused for good, nothing else wiped it until the app quit (R3 F10).
+  if (!told) invoke("disconnect", { server }).catch(() => {});
   details.delete(server);
   // What it sent can no longer be answered: its connection is gone
   pendingInvites.update((list) => list.filter((i) => i.server !== server));
@@ -528,7 +549,7 @@ export async function disconnectServer(
   server: string,
   { save = true }: { save?: boolean } = {},
 ): Promise<void> {
-  removeServer(server);
+  removeServer(server, true);
   try {
     await invoke("disconnect", { server });
   } catch (e) {

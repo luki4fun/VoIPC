@@ -66,7 +66,7 @@
     </span>
     <span class="marks" aria-hidden="true">
       {#if user.is_muted}<span class="mark" title="Muted"><Icon name="mic-off" size={small ? 12 : 14} /></span>{/if}
-      {#if $restrictions.has(user.user_id)}<span class="mark restricted-mark" title={markTitle($restrictions.get(user.user_id)!, Date.now())}><Icon name="hourglass" size={small ? 12 : 14} /></span>{/if}
+      {#if $restrictions.has(user.user_id)}{@const held = markTitle($restrictions.get(user.user_id)!, Date.now())}<span class="mark restricted-mark" role="img" title={held} aria-label={held}><Icon name="hourglass" size={small ? 12 : 14} /></span>{/if}
       {#if user.is_deafened}<span class="mark" title="Deafened"><Icon name="headphones-off" size={small ? 12 : 14} /></span>{/if}
     </span>
   </div>

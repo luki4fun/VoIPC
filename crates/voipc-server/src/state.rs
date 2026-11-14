@@ -264,6 +264,17 @@ pub struct AccountSession {
     /// turning codes on, and for nothing else. A provider alone never sets this,
     /// nor does a remembered device, so one stolen device stays what it was.
     pub vault_proven: bool,
+    /// This connection's TLS exporter (`voipc_crypto::bind`): what its proofs are bound to.
+    pub binding: Option<[u8; voipc_crypto::bind::BIND_LEN]>,
+    /// A login-key challenge waiting for `KeyStepUp`, and its nonce (kept here, never sent).
+    pub key_challenge: Option<(String, [u8; 16])>,
+    /// When `KeyStepUp` last held: the password again, for the next request that wants it
+    /// (`accounts::prove_recent` takes it, as it took a secret in the request).
+    pub key_stepped: Option<std::time::Instant>,
+    /// Signed in with the password's secret on this connection, or proved it again since
+    /// (`accounts::confirm_again`), and not moved to the login key yet
+    /// (`accounts::login_key_set`).
+    pub by_secret: bool,
 }
 
 impl UserSession {
@@ -831,6 +842,26 @@ fn check_admission(
 }
 
 /// The pseudonym `subject` goes by in whichever anonymous channel they stand in.
+/// `ServerState::channel_seen_by` for a viewer already in hand: inside `sessions.iter()`, no
+/// second `sessions.get` into the map the loop holds (DashMap's re-entry hazard).
+pub(crate) fn channel_seen_as(info: &ChannelInfo, user_id: UserId, admin: bool) -> ChannelInfo {
+    let mut info = info.clone();
+    if info.anonymous && !admin && info.created_by.is_some() && info.created_by != Some(user_id) {
+        info.created_by = None;
+    }
+    info
+}
+
+/// A row under a pseudonym, for someone who is not an admin: no role, privilege or history
+/// switch of the person behind it. The shield, the moderator's mark and the history icon on
+/// it named staff, and so narrowed who it could be, for every honest app (G1).
+pub(crate) fn masked(row: &mut UserInfo) {
+    row.is_admin = false;
+    row.is_moderator = false;
+    row.shares_history = false;
+    row.badges.clear();
+}
+
 fn alias_anywhere(channels: &HashMap<ChannelId, Channel>, subject: UserId) -> Option<String> {
     channels.values().find_map(|ch| {
         (ch.info.anonymous && ch.members.contains(&subject))
@@ -975,6 +1006,12 @@ pub struct ServerState {
     /// Every account holding a privilege (`accounts::read_chat_mods`), as clients
     /// were last told. Stays empty on a relay without accounts.
     pub chat_mods: RwLock<Vec<voipc_protocol::types::ChatMod>>,
+    /// Held by one `accounts::refresh_chat_mods` at a time, across its reads, so that two at
+    /// once cannot end with the older one's answer; `chat_mods` only for the swap (W2-2).
+    pub chat_mods_reading: tokio::sync::Mutex<()>,
+    /// How often that list was read, for the tests.
+    #[cfg(test)]
+    pub chat_mods_reads: std::sync::atomic::AtomicUsize,
     /// Address bans' hash key on a relay without accounts (made at start).
     pub ban_salt: [u8; 32],
     /// `bans.json`, on a relay without accounts; None keeps bans in memory.
@@ -1176,6 +1213,9 @@ impl ServerState {
             prune_asks: Default::default(),
             exits_due: DashMap::new(),
             chat_mods: RwLock::new(Vec::new()),
+            chat_mods_reading: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            chat_mods_reads: Default::default(),
             ban_salt: rand::random(),
             bans_file: None,
             bans_writer: std::sync::Mutex::new(()),
@@ -1364,13 +1404,24 @@ impl ServerState {
         }
     }
 
+    /// A channel as `viewer` is told of it. An anonymous room names its creator only to them
+    /// and to admins: the crown on the first pseudonym, and the creator's join right after
+    /// `ChannelCreated`, tied it to a name for every honest app (G1).
+    pub fn channel_seen_by(&self, info: &ChannelInfo, viewer: SessionId) -> ChannelInfo {
+        let (user_id, admin) = self
+            .sessions
+            .get(&viewer)
+            .map_or((0, false), |s| (s.user_id, s.is_admin));
+        channel_seen_as(info, user_id, admin)
+    }
+
     /// The channels `session_id` may see: every one whose gate they pass.
     pub async fn channel_list_for(&self, session_id: SessionId) -> Vec<ChannelInfo> {
         let channels = self.channels.read().await;
         let mut list: Vec<ChannelInfo> = channels
             .values()
             .filter(|ch| self.passes(session_id, &ch.gate.groups))
-            .map(|ch| ch.info.clone())
+            .map(|ch| self.channel_seen_by(&ch.info, session_id))
             .collect();
         list.sort_by_key(|ch| ch.channel_id);
         list
@@ -1416,6 +1467,7 @@ impl ServerState {
             return Vec::new();
         };
         let anonymous = channel.info.anonymous && !self.is_admin(viewer_session);
+        let viewer = self.sessions.get(&viewer_session).map(|s| s.user_id);
 
         channel
             .members
@@ -1428,7 +1480,12 @@ impl ServerState {
                 };
                 // Never under a pseudonym: it would name the account.
                 let account = account_shown(session.account_id(), !anonymous, false);
-                Some(session.row_in(channel_id, username, account))
+                let mut row = session.row_in(channel_id, username, account);
+                // Their own row as it is: their app reads its own switches off it
+                if anonymous && Some(uid) != viewer {
+                    masked(&mut row);
+                }
+                Some(row)
             })
             .collect()
     }
@@ -1833,11 +1890,22 @@ impl ServerState {
             let public = channels
                 .get(&session.channel_id)
                 .is_some_and(list_is_public);
+            // Standing in an anonymous room: what it does there is not told under the name
+            // here, or a mute or a share there and here at once ties the two (G1)
+            let masked_room = channels
+                .get(&session.channel_id)
+                .is_some_and(|c| c.info.anonymous);
             let row = (!public).then(|| {
                 // A text channel never has a pseudonym: this name is the one it has always
                 // told its members.
                 let account = account_shown(session.account_id(), true, false);
-                session.row_in(channel_id, session.username.clone(), account)
+                let mut row = session.row_in(channel_id, session.username.clone(), account);
+                if masked_room {
+                    row.is_muted = false;
+                    row.is_deafened = false;
+                    row.is_screen_sharing = false;
+                }
+                row
             });
             bytes += row.as_ref().map_or(ID_BYTES, row_bytes);
             if bytes > PAGE_BYTES && used > 0 {
@@ -2060,11 +2128,10 @@ impl ServerState {
 
         // Check for duplicate names, ignoring case as channels.json does: a
         // made-up "Announcements" beside the real "announcements" is a look-alike.
+        // By the one rule a channel made in the panel goes by, where a text channel
+        // may share the lobby's name (W3-32)
         let lower = name.to_lowercase();
-        if channels
-            .values()
-            .any(|ch| ch.info.name.to_lowercase() == lower)
-        {
+        if crate::layout::name_taken(&channels, &lower, text, None) {
             anyhow::bail!("a channel with that name already exists");
         }
 
@@ -3203,6 +3270,31 @@ mod tests {
 
     // ── Channel operations ─────────────────────────────────────────────
 
+    /// W3-32: a temporary channel went by a copy of the name rule that had drifted from
+    /// `layout::name_taken`, and refused a text `general` that one from the panel may have.
+    #[tokio::test]
+    async fn a_temporary_channel_goes_by_the_one_name_rule() {
+        let state = make_state();
+        let (uid, _) = add_user(&state, "alice");
+        let lobby = state.channels.read().await[&0].info.name.to_lowercase();
+        let made = |name: String, text: bool| {
+            state.create_channel(name, None, ProximityMode::Off, false, text, uid)
+        };
+        assert!(
+            made(lobby.clone(), true).await.is_ok(),
+            "text beside the lobby"
+        );
+        assert!(
+            made(lobby.to_uppercase(), false).await.is_err(),
+            "the control: voice"
+        );
+        assert!(made("Open".into(), false).await.is_ok());
+        assert!(
+            made("open".into(), true).await.is_err(),
+            "any other name, whatever the kind"
+        );
+    }
+
     #[tokio::test]
     async fn validate_join_open_channel() {
         let state = make_state();
@@ -3568,6 +3660,94 @@ mod tests {
         // Even about themselves, so they know what the others see
         let own = state.display_name(bob, bob_sid).await;
         assert!(own.starts_with("Guest-"), "{own}");
+    }
+
+    /// G1: on an honest app nothing an anonymous room tells ties a pseudonym to a person: no
+    /// role on its rows, its maker named only to them and to admins, and nothing of what they
+    /// do there on a text roster that shows their name.
+    #[tokio::test]
+    async fn an_anonymous_room_tells_no_role_its_maker_or_what_they_do_there() {
+        let state = make_state();
+        let (alice, alice_sid) = add_user(&state, "alice");
+        let (bob, bob_sid) = add_user(&state, "bob");
+        let (_adm, adm_sid) = add_user(&state, "admin");
+        // Staff behind a pseudonym
+        make_admin(&state, alice_sid);
+        make_admin(&state, adm_sid);
+        let room = state
+            .create_channel(
+                "Ingame".into(),
+                None,
+                ProximityMode::Off,
+                true,
+                false,
+                alice,
+            )
+            .await
+            .unwrap();
+        for (u, s) in [(alice, alice_sid), (bob, bob_sid)] {
+            state
+                .join_channel(u, s, room.channel_id, None)
+                .await
+                .unwrap();
+        }
+        let seen = state.users_in_channel_for(room.channel_id, bob_sid).await;
+        let a = seen.iter().find(|u| u.user_id == alice).unwrap();
+        assert!(!a.is_admin && !a.is_moderator && !a.shares_history, "{a:?}");
+        // An admin reads it as it is
+        let seen = state.users_in_channel_for(room.channel_id, adm_sid).await;
+        assert!(seen.iter().find(|u| u.user_id == alice).unwrap().is_admin);
+        for (sid, want) in [
+            (bob_sid, None),
+            (alice_sid, Some(alice)),
+            (adm_sid, Some(alice)),
+        ] {
+            let list = state.channel_list_for(sid).await;
+            let c = list
+                .iter()
+                .find(|c| c.channel_id == room.channel_id)
+                .unwrap();
+            assert_eq!(c.created_by, want, "seen by {sid}");
+        }
+
+        // A text roster with her name says nothing of what she does in the room
+        let text = state
+            .create_channel("lounge".into(), None, ProximityMode::Off, false, true, bob)
+            .await
+            .unwrap();
+        state
+            .join_text_channel(alice, text.channel_id, None)
+            .await
+            .unwrap();
+        let busy = |state: &ServerState| {
+            let mut s = state.sessions.get_mut(&alice_sid).unwrap();
+            s.is_screen_sharing = true;
+            s.is_muted = true;
+        };
+        busy(&state);
+        let (_, rows, _, _) = state.channel_page(text.channel_id, bob_sid, 0).await;
+        let row = rows.iter().find(|r| r.user_id == alice).expect("a row");
+        assert!(!row.is_screen_sharing && !row.is_muted, "{row:?}");
+        // The control: in a room that is only locked, it is told as ever
+        let locked = state
+            .create_channel(
+                "Locked".into(),
+                Some("pw".into()),
+                ProximityMode::Off,
+                false,
+                false,
+                alice,
+            )
+            .await
+            .unwrap();
+        state
+            .join_channel(alice, alice_sid, locked.channel_id, Some("pw"))
+            .await
+            .unwrap();
+        busy(&state);
+        let (_, rows, _, _) = state.channel_page(text.channel_id, bob_sid, 0).await;
+        let row = rows.iter().find(|r| r.user_id == alice).expect("a row");
+        assert!(row.is_screen_sharing && row.is_muted, "{row:?}");
     }
 
     #[test]

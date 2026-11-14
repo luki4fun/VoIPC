@@ -16,7 +16,7 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { loadPage, openTab, sleep, startChromium, waitFor } from "./test-cdp.mjs";
+import { HANG_MS, loadPage, openTab, seen, sleep, startChromium, waitFor } from "./test-cdp.mjs";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.argv[2] ?? 49990);
@@ -179,7 +179,8 @@ async function throughProvider(tab, cdpPort, { outsider = false } = {}) {
 
 /** What a first connect asks after the sign-in: answered. */
 async function settle(tab) {
-  const end = Date.now() + 40_000;
+  // Rule 1: a limit says hung, not slow
+  const end = Date.now() + HANG_MS;
   while (Date.now() < end) {
     await tab.evaluate(`document.querySelector('${dialogOf("cloud")} .submit-btn')?.click(); 0`);
     await tab.evaluate(`document.querySelector(".audio-setup .skip-link")?.click(); 0`);
@@ -201,6 +202,12 @@ const devices = (tab) =>
     r.onsuccess = () => { const q = r.result.transaction("devices").objectStore("devices").count();
       q.onsuccess = () => done(q.result); q.onerror = () => done(-1); };
     r.onerror = () => done(-1); })`);
+/** An expression for waitFor: this browser has a device remembered. It is saved in the background
+ *  after the sign-in; each look starts a count, and says what the one before it found. */
+const deviceKept = `(() => { const r = indexedDB.open("voipc-accounts", 1);
+    r.onsuccess = () => { try { const q = r.result.transaction("devices").objectStore("devices").count();
+      q.onsuccess = () => { window.__devicesKept = q.result; r.result.close(); }; } catch { r.result.close(); } };
+    return (window.__devicesKept ?? 0) >= 1; })()`;
 
 // ── Frames no honest relay sends ──────────────────────────────────────────
 
@@ -293,7 +300,7 @@ async function lane() {
   await settle(a);
   check("and it shows no key a second time", !(await a.evaluate(`!!document.querySelector('${dialogOf("recovery")}')`)));
   check("and the account is in, by the name chosen", (await a.evaluate(`document.body.innerText`)).includes("deedee"));
-  for (let i = 0; i < 40 && (await devices(a)) < 1; i++) await sleep(150);
+  await seen(a, deviceKept);
   check("this browser is remembered, with no password", (await devices(a)) === 1);
 
   // The account panel lists the provider, and has no password to change.
@@ -350,15 +357,20 @@ async function lane() {
   await forge(a, "ProviderDone");
   await forge(a, "ProviderUnlinked");
   await forge(a, "Error", "x", "a forged notice");
-  await settled();
+  // The four went through the page's handlers at once and in order (session.ts `__voipc_frame`
+  // → onControl → account-reply, all synchronous): once the last one's notice shows, whatever
+  // the first three raised is on screen too, in the same render or one before it
+  const noticed = await seen(a, `document.body.innerText.includes("a forged notice")`);
+  const burst = await bodyText(a);
   check("a relay's burst leaves the old device's question up", await a.evaluate(`!!document.querySelector('${dialogOf("pair-ask")}')`));
   check("and what was typed in it", (await a.evaluate(`document.querySelector("#acct-pair-code").value`)) === "12");
-  const burst = await bodyText(a);
   check("with no dialog of the relay's code", !burst.includes("483920"), burst);
   check("and no word of a confirmation", !burst.includes("confirmed"), burst);
-  check("the control: a notice is what it still has, and the frames went in", burst.includes("a forged notice"), burst);
+  check("the control: a notice is what it still has, and the frames went in", noticed && burst.includes("a forged notice"), burst);
   await forge(b, "ChannelError", "Code for your other device: 483920");
   await forge(b, "Disconnected", "Code for your other device: 483920");
+  // A timer still: nothing here is meant to show, so there is no end state to wait on, and a
+  // relay barrier says nothing of frames that never left the page
   await settled();
   check("and on the new device, looking for a code, its words do not show", !(await bodyText(b)).includes("483920"));
   check("with the sign-in still going", await b.evaluate(`!!document.querySelector('${dialogOf("pair-wait")}')`));
@@ -445,17 +457,25 @@ async function lane() {
   await b.evaluate(`document.querySelector('${dialogOf("pair-same")} .submit-btn').click()`);
   await settle(b);
   check("the new device is in", (await b.evaluate(`document.body.innerText`)).includes("deedee"));
-  for (let i = 0; i < 40 && (await devices(b)) < 1; i++) await sleep(150);
+  await seen(b, deviceKept);
   check("and remembered too", (await devices(b)) === 1);
 
   // A third way in: the recovery key, on the first browser with its memory wiped.
   const back = await newTab(one);
   await back.send("Page.navigate", { url: `${ORIGIN}/favicon.png` });
-  await sleep(300);
+  // The database is the origin's: the tab has to be on it first
+  await waitFor(back, `location.href === ${JSON.stringify(`${ORIGIN}/favicon.png`)} && document.readyState === "complete"`);
   await a.send("Page.close").catch(() => {});
-  await sleep(300);
-  await back.evaluate(`new Promise((done) => { const r = indexedDB.deleteDatabase("voipc-accounts");
-    r.onsuccess = r.onerror = r.onblocked = () => done(true); })`);
+  // Done only once it is gone: a tab still holding it open (the old one, closing) blocks it
+  // until its connection closes, and the delete then goes through
+  // (send, not evaluate: evaluate's CDP deadline is 30 s, a bet on speed; this one says hung)
+  const wipe = await back.send("Runtime.evaluate", {
+    expression: `new Promise((done) => { const r = indexedDB.deleteDatabase("voipc-accounts");
+    r.onsuccess = () => done(true); r.onerror = () => done(false); setTimeout(() => done(false), ${HANG_MS}); })`,
+    awaitPromise: true,
+    returnByValue: true,
+  }, HANG_MS + 10_000);
+  if (wipe.result?.result?.value !== true) throw new Error(`the first browser's memory could not be wiped: ${JSON.stringify(wipe).slice(0, 300)}`);
   await back.send("Page.close").catch(() => {});
   const c = await openDialog(one);
   await throughProvider(c, one);
@@ -489,11 +509,14 @@ async function lane() {
   await waitFor(c, `!document.querySelector('${dialogOf("provider-page")}') && document.body.innerText.includes("confirmed")`);
   check("a proof the person started gets its page and its confirmation", true);
   await forge(c, "ProviderBrowser", "https://discord.com/oauth2/authorize?x", "483920");
-  await settled();
-  check("and that flow over, a page from nobody's click stays away", !(await bodyText(c)).includes("483920"));
   await forge(c, "ChannelError", "a forged channel error");
-  await settled();
-  check("the control: signed in, what kept away from a sign-in shows", (await bodyText(c)).includes("a forged channel error"));
+  // Both went through the page's handlers at once and in order (session.ts `__voipc_frame`
+  // → onControl, all synchronous): once the second one's toast shows, whatever the first
+  // raised is on screen too
+  const shown = await seen(c, `document.body.innerText.includes("a forged channel error")`);
+  const after = await bodyText(c);
+  check("and that flow over, a page from nobody's click stays away", !after.includes("483920"), after);
+  check("the control: signed in, what kept away from a sign-in shows", shown && after.includes("a forged channel error"));
 
   for (const [who, tab] of [["first device", c], ["second device", b]]) {
     const fatal = tab.errors.filter((e) => !/Failed to load resource/.test(e));

@@ -68,6 +68,7 @@ fn admin_user(u: &User) -> AdminUser {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn handle(
     state: &Arc<ServerState>,
     relay: &Relay,
@@ -76,6 +77,7 @@ pub(super) async fn handle(
     ctx: &Ctx,
     op: AdminOp,
     code: Option<String>,
+    ask: Option<u32>,
 ) -> Result<AccountReply> {
     let scopes = state
         .sessions
@@ -236,9 +238,14 @@ pub(super) async fn handle(
             if let Err(e) = r {
                 return Ok(no(e));
             }
-            // Its holders' privileges and badges, wherever they are
-            super::revalidate(state).await;
-            crate::gates::prune_soon(state);
+            // Its holders' privileges and badges, wherever they are: in its own task, since it
+            // reads every connected account, and in this frame it held the admin's own
+            // connection for as long
+            let all = state.clone();
+            tokio::spawn(async move {
+                super::revalidate(&all).await;
+                crate::gates::prune_soon(&all);
+            });
             crate::layout::send_styles_all(state).await;
             Ok(groups_reply(relay, actor).await)
         }
@@ -353,7 +360,7 @@ pub(super) async fn handle(
                     "",
                 )
                 .await?;
-            super::profile::tell_everyone(state, relay, id).await;
+            super::profile::tell(state, relay, id).await;
             Ok(AccountReply::ProfileDone)
         }
         AdminOp::ServerProfileSet { name, description } => {
@@ -743,6 +750,7 @@ pub(super) async fn handle(
                 active,
                 begin,
                 &options,
+                ask,
             )
             .await
         }

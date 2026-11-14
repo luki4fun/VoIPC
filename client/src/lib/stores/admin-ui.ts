@@ -37,6 +37,7 @@ import {
   adminUsers,
   inviteCode,
   lastOp,
+  askedOp,
   removalWithCode,
   stepUp,
 } from "./admin-ops.js";
@@ -211,7 +212,8 @@ export function onAdminReply(server: string, raw: unknown): void {
   const a = r.Admin;
   if (!a) return;
   if (a === "StepUp") {
-    stepUp.of(server).set(lastOp.get(server) ?? null);
+    // The step it is about, by its number on a 22 relay; the one sent last on an older one
+    stepUp.of(server).set(askedOp(server, (raw as { ask?: unknown }).ask) ?? lastOp.get(server) ?? null);
     return;
   }
   if ("Users" in a) adminUsers.of(server).set(a.Users);
