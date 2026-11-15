@@ -7,7 +7,7 @@
     populateFromArchive,
     type ChatHistoryStatus,
   } from "../stores/chat.js";
-  import { chatHistoryDisabled } from "../stores/settings.js";
+  import { chatHistoryDisabled, chatHistoryLater } from "../stores/settings.js";
 
   // Skip the vault entirely: chat stays in-memory (persistence no-ops
   // without an unlock key) and this gate is not shown again.
@@ -466,6 +466,11 @@
         <button class="text-link danger-link" onclick={goToDeleteConfirm}>Delete history</button>
         <button class="text-link" onclick={goToChangePath}>Change storage location</button>
       </div>
+      <!-- Into a call first, the password later: this session keeps chat in
+           memory, the history stays as it is, and the next start asks again -->
+      <button class="text-link skip-link" onclick={() => chatHistoryLater.set(true)} disabled={loading}>
+        Not now — keep this session's chat in memory, ask again next start
+      </button>
 
     {:else if mode === "create_new"}
       <h2>Chat history not found</h2>

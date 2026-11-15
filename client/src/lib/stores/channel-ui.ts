@@ -702,6 +702,8 @@ export async function submitPasswordJoin(): Promise<void> {
       forgetLeft(server, channelId);
       if (livePath(get(olderRelay.peek(server))?.protocol ?? null)) refreshList(server, channelId);
     }
+    // Into a voice room: its chat, as joinChannel does without a password
+    else if (channel) activeTextChannelId.of(server).set(null);
     cancelPasswordPrompt();
     // A text channel was picked to be read: show it, now that we are in it
     if (channel?.text) openJoinedTextChannel(server, channelId, channel.name);

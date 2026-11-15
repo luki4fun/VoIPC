@@ -460,12 +460,34 @@ async function lane() {
   await seen(b, deviceKept);
   check("and remembered too", (await devices(b)) === 1);
 
+  // The provider again on the browser that made the account: it remembers it, so the
+  // prompt offers this device, with the focus (not the recovery key's field, whose
+  // keyboard covered the dialog on a phone), and it signs in with no password.
+  await a.send("Page.close").catch(() => {});
+  const again = await openDialog(one);
+  await throughProvider(again, one);
+  await waitFor(again, `document.querySelector('${dialogOf("provider-choice")} .provider-device')`);
+  check(
+    "the provider on the device that made the account offers this device",
+    await again.evaluate(`document.querySelector('${dialogOf("provider-choice")}').innerText.includes("Sign in with this device")`),
+  );
+  check(
+    "and that button has the focus",
+    await again.evaluate(`document.activeElement?.classList.contains("provider-device") === true`),
+    await again.evaluate(`document.activeElement?.outerHTML.slice(0, 120) ?? "nothing"`),
+  );
+  await again.evaluate(`document.querySelector('${dialogOf("provider-choice")} .provider-device').click()`);
+  await settle(again);
+  check("and it signs in by this device's key", (await again.evaluate(`document.body.innerText`)).includes("deedee"));
+  check("with no second device remembered", (await devices(again)) === 1);
+  await again.send("Page.close").catch(() => {});
+
   // A third way in: the recovery key, on the first browser with its memory wiped.
   const back = await newTab(one);
   await back.send("Page.navigate", { url: `${ORIGIN}/favicon.png` });
   // The database is the origin's: the tab has to be on it first
   await waitFor(back, `location.href === ${JSON.stringify(`${ORIGIN}/favicon.png`)} && document.readyState === "complete"`);
-  await a.send("Page.close").catch(() => {});
+  // (the account's first tab, and the one that signed in again, are closed above)
   // Done only once it is gone: a tab still holding it open (the old one, closing) blocks it
   // until its connection closes, and the delete then goes through
   // (send, not evaluate: evaluate's CDP deadline is 30 s, a bet on speed; this one says hung)

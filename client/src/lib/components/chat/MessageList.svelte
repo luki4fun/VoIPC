@@ -128,7 +128,16 @@
   $effect(() => {
     // A second late: a timer may fire a moment early
     const timer = setTimeout(() => (today = Date.now()), msToMidnight(today) + 1000);
-    return () => clearTimeout(timer);
+    // A timer counts only the time the device was awake: a phone asleep over
+    // midnight fired it hours late. Coming back to the app catches up.
+    const shown = () => {
+      if (dayKey(Date.now()) !== dayKey(today)) today = Date.now();
+    };
+    document.addEventListener("visibilitychange", shown);
+    return () => {
+      clearTimeout(timer);
+      document.removeEventListener("visibilitychange", shown);
+    };
   });
 
   /** A loaded picture shown big. */

@@ -13,6 +13,7 @@
     muteKey,
     deafenKey,
     chatHistoryDisabled,
+    chatHistoryLater,
     pttHoldMode,
     noiseSuppression,
     rememberConnection,
@@ -1255,7 +1256,9 @@
           <span class="toggle-hint">
             {$chatHistoryDisabled
               ? "Off — chat is kept in memory only and lost on exit"
-              : "Saved on this device, encrypted with your password"}
+              : $chatHistoryLater
+                ? "Not opened this session — chat is kept in memory until the next start asks for the password"
+                : "Saved on this device, encrypted with your password"}
           </span>
         </label>
         {/if}

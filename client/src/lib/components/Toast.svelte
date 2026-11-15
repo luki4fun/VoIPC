@@ -7,11 +7,21 @@
   } from "../stores/notifications.js";
   import { holdsToast } from "../notify-rules.js";
   import Icon from "./Icons.svelte";
+
+  let stackHeight = $state(0);
+  // How much room the stack takes, for a phone's open dialog to move down by
+  // (the rules at the end): only while a toast is up
+  $effect(() => {
+    const root = document.documentElement;
+    root.toggleAttribute("data-toasts", stackHeight > 0);
+    if (stackHeight > 0) root.style.setProperty("--toast-room", `${stackHeight}px`);
+    else root.style.removeProperty("--toast-room");
+  });
 </script>
 
 <!-- Always in the page, so a screen reader is watching it before the first
      toast arrives: polite for news, an alert for an error (H5-04) -->
-<div class="toast-container" aria-live="polite">
+<div class="toast-container" aria-live="polite" bind:clientHeight={stackHeight}>
   {#each $notifications as notification (notification.id)}
     <div
       class="toast toast-{notification.type}"
@@ -97,17 +107,31 @@
      certificate) sat on Connect, and a tap there hit the toast (rc.2 device run). While one is
      open the stack goes to the top; with none, the top has the header's buttons, so not then */
   @media (max-width: 600px) {
+    /* Across the screen between the gutters: centred from half way, a long
+       one (a fingerprint) had half the width and stood three times as tall */
     :global(body:has([aria-modal="true"])) .toast-container {
       top: calc(12px + env(safe-area-inset-top, 0px));
       bottom: auto;
-      right: auto;
-      left: 50%;
-      transform: translateX(-50%);
+      right: 16px;
+      left: 16px;
+      transform: none;
+      align-items: center;
       flex-direction: column;
     }
 
     :global(body:has([aria-modal="true"])) .toast {
       animation-name: drop-in;
+    }
+
+    /* ...and the dialog moves down under the stack: at the top a toast that
+       stays covered the form's first fields instead (rc.3 device run). Its
+       backdrop makes the room, and the dialog fits the rest */
+    :global(html[data-toasts] body:has([aria-modal="true"]) :not(body):has(> [aria-modal="true"])) {
+      padding-top: calc(var(--toast-room) + 20px + env(safe-area-inset-top, 0px));
+    }
+
+    :global(html[data-toasts] body:has([aria-modal="true"]) [aria-modal="true"]) {
+      max-height: calc(100dvh - 52px - var(--toast-room) - env(safe-area-inset-top, 0px));
     }
   }
 
