@@ -40,3 +40,50 @@ test("no other way to have the browser decode a picture: only one's own photo is
   }
   assert.deepEqual(found, ["lib/image-prep.ts"]);
 });
+
+// W3-9: the scans above miss a picture that goes in another way: bytes no sanitizer wrote,
+// handed to `pictureUrl`, or an <img> pointed at something else. A new one fails here until
+// someone has looked at where it comes from.
+const occurrences = (pattern: RegExp, only: (path: string) => boolean): string[] => {
+  const found: string[] = [];
+  for (const path of sources(ROOT)) {
+    if (!only(path)) continue;
+    for (const m of readFileSync(path, "utf8").matchAll(pattern)) found.push(`${relative(ROOT, path)}: ${m[1]}`);
+  }
+  return found.sort();
+};
+
+test("pictureUrl gets only what a sanitizer wrote", () => {
+  const calls = occurrences(/(?<!function )pictureUrl\(([^)]*)\)/g, () => true);
+  assert.deepEqual(calls, [
+    // prepareEmote's preview of what was picked
+    "lib/components/EmoteManager.svelte: p.preview",
+    // fileImage: the sanitizer's PNG of a file's picture
+    "lib/components/chat/FileCard.svelte: pic.png",
+    "lib/components/chat/FileCard.svelte: pic.png",
+    "lib/components/chat/FileCard.svelte: pic.png",
+    // emote_image: the backend's own PNG of the relay's picture
+    "lib/stores/emotes.ts: png",
+    // prepareEmote's still or preview of a profile picture
+    "lib/stores/profiles.ts: png",
+  ]);
+});
+
+test("an <img> draws only a URL made here", () => {
+  const srcs = occurrences(/<img\b[^>]*\bsrc=\{([^}]*)\}/g, (p) => p.endsWith(".svelte"));
+  assert.deepEqual(srcs, [
+    "lib/components/AdminServer.svelte: iconUrl",
+    "lib/components/AvatarPicture.svelte: url",
+    "lib/components/EmoteManager.svelte: r.url",
+    // A frame the app's own video decoder drew, not a picture file
+    "lib/components/ScreenSharePopout.svelte: displayFrame",
+    "lib/components/ScreenShareViewer.svelte: displayFrame",
+    "lib/components/SharePreview.svelte: $previewFrame",
+    "lib/components/chat/FileCard.svelte: url",
+    "lib/components/chat/Lightbox.svelte: url",
+    "lib/components/modern/ServerRail.svelte: iconOf(entry)",
+  ]);
+  // None with a src in plain text, which no scan above could follow
+  const plain = occurrences(/<img\b[^>]*\bsrc="([^"]*)"/g, (p) => p.endsWith(".svelte"));
+  assert.deepEqual(plain, []);
+});

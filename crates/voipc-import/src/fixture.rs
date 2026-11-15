@@ -408,3 +408,13 @@ async fn the_delta_sees_what_v2_adds_and_nothing_else_changes() {
     assert_eq!(resend["channel"], LOUNGE.to_string());
     assert_eq!(resend["message"]["id"], (M + 5001).to_string());
 }
+
+/// What the fuzzer once found, saved under `fuzz/regressions/import`, replays on stable
+/// (`fuzz::fuzz_import`). Here, since no other module of this crate may read the disk.
+#[test]
+fn the_saved_fuzz_regressions_replay() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/regressions/import");
+    for file in fs::read_dir(dir).into_iter().flatten().flatten() {
+        crate::fuzz::fuzz_import(&fs::read(file.path()).unwrap());
+    }
+}

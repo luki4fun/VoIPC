@@ -56,6 +56,9 @@ pub async fn connect(
     // Install the ring crypto provider (idempotent — only the first call succeeds)
     let _ = rustls::crypto::ring::default_provider().install_default();
 
+    // In the app's log too: on screen alone, below a short window's fold, it left nothing to
+    // read afterwards (device pass)
+    let host = address.clone();
     network::connect_to_server(
         &state,
         app_handle,
@@ -65,6 +68,7 @@ pub async fn connect(
         account,
     )
     .await
+    .inspect_err(|e| tracing::warn!(server = %host, "connecting failed: {e}"))
 }
 
 /// Disconnect from one server. The others stay connected.
@@ -3573,6 +3577,9 @@ pub async fn save_chat_messages(
     // Chat key → newest deleted timestamp. What keeps a cleared channel from
     // filling back up the next time a member offers their history.
     cleared: Option<HashMap<String, u64>>,
+    // The last `log-read-upto` the front end had filed when it took these: the log's
+    // cursors up to that read go to disk with them, never ahead of them.
+    read_upto: Option<u64>,
 ) -> Result<(), String> {
     let mut chat = state.chat.write().await;
 
@@ -3586,6 +3593,9 @@ pub async fn save_chat_messages(
     if let Some(cleared) = cleared {
         chat.archive.cleared = cleared;
     }
+    if let Some(upto) = read_upto {
+        chat.commit_reads(upto);
+    }
     // Whatever the front end handed us, nothing already past its destruction
     // deadline is written to disk. The sweep on screen and this one are the
     // same rule applied to the two copies.
@@ -3598,6 +3608,17 @@ pub async fn save_chat_messages(
 }
 
 /// Clear all chat history: empties the archive and re-encrypts the file.
+/// With chat history off nothing of a read is kept here, so its cursors go to disk as it
+/// is filed (`log-read-upto`): what was read is not read back at the next start.
+#[tauri::command]
+pub async fn log_read_saved(state: State<'_, AppState>, upto: u64) -> Result<(), String> {
+    let mut chat = state.chat.write().await;
+    if chat.commit_reads(upto) && chat.sealing_key.is_some() {
+        chat.dirty = true;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn clear_chat_history(state: State<'_, AppState>) -> Result<(), String> {
     let mut chat = state.chat.write().await;
@@ -4274,10 +4295,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("chat_history.bin");
         let named = |suffix: &str| dir.join(format!("chat_history.bin{suffix}"));
-        let copies = [".v1", ".v4", ".v5", ".v6"].map(named);
+        let copies = [".v1", ".v4", ".v5", ".v6", ".v7"].map(named);
         // Not ours to remove: a file moved aside for a newer VoIPC, a
         // version that is no older one's, and another name
-        let others = [".old-1700000000", ".v7", ".v0", ".v5.tmp"].map(named);
+        let others = [".old-1700000000", ".v8", ".v0", ".v5.tmp"].map(named);
         let write_all = || {
             for f in copies.iter().chain(&others).chain([&path]) {
                 std::fs::write(f, b"x").unwrap();

@@ -8,7 +8,12 @@ test("the first sight of a channel is the baseline: no ring for a new member", (
 
 test("zero is a relay that restarted: never a false ring", () => {
   assert.deepEqual(afterMark(5000, 0), { read: 5000, ring: false });
-  assert.deepEqual(afterMark(undefined, 0), { read: undefined, ring: false });
+});
+
+test("a channel first seen with nothing in it rings at its first post", () => {
+  const first = afterMark(undefined, 0);
+  assert.deepEqual(first, { read: 1, ring: false });
+  assert.deepEqual(afterMark(first.read, 60_000), { read: 1, ring: true });
 });
 
 test("someone wrote after where they read: a ring, and the position stays", () => {

@@ -496,6 +496,13 @@ pub struct Restriction {
     pub by: String,
     /// Told to the member and to holders of `voipc:restrict`; empty for everyone else.
     pub reason: String,
+    /// What `by`'s own restriction holds (protocol 23); the rest of `voice` and `text`, and
+    /// all of `direct`, is the new-member wait. Both false when `by` is empty.
+    pub by_voice: bool,
+    pub by_text: bool,
+    /// Seconds until the new-member wait ends for them, by the relay's clock (protocol 23).
+    /// None: no wait holds them.
+    pub wait_in_secs: Option<u32>,
 }
 
 // ── The move from Discord (protocol v20) ────────────────────────────────

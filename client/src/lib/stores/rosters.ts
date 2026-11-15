@@ -250,14 +250,26 @@ export function setRoster(server: string, channelId: number, list: UserInfo[]): 
  *
  * Mute, deafen and screen-share events are broadcast to every session and carry
  * no channel, so rather than re-asking for a roster because somebody muted, the
- * flag is applied to whichever roster holds them.
+ * flag is applied to whichever roster holds them. `where` says which channels' rows take it.
  */
-export function patchRosters(server: string, userId: number, patch: Partial<UserInfo>): void {
+export function patchRosters(
+  server: string,
+  userId: number,
+  patch: Partial<UserInfo>,
+  where: (channelId: number) => boolean = () => true,
+): void {
+  // A join still in the batch carries their row as it was: what came since goes on it too,
+  // or the flush puts the old flag back (a sharer shown as not sharing, with no Resync)
+  for (const change of pending.get(server)?.changes ?? []) {
+    if ("join" in change && change.join.user_id === userId && where(change.join.channel_id)) {
+      change.join = { ...change.join, ...patch };
+    }
+  }
   channelRosters.of(server).update((m) => {
     let changed = false;
     const next = new Map(m);
     for (const [channelId, list] of next) {
-      if (!list.some((u) => u.user_id === userId)) continue;
+      if (!where(channelId) || !list.some((u) => u.user_id === userId)) continue;
       next.set(
         channelId,
         list.map((u) => (u.user_id === userId ? { ...u, ...patch } : u)),

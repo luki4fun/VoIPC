@@ -229,7 +229,8 @@ impl Relay {
 
 /// What vouches for the new account.
 pub enum How<'a> {
-    Password(&'a str),
+    /// The password's login key (l4f's host key, protocol v22).
+    HostKey(&'a [u8; 32]),
     /// The provider's sealed identity (`SocialOutcome::Signup`, `NoAccount`).
     Provider(&'a str),
 }
@@ -358,15 +359,15 @@ async fn with_minted_code(
         .invite_create_as_host(ctx, Some(name), 1)
         .await?;
     let r = match how {
-        How::Password(password) => {
+        How::HostKey(key) => {
             let form = InviteForm {
                 code: &code,
                 username: name,
-                password,
+                password: "",
                 email: None,
                 display_name: None,
             };
-            relay.accounts.register_invite(ctx, form).await
+            relay.accounts.register_invite_hostkey(ctx, form, key).await
         }
         How::Provider(cookie) => {
             relay

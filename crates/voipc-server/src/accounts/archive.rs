@@ -31,7 +31,7 @@ use voipc_protocol::types::{
     IMPORT_BODY_BYTES, IMPORT_FRAME_ROWS, IMPORT_MESSAGE_ROWS, THREAD_TAKEN_BACK,
 };
 
-use super::import::{no_frame, CURSOR_UP};
+use super::import::{no_frame, CURSOR_UP, KIND_THREAD_MADE};
 use super::modlog::{self, clip};
 use super::placeholder::id_ok;
 use super::{is_star, log, refused, Relay};
@@ -131,10 +131,17 @@ const ERASE_BY: &str = "DELETE FROM voipc_archive WHERE (channel, thread, dc_id)
      (SELECT channel, thread, dc_id FROM voipc_archive \
       WHERE author_dc_id = $1 AND channel BETWEEN $2 AND $3 AND dc_id BETWEEN $4 AND $5 \
       AND thread_name IS NULL LIMIT $6)";
+/// By anyone, in one channel (`$1`) or in all (`ERASE_ANYONE_ALL`): two statements, so that
+/// each is a range of an index, `(channel, dc_id)` or `(dc_id)`. With `channel BETWEEN` the
+/// planner walked the primary key over the whole channel, every pass (W2-3).
 const ERASE_ANYONE: &str = "DELETE FROM voipc_archive WHERE (channel, thread, dc_id) IN \
      (SELECT channel, thread, dc_id FROM voipc_archive \
-      WHERE channel BETWEEN $1 AND $2 AND dc_id BETWEEN $3 AND $4 \
-      AND thread_name IS NULL LIMIT $5)";
+      WHERE channel = $1 AND dc_id BETWEEN $2 AND $3 \
+      AND thread_name IS NULL LIMIT $4)";
+const ERASE_ANYONE_ALL: &str = "DELETE FROM voipc_archive WHERE (channel, thread, dc_id) IN \
+     (SELECT channel, thread, dc_id FROM voipc_archive \
+      WHERE dc_id BETWEEN $1 AND $2 \
+      AND thread_name IS NULL LIMIT $3)";
 
 /// A thread's opening row someone took back keeps only that a thread is here: the replies in
 /// it are other people's, and it is the way in to them. A macro so that each statement stays
@@ -154,19 +161,52 @@ macro_rules! root_taken_back {
 const ROOT_BY: &str = root_taken_back!(
     "author_dc_id = $2 AND channel BETWEEN $3 AND $4 AND dc_id BETWEEN $5 AND $6 LIMIT $7"
 );
-/// Only what is not that already: this wish still covers the row afterwards.
+/// Only what is not that already: this wish still covers the row afterwards. In one channel
+/// or in all, as `ERASE_ANYONE`.
 const ROOT_ANYONE: &str = root_taken_back!(
-    "channel BETWEEN $2 AND $3 AND dc_id BETWEEN $4 AND $5 \
+    "channel = $2 AND dc_id BETWEEN $3 AND $4 \
      AND (author_dc_id IS NOT NULL OR author_name <> '' OR body <> '' OR reply_to IS NOT NULL \
      OR reactions IS NOT NULL OR attachments IS NOT NULL OR pinned = TRUE OR thread_name <> $1) \
-     LIMIT $6"
+     LIMIT $5"
+);
+const ROOT_ANYONE_ALL: &str = root_taken_back!(
+    "dc_id BETWEEN $2 AND $3 \
+     AND (author_dc_id IS NOT NULL OR author_name <> '' OR body <> '' OR reply_to IS NOT NULL \
+     OR reactions IS NOT NULL OR attachments IS NOT NULL OR pinned = TRUE OR thread_name <> $1) \
+     LIMIT $4"
 );
 /// A row a frame dropped, if a thread opens on it: a run files its threads first.
 const ROOT_ONE: &str = root_taken_back!("channel = $2 AND thread = 0 AND dc_id = $3");
 const ERASE_CHANNEL: &str = "DELETE FROM voipc_archive WHERE (channel, thread, dc_id) IN \
      (SELECT channel, thread, dc_id FROM voipc_archive WHERE channel = $1 LIMIT $2)";
+/// Past `archive_days`, but its thread has replies inside: it is the way in to them, so it
+/// keeps that a thread is here, and none of its words (W2-7). Only what is not that already.
+const ROOT_OLD: &str = root_taken_back!(
+    "channel = $2 AND thread = 0 AND dc_id < $3 \
+     AND EXISTS (SELECT 1 FROM voipc_archive r \
+       WHERE r.channel = $2 AND r.thread = voipc_archive.dc_id AND r.dc_id >= $3) \
+     AND (author_dc_id IS NOT NULL OR author_name <> '' OR body <> '' OR reply_to IS NOT NULL \
+     OR reactions IS NOT NULL OR attachments IS NOT NULL OR pinned = TRUE OR thread_name <> $1) \
+     LIMIT $4"
+);
+/// Past `archive_days`, but not a thread's opening row while its thread has replies inside.
 const ERASE_OLD: &str = "DELETE FROM voipc_archive WHERE (channel, thread, dc_id) IN \
-     (SELECT channel, thread, dc_id FROM voipc_archive WHERE channel = $1 AND dc_id < $2 LIMIT $3)";
+     (SELECT a.channel, a.thread, a.dc_id FROM voipc_archive a WHERE a.channel = $1 AND a.dc_id < $2 \
+      AND NOT (a.thread = 0 AND a.thread_name IS NOT NULL AND EXISTS (SELECT 1 FROM voipc_archive r \
+        WHERE r.channel = $1 AND r.thread = a.dc_id AND r.dc_id >= $2)) LIMIT $3)";
+
+/// The statements a tidy pass repeats, for the Round C measurement's query plans.
+#[cfg(test)]
+pub(crate) const PLANNED: [&str; 8] = [
+    ERASE_BY,
+    ERASE_ANYONE,
+    ERASE_ANYONE_ALL,
+    ROOT_BY,
+    ROOT_ANYONE,
+    ROOT_ANYONE_ALL,
+    ROOT_OLD,
+    ERASE_OLD,
+];
 
 const FILE_ROW: &str =
     "INSERT INTO voipc_archive (channel, thread, dc_id, author_dc_id, author_name, \
@@ -405,7 +445,23 @@ fn clean_name(name: &str, chars: usize) -> String {
         .filter(|c| !bad_name_char(*c))
         .take(chars)
         .collect();
-    kept.trim().to_string()
+    // One of only what draws nothing is none: a blank author, or a blank thread (W1-36)
+    if voipc_protocol::names::draws_something(&kept) {
+        kept.trim().to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// A thread's name as kept. One that shows nothing goes by the neutral name: an empty one
+/// would be no way in to its replies (`thread_name` is what marks an opening row).
+fn thread_title(name: &str) -> String {
+    let name = clean_name(name, THREAD_CHARS);
+    if name.is_empty() {
+        THREAD_TAKEN_BACK.to_string()
+    } else {
+        name
+    }
 }
 
 /// JSON, or NULL for nothing, so most rows pay nothing.
@@ -535,7 +591,8 @@ pub(super) async fn archive_put(
 
 /// Each thread's root row: its name and count, on the message it started from if there is
 /// one, whichever comes first, and with an empty body if there is none. Who named it counts as
-/// its author if the row is no one's message, so that their wishes reach the name.
+/// its author if the row is no one's message, so that their wishes reach the name. A thread
+/// opened on a message an earlier run filed goes in the ledger, for an undo.
 pub(super) async fn archive_threads(
     relay: &Relay,
     import_id: i64,
@@ -544,11 +601,25 @@ pub(super) async fn archive_threads(
     db!(relay.store(), pool => {
         let mut tx = pool.begin().await?;
         for t in threads {
+            sqlx::query(
+                "INSERT INTO voipc_import_items (kind, dc_id, import_id, local) \
+                 SELECT $1, dc_id, $2, $3 FROM voipc_archive \
+                 WHERE channel = $4 AND thread = 0 AND dc_id = $5 AND import_id <> $2 \
+                   AND thread_name IS NULL \
+                 ON CONFLICT (kind, dc_id) DO NOTHING",
+            )
+            .bind(KIND_THREAD_MADE)
+            .bind(import_id)
+            .bind(t.parent.to_string())
+            .bind(t.parent as i64)
+            .bind(t.id as i64)
+            .execute(&mut *tx)
+            .await?;
             sqlx::query(FILE_THREAD)
                 .bind(t.parent as i64)
                 .bind(t.id as i64)
                 .bind(t.owner.map(|o| o as i64))
-                .bind(clean_name(&t.name, THREAD_CHARS))
+                .bind(thread_title(&t.name))
                 .bind(t.replies.min(i32::MAX as u32) as i32)
                 .bind(import_id)
                 .bind(THREAD_TAKEN_BACK)
@@ -578,6 +649,7 @@ pub(super) async fn threads(
     }
     let wishes = relay.wishes();
     let mut allowed: HashMap<u64, bool> = HashMap::new();
+    let mut read_to: HashMap<i64, Option<i64>> = HashMap::new();
     let mut filing = Vec::with_capacity(rows.len());
     let mut stored = 0;
     for t in rows {
@@ -592,25 +664,78 @@ pub(super) async fn threads(
         if !may {
             continue;
         }
+        let (parent, id) = (t.parent as i64, t.id as i64);
         let owner = t.owner.map(|o| o as i64);
-        filing.push(
-            if verdict(&wishes, owner, t.parent as i64, t.id as i64) == Verdict::Erased {
-                ImportThread {
-                    owner: None,
-                    name: THREAD_TAKEN_BACK.to_string(),
-                    ..t.clone()
-                }
-            } else {
-                stored += 1;
-                t.clone()
-            },
-        );
+        let taken_back = verdict(&wishes, owner, parent, id) == Verdict::Erased
+            || (erased_by_anyone(&wishes, parent, id)
+                && gone_from_read_part(relay, &mut read_to, parent, id).await?);
+        filing.push(if taken_back {
+            ImportThread {
+                owner: None,
+                name: THREAD_TAKEN_BACK.to_string(),
+                ..t.clone()
+            }
+        } else {
+            stored += 1;
+            t.clone()
+        });
     }
     archive_threads(relay, run, &filing).await?;
     Ok(AccountReply::Admin(AdminReply::ImportAcked {
         stored,
         skipped: rows.len() as u32 - stored,
     }))
+}
+
+/// Whether anyone's wish takes a row at `id` in `channel`. A thread's frame names who opened
+/// it, not who wrote the message it opened on, so whose wish it was cannot be told here.
+fn erased_by_anyone(wishes: &Wishes, channel: i64, id: i64) -> bool {
+    wishes.values().flatten().any(|w| {
+        w.erase && (w.channel == 0 || w.channel == channel) && (w.low..=w.high).contains(&id)
+    })
+}
+
+/// Whether the message a thread opened on is missing from a part of `channel` a run has
+/// already read (runs not undone). Then it was taken back before the thread opened, and the
+/// worker took its row whole, since no thread was on it yet: the title Discord gives the
+/// thread may be its words. A message this run has not reached is not missing. `read_to`
+/// keeps each channel's cursor for the frame.
+async fn gone_from_read_part(
+    relay: &Relay,
+    read_to: &mut HashMap<i64, Option<i64>>,
+    channel: i64,
+    id: i64,
+) -> Result<bool> {
+    let high = match read_to.get(&channel) {
+        Some(high) => *high,
+        None => {
+            let high: Option<i64> = db!(relay.store(), pool => {
+                sqlx::query_scalar(
+                    "SELECT CAST(MAX(c.high) AS BIGINT) FROM voipc_import_cursors c \
+                     JOIN voipc_imports i ON i.id = c.import_id \
+                     WHERE c.uid = $1 AND i.undone_at IS NULL",
+                )
+                .bind(channel)
+                .fetch_one(pool)
+                .await?
+            });
+            read_to.insert(channel, high);
+            high
+        }
+    };
+    if high.is_none_or(|high| id > high) {
+        return Ok(false);
+    }
+    let here: Option<i64> = db!(relay.store(), pool => {
+        sqlx::query_scalar(
+            "SELECT dc_id FROM voipc_archive WHERE channel = $1 AND thread = 0 AND dc_id = $2",
+        )
+        .bind(channel)
+        .bind(id)
+        .fetch_optional(pool)
+        .await?
+    });
+    Ok(here.is_none())
 }
 
 /// What is wrong with a frame on its face, whatever the importer did.
@@ -1499,6 +1624,8 @@ enum Going<'a> {
     Roots(i64, &'a Wish),
     Wished(i64, &'a Wish),
     Channel(i64),
+    /// Opening rows past the floor whose threads go on inside it, left neutral.
+    OldRoots(i64, i64),
     Older(i64, i64),
 }
 
@@ -1506,19 +1633,23 @@ enum Going<'a> {
 async fn batch(relay: &Relay, going: Going<'_>) -> Result<u64> {
     Ok(db!(relay.store(), pool => {
         match going {
-            Going::Roots(0, wish) => {
-                let (first, last) = channels_of(wish.channel);
-                sqlx::query(ROOT_ANYONE)
-                    .bind(THREAD_TAKEN_BACK)
-                    .bind(first)
-                    .bind(last)
-                    .bind(wish.low)
-                    .bind(wish.high)
-                    .bind(BATCH)
-                    .execute(pool)
-                    .await?
-                    .rows_affected()
-            }
+            Going::Roots(0, wish) if wish.channel == 0 => sqlx::query(ROOT_ANYONE_ALL)
+                .bind(THREAD_TAKEN_BACK)
+                .bind(wish.low)
+                .bind(wish.high)
+                .bind(BATCH)
+                .execute(pool)
+                .await?
+                .rows_affected(),
+            Going::Roots(0, wish) => sqlx::query(ROOT_ANYONE)
+                .bind(THREAD_TAKEN_BACK)
+                .bind(wish.channel)
+                .bind(wish.low)
+                .bind(wish.high)
+                .bind(BATCH)
+                .execute(pool)
+                .await?
+                .rows_affected(),
             Going::Roots(author, wish) => {
                 let (first, last) = channels_of(wish.channel);
                 sqlx::query(ROOT_BY)
@@ -1533,18 +1664,21 @@ async fn batch(relay: &Relay, going: Going<'_>) -> Result<u64> {
                     .await?
                     .rows_affected()
             }
-            Going::Wished(0, wish) => {
-                let (first, last) = channels_of(wish.channel);
-                sqlx::query(ERASE_ANYONE)
-                    .bind(first)
-                    .bind(last)
-                    .bind(wish.low)
-                    .bind(wish.high)
-                    .bind(BATCH)
-                    .execute(pool)
-                    .await?
-                    .rows_affected()
-            }
+            Going::Wished(0, wish) if wish.channel == 0 => sqlx::query(ERASE_ANYONE_ALL)
+                .bind(wish.low)
+                .bind(wish.high)
+                .bind(BATCH)
+                .execute(pool)
+                .await?
+                .rows_affected(),
+            Going::Wished(0, wish) => sqlx::query(ERASE_ANYONE)
+                .bind(wish.channel)
+                .bind(wish.low)
+                .bind(wish.high)
+                .bind(BATCH)
+                .execute(pool)
+                .await?
+                .rows_affected(),
             Going::Wished(author, wish) => {
                 let (first, last) = channels_of(wish.channel);
                 sqlx::query(ERASE_BY)
@@ -1561,6 +1695,16 @@ async fn batch(relay: &Relay, going: Going<'_>) -> Result<u64> {
             Going::Channel(channel) => {
                 sqlx::query(ERASE_CHANNEL)
                     .bind(channel)
+                    .bind(BATCH)
+                    .execute(pool)
+                    .await?
+                    .rows_affected()
+            }
+            Going::OldRoots(channel, floor) => {
+                sqlx::query(ROOT_OLD)
+                    .bind(THREAD_TAKEN_BACK)
+                    .bind(channel)
+                    .bind(floor)
                     .bind(BATCH)
                     .execute(pool)
                     .await?
@@ -1710,6 +1854,7 @@ pub async fn tidy(state: &ServerState, relay: &Relay) -> Result<u64> {
             if !channel_stands(state, relay, &format!("c:dc-{channel}")).await? {
                 gone += all_of(relay, Going::Channel(channel)).await?;
             } else if let Some(floor) = floor {
+                all_of(relay, Going::OldRoots(channel, floor)).await?;
                 gone += all_of(relay, Going::Older(channel, floor)).await?;
             }
         }
@@ -1946,6 +2091,10 @@ mod tests {
     #[test]
     fn a_name_shows_all_it_says() {
         assert_eq!(clean_name("  a\u{200B}\u{202E}b\u{0} ", 64), "ab");
+        // W1-36: one of only what draws nothing is none, and a thread still has a name
+        assert_eq!(clean_name("\u{2800} \u{fe0f}", 64), "");
+        assert_eq!(thread_title("\u{2800}"), THREAD_TAKEN_BACK);
+        assert_eq!(thread_title("Plans"), "Plans");
         let wide = "\u{1F389}".repeat(70);
         assert_eq!(clean_name(&wide, 64).chars().count(), 64);
     }

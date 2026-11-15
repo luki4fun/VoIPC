@@ -460,6 +460,18 @@ impl Relay {
         }))
     }
 
+    /// Whether a ban on this id stays lifted: a lifted ban (`own` off), or one lifted for
+    /// someone who deleted their own account (`lifted`, W1-31).
+    async fn ban_lifted(&self, dc_id: i64) -> Result<bool> {
+        let row: Option<(bool, bool)> = db!(self.store(), pool => {
+            sqlx::query_as("SELECT own, lifted FROM voipc_import_excluded WHERE dc_id = $1")
+                .bind(dc_id)
+                .fetch_optional(pool)
+                .await?
+        });
+        Ok(row.is_some_and(|(own, lifted)| !own || lifted))
+    }
+
     /// `Some(own)` for an id no import touches.
     async fn excluded_own(&self, dc_id: i64) -> Result<Option<bool>> {
         Ok(db!(self.store(), pool => {
@@ -690,6 +702,37 @@ impl Relay {
             _ => groups.push(group.clone()),
         }
         Ok(roles_fit(&groups))
+    }
+
+    /// A group a run made and then stopped before its ledger row: `name`, just as `form`
+    /// makes it, in no run's ledger and holding nobody. The next run takes it up, where it
+    /// made `<name>-<tail>` beside it and the first stayed for good (W2-24). One made by hand
+    /// differs in its description, its badge, its privileges or its people.
+    async fn stopped_group(&self, name: &str, form: &RoleForm<'_>) -> Result<Option<AccountId>> {
+        let Some(role) = self.store().role_by_name(name).await? else {
+            return Ok(None);
+        };
+        let mut scopes = form.scopes.to_vec();
+        scopes.sort();
+        scopes.dedup();
+        if role.builtin
+            || role.description != form.description
+            || role.badge.as_deref().unwrap_or("") != form.badge
+            || role.scopes != scopes
+        {
+            return Ok(None);
+        }
+        let ledgered: i64 = db!(self.store(), pool => {
+            sqlx::query_scalar("SELECT CAST(COUNT(*) AS BIGINT) FROM voipc_import_groups WHERE role = $1")
+                .bind(&role.id.0[..])
+                .fetch_one(pool)
+                .await?
+        });
+        if ledgered > 0 {
+            return Ok(None);
+        }
+        let (_, people) = self.store().role_members(role.id, 1, 0).await?;
+        Ok((people == 0).then_some(role.id))
     }
 
     async fn ledger_put(&self, role: AccountId, dc_role: u64, power: bool, run: i64) -> Result<()> {
@@ -1113,6 +1156,12 @@ async fn make_group(
             Ok(id) => return Ok(Some((id, name.clone()))),
             Err(Error::RoleTaken) => {
                 groups.pop();
+                if let Some(id) = relay
+                    .stopped_group(name, &RoleForm { name, ..form })
+                    .await?
+                {
+                    return Ok(Some((id, name.clone())));
+                }
             }
             Err(e) => {
                 groups.pop();
@@ -1315,7 +1364,8 @@ async fn groups_of(
 /// `AdminOp::ImportBans`, past `import::frame`. An import never acts on someone who has
 /// opened an account: those are named, and the owner bans by name if they mean it. A
 /// lifted ban stays lifted, since a lift leaves the id on the excluded list; someone's own
-/// exclusion (they deleted their account) does not stop a ban.
+/// exclusion (they deleted their account) does not stop a ban, until one was lifted for them
+/// (`lifted`, W1-31).
 pub(super) async fn bans(
     relay: &Relay,
     ctx: &Ctx,
@@ -1327,7 +1377,7 @@ pub(super) async fn bans(
     let (mut claimed, mut names_kept) = (Vec::new(), Vec::new());
     for b in rows {
         let dc = b.dc_id as i64;
-        if relay.excluded_own(dc).await? == Some(false) {
+        if relay.ban_lifted(dc).await? {
             continue;
         }
         let ext_id = b.dc_id.to_string();
@@ -1349,9 +1399,9 @@ pub(super) async fn bans(
                 let Some(id) = account_of(&account) else {
                     continue;
                 };
+                // `claim` waits for this: a vault is bound to the name it was made under
+                let _one = relay.claiming.lock().await;
                 if !banned {
-                    // `claim` waits for this: a vault is bound to the name it was made under
-                    let _one = relay.claiming.lock().await;
                     // Opened this instant: left alone, and the next run names them
                     if relay.identity(id).await?.is_some() {
                         continue;
@@ -1374,12 +1424,18 @@ pub(super) async fn bans(
                             .execute(pool)
                             .await?;
                     });
+                    converted += 1;
+                }
+                // The name after the mark, and again on a later run while it is not yet a
+                // banned one's: stopped in between, a run left the real name squatted on a
+                // banned row, which the mark then skipped (W2-23)
+                let user = relay.store().user_by_id(id).await?;
+                let names = relay.banned_names(b.dc_id);
+                if !user.as_ref().is_some_and(|u| names.contains(&u.username)) {
                     relay.profile_name_put(id, None).await?;
                     if !relay.banned_rename(ctx, id, b.dc_id).await? {
-                        let user = relay.store().user_by_id(id).await?;
                         names_kept.extend(user.map(|u| u.username));
                     }
-                    converted += 1;
                 }
                 if cred.is_none() {
                     relay.discord_link(id, b.dc_id, &handle).await?;
@@ -1405,18 +1461,47 @@ pub(super) async fn bans(
     })
 }
 
+/// Why a name of the move's shape is refused, to anyone, whoever holds one.
+pub(crate) const KEPT_FOR_THE_MOVE: &str =
+    "Names like dc-<number> are kept for accounts moved from Discord: pick another.";
+
+/// `dc-` and a digit: the move's own names (`names_for`, `banned_names`). Nobody else takes
+/// one, as a guest, at sign-up or as a display name, whether or not such an account exists:
+/// an answer that turned on that would tell anyone who knows a Discord id that it was banned
+/// there (W1-30). A look-alike in another script is checked by its ASCII spelling.
+pub(crate) fn kept_for_the_move(name: &str) -> bool {
+    let name = name.trim().as_bytes();
+    name.len() > 3 && name[..3].eq_ignore_ascii_case(b"dc-") && name[3].is_ascii_digit()
+}
+
 /// What refuses `AdminOp::MoveExclude`, ahead of its code. Someone who opened their account
-/// can delete it themselves, and someone who did that stays out: nobody may let them back.
+/// can delete it themselves, and someone who did that stays out: nobody may let them back. A
+/// ban by name here holds the account, name and Discord id with it, which leaving out would
+/// then keep while saying done (W1-32): the ban is lifted first, on purpose.
 pub(super) async fn exclude_refusal(
     relay: &Relay,
     dc_id: i64,
     on: bool,
 ) -> Result<Option<&'static str>> {
     if on {
-        if matches!(relay.place_of(dc_id).await?, Some((_, _, Some(_)))) {
+        let place = relay.place_of(dc_id).await?;
+        if matches!(place, Some((_, _, Some(_)))) {
             return Ok(Some(
                 "They have opened their account: they can delete it themselves.",
             ));
+        }
+        if let Some((account, _, None)) = place {
+            let banned: Option<i64> = db!(relay.store(), pool => {
+                sqlx::query_scalar("SELECT id FROM voipc_bans WHERE account = $1")
+                    .bind(&account)
+                    .fetch_optional(pool)
+                    .await?
+            });
+            if banned.is_some() {
+                return Ok(Some(
+                    "They are banned here by name, and the ban holds their account. Lift it under Bans first, then leave them out.",
+                ));
+            }
         }
     } else if relay.excluded_own(dc_id).await? == Some(true) {
         return Ok(Some(
@@ -1465,8 +1550,12 @@ pub(super) async fn exclude(
         let mut tx = pool.begin().await?;
         if on {
             sqlx::query(
+                // On someone who deleted their own account, holding is all a lift can be: it
+                // stays lifted (W1-31)
                 "INSERT INTO voipc_import_excluded (dc_id, own, erase, at) VALUES ($1, $2, $3, $4)
-                 ON CONFLICT (dc_id) DO UPDATE SET erase = voipc_import_excluded.erase OR excluded.erase",
+                 ON CONFLICT (dc_id) DO UPDATE SET erase = voipc_import_excluded.erase OR excluded.erase,
+                   lifted = voipc_import_excluded.lifted
+                     OR (voipc_import_excluded.own AND NOT excluded.erase)",
             )
             .bind(dc_id)
             .bind(false)
@@ -2703,6 +2792,24 @@ mod tests {
             // Who is left out, both ways, and the list of them
             exclude_refusal(r, 1001, true).await.unwrap().unwrap();
             assert!(exclude_refusal(r, 1002, true).await.unwrap().is_none());
+            // Banned here by name (W1-32): leaving out could not take the account, so it says
+            // so rather than answering done. Without the ban, the control, it goes ahead.
+            let eve = store.user_by_username("eve").await.unwrap().unwrap().id;
+            let ban = |sql: &'static str| async move {
+                db!(store, pool => {
+                    sqlx::query(sql).bind(&eve.0[..]).execute(pool).await.unwrap();
+                });
+            };
+            ban(
+                "INSERT INTO voipc_bans (id, account, label, reason, by_name, created_at)
+                 VALUES (77, $1, 'eve', '', 'mod', 1)",
+            )
+            .await;
+            let why = exclude_refusal(r, 1002, true).await.unwrap().unwrap();
+            assert!(why.contains("banned here"), "{why}");
+            assert!(exclude_refusal(r, 1002, false).await.unwrap().is_none());
+            ban("DELETE FROM voipc_bans WHERE account = $1").await;
+            assert!(exclude_refusal(r, 1002, true).await.unwrap().is_none());
             let page = exclude(&state, r, 0, 2222, true, true).await.unwrap();
             assert!(
                 matches!(page, AccountReply::Admin(AdminReply::MoveExcluded { ref ids, more: false }) if ids.len() == 1),
@@ -3421,10 +3528,31 @@ mod tests {
             assert_eq!(gated.speakers, ["crew"]);
             assert_eq!(of(format!("c:dc-{}", TOP + 2)).unwrap().groups, ["admin"]);
 
-            // A category gone by hand: the ledger keeps its row, naming nothing
-            r.category_delete(2).await.unwrap();
+            // A new order is one transaction, rows and categories together (W2-14)
+            let one = voipc_protocol::types::ChannelCategory {
+                id: 1,
+                name: "first".into(),
+            };
+            r.layout_write(
+                &[(format!("c:dc-{}", TOP + 2), None, -5, Some(1))],
+                &[(one.clone(), 7)],
+            )
+            .await
+            .unwrap();
+            let back = r.layout_rows().await.unwrap();
+            assert_eq!(back.rows[0].conv, format!("c:dc-{}", TOP + 2));
+            assert_eq!(back.rows[0].category, Some(1));
+            assert_eq!(back.categories.last().map(|c| c.id), Some(1));
+
+            // A category gone by hand: the ledger keeps its row, naming nothing, and the rest
+            // take the places the list gives them
+            r.category_delete(2, std::slice::from_ref(&one))
+                .await
+                .unwrap();
             let held = r.import_items(import::KIND_CATEGORY).await.unwrap();
             assert_eq!((held[&501].as_str(), held[&502].as_str()), ("1", ""));
+            let back = r.layout_rows().await.unwrap();
+            assert_eq!(back.categories, [one]);
 
             // A private channel with its gate opened takes nothing; one that was open does
             let top = TOP as i64;

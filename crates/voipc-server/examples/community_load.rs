@@ -385,20 +385,10 @@ async fn run(n: usize, server: &str, pid: Option<u32>) -> Result<(), Error> {
     settle(&tally, limit).await;
     let after_join = pid.and_then(relay_stats);
     let join_messages = tally.messages.load(Ordering::Relaxed) - before_join;
-    let short: Vec<usize> = tally
-        .roster
-        .lock()
-        .unwrap()
-        .iter()
-        .flatten()
-        .filter(|&&known| known + 1 < up)
-        .map(|&known| up - 1 - known)
-        .collect();
+    // A text channel pushes no list since protocol 21: nothing to count short
     println!(
-        "joined in {:.1} s, {join_messages} messages fanned out; {} of {up} rosters short, by {} members at most",
+        "joined in {:.1} s, {join_messages} messages fanned out; a text channel pushes no roster (its pages are asked)",
         all_joined.as_secs_f64(),
-        short.len(),
-        short.iter().max().copied().unwrap_or(0),
     );
 
     for seq in 1..=CHAT_MESSAGES {
@@ -424,12 +414,11 @@ async fn run(n: usize, server: &str, pid: Option<u32>) -> Result<(), Error> {
     let rss = after_chat.map_or("?".to_string(), |s| s.0.to_string());
     println!("| clients | connect p95 ms | General lists | join all s | join p95 ms | rosters short | chat p50/p95 ms | chat delivered | relay RSS MiB | relay CPU s: join, chat |");
     println!(
-        "| {up} | {} | {} | {:.1} | {} | {} | {}/{} | {}/{expected} | {rss} | {}, {} |",
+        "| {up} | {} | {} | {:.1} | {} | - | {}/{} | {}/{expected} | {rss} | {}, {} |",
         percentile(&mut connect_ms, 95),
         tally.general_lists.load(Ordering::Relaxed),
         all_joined.as_secs_f64(),
         percentile(&mut join_ms, 95),
-        short.len(),
         percentile(&mut chat_ms, 50),
         percentile(&mut chat_ms, 95),
         chat_ms.len(),
@@ -573,6 +562,19 @@ async fn client(
                 if user.channel_id == channel_id && channel_id != 0 =>
             {
                 note(&mut known, tally, user.user_id);
+            }
+            // A text channel's join answers with this since protocol 21, and no list: its
+            // members are asked a page at a time (`RequestChannelPage`), not pushed
+            ServerMessage::TextJoined { joined, .. }
+                if joined.iter().any(|(id, ..)| *id == channel_id) =>
+            {
+                if let Some(at) = joined_at.lock().unwrap().take() {
+                    tally
+                        .join_ms
+                        .lock()
+                        .unwrap()
+                        .push(at.elapsed().as_millis() as u64);
+                }
             }
             ServerMessage::TextPost { ciphertext, .. } => {
                 if let Some(sent) = ciphertext.get(..8) {

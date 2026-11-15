@@ -1,14 +1,20 @@
 //! `voipc_gates`: the database half of `crate::gates`, and its stored-log
 //! members.
 
-use std::collections::hash_map::{Entry, HashMap};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use anyhow::Result;
 use l4f_accounts::model::AccountId;
 use l4f_accounts::store::Store;
+use tokio::task::JoinSet;
+use tracing::warn;
 use voipc_protocol::types::ChannelGate;
 
 use super::{is_star, log, Relay};
+
+/// Accounts a gate pass decides at once: reads side by side, on SQLite's WAL as on Postgres.
+const DECIDE_AT_ONCE: usize = 8;
 
 fn split(list: &str) -> Vec<String> {
     list.split_whitespace().map(String::from).collect()
@@ -79,31 +85,76 @@ impl Relay {
         if is_star(&scopes) {
             return Ok(Held::Everything);
         }
-        Ok(Held::Groups(self.standing(&user, &scopes).await?.groups))
+        // `standing`'s groups, without the badges it also reads (W2-1)
+        let roles = self.store().user_roles(user.id).await?;
+        Ok(Held::Groups(
+            super::counted(&roles, &scopes)
+                .into_iter()
+                .map(|r| r.name.clone())
+                .collect(),
+        ))
     }
 
-    /// The stored members of `conv` outside `groups`, out of it. `decided` is shared across a
-    /// pass: most of the same accounts sit in every gated log, and each is four queries.
-    pub async fn prune_log(
-        &self,
-        conv: &str,
-        groups: &[String],
-        decided: &mut HashMap<[u8; 16], Held>,
-    ) -> Result<()> {
-        let members: Vec<Vec<u8>> = members_of(self.store(), conv).await?;
-        for m in members {
-            let Ok(id) = <[u8; 16]>::try_from(m.as_slice()) else {
-                continue;
-            };
-            let held = match decided.entry(id) {
-                Entry::Occupied(e) => e.into_mut(),
-                Entry::Vacant(e) => e.insert(self.held_by(AccountId(id)).await?),
-            };
-            if !held.passes(groups) {
-                log::unseat(self.store(), conv, &id).await?;
+    /// The stored members of each gated log (its conv, its gate's groups) outside its
+    /// groups, out of it. Each account is decided once a pass, `DECIDE_AT_ONCE` at a time:
+    /// most of the same accounts sit in every gated log, and each is three reads (W2-1).
+    /// One that cannot be decided keeps its seats until the next pass.
+    pub async fn prune_gated(self: &Arc<Self>, gated: &[(String, Vec<String>)]) {
+        let mut seats = Vec::new();
+        for (i, (conv, _)) in gated.iter().enumerate() {
+            match members_of(self.store(), conv).await {
+                Ok(m) => seats.extend(
+                    m.iter()
+                        .filter_map(|a| <[u8; 16]>::try_from(a.as_slice()).ok())
+                        .map(|a| (i, a)),
+                ),
+                Err(e) => warn!("keeping {conv} to its gate: {e:#}"),
             }
         }
-        Ok(())
+        let accounts: HashSet<[u8; 16]> = seats.iter().map(|(_, a)| *a).collect();
+        let decided = self.decide(accounts).await;
+        for (i, account) in seats {
+            let (conv, groups) = &gated[i];
+            if decided.get(&account).is_some_and(|h| !h.passes(groups)) {
+                if let Err(e) = log::unseat(self.store(), conv, &account).await {
+                    warn!("keeping {conv} to its gate: {e:#}");
+                }
+            }
+        }
+    }
+
+    /// What gates ask of each of `accounts`; those whose reads failed are not in it.
+    async fn decide(self: &Arc<Self>, accounts: HashSet<[u8; 16]>) -> HashMap<[u8; 16], Held> {
+        let mut out = HashMap::with_capacity(accounts.len());
+        let mut failed = 0usize;
+        let mut running = JoinSet::new();
+        let mut left = accounts.into_iter();
+        loop {
+            while running.len() < DECIDE_AT_ONCE {
+                let Some(a) = left.next() else { break };
+                let relay = self.clone();
+                running.spawn(async move { (a, relay.held_by(AccountId(a)).await) });
+            }
+            let Some(done) = running.join_next().await else {
+                break;
+            };
+            match done {
+                Ok((a, Ok(held))) => {
+                    out.insert(a, held);
+                }
+                Ok((_, Err(e))) => {
+                    if failed == 0 {
+                        warn!("reading who passes the gates: {e:#}");
+                    }
+                    failed += 1;
+                }
+                Err(_) => failed += 1,
+            }
+        }
+        if failed > 0 {
+            warn!("{failed} accounts keep their seats in gated logs until the next pass");
+        }
+        out
     }
 
     /// `account` out of those of `convs` it holds a seat in.

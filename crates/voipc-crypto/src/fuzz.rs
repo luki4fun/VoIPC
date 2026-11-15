@@ -7,6 +7,7 @@
 use crate::account::{self, Pins, Vault};
 use crate::file::{self, FileMeta};
 use crate::log::{self, LogKey};
+use crate::pair;
 use crate::{envelope, MediaKey};
 use voipc_protocol::types::VaultBlob;
 
@@ -109,6 +110,28 @@ pub fn fuzz_file(data: &[u8]) {
     assert_eq!(file::open(&meta, &blob).as_deref(), Ok(rest));
 }
 
+/// What a pairing's frames carry, from the relay or the other device: a commitment, an
+/// ephemeral key and its blind, the answer's key and a wrapped vault key (W3-35). The
+/// request's own keys are drawn fresh, as a device draws them: no input reaches anything
+/// that turns on them but the six digits.
+pub fn fuzz_pair(data: &[u8]) {
+    let mut rest = data;
+    let mut take = |n: usize| {
+        let (a, b) = rest.split_at(n.min(rest.len()));
+        rest = b;
+        a
+    };
+    let (commitment, ephemeral, blind, nonce) = (take(32), take(33), take(32), take(32));
+    let wrapped = rest;
+    let _ = pair::code(commitment, nonce, ephemeral);
+    let _ = pair::reveal_ok(commitment, ephemeral, blind);
+    let mut asks = pair::PairRequest::new();
+    if asks.take_answer(nonce).is_some() {
+        assert!(asks.take_answer(nonce).is_none(), "one answer");
+        let _ = asks.open(wrapped, &RELAY, "fuzz");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,6 +160,7 @@ mod tests {
         replay("keys", &[0x11; 32], fuzz_keys);
         replay("log", &[33; 64], fuzz_log);
         replay("file", &[1, 0, 64, 0x63, 0x60, 0xa0, 0x0c, 0, 0], fuzz_file);
+        replay("pair", &[9; 200], fuzz_pair);
         replay(
             "vault",
             &vault.seal_item("item.fuzz", 1, b"payload").v,

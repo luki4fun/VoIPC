@@ -567,6 +567,14 @@
     cursor: pointer;
   }
 
+  /* A finger's size on a touch screen: Hide and Delete sat 22px tall side by side (W3-54) */
+  @media (pointer: coarse) {
+    .link-btn {
+      min-height: var(--hit);
+      padding: 0 var(--sp-2, 8px);
+    }
+  }
+
   .link-btn:hover {
     color: var(--text-primary);
   }

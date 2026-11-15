@@ -7,9 +7,9 @@
 import { get } from "svelte/store";
 
 import { channels } from "./channels.js";
-import { serverKey } from "./connection.js";
 import { textSeats } from "./rosters.js";
 import { scoped } from "./scoped.js";
+import { historyKey } from "./history-scope.js";
 import { uiPrefs, updateUiPrefs } from "./ui-prefs.js";
 import { afterMark, OWN_CLOCK_SLACK_MS } from "../marks-rules.js";
 import { stableName } from "../follow-rules.js";
@@ -26,7 +26,7 @@ let unwritten = new Map<string, Map<string, number>>();
 let writeTimer: ReturnType<typeof setTimeout> | null = null;
 
 function readAt(server: string, channel: ChannelInfo): number | undefined {
-  const key = serverKey(server);
+  const key = historyKey(server);
   const stable = stableName(channel);
   return unwritten.get(key)?.get(stable) ?? get(uiPrefs).read_marks[key]?.[stable];
 }
@@ -47,7 +47,7 @@ export function flushMarks(): void {
 export function moveRead(server: string, channel: ChannelInfo, at: number): void {
   const before = readAt(server, channel);
   if (before !== undefined && before >= at) return;
-  const key = serverKey(server);
+  const key = historyKey(server);
   if (!key) return;
   let marks = unwritten.get(key);
   if (!marks) unwritten.set(key, (marks = new Map()));

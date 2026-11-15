@@ -148,12 +148,20 @@ export function pairCodeCame(server: string, code: string): void {
 /** Servers where the person started a provider's link or proof, and it has not ended:
  *  `page` once its page was up. */
 const providerFlows = new Map<string, "started" | "page">();
+/** Each flow's own number, while it is open: what waits on one flow (a code setup waiting
+ *  for a proof) must not come back at the end of a later one, after a cut ended it (W2-37). */
+const flowNumbers = new Map<string, number>();
+let lastFlow = 0;
 export function providerStarted(server: string): void {
   providerFlows.set(server, "started");
+  flowNumbers.set(server, ++lastFlow);
 }
 export function providerRefused(server: string): void {
   providerFlows.delete(server);
+  flowNumbers.delete(server);
 }
+/** The flow open on `server`, 0 for none. Read before `providerDone` ends it. */
+export const providerFlowOf = (server: string): number => flowNumbers.get(server) ?? 0;
 /** `ProviderBrowser`. Its dialog says "Your code" in the app's words with a code the relay
  *  chose, so it answers the person's own click, once, and nothing else. */
 export function providerPage(server: string, url: string, code: string): boolean {
@@ -164,7 +172,10 @@ export function providerPage(server: string, url: string, code: string): boolean
 }
 /** `ProviderDone`. Its notice says "confirmed", so it too answers only a flow the person
  *  started. A page they gave up on still counts: the provider may have finished it. */
-export const providerDone = (server: string): boolean => providerFlows.delete(server);
+export function providerDone(server: string): boolean {
+  flowNumbers.delete(server);
+  return providerFlows.delete(server);
+}
 
 /** Servers where this device's key went out for a pairing, and the pairing has not ended. */
 const looks = new Set<string>();
@@ -181,6 +192,7 @@ export const takeLook = (server: string): boolean => looks.delete(server);
 export function dropPrompts(server: string): void {
   setups.delete(server);
   providerFlows.delete(server);
+  flowNumbers.delete(server);
   for (let i = waiting.length - 1; i >= 0; i--) {
     if (waiting[i].server === server && !ONCE.includes(waiting[i].kind)) waiting.splice(i, 1);
   }

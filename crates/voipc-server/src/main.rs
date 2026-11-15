@@ -1042,6 +1042,15 @@ async fn main() -> Result<()> {
             relay_id = %hex::encode(relay.relay_id),
             "accounts on"
         );
+        // A deleted channel's rows that a stop cut short (`channel_purge`)
+        let purger = relay.clone();
+        tokio::spawn(async move {
+            match purger.purge_unfinished().await {
+                Ok(n) if n > 0 => info!(channels = n, "finished taking deleted channels' rows"),
+                Ok(_) => {}
+                Err(e) => warn!("finishing deleted channels' rows: {e:#}"),
+            }
+        });
         // Expired sessions, invites, old audit rows and unused device keys.
         let sweeper = relay.clone();
         tokio::spawn(async move {
@@ -1359,7 +1368,8 @@ async fn main() -> Result<()> {
                     // A native client's files, or the TCP fallback
                     Some(b"http/1.1") => {
                         tunnel::tune(tls_stream.get_ref().0, peer_addr);
-                        tunnel::serve(tls_stream, http_state, peer_addr).await;
+                        let binding = web::tls_binding(tls_stream.get_ref().1);
+                        tunnel::serve(tls_stream, http_state, peer_addr, binding).await;
                     }
                     _ => debug!(peer = %peer_addr, "no ALPN (a pre-0.5 client?), closing"),
                 },

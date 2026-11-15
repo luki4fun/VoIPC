@@ -403,7 +403,7 @@ export function fileRef(v: unknown): FileRef | undefined {
 /** The fields the archive has a place of its own for (crypto.rs `ChatMessage`). */
 const ARCHIVE_FIELDS = new Set(["user_id", "username", "content", "timestamp", "kind", "id", "expires_at", "account"]);
 /** The fields `extra` holds that this version reads back (`fromArchived`). */
-const EXTRA_FIELDS = new Set(["reply_to", "thread", "file", "fwd", "edited_at", "reactions", "pin", "hide", "power"]);
+const EXTRA_FIELDS = new Set(["reply_to", "thread", "file", "fwd", "edited_at", "reactions", "pin", "hide", "power", "relay_at"]);
 
 /**
  * A message as the desktop archive stores it: every field it has no place of
@@ -450,6 +450,7 @@ export function fromArchived(m: ChatMessage & { extra?: string | null }): ChatMe
       ...messageRefs(more),
       ...eventState(more, rest.timestamp),
       ...(more.power === true ? { power: true } : {}),
+      ...(typeof more.relay_at === "number" && Number.isFinite(more.relay_at) ? { relay_at: more.relay_at } : {}),
       ...(unknown.length > 0 ? { extra_kept: JSON.stringify(Object.fromEntries(unknown)) } : {}),
     };
   } catch {
@@ -547,15 +548,29 @@ export interface ChatPlace {
   /** `host:port`, as chat keys carry it. */
   server: string;
   name: string;
+  /** Whose history: the account (hex), `""` for a guest's (`splitChatKey`). */
+  scope: string;
 }
 
-/** `host:port/name`; a channel name may hold a slash of its own. */
-export function splitChatKey(key: string): { server: string; name: string } | null {
-  const m = /^([^/]+:\d+)\/(.*)$/s.exec(key);
-  return m ? { server: m[1], name: m[2] } : null;
+/** `host:port/name`, or `host:port~<account>/name` for an account's own history (1.12); a
+ *  channel name may hold a slash of its own. `scope`: the account, `""` for a guest's. */
+export function splitChatKey(key: string): { server: string; name: string; scope: string } | null {
+  const m = /^([^/~]+:\d+)(?:~([0-9a-f]{32}))?\/(.*)$/s.exec(key);
+  return m ? { server: m[1], name: m[3], scope: m[2] ?? "" } : null;
 }
 
-const byTimestamp = (a: ChatMessage, b: ChatMessage) => a.timestamp - b.timestamp;
+/** Two copies of one conversation as one: `kept`, and what `more` has that it lacks, by time.
+ *  For history moved between keys (`adoptGuestHistory`), never for what a member offers. */
+export function joinHistories(kept: ChatMessage[], more: ChatMessage[]): ChatMessage[] {
+  const added = more.filter((m) => !kept.some((k) => sameMessage(k, m)));
+  if (added.length === 0) return kept;
+  return [...kept, ...added].sort(byReadingTime);
+}
+
+/** Where a row stands in a conversation: a stored row by when the relay filed it
+ *  (`relay_at`), any other by its own time. */
+export const readingAt = (m: ChatMessage): number => m.relay_at ?? m.timestamp;
+const byReadingTime = (a: ChatMessage, b: ChatMessage) => readingAt(a) - readingAt(b);
 
 export interface MergeResult {
   messages: ChatMessage[];
@@ -622,6 +637,11 @@ export function mergeHistory(
           kept[seen] = { ...kept[seen], expires_at: sooner };
           replaced++;
         }
+        // The relay's read of a row seen live: from now on it stands where the log has it
+        if (m.relay_at !== undefined && kept[seen].relay_at === undefined && kept[seen].account) {
+          kept[seen] = { ...kept[seen], relay_at: m.relay_at };
+          replaced++;
+        }
       }
       continue;
     }
@@ -632,7 +652,7 @@ export function mergeHistory(
     // A divider marks where a hand-off's messages end, so one that brought
     // nothing draws none — but a copy it corrected still has to be written.
     return {
-      messages: replaced > 0 ? [...kept, ...markers].sort(byTimestamp) : existing,
+      messages: replaced > 0 ? [...kept, ...markers].sort(byReadingTime) : existing,
       added: 0,
     };
   }
@@ -647,7 +667,7 @@ export function mergeHistory(
   };
   // This sharer's previous divider moves; everyone else's stays where it is.
   const others = markers.filter((m) => m.content !== marker.content);
-  const messages = [...kept, ...others, marker].sort(byTimestamp);
+  const messages = [...kept, ...others, marker].sort(byReadingTime);
   if (messages.length > MAX_MESSAGES) {
     messages.splice(0, messages.length - MAX_MESSAGES);
   }

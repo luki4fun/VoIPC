@@ -38,6 +38,7 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
+use voipc_crypto::bind::{BIND_LEN, EXPORTER_LABEL};
 use wtransport::config::{DnsLookupFuture, DnsResolver, QuicTransportConfig};
 use wtransport::endpoint::endpoint_side::Client;
 use wtransport::{ClientConfig, Connection, Endpoint, RecvStream, VarInt};
@@ -112,6 +113,24 @@ pub struct Link {
     pub conn: Conn,
     pub control_send: Box<dyn AsyncWrite + Send + Unpin>,
     pub control_recv: Box<dyn AsyncRead + Send + Unpin>,
+    /// This end's TLS exporter (`voipc_crypto::bind`), which a sign-in's proofs are bound
+    /// to. The relay reads the same from its end; through a server in between it differs.
+    pub binding: Option<[u8; BIND_LEN]>,
+}
+
+/// The exporter of a QUIC connection.
+fn quic_binding(connection: &Connection) -> Option<[u8; BIND_LEN]> {
+    let mut out = [0u8; BIND_LEN];
+    connection
+        .export_keying_material(&mut out, EXPORTER_LABEL, &[])
+        .ok()
+        .map(|()| out)
+}
+
+/// The exporter of the TCP fallback's TLS session: the same label and (empty) context.
+fn tls_binding(conn: &rustls::ClientConnection) -> Option<[u8; BIND_LEN]> {
+    conn.export_keying_material([0u8; BIND_LEN], EXPORTER_LABEL, Some(&[]))
+        .ok()
 }
 
 /// Resolve `host` and connect: QUIC first, the TCP fallback once QUIC has
@@ -292,6 +311,7 @@ async fn connect_quic(
     // Control messages must not wait behind video frames, which go out in order.
     control_send.set_priority(1);
 
+    let binding = quic_binding(&connection);
     Ok((
         Link {
             conn: Conn::Quic(Quic {
@@ -300,6 +320,7 @@ async fn connect_quic(
             }),
             control_send: Box::new(control_send),
             control_recv: Box::new(control_recv),
+            binding,
         },
         sight,
     ))
@@ -565,7 +586,8 @@ async fn open_tunnel(
         return Err(format!("{addr} answered the TCP fallback upgrade wrongly"));
     }
     info!("connected to {addr} over the TCP fallback");
-    Ok(start_tunnel(tls, buf.split_off(end)))
+    let binding = tls_binding(tls.get_ref().1);
+    Ok(start_tunnel(tls, buf.split_off(end), binding))
 }
 
 /// A connection for file bytes (`files.rs`): TLS with `http/1.1` on the
@@ -630,7 +652,7 @@ fn tune(tcp: &TcpStream) {
 /// one-way pipes rather than one duplex split in two: the reader ending (the
 /// server closed, or went quiet) must read as the end of the control channel
 /// at once, whatever the writer is doing.
-fn start_tunnel<S>(stream: S, leftover: Vec<u8>) -> Link
+fn start_tunnel<S>(stream: S, leftover: Vec<u8>, binding: Option<[u8; BIND_LEN]>) -> Link
 where
     S: AsyncRead + AsyncWrite + Send + 'static,
 {
@@ -660,6 +682,7 @@ where
         }),
         control_send: Box::new(control_send),
         control_recv: Box::new(control_recv),
+        binding,
     }
 }
 
@@ -804,7 +827,12 @@ pub(crate) fn accept_key(key: &str) -> String {
 }
 
 fn server_name(host: &str) -> Result<ServerName<'static>, String> {
-    if let Ok(ip) = host.parse::<IpAddr>() {
+    // A link-local address names its interface (`fe80::1%eth0`), which no name and no
+    // certificate holds: the address without it (W2-36). An IP literal sends no SNI.
+    let address = host.split_once('%').map_or(host, |(ip, _)| ip);
+    if let Ok(ip) = address.parse::<std::net::Ipv6Addr>() {
+        Ok(ServerName::IpAddress(IpAddr::V6(ip).into()))
+    } else if let Ok(ip) = host.parse::<IpAddr>() {
         Ok(ServerName::IpAddress(ip.into()))
     } else {
         ServerName::try_from(host.to_string())
@@ -1180,6 +1208,20 @@ mod tests {
         Arc::new(rustls::crypto::ring::default_provider())
     }
 
+    /// W2-36: a link-local address with its interface, as a LAN link gives one. No name and
+    /// no certificate holds the interface, and the self-signed path still connects.
+    #[test]
+    fn a_link_local_address_with_its_interface_is_a_server_name() {
+        let ip: IpAddr = "fe80::1".parse().unwrap();
+        assert_eq!(
+            server_name("fe80::1%eth0").unwrap(),
+            ServerName::IpAddress(ip.into())
+        );
+        assert!(tls_config("fe80::1%eth0", 9987, true, b"h3").is_ok());
+        // Only an address: a name holding a `%` stays refused
+        assert!(server_name("evil%example").is_err());
+    }
+
     /// The real roots: nothing a test makes passes them.
     fn no_public_ca() -> VerifyAs {
         public_verifier("tofu-test.invalid", ring()).unwrap()
@@ -1241,6 +1283,57 @@ mod tests {
             Some(&vec![9; 32]),
             "the pin is left alone"
         );
+    }
+
+    /// W1-24: the app and the relay read the same exporter from one TLS session (the relay
+    /// with the same label and empty context, `web::tls_binding`), and another value from
+    /// any other session, which is what a server in between holds.
+    #[tokio::test]
+    async fn both_ends_of_a_tls_session_read_the_same_binding_and_another_session_another() {
+        use rcgen::{CertificateParams, KeyPair};
+        let key = KeyPair::generate().unwrap();
+        let cert = CertificateParams::new(vec!["bind.invalid".to_string()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let server_config = Arc::new(
+            rustls::ServerConfig::builder_with_provider(ring())
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![cert.der().clone()],
+                    rustls::pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into()),
+                )
+                .unwrap(),
+        );
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.der().clone()).unwrap();
+        let client_config = Arc::new(
+            rustls::ClientConfig::builder_with_provider(ring())
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let session = || async {
+            let (a, b) = tokio::io::duplex(1 << 16);
+            let acceptor = tokio_rustls::TlsAcceptor::from(server_config.clone());
+            let connector = tokio_rustls::TlsConnector::from(client_config.clone());
+            let name = ServerName::try_from("bind.invalid").unwrap();
+            let (server, client) = tokio::join!(acceptor.accept(b), connector.connect(name, a));
+            let (server, client) = (server.unwrap(), client.unwrap());
+            let theirs = server
+                .get_ref()
+                .1
+                .export_keying_material([0u8; BIND_LEN], EXPORTER_LABEL, Some(&[]))
+                .unwrap();
+            (tls_binding(client.get_ref().1).unwrap(), theirs)
+        };
+        let (ours, theirs) = session().await;
+        assert_eq!(ours, theirs);
+        let (again, _) = session().await;
+        assert_ne!(ours, again);
     }
 
     /// The verifier sees the certificate before the handshake proves the
@@ -1331,7 +1424,8 @@ mod tests {
             conn,
             mut control_send,
             mut control_recv,
-        } = start_tunnel(ours, Vec::new());
+            ..
+        } = start_tunnel(ours, Vec::new(), None);
         let Conn::Tunnel(mut tunnel) = conn else {
             unreachable!("start_tunnel builds a tunnel")
         };
@@ -1409,7 +1503,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_silent_tunnel_lives_through_a_persons_wait() {
         let (ours, mut server) = tokio::io::duplex(1 << 20);
-        let mut link = start_tunnel(ours, Vec::new());
+        let mut link = start_tunnel(ours, Vec::new(), None);
         // The relay's longest wait (`CHOICE_WAIT`), after a first word from it
         server_says(&mut server, &[&[0x00], b"first"]).await;
         let mut word = [0u8; 5];
@@ -1431,7 +1525,8 @@ mod tests {
             conn,
             control_send: _control_send,
             mut control_recv,
-        } = start_tunnel(ours, Vec::new());
+            ..
+        } = start_tunnel(ours, Vec::new(), None);
         let Conn::Tunnel(mut tunnel) = conn else {
             unreachable!("start_tunnel builds a tunnel")
         };

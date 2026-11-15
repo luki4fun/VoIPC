@@ -75,12 +75,23 @@ pub struct OpenGuild {
     pub admin: bool,
 }
 
+/// A Discord name drawn among the wizard's and the end screen's own words: nothing in it may
+/// turn those around or hide (W1-38), as every name that comes over is cleaned.
+fn drawn_name(raw: &str) -> String {
+    let name = names::clean_chars(raw, 100);
+    if name.is_empty() {
+        "(no name)".to_string()
+    } else {
+        name
+    }
+}
+
 pub async fn open<T: Transport>(api: &Api<T>) -> Result<Opening, String> {
     let me: User = must(api.get("/users/@me").await, "the bot")?;
     let app: Application = must(api.get("/applications/@me").await, "the application")?;
     let guilds: Vec<GuildBrief> = must(api.get("/users/@me/guilds").await, "its servers")?;
     Ok(Opening {
-        bot_name: me.username,
+        bot_name: drawn_name(&me.username),
         app_id: id(app.id),
         member_intent: app.member_intent(),
         content_intent: app.content_intent(),
@@ -88,7 +99,7 @@ pub async fn open<T: Transport>(api: &Api<T>) -> Result<Opening, String> {
             .into_iter()
             .map(|g| OpenGuild {
                 id: id(g.id),
-                name: g.name,
+                name: drawn_name(&g.name),
                 admin: g.permissions & discord::ADMINISTRATOR != 0,
             })
             .collect(),
@@ -926,12 +937,19 @@ fn role_notes(read: &Read, options: &ImportOptions, notes: &mut Vec<Note>) {
             notes.push(Note::screen(
                 "managed_role",
                 None,
-                format!("@{}: a bot's own role, which does not come.", role.name),
+                format!(
+                    "@{}: a bot's own role, which does not come.",
+                    drawn_name(&role.name)
+                ),
             ));
         } else {
             let lost = discord::lossy(role.permissions);
             if !lost.is_empty() {
-                let text = format!("@{}: nothing here for {}.", role.name, lost.join(", "));
+                let text = format!(
+                    "@{}: nothing here for {}.",
+                    drawn_name(&role.name),
+                    lost.join(", ")
+                );
                 notes.push(if options.roles {
                     Note::kept("lossy", None, text)
                 } else {
@@ -1290,7 +1308,11 @@ fn warnings(read: &Read, here: &Here, layout: &Layout, est: &Estimate) -> Vec<Wa
     let members = read.guild.approximate_member_count;
     let mut out = Vec::new();
     let mut say = |level: Level, code: &'static str, text: String| {
-        out.push(Warning { level, code, text });
+        out.push(Warning {
+            level,
+            code,
+            text: crate::words_only(text),
+        });
     };
     if online >= 789 {
         say(
@@ -1592,7 +1614,7 @@ pub fn build(read: &Read, here: &Here) -> Plan {
             };
             PlanChannel {
                 id: id(ch.id),
-                name: ch.name.clone(),
+                name: drawn_name(&ch.name),
                 final_name: planned.map_or_else(|| ch.name.clone(), |p| p.row.name.clone()),
                 kind: ch.kind,
                 category: ch.parent_id.map(id),
@@ -1634,7 +1656,7 @@ pub fn build(read: &Read, here: &Here) -> Plan {
         .into_iter()
         .map(|r| PlanRole {
             id: id(r.id),
-            name: r.name.clone(),
+            name: drawn_name(&r.name),
             members: read
                 .role_counts
                 .as_ref()
@@ -1677,7 +1699,7 @@ pub fn build(read: &Read, here: &Here) -> Plan {
     Plan {
         guild: PlanGuild {
             id: id(read.guild.id),
-            name: read.guild.name.clone(),
+            name: drawn_name(&read.guild.name),
             members: safe(read.guild.approximate_member_count),
             online: safe(read.guild.approximate_presence_count),
             mfa: read.guild.mfa_level != 0,
@@ -1791,6 +1813,32 @@ mod tests {
             .iter()
             .find(|c| c.row.dc_id == id)
             .unwrap_or_else(|| panic!("no channel {id}"))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_name_from_discord_cannot_turn_the_wizards_words_around() {
+        // W1-38: an override in a name would turn the words after it around, the
+        // privileges waiting for an OK among them
+        let mut read = read_fixture().await;
+        let flip = "\u{202E}nimda";
+        read.guild.name = format!("Guild{flip}");
+        for r in read.roles.iter_mut() {
+            r.name = format!("{}{flip}", r.name);
+        }
+        for c in read.channels.iter_mut() {
+            c.name = format!("{}{flip}", c.name);
+        }
+        let plan = build(&read, &fixture::here());
+        let drawn: Vec<&str> = std::iter::once(plan.guild.name.as_str())
+            .chain(plan.roles.iter().map(|r| r.name.as_str()))
+            .chain(plan.channels.iter().map(|c| c.name.as_str()))
+            .chain(plan.categories.iter().map(|c| c.name.as_str()))
+            .chain(plan.warnings.iter().map(|w| w.text.as_str()))
+            .chain(plan.report_preview.iter().map(String::as_str))
+            .collect();
+        assert!(drawn.iter().all(|s| !s.contains('\u{202E}')), "{drawn:?}");
+        assert!(plan.roles.iter().any(|r| r.name == "Adminnimda"));
+        assert_eq!(drawn_name("\u{2800}"), "(no name)");
     }
 
     #[tokio::test(start_paused = true)]

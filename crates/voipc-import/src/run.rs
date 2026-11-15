@@ -85,7 +85,9 @@ pub trait RelayLink: Send {
 /// Where an emote or a sticker goes: into the relay's own store, by the way any other does.
 /// `Err`: why it did not, and the run goes on without it.
 pub trait EmoteSink: Send {
-    fn add(&mut self, emote: &PlannedEmote) -> impl Future<Output = Result<(), String>> + Send;
+    /// Into the relay's store. `Ok`: the name it is listed under, `emote.name` unless an
+    /// earlier run put it there under another (W2-27).
+    fn add(&mut self, emote: &PlannedEmote) -> impl Future<Output = Result<String, String>> + Send;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -574,6 +576,7 @@ async fn emotes<L: RelayLink, E: EmoteSink>(
     sink: &mut E,
     job: &Job,
     layout: &Layout,
+    names: &mut Names,
     adding: &watch::Sender<bool>,
     report: &mut Report,
 ) -> Result<(), String> {
@@ -584,19 +587,27 @@ async fn emotes<L: RelayLink, E: EmoteSink>(
         }
         job.say(Phase::Emotes, done as u64, total, "");
         adding.send_replace(true);
-        if let Err(why) = sink.add(emote).await {
-            adding.send_replace(false);
-            report.notes.push(Note::screen(
-                "emote_failed",
-                None,
-                format!(":{}: did not come. {why}", emote.raw),
-            ));
-            continue;
+        let listed = match sink.add(emote).await {
+            Ok(listed) => listed,
+            Err(why) => {
+                adding.send_replace(false);
+                report.notes.push(Note::screen(
+                    "emote_failed",
+                    None,
+                    format!(":{}: did not come. {why}", emote.raw),
+                ));
+                continue;
+            }
+        };
+        // A run cut before its ledger frame left it listed under the name an earlier read
+        // gave it, and a new read named it anew: the ledger and the posts go by the first
+        if listed != emote.name {
+            names.emotes.insert(emote.id, listed.clone());
         }
         let op = AdminOp::ImportEmote {
             run: job.run,
             dc_id: emote.id,
-            name: emote.name.clone(),
+            name: listed,
         };
         let reply = w.ask(op).await;
         adding.send_replace(false);
@@ -1103,7 +1114,7 @@ async fn drive<T: Transport + 'static, L: RelayLink, E: EmoteSink>(
         bans(api, w, guild, run, &names, report).await?;
     }
     if layout.options.emotes {
-        emotes(w, sink, job, &layout, adding, report).await?;
+        emotes(w, sink, job, &layout, &mut names, adding, report).await?;
     }
     if layout.options.messages {
         let (threads, walks, forums) = walks_of(read, &here, &layout, &names, &gone);
@@ -1496,15 +1507,24 @@ mod tests {
     struct FakeSink {
         added: Vec<String>,
         fail: Option<String>,
+        /// Listed already under these names, by an earlier run.
+        listed: HashMap<u64, String>,
     }
 
     impl EmoteSink for FakeSink {
-        fn add(&mut self, emote: &PlannedEmote) -> impl Future<Output = Result<(), String>> + Send {
+        fn add(
+            &mut self,
+            emote: &PlannedEmote,
+        ) -> impl Future<Output = Result<String, String>> + Send {
             let out = if self.fail.as_deref() == Some(&emote.raw) {
                 Err("It would not download.".to_string())
             } else {
                 self.added.push(emote.name.clone());
-                Ok(())
+                Ok(self
+                    .listed
+                    .get(&emote.id)
+                    .cloned()
+                    .unwrap_or_else(|| emote.name.clone()))
             };
             async move { out }
         }
@@ -2261,6 +2281,31 @@ mod tests {
             .contains(":pog: did not come"));
     }
 
+    /// W2-27: a run cut between an emote's upload and its ledger frame, then the server read
+    /// again: its name was taken by then, so the plan named it anew. The sink finds the first
+    /// still listed, and the ledger and the posts go by that.
+    #[tokio::test(start_paused = true)]
+    async fn an_emote_listed_under_an_earlier_name_is_filed_under_it() {
+        let mut s = scene().await;
+        let pog = s.read.emojis.iter().find(|e| e.name == "pog").unwrap().id;
+        s.sink.listed.insert(pog, "pog_first".into());
+        let out = run_it(&mut s).await;
+        assert_eq!(out.stopped, None);
+        let named: Vec<&str> = s
+            .relay
+            .frames
+            .iter()
+            .filter_map(|f| match f {
+                AdminOp::ImportEmote { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(named.contains(&"pog_first"), "{named:?}");
+        assert!(!named.contains(&"pog"), "{named:?}");
+        let body = &s.relay.row(1_200_000_000_000_005_007).unwrap().body;
+        assert!(body.starts_with(":pog_first: and :party_blob:"), "{body}");
+    }
+
     /// Stop lands while the relay has been told of an emote and its ledger frame has not gone.
     #[tokio::test(start_paused = true)]
     async fn stop_waits_for_the_emote_in_hand_and_takes_no_more() {
@@ -2274,16 +2319,17 @@ mod tests {
             fn add(
                 &mut self,
                 emote: &PlannedEmote,
-            ) -> impl Future<Output = Result<(), String>> + Send {
+            ) -> impl Future<Output = Result<String, String>> + Send {
                 self.added.push(emote.name.clone());
                 let inside = self.inside.take();
                 let mut go = self.go.clone();
+                let name = emote.name.clone();
                 async move {
                     if let Some(inside) = inside {
                         let _ = inside.send(());
                     }
                     let _ = go.wait_for(|on| *on).await;
-                    Ok(())
+                    Ok(name)
                 }
             }
         }
@@ -2924,9 +2970,12 @@ mod tests {
     struct PressesStop(watch::Sender<bool>);
 
     impl EmoteSink for PressesStop {
-        fn add(&mut self, _: &PlannedEmote) -> impl Future<Output = Result<(), String>> + Send {
+        fn add(
+            &mut self,
+            emote: &PlannedEmote,
+        ) -> impl Future<Output = Result<String, String>> + Send {
             self.0.send_replace(true);
-            async { Ok(()) }
+            std::future::ready(Ok(emote.name.clone()))
         }
     }
 

@@ -8,7 +8,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { rosterForRow, rosterOf, summonOffered, trustRosterCount, worthAsking } from "./roster-rules.ts";
+import { rosterForRow, rosterOf, summonOffered, takesSwitch, trustRosterCount, worthAsking } from "./roster-rules.ts";
 import type { ChannelInfo, UserInfo } from "./types.ts";
 
 function channel(over: Partial<ChannelInfo> = {}): ChannelInfo {
@@ -152,4 +152,13 @@ test("an invite on a privilege is offered in a room we stand in, to a holder, on
   assert.equal(summonOffered(undefined, true, null), false, "in no room");
   assert.equal(summonOffered(channel({ channel_id: 0 }), true, null), false, "the lobby");
   assert.equal(summonOffered(channel({ anonymous: true }), true, null), false, "behind a pseudonym");
+});
+
+test("a pseudonym's row never takes the sharing switch, but its owner's and an admin's do (G1)", () => {
+  const anonymous = { anonymous: true };
+  assert.equal(takesSwitch(anonymous, 7, 1, false), false, "someone else's pseudonym");
+  assert.equal(takesSwitch(anonymous, 7, 7, false), true, "their own row");
+  assert.equal(takesSwitch(anonymous, 7, 1, true), true, "an admin's view");
+  assert.equal(takesSwitch({ anonymous: false }, 7, 1, false), true, "the control: a row under the name");
+  assert.equal(takesSwitch(undefined, 7, 1, false), true, "a channel not listed here");
 });

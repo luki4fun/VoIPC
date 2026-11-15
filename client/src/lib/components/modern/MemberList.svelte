@@ -146,7 +146,7 @@
         <span class="sharing-history" role="img" title="Shares history with newcomers" aria-label="Shares history with newcomers"><Icon name="history" size={12} /></span>
       {/if}
       {#if $blockedMember(user)}
-        <span class="blocked-mark" title="You blocked this person"><Icon name="ban" size={12} /></span>
+        <span class="blocked-mark" role="img" title="You blocked this person" aria-label="You blocked this person"><Icon name="ban" size={12} /></span>
       {/if}
       {#if user.user_id === $userId}
         <span class="you">(you)</span>
@@ -156,7 +156,8 @@
       <span class="status-icon muted" title="Muted"><Icon name="mic-off" size={14} /></span>
     {/if}
     {#if $restrictions.has(user.user_id)}
-      <span class="status-icon restricted-mark" title={markTitle($restrictions.get(user.user_id)!, Date.now())}><Icon name="hourglass" size={14} /></span>
+      {@const held = markTitle($restrictions.get(user.user_id)!, Date.now())}
+      <span class="status-icon restricted-mark" role="img" title={held} aria-label={held}><Icon name="hourglass" size={14} /></span>
     {/if}
     {#if user.is_deafened}
       <span class="status-icon deafened" title="Deafened"><Icon name="headphones-off" size={14} /></span>
@@ -275,14 +276,33 @@
     box-shadow: 0 0 0 2px var(--speaking);
   }
 
+  /* The name clips, not what stands after it: inline, a display name with its @tag pushed
+     the group's badge out of sight (W3-59) */
   .name {
     flex: 1;
+    display: flex;
+    align-items: center;
+    gap: 4px;
     font-size: var(--fs-md);
     color: var(--text-secondary);
     overflow: hidden;
-    text-overflow: ellipsis;
     white-space: nowrap;
     min-width: 0;
+  }
+
+  .name :global(.member-name) {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .crown,
+  .shield,
+  .badge,
+  .sharing-history,
+  .blocked-mark,
+  .you {
+    flex-shrink: 0;
   }
 
   .user:hover .name {

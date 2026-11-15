@@ -510,6 +510,7 @@ workflow section below.
 ```bash
 npm run web         # wasm crate + Vite bundle + server binary that embeds it
 VOIPC_SELFTEST=1 npm run web && npm run test:web   # headless two-browser end-to-end check
+# test:web's move lane also needs: cargo build --release --locked -p voipc-server --example import_replay
 ```
 
 The end-to-end check drives the page's built-in self-test, which only a bundle built with

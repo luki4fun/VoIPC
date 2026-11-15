@@ -8,8 +8,8 @@ const { invoked } = await import("./node-stores.mjs");
 const { autoJoinTextChannels, forgetAutoJoinAsk, hasNsfwConsent, giveNsfwConsent, isLeft, markKicked } = await import("./channel-ui.ts");
 const { channels } = await import("./channels.ts");
 const { activeTextChannelId, authorsHere, peerName, joinedTextChannelIds, addChannelMessage, channelMessages, chatKey, dmMessages, noteChannelUnseen, noteNeverOpened, clearChannelUnread, unseenChannels } = await import("./chat.ts");
-const { channelRosters, exchangedKey, goneFrom, noteJoin, noteLeft, onlineById, requestAllRosters, setRoster, textSeats } = await import("./rosters.ts");
-const { clearSweeps, noteMemberGone, onSweepPage, refreshList, setSweepQuiet, startSweeps, sweepForAsker } = await import("./sweep.ts");
+const { channelRosters, exchangedKey, goneFrom, noteJoin, noteLeft, onlineById, patchRosters, requestAllRosters, setRoster, textSeats } = await import("./rosters.ts");
+const { clearSweeps, joinedMade, noteMade, noteMemberGone, onSweepPage, refreshList, setSweepQuiet, startSweeps, sweepForAsker } = await import("./sweep.ts");
 const { askSharers, channelOpened, forgetHandOff, handOffAnswered, handOffs, reopenAfterDrop, sharersOf } = await import("./handoff.ts");
 const { channelRings, clearRing, flushMarks, forgetRings, lightRing, moveRead, noteLastPost, ringBack, ringForPost } = await import("./marks.ts");
 const { networkKnown } = await import("./emotes.ts");
@@ -178,6 +178,31 @@ test("a leave comes off the list and the count, with no ask", () => {
   assert.equal(asked("request_channel_users").length, 0);
 });
 
+test("a flag that comes while the join waits in the batch is on the row the batch writes", () => {
+  const s = server();
+  channels.of(s).set([voice(500)]);
+  setRoster(s, 500, [person(1, { channel_id: 500 })]);
+  const flag = (id: number) => get(channelRosters.peek(s)).get(500)!.find((u) => u.user_id === id)?.shares_history;
+  // Joined not sharing; the switch goes on 100 ms later, before the 250 ms flush
+  noteJoin(s, person(10, { channel_id: 500 }));
+  mock.timers.tick(100);
+  patchRosters(s, 10, { shares_history: true });
+  mock.timers.tick(200);
+  assert.equal(flag(10), true, "the join did not put the old flag back");
+  // The control: after the flush the patch lands on the row itself
+  noteJoin(s, person(11, { channel_id: 500 }));
+  mock.timers.tick(300);
+  patchRosters(s, 11, { shares_history: true });
+  assert.equal(flag(11), true);
+  // A channel `where` leaves out keeps the row as it came, queued or not
+  noteJoin(s, person(12, { channel_id: 500 }));
+  patchRosters(s, 12, { shares_history: true }, (id) => id !== 500);
+  mock.timers.tick(300);
+  patchRosters(s, 11, { shares_history: false }, (id) => id !== 500);
+  assert.equal(flag(12), false);
+  assert.equal(flag(11), true);
+});
+
 test("a join applies after a list that came before it, and twice counts once", () => {
   const s = server();
   channels.of(s).set([voice(500)]);
@@ -289,6 +314,43 @@ test("a quiet channel is not swept: opening it tells the relay anyway", () => {
   mock.timers.tick(1);
   onSweepPage(s, { channel_id: 2, rows: [], next: 0 });
   assert.equal(asked("request_channel_page")[1].channelId, 4);
+  clearSweeps(s);
+});
+
+test("a first sweep with nothing to ask is no sweep: the next comes in a minute, not ten", () => {
+  const s = server();
+  // Only an open channel at the first join: nothing goes by a list yet
+  channels.of(s).set([ch(1)]);
+  joinedTextChannelIds.of(s).set(new Set([1]));
+  textSeats.of(s).set(new Map([[1, { gated: false, lastPost: 0 }]]));
+  startSweeps(s, 0);
+  mock.timers.tick(1);
+  assert.equal(asked("request_channel_page").length, 0);
+  // Then one made by hand is followed, and its list comes within the minute
+  channels.of(s).set([ch(1), ch(4, { auto_join: false })]);
+  joinedTextChannelIds.of(s).set(new Set([1, 4]));
+  mock.timers.tick(60_000);
+  assert.deepEqual(asked("request_channel_page").map((a) => a.channelId), [4]);
+  // A sweep that asked counts: the next is ten minutes on
+  onSweepPage(s, { channel_id: 4, rows: [], next: 0 });
+  mock.timers.tick(599_000);
+  assert.equal(asked("request_channel_page").length, 1);
+  mock.timers.tick(1000);
+  assert.equal(asked("request_channel_page").length, 2);
+  clearSweeps(s);
+});
+
+test("a channel this person made has its list asked at their join, once", () => {
+  const s = server();
+  channels.of(s).set([ch(4, { auto_join: false }), ch(5, { auto_join: false })]);
+  noteMade(s, 4);
+  joinedMade(s, [4]);
+  assert.deepEqual(asked("request_channel_page"), [{ server: s, channelId: 4, after: 0 }]);
+  onSweepPage(s, { channel_id: 4, rows: [person(1)], next: 0 });
+  assert.deepEqual(get(channelRosters.peek(s)).get(4)!.map((u) => u.user_id), [1]);
+  // Followed again (a reconnect), or one somebody else made: no ask
+  joinedMade(s, [4, 5]);
+  assert.equal(asked("request_channel_page").length, 1);
   clearSweeps(s);
 });
 

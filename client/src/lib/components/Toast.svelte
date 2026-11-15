@@ -75,6 +75,53 @@
     }
   }
 
+  /* A short window, 800x600 the desktop's first: at the bottom the stack covered a dialog's
+     buttons and its error, Next on the first-run microphone check and the Connect error
+     among them (device pass). At the top it can cover a title for its seconds, no button */
+  @media (max-height: 720px) {
+    .toast-container {
+      top: 12px;
+      bottom: auto;
+      right: auto;
+      left: 50%;
+      transform: translateX(-50%);
+      flex-direction: column;
+    }
+
+    .toast {
+      animation-name: drop-in;
+    }
+  }
+
+  /* A phone's dialog has its buttons at the bottom too: a toast that stays (a new server's
+     certificate) sat on Connect, and a tap there hit the toast (rc.2 device run). While one is
+     open the stack goes to the top; with none, the top has the header's buttons, so not then */
+  @media (max-width: 600px) {
+    :global(body:has([aria-modal="true"])) .toast-container {
+      top: calc(12px + env(safe-area-inset-top, 0px));
+      bottom: auto;
+      right: auto;
+      left: 50%;
+      transform: translateX(-50%);
+      flex-direction: column;
+    }
+
+    :global(body:has([aria-modal="true"])) .toast {
+      animation-name: drop-in;
+    }
+  }
+
+  @keyframes drop-in {
+    from {
+      transform: translateY(-100%);
+      opacity: 0;
+    }
+    to {
+      transform: translateY(0);
+      opacity: 1;
+    }
+  }
+
   /* What kind of news, as a dot before the words (the role says it to a
      screen reader) */
   .toast::before {

@@ -44,7 +44,9 @@ test("what I am looking at neither counts nor sounds, and may still notify a win
 });
 
 test("my own message makes no sound, and tells me nothing", () => {
-  assert.deepEqual(arrival("all", { mine: true, onScreen: false, forMe: false }), { count: true, sound: false, os: false });
+  // W3-26: one forwarded into another channel counted as unread there
+  assert.deepEqual(arrival("all", { mine: true, onScreen: false, forMe: false }), { count: false, sound: false, os: false });
+  assert.deepEqual(arrival("all", { mine: false, onScreen: false, forMe: false }), { count: true, sound: true, os: false }, "the control");
 });
 
 test("the page counts as in view only if it is both shown and focused", () => {
@@ -53,6 +55,9 @@ test("the page counts as in view only if it is both shown and focused", () => {
   assert.equal(pageInView(page(true, true)), false, "a WebView behind HOME says it has focus");
   assert.equal(pageInView(page(false, false)), false, "another window has it");
   assert.equal(pageInView(page(true, false)), false);
+  // Android's shade over the app in front: shown and focused, says the page; not the window
+  assert.equal(pageInView(page(false, true), false), false, "the window lost focus under the shade");
+  assert.equal(pageInView(page(false, true), true), true, "the control: the window has it");
 });
 
 test("only a mouse holds a toast's clock", () => {

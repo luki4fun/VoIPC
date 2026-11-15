@@ -114,8 +114,9 @@ export interface UiPrefs {
   /** Categories folded in the sidebar, by `"host:port"`. */
   folded_categories: Record<string, number[]>;
   /**
-   * Where this person read each followed channel, by `"host:port"` and then the
-   * channel's log or name, in the relay's clock (`marks-rules.ts`).
+   * Where this person read each followed channel, by the history's key (`"host:port"` for a
+   * guest, `"host:port~<account>"` for an account, `history-scope.ts`) and then the channel's
+   * log or name, in the relay's clock (`marks-rules.ts`).
    */
   read_marks: Record<string, Record<string, number>>;
   /** Channels ever opened on this device, by `"host:port"`: the others keep fewer messages. */
@@ -125,9 +126,13 @@ export interface UiPrefs {
   gates_seen: Record<string, string[]>;
   /**
    * Who this device told its person can read what they write in a channel with a list, by
-   * `"host:port"` and then the channel's log or name: each is named once ever.
+   * the history's key, as `read_marks`, and then the channel's log or name: each is named
+   * once ever.
    */
   readers_named: Record<string, Record<string, string[]>>;
+  /** Servers, by `"host:port"`, whose history from before 1.12 has been given its owner:
+   *  the account this device remembers there, or the guest (`adoptGuestHistory`). */
+  history_split: string[];
   /**
    * Quiet mode, by `"host:port"`: whether it holds, and the channels that still arrive here by
    * log or name. Here and never in the vault or on the server: only this person turns it on.
@@ -230,6 +235,7 @@ export function defaultUiPrefs(): UiPrefs {
     opened_channels: {},
     gates_seen: {},
     readers_named: {},
+    history_split: [],
     newest_protocol: {},
     quiet_mode: {},
     welcomed: [],
@@ -479,6 +485,7 @@ export function sanitizeUiPrefs(raw: unknown): UiPrefs {
       Array.isArray(v) ? v.filter((x): x is string => typeof x === "string").slice(-READERS_MAX_PER_CHANNEL) : undefined,
     ),
     quiet_mode: quietModes(r.quiet_mode),
+    history_split: nsfwOk(r.history_split),
     newest_protocol: Object.fromEntries(
       Object.entries(typeof r.newest_protocol === "object" && r.newest_protocol !== null ? r.newest_protocol : {})
         .filter((e): e is [string, number] => Number.isInteger(e[1]))

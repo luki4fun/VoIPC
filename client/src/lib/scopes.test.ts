@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { allowed, canWith, grants, noPowerOverAnyone, PRIVILEGES, privilegesOn, SHARE_HISTORY } from "./scopes.ts";
+import { allowed, canWith, grants, noPowerOverAnyone, noTabLine, PRIVILEGES, privilegesOn, SHARE_HISTORY, toggledScope } from "./scopes.ts";
 
 test("a grant covers what l4f says it covers, and nothing more", () => {
   assert.equal(grants("*", "voipc:kick"), true);
@@ -61,4 +61,14 @@ test("a group holding nothing, or only Share history, has no power over anyone",
   assert.equal(noPowerOverAnyone(["voipc:mention_all"]), false, "what spares nobody can still be power to hand out");
   assert.equal(noPowerOverAnyone(["voipc:*"]), false);
   assert.equal(noPowerOverAnyone(["*"]), false);
+});
+
+// W3-25: Manage accounts alone opened the panel on the Bans form, with no way to the account list
+test("managing accounts comes with seeing them, either way round", () => {
+  assert.deepEqual(toggledScope(["voipc:ban"], "users:admin", true), ["users:admin", "users:read", "voipc:ban"]);
+  assert.deepEqual(toggledScope(["users:admin", "users:read"], "users:read", false), []);
+  assert.deepEqual(toggledScope(["users:admin", "users:read"], "users:admin", false), ["users:read"], "seeing alone is fine");
+  assert.deepEqual(toggledScope([], "voipc:ban", true), ["voipc:ban"], "the control: others go alone");
+  assert.match(noTabLine((s) => s === "users:admin"), /See accounts/);
+  assert.doesNotMatch(noTabLine(() => false), /See accounts/);
 });

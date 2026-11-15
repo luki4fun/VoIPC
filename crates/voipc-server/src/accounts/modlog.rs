@@ -586,7 +586,10 @@ pub async fn remove_posts(
         .posts_remove(account, imported, since_ms, before_ms, &window, &row)
         .await
     {
-        Ok(entries) => entries,
+        Ok(entries) => {
+            relay.at_connect.marks.changed();
+            entries
+        }
         Err(e) => {
             warn!("removing posts: {e:#}");
             return refused("Admin", "That could not be kept, so nothing was removed.");
@@ -639,14 +642,52 @@ pub async fn send_marks(state: &ServerState, tx: &ControlTx) {
     let Some(relay) = &state.accounts else {
         return;
     };
-    match relay.modlog_marks().await {
-        Ok(marks) => {
-            for marks in mark_frames(marks) {
-                let _ = crate::session::send_msg(tx, &ServerMessage::PostsHidden { marks });
+    if send_marks_once(relay, tx).await {
+        return;
+    }
+    // A client that missed them would show removed posts until it connects again (W2-16)
+    let (relay, tx) = (relay.clone(), tx.clone());
+    tokio::spawn(async move {
+        for _ in 0..MARKS_RETRIES {
+            tokio::time::sleep(MARKS_RETRY_AFTER).await;
+            if tx.is_closed() || send_marks_once(&relay, &tx).await {
+                return;
             }
         }
-        Err(e) => warn!("reading what was removed: {e:#}"),
+    });
+}
+
+/// Tries again after a failed read at connect, this often, this far apart.
+const MARKS_RETRIES: usize = 5;
+const MARKS_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The marks, read once for all who connect a while (`at_connect`). False: the read failed.
+async fn send_marks_once(relay: &Relay, tx: &ControlTx) -> bool {
+    let frames = relay
+        .at_connect
+        .marks
+        .frames(|| async {
+            match relay.modlog_marks().await {
+                Ok(marks) => mark_frames(marks)
+                    .into_iter()
+                    .map(|marks| encode_server_msg(&ServerMessage::PostsHidden { marks }))
+                    .collect::<Result<Vec<_>, _>>()
+                    .inspect_err(|e| warn!("telling what was removed: {e:#}"))
+                    .ok(),
+                Err(e) => {
+                    warn!("reading what was removed: {e:#}");
+                    None
+                }
+            }
+        })
+        .await;
+    let Some(frames) = frames else {
+        return false;
+    };
+    for data in frames.iter() {
+        let _ = tx.try_send(data.clone());
     }
+    true
 }
 
 /// Rows past `modlog_days`; run with the hourly sweep. By time alone: evicting by
@@ -656,6 +697,9 @@ pub async fn sweep(relay: &Relay) -> Result<u64> {
     let n = db!(relay.store(), pool => {
         sqlx::query("DELETE FROM voipc_modlog WHERE at < $1").bind(cutoff).execute(pool).await?.rows_affected()
     });
+    if n > 0 {
+        relay.at_connect.marks.changed();
+    }
     Ok(n)
 }
 

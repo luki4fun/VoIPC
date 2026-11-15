@@ -84,6 +84,47 @@ export function stepUpCancelled(op: AdminOp | null): string {
  *  answers a connection's requests in order). */
 export const lastOp = new Map<string, AdminOp>();
 
+// ── Numbered asks (protocol v22) ────────────────────────────────────────────
+//
+// Every admin request goes as `AdminAsk`, and a 22 relay's answers carry its number back as
+// `ask` on the reply, a refusal included: a refusal names no step, and the wizard, an undo and
+// a panel asking side by side took each other's (W2-31). An older relay is sent plain `Admin`
+// (compat.rs) and answers unnumbered; what goes by these then guesses as before.
+
+let nextAsk = 1;
+/** What each number asked, per server, the newest few hundred: an answer may come more than
+ *  once (`ImportBackingUp`, then `ImportBegun`), so a number stays after its first. */
+const asks = new Map<string, Map<number, AdminOp>>();
+const ASKS_KEPT = 256;
+
+function numbered(server: string, op: AdminOp, code: string | null) {
+  const ask = nextAsk;
+  nextAsk = nextAsk >= 0xffff_ffff ? 1 : nextAsk + 1;
+  let kept = asks.get(server);
+  if (!kept) asks.set(server, (kept = new Map()));
+  kept.set(ask, op);
+  if (kept.size > ASKS_KEPT) kept.delete(kept.keys().next().value!);
+  return { AdminAsk: { ask, op, code } };
+}
+
+/** The step an answer answers, by its number; undefined for an unnumbered answer (a relay
+ *  before 22) or a number this page did not give. */
+export function askedOp(server: string, ask: unknown): AdminOp | undefined {
+  return typeof ask === "number" ? asks.get(server)?.get(ask) : undefined;
+}
+
+/** The number's step's name: `{ ImportBegin: … }` is "ImportBegin", `"MoveStatus"` itself. */
+export function askedName(server: string, ask: unknown): string | undefined {
+  const op = askedOp(server, ask);
+  if (op === undefined) return undefined;
+  return typeof op === "string" ? op : Object.keys(op)[0];
+}
+
+/** A server closed: its numbers say nothing to the next connection's answers. */
+export function forgetAsks(server: string): void {
+  asks.delete(server);
+}
+
 /**
  * The removal a code was just sent for, per server. Its checks came before the code
  * was asked for, so a refusal now is that code: from the ban dialog there is no button
@@ -104,7 +145,7 @@ export function codeAskedAgain(server: string): boolean {
  */
 export function modNote(server: string, channelId: number, target: string, message: string, on: boolean): void {
   const op: AdminOp = { ModNote: { channel_id: channelId, target, message, on } };
-  invoke("account_request", { server, request: { Admin: { op, code: null } } }).catch((e: unknown) =>
+  invoke("account_request", { server, request: numbered(server, op, null) }).catch((e: unknown) =>
     console.warn("a moderation note did not go:", e),
   );
 }
@@ -112,7 +153,7 @@ export function modNote(server: string, channelId: number, target: string, messa
 /** A read: it asks for no code, so a `StepUp` still out goes on answering the step before
  *  it (`lastOp`), and a refusal shown stays shown. */
 export function adminRead(op: AdminOp, server = get(serverAddress)): void {
-  invoke("account_request", { server, request: { Admin: { op, code: null } } }).catch((e: unknown) =>
+  invoke("account_request", { server, request: numbered(server, op, null) }).catch((e: unknown) =>
     adminError.of(server).set(String(e)),
   );
 }
@@ -121,7 +162,7 @@ export async function adminOp(op: AdminOp, code: string | null = null, server = 
   lastOp.set(server, op);
   adminError.of(server).set(null);
   try {
-    await invoke("account_request", { server, request: { Admin: { op, code } } });
+    await invoke("account_request", { server, request: numbered(server, op, code) });
   } catch (e) {
     adminError.of(server).set(String(e));
   }

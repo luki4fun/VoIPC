@@ -192,6 +192,16 @@ export function rosterForRow(
  * lobby takes no invites, and an anonymous room is the one place we go by a
  * pseudonym, from behind which the relay lets nobody summon.
  */
+/**
+ * Whether a row in `channel` takes a person's own switch (history sharing) as the relay
+ * announces it. The announcement goes to everyone by id, and a pseudonym's row has that id
+ * for whoever stands in the room, so applied there it would put back the icon the relay keeps
+ * off pseudonyms for all but their owner and admins (G1, `masked` in state.rs).
+ */
+export function takesSwitch(channel: Pick<ChannelInfo, "anonymous"> | undefined, rowUserId: number, me: number, admin: boolean): boolean {
+  return !channel?.anonymous || admin || rowUserId === me;
+}
+
 export function summonOffered(room: ChannelInfo | undefined, holds: boolean, protocol: number | null): boolean {
   return holds && moderation(protocol) && !!room && room.channel_id !== 0 && !room.anonymous;
 }

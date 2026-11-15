@@ -14,10 +14,11 @@ export const OWN_CLOCK_SLACK_MS = 5000;
  * A mark from the relay (`TextJoined`, `ChannelMarks`) against where this person read. A value
  * never seen is taken as read: the first sight of a channel is the baseline, so a new member
  * sees no marks. Zero is a relay that restarted and has seen no post since, so no ring, and
- * never a false one.
+ * never a false one. A first sight of zero is a baseline too, before any post: it kept none,
+ * so the channel's first post became the baseline and never rang (device pass, `afterMark`).
  */
 export function afterMark(read: number | undefined, lastPost: number): { read: number | undefined; ring: boolean } {
-  if (lastPost <= 0) return { read, ring: false };
+  if (lastPost <= 0) return { read: read ?? 1, ring: false };
   if (read === undefined) return { read: lastPost, ring: false };
   return { read, ring: lastPost > read + OWN_CLOCK_SLACK_MS };
 }

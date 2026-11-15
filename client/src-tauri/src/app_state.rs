@@ -524,6 +524,13 @@ pub struct ChatState {
     pub file_path: PathBuf,
     /// Whether there are unsaved changes.
     pub dirty: bool,
+    /// Log read cursors that moved past what the front end has saved, by `memory_key`, each
+    /// with the read it came from. The archive takes one only when the front end saved up
+    /// to that read (`commit_reads`): on disk ahead of the posts it read, a crash between
+    /// the two lost those posts on this device for good (Round C).
+    pub pending_reads: HashMap<String, (u64, voipc_crypto::sync::LogMemory)>,
+    /// The last read numbered (`log-read-upto`).
+    pub read_gen: u64,
 }
 
 impl Default for ChatState {
@@ -534,7 +541,46 @@ impl Default for ChatState {
             salt: [0u8; 32],
             file_path: PathBuf::new(),
             dirty: false,
+            pending_reads: HashMap::new(),
+            read_gen: 0,
         }
+    }
+}
+
+impl ChatState {
+    /// A read moved `key`'s cursors: held until the front end has saved what it read.
+    /// The number the front end passes back when it has (`log-read-upto`).
+    pub fn read_moved(&mut self, key: String, memory: voipc_crypto::sync::LogMemory) -> u64 {
+        self.read_gen += 1;
+        self.pending_reads.insert(key, (self.read_gen, memory));
+        self.read_gen
+    }
+
+    /// The front end has saved every post read up to read `upto`: their cursors go to the
+    /// archive. Whether any did.
+    pub fn commit_reads(&mut self, upto: u64) -> bool {
+        let done: Vec<String> = self
+            .pending_reads
+            .iter()
+            .filter(|(_, (gen, _))| *gen <= upto)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in &done {
+            if let Some((_, memory)) = self.pending_reads.remove(key) {
+                self.archive.cursors.insert(key.clone(), memory);
+            }
+        }
+        !done.is_empty()
+    }
+
+    /// What a session under `key` goes on from: the newest, saved or not.
+    pub fn log_memory(&self, key: &str) -> voipc_crypto::sync::LogMemory {
+        self.pending_reads
+            .get(key)
+            .map(|(_, m)| m)
+            .or_else(|| self.archive.cursors.get(key))
+            .cloned()
+            .unwrap_or_default()
     }
 }
 
@@ -1080,6 +1126,37 @@ pub fn merge_source(
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    /// A read's cursors reach the archive only once the front end saved what that read filed:
+    /// ahead of the posts, a crash between lost them on this device for good (Round C).
+    #[test]
+    fn a_reads_cursors_wait_for_the_save_of_what_it_read() {
+        let memory = |at: i64| voipc_crypto::sync::LogMemory {
+            cursors: [("d:x".to_string(), at)].into_iter().collect(),
+            ..Default::default()
+        };
+        let mut chat = ChatState::default();
+        chat.archive.cursors.insert("r|luki".into(), memory(3));
+        let first = chat.read_moved("r|luki".into(), memory(5));
+        let second = chat.read_moved("r|luki".into(), memory(9));
+        let other = chat.read_moved("r|ann".into(), memory(4));
+        assert!(first < second && second < other);
+        // Nothing saved yet: the archive keeps what it had, a new session goes on from the newest
+        assert_eq!(chat.archive.cursors["r|luki"].cursors["d:x"], 3);
+        assert_eq!(chat.log_memory("r|luki").cursors["d:x"], 9);
+        // A save that took the stores after the first read only: the second read is
+        // later than it, so none of luki's moves yet
+        assert!(!chat.commit_reads(first));
+        assert_eq!(chat.archive.cursors["r|luki"].cursors["d:x"], 3);
+        // After the second
+        assert!(chat.commit_reads(second));
+        assert_eq!(chat.archive.cursors["r|luki"].cursors["d:x"], 9);
+        assert!(!chat.archive.cursors.contains_key("r|ann"));
+        assert!(chat.commit_reads(other));
+        assert_eq!(chat.archive.cursors["r|ann"].cursors["d:x"], 4);
+        assert!(chat.pending_reads.is_empty());
+        assert_eq!(chat.log_memory("r|nobody").cursors.len(), 0);
+    }
 
     #[test]
     fn a_channel_list_past_one_frame_is_told_whole_at_its_last_frame() {

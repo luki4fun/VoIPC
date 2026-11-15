@@ -255,7 +255,10 @@ pub(crate) fn validate_entries(entries: &[ChannelEntry]) -> anyhow::Result<()> {
                 name
             );
         }
-        if name.len() > 64 {
+        // Characters, as the error and the app say, and as Postgres counts a VARCHAR:
+        // counted in bytes, 25 Japanese ones were refused as over 64 (W3-22). A list too big
+        // for one frame goes in several (`send_channel_list`)
+        if name.chars().count() > 64 {
             bail!("channel '{}' name exceeds 64 characters", name);
         }
         // The channel list is one message to every client on every connect,
@@ -263,7 +266,7 @@ pub(crate) fn validate_entries(entries: &[ChannelEntry]) -> anyhow::Result<()> {
         // sent, and everybody arrives at a server that appears to have no
         // channels. The name is bounded above; the description is the other
         // field big enough to get there on its own.
-        if entry.description.len() > 256 {
+        if entry.description.chars().count() > 256 {
             bail!("channel '{}' description exceeds 256 characters", name);
         }
         // The same bound a message's own timer gets, and the same reason: a
@@ -389,6 +392,24 @@ mod tests {
             "md5:5ebe2294ecd0e0f08eab7690d2a6ee69"
         ));
         assert!(hash_password("").is_err());
+    }
+
+    /// W3-22: the limits are characters, as their errors say.
+    #[test]
+    fn a_name_and_a_description_are_counted_in_characters() {
+        let entry = |name: String, description: String| ChannelEntry {
+            name,
+            description,
+            ..Default::default()
+        };
+        let ok = |n: usize, d: usize| validate_entries(&[entry("日".repeat(n), "д".repeat(d))]);
+        assert!(ok(25, 150).is_ok(), "75 and 300 bytes");
+        assert!(ok(64, 256).is_ok());
+        assert!(ok(65, 0).unwrap_err().to_string().contains("64 characters"));
+        assert!(ok(1, 257)
+            .unwrap_err()
+            .to_string()
+            .contains("256 characters"));
     }
 
     #[test]

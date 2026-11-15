@@ -116,6 +116,7 @@ pub async fn connect_to_server(
                 conn,
                 mut control_send,
                 mut control_recv,
+                binding,
             },
             first_pin,
         ) = crate::transport::connect(&host, port, accept_invalid_certs).await?;
@@ -148,6 +149,7 @@ pub async fn connect_to_server(
                 &mut control_recv,
                 &mut buf,
                 proto,
+                binding,
             )
             .await
             .map(|(user_id, session_id, link, files, emotes)| {

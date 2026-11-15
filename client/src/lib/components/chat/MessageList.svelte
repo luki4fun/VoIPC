@@ -856,6 +856,13 @@
     cursor: pointer;
   }
 
+  @media (pointer: coarse) {
+    .folded-show {
+      min-height: var(--hit);
+      padding: 0 var(--sp-2, 8px);
+    }
+  }
+
   .folded-show:hover {
     color: var(--text-primary);
   }

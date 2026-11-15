@@ -716,6 +716,13 @@ impl ChannelKeying {
                     if let Some(before) = self.live.last_id.insert(account, user_id) {
                         if before != user_id {
                             self.live.prior_id.insert(user_id, before);
+                            // Their older id is no one's now, ids not coming round again: its
+                            // name and its own step back go, or the maps grew with every
+                            // reconnect a long connection saw (R3 F9). The step from this id
+                            // stays, for the session to move by, and the old id's account
+                            // while a session is under it (`live_tick` trims the rest)
+                            self.live.names.remove(&before);
+                            self.live.prior_id.remove(&before);
                         }
                     }
                 }
@@ -898,6 +905,20 @@ impl ChannelKeying {
         let Some(named) = w.asking.take() else {
             return out;
         };
+        // What was true when it was asked may not be now (R3 F13). A chain past its age while
+        // the question was up answers nobody: sealed on it the posts would open for none of
+        // those just told they can read them. A check for everyone starts again, as a post on
+        // an over chain does. (Someone told of as gone meanwhile is off `asking` already.)
+        if go && w.started.is_some() && w.over(now) {
+            group::forget_own_sender_key(stores, stores.own_user_id, channel_id);
+            w.end_chain();
+            w.check_out = Some((now, true));
+            out.send.push(ClientMessage::KeyCheck {
+                channel_id,
+                restart: true,
+            });
+            return out;
+        }
         if go {
             self.start_round(stores, channel_id, named, now, &mut out);
         } else {
@@ -1025,6 +1046,10 @@ impl ChannelKeying {
                     w.named.remove(user_id);
                     for round in &mut w.rounds {
                         round.named.remove(user_id);
+                    }
+                    // Nor named by a yes to a question asked before they went (R3 F13)
+                    if let Some(asked) = w.asking.as_mut() {
+                        asked.retain(|id| id != user_id);
                     }
                 }
                 out.emit.push((
@@ -1665,6 +1690,13 @@ impl ChannelKeying {
     /// and old session keys going.
     pub fn live_tick(&mut self, stores: &mut SignalStores, now: u64) -> LiveOut {
         let mut out = LiveOut::default();
+        // An account's older ids with no session left under them: nothing reads them now
+        let live = &mut self.live;
+        live.people.retain(|id, account| match account {
+            Some(a) => live.last_id.get(a) == Some(id) || stores.session.has(*id),
+            None => true,
+        });
+        live.names.retain(|id, _| live.people.contains_key(id));
         // Pages that do not come: what waited is said to be lost, as behind any answer
         while let Some((channel_id, ..)) = self
             .live
@@ -3567,6 +3599,91 @@ mod tests {
             net.also_names.clear();
             net.now += 2_000;
             net.post(1, "cheaper");
+            assert!(matches!(
+                net.devices[&1].sent.last().unwrap(),
+                ClientMessage::KeyCheck { restart: true, .. }
+            ));
+        }
+
+        /// R3 F9: each reconnect a long connection saw left the old id in every map.
+        #[test]
+        fn an_account_back_under_a_new_id_leaves_nothing_of_the_old_but_the_step() {
+            let mut d = Device::new(1, Some([1; 16]), crate::generate_identity_key_pair());
+            let a = Some([7u8; 16]);
+            let row = |id: u32| UserInfo {
+                user_id: id,
+                username: "ann".into(),
+                channel_id: CH,
+                is_muted: false,
+                is_deafened: false,
+                is_screen_sharing: false,
+                is_admin: false,
+                shares_history: false,
+                account: a,
+                is_moderator: false,
+                badges: vec![],
+            };
+            d.k.live_note_rows(&d.stores, &[row(10)]);
+            d.k.live_note_rows(&d.stores, &[row(20)]);
+            d.k.live_note_rows(&d.stores, &[row(30)]);
+            let live = &d.k.live;
+            assert!(!live.names.contains_key(&10) && !live.names.contains_key(&20));
+            assert_eq!(live.prior_id.len(), 1, "{:?}", live.prior_id);
+            assert_eq!(
+                live.prior_id.get(&30),
+                Some(&20),
+                "the step back from the new id"
+            );
+            // With no session under them, a tick takes the old ids' accounts too
+            let _ = d.k.live_tick(&mut d.stores, 0);
+            let live = &d.k.live;
+            assert!(live.people.contains_key(&30) && live.names.contains_key(&30));
+            assert!(!live.people.contains_key(&10) && !live.people.contains_key(&20));
+        }
+
+        /// R3 F13: a yes after what the question was about changed, someone it named gone and
+        /// the chain past its age, sealed on that chain and named the one who left.
+        #[test]
+        fn a_late_yes_goes_by_what_is_true_now() {
+            let mut net = Net::with(&[1, 2]);
+            net.post(1, "first");
+            net.pump();
+            let ids: Vec<u32> = (1000..2200).collect();
+            net.also_names = ids.clone();
+            let d = net.devices.get_mut(&1).unwrap();
+            for id in &ids {
+                d.k.live_note_person(*id, None);
+            }
+            d.k.live_set_metered(true);
+            net.drop_opens = true;
+            net.post(1, "costly");
+            net.pump();
+            assert_eq!(net.devices[&1].events("key-job-ask"), 1);
+            net.tell(
+                1,
+                ServerMessage::MemberGone {
+                    channel_id: CH,
+                    user_id: 1000,
+                },
+            );
+            net.pump();
+            let asked = net.devices[&1].k.live.writing[&CH].asking.clone().unwrap();
+            assert!(
+                !asked.contains(&1000),
+                "the one who left is not asked about"
+            );
+            assert!(asked.contains(&1001), "the control: the others are");
+            net.now += chain_age_limit(2200) + 1;
+            let checks = net.devices[&1].wrote(is_check);
+            let now = net.now;
+            let d = net.devices.get_mut(&1).unwrap();
+            let out = d.k.live_answer_job(&mut d.stores, CH, true, now);
+            assert_eq!(
+                out.emit.iter().filter(|(e, _)| *e == "key-readers").count(),
+                0
+            );
+            net.apply(1, out);
+            assert_eq!(net.devices[&1].wrote(is_check), checks + 1);
             assert!(matches!(
                 net.devices[&1].sent.last().unwrap(),
                 ClientMessage::KeyCheck { restart: true, .. }

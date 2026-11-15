@@ -60,6 +60,10 @@ fn rank(rows: &HashMap<Vec<u8>, StyleRow>, role: &Role) -> (i64, bool, bool, Str
     )
 }
 
+/// The rows one statement of a channel's purge takes at most (`purge_rows`): a few
+/// milliseconds of SQLite's writer.
+const PURGE_BATCH: i64 = 2000;
+
 impl Relay {
     async fn style_rows(&self) -> Result<HashMap<Vec<u8>, StyleRow>> {
         let rows: Vec<StyleColumns> = db!(self.store(), pool => {
@@ -230,28 +234,185 @@ impl Relay {
         Ok(())
     }
 
+    /// Rows placed and categories ordered, in one transaction: a new order is one commit, not
+    /// one per row under the layout's lock that every connect waits for (W2-14), and all of
+    /// it or none.
+    pub async fn layout_write(
+        &self,
+        rows: &[(String, Option<ChannelEntry>, i64, Option<u32>)],
+        categories: &[(ChannelCategory, i64)],
+    ) -> Result<()> {
+        if rows.is_empty() && categories.is_empty() {
+            return Ok(());
+        }
+        let rows = rows
+            .iter()
+            .map(|(conv, entry, position, category)| {
+                Ok((
+                    conv,
+                    entry.as_ref().map(serde_json::to_string).transpose()?,
+                    *position as i32,
+                    category.map(|c| c as i32),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        db!(self.store(), pool => {
+            let mut tx = pool.begin().await?;
+            for (conv, entry, position, category) in &rows {
+                sqlx::query(
+                    "INSERT INTO voipc_channels (conv, entry, position, category) VALUES ($1, $2, $3, $4)
+                     ON CONFLICT (conv) DO UPDATE SET entry = excluded.entry, position = excluded.position, category = excluded.category",
+                )
+                .bind(conv.as_str())
+                .bind(entry)
+                .bind(position)
+                .bind(category)
+                .execute(&mut *tx)
+                .await?;
+            }
+            for (c, position) in categories {
+                sqlx::query(
+                    "INSERT INTO voipc_categories (id, name, position) VALUES ($1, $2, $3)
+                     ON CONFLICT (id) DO UPDATE SET name = excluded.name, position = excluded.position",
+                )
+                .bind(c.id as i32)
+                .bind(&c.name)
+                .bind(*position as i32)
+                .execute(&mut *tx)
+                .await?;
+            }
+            tx.commit().await?;
+        });
+        Ok(())
+    }
+
     /// A channel made in the app is gone: its row, its gate, its stored messages
     /// and the keys to them, all or none. Without its row a failure could not be
     /// tried again, and without its gate it would come back open.
     pub async fn channel_purge(&self, conv: &str) -> Result<()> {
+        self.purge_begin(conv).await?;
+        self.purge_rows(conv).await
+    }
+
+    /// The channel, its gate and who keeps its log at once, with the note that its rows are to
+    /// go: a crash after this never brings the channel back, and a restart finishes the rows.
+    /// Nobody reads them meanwhile: a read asks for a seat in the log, and none is left.
+    pub(crate) async fn purge_begin(&self, conv: &str) -> Result<()> {
         db!(self.store(), pool => {
             let mut tx = pool.begin().await?;
             for q in [
                 "DELETE FROM voipc_channels WHERE conv = $1",
                 "DELETE FROM voipc_gates WHERE conv = $1",
-                "DELETE FROM voipc_log WHERE conv = $1",
-                "DELETE FROM voipc_wraps WHERE conv = $1",
-                "DELETE FROM voipc_writers WHERE conv = $1",
-                "DELETE FROM voipc_log_floors WHERE conv = $1",
-                "DELETE FROM voipc_left WHERE conv = $1",
                 "DELETE FROM voipc_members WHERE conv = $1",
                 "DELETE FROM voipc_pending WHERE conv = $1",
+            ] {
+                sqlx::query(q).bind(conv).execute(&mut *tx).await?;
+            }
+            sqlx::query("INSERT INTO voipc_purging (conv, at) VALUES ($1, $2) ON CONFLICT DO NOTHING")
+                .bind(conv)
+                .bind(crate::accounts::log::now_ms())
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+        });
+        Ok(())
+    }
+
+    /// A deleted channel's rows, a batch at a time (W2-17): one transaction over a log of a
+    /// million rows held SQLite's only writer for 6 s, past the 5 s every other writer waits,
+    /// so sign-ins and posts failed meanwhile. Each statement here takes at most `PURGE_BATCH`
+    /// rows (a chain counts as its steps) and gives the writer back. Stops, and forgets the
+    /// purge, if a channel of that log is back.
+    async fn purge_rows(&self, conv: &str) -> Result<()> {
+        const BATCHED: [(&str, i64); 6] = [
+            (
+                "DELETE FROM voipc_log WHERE seq IN (SELECT seq FROM voipc_log WHERE conv = $1 LIMIT $2)",
+                PURGE_BATCH,
+            ),
+            // At most 256 steps a chain: their steps and seals go with them
+            (
+                "DELETE FROM voipc_chains WHERE id IN (SELECT c.id FROM voipc_chains c
+                 JOIN voipc_writers w ON w.id = c.writer WHERE w.conv = $1 LIMIT $2)",
+                PURGE_BATCH / 256 + 1,
+            ),
+            (
+                "DELETE FROM voipc_seats WHERE (writer, recipient, bucket, version) IN
+                 (SELECT s.writer, s.recipient, s.bucket, s.version FROM voipc_seats s
+                  JOIN voipc_writers w ON w.id = s.writer WHERE w.conv = $1 LIMIT $2)",
+                PURGE_BATCH,
+            ),
+            (
+                "DELETE FROM voipc_chain_wraps WHERE (writer, recipient, chain_id) IN
+                 (SELECT x.writer, x.recipient, x.chain_id FROM voipc_chain_wraps x
+                  JOIN voipc_writers w ON w.id = x.writer WHERE w.conv = $1 LIMIT $2)",
+                PURGE_BATCH,
+            ),
+            (
+                "DELETE FROM voipc_wraps WHERE (conv, owner, epoch, recipient) IN
+                 (SELECT conv, owner, epoch, recipient FROM voipc_wraps WHERE conv = $1 LIMIT $2)",
+                PURGE_BATCH,
+            ),
+            (
+                "DELETE FROM voipc_left WHERE (account, conv) IN
+                 (SELECT account, conv FROM voipc_left WHERE conv = $1 LIMIT $2)",
+                PURGE_BATCH,
+            ),
+        ];
+        for (q, limit) in BATCHED {
+            loop {
+                if self.channel_back(conv).await? {
+                    return self.purge_done(conv).await;
+                }
+                let n = db!(self.store(), pool => {
+                    sqlx::query(q).bind(conv).bind(limit).execute(pool).await?.rows_affected()
+                });
+                if n == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+        // What is left is small: a writer's lists and the floor
+        db!(self.store(), pool => {
+            let mut tx = pool.begin().await?;
+            for q in [
+                "DELETE FROM voipc_writers WHERE conv = $1",
+                "DELETE FROM voipc_log_floors WHERE conv = $1",
+                "DELETE FROM voipc_purging WHERE conv = $1",
             ] {
                 sqlx::query(q).bind(conv).execute(&mut *tx).await?;
             }
             tx.commit().await?;
         });
         Ok(())
+    }
+
+    /// A channel of this log exists again: what is there is its own.
+    async fn channel_back(&self, conv: &str) -> Result<bool> {
+        Ok(db!(self.store(), pool => {
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM voipc_channels WHERE conv = $1")
+                .bind(conv)
+                .fetch_one(pool)
+                .await? > 0
+        }))
+    }
+
+    async fn purge_done(&self, conv: &str) -> Result<()> {
+        db!(self.store(), pool => {
+            sqlx::query("DELETE FROM voipc_purging WHERE conv = $1").bind(conv).execute(pool).await?;
+        });
+        Ok(())
+    }
+
+    /// Purges a restart cut short (`channel_purge`), at start.
+    pub async fn purge_unfinished(&self) -> Result<usize> {
+        let convs: Vec<String> = db!(self.store(), pool => {
+            sqlx::query_scalar("SELECT conv FROM voipc_purging").fetch_all(pool).await?
+        });
+        for conv in &convs {
+            self.purge_rows(conv).await?;
+        }
+        Ok(convs.len())
     }
 
     /// A channel the importer made: its gate, its row and the ledger's, all or none. Nothing
@@ -366,16 +527,27 @@ impl Relay {
 
     /// The category goes; its channels stay, outside any. An import's row stays too, so that
     /// a delta does not make it again, but names nothing now: the next category made may
-    /// get this id, and is nobody's import.
-    pub async fn category_delete(&self, id: u32) -> Result<()> {
+    /// get this id, and is nobody's import. All three or none: a row still naming the id
+    /// past the delete had an undo take the next category made by hand (W2-28). `rest`: the
+    /// others, at the positions the list now gives them, in the same transaction (W2-14).
+    pub async fn category_delete(&self, id: u32, rest: &[ChannelCategory]) -> Result<()> {
         db!(self.store(), pool => {
-            sqlx::query("UPDATE voipc_channels SET category = NULL WHERE category = $1").bind(id as i32).execute(pool).await?;
-            sqlx::query("DELETE FROM voipc_categories WHERE id = $1").bind(id as i32).execute(pool).await?;
+            let mut tx = pool.begin().await?;
+            sqlx::query("UPDATE voipc_channels SET category = NULL WHERE category = $1").bind(id as i32).execute(&mut *tx).await?;
+            sqlx::query("DELETE FROM voipc_categories WHERE id = $1").bind(id as i32).execute(&mut *tx).await?;
             sqlx::query("UPDATE voipc_import_items SET local = '' WHERE kind = $1 AND local = $2")
                 .bind(KIND_CATEGORY)
                 .bind(id.to_string())
-                .execute(pool)
+                .execute(&mut *tx)
                 .await?;
+            for (i, c) in rest.iter().enumerate() {
+                sqlx::query("UPDATE voipc_categories SET position = $1 WHERE id = $2")
+                    .bind(i as i32)
+                    .bind(c.id as i32)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            tx.commit().await?;
         });
         Ok(())
     }

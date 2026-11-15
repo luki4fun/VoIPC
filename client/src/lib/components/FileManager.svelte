@@ -6,6 +6,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { onDestroy, tick } from "svelte";
   import { channelMessages, dmMessages } from "../stores/chat.js";
+  import { historyScopes, inScope } from "../stores/history-scope.js";
   import { serverKey } from "../stores/connection.js";
   import { openServers, serverId, serverName } from "../stores/servers.js";
   import { savedServers } from "../stores/settings.js";
@@ -127,7 +128,13 @@
     }
     return false;
   }
-  const rows = $derived(fileRows($channelMessages, $dmMessages, cache?.entries ?? []).filter((r) => !behindGate(r) && !$foldedAt(r.place, r.msg)));
+  // Only the history each server shows: a guest's, or the account's signed in there
+  const rows = $derived.by(() => {
+    void $historyScopes;
+    return fileRows($channelMessages, $dmMessages, cache?.entries ?? []).filter(
+      (r) => inScope(r.place.server, r.place.scope) && !behindGate(r) && !$foldedAt(r.place, r.msg),
+    );
+  });
   const sections = $derived(arrangeFiles(rows, { filter, sort, group, query, place }));
   const total = $derived(sections.reduce((n, s) => n + s.rows.length, 0));
   /** The sections as drawn: the first `limit` rows. */

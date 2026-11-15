@@ -66,6 +66,7 @@
     ensureAwayDm,
     receivedNow,
   } from "../stores/chat.js";
+  import { historyPrefix, historyScopes, inScope } from "../stores/history-scope.js";
   import {
     channelMessageTtl,
     dmMessageTtl,
@@ -226,7 +227,8 @@
 
   // This server's channels: another server's unread is on its icon in the rail
   let totalUnreadChannels = $derived.by(() => {
-    const prefix = `${serverKey($serverAddress)}/`;
+    void $historyScopes;
+    const prefix = historyPrefix($serverAddress);
     let total = 0;
     for (const [key, count] of $unreadPerChannel) {
       if (key.startsWith(prefix)) total += count;
@@ -331,9 +333,11 @@
   // ── Mentions and "New" ───────────────────────────────────────────────────
 
   /** The conversation's key in the chat stores. */
-  const currentKey = $derived(
-    isDmMode ? dmKey($serverAddress, $activeDmUsername) : chatKey($serverAddress, channelName),
-  );
+  const currentKey = $derived.by(() => {
+    // A sign-in changes whose history the same names stand for
+    void $historyScopes;
+    return isDmMode ? dmKey($serverAddress, $activeDmUsername) : chatKey($serverAddress, channelName);
+  });
   /** Where the unread part of this conversation began, until the reader moves on. */
   const newSince = $derived($newMessagesAt.get(currentKey));
   $effect(() => {
@@ -390,7 +394,8 @@
     for (const [kind, map] of [["channel", $channelMessages], ["dm", $dmMessages]] as const) {
       for (const [key, messages] of map) {
         const at = splitChatKey(key);
-        if (!at || (kind === "channel" && behindNsfwGate(at.server, at.name))) continue;
+        // Only the history each server shows: a guest's, or the account's signed in there
+        if (!at || !inScope(at.server, at.scope) || (kind === "channel" && behindNsfwGate(at.server, at.name))) continue;
         const conv = { kind, key, ...at };
         out.push({ conv, messages: messages.filter((m) => !$foldedAt(conv, m)) });
       }

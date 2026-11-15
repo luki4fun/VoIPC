@@ -5,6 +5,7 @@
 // with a native process (screen-share sending, the chat vault, sound files,
 // global hotkeys) are stubs.
 
+import { openProviderPage } from "./provider-page";
 import { audio } from "./audio";
 import { video } from "./video";
 import { share } from "./share";
@@ -231,8 +232,7 @@ const handlers: Record<string, Handler> = {
   },
   account_open_page: ({ url }) => {
     const page = str(url, "url");
-    if (!wasm().providerPageOk(page)) fail("This server named a page that is no provider's: not opening it.");
-    window.open(page, "_blank", "noopener");
+    openProviderPage(page, (u) => wasm().providerPageOk(u), (u) => window.open(u, "_blank", "noopener"));
   },
   account_provider_answer: ({ server, answer }) => {
     const s = session.sessionOrSigningIn(str(server, "server"));
@@ -870,6 +870,7 @@ const handlers: Record<string, Handler> = {
 
   // ── chat history (no vault in the browser: chat stays in memory) ──
   save_chat_messages: () => {},
+  log_read_saved: () => {},
   clear_chat_history: () => {},
   get_chat_history_status: () => ({ path_configured: false, current_path: "", file_exists: false }),
   browse_chat_history_directory: () => null,

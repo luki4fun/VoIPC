@@ -103,8 +103,12 @@ pub fn tune(tcp: &TcpStream, peer: SocketAddr) {
 /// Serve one connection that negotiated `http/1.1`: files on `/f/`
 /// (`files::serve_http1`, always), the tunnel on `GET /voipc` (with
 /// `tcp_fallback` on), a short refusal for anything else.
-pub async fn serve<S>(mut stream: S, state: Arc<ServerState>, peer: SocketAddr)
-where
+pub async fn serve<S>(
+    mut stream: S,
+    state: Arc<ServerState>,
+    peer: SocketAddr,
+    binding: Option<[u8; voipc_crypto::bind::BIND_LEN]>,
+) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let mut buf = Vec::new();
@@ -130,7 +134,7 @@ where
         debug!(%peer, "tunnel refused: {e}");
         return;
     }
-    run(stream, buf, state, peer).await;
+    run(stream, buf, state, peer, binding).await;
 }
 
 /// What `read_head` found.
@@ -226,13 +230,17 @@ fn accept_key(key: &str) -> String {
 
 /// Bridge one tunnelled session onto the control handler and the media relay
 /// until either side goes away (the twin of `web::run_session`).
-async fn run<S>(stream: S, leftover: Vec<u8>, state: Arc<ServerState>, peer: SocketAddr)
-where
+async fn run<S>(
+    stream: S,
+    leftover: Vec<u8>,
+    state: Arc<ServerState>,
+    peer: SocketAddr,
+    binding: Option<[u8; voipc_crypto::bind::BIND_LEN]>,
+) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let label = format!("tcp:{}", peer.ip());
-    // test-web.sh counts this line; the address only at debug
-    info!("session established over the TCP fallback");
+    // A client that won the race on QUIC closes this unused: "established" waits for its first word
     debug!(peer = %label, "tunnel opened");
 
     let SessionStart {
@@ -240,7 +248,7 @@ where
         bridge,
         media_rx,
         sid_rx,
-    } = web::start_session(&label, peer.ip(), &state);
+    } = web::start_session(&label, peer.ip(), &state, binding);
     let (bridge_read, bridge_write) = tokio::io::split(bridge);
     let (stream_read, stream_write) = tokio::io::split(stream);
     let (datagram_tx, datagram_rx) = mpsc::channel(DATAGRAM_LANE);
@@ -314,6 +322,7 @@ async fn read_side<R: AsyncRead + Unpin>(
     decoder.feed(&leftover);
     let mut session: Option<SessionId> = None;
     let mut bridge_open = true;
+    let mut spoke = false;
     let mut chunk = vec![0u8; 16 * 1024];
     loop {
         loop {
@@ -328,6 +337,12 @@ async fn read_side<R: AsyncRead + Unpin>(
             match message {
                 Message::Binary(data) => match data.split_first() {
                     Some((0x00, control)) => {
+                        if !spoke {
+                            spoke = true;
+                            // test-web.sh counts this line: a session the client runs here,
+                            // not a race loser it closed unused
+                            info!("session established over the TCP fallback");
+                        }
                         // A write fails once the handler is gone: what the
                         // client still says goes nowhere, but it is read
                         if bridge_open && bridge.write_all(control).await.is_err() {
@@ -423,6 +438,9 @@ async fn send<W: AsyncWrite + Unpin>(stream: &mut W, frame: &[u8]) -> std::io::R
 
 #[cfg(test)]
 mod tests {
+    /// What a wait for something that must come allows: past it the relay hung, a slow
+    /// machine is not (the lanes' rule 1).
+    const HANG: Duration = Duration::from_secs(60);
     use super::*;
 
     use bytes::BytesMut;
@@ -458,7 +476,12 @@ mod tests {
     /// Serve one in-memory connection; returns the client's end.
     fn open(state: &Arc<ServerState>) -> DuplexStream {
         let (client, server) = tokio::io::duplex(1 << 20);
-        tokio::spawn(serve(server, state.clone(), "127.0.0.1:1".parse().unwrap()));
+        tokio::spawn(serve(
+            server,
+            state.clone(),
+            "127.0.0.1:1".parse().unwrap(),
+            None,
+        ));
         client
     }
 
@@ -528,7 +551,7 @@ mod tests {
 
         /// The next message, `None` once the tunnel is closed.
         async fn next(&mut self) -> Option<Message> {
-            tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::time::timeout(HANG, async {
                 loop {
                     if let Some(message) = self.decoder.next().unwrap() {
                         return Some(message);
@@ -593,10 +616,7 @@ mod tests {
         client
             .send(&[&VoicePacket::ping(session_id, 77).to_bytes()])
             .await;
-        let pong = client
-            .next_media(Duration::from_secs(5))
-            .await
-            .expect("pong");
+        let pong = client.next_media(HANG).await.expect("pong");
         let pong = VoicePacket::from_bytes(&pong).unwrap();
         assert_eq!(pong.packet_type, VoicePacketType::Pong);
         assert_eq!(pong.sequence, 77);
@@ -630,10 +650,7 @@ mod tests {
         client
             .send(&[&VoicePacket::ping(session_id, 79).to_bytes()])
             .await;
-        let pong = client
-            .next_media(Duration::from_secs(5))
-            .await
-            .expect("pong after video");
+        let pong = client.next_media(HANG).await.expect("pong after video");
         assert_eq!(VoicePacket::from_bytes(&pong).unwrap().sequence, 79);
 
         // Closing the tunnel cleans the session up
@@ -645,13 +662,13 @@ mod tests {
             Some(KEY),
         );
         client.io.write_all(&close).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(HANG, async {
             while !state.sessions.is_empty() {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
         .await
-        .expect("session removed within 5 s");
+        .expect("session removed");
     }
 
     /// The handler's last word must not be lost to a reset: the client reads
@@ -920,7 +937,7 @@ mod tests {
         assert_eq!(limits.files_total.load(Ordering::Relaxed), 1);
 
         drop(io);
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(HANG, async {
             while limits.files_total.load(Ordering::Relaxed) != 0 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }

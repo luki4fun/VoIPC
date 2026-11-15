@@ -85,3 +85,32 @@ test("the person hears of a change once", () => {
   assert.match(heldNotice(held({ until: null }), held({}), NOW) ?? "", /Timed out/);
   assert.equal(heldNotice(held({ until: null }), held({ until: null }), NOW), null);
 });
+
+test("a mute during the wait is a mute, and writing comes back with the wait (W3-17)", () => {
+  // The moderator muted voice for a day; the wait holds writing for an hour
+  const [r] = [
+    {
+      user_id: 7,
+      voice: true,
+      text: true,
+      direct: true,
+      expires_in_secs: 86_400,
+      by: "bobby",
+      reason: "",
+      by_voice: true,
+      by_text: false,
+      wait_in_secs: 3600,
+    },
+  ];
+  const h = withRows(new Map(), [r], NOW).get(7)!;
+  assert.equal(h.wait, NOW + 3_600_000);
+  assert.equal(markTitle(h, NOW, "en-GB"), "Muted by @bobby until 5 Nov 14:00");
+  assert.equal(heldLine(h, "voice", NOW, "en-GB"), "Muted by @bobby until 5 Nov 14:00");
+  assert.equal(heldLine(h, "text", NOW, "en-GB"), "New here: you can write from 15:00");
+  assert.equal(heldLine(h, "direct", NOW, "en-GB"), "New here: you can write direct messages from 15:00");
+  assert.match(heldNotice(null, h, NOW, "en-GB") ?? "", /^Muted by @bobby/);
+  // A relay before 23 sends no parts: all of a moderator's row is theirs, as before
+  const old = withRows(new Map(), [{ ...r, by_voice: undefined, by_text: undefined, wait_in_secs: undefined }], NOW).get(7)!;
+  assert.equal(markTitle(old, NOW, "en-GB"), "Timed out by @bobby until 5 Nov 14:00");
+});
+

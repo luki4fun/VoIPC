@@ -182,7 +182,9 @@ test("removing with a ban: the ban first, of the account too, then the removal b
   assert.equal(ban[0], "admin_ban");
   assert.equal(ban[1].account, true, "nothing kept goes without the account's ban");
   assert.equal(removal[0], "account_request");
-  assert.deepEqual(removal[1].request, { Admin: { op: { RemovePosts: { name: "dan", window_secs: 86_400 } }, code: null } });
+  const { ask, ...sentStep } = (removal[1].request as { AdminAsk: { ask: number } }).AdminAsk;
+  assert.equal(typeof ask, "number", "numbered");
+  assert.deepEqual(sentStep, { op: { RemovePosts: { name: "dan", window_secs: 86_400 } }, code: null });
   assert.equal(removal[1].server, S);
   assert.deepEqual(rest, []);
 });
@@ -192,7 +194,7 @@ test("all that is kept is the window 0, which is no 'no'", async () => {
   openAdminAction(who as never, "ban", 3600, "Ban for 1 hour");
   adminRemovePosts.set(0);
   await confirmAdminAction();
-  assert.deepEqual(lastInvokes(from)[1][1].request.Admin.op, { RemovePosts: { name: "dan", window_secs: 0 } });
+  assert.deepEqual(lastInvokes(from)[1][1].request.AdminAsk.op, { RemovePosts: { name: "dan", window_secs: 0 } });
 });
 
 test("the control: a ban alone removes nothing, and asks only what it asked", async () => {

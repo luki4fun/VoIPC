@@ -103,11 +103,19 @@ export function askPicture(server: string, hash: string): void {
   start(server, a);
 }
 
+/**
+ * An answer, or a change the relay sends everyone connected (`profile::tell`). Kept only for
+ * an account this page shows or asked about: drawing a name asks for it first, and a page
+ * keeps no list of every account on the server.
+ */
 export function onProfiles(server: string, list: WireProfile[]): void {
+  const asked = asking.get(server)?.asked;
   profiles.of(server).update((m) => {
     const next = new Map(m);
     for (const p of list) {
-      next.set(toHex(p.account), {
+      const key = toHex(p.account);
+      if (!next.has(key) && !asked?.has(key)) continue;
+      next.set(key, {
         name: cleanDisplayName(p.name),
         picture: p.picture ? toHex(p.picture) : null,
       });

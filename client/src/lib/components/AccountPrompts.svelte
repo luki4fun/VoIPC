@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { filePick } from "../actions/file-pick.js";
   import { dialog } from "../actions/dialog.js";
   // The dialogs a relay account needs: the code a sign-in waits for, a new
   // account's recovery key (shown once), setting up the authenticator app
@@ -7,7 +8,7 @@
   // setup), and the account panel. Listens for the account events both
   // backends emit itself, so App.svelte only mounts it.
 
-  import { onDestroy, onMount } from "svelte";
+  import { onDestroy, onMount, tick } from "svelte";
   import { get } from "svelte/store";
   import { invoke } from "@tauri-apps/api/core";
   import type { UnlistenFn } from "@tauri-apps/api/event";
@@ -24,6 +25,7 @@
     lookOver,
     pairCodeCame,
     providerDone,
+    providerFlowOf,
     providerPage,
     providerRefused,
     providerStarted,
@@ -40,10 +42,13 @@
     applyStoredDmEvent,
     fileStoredDm,
     joinedTextChannelIds,
+    decideLegacyHistory,
     loadBrowserMarks,
+    noteReadUpto,
     purgeWritten,
     releaseBrowserMarks,
   } from "../stores/chat.js";
+  import { setHistoryScope } from "../stores/history-scope.js";
   import { onAccountBlocks } from "../stores/blocks.js";
   import { channels, currentChannelId } from "../stores/channels.js";
   import { shareChannelHistory } from "../stores/settings.js";
@@ -78,12 +83,17 @@
   let recoveryText = $state("");
   /** "First time here" was asked for, and the warning under it is on screen. */
   let claimAsked = $state(false);
+  /** This device remembers the account a provider named: its own key signs it in, and nothing
+   *  else is needed (rc.2 device run: it was asked to unlock as a new device). */
+  let rememberedHere = $state(false);
   /** What the relay offers and this account has linked (`ProviderList`). */
   let providers = $state<{ offered: string[]; linked: { kind: string; name: string }[]; hasPassword: boolean } | null>(null);
   /** A linked provider can prove it's them, once the relay asks that before it turns codes on. */
   const provable = $derived(error === PROVE_FIRST ? [...new Set<string>(providers?.linked.map((l) => l.kind))] : []);
   /** The setup a proof took off the screen. It comes back after: the key is in their app by then. */
   let setupToProve: Extract<AccountPrompt, { kind: "totp-setup" }> | null = null;
+  /** The provider flow `setupToProve` waits on. */
+  let setupFlow = 0;
   let qr = $state("");
   let copied = $state(false);
   /** Whether this prompt's yes is live (`armsSlowly`). */
@@ -227,11 +237,14 @@
         "account-signed-in",
         (server, d) => {
           account.of(server).set({ name: d.name, relayId: d.relay_id, info: d.info, cloud: d.prefs.cloud });
+          // Its own history from here on, before anything of it is filed (1.12)
+          setHistoryScope(server, accountHex(d.info.id));
           onAccountBlocks(server, d.blocks);
           const waiting = get(accountPrompt);
           if (waiting?.kind === "pair-wait" && waiting.server === server) closePrompt(waiting);
           // Before the log is read: what was cleared must not come back with it
           loadBrowserMarks(server, d.name);
+          void decideLegacyHistory(server, { name: d.name, hex: accountHex(d.info.id) });
           // The second factor a role needs is asked for by the backend once the
           // connection is listed (account.rs after_connect); its setup waits
           // behind the recovery key, which nothing replaces.
@@ -260,6 +273,21 @@
         reset();
         recoveryText = "";
         claimAsked = false;
+        rememberedHere = false;
+        if (!d.claim) {
+          const want = d.name.toLowerCase();
+          void invoke<{ server: string; name: string }[]>("account_devices")
+            .then(async (list) => {
+              rememberedHere = list.some((x) => x.server === server && x.name === want);
+              // It takes the focus from the recovery key's field, which has it by then: on a
+              // phone that field's keyboard covered the dialog (rc.3 device recheck)
+              if (rememberedHere) {
+                await tick();
+                document.querySelector<HTMLButtonElement>(".provider-device")?.focus();
+              }
+            })
+            .catch(() => {});
+        }
         showPrompt({ kind: "provider-choice", server, name: d.name, claim: d.claim, hasPassword: d.has_password, problem: d.problem, knownAs: d.known_as });
       }),
       // A first vault's key, before anything of it leaves this device.
@@ -308,6 +336,7 @@
         content: string;
         ttl_secs: number | null;
         timestamp: number;
+        server_at?: number;
         reply_to?: string | null;
         thread?: string | null;
         file?: unknown;
@@ -325,6 +354,8 @@
           liveIdOf(m.peer_name, get(users.peek(server)), get(channelRosters.peek(server))),
         );
       }),
+      // A read's posts are filed (they came before this): its cursors may go to disk with them
+      listenServer<{ gen: number }>("log-read-upto", (_server, d) => noteReadUpto(d.gen)),
       // A tombstone: its writer deleted what they wrote there up to `before`.
       listenServer<{ conv: string; name: string; account: string; from_me: boolean; before: number }>("stored-purge", (server, t) => {
         const me = get(account.peek(server));
@@ -429,12 +460,16 @@
         if (codesTurnedOn(server, body.recovery_codes)) reset();
         break;
       case "Providers":
+        // Only for the panel that asked: another server's answer landing while this one is up
+        // showed its rows and its password here, and steps then went without one (W2-9)
+        if (server !== providersOf) break;
         providers = { offered: [...new Set<string>(body.offered)], linked: body.linked, hasPassword: body.has_password };
         break;
       case "ProviderBrowser":
         if (providerPage(server, body.url, body.code)) reset();
         break;
       case "ProviderDone": {
+        const flow = providerFlowOf(server);
         if (!providerDone(server)) break;
         const now = get(accountPrompt);
         if (now?.kind === "provider-page" && now.server === server) closePrompt(now);
@@ -444,7 +479,11 @@
           "info",
         );
         listProviders(server);
-        if (setupToProve?.server === server) backToSetup();
+        // A cut ended the proof it waited for: its setup, from that connection, goes too
+        if (setupToProve?.server === server) {
+          if (flow === setupFlow) backToSetup();
+          else setupToProve = null;
+        }
         break;
       }
       case "ProviderUnlinked":
@@ -508,7 +547,9 @@
           error = body.reason;
           busy = false;
         } else {
-          addNotification(`${fromServer(server)}${body.reason}`, "warning");
+          // The move refused for its connection asks the person to act: it stays until closed
+          // (rc.3 device recheck: gone in 5 s, beside two other toasts)
+          addNotification(`${fromServer(server)}${body.reason}`, "warning", body.request === "LoginKeySet" ? 0 : undefined);
         }
         break;
     }
@@ -551,6 +592,8 @@
   let providersOf = "";
   $effect(() => {
     const p = $accountPrompt;
+    // Closed: the next time it opens it asks again, as after a reconnect
+    if (!p) providersOf = "";
     if ((p?.kind !== "account" && p?.kind !== "totp-setup") || p.server === providersOf) return;
     providersOf = p.server;
     providers = null;
@@ -687,6 +730,8 @@
   function proveForSetup(p: Extract<AccountPrompt, { kind: "totp-setup" }>, provider: string) {
     setupToProve = p;
     void runProvider(p.server, provider, "prove");
+    // Started before its first wait
+    setupFlow = providerFlowOf(p.server);
   }
 
   function backToSetup() {
@@ -925,10 +970,26 @@
           </div>
         {:else}
           <h2>{fromServer(p.server)}Unlock {p.name}</h2>
+          {#if rememberedHere}
+            <p class="hint">This device remembers {p.name} here: it signs in with its own key, and needs nothing else.</p>
+            <div class="buttons">
+              <!-- Ends the provider's sign-in as "Use my password" does; the connect form then
+                   signs in with this device's key (ConnectDialog) -->
+              <button type="button" class="submit-btn btn btn-primary provider-device" onclick={() => chooseProvider({ kind: "password" })}>Sign in with this device</button>
+            </div>
+          {/if}
           <p class="hint">
             Your provider says who you are. Your messages and keys are encrypted with a key only your devices hold,
-            so this new device needs one of these.
+            so a new device needs one of these.
           </p>
+          <!-- W3-16: nothing said what is left to someone with none of them. A reset
+               (`admin reclaim`) refuses an account with a password -->
+          {#if !p.hasPassword}
+            <p class="hint">
+              None of them? Then nobody can open what this account kept, the server included. Whoever runs this
+              server can reset the account, so that it starts again empty: ask them.
+            </p>
+          {/if}
           {#if p.problem}<div class="error" role="alert">{p.problem}</div>{/if}
           <div class="field">
             <label for="acct-provider-recovery">Recovery key</label>
@@ -1034,7 +1095,7 @@
         </div>
       {:else if p.kind === "provider-page"}
         <h2>Your code: {p.code}</h2>
-        <p class="hint">Open the provider's page. When it comes back, tap this code there.</p>
+        <p class="hint">Open the provider's page. When it comes back, type this code there.</p>
         <div class="buttons">
           <button type="button" class="secondary" onclick={closeProviderPage}>Cancel</button>
           <button
@@ -1127,8 +1188,9 @@
       {:else if p.kind === "cloud"}
         <h2>Keep your messages here too?</h2>
         <p class="hint">
-          With a copy on {fromServer(p.server).replace(/: $/, "") || "this server"}, you can read your messages on
-          your other devices, and what people write while you are away waits for you. {isWeb
+          With a copy on {fromServer(p.server).replace(/: $/, "") || "this server"}, what you write reaches your
+          other devices, and the people it is for read it when they come back. What others keep here reaches you
+          either way. {isWeb
             ? "A browser keeps no chat of its own: a reload brings back what has a copy here, and whoever writes a message decides whether it gets one."
             : "This device keeps them only in its own chat history, if that is on."}
         </p>
@@ -1176,7 +1238,7 @@
             </form>
             <div class="row">
               <span>Profile picture{#if profilePicture}: <strong>set</strong>{/if}. Anyone on this server can see it, and the server knows who fetched it.</span>
-              <label class="secondary file-pick">
+              <label class="secondary file-pick" use:filePick>
                 Choose…
                 <input type="file" accept="image/*" hidden onchange={(e) => pickPicture(p.server, e.currentTarget)} />
               </label>

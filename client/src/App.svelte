@@ -93,6 +93,7 @@
     flushChatSave,
     quietBlockedDms,
     receivedNow,
+    noteChannelLogNames,
   } from "./lib/stores/chat.js";
   import ChatHistorySetup from "./lib/components/ChatHistorySetup.svelte";
   import AudioSetup from "./lib/components/AudioSetup.svelte";
@@ -105,6 +106,7 @@
     listenServer,
     reconnectAll,
     withReloadServers,
+    autoConnectList,
     serverId,
     resetServer,
     sayConnectionLost,
@@ -173,8 +175,10 @@
   import { olderRelay } from "./lib/stores/relay.js";
   import { community, livePath } from "./lib/relay-rules.js";
   import { askArchiveChannels } from "./lib/stores/imported.js";
-  import { noteMemberGone, onSweepPage, startSweeps, sweepForAsker } from "./lib/stores/sweep.js";
+  import { joinedMade, noteMade, noteMemberGone, onSweepPage, startSweeps, sweepForAsker } from "./lib/stores/sweep.js";
+  import { afterJoin, joinedNow } from "./lib/stores/join-wait.js";
   import { goesByList, marksChannel } from "./lib/follow-rules.js";
+  import { takesSwitch } from "./lib/roster-rules.js";
   import { gateNoted, noteReaders, relayWentBack, type NamedReader } from "./lib/stores/noticing.js";
   import { forgetHandOff, handOffAnswered } from "./lib/stores/handoff.js";
   import { clearRing, flushMarks, moveRead, noteLastPost, ringBack, ringForPost } from "./lib/stores/marks.js";
@@ -195,6 +199,7 @@
     settingsAsk,
     channelNotify,
     channelRenamed,
+    channelsListed,
     firstVisit,
     forgetAutoJoinAsk,
     markKicked,
@@ -543,6 +548,9 @@
   // pokes at the relay's full rate would otherwise stack dozens a second on
   // the desktop. The unread counts still say what arrived.
   let lastNotifyAt = -Infinity;
+  /** The app's own window has focus: on Android the shade pulled over the app takes it while
+   *  the page goes on saying it is shown and focused (rc.2 device run, pass 3). */
+  let windowFocused = true;
 
   /** Our own account on `server` (hex), which names what we wrote across connects. */
   function ownAccount(server: string): string | undefined {
@@ -618,15 +626,20 @@
       sweepForAsker(server, () => answerHandOff(server, data, false));
       return;
     }
+    const ours = channelId === get(currentChannelId.peek(server)) || get(joinedTextChannelIds.peek(server)).has(channelId);
+    // Before its join: on a one-page account the relay answers the page first, so a held ask
+    // always came early and was dropped with no word. It goes on at the join (device pass)
+    if (mayWait && right && !ours && channel?.text) {
+      afterJoin(server, channelId, () => answerHandOff(server, data, true));
+      return;
+    }
     const answer = answersHandOff({
       switchOn: $shareChannelHistory,
       right: get(shareRight.peek(server)),
       anonymous: !!channel?.anonymous,
       listenOnly: get(listenOnly.peek(server)).has(channelId),
       held: !!hold?.text || !!hold?.direct,
-      ours:
-        channelId === get(currentChannelId.peek(server)) ||
-        get(joinedTextChannelIds.peek(server)).has(channelId),
+      ours,
       swept,
       askerOnline: onlineById(server).has(data.from_user_id),
       askerOnSweep: !!asker,
@@ -656,7 +669,7 @@
   }
 
   async function notifyUnfocused(title: string, body: string) {
-    if (pageInView(document)) return;
+    if (pageInView(document, windowFocused)) return;
     const now = performance.now();
     if (now - lastNotifyAt < 2000) return;
     lastNotifyAt = now;
@@ -835,6 +848,15 @@
     // Messages with a destruction timer go when their moment comes, whether or
     // not anybody is looking at them. One sweep for the whole app.
     startExpirySweep();
+    if (!isWeb) {
+      void import("@tauri-apps/api/window")
+        .then(({ getCurrentWindow }) =>
+          getCurrentWindow().onFocusChanged(({ payload }) => {
+            windowFocused = payload;
+          }),
+        )
+        .catch(() => {});
+    }
     // ...and the file cache follows what the chat still refers to
     const stopFileRetain = startFileRetain();
     // A reload, or a window closed under us: the debounced chat save goes now
@@ -943,27 +965,8 @@
       }
 
       // Schedule auto-connect — will trigger after chat history is unlocked.
-      // Every server that was open, or, in a config written before there was
-      // a list, the one server it remembered.
-      let list: SavedServer[] = [];
-      if (config.auto_connect) {
-        const open = config.open_servers ?? [];
-        list =
-          open.length > 0
-            ? open
-            : config.last_host && config.last_username
-              ? [
-                  {
-                    name: config.last_host,
-                    host: config.last_host,
-                    port: config.last_port ?? 9987,
-                    username: config.last_username,
-                    accept_self_signed: config.last_accept_self_signed ?? false,
-                  },
-                ]
-              : [];
-      }
-      list = withReloadServers(list);
+      // Every server that was open, none after the last was closed.
+      let list: SavedServer[] = withReloadServers(autoConnectList(config));
       if (list.length > 0) pendingAutoConnect = list;
     } catch (e) {
       console.error("Failed to load config:", e);
@@ -1018,6 +1021,8 @@
       listenServer<ChannelInfo[]>("channel-list", (server, raw) => {
         const list = eachOnce(raw, (c) => c.channel_id);
         channels.of(server).set(list);
+        // Renamed while this device was away: what it keeps by name follows
+        channelsListed(server, list);
         // A reconnect waits for this before deciding where to put the user back
         channelListArrived(server, list);
         // The sidebar draws the people under every channel, and the names for
@@ -1242,12 +1247,18 @@
       }),
 
       listenServer<{ user_id: number; enabled: boolean }>("user-history-sharing", (server, data) => {
+        // Never onto a pseudonym's row: that one keeps it off, as the relay told it (G1)
+        const list = get(channels.peek(server));
+        const me = get(userId.peek(server));
+        const admin = get(isAdmin.peek(server));
+        const takes = (channelId: number) =>
+          takesSwitch(list.find((c) => c.channel_id === channelId), data.user_id, me, admin);
         users.of(server).update((u) =>
           u.map((user) =>
-            user.user_id === data.user_id ? { ...user, shares_history: data.enabled } : user,
+            user.user_id === data.user_id && takes(user.channel_id) ? { ...user, shares_history: data.enabled } : user,
           ),
         );
-        patchRosters(server, data.user_id, { shares_history: data.enabled });
+        patchRosters(server, data.user_id, { shares_history: data.enabled }, takes);
       }),
 
       listenServer<{ user_id: number; deafened: boolean }>("user-deafened", (server, data) => {
@@ -1561,6 +1572,9 @@
       listenServer<ChannelInfo>("channel-created", (server, created) => {
         // Idempotent: the channel list snapshot may already contain it
         channels.of(server).update((chs) => upsertById(chs, created, (c) => c.channel_id).list);
+        if (created.text && created.created_by !== null && created.created_by === get(userId.peek(server))) {
+          noteMade(server, created.channel_id);
+        }
       }),
 
       listenServer<{ channel_id: number }>("channel-deleted", (server, data) => {
@@ -1639,6 +1653,7 @@
       listenServer<ChannelInfo>("channel-updated", (server, updated) => {
         const before = get(channels.peek(server)).find((c) => c.channel_id === updated.channel_id);
         if (before && before.name !== updated.name) channelRenamed(server, before.name, updated.name);
+        noteChannelLogNames(server, [updated]);
         channels.of(server).update((chs) =>
           chs.map((ch) => (ch.channel_id === updated.channel_id ? updated : ch)),
         );
@@ -1672,6 +1687,7 @@
       }>("text-joined", (server, data) => {
         const ids = data.joined.map((row) => row.channel_id);
         joinedTextChannelIds.of(server).update((had) => new Set([...had, ...ids]));
+        joinedNow(server, ids);
         textSeats.of(server).update((had) => {
           const next = new Map(had);
           for (const row of data.joined) next.set(row.channel_id, { gated: row.gated, lastPost: row.last_post_ms });
@@ -1711,6 +1727,7 @@
           if (name) clearChannelUnread(server, name);
         }
         askArchiveChannels(server);
+        joinedMade(server, ids);
         startSweeps(server);
       }),
 
@@ -1981,6 +1998,8 @@
         content: string;
         ttl_secs: number | null;
         timestamp: number;
+        /** When the relay filed it: where it stands when read back. */
+        server_at?: number;
         reply_to?: string | null;
         thread?: string | null;
         replay?: boolean;
@@ -1999,6 +2018,7 @@
           id: m.message_id ?? undefined,
           account: m.sender_account,
           expires_at: expiryFor(m.timestamp, m.ttl_secs, channelMessageTtl(server, ch.channel_id)),
+          ...(typeof m.server_at === "number" ? { relay_at: m.server_at } : {}),
           ...messageRefs(m),
         });
         const quiet = isBlocked(get(blocked.peek(server)), { account: m.sender_account, username: m.sender_name }, !!ch.anonymous);

@@ -20,10 +20,14 @@ test("every live message with a file is a row, beside what this device keeps of 
   const dms = new Map([["b.example:9987/Bob#0001", [m({ file: file("a", { mime: "video/mp4" }), timestamp: T + 1 })]]]);
   const rows = fileRows(channels, dms, [{ hash: "a".repeat(64), bytes: 42, last_used: T }], T);
   assert.equal(rows.length, 2, "no text-only message, nothing expired, nothing without a server");
-  assert.deepEqual(rows[0].place, { kind: "channel", key: "a.example:9987/general", server: "a.example:9987", name: "general" });
+  assert.deepEqual(rows[0].place, { kind: "channel", key: "a.example:9987/general", server: "a.example:9987", name: "general", scope: "" });
   assert.equal(rows[0].kind, "image");
   assert.equal(rows[0].local, 42);
-  assert.deepEqual(rows[1].place, { kind: "dm", key: "b.example:9987/Bob#0001", server: "b.example:9987", name: "Bob#0001" });
+  assert.deepEqual(rows[1].place, { kind: "dm", key: "b.example:9987/Bob#0001", server: "b.example:9987", name: "Bob#0001", scope: "" });
+  // An account's own history (1.12) says whose it is
+  const acct = "ab".repeat(16);
+  const [own] = fileRows(new Map([[`a.example:9987~${acct}/team/ops`, [m({ file: file("f") })]]]), new Map(), [], T);
+  assert.deepEqual(own.place, { kind: "channel", key: `a.example:9987~${acct}/team/ops`, server: "a.example:9987", name: "team/ops", scope: acct });
   assert.equal(rows[1].local, 42, "one blob, kept once, for both of its messages");
   assert.equal(fileRows(channels, new Map(), [], T)[0].local, null);
   assert.deepEqual(

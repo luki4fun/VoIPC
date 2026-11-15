@@ -48,6 +48,7 @@ import {
   receivedText,
   type EventIn,
   placedByTime,
+  readingAt,
 } from "./chat-rules.ts";
 import type { ChatMessage } from "./types.ts";
 import { EMOJI_CATEGORIES, QUICK_REACTIONS } from "./emoji.ts";
@@ -1128,4 +1129,34 @@ test("a post held for its key goes in at its own time, and no further back than 
   assert.deepEqual(at(row(55_000), 10_000), [1000, 50_000, 55_000, 60_000]);
   assert.deepEqual(at(row(500), 10_000), [1000, 500, 50_000, 60_000], "the floor stops it");
   assert.deepEqual(at(row(500), 100_000), [1000, 50_000, 60_000, 500], "nothing here within the hold: at the end, as it came");
+});
+
+// ── Read-back order (1.12) ─────────────────────────────────────────────────
+
+test("a read-back stands where the relay filed each row, not where each writer's clock says", () => {
+  const ANN = "a1".repeat(16);
+  const BOB = "b2".repeat(16);
+  // Bob's clock runs ten seconds behind: his answer claims a time before the question
+  const question: ChatMessage = { user_id: 1, username: "ann", content: "lunch?", timestamp: 100_000, id: "q", account: ANN, relay_at: 100_050 };
+  const answer: ChatMessage = { user_id: 2, username: "bob", content: "yes", timestamp: 95_000, id: "a", account: BOB, relay_at: 100_900 };
+  const { messages } = mergeHistory([], [answer, question], "");
+  assert.deepEqual(
+    messages.filter((m) => m.kind !== "history-marker").map((m) => m.id),
+    ["q", "a"],
+  );
+  // The control: by the writers' clocks alone, the answer stood first
+  const bare = mergeHistory([], [{ ...answer, relay_at: undefined }, { ...question, relay_at: undefined }], "");
+  assert.deepEqual(
+    bare.messages.filter((m) => m.kind !== "history-marker").map((m) => m.id),
+    ["a", "q"],
+  );
+  // A row seen live takes the relay's place when its stored copy comes
+  const live = { ...answer, relay_at: undefined };
+  const { messages: joined } = mergeHistory([live, { ...question, relay_at: undefined }], [answer], "");
+  assert.equal(joined.find((m) => m.id === "a")?.relay_at, 100_900);
+  // Kept in the archive, and never taken from a member's hand-off
+  assert.equal(fromArchived(toArchived(answer)).relay_at, 100_900);
+  assert.equal(sanitizeHistory([answer], null, 100_000)[0].relay_at, undefined);
+  assert.equal(readingAt(answer), 100_900);
+  assert.equal(readingAt(live), 95_000);
 });

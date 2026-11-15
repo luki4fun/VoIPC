@@ -15,6 +15,7 @@
 pub mod account;
 pub mod account_session;
 mod aead;
+pub mod bind;
 pub mod channel_state;
 pub mod envelope;
 pub mod file;
@@ -42,6 +43,8 @@ pub use envelope::{
     ReportMark, Sealed, MAX_MESSAGE_TTL_SECS,
 };
 pub use identity::{generate_identity_key_pair, SerializableIdentityKeyPair};
+/// The identity's key pair, for hosts that sign with it (`account::login_key_proof`).
+pub use libsignal_protocol::IdentityKeyPair;
 pub use media_keys::{
     build_aad, media_decrypt, media_encrypt, MediaKey, MediaKeyRing, MAX_SEQUENCE_BEFORE_ROTATION,
 };

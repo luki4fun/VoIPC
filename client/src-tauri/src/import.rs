@@ -399,6 +399,13 @@ mod desktop {
                 .as_ref()
                 .is_some_and(|w| !w.answer.is_closed() && w.asked.takes(reply));
             match reply {
+                // Numbered: the page's, whatever it says, since a run's frames go unnumbered
+                // (protocol v22). It was counted with the page's, ahead of a frame or not
+                AccountReply::Asked { .. } => {
+                    self.page_ahead = self.page_ahead.saturating_sub(1);
+                    self.page_out = self.page_out.saturating_sub(1);
+                    false
+                }
                 // A refusal names no step, so it goes by the order they were sent in
                 AccountReply::Error { request, .. } if request == "Admin" => {
                     if self.page_ahead > 0 {
@@ -411,6 +418,18 @@ mod desktop {
                         self.page_out = self.page_out.saturating_sub(1);
                         false
                     }
+                }
+                // The page reads this list too, and the reply names no `after`: one of its pages
+                // answered ahead of the run's first read passed for it, and the run stopped
+                // reading at that page, short of who asked for their posts to go (W2-29). In
+                // order then. A page ask never answered costs the run this answer, and it
+                // stops for want of one, to be gone on with.
+                AccountReply::Admin(AdminReply::MoveExcluded { .. })
+                    if takes && self.page_ahead > 0 =>
+                {
+                    self.page_ahead -= 1;
+                    self.page_out -= 1;
+                    false
                 }
                 AccountReply::Admin(r) if takes || only_a_run_asks(r) => {
                     // So all the page asked ahead of that frame is answered, or never will be
@@ -449,7 +468,16 @@ mod desktop {
         forgotten: Mutex<HashMap<String, u64>>,
         /// The same, of the last `forget_all`: for any server, known here or not.
         forgotten_all: AtomicU64,
+        /// Per server, apart from the token's slot, which goes after an hour.
+        uploaded: Mutex<HashMap<String, Uploaded>>,
     }
+
+    /// What this app put in a server's emote store for a Discord emote, by its id: the name
+    /// and the picture. A run cut between that and its ledger frame left it listed and in no
+    /// ledger, and a server read again names that emote anew (`foo_2`, `foo` being taken).
+    /// This is how the next run still finds the first, which no undo would otherwise take
+    /// (W2-27). Only for as long as the app runs.
+    type Uploaded = Arc<Mutex<HashMap<u64, (String, [u8; 32])>>>;
 
     impl<T> Default for ImportHub<T> {
         fn default() -> Self {
@@ -458,6 +486,7 @@ mod desktop {
                 next: AtomicU64::new(1),
                 forgotten: Mutex::default(),
                 forgotten_all: AtomicU64::new(0),
+                uploaded: Mutex::default(),
             }
         }
     }
@@ -517,6 +546,15 @@ mod desktop {
             self.slots.lock().unwrap_or_else(PoisonError::into_inner)
         }
 
+        fn uploaded(&self, server: &str) -> Uploaded {
+            self.uploaded
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(server.to_string())
+                .or_default()
+                .clone()
+        }
+
         fn number(&self) -> u64 {
             self.next.fetch_add(1, Ordering::Relaxed)
         }
@@ -559,7 +597,13 @@ mod desktop {
             if tcp_tx.send(msg).is_err() {
                 return;
             }
-            if matches!(msg, ClientMessage::Account(AccountRequest::Admin { .. })) {
+            // Numbered or not: an older relay answers `AdminAsk` unnumbered
+            if matches!(
+                msg,
+                ClientMessage::Account(
+                    AccountRequest::Admin { .. } | AccountRequest::AdminAsk { .. }
+                )
+            ) {
                 if let Some(slot) = slots.get_mut(server).filter(|s| s.going.is_some()) {
                     slot.wire.page_out += 1;
                 }
@@ -870,11 +914,13 @@ mod desktop {
         http: reqwest::Client,
         files: Arc<Files>,
         dry: Arc<Dry>,
+        uploaded: Uploaded,
     }
 
     impl Sink {
-        /// A picture as it came from Discord, into the relay's store.
-        async fn store(&self, emote: &PlannedEmote, file: Vec<u8>) -> Result<(), String> {
+        /// A picture as it came from Discord, into the relay's store. `Ok`: the name it is
+        /// listed under.
+        async fn store(&self, emote: &PlannedEmote, file: Vec<u8>) -> Result<String, String> {
             let access = self
                 .files
                 .emotes
@@ -886,13 +932,25 @@ mod desktop {
                 access.max_emote_bytes
             } as usize;
             let made = crate::emotes::prepare(file, emote.sticker, max).await?;
-            // A run cut between the two left it listed and not in the ledger: this files it
-            if self
-                .files
-                .emote_listed(&emote.name, &crate::emotes::sha256(&made.upload))
-            {
-                return Ok(());
+            let hash = crate::emotes::sha256(&made.upload);
+            // A run cut between the two left it listed and not in the ledger: this files it,
+            // under the name this app gave it then, if the server was read again since
+            let earlier = self
+                .uploaded
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&emote.id)
+                .filter(|(_, h)| *h == hash)
+                .map(|(name, _)| name.clone());
+            for name in std::iter::once(emote.name.clone()).chain(earlier) {
+                if self.files.emote_listed(&name, &hash) {
+                    return Ok(name);
+                }
             }
+            self.uploaded
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(emote.id, (emote.name.clone(), hash));
             crate::emotes::add(
                 &self.files,
                 emote.name.clone(),
@@ -904,12 +962,13 @@ mod desktop {
                 ),
                 &made.upload,
             )
-            .await
+            .await?;
+            Ok(emote.name.clone())
         }
     }
 
     impl EmoteSink for Sink {
-        async fn add(&mut self, emote: &PlannedEmote) -> Result<(), String> {
+        async fn add(&mut self, emote: &PlannedEmote) -> Result<String, String> {
             let picture = picture_of(&self.dry.read, emote).ok_or("Discord does not list it")?;
             let file = get(&self.http, &picture.url, None, MAX_IMAGE).await?;
             self.store(emote, file).await
@@ -988,12 +1047,18 @@ mod desktop {
             .map_err(|_| "Those are not the wizard's choices.".to_string())?;
         let (tcp_tx, files, _) = connection_of(state, server).await?;
         let http = client(TIMEOUT)?;
+        let uploaded = state.import.uploaded(server);
         state.import.start(
             server,
             run,
             choices,
             tcp_tx,
-            |dry| Sink { http, files, dry },
+            |dry| Sink {
+                http,
+                files,
+                dry,
+                uploaded,
+            },
             emitter(app, server),
         )
     }
@@ -1266,9 +1331,9 @@ mod desktop {
         struct Recorder(Vec<String>);
 
         impl EmoteSink for Recorder {
-            async fn add(&mut self, emote: &PlannedEmote) -> Result<(), String> {
+            async fn add(&mut self, emote: &PlannedEmote) -> Result<String, String> {
                 self.0.push(emote.name.clone());
-                Ok(())
+                Ok(emote.name.clone())
             }
         }
 
@@ -1848,7 +1913,7 @@ mod desktop {
         struct Panics;
 
         impl EmoteSink for Panics {
-            async fn add(&mut self, _: &PlannedEmote) -> Result<(), String> {
+            async fn add(&mut self, _: &PlannedEmote) -> Result<String, String> {
                 panic!("a bug in the run, on purpose");
             }
         }
@@ -2136,6 +2201,7 @@ mod desktop {
             Sink {
                 http: client(TIMEOUT).unwrap(),
                 files,
+                uploaded: Uploaded::default(),
                 dry: Arc::new(Dry {
                     read: Read::default(),
                     here: Here {
@@ -2242,6 +2308,73 @@ mod desktop {
             assert_eq!(out.err().as_deref(), Some(":pog: is taken"));
         }
 
+        /// W2-27: cut between the relay's listing and the ledger's frame, and the server read
+        /// again before going on: `pog` is taken by then, so the plan says `pog_2`. What this
+        /// app put up is filed under its first name, and nothing goes up twice.
+        #[tokio::test]
+        async fn a_picture_this_app_put_up_is_found_under_its_first_name() {
+            let (out, mut frames) = mpsc::unbounded_channel::<Vec<u8>>();
+            let files = files_on(ControlTx::new(out, PROTOCOL_VERSION));
+            let sink = sink_on(files.clone());
+            let planned = |id: u64, name: &str| PlannedEmote {
+                id,
+                raw: "pog".into(),
+                name: name.into(),
+                sticker: false,
+            };
+            // The relay lists what it gets, and the answer it would give is lost
+            let answers = files.clone();
+            let relay = tokio::spawn(async move {
+                let frame = frames.recv().await.unwrap();
+                let mut buf = BytesMut::from(&frame[..]);
+                let payload = try_decode_frame(&mut buf).unwrap().unwrap();
+                let ClientMessage::EmoteAdd { emote } = decode_client_msg(&payload).unwrap() else {
+                    panic!("not an add");
+                };
+                answers.on_message(voipc_protocol::messages::ServerMessage::EmoteList {
+                    stickers: true,
+                    emotes: vec![emote],
+                });
+                frames
+            });
+            assert_eq!(
+                sink.store(&planned(1, "pog"), PIXEL.to_vec())
+                    .await
+                    .unwrap(),
+                "pog"
+            );
+            let mut frames = relay.await.unwrap();
+
+            assert_eq!(
+                sink.store(&planned(1, "pog_2"), PIXEL.to_vec())
+                    .await
+                    .unwrap(),
+                "pog"
+            );
+            assert!(frames.try_recv().is_err(), "nothing to ask the relay");
+
+            // The control: the same picture for another emote this app never put up is its own
+            let relay = tokio::spawn(async move {
+                let frame = frames.recv().await.unwrap();
+                let mut buf = BytesMut::from(&frame[..]);
+                let payload = try_decode_frame(&mut buf).unwrap().unwrap();
+                let ClientMessage::EmoteAdd { emote } = decode_client_msg(&payload).unwrap() else {
+                    panic!("not an add");
+                };
+                files.on_message(voipc_protocol::messages::ServerMessage::EmoteList {
+                    stickers: true,
+                    emotes: vec![emote],
+                });
+            });
+            assert_eq!(
+                sink.store(&planned(2, "pog_2"), PIXEL.to_vec())
+                    .await
+                    .unwrap(),
+                "pog_2"
+            );
+            relay.await.unwrap();
+        }
+
         #[tokio::test]
         async fn a_file_that_is_no_picture_stays_here() {
             let (out, mut frames) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -2257,6 +2390,70 @@ mod desktop {
                 frames.try_recv().is_err(),
                 "nothing was offered to the relay"
             );
+        }
+
+        /// W2-31: the page numbers its asks on a 22 relay. A numbered answer is the page's
+        /// whatever it says, ahead of the run's frame or not, and the run gets its own.
+        #[tokio::test(start_paused = true)]
+        async fn a_numbered_answer_is_the_pages_and_the_count_stays_right() {
+            let s = scene();
+            let _going = s.hub.take_up(SERVER).unwrap();
+            let page_ask = ClientMessage::Account(AccountRequest::AdminAsk {
+                ask: 3,
+                op: AdminOp::MoveExcluded {
+                    after: "1000".into(),
+                },
+                code: None,
+            });
+            s.hub.send_for_page(SERVER, &s.tcp_tx, &page_ask);
+            let mut first = s.frame(AdminOp::MoveExcluded { after: "".into() });
+            let excluded = |id: &str| AdminReply::MoveExcluded {
+                ids: vec![(id.to_string(), true, true, 1)],
+                more: false,
+            };
+            let numbered =
+                voipc_protocol::codec::encode_asked(3, &AccountReply::Admin(excluded("1001")))
+                    .unwrap();
+            assert!(s.hub.on_reply(SERVER, numbered).is_some(), "the page's");
+            assert_eq!(s.hub.lock()[SERVER].wire.page_out, 0);
+            assert!(first.try_recv().is_err(), "the run still waits");
+            // Its refusal now, unnumbered: the run's
+            assert!(s.hub.on_reply(SERVER, refused_op("Too many")).is_none());
+            assert!(matches!(first.try_recv(), Ok(Err(Stop::Said(_)))));
+        }
+
+        /// W2-29: the page's "Show more" on the left-out list is out when the run reads it
+        /// from the start. Its answer came first and passed for the run's.
+        #[tokio::test(start_paused = true)]
+        async fn the_pages_left_out_page_is_not_the_runs_first() {
+            let s = scene();
+            let _going = s.hub.take_up(SERVER).unwrap();
+            let ask = |after: &str| AdminOp::MoveExcluded {
+                after: after.into(),
+            };
+            let page_ask = ClientMessage::Account(AccountRequest::Admin {
+                op: ask("1000"),
+                code: None,
+            });
+            s.hub.send_for_page(SERVER, &s.tcp_tx, &page_ask);
+            let mut first = s.frame(ask(""));
+            let reply = |ids: &[&str]| {
+                AccountReply::Admin(AdminReply::MoveExcluded {
+                    ids: ids.iter().map(|i| (i.to_string(), true, true, 1)).collect(),
+                    more: false,
+                })
+            };
+            assert!(
+                s.hub.on_reply(SERVER, reply(&["1001"])).is_some(),
+                "the page's, answered first"
+            );
+            assert!(first.try_recv().is_err(), "the run still waits");
+            assert!(s.hub.on_reply(SERVER, reply(&["1"])).is_none());
+            let Ok(Ok(AdminReply::MoveExcluded { ids, .. })) = first.try_recv() else {
+                panic!("not the run's")
+            };
+            assert_eq!(ids[0].0, "1");
+            assert_eq!(s.hub.lock()[SERVER].wire.page_out, 0);
         }
 
         #[tokio::test(start_paused = true)]

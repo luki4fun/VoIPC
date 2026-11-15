@@ -6,6 +6,7 @@ pub mod error;
 #[cfg(any(test, fuzzing))]
 pub mod fuzz;
 pub mod messages;
+pub mod names;
 pub mod types;
 pub mod video;
 pub mod voice;

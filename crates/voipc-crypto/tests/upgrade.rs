@@ -371,6 +371,9 @@ fn a_1_11_account_reads_its_paged_pins_prefs_and_blocks() {
         vault,
         identity,
         recovery: None,
+        binding: None,
+        keyed: false,
+        login_key: None,
         blobs: blobs.clone(),
     };
     let memory: LogMemory =

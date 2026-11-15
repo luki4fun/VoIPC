@@ -3,6 +3,7 @@
   import { removalHint, removalReachesAccount, removalWindows } from "../modlog-rules.js";
   import { backdrop, dialog } from "../actions/dialog.js";
   import { roving } from "../actions/roving.js";
+  import { noTabLine } from "../scopes.js";
   // Admin token login, and the server admin panel: bans, emotes, and on a
   // relay with accounts (1.7) its users and groups.
   //
@@ -194,7 +195,9 @@
         {#if $adminError}
           <div class="admin-error" role="alert">{$adminError}</div>
         {/if}
-        {#if shown === "emotes"}
+        {#if tabs.length === 0}
+          <p class="admin-hint">{noTabLine($can)}</p>
+        {:else if shown === "emotes"}
           <EmoteManager bind:this={emoteManager} />
         {:else if shown === "users"}
           <AdminUsers />
@@ -263,7 +266,7 @@
               {#if $banSearch}
                 <p class="admin-hint empty">No active ban matches “{$banSearch}”.</p>
               {:else}
-                <p class="admin-hint empty">No active bans. Right-click someone in the member list to kick or ban them.</p>
+                <p class="admin-hint empty">No active bans. To kick or ban someone, right-click them in the member list, or use their Actions button there.</p>
               {/if}
             {:else}
               {#if accountBans.length}

@@ -30,6 +30,7 @@ use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use voipc_crypto::bind::BIND_LEN;
 
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
@@ -41,7 +42,6 @@ use l4f_accounts::oauth::{Kind, Provider};
 use l4f_accounts::service::{Host, Intent, LoginStep, NewSession, OAuth, SocialOutcome};
 use l4f_accounts::store::Store;
 use l4f_accounts::{pow, util};
-use rand::seq::SliceRandom;
 use rand::Rng;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
@@ -166,13 +166,13 @@ enum Outcome {
 enum Stage {
     /// The browser is at the provider.
     Open,
-    /// The provider sent it back with this; waiting for the person to tap. The key
-    /// is in the page and goes with this code: whoever brought the code has it.
+    /// The provider sent it back with this; waiting for the person to type the app's code.
+    /// The key is in the page and goes with this code: whoever brought the code has it.
     Back {
         provider_code: String,
         page_key: String,
     },
-    /// Tapped; the provider is being asked. A second tap ends here.
+    /// The code typed; the provider is being asked. A second try ends here.
     Asking,
     Done(Outcome),
 }
@@ -184,8 +184,8 @@ struct Flow {
     cookie: String,
     state: String,
     code: String,
-    /// The code and two others, in the order the page shows them.
-    choices: [String; 3],
+    /// Wrong codes typed on the page so far (`TRIES`).
+    tries: u8,
     purpose: Purpose,
     started: Instant,
     stage: Stage,
@@ -319,22 +319,26 @@ impl Flows {
     }
 }
 
-fn three_digits() -> String {
-    rand::thread_rng().gen_range(100..1000).to_string()
+fn six_digits() -> String {
+    format!("{:06}", rand::thread_rng().gen_range(0..1_000_000))
 }
 
-fn code_and_choices() -> (String, [String; 3]) {
-    let code = three_digits();
-    let mut others = Vec::with_capacity(2);
-    while others.len() < 2 {
-        let other = three_digits();
-        if other != code && !others.contains(&other) {
-            others.push(other);
-        }
+/// Wrong codes the page takes before it stops the sign-in. Typed, a slip is likelier than a
+/// tap's; a guess still lands three times in a million.
+const TRIES: u8 = 3;
+
+/// The code the person types on the page. With the connection's exporter it is
+/// `voipc_crypto::bind::provider_code` over the provider's address, which an app at 22
+/// derives from its own end and shows: through a server that passes the sign-in on, the two
+/// differ (W1-24). The app derives it only from l4f's own form of the address
+/// (`provider_page_exact`), so such a server cannot change the address until they agree; it
+/// could start flows here until two codes agree, which the limits above hold back. Without a
+/// binding (it never lacks one), a random code.
+fn code_for(binding: Option<[u8; BIND_LEN]>, url: &str) -> String {
+    match binding {
+        Some(x) => voipc_crypto::bind::provider_code(&x, url.as_bytes()),
+        None => six_digits(),
     }
-    let mut choices = [code.clone(), others.remove(0), others.remove(0)];
-    choices.shuffle(&mut rand::thread_rng());
-    (code, choices)
 }
 
 impl Relay {
@@ -355,6 +359,7 @@ impl Relay {
         intent: Intent,
         user: Option<&User>,
         ip: IpAddr,
+        binding: Option<[u8; BIND_LEN]>,
     ) -> Result<(String, String, [u8; 32]), String> {
         if !self.providers.admit(ip) {
             return Err("Too many sign-ins from your address. Try again later.".into());
@@ -370,7 +375,7 @@ impl Relay {
             .find_map(|p| p.strip_prefix("state="))
             .ok_or("unexpected sign-in step")?
             .to_string();
-        let (code, choices) = code_and_choices();
+        let code = code_for(binding, &url);
         let ticket: [u8; 32] = rand::random();
         self.providers.by_state.insert(state.clone(), ticket);
         self.providers.by_ticket.insert(
@@ -380,7 +385,7 @@ impl Relay {
                 cookie,
                 state,
                 code: code.clone(),
-                choices,
+                tries: 0,
                 purpose,
                 started: Instant::now(),
                 stage: Stage::Open,
@@ -396,9 +401,10 @@ impl Relay {
         stream: &mut S,
         kind: ProviderKind,
         ip: IpAddr,
+        binding: Option<[u8; BIND_LEN]>,
     ) -> Result<(), String> {
         let (url, code, ticket) =
-            self.flow_begin(kind, Purpose::SignIn, Intent::Login, None, ip)?;
+            self.flow_begin(kind, Purpose::SignIn, Intent::Login, None, ip, binding)?;
         step(
             stream,
             AuthStep::OpenBrowser {
@@ -418,9 +424,12 @@ const PAGE_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; form-acti
     frame-ancestors 'none'; base-uri 'none'";
 const PAGE_STYLE: &str = "body{font:18px system-ui,sans-serif;max-width:32rem;margin:15vh auto;\
     padding:0 1.5rem;background:#101215;color:#e8e8e6}\
-    button{font:600 1.6rem ui-monospace,monospace;padding:.9rem 1.4rem;margin:.3rem;\
-    border-radius:.6rem;border:1px solid #555;background:#1b1e23;color:inherit;cursor:pointer}\
-    button[name=none]{font:inherit}p{line-height:1.5}";
+    button,input{font:600 1.1rem system-ui,sans-serif;padding:.8rem 1.2rem;margin:.3rem 0;\
+    border-radius:.6rem;border:1px solid #555;background:#1b1e23;color:inherit}\
+    button{cursor:pointer}button[name=none]{font-weight:400}\
+    input{display:block;box-sizing:border-box;width:100%;max-width:14rem;\
+    font:600 1.8rem ui-monospace,monospace;letter-spacing:.3rem}\
+    .wrong{color:#ff9b8f}p{line-height:1.5}";
 
 fn page(status: StatusCode, title: &str, body: &str) -> Response<Full<Bytes>> {
     let html = format!(
@@ -487,7 +496,7 @@ fn percent_decode(s: &str) -> String {
 }
 
 /// `GET /account/oauth/<provider>/cb`: the provider sent the browser back. Asks
-/// the provider nothing yet: that waits for the person to tap the code. The page's
+/// the provider nothing yet: that waits for the person to type the code. The page's
 /// key goes only to a request bringing the provider's code.
 pub fn callback(state: &ServerState, path: &str, query: &str) -> Response<Full<Bytes>> {
     let Some(relay) = state.accounts.as_ref() else {
@@ -537,6 +546,18 @@ pub fn callback(state: &ServerState, path: &str, query: &str) -> Response<Full<B
     let Stage::Back { page_key, .. } = &flow.stage else {
         return ended_page();
     };
+    code_page(relay, &flow.state, page_key, None)
+}
+
+/// The page that asks for the code the app shows: typed, so a person who does not see it in
+/// their app has nothing to pick from (a careless tap among three passed one time in three).
+/// `left`: the tries left after a code that was not it.
+fn code_page(
+    relay: &Relay,
+    oauth_state: &str,
+    page_key: &str,
+    left: Option<u8>,
+) -> Response<Full<Bytes>> {
     let host = relay
         .accounts
         .host
@@ -546,23 +567,33 @@ pub fn callback(state: &ServerState, path: &str, query: &str) -> Response<Full<B
         .nth(1)
         .unwrap_or_default()
         .to_string();
-    let buttons: String = flow
-        .choices
-        .iter()
-        .map(|c| format!("<button name=\"pick\" value=\"{c}\">{c}</button>"))
-        .collect();
+    let (status, note) = match left {
+        None => (StatusCode::OK, String::new()),
+        Some(left) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "<p class=\"wrong\">That was not the code. Check your app and type it again \
+                 ({left} {} left).</p>",
+                if left == 1 { "try" } else { "tries" }
+            ),
+        ),
+    };
     page(
-        StatusCode::OK,
-        "Which code does your app show?",
+        status,
+        "Type the code your app shows",
         &format!(
-            "<p>Signing in to VoIPC on <b>{host}</b>. Tap the code your VoIPC app shows.</p>\
+            "<p>Signing in to VoIPC on <b>{host}</b>. Your VoIPC app shows a six-digit code: \
+             type it here.</p>{note}\
              <form method=\"post\" action=\"{CONFIRM_PATH}\">\
              <input type=\"hidden\" name=\"state\" value=\"{oauth_state}\">\
-             <input type=\"hidden\" name=\"key\" value=\"{key}\">{buttons}\
-             <button name=\"none\" value=\"1\">None of these</button></form>\
+             <input type=\"hidden\" name=\"key\" value=\"{key}\">\
+             <input name=\"pick\" inputmode=\"numeric\" autocomplete=\"one-time-code\" \
+             maxlength=\"7\" required autofocus aria-label=\"The code your app shows\">\
+             <button>Continue</button> \
+             <button name=\"none\" value=\"1\" formnovalidate>Cancel</button></form>\
              <p>If you did not start this in your own app, close this page: someone may be \
              trying to sign in as you.</p>",
-            oauth_state = html_attr(&flow.state),
+            oauth_state = html_attr(oauth_state),
             key = html_attr(page_key),
         ),
     )
@@ -575,7 +606,7 @@ fn html_attr(s: &str) -> String {
         .collect()
 }
 
-/// `POST /account/oauth/confirm`: the person tapped a code.
+/// `POST /account/oauth/confirm`: the person typed the code, or cancelled.
 pub async fn confirm(state: &Arc<ServerState>, body: &[u8], ip: IpAddr) -> Response<Full<Bytes>> {
     let Some(relay) = state.accounts.clone() else {
         return ended_page();
@@ -584,7 +615,13 @@ pub async fn confirm(state: &Arc<ServerState>, body: &[u8], ip: IpAddr) -> Respo
     let Some(oauth_state) = query_param(&form, "state") else {
         return ended_page();
     };
-    let pick = query_param(&form, "pick").unwrap_or_default();
+    // Only its digits: "123 456" is the code too
+    let typed: String = query_param(&form, "pick")
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .collect();
+    let cancelled = query_param(&form, "none").is_some();
     let key = query_param(&form, "key").unwrap_or_default();
     let Some(ticket) = relay.providers.by_state.get(oauth_state).map(|t| *t) else {
         return ended_page();
@@ -606,10 +643,23 @@ pub async fn confirm(state: &Arc<ServerState>, body: &[u8], ip: IpAddr) -> Respo
             return ended_page();
         }
         let provider_code = provider_code.clone();
-        if flow.code != pick {
-            // One tap. A wrong one is someone reading the page, not the app.
+        if cancelled {
+            flow.stage = Stage::Done(Outcome::Failed("Cancelled on the sign-in page.".into()));
+            return page(
+                StatusCode::OK,
+                "Sign-in cancelled",
+                "<p>Nothing happened. You can close this page.</p>",
+            );
+        }
+        if !util::ct_eq(&flow.code, &typed) {
+            flow.tries += 1;
+            if flow.tries < TRIES {
+                let (oauth_state, left) = (flow.state.clone(), TRIES - flow.tries);
+                return code_page(&relay, &oauth_state, key, Some(left));
+            }
+            // A person reads the code off their app; three wrong ones are someone without it
             flow.stage = Stage::Done(Outcome::Failed(
-                "The code tapped was not the one this app showed.".into(),
+                "The code typed on the page was not the one this app showed.".into(),
             ));
             return page(
                 StatusCode::FORBIDDEN,
@@ -627,6 +677,22 @@ pub async fn confirm(state: &Arc<ServerState>, body: &[u8], ip: IpAddr) -> Respo
             flow.purpose,
         )
     };
+    // In its own task: a browser that goes away mid-way (a closed tab, a phone off its
+    // network) drops this request, and with it the flow stayed Asking until it expired (W2-19)
+    let state = state.clone();
+    tokio::spawn(async move { exchange(&state, &relay, ticket, taken, ip).await })
+        .await
+        .unwrap_or_else(|_| ended_page())
+}
+
+/// What the provider's code comes to, past the tap.
+async fn exchange(
+    state: &Arc<ServerState>,
+    relay: &Arc<Relay>,
+    ticket: [u8; 32],
+    taken: (Kind, String, String, String, Purpose),
+    ip: IpAddr,
+) -> Response<Full<Bytes>> {
     let (kind, cookie, oauth_state, provider_code, purpose) = taken;
     let ctx = relay.ctx(ip, "web");
     match purpose {
@@ -655,19 +721,15 @@ pub async fn confirm(state: &Arc<ServerState>, body: &[u8], ip: IpAddr) -> Respo
                 flow.stage = Stage::Done(outcome);
             }
             match failed {
-                Some(reason) => page(
-                    StatusCode::OK,
-                    "That did not work",
-                    &format!("<p>{}</p>", html_text(&reason)),
-                ),
+                Some(reason) => did_not_work(&reason),
                 None => back_to_the_app(),
             }
         }
         Purpose::Account { session_id } => {
             relay.providers.remove(&ticket);
-            finish_for_account(
+            let done = finish_for_account(
                 state,
-                &relay,
+                relay,
                 session_id,
                 kind,
                 &cookie,
@@ -676,10 +738,26 @@ pub async fn confirm(state: &Arc<ServerState>, body: &[u8], ip: IpAddr) -> Respo
                 ip,
             )
             .await;
-            back_to_the_app()
+            match done {
+                Ok(()) => back_to_the_app(),
+                Err(reason) => did_not_work(&reason),
+            }
         }
     }
 }
+
+fn did_not_work(reason: &str) -> Response<Full<Bytes>> {
+    page(
+        StatusCode::OK,
+        "That did not work",
+        &format!("<p>{}</p>", html_text(reason)),
+    )
+}
+
+/// A link or proof whose connection ended before the tap: a phone's app goes to sleep
+/// while the browser is up, and comes back as a new session.
+pub(crate) const APP_GONE: &str =
+    "The app was no longer connected, so nothing changed. Start again in the app.";
 
 fn html_text(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -695,8 +773,9 @@ fn back_to_the_app() -> Response<Full<Bytes>> {
     )
 }
 
-/// A signed-in connection's link or proof. What it comes to reaches the
-/// connection; if that is gone, the next `ProviderList` shows a link.
+/// A signed-in connection's link or proof. What it comes to reaches the connection,
+/// and the page: `Err` is what to show there, since "Done" over nothing done misleads
+/// (W2-20). With the connection gone the provider is not asked at all.
 #[allow(clippy::too_many_arguments)]
 async fn finish_for_account(
     state: &Arc<ServerState>,
@@ -707,14 +786,14 @@ async fn finish_for_account(
     oauth_state: &str,
     provider_code: &str,
     ip: IpAddr,
-) {
+) -> Result<(), String> {
     let session = state.sessions.get(&session_id).and_then(|s| {
         s.account
             .as_ref()
             .map(|a| (a.user.clone(), a.info.clone(), s.control_tx.clone()))
     });
     let Some((user, info, tx)) = session else {
-        return;
+        return Err(APP_GONE.into());
     };
     let ctx = relay.ctx(ip, "web");
     let done = relay
@@ -728,22 +807,35 @@ async fn finish_for_account(
             Some((&user, &info)),
         )
         .await;
-    let answer = match done {
-        Ok((SocialOutcome::Linked, _)) => AccountReply::ProviderDone {
-            kind: kind_from(kind),
-            link: true,
-        },
-        Ok((SocialOutcome::SteppedUp(fresh), _)) => {
-            put_session(state, session_id, fresh);
+    let (answer, out) = match done {
+        Ok((SocialOutcome::Linked, _)) => (
             AccountReply::ProviderDone {
                 kind: kind_from(kind),
-                link: false,
-            }
+                link: true,
+            },
+            Ok(()),
+        ),
+        Ok((SocialOutcome::SteppedUp(fresh), _)) => {
+            put_session(state, session_id, fresh);
+            (
+                AccountReply::ProviderDone {
+                    kind: kind_from(kind),
+                    link: false,
+                },
+                Ok(()),
+            )
         }
-        Ok(_) => refused("ProviderStart", "unexpected sign-in step"),
-        Err(e) => refused("ProviderStart", e.message()),
+        Ok(_) => {
+            let why = "unexpected sign-in step";
+            (refused("ProviderStart", why), Err(why.to_string()))
+        }
+        Err(e) => (
+            refused("ProviderStart", e.message()),
+            Err(e.message().to_string()),
+        ),
     };
     let _ = crate::session::send_msg(&tx, &ServerMessage::Account(answer));
+    out
 }
 
 /// A step-up gave this session a new token; the old one no longer resolves, so
@@ -786,6 +878,7 @@ pub(super) async fn resume<S: AsyncRead + AsyncWrite + Unpin>(
     ctx: &l4f_accounts::service::Ctx,
     ip: IpAddr,
     answers: &mut u32,
+    binding: Option<[u8; voipc_crypto::bind::BIND_LEN]>,
 ) -> Result<SignedIn, String> {
     let ticket: [u8; 32] = ticket.try_into().map_err(|_| ENDED.to_string())?;
     let not_yet = relay
@@ -829,7 +922,10 @@ pub(super) async fn resume<S: AsyncRead + AsyncWrite + Unpin>(
         _ => return Err(ENDED.into()),
     };
     let token = session.token.clone();
-    let r = finish(state, relay, stream, buf, ctx, session, answers, ip).await;
+    let r = finish(
+        state, relay, stream, buf, ctx, session, answers, ip, binding,
+    )
+    .await;
     if r.is_err() {
         let _ = relay.accounts.logout(&token).await;
     }
@@ -890,6 +986,11 @@ async fn signup<S: AsyncRead + AsyncWrite + Unpin>(
         };
         if altcha.is_empty() {
             return Err("The sign-up puzzle was not solved.".into());
+        }
+        // Asked again, as for a name that is taken; a shape, so it tells nothing (W1-30)
+        if super::placeholder::kept_for_the_move(&name) {
+            problem = super::placeholder::KEPT_FOR_THE_MOVE.to_string();
+            continue;
         }
         let proof = pow::Proof {
             altcha: &altcha,
@@ -1071,6 +1172,7 @@ async fn finish<S: AsyncRead + AsyncWrite + Unpin>(
     session: NewSession,
     answers: &mut u32,
     ip: IpAddr,
+    binding: Option<[u8; voipc_crypto::bind::BIND_LEN]>,
 ) -> Result<SignedIn, String> {
     let gone = || "Something went wrong. Please try again.".to_string();
     let work = || relay.pending_slot(ip).ok_or_else(|| BUSY.to_string());
@@ -1116,16 +1218,27 @@ async fn finish<S: AsyncRead + AsyncWrite + Unpin>(
                 info!(user = %user.id.hex(), "account claimed through a provider");
                 break identity_key;
             }
-            AuthContinue::ProviderProof { signature } if !claim_it => {
+            // Only the bound proof (22): an unbound one is what a server passing the
+            // sign-in on would hold (W1-24)
+            AuthContinue::ProviderProofBound { signature, web } if !claim_it => {
                 let key = known.as_deref().ok_or_else(unexpected)?;
-                if !voipc_crypto::account::provider_proof_ok(
+                let Some(b) = voipc_crypto::bind::Binding::claimed(web, binding) else {
+                    return Err(super::NOT_THIS_CONNECTION.into());
+                };
+                if !voipc_crypto::account::provider_proof_bound_ok(
                     key,
                     &relay.relay_id,
                     &user.username,
                     &challenge,
+                    &b,
                     &signature,
                 ) {
-                    return Err("That does not open this account.".into());
+                    info!(user = %user.id.hex(), "provider proof refused: not this account's, or not made on this connection");
+                    return Err(
+                        "That does not open this account, or the sign-in was not made \
+                                on this connection."
+                            .into(),
+                    );
                 }
                 break key.to_vec();
             }
@@ -1162,6 +1275,7 @@ async fn finish<S: AsyncRead + AsyncWrite + Unpin>(
         identity_key,
         prekey_bundle,
         vault_proven: true,
+        by_secret: false,
     })
 }
 
@@ -1414,10 +1528,11 @@ pub(super) fn start_for_account(
     kind: ProviderKind,
     link: bool,
     ip: IpAddr,
+    binding: Option<[u8; BIND_LEN]>,
 ) -> AccountReply {
     let intent = if link { Intent::Link } else { Intent::Reauth };
     let purpose = Purpose::Account { session_id };
-    match relay.flow_begin(kind, purpose, intent, Some(user), ip) {
+    match relay.flow_begin(kind, purpose, intent, Some(user), ip, binding) {
         Ok((url, code, _)) => AccountReply::ProviderBrowser { url, code },
         Err(reason) => refused("ProviderStart", &reason),
     }
@@ -1443,6 +1558,26 @@ pub(super) async fn unlink(
             "That provider is not linked here.",
         ));
     };
+    // Deleting the account later still takes what the move brought under this Discord id
+    // (W1-34): kept before the link goes, read only then and in the account's export
+    if kind_l4f == l4f_accounts::oauth::Kind::Discord {
+        if let Some(dc_id) = std::str::from_utf8(&cred.ext_id)
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+        {
+            db!(relay.store(), pool => {
+                sqlx::query(
+                    "INSERT INTO voipc_dc_unlinked (account, dc_id, at) VALUES ($1, $2, $3)
+                     ON CONFLICT DO NOTHING",
+                )
+                .bind(&user.id.0[..])
+                .bind(dc_id)
+                .bind(util::now())
+                .execute(pool)
+                .await?;
+            });
+        }
+    }
     Ok(
         match relay
             .accounts
@@ -1457,6 +1592,38 @@ pub(super) async fn unlink(
 
 #[cfg(test)]
 mod tests {
+
+    /// W3-35: anyone on the internet reaches these at `/account/oauth/`, and no fuzz target
+    /// can, the relay being a binary. Many generated inputs instead: no panic, a value is
+    /// a piece of what came, and text with no `%` decodes to itself.
+    #[test]
+    fn the_callbacks_query_reading_takes_anything() {
+        let alphabet: Vec<char> = "%=&ab09AF-_.~+/?é漢😀\u{0}".chars().collect();
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..20_000 {
+            let len = (next() % 24) as usize;
+            let s: String = (0..len)
+                .map(|_| alphabet[(next() % alphabet.len() as u64) as usize])
+                .collect();
+            let decoded = super::percent_decode(&s);
+            if !s.contains('%') {
+                assert_eq!(decoded, s);
+            }
+            for key in ["state", "code", "a", ""] {
+                if let Some(v) = super::query_param(&s, key) {
+                    assert!(s.contains(v), "{s:?} {key:?} {v:?}");
+                }
+            }
+        }
+        assert_eq!(super::percent_decode("a%20b%zz%"), "a b%zz%");
+        assert_eq!(super::query_param("x=1&code=ab%2F", "code"), Some("ab%2F"));
+    }
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -1544,7 +1711,7 @@ mod tests {
                 cookie: String::new(),
                 state,
                 code: String::new(),
-                choices: Default::default(),
+                tries: 0,
                 purpose: Purpose::SignIn,
                 started: Instant::now() - Duration::from_secs(age),
                 stage,

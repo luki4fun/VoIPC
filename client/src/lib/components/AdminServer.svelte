@@ -3,6 +3,7 @@
   // beside the address everywhere and never replaces it, so it cannot pass for
   // another server. Its look is AdminDialogs.svelte's.
 
+  import { filePick } from "../actions/file-pick.js";
   import { get } from "svelte/store";
   import { makeProfilePicture } from "../image-prep.js";
   import { adminError, adminOp } from "../stores/admin-ui.js";
@@ -52,7 +53,7 @@
   <div class="section-title">Icon</div>
   <div class="icon-row">
     {#if iconUrl}<img class="icon" src={iconUrl} alt="The server's icon" />{/if}
-    <label class="btn btn-secondary">
+    <label class="btn btn-secondary" use:filePick>
       Choose…
       <input type="file" accept="image/*" hidden onchange={(e) => pick(e.currentTarget)} />
     </label>

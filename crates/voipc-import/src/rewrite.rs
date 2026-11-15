@@ -294,7 +294,8 @@ fn push_name(name: &str, out: &mut String) {
             c,
             '\\' | '`' | '*' | '_' | '~' | '|' | '[' | ']' | '(' | ')' | '<' | '>'
         );
-        if (special && !inert) || makes_a_bare_link(name, at) {
+        // `@` too: `ceo@evil.xy` is a mailto link there (W1-37)
+        if (special && !inert) || c == '@' || makes_a_bare_link(name, at) {
             out.push('\\');
         }
         out.push(c);
@@ -413,6 +414,21 @@ pub fn label(raw: &str, max_chars: usize) -> String {
     }
 }
 
+/// `label`, for a line of the body, which the pane draws as Markdown: an address in it is
+/// words, not a link (W1-37). The file's own name and type keep `label`, since no Markdown
+/// draws them.
+fn label_line(raw: &str, max_chars: usize) -> String {
+    let kept = label(raw, max_chars);
+    let mut out = String::with_capacity(kept.len() + 4);
+    for (at, c) in kept.char_indices() {
+        if c == '@' || makes_a_bare_link(&kept, at) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn push_line(out: &mut String, line: &str) {
     if !out.is_empty() {
         out.push('\n');
@@ -441,15 +457,15 @@ fn body_of(m: &Message, names: &Names) -> String {
         }
     }
     for a in &m.attachments {
-        let name = label(&a.filename, ATTACHMENT_NAME_CHARS);
+        let name = label_line(&a.filename, ATTACHMENT_NAME_CHARS);
         push_line(&mut body, &format!("[attachment: {name}]"));
     }
     for s in &m.sticker_items {
-        let name = label(&s.name, ATTACHMENT_NAME_CHARS);
+        let name = label_line(&s.name, ATTACHMENT_NAME_CHARS);
         push_line(&mut body, &format!("[sticker: {name}]"));
     }
     if let Some(poll) = &m.poll {
-        let question = label(&poll.question.text, ATTACHMENT_NAME_CHARS);
+        let question = label_line(&poll.question.text, ATTACHMENT_NAME_CHARS);
         push_line(&mut body, &format!("[poll: {question}]"));
     }
     body.truncate(clip_bytes(&body, IMPORT_BODY_BYTES).len());
@@ -875,11 +891,31 @@ mod tests {
             let row = row_of(&m, &n, &all_on()).unwrap();
             let line = row.body.strip_prefix("[attachment: ").unwrap();
             let name = line.strip_suffix(']').unwrap();
+            // A `\` only of our own, before what would make an address a link (W1-37)
+            let unescaped = name
+                .replace("\\:", ":")
+                .replace("\\.", ".")
+                .replace("\\@", "@");
             for c in ['[', ']', '(', ')', '<', '>', '\\', '`', '\n'] {
-                assert!(!name.contains(c), "{c} in {name}");
+                assert!(!unescaped.contains(c), "{c} in {name}");
             }
             assert_eq!(row.body.lines().count(), 1, "{}", row.body);
-            assert_eq!(row.attachments[0].name, name);
+            assert_eq!(row.attachments[0].name, unescaped);
+        }
+        // An address in such a line is no link either (W1-37), and the file's own name, which
+        // no Markdown draws, keeps what it said
+        for (evil, line) in [
+            ("https://evil.xy", r"[attachment: https\://evil.xy]"),
+            ("www.evil.xy", r"[attachment: www\.evil.xy]"),
+            ("ceo@evil.xy", r"[attachment: ceo\@evil.xy]"),
+        ] {
+            let m = message(&format!(
+                r#"{{"id":"1","author":{{"id":"1001"}},"attachments":[{{"id":"2","filename":{}}}]}}"#,
+                serde_json::to_string(evil).unwrap()
+            ));
+            let row = row_of(&m, &n, &all_on()).unwrap();
+            assert_eq!(row.body, line);
+            assert_eq!(row.attachments[0].name, evil);
         }
         // The same goes for what else makes such a line
         let m = message(
@@ -888,7 +924,7 @@ mod tests {
         );
         assert_eq!(
             row_of(&m, &n, &all_on()).unwrap().body,
-            "[sticker: sx]\n[poll: qhttp://evil]"
+            "[sticker: sx]\n[poll: qhttp\\://evil]"
         );
     }
 
@@ -1252,6 +1288,8 @@ mod tests {
             ("WWW.evil.xy", r"@WWW\.evil.xy"),
             ("see www.evil.xy", r"@see www\.evil.xy"),
             ("xwww.evil.xy", r"@xwww\.evil.xy"),
+            // An address is a mailto link there (W1-37)
+            ("ceo@evil.xy", r"@ceo\@evil.xy"),
             // The controls: nothing to say, and an `_` inside a name does nothing there
             ("Dan D", "@Dan D"),
             ("dan_d", "@dan_d"),

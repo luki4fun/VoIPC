@@ -1976,6 +1976,7 @@ mod tests {
             conn,
             mut control_send,
             mut control_recv,
+            ..
         } = link;
         let auth = ClientMessage::Authenticate {
             username: name.into(),

@@ -7,9 +7,11 @@
 export type NotifyLevel = "all" | "mentions" | "nothing";
 
 /** Whether a person can see this page now, so a system notification would tell them nothing.
- *  A WebView behind HOME goes on saying it has focus: only `hidden` tells. */
-export function pageInView(page: { hidden: boolean; hasFocus(): boolean }): boolean {
-  return !page.hidden && page.hasFocus();
+ *  A WebView behind HOME goes on saying it has focus: only `hidden` tells. Under Android's
+ *  pulled-down shade it is neither hidden nor unfocused: only the app's window says it lost
+ *  focus (`windowFocused`, from the native window's own event; a browser has none). */
+export function pageInView(page: { hidden: boolean; hasFocus(): boolean }, windowFocused = true): boolean {
+  return !page.hidden && page.hasFocus() && windowFocused;
 }
 
 /** Whether a pointer over a toast holds its clock: a mouse, which also says when it has left.
@@ -53,8 +55,10 @@ export function arrival(
 ): { count: boolean; sound: boolean; os: boolean } {
   if (level === "nothing") return { count: false, sound: false, os: false };
   const wanted = level === "all" || m.forMe;
+  // What you wrote yourself is not news to you, forwarded into another channel or from your
+  // other device, as `dmCountsUnread` has it for direct messages (W3-26)
   return {
-    count: !m.onScreen && wanted,
+    count: !m.onScreen && wanted && !m.mine,
     sound: !m.onScreen && wanted && !m.mine,
     os: m.forMe && !m.mine,
   };
