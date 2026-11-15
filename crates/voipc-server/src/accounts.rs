@@ -830,13 +830,33 @@ async fn migrate_relay(store: &Store) -> Result<()> {
         m.set_locking(false);
         m
     }
+    // What ran is said: an upgrade's only trace was the table (rc.2 device run)
+    let before = relay_migrations(store).await.unwrap_or_default();
     let mut held = l4f_accounts::migrate::lock(store).await?;
     let r = match held.conn() {
         StoreConn::Pg(c) => ours(sqlx::migrate!("migrations/postgres")).run(c).await,
         StoreConn::Lite(c) => ours(sqlx::migrate!("migrations/sqlite")).run(c).await,
     };
     l4f_accounts::migrate::unlock(held).await;
-    Ok(r?)
+    r?;
+    let after = relay_migrations(store).await.unwrap_or_default();
+    // Both dialects number and name them alike
+    for m in sqlx::migrate!("migrations/sqlite").iter() {
+        if after.contains(&m.version) && !before.contains(&m.version) {
+            info!(
+                version = m.version,
+                "database migration applied: {}", m.description
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The relay's migrations this database has, none before its first start.
+async fn relay_migrations(store: &Store) -> Result<Vec<i64>> {
+    Ok(db!(store, pool => {
+        sqlx::query_scalar("SELECT version FROM voipc_migrations").fetch_all(pool).await?
+    }))
 }
 
 /// The key this database was made with, recognised again: a check value
@@ -1169,9 +1189,7 @@ const DEVKEY_KIND: &str = "devkey";
 
 /// A proof bound to another connection than this one: a server between the app and this
 /// relay passed it on (W1-24), or the device's key is gone.
-pub(crate) const NOT_THIS_CONNECTION: &str =
-    "This sign-in was not made on this connection. If you used a link, open the server's \
-     own address in VoIPC instead.";
+pub(crate) const NOT_THIS_CONNECTION: &str = voipc_crypto::bind::NOT_THIS_CONNECTION;
 
 /// Runs an account sign-in on a connection whose `Authenticate` named one, up
 /// to the keys. `Err` is the reason for the client (`AuthError`). A session
@@ -1312,6 +1330,9 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
                 })
             });
             if !bound {
+                // An operator's one sign of a proxy that ends TLS in front of the relay, or of
+                // a server passing sign-ins on (rc.2 device run: this said nothing)
+                info!("device key sign-in refused: not made on this connection");
                 return Err(NOT_THIS_CONNECTION.into());
             }
             relay
@@ -2179,7 +2200,11 @@ async fn login_key_set(
         &b,
         identity_sig,
     ) {
-        return Err("That key was not signed by this account.".into());
+        // The app signs with this account's identity over its own end of the TLS session:
+        // refused here, that is another session's end, so a server in between, which the app
+        // must hear of (rc.2 device run: the move after an old secret was refused unseen)
+        info!(user = %user.id.hex(), "login key refused: not made on this connection");
+        return Err(NOT_THIS_CONNECTION.into());
     }
     let user = relay
         .store()

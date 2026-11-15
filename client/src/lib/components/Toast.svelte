@@ -93,6 +93,24 @@
     }
   }
 
+  /* A phone's dialog has its buttons at the bottom too: a toast that stays (a new server's
+     certificate) sat on Connect, and a tap there hit the toast (rc.2 device run). While one is
+     open the stack goes to the top; with none, the top has the header's buttons, so not then */
+  @media (max-width: 600px) {
+    :global(body:has([aria-modal="true"])) .toast-container {
+      top: calc(12px + env(safe-area-inset-top, 0px));
+      bottom: auto;
+      right: auto;
+      left: 50%;
+      transform: translateX(-50%);
+      flex-direction: column;
+    }
+
+    :global(body:has([aria-modal="true"])) .toast {
+      animation-name: drop-in;
+    }
+  }
+
   @keyframes drop-in {
     from {
       transform: translateY(-100%);

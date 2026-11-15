@@ -95,6 +95,9 @@ fn page_to_open(url: &str) -> Result<(), String> {
     }
 }
 
+/// A provider's page whose address is not as the relay writes it: its code cannot be trusted.
+const PAGE_NOT_EXACT: &str = voipc_crypto::account::PAGE_NOT_EXACT;
+
 /// What this ends with when the person chose their password; the name follows.
 pub const USE_PASSWORD: &str = "Sign in with your password: ";
 
@@ -158,6 +161,11 @@ pub async fn account_provider_ask(
                 let x = link
                     .binding
                     .ok_or("This connection cannot be checked. Nothing was opened.")?;
+                // Only from l4f's own form of the address: anything else could be a server in
+                // between trying addresses until the two codes agree
+                if !voipc_crypto::account::provider_page_exact(&url) {
+                    return Err(PAGE_NOT_EXACT.into());
+                }
                 let code = voipc_crypto::bind::provider_code(&x, url.as_bytes());
                 return Ok(serde_json::json!({ "url": url, "code": code, "ticket": ticket }));
             }

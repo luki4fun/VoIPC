@@ -1154,6 +1154,126 @@ fn facebook_dialog(url: &str) -> bool {
         && rest.starts_with("dialog/oauth?")
 }
 
+/// What an app says of a provider's page not in that form, and opens nothing.
+pub const PAGE_NOT_EXACT: &str = "This server named the provider's page in a form this app \
+     cannot check, so it cannot show you a code to trust. Nothing was opened. If you used a \
+     link, open the server's own address in VoIPC instead.";
+
+/// The Graph API version l4f-accounts asks Facebook's dialog for (`oauth::FB_VERSION`).
+/// voipc-server's tests hold the two together.
+pub const FACEBOOK_VERSION: &str = "v21.0";
+
+/// Whether a provider's page is exactly as l4f-accounts writes it (`oauth::authorize_url`):
+/// the only form an app at 22 works out its code from. The code covers the whole address, so
+/// anything a server in between can add to it, or spell another way, is one more guess at the
+/// relay's code; with a suffix it found one in about a second (rc.2 device run). In this form
+/// each value is the relay's own, which the provider or the relay checks again, or one fixed
+/// word, each with one spelling: what is left to vary is whether it asks again (one bit).
+pub fn provider_page_exact(url: &str) -> bool {
+    let facebook = format!("https://www.facebook.com/{FACEBOOK_VERSION}/dialog/oauth");
+    let Some((page, query)) = url.split_once('?') else {
+        return false;
+    };
+    // The keys and values l4f writes for each, in its order; `None` is the relay's own value
+    type Pairs<'a> = &'a [(&'a str, Option<&'a str>)];
+    let tails: [Pairs; 2] = match page {
+        "https://discord.com/oauth2/authorize" => [
+            &[("scope", Some("identify"))],
+            &[("scope", Some("identify")), ("prompt", Some("consent"))],
+        ],
+        "https://accounts.google.com/o/oauth2/v2/auth" => [
+            &[("scope", Some("openid+profile")), ("nonce", None)],
+            &[
+                ("scope", Some("openid+profile")),
+                ("nonce", None),
+                ("prompt", Some("login")),
+                ("max_age", Some("0")),
+            ],
+        ],
+        p if p == facebook => [
+            &[("scope", Some("public_profile"))],
+            &[
+                ("scope", Some("public_profile")),
+                ("auth_type", Some("reauthenticate")),
+            ],
+        ],
+        _ => return false,
+    };
+    const HEAD: Pairs = &[
+        ("response_type", Some("code")),
+        ("client_id", None),
+        ("redirect_uri", None),
+        ("state", None),
+        ("code_challenge", None),
+        ("code_challenge_method", Some("S256")),
+    ];
+    let Some(pairs) = query
+        .split('&')
+        .map(|p| p.split_once('='))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    provider_page_ok(url)
+        && tails.iter().any(|tail| {
+            pairs.len() == HEAD.len() + tail.len()
+                && pairs.iter().zip(HEAD.iter().chain(tail.iter())).all(
+                    |(&(k, v), &(key, want))| {
+                        k == key && want.map_or_else(|| relay_value_ok(key, v), |w| v == w)
+                    },
+                )
+        })
+}
+
+/// One value the relay chose, as l4f writes it: random ones at their length, and an id and an
+/// address in l4f's `urlencode` spelling only (letters, digits and `-_.*` as they are, a space
+/// as `+`, any other byte as `%XX` in capitals), so no two spellings name the same value.
+fn relay_value_ok(key: &str, v: &str) -> bool {
+    let b64u = |n: usize| {
+        v.len() == n
+            && v.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    };
+    match key {
+        // 16 random bytes, and PKCE's SHA-256
+        "state" | "nonce" => b64u(22),
+        "code_challenge" => b64u(43),
+        // Discord's and Facebook's are digits, Google's lower case: a provider that took
+        // capitals as the same id would be a free spelling
+        "client_id" => {
+            (1..=128).contains(&v.len())
+                && v.bytes().all(|b| {
+                    b.is_ascii_digit() || b.is_ascii_lowercase() || matches!(b, b'-' | b'_' | b'.')
+                })
+        }
+        "redirect_uri" => {
+            let raw = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'*');
+            let hex = |b: u8| b.is_ascii_digit() || (b'A'..=b'F').contains(&b);
+            let (bytes, mut i, mut decoded) = (v.as_bytes(), 0, Vec::new());
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'%' if i + 2 < bytes.len() && hex(bytes[i + 1]) && hex(bytes[i + 2]) => {
+                        let byte = u8::from_str_radix(&v[i + 1..i + 3], 16).unwrap_or(b' ');
+                        // Escaped only where l4f escapes; a space is `+`, and an address has none
+                        if raw(byte) || byte == b' ' {
+                            return false;
+                        }
+                        decoded.push(byte);
+                        i += 3;
+                    }
+                    b if raw(b) => {
+                        decoded.push(b);
+                        i += 1;
+                    }
+                    _ => return false,
+                }
+            }
+            v.len() <= 512 && decoded.starts_with(b"https://")
+        }
+        _ => false,
+    }
+}
+
 /// What `Authenticate` asks for a provider's sign-in, before there is a
 /// sign-in: which ones there are (`AccountStart::Providers`), or the page to
 /// open (`AccountStart::Provider`). The relay answers, then ends the connection.
@@ -2158,6 +2278,77 @@ mod tests {
             "",
         ] {
             assert!(!provider_page_ok(bad), "{bad}");
+        }
+    }
+
+    /// The code an app shows covers the whole address: a server in between that may add to it
+    /// or spell it another way grinds the relay's code in about a second (rc.2 device run).
+    /// Only l4f's own form is worked out; voipc-server checks l4f's real addresses against it.
+    #[test]
+    fn a_code_is_worked_out_only_from_the_address_as_l4f_writes_it() {
+        let state = "Ab-_0123456789abcdefgh";
+        let challenge = "C".repeat(43);
+        let head = |page: &str, id: &str| {
+            format!(
+                "{page}?response_type=code&client_id={id}&redirect_uri=https%3A%2F%2Fvoipc.example%3A8443%2Faccount%2Foauth%2Fdiscord%2Fcb&state={state}&code_challenge={challenge}&code_challenge_method=S256"
+            )
+        };
+        let discord = head("https://discord.com/oauth2/authorize", "1234567890");
+        let google = head(
+            "https://accounts.google.com/o/oauth2/v2/auth",
+            "123-abc.apps.googleusercontent.com",
+        );
+        let facebook = head("https://www.facebook.com/v21.0/dialog/oauth", "987654321");
+        let ok = format!("{discord}&scope=identify");
+        for good in [
+            ok.clone(),
+            format!("{discord}&scope=identify&prompt=consent"),
+            format!("{google}&scope=openid+profile&nonce={state}"),
+            format!("{google}&scope=openid+profile&nonce={state}&prompt=login&max_age=0"),
+            format!("{facebook}&scope=public_profile"),
+            format!("{facebook}&scope=public_profile&auth_type=reauthenticate"),
+            // The test lanes' stand-in id
+            format!(
+                "{}&scope=identify",
+                head("https://discord.com/oauth2/authorize", "client")
+            ),
+        ] {
+            assert!(provider_page_exact(&good), "{good}");
+        }
+        for bad in [
+            // What the grind did: one more pair, any name, any value
+            format!("{ok}&x=649654"),
+            format!("{ok}&"),
+            format!("{ok}&scope=identify"),
+            ok.replace("&scope=identify", "&scope=identify+email"),
+            // Another order, a pair left out, a key twice
+            ok.replace(
+                "response_type=code&client_id=1234567890",
+                "client_id=1234567890&response_type=code",
+            ),
+            ok.replace("&code_challenge_method=S256", ""),
+            ok.replace(
+                &format!("&state={state}"),
+                &format!("&state={state}&state={state}"),
+            ),
+            // Another spelling of the same value
+            ok.replace("%3A%2F%2F", "%3a%2f%2f"),
+            ok.replace("voipc.example", "voipc%2Eexample"),
+            ok.replace("voipc.example", "VOIPC.example")
+                .replace("client_id=1234567890", "client_id=ABC"),
+            ok.replace(state, &format!("{}%41", &state[..19])),
+            ok.replace("https%3A", "http%3A"),
+            // Another page, or another Facebook version
+            facebook.replace("v21.0", "v22.0") + "&scope=public_profile",
+            ok.replace(
+                "discord.com/oauth2/authorize",
+                "discord.com/oauth2/authorize/",
+            ),
+            format!("{google}&scope=openid+profile"),
+            format!("{discord}&scope=identify&prompt=login"),
+            String::new(),
+        ] {
+            assert!(!provider_page_exact(&bad), "{bad}");
         }
     }
 

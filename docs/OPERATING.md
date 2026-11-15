@@ -101,7 +101,11 @@ WantedBy=multi-user.target
 - **The relay ends TLS itself, for QUIC and for the TCP fallback.** Since 1.12 an app binds its
   sign-in to its own TLS session, and the relay checks that against its end. Port forwarding and
   proxies that pass TLS through are fine; one that ends TLS in front of the TCP port breaks app
-  sign-ins over the fallback (guests and browsers are unaffected).
+  sign-ins over the fallback (guests and browsers are unaffected). How it shows: apps' right
+  passwords read as wrong (the relay cannot tell the two apart), remembered devices are refused as
+  "not made on this connection", and the relay logs `device key sign-in refused: not made on this
+  connection` (also `login key refused` and `provider proof refused`). An account from before
+  1.12 still gets in there with its old secret, and cannot move to its login key.
 - The certificate and key are read once, at start; there is no reload. A certbot deploy hook
   therefore restarts the service (`systemctl restart voipc`). That drops calls in progress, so
   schedule the renewal for a quiet hour.
@@ -389,7 +393,7 @@ The simplest way is a host directory that user 65532 owns:
     install -d -o 65532 -g 65532 -m 0700 /srv/voipc
     install -o 65532 -g 65532 -m 0600 server.toml cert.pem key.pem /srv/voipc/
     docker run -d --name voipc -v /srv/voipc:/data \
-      -p 9987:9987/tcp -p 9987:9987/udp ghcr.io/luki4fun/voipc-server:1.12.0-rc.2
+      -p 9987:9987/tcp -p 9987:9987/udp ghcr.io/luki4fun/voipc-server:1.12.0-rc.3
     docker exec voipc /voipc-server --config /data/server.toml admin grant <name> admin
 
 With a named volume instead, copy the files in with a throwaway container first, then run the

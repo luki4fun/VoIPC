@@ -368,6 +368,24 @@ export async function waitFor(tab, expression, timeoutMs = HANG_MS) {
   return true;
 }
 
+/**
+ * On the relay's provider page (`page`, a tab of its own), the code the app shows typed into
+ * its one field as a person would, then Continue: a real submit, which the page's own policy has
+ * to allow. Since 1.12.0-rc.3 the page shows no codes to tap.
+ */
+export async function typeProviderCode(page, code) {
+  // Loaded, so the field's autofocus has had its turn and the typing stays in it
+  await waitFor(page, `document.readyState === "complete" && document.querySelector("input[name=pick]")`);
+  await page.evaluate(`document.querySelector("input[name=pick]").focus()`);
+  await page.send("Input.insertText", { text: code });
+  await waitFor(page, `document.querySelector("input[name=pick]").value === ${JSON.stringify(code)}`);
+  // Enter, as a person ends it: a real key, so no evaluate is waiting on an answer from a tab
+  // the submit navigates away (a click inside one held the lane on a 30 s CDP timeout)
+  const enter = { key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 };
+  await page.send("Input.dispatchKeyEvent", { type: "keyDown", ...enter, text: "\r" });
+  await page.send("Input.dispatchKeyEvent", { type: "keyUp", ...enter });
+}
+
 /** waitFor as a yes or no, for a check: what it saw is the check's to print. */
 export const seen = (tab, expression, timeoutMs = HANG_MS) =>
   waitFor(tab, expression, timeoutMs).then(() => true, () => false);

@@ -2859,9 +2859,17 @@ async fn an_account_moves_to_its_login_key_once_after_a_sign_in_with_its_secret(
         None,
     ))
     .await;
-    assert!(refused(c.expect("refused", |m| reply(m).is_some()).await).contains("not signed"));
+    assert_eq!(
+        refused(c.expect("refused", |m| reply(m).is_some()).await),
+        crate::accounts::NOT_THIS_CONNECTION
+    );
+    // The account's own over another connection: what an app passed on by a server in
+    // between sends. Named so, the app tells its person (rc.2 device run)
     c.send(&set(&id, Binding::Tls([0x77; 32]), None)).await;
-    assert!(refused(c.expect("refused", |m| reply(m).is_some()).await).contains("not signed"));
+    assert_eq!(
+        refused(c.expect("refused", |m| reply(m).is_some()).await),
+        voipc_crypto::bind::NOT_THIS_CONNECTION
+    );
     // The account's own, over this connection
     c.send(&set(&id, Binding::Tls(TEST_BIND), None)).await;
     let r = c.expect("saved", |m| reply(m).is_some()).await;
@@ -8882,6 +8890,32 @@ mod providers {
     }
 
     /// `AccountStart::Provider`: the page, the code, the ticket.
+    /// An app works out its code only from l4f's own form of the page (rc.2 device run: a
+    /// server in between added to the address until the two codes agreed). Every address l4f
+    /// writes, for each provider and id shape, asking again or not, is in that form.
+    #[test]
+    fn every_page_l4f_writes_is_one_an_app_works_its_code_out_from() {
+        use l4f_accounts::oauth::{authorize_url, Flow};
+        let google = "123456789012-abcdefghij0123456789abcdefghij01.apps.googleusercontent.com";
+        for (kind, id) in [
+            (Kind::Discord, "1234567890123456789"),
+            (Kind::Google, google),
+            (Kind::Facebook, "1234567890123456"),
+            (Kind::Discord, "client"),
+        ] {
+            let p = Provider::new(kind, id.into(), "secret".into());
+            for reauth in [false, true] {
+                for redirect in [
+                    "https://voipc.example.org/account/oauth/discord/cb",
+                    "https://[2001:db8::1]:8443/account/oauth/google/cb",
+                ] {
+                    let url = authorize_url(&p, redirect, &Flow::new(), reauth);
+                    assert!(voipc_crypto::account::provider_page_exact(&url), "{url}");
+                }
+            }
+        }
+    }
+
     async fn open_page(state: &Arc<ServerState>) -> (String, String, Vec<u8>) {
         open_page_from(state, LO).await.expect("no page to open")
     }
@@ -8901,11 +8935,18 @@ mod providers {
         let mut c = open_raw_from(state, &first, ip).await;
         match c.next().await {
             Some(ServerMessage::AuthStep(AuthStep::OpenBrowser { url, code, ticket })) => {
-                // W1-24: what an app derives from its own end of this connection
+                // W1-24: what an app derives from its own end of this connection, and only
+                // from an address in l4f's own form (rc.2 device run)
                 assert_eq!(
                     code,
                     voipc_crypto::bind::provider_code(&TEST_BIND, url.as_bytes())
                 );
+                // (the stand-in provider's page has its own address; the query is the relay's)
+                let real = format!(
+                    "https://discord.com/oauth2/authorize?{}",
+                    url.split_once('?').map_or("", |(_, q)| q)
+                );
+                assert!(voipc_crypto::account::provider_page_exact(&real), "{url}");
                 Ok((url, code, ticket))
             }
             Some(ServerMessage::AuthError { reason }) => Err(reason),
@@ -9091,10 +9132,12 @@ mod providers {
         ));
     }
 
-    /// Nothing is asked of the provider before the tap, and a wrong tap ends it:
-    /// that is what a person sent somebody else's link does.
+    /// Nothing is asked of the provider before the code is typed, and three wrong ones end
+    /// it: that is what a person sent somebody else's link does. The page never shows the
+    /// code, so a person who does not see one in their app has nothing to pick (rc.2 device
+    /// run: a careless tap among three passed one time in three through a server in between).
     #[tokio::test]
-    async fn the_flow_waits_for_the_right_code_and_a_wrong_one_ends_it() {
+    async fn the_flow_waits_for_the_right_code_and_three_wrong_ones_end_it() {
         let (state, _db, _) = relay(RegistrationMode::Open).await;
         let (url, code, ticket) = open_page(&state).await;
 
@@ -9113,23 +9156,60 @@ mod providers {
             .get(hyper::header::CONTENT_SECURITY_POLICY)
             .unwrap();
         assert!(csp.to_str().unwrap().contains("form-action 'self'"));
-        let key = page_key(page).await;
+        let body = page.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&body);
+        assert!(!body.contains(&code), "the page shows no code: {body}");
+        assert!(
+            body.contains("name=\"pick\" inputmode=\"numeric\""),
+            "{body}"
+        );
+        let key = page_key(back(&state, &s, "abc")).await;
         let not_yet = sign_in(&state, ticket.clone(), Choice::Claim).await;
         assert_eq!(
             not_yet.err().as_deref(),
             Some(NOT_YET),
-            "back from the provider, not tapped"
+            "back from the provider, nothing typed"
         );
 
-        let wrong = if code == "100" { "101" } else { "100" };
-        let tapped = tap(&state, &format!("state={s}&pick={wrong}&key={key}")).await;
-        assert_eq!(tapped, StatusCode::FORBIDDEN);
-        // A second tap, now with the right code, changes nothing
+        let wrong = if code == "100000" { "100001" } else { "100000" };
+        for left in ["2 tries left", "1 try left"] {
+            let typed = provider::confirm(
+                &state,
+                format!("state={s}&pick={wrong}&key={key}").as_bytes(),
+                LO,
+            )
+            .await;
+            assert_eq!(typed.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let body = typed.into_body().collect().await.unwrap().to_bytes();
+            let body = String::from_utf8_lossy(&body);
+            assert!(body.contains(left) && !body.contains(&code), "{body}");
+            assert!(!status(&state, &ticket).await, "asked again, not ended");
+        }
+        let third = tap(&state, &format!("state={s}&pick={wrong}&key={key}")).await;
+        assert_eq!(third, StatusCode::FORBIDDEN);
+        // Then the right code changes nothing
         let again = tap(&state, &format!("state={s}&pick={code}&key={key}")).await;
         assert_eq!(again, StatusCode::GONE);
         assert!(status(&state, &ticket).await, "through, if not well");
         let ended = sign_in(&state, ticket, Choice::Claim).await;
         assert!(ended.err().unwrap().contains("not the one"));
+    }
+
+    /// A slip, then the code with a space in it: through.
+    #[tokio::test]
+    async fn a_slip_is_typed_again() {
+        let (state, _db, _) = relay(RegistrationMode::Open).await;
+        let (url, code, ticket) = open_page(&state).await;
+        let s = state_in(&url).to_string();
+        let key = page_key(back(&state, &s, "abc")).await;
+        let wrong = if code == "100000" { "100001" } else { "100000" };
+        let slip = tap(&state, &format!("state={s}&pick={wrong}&key={key}")).await;
+        assert_eq!(slip, StatusCode::UNPROCESSABLE_ENTITY);
+        let spaced = format!("{}+{}", &code[..3], &code[3..]);
+        let typed = tap(&state, &format!("state={s}&pick={spaced}&key={key}")).await;
+        assert_eq!(typed, StatusCode::OK, "{spaced}");
+        let (_c, signed) = sign_in(&state, ticket, Choice::Claim).await.unwrap();
+        assert!(signed.recovery.is_some());
     }
 
     /// Whoever starts a sign-in holds its `state` and its code, and can send the
@@ -9372,10 +9452,10 @@ mod providers {
         assert!(status(&state, &ticket).await);
     }
 
-    /// A person who sees none of their code here says so, and ends it: tapping one
-    /// anyway hits the right one time in three.
+    /// A person who did not start this, or changed their mind, cancels: it ends, and says it
+    /// was cancelled, not that a code was wrong. One field, no codes to pick from.
     #[tokio::test]
-    async fn none_of_these_ends_the_sign_in() {
+    async fn cancel_ends_the_sign_in() {
         let (state, _db, _) = relay(RegistrationMode::Open).await;
         let (url, code, ticket) = open_page(&state).await;
         let s = state_in(&url).to_string();
@@ -9383,16 +9463,19 @@ mod providers {
         let body = page.into_body().collect().await.unwrap().to_bytes();
         let html = String::from_utf8_lossy(&body);
         assert!(html.contains("name=\"none\""), "{html}");
-        assert_eq!(html.matches("name=\"pick\"").count(), 3, "{html}");
+        assert_eq!(html.matches("name=\"pick\"").count(), 1, "{html}");
 
         let key = page_key(back(&state, &s, "abc")).await;
         let none = format!("state={s}&key={key}&none=1");
-        assert_eq!(tap(&state, &none).await, StatusCode::FORBIDDEN);
+        assert_eq!(tap(&state, &none).await, StatusCode::OK);
         let late = format!("state={s}&pick={code}&key={key}");
         assert_eq!(tap(&state, &late).await, StatusCode::GONE);
         assert!(status(&state, &ticket).await);
         let ended = sign_in(&state, ticket, Choice::Claim).await;
-        assert!(ended.err().unwrap().contains("not the one"));
+        assert_eq!(
+            ended.err().as_deref(),
+            Some("Cancelled on the sign-in page.")
+        );
     }
 
     /// Each /64 of one /48, inside its own limit, is what held every sign-in out.
@@ -27665,6 +27748,16 @@ mod moderation {
             chat_mod(ki.id, false, false),
         ];
         want.sort_by_key(|m| m.account);
+        // Each grant tells everybody from a pass of its own: the last one lands first, so the
+        // list this guest is given at connect is the whole one. A loaded run (the whole suite)
+        // connected while it was still going, and its broadcast came after the Pong below.
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while *state.chat_mods.read().await != want {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the holders' list settles");
 
         let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let mut guest = connect(&state, "late#1234", lo).await;

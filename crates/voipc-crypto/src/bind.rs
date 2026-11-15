@@ -170,9 +170,16 @@ pub(crate) fn reset_message(
     message(kind, relay_id, name, &[challenge, login_key], b)
 }
 
-/// The six digits a provider's sign-in shows on the app and on the relay's page. Each side
-/// derives them from its own exporter: through a forwarder they differ. Six, because a
-/// forwarder knows both exporters and could start flows at the relay until the two agree.
+/// A relay's refusal of a proof made on another TLS session than its own: through a server in
+/// between. The app knows it by these words (`account_session`).
+pub const NOT_THIS_CONNECTION: &str = "This sign-in was not made on this connection. If you \
+     used a link, open the server's own address in VoIPC instead.";
+
+/// The six digits a provider's sign-in shows on the app and the person types on the relay's
+/// page. Each side derives them from its own exporter: through a forwarder they differ. Six,
+/// because a forwarder knows both exporters and could start flows at the relay until the two
+/// agree; and only from an address in l4f's own form (`account::provider_page_exact`), which it
+/// could otherwise vary until they agree.
 pub fn provider_code(exporter: &[u8; BIND_LEN], ticket: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(b"voipc-provider-code/v1|");

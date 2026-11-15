@@ -25,7 +25,7 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { barrier, loadPage, openTab, probe, seen, sleep, startChromium, waitFor } from "./test-cdp.mjs";
+import { barrier, loadPage, openTab, probe, seen, sleep, startChromium, typeProviderCode, waitFor } from "./test-cdp.mjs";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.argv[2] ?? 49993);
@@ -486,8 +486,7 @@ async function throughProvider(tab, cdpPort) {
   const state = new URL(opened).searchParams.get("state");
   const page = await newTab(cdpPort);
   await page.send("Page.navigate", { url: `${ORIGIN}/account/oauth/discord/cb?state=${state}&code=abc` });
-  await waitFor(page, `document.querySelector("button[name=pick]")`);
-  await page.evaluate(`document.querySelector('button[name=pick][value="${code}"]').click()`);
+  await typeProviderCode(page, code);
   await waitFor(page, `document.body?.innerText.includes("go back to the app")`);
   await page.send("Page.close").catch(() => {});
 }

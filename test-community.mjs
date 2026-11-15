@@ -20,7 +20,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { deflateSync } from "node:zlib";
-import { barrier, diagnose, loadPage, openTab, probe, seen, sentKind, sleep, startChromium, waitFor } from "./test-cdp.mjs";
+import { barrier, diagnose, loadPage, openTab, probe, seen, sentKind, sleep, startChromium, typeProviderCode, waitFor } from "./test-cdp.mjs";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.argv[2] ?? 49991);
@@ -214,8 +214,7 @@ async function throughProvider(tab, cdpPort) {
   const state = new URL(await tab.evaluate(`window.__opened`)).searchParams.get("state");
   const page = await newTab(cdpPort);
   await page.send("Page.navigate", { url: `${ORIGIN}/account/oauth/discord/cb?state=${state}&code=abc` });
-  await waitFor(page, `document.querySelector("button[name=pick]")`);
-  await page.evaluate(`document.querySelector('button[name=pick][value="${code}"]').click()`);
+  await typeProviderCode(page, code);
   // body?: the submit is navigating, and a document starts with none
   await waitFor(page, `document.body?.innerText.includes("go back to the app")`);
   await page.send("Page.close").catch(() => {});

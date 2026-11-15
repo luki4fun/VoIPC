@@ -42,7 +42,6 @@ use l4f_accounts::oauth::{Kind, Provider};
 use l4f_accounts::service::{Host, Intent, LoginStep, NewSession, OAuth, SocialOutcome};
 use l4f_accounts::store::Store;
 use l4f_accounts::{pow, util};
-use rand::seq::SliceRandom;
 use rand::Rng;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
@@ -167,13 +166,13 @@ enum Outcome {
 enum Stage {
     /// The browser is at the provider.
     Open,
-    /// The provider sent it back with this; waiting for the person to tap. The key
-    /// is in the page and goes with this code: whoever brought the code has it.
+    /// The provider sent it back with this; waiting for the person to type the app's code.
+    /// The key is in the page and goes with this code: whoever brought the code has it.
     Back {
         provider_code: String,
         page_key: String,
     },
-    /// Tapped; the provider is being asked. A second tap ends here.
+    /// The code typed; the provider is being asked. A second try ends here.
     Asking,
     Done(Outcome),
 }
@@ -185,8 +184,8 @@ struct Flow {
     cookie: String,
     state: String,
     code: String,
-    /// The code and two others, in the order the page shows them.
-    choices: [String; 3],
+    /// Wrong codes typed on the page so far (`TRIES`).
+    tries: u8,
     purpose: Purpose,
     started: Instant,
     stage: Stage,
@@ -324,26 +323,22 @@ fn six_digits() -> String {
     format!("{:06}", rand::thread_rng().gen_range(0..1_000_000))
 }
 
-/// The code and the page's three buttons. With the connection's exporter the code is
+/// Wrong codes the page takes before it stops the sign-in. Typed, a slip is likelier than a
+/// tap's; a guess still lands three times in a million.
+const TRIES: u8 = 3;
+
+/// The code the person types on the page. With the connection's exporter it is
 /// `voipc_crypto::bind::provider_code` over the provider's address, which an app at 22
-/// derives from its own end and shows: through a server that passes the sign-in on, the
-/// two differ (W1-24). Six digits: such a server knows both exporters and could start
-/// flows here until two codes agree. Without one (it never lacks one), a random code.
-fn code_and_choices(binding: Option<[u8; BIND_LEN]>, url: &str) -> (String, [String; 3]) {
-    let code = match binding {
+/// derives from its own end and shows: through a server that passes the sign-in on, the two
+/// differ (W1-24). The app derives it only from l4f's own form of the address
+/// (`provider_page_exact`), so such a server cannot change the address until they agree; it
+/// could start flows here until two codes agree, which the limits above hold back. Without a
+/// binding (it never lacks one), a random code.
+fn code_for(binding: Option<[u8; BIND_LEN]>, url: &str) -> String {
+    match binding {
         Some(x) => voipc_crypto::bind::provider_code(&x, url.as_bytes()),
         None => six_digits(),
-    };
-    let mut others = Vec::with_capacity(2);
-    while others.len() < 2 {
-        let other = six_digits();
-        if other != code && !others.contains(&other) {
-            others.push(other);
-        }
     }
-    let mut choices = [code.clone(), others.remove(0), others.remove(0)];
-    choices.shuffle(&mut rand::thread_rng());
-    (code, choices)
 }
 
 impl Relay {
@@ -380,7 +375,7 @@ impl Relay {
             .find_map(|p| p.strip_prefix("state="))
             .ok_or("unexpected sign-in step")?
             .to_string();
-        let (code, choices) = code_and_choices(binding, &url);
+        let code = code_for(binding, &url);
         let ticket: [u8; 32] = rand::random();
         self.providers.by_state.insert(state.clone(), ticket);
         self.providers.by_ticket.insert(
@@ -390,7 +385,7 @@ impl Relay {
                 cookie,
                 state,
                 code: code.clone(),
-                choices,
+                tries: 0,
                 purpose,
                 started: Instant::now(),
                 stage: Stage::Open,
@@ -429,9 +424,12 @@ const PAGE_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; form-acti
     frame-ancestors 'none'; base-uri 'none'";
 const PAGE_STYLE: &str = "body{font:18px system-ui,sans-serif;max-width:32rem;margin:15vh auto;\
     padding:0 1.5rem;background:#101215;color:#e8e8e6}\
-    button{font:600 1.6rem ui-monospace,monospace;padding:.9rem 1.4rem;margin:.3rem;\
-    border-radius:.6rem;border:1px solid #555;background:#1b1e23;color:inherit;cursor:pointer}\
-    button[name=none]{font:inherit}p{line-height:1.5}";
+    button,input{font:600 1.1rem system-ui,sans-serif;padding:.8rem 1.2rem;margin:.3rem 0;\
+    border-radius:.6rem;border:1px solid #555;background:#1b1e23;color:inherit}\
+    button{cursor:pointer}button[name=none]{font-weight:400}\
+    input{display:block;box-sizing:border-box;width:100%;max-width:14rem;\
+    font:600 1.8rem ui-monospace,monospace;letter-spacing:.3rem}\
+    .wrong{color:#ff9b8f}p{line-height:1.5}";
 
 fn page(status: StatusCode, title: &str, body: &str) -> Response<Full<Bytes>> {
     let html = format!(
@@ -498,7 +496,7 @@ fn percent_decode(s: &str) -> String {
 }
 
 /// `GET /account/oauth/<provider>/cb`: the provider sent the browser back. Asks
-/// the provider nothing yet: that waits for the person to tap the code. The page's
+/// the provider nothing yet: that waits for the person to type the code. The page's
 /// key goes only to a request bringing the provider's code.
 pub fn callback(state: &ServerState, path: &str, query: &str) -> Response<Full<Bytes>> {
     let Some(relay) = state.accounts.as_ref() else {
@@ -548,6 +546,18 @@ pub fn callback(state: &ServerState, path: &str, query: &str) -> Response<Full<B
     let Stage::Back { page_key, .. } = &flow.stage else {
         return ended_page();
     };
+    code_page(relay, &flow.state, page_key, None)
+}
+
+/// The page that asks for the code the app shows: typed, so a person who does not see it in
+/// their app has nothing to pick from (a careless tap among three passed one time in three).
+/// `left`: the tries left after a code that was not it.
+fn code_page(
+    relay: &Relay,
+    oauth_state: &str,
+    page_key: &str,
+    left: Option<u8>,
+) -> Response<Full<Bytes>> {
     let host = relay
         .accounts
         .host
@@ -557,23 +567,33 @@ pub fn callback(state: &ServerState, path: &str, query: &str) -> Response<Full<B
         .nth(1)
         .unwrap_or_default()
         .to_string();
-    let buttons: String = flow
-        .choices
-        .iter()
-        .map(|c| format!("<button name=\"pick\" value=\"{c}\">{c}</button>"))
-        .collect();
+    let (status, note) = match left {
+        None => (StatusCode::OK, String::new()),
+        Some(left) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "<p class=\"wrong\">That was not the code. Check your app and type it again \
+                 ({left} {} left).</p>",
+                if left == 1 { "try" } else { "tries" }
+            ),
+        ),
+    };
     page(
-        StatusCode::OK,
-        "Which code does your app show?",
+        status,
+        "Type the code your app shows",
         &format!(
-            "<p>Signing in to VoIPC on <b>{host}</b>. Tap the code your VoIPC app shows.</p>\
+            "<p>Signing in to VoIPC on <b>{host}</b>. Your VoIPC app shows a six-digit code: \
+             type it here.</p>{note}\
              <form method=\"post\" action=\"{CONFIRM_PATH}\">\
              <input type=\"hidden\" name=\"state\" value=\"{oauth_state}\">\
-             <input type=\"hidden\" name=\"key\" value=\"{key}\">{buttons}\
-             <button name=\"none\" value=\"1\">None of these</button></form>\
+             <input type=\"hidden\" name=\"key\" value=\"{key}\">\
+             <input name=\"pick\" inputmode=\"numeric\" autocomplete=\"one-time-code\" \
+             maxlength=\"7\" required autofocus aria-label=\"The code your app shows\">\
+             <button>Continue</button> \
+             <button name=\"none\" value=\"1\" formnovalidate>Cancel</button></form>\
              <p>If you did not start this in your own app, close this page: someone may be \
              trying to sign in as you.</p>",
-            oauth_state = html_attr(&flow.state),
+            oauth_state = html_attr(oauth_state),
             key = html_attr(page_key),
         ),
     )
@@ -586,7 +606,7 @@ fn html_attr(s: &str) -> String {
         .collect()
 }
 
-/// `POST /account/oauth/confirm`: the person tapped a code.
+/// `POST /account/oauth/confirm`: the person typed the code, or cancelled.
 pub async fn confirm(state: &Arc<ServerState>, body: &[u8], ip: IpAddr) -> Response<Full<Bytes>> {
     let Some(relay) = state.accounts.clone() else {
         return ended_page();
@@ -595,7 +615,13 @@ pub async fn confirm(state: &Arc<ServerState>, body: &[u8], ip: IpAddr) -> Respo
     let Some(oauth_state) = query_param(&form, "state") else {
         return ended_page();
     };
-    let pick = query_param(&form, "pick").unwrap_or_default();
+    // Only its digits: "123 456" is the code too
+    let typed: String = query_param(&form, "pick")
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .collect();
+    let cancelled = query_param(&form, "none").is_some();
     let key = query_param(&form, "key").unwrap_or_default();
     let Some(ticket) = relay.providers.by_state.get(oauth_state).map(|t| *t) else {
         return ended_page();
@@ -617,10 +643,23 @@ pub async fn confirm(state: &Arc<ServerState>, body: &[u8], ip: IpAddr) -> Respo
             return ended_page();
         }
         let provider_code = provider_code.clone();
-        if flow.code != pick {
-            // One tap. A wrong one is someone reading the page, not the app.
+        if cancelled {
+            flow.stage = Stage::Done(Outcome::Failed("Cancelled on the sign-in page.".into()));
+            return page(
+                StatusCode::OK,
+                "Sign-in cancelled",
+                "<p>Nothing happened. You can close this page.</p>",
+            );
+        }
+        if !util::ct_eq(&flow.code, &typed) {
+            flow.tries += 1;
+            if flow.tries < TRIES {
+                let (oauth_state, left) = (flow.state.clone(), TRIES - flow.tries);
+                return code_page(&relay, &oauth_state, key, Some(left));
+            }
+            // A person reads the code off their app; three wrong ones are someone without it
             flow.stage = Stage::Done(Outcome::Failed(
-                "The code tapped was not the one this app showed.".into(),
+                "The code typed on the page was not the one this app showed.".into(),
             ));
             return page(
                 StatusCode::FORBIDDEN,
@@ -1194,6 +1233,7 @@ async fn finish<S: AsyncRead + AsyncWrite + Unpin>(
                     &b,
                     &signature,
                 ) {
+                    info!(user = %user.id.hex(), "provider proof refused: not this account's, or not made on this connection");
                     return Err(
                         "That does not open this account, or the sign-in was not made \
                                 on this connection."
@@ -1671,7 +1711,7 @@ mod tests {
                 cookie: String::new(),
                 state,
                 code: String::new(),
-                choices: Default::default(),
+                tries: 0,
                 purpose: Purpose::SignIn,
                 started: Instant::now() - Duration::from_secs(age),
                 stage,

@@ -13,15 +13,29 @@ l4f-accounts 0.14.1.
 - **A sign-in is bound to the connection it was made on.** A server you are lured to, which passes your sign-in on to
   the real relay, gets nothing it can use there: a remembered device's answer, a reset, a provider's proof and the
   password's proof each end in the app's own TLS session, and the relay checks them against its end. The provider's code
-  is the one your app works out from its own connection, six digits now, so through a server in between the app and the
-  page show different codes. A browser cannot read its TLS session; its sign-ins say so and an app's never do
-  ([THREAT-MODEL.md](docs/THREAT-MODEL.md)).
+  is the one your app works out from its own connection, six digits now, and you type it on the relay's page, so through
+  a server in between the app and the page hold different codes. A browser cannot read its TLS session; its sign-ins say
+  so and an app's never do ([THREAT-MODEL.md](docs/THREAT-MODEL.md)).
+- **rc.3: a server in between could make the provider's code match.** rc.2's app worked its code out from any page
+  address that began with the provider's own, so a server passing the sign-in on added to the address until the app's code
+  was the relay's, in about a second, and a provider sign-up, or the claim of an account nobody had opened yet (such as one
+  the move from Discord made), went through it. The app now works the code out only from the address exactly as the
+  relay writes it, and refuses any other. An account that already has its keys was never at risk: unlocking it is bound.
+- **rc.3: the provider's page asks you to type the code** your app shows, where it offered three to tap: someone who sees
+  none of them in their app has nothing to pick, where a tap without looking passed one time in three. A slip can be typed
+  again twice; *Cancel* says it was cancelled.
+- **rc.3: an account from before 1.12 that signs in through a server in between is told so.** Its password goes the old
+  way that once, which such a server can read, and its move to the login key is refused there; the app now says so and
+  asks you to change the password from the server's own address, which also signs out every other device and session.
 - **The password never leaves the app.** It signs in with a key derived from the password, and the server keeps only the
   key's public half. A new password, deleting the account, a new recovery key and linking a provider prove the password
   the same way. An account from before 1.12 moves the first time it gives its password to a 1.12 app, at a sign-in or
   when a device signed in by its remembered key or a provider confirms it (rc.2: such accounts never moved); from then on
   its old secret opens nothing. That once, the password is confirmed the old way.
-- **The relay must end TLS itself**: a proxy that ends it in front of the TCP fallback breaks app sign-ins there.
+- **The relay must end TLS itself**: a proxy that ends it in front of the TCP fallback breaks app sign-ins there (an
+  account from before 1.12 still signs in there with its old secret, and cannot move). rc.3: the relay logs a device key,
+  login key or provider proof refused as not made on this connection, which is how such a proxy shows; a password there
+  reads as wrong, since the relay cannot tell the two apart.
 
 ### Changed
 - **Your history is your account's.** Signed in, a server shows only what belongs to that account; as a guest, one history
@@ -53,6 +67,13 @@ Measured on a disk-backed relay before and after; each one has a test.
   (340 ms at a million); now only that account's (5 ms).
 
 ### Fixed
+- **Android: no notification while the shade was pulled over the app** (rc.3): the page went on saying it was shown and
+  focused. The app's window losing focus counts now.
+- **A provider sign-in on a device that remembers the account asked to unlock it as a new device** (rc.3). It offers
+  *Sign in with this device*, which uses the device's own key.
+- **On a phone, a toast that stays (a new server's certificate) covered the connect form's Connect button** (rc.3): with
+  a dialog open the toasts go to the top.
+- **The relay logs the database migrations it applies** (rc.3); an upgrade's only trace was the migrations table.
 - **A voice-only mute during the new-member wait read "Timed out"** until the wait ended (protocol 23): a restriction now
   says what the moderator holds and when the wait ends, each with its own end.
 - **A crash right after reading back messages lost them on that device** (desktop): the read position reached the disk

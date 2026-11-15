@@ -16,7 +16,7 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { HANG_MS, loadPage, openTab, seen, sleep, startChromium, waitFor } from "./test-cdp.mjs";
+import { HANG_MS, loadPage, openTab, seen, sleep, startChromium, typeProviderCode, waitFor } from "./test-cdp.mjs";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.argv[2] ?? 49990);
@@ -149,8 +149,9 @@ async function throughProvider(tab, cdpPort, { outsider = false } = {}) {
 
   const page = await newTab(cdpPort);
   await page.send("Page.navigate", { url: `${ORIGIN}/account/oauth/discord/cb?state=${state}&code=abc` });
-  await waitFor(page, `document.querySelector("button[name=pick]")`);
-  const choices = await page.evaluate(`[...document.querySelectorAll("button[name=pick]")].map((b) => b.value)`);
+  await waitFor(page, `document.querySelector("input[name=pick]")`);
+  // What the page shows: the code is the app's to show, never the page's
+  const pageText = await page.evaluate(`document.body.innerText`);
   if (outsider) {
     const answer = await tab.evaluate(`fetch("/account/oauth/confirm", {
       method: "POST",
@@ -162,19 +163,18 @@ async function throughProvider(tab, cdpPort, { outsider = false } = {}) {
     const before = await key();
     await page.evaluate(`window.__beforeReload = true`);
     await page.send("Page.reload");
-    await waitFor(page, `!window.__beforeReload && document.querySelector("button[name=pick]")`);
+    await waitFor(page, `!window.__beforeReload && document.querySelector("input[name=pick]")`);
     check("a reload keeps the page's key", /^[\w-]{43}$/.test(before) && (await key()) === before, before);
     check(
-      "and the page offers None of these",
-      await page.evaluate(`document.querySelector("button[name=none]")?.innerText === "None of these"`),
+      "and the page offers Cancel",
+      await page.evaluate(`document.querySelector("button[name=none]")?.innerText === "Cancel"`),
     );
   }
-  // A real submit: this is what the page's own policy has to allow
-  await page.evaluate(`document.querySelector('button[name=pick][value="${code}"]').click()`);
+  await typeProviderCode(page, code);
   // body?: the submit is navigating, and a document starts with none
   await waitFor(page, `document.body?.innerText.includes("go back to the app")`);
   await page.send("Page.close").catch(() => {});
-  return { code, opened, choices };
+  return { code, opened, pageText };
 }
 
 /** What a first connect asks after the sign-in: answered. */
@@ -256,9 +256,9 @@ async function lane() {
 
   // First sign-in: the provider's person takes a name, and claims.
   const a = await openDialog(one);
-  const { code, opened, choices } = await throughProvider(a, one, { outsider: true });
+  const { code, opened, pageText } = await throughProvider(a, one, { outsider: true });
   check("the page opened is the provider's own", opened.startsWith("https://discord.com/oauth2/authorize?"), opened);
-  check("the provider's page offers the code among others", choices.length === 3 && choices.includes(code), choices.join());
+  check("the provider's page asks for the code and shows none", /type it here/.test(pageText) && !/\d{6}/.test(pageText), pageText);
 
   await waitFor(a, `document.querySelector('${dialogOf("provider-name")}')`);
   const suggestion = await a.evaluate(`document.querySelector("#acct-provider-name").value`);
@@ -502,8 +502,7 @@ async function lane() {
   await waitFor(c, `window.__opened`);
   const proofPage = await newTab(one);
   await proofPage.send("Page.navigate", { url: `${ORIGIN}/account/oauth/discord/cb?state=${new URL(await c.evaluate(`window.__opened`)).searchParams.get("state")}&code=abc` });
-  await waitFor(proofPage, `document.querySelector('button[name=pick][value="${proof}"]')`);
-  await proofPage.evaluate(`document.querySelector('button[name=pick][value="${proof}"]').click()`);
+  await typeProviderCode(proofPage, proof);
   await waitFor(proofPage, `document.body?.innerText.includes("go back to the app")`);
   await proofPage.send("Page.close").catch(() => {});
   await waitFor(c, `!document.querySelector('${dialogOf("provider-page")}') && document.body.innerText.includes("confirmed")`);

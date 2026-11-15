@@ -565,12 +565,14 @@ VOIPC_OAUTH_DISCORD_ID=…     VOIPC_OAUTH_DISCORD_SECRET=…
 VOIPC_OAUTH_GOOGLE_ID=…      VOIPC_OAUTH_GOOGLE_SECRET=…
 ```
 
-**Signing in.** Account tab → *Continue with Discord*. The app shows a three-digit code and opens the
-provider; back on the relay's page, the person taps that code, or *None of these* if the app shows none of them,
+**Signing in.** Account tab → *Continue with Discord*. The app shows a six-digit code and opens the
+provider; back on the relay's page, the person types that code (a slip can be typed again twice), or *Cancel*,
 which ends the sign-in. Only then is the provider asked who it is. The code is against somebody sending you their
-link. Only the browser the provider sent back can tap it, so they cannot tap for you. It is not perfect (they can
-tell you which code to tap, or ask you for that page's address, and tapping one without looking hits the right one
-time in three), which is why getting this far opens nothing yet:
+link, and since 1.12 against a server passing the sign-in on: an app works it out from its own TLS session and the
+page's address exactly as the relay writes it, and the relay from its own, so through a server in between they
+differ. Only the browser the provider sent back can send it, so they cannot type it for you. It is not perfect
+(they can tell you which code to type, or ask you for that page's address), which is why getting this far opens
+nothing yet:
 
 **A provider says who you are. It cannot unlock your messages.** The relay sees all a provider says, so no key
 may come from it. So a device that signs in this way needs one of these before it gets in at all:

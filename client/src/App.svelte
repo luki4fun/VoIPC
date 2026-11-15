@@ -548,6 +548,9 @@
   // pokes at the relay's full rate would otherwise stack dozens a second on
   // the desktop. The unread counts still say what arrived.
   let lastNotifyAt = -Infinity;
+  /** The app's own window has focus: on Android the shade pulled over the app takes it while
+   *  the page goes on saying it is shown and focused (rc.2 device run, pass 3). */
+  let windowFocused = true;
 
   /** Our own account on `server` (hex), which names what we wrote across connects. */
   function ownAccount(server: string): string | undefined {
@@ -666,7 +669,7 @@
   }
 
   async function notifyUnfocused(title: string, body: string) {
-    if (pageInView(document)) return;
+    if (pageInView(document, windowFocused)) return;
     const now = performance.now();
     if (now - lastNotifyAt < 2000) return;
     lastNotifyAt = now;
@@ -845,6 +848,15 @@
     // Messages with a destruction timer go when their moment comes, whether or
     // not anybody is looking at them. One sweep for the whole app.
     startExpirySweep();
+    if (!isWeb) {
+      void import("@tauri-apps/api/window")
+        .then(({ getCurrentWindow }) =>
+          getCurrentWindow().onFocusChanged(({ payload }) => {
+            windowFocused = payload;
+          }),
+        )
+        .catch(() => {});
+    }
     // ...and the file cache follows what the chat still refers to
     const stopFileRetain = startFileRetain();
     // A reload, or a window closed under us: the debounced chat save goes now

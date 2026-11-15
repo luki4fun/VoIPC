@@ -8,7 +8,7 @@
   // setup), and the account panel. Listens for the account events both
   // backends emit itself, so App.svelte only mounts it.
 
-  import { onDestroy, onMount } from "svelte";
+  import { onDestroy, onMount, tick } from "svelte";
   import { get } from "svelte/store";
   import { invoke } from "@tauri-apps/api/core";
   import type { UnlistenFn } from "@tauri-apps/api/event";
@@ -83,6 +83,9 @@
   let recoveryText = $state("");
   /** "First time here" was asked for, and the warning under it is on screen. */
   let claimAsked = $state(false);
+  /** This device remembers the account a provider named: its own key signs it in, and nothing
+   *  else is needed (rc.2 device run: it was asked to unlock as a new device). */
+  let rememberedHere = $state(false);
   /** What the relay offers and this account has linked (`ProviderList`). */
   let providers = $state<{ offered: string[]; linked: { kind: string; name: string }[]; hasPassword: boolean } | null>(null);
   /** A linked provider can prove it's them, once the relay asks that before it turns codes on. */
@@ -270,6 +273,21 @@
         reset();
         recoveryText = "";
         claimAsked = false;
+        rememberedHere = false;
+        if (!d.claim) {
+          const want = d.name.toLowerCase();
+          void invoke<{ server: string; name: string }[]>("account_devices")
+            .then(async (list) => {
+              rememberedHere = list.some((x) => x.server === server && x.name === want);
+              // It takes the focus from the recovery key's field, which has it by then: on a
+              // phone that field's keyboard covered the dialog (rc.3 device recheck)
+              if (rememberedHere) {
+                await tick();
+                document.querySelector<HTMLButtonElement>(".provider-device")?.focus();
+              }
+            })
+            .catch(() => {});
+        }
         showPrompt({ kind: "provider-choice", server, name: d.name, claim: d.claim, hasPassword: d.has_password, problem: d.problem, knownAs: d.known_as });
       }),
       // A first vault's key, before anything of it leaves this device.
@@ -529,7 +547,9 @@
           error = body.reason;
           busy = false;
         } else {
-          addNotification(`${fromServer(server)}${body.reason}`, "warning");
+          // The move refused for its connection asks the person to act: it stays until closed
+          // (rc.3 device recheck: gone in 5 s, beside two other toasts)
+          addNotification(`${fromServer(server)}${body.reason}`, "warning", body.request === "LoginKeySet" ? 0 : undefined);
         }
         break;
     }
@@ -950,9 +970,17 @@
           </div>
         {:else}
           <h2>{fromServer(p.server)}Unlock {p.name}</h2>
+          {#if rememberedHere}
+            <p class="hint">This device remembers {p.name} here: it signs in with its own key, and needs nothing else.</p>
+            <div class="buttons">
+              <!-- Ends the provider's sign-in as "Use my password" does; the connect form then
+                   signs in with this device's key (ConnectDialog) -->
+              <button type="button" class="submit-btn btn btn-primary provider-device" onclick={() => chooseProvider({ kind: "password" })}>Sign in with this device</button>
+            </div>
+          {/if}
           <p class="hint">
             Your provider says who you are. Your messages and keys are encrypted with a key only your devices hold,
-            so this new device needs one of these.
+            so a new device needs one of these.
           </p>
           <!-- W3-16: nothing said what is left to someone with none of them. A reset
                (`admin reclaim`) refuses an account with a password -->
@@ -1067,7 +1095,7 @@
         </div>
       {:else if p.kind === "provider-page"}
         <h2>Your code: {p.code}</h2>
-        <p class="hint">Open the provider's page. When it comes back, tap this code there.</p>
+        <p class="hint">Open the provider's page. When it comes back, type this code there.</p>
         <div class="buttons">
           <button type="button" class="secondary" onclick={closeProviderPage}>Cancel</button>
           <button

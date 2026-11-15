@@ -708,9 +708,14 @@ impl AccountSession {
             }
             AccountReply::Error { request, reason } if request == "LoginKeySet" => {
                 match self.key_set.take()? {
-                    // The move after a sign-in: the account stays as it was
+                    // The move after a sign-in: the account stays as it was. Refused for its
+                    // connection, the sign-in before it went through a server in between,
+                    // which read the password's old proof: the person hears it (rc.2 device run)
                     "" => {
                         self.keyed = Some(false);
+                        if reason == crate::bind::NOT_THIS_CONNECTION {
+                            return Some(self.refusal("LoginKeySet", MOVE_INTERCEPTED));
+                        }
                         Some(Actions::default())
                     }
                     r => Some(self.refusal(r, reason)),
@@ -827,8 +832,21 @@ impl AccountSession {
             // a browser shows the relay's, having nothing else (W1-24)
             AccountReply::ProviderBrowser { url, code } if self.proto >= 22 => {
                 let code = match self.binding {
-                    Some(crate::bind::Binding::Tls(x)) => {
+                    // Only from l4f's own form of the address (see `provider_page_exact`)
+                    Some(crate::bind::Binding::Tls(x))
+                        if crate::account::provider_page_exact(url) =>
+                    {
                         crate::bind::provider_code(&x, url.as_bytes())
+                    }
+                    Some(crate::bind::Binding::Tls(_)) => {
+                        a.emit.push((
+                            "account-reply",
+                            json!({ "Error": {
+                                "request": "ProviderStart",
+                                "reason": crate::account::PAGE_NOT_EXACT,
+                            }}),
+                        ));
+                        return a;
                     }
                     Some(crate::bind::Binding::Web) => code.clone(),
                     None => {
@@ -1340,6 +1358,13 @@ impl AccountSession {
 
 /// Said instead of a proof when the host gave the session no binding.
 const NO_BINDING: &str = "This connection cannot be checked. Nothing was sent.";
+
+/// The move to the login key refused for its connection, after a sign-in with the password's old
+/// proof (an account from before 1.12): something between the app and the server read that proof.
+/// A new password from the server's own address makes it worthless and signs everything else out.
+pub const MOVE_INTERCEPTED: &str = "This sign-in went through something between you and the \
+     server, which could read what your password sent. Change your password from the server's \
+     own address in VoIPC: that also signs out every other device and session.";
 
 /// What a stretched password proves itself with. An account without a password
 /// sends none (a recent sign-in through a provider, or a code, stands in for it).
@@ -2214,6 +2239,18 @@ mod tests {
             &a.send[..],
             [ClientMessage::Account(AccountRequest::DeleteAccount { secret, .. })] if secret.len() == 32
         ));
+
+        // Refused for its connection: the secret went through a server in between, and the
+        // person is told what to do about it (rc.2 device run: refused unseen before)
+        let mut s = session_at(false, Some(key), 22);
+        let _ = s.after_connect();
+        let a = s.on_reply(&AccountReply::Error {
+            request: "LoginKeySet".into(),
+            reason: crate::bind::NOT_THIS_CONNECTION.into(),
+        });
+        let (_, page) = a.emit.iter().find(|(n, _)| *n == "account-reply").unwrap();
+        assert_eq!(page["Error"]["reason"], MOVE_INTERCEPTED);
+        assert!(a.send.is_empty());
     }
 
     /// An account that signs in only by a remembered device or a provider: the first request
@@ -2411,7 +2448,8 @@ mod tests {
     #[test]
     fn a_link_shows_the_code_of_this_end_of_the_connection() {
         use crate::bind::{provider_code, Binding};
-        let shown = |b: Option<Binding>, proto: u32| {
+        const PAGE: &str = "https://discord.com/oauth2/authorize?response_type=code&client_id=1&redirect_uri=https%3A%2F%2Fr.example%2Fcb&state=AAAAAAAAAAAAAAAAAAAAAA&code_challenge=BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB&code_challenge_method=S256&scope=identify";
+        let shown_at = |b: Option<Binding>, proto: u32, url: &str| {
             let signed = SignedIn {
                 relay_id: RELAY,
                 name: "me".into(),
@@ -2432,13 +2470,14 @@ mod tests {
                 proto,
             );
             let a = s.on_reply(&AccountReply::ProviderBrowser {
-                url: "https://discord.com/x?state=s".into(),
+                url: url.into(),
                 code: "111111".into(),
             });
             let (_, v) = a.emit.iter().find(|(n, _)| *n == "account-reply").unwrap();
             v.clone()
         };
-        let ours = provider_code(&[3; 32], b"https://discord.com/x?state=s");
+        let shown = |b: Option<Binding>, proto: u32| shown_at(b, proto, PAGE);
+        let ours = provider_code(&[3; 32], PAGE.as_bytes());
         assert_ne!(ours, "111111");
         assert_eq!(
             shown(Some(Binding::Tls([3; 32])), 22)["ProviderBrowser"]["code"],
@@ -2456,6 +2495,13 @@ mod tests {
         let none = shown(None, 22);
         assert!(none.get("ProviderBrowser").is_none(), "{none}");
         assert_eq!(none["Error"]["request"], "ProviderStart");
+        // A page a server in between added to, to make the two codes agree: no code at all
+        let ground = shown_at(Some(Binding::Tls([3; 32])), 22, &format!("{PAGE}&x=649654"));
+        assert!(ground.get("ProviderBrowser").is_none(), "{ground}");
+        assert_eq!(ground["Error"]["reason"], crate::account::PAGE_NOT_EXACT);
+        // A browser shows the relay's code, having nothing else to check (W1-24)
+        let web = shown_at(Some(Binding::Web), 22, &format!("{PAGE}&x=1"));
+        assert_eq!(web["ProviderBrowser"]["code"], "111111");
     }
 
     #[test]

@@ -214,6 +214,15 @@
     } else if (result.error.includes(USE_PASSWORD)) {
       name = result.error.slice(result.error.indexOf(USE_PASSWORD) + USE_PASSWORD.length).trim();
       accountAction = "signin";
+      // A device that remembers the account signs in with its own key: no password to ask
+      const server = serverId(wait.server.host, wait.server.port);
+      const list = await invoke<{ server: string; name: string }[]>("account_devices").catch(() => []);
+      if (list.some((d) => d.server === server && d.name === name.toLowerCase())) {
+        remembered = true;
+        password = "";
+        await handleConnect();
+        return;
+      }
       error = "Enter your password to unlock this account.";
     } else {
       error = result.error;
@@ -583,7 +592,7 @@
         <div class="provider-wait">
           <p class="account-note">Your code is</p>
           <code class="provider-code">{providerWait.code}</code>
-          <p class="account-note">Open {providerWait.provider} and sign in there. When it comes back, tap this code on the page, then return here.</p>
+          <p class="account-note">Open {providerWait.provider} and sign in there. When it comes back, type this code on the page, then return here.</p>
           <button type="button" class="connect-provider" onclick={() => providerWait && invoke("account_open_page", { url: providerWait.url }).catch((e) => (error = String(e)))}>Open {providerWait.provider}</button>
           <button type="button" class="link-btn" onclick={() => (providerWait = null)}>Cancel</button>
         </div>
