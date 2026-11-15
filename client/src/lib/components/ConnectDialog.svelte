@@ -611,6 +611,9 @@
           bind:value={name}
           placeholder="a-z, 0-9, _ and -"
           autocomplete="username"
+          autocapitalize="none"
+          autocorrect="off"
+          spellcheck="false"
           disabled={connecting}
           maxlength={32}
           onkeydown={(e) => e.key === "Enter" && handleConnect()}

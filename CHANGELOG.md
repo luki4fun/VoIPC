@@ -2,6 +2,30 @@
 
 All notable changes to VoIPC are documented here.
 
+## [1.12.1] - 2026-11-15
+
+Protocol 23, as 1.12.0: apps and relays of both versions talk to each other. No database migration.
+
+### Fixed
+- **On a phone, a toast that stays (a new server's certificate) covered the connect form's first fields** (1.12.0 moved
+  the toasts to the top while a dialog is open, off its Connect button): the dialog now moves down under the toasts while
+  they are up, and scrolls. The toast also takes the screen's width: centred from half way, a fingerprint stood three
+  times as tall.
+- **The chat history's lock came before everything**, with no way past it but turning history off or deleting it:
+  *Not now* keeps this session's chat in memory, leaves the saved history as it is, and the next start asks again.
+- **The account name field let a phone keyboard capitalise and autocorrect the name**, as the guest name field already
+  did not.
+- **Joining a voice channel with a password from its preview showed #general**, not the room's own chat (without a
+  password it already did).
+- **A day divider still said "Today" after a phone slept past midnight**: the midnight timer counts only awake time.
+  Coming back to the app now catches up.
+- **In a narrow chat column (a tablet's, beside both side panels) the message field's hint wrapped**, and the empty
+  field stood two lines tall; it is one line, cut short.
+
+### Known
+- A password sign-in on a device that already remembers the account remembers it again; the relay keeps the old key,
+  unused, until its 90-day sweep. Replacing it needs a wire change, planned for 1.13.
+
 ## [1.12.0] - 2026-11-15
 
 Protocol 23 (rc.1 was 22: its apps and relays update too). A 1.12 app talks to relays back to 1.0 (protocol 12); update

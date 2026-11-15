@@ -10,6 +10,9 @@ export const pttKey = writable<string>("Space");
 export const muteKey = writable<string>("");
 export const deafenKey = writable<string>("");
 export const chatHistoryDisabled = writable<boolean>(false);
+/** "Not now" at the chat history's lock: this session keeps chat in memory
+ *  only, and the next start asks again. Never saved. */
+export const chatHistoryLater = writable<boolean>(false);
 export const pttHoldMode = writable<boolean>(true);
 export const noiseSuppression = writable<boolean>(true);
 

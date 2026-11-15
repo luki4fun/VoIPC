@@ -772,6 +772,14 @@
     border-color: var(--focus-ring);
   }
 
+  /* One line, cut short: in a narrow column (a tablet's, beside both side
+     panels) it wrapped, and the empty field grew to two lines to hold it */
+  .chat-input::placeholder {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
   .send-btn {
     flex-shrink: 0;
     background: var(--accent);

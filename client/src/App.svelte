@@ -135,6 +135,7 @@
     muteKey,
     deafenKey,
     chatHistoryDisabled,
+    chatHistoryLater,
     shareChannelHistory,
     maxConversations,
     screenShareCodec,
@@ -693,9 +694,9 @@
   }
 
   // Trigger auto-connect only after chat history password has been entered
-  // (or the vault was skipped — then there is nothing to unlock)
+  // (or the vault was skipped, or left locked for this session: "Not now")
   $effect(() => {
-    if (pendingAutoConnect && ($chatUnlocked || $chatHistoryDisabled)) {
+    if (pendingAutoConnect && ($chatUnlocked || $chatHistoryDisabled || $chatHistoryLater)) {
       const list = pendingAutoConnect;
       pendingAutoConnect = null;
       reconnectAll(list);
@@ -2348,7 +2349,7 @@
 <!-- Both wait for the config, which says whether there is history to unlock
      and what to fill in: before it, a start with history off flashed "Set up
      chat history", and the connect dialog showed empty fields first -->
-{#if $uiPrefsReady && !$chatUnlocked && !$chatHistoryDisabled}
+{#if $uiPrefsReady && !$chatUnlocked && !$chatHistoryDisabled && !$chatHistoryLater}
   <ChatHistorySetup />
 {/if}
 
