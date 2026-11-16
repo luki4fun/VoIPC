@@ -422,6 +422,32 @@ jobs:
           trap 'sudo tc qdisc del dev lo root' EXIT
           ./test-web.sh
         env: { BROWSER: chromium, UI_TEST: '0', FILE_KIB: '0' }
+      # A 6 Mbit/s link with a router's short queue (100 packets, about 160 ms). A 720p30
+      # share whose picture costs its 3 Mbit/s (SHARE_NOISE; ~3.4 measured uncapped) crosses
+      # loopback twice, sharer to relay and relay to viewer, so the link gives way: voice
+      # loses at most 2 %, the viewer draws in every 10 s window, and the sharer's ladder steps
+      # down (H3-14; EXPECT_LADDER in test-web.sh). Uncapped, the ladder check fails: that is
+      # the control that it measures the cap, not the picture.
+      - name: Capped link (netem rate)
+        if: ${{ !cancelled() && matrix.part == 'lanes' }}
+        timeout-minutes: 15
+        run: |
+          if ! sudo modprobe sch_netem; then
+            sudo apt-get install -y "linux-modules-extra-$(uname -r)"
+            sudo modprobe sch_netem
+          fi
+          sudo tc qdisc add dev lo root netem rate 6mbit delay 20ms limit 100
+          trap 'sudo tc qdisc del dev lo root' EXIT
+          ./test-web.sh
+        env:
+          BROWSER: chromium
+          UI_TEST: '0'
+          FILE_KIB: '0'
+          SHARE_RES: '720'
+          SHARE_FPS: '30'
+          SHARE_NOISE: '100'
+          EXPECT_LADDER: '1'
+          DURATION: '45000'
 
       # The relay on Postgres, which nothing above reaches: the accounts tests that take a
       # second database, and the lanes that read and write it most. The runner's own Postgres,

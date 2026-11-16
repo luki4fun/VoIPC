@@ -28,6 +28,16 @@ pub use decode::probe;
 pub use pack::{read_pack, Entry, Pack};
 pub use strip::strip;
 
+/// One RGBA picture as a PNG: the Windows share picker's window icons (1.13).
+pub fn png(rgba: Vec<u8>, w: u32, h: u32) -> Result<Vec<u8>> {
+    encode::write(
+        &[resize::Frame { rgba, delay_ms: 0 }],
+        w,
+        h,
+        png::Compression::Fast,
+    )
+}
+
 /// Bumped whenever what `sanitize` writes may change: a copy cached under an
 /// older version is made again (a decoder fix reaches every cached picture).
 pub const SANITIZER_VERSION: u32 = 1;

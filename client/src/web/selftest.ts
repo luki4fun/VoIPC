@@ -21,6 +21,11 @@
 //   share=1              share a screen (a synthetic canvas stands in for the
 //                        display, so headless browsers need no real capture)
 //   watch=1              watch the first peer that starts sharing
+//   share_res=480|720|1080, share_fps=15|30|60, share_noise=<blocks>
+//                        what the share sends (default 480p at 15 fps, and that many
+//                        random blocks a frame to cost bitrate, default 0); both sides log
+//                        a share-window line every 10 s (the sharer's kbps, the
+//                        viewer's canvas draws) for the capped-link lane
 //   proximity=off|2d|3d  proximity mode for a channel this run creates
 //   pos=<x,y,z>          stand here (metres) and share the position with the
 //                        channel, so peers receive a position beacon
@@ -45,10 +50,10 @@ interface UserInfo { user_id: number; username: string; channel_id: number; is_s
  * replaces getDisplayMedia with this. Product code is untouched — the override
  * lives on the navigator.mediaDevices instance and shadows the prototype method.
  */
-function fakeDisplayCapture(fps: number): void {
+function fakeDisplayCapture(fps: number, height: number, noise: number): void {
   const canvas = document.createElement("canvas");
-  canvas.width = 854;
-  canvas.height = 480;
+  canvas.width = ({ 480: 854, 720: 1280, 1080: 1920 } as Record<number, number>)[height] ?? 854;
+  canvas.height = height;
   const ctx = canvas.getContext("2d")!;
   let frame = 0;
   setInterval(() => {
@@ -61,6 +66,14 @@ function fakeDisplayCapture(fps: number): void {
     ctx.fillRect((frame * 13) % canvas.width, 120, 160, 160);
     ctx.font = "48px sans-serif";
     ctx.fillText(`frame ${frame}`, 40, 400);
+    // The capped-link lane: blocks that change every frame, so the encoder needs about its
+    // target bitrate and the link is what gives way
+    if (noise > 0) {
+      for (let i = 0; i < noise; i++) {
+        ctx.fillStyle = `hsl(${(Math.random() * 360) | 0}, 80%, ${(30 + Math.random() * 40) | 0}%)`;
+        ctx.fillRect((Math.random() * canvas.width) | 0, (Math.random() * canvas.height) | 0, 24, 24);
+      }
+    }
   }, Math.round(1000 / fps));
   const stream = canvas.captureStream(fps);
   navigator.mediaDevices.getDisplayMedia = async () => stream;
@@ -96,6 +109,9 @@ export async function run(params: URLSearchParams): Promise<void> {
   const expectKick = params.has("expect_kick");
   const doShare = params.has("share");
   const doWatch = params.has("watch");
+  const shareRes = Number(params.get("share_res") ?? 480);
+  const shareFps = Number(params.get("share_fps") ?? 15);
+  const shareNoise = Number(params.get("share_noise") ?? 0);
   const textChannelName = params.get("textchannel");
   const proximity = (params.get("proximity") ?? "off") as ProximityMode;
   const ownPosition = params.get("pos");
@@ -126,6 +142,25 @@ export async function run(params: URLSearchParams): Promise<void> {
   let watching = false;
   let sharerUserId = 0;
   let framesDrawn = 0;
+  /** Pictures the viewer drew on our canvas (the frame event comes once). */
+  let canvasDraws = 0;
+  /** Every 10 s while sharing or watching: what went out, or what was drawn, in that window. */
+  let shareWindows: ReturnType<typeof setInterval> | null = null;
+  const startShareWindows = () => {
+    if (shareWindows !== null) return;
+    let lastBytes = 0;
+    let lastDraws = 0;
+    shareWindows = setInterval(() => {
+      invoke<[number, number, number, number, number, number]>("get_screen_share_stats")
+        .then(([sent, bytesSent]) => {
+          const kbps = Math.round(((bytesSent - lastBytes) * 8) / 10_000);
+          lastBytes = bytesSent;
+          log("share-window", { frames_sent: sent, kbps, drawn: canvasDraws - lastDraws });
+          lastDraws = canvasDraws;
+        })
+        .catch(() => {});
+    }, 10_000);
+  };
   let textChannelId = 0;
   let textCreated = false;
   let textJoined = false;
@@ -266,7 +301,7 @@ export async function run(params: URLSearchParams): Promise<void> {
       if (ev === "viewer-count-changed") {
         const p = e.payload as { viewer_count: number };
         const cmd = p.viewer_count > 0 ? "start_screen_capture" : "stop_screen_capture";
-        invoke(cmd, { resolution: 480, fps: 15 }).catch((err) =>
+        invoke(cmd, { resolution: shareRes, fps: shareFps }).catch((err) =>
           log("error", { message: `${cmd}: ${String(err)}` }),
         );
       }
@@ -545,14 +580,15 @@ export async function run(params: URLSearchParams): Promise<void> {
     if (doShare && !sharing && peers.length > 0 && Date.now() - started > 3000) {
       sharing = true;
       try {
-        fakeDisplayCapture(15);
+        fakeDisplayCapture(shareFps, shareRes, shareNoise);
         await invoke("start_screen_share", {
           sourceType: "display",
           sourceId: "0",
-          resolution: 480,
-          fps: 15,
+          resolution: shareRes,
+          fps: shareFps,
         });
-        log("share-started");
+        log("share-started", { resolution: shareRes, fps: shareFps });
+        startShareWindows();
       } catch (e) {
         log("error", { message: `share: ${String(e)}` });
       }
@@ -568,9 +604,17 @@ export async function run(params: URLSearchParams): Promise<void> {
           // The viewer component's job: hand the canvas to the web backend
           const canvas = document.createElement("canvas");
           document.body.appendChild(canvas);
+          // Every picture the viewer puts on it, counted (the frame event comes once)
+          const g = canvas.getContext("2d")!;
+          const draw = g.drawImage.bind(g) as (...a: unknown[]) => void;
+          (g as unknown as { drawImage: (...a: unknown[]) => void }).drawImage = (...a: unknown[]) => {
+            canvasDraws++;
+            draw(...a);
+          };
           (window as any).__voipc_web?.setVideoCanvas(canvas);
           await invoke("watch_screen_share", { sharerUserId: target });
           log("watch-requested", { sharer: target });
+          startShareWindows();
         } catch (e) {
           log("error", { message: `watch: ${String(e)}` });
         }
@@ -623,6 +667,7 @@ export async function run(params: URLSearchParams): Promise<void> {
     log("error", { message: `voice-stats: ${String(e)}` });
   }
 
+  if (shareWindows !== null) clearInterval(shareWindows);
   if (doShare || doWatch) {
     try {
       const [sent, bytesSent, recv, dropped, bytesRecv, resolution] =
@@ -636,6 +681,7 @@ export async function run(params: URLSearchParams): Promise<void> {
         width: resolution >>> 16,
         height: resolution & 0xffff,
         frames_drawn: framesDrawn,
+        canvas_draws: canvasDraws,
       });
     } catch (e) {
       log("error", { message: `screenshare-stats: ${String(e)}` });

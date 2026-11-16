@@ -345,6 +345,8 @@ export interface AccountActions {
 /** What follows a sign-in — the stored log, the pins, remembering this
  *  browser — as the desktop client runs it too (voipc_crypto::account_session). */
 export interface AccountSession {
+  /** The device id of the record this browser holds for the account, before `afterConnect`. */
+  setHeldDevice(deviceId: number[]): void;
   /** Once the session is listed. */
   afterConnect(): AccountActions;
   /** Every couple of seconds while connected: reads refused for now go on. */

@@ -461,7 +461,9 @@ What is done in the app counts at once.
   will not export, and reloading a tab signs a remembered account back in by
   itself, without voice; a new tab, or a tab you disconnected or that another
   device took over, shows the connect dialog. *Your account → Forget* drops it on
-  this device.
+  this device. Signing in with the password again on a remembered device remembers
+  it with a new key, and since 1.13 the server drops the old one at once (a 1.12
+  server keeps it, unused, until 90 days pass).
 - **One device at a time.** Signing in somewhere else ends the older session; it
   does not reconnect by itself.
 - **Copies on the server** are asked about once, the first time you connect, and

@@ -7753,6 +7753,7 @@ dependencies = [
  "pipewire",
  "postcard",
  "rand 0.8.8",
+ "raw-window-handle",
  "rcgen",
  "rdev",
  "reqwest",

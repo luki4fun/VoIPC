@@ -847,6 +847,12 @@ pub enum AccountRequest {
         pass_slot: Option<Vec<u8>>,
         web: bool,
     },
+    /// Drops one of this account's own device keys (protocol v24): the one this device held
+    /// before it was remembered again with a new key, which nothing could use any more.
+    /// `DeviceForgotten` answers; a key of another account, or none, is an `Error`.
+    DeviceForget {
+        device_id: Vec<u8>,
+    },
 }
 
 /// What an admin asks for (`AccountRequest::Admin`). A step that changes
@@ -1480,6 +1486,8 @@ pub enum AccountReply {
     SteppedUp,
     /// `LoginKeySet` held.
     LoginKeySaved,
+    /// `DeviceForget` held (protocol v24).
+    DeviceForgotten,
 }
 
 /// Answers to `AdminOp`.

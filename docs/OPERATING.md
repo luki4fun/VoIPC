@@ -359,6 +359,12 @@ of them:
   proxy that passes TLS through is fine; one that ends it in front of the TCP fallback makes
   app sign-ins over that fallback fail.
 
+**From 1.12 to 1.13** (protocol 23 to 24):
+- **Apps first**, as for any protocol: a 1.13 app talks to the 1.12 relay meanwhile.
+- No migration and no new keys. A device remembered again (a password or provider sign-in on a
+  device that already was) now drops its old device key at once; on 1.12 those stayed until the
+  90-day sweep.
+
 **A later release that migrates the database** needs the old binary **and** the backup taken
 before the upgrade for a rollback: an older relay refuses a database that a newer one has
 migrated, by design. Release candidates (`-rc.N`) are for testing on a relay you can roll back.

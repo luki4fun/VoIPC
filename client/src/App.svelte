@@ -238,7 +238,7 @@
     playChannelMessageSound,
     playPokeSound,
   } from "./lib/sounds.js";
-  import { isMobile, isWeb } from "./lib/stores/platform.js";
+  import { isAndroidApp, isMobile, isWeb } from "./lib/stores/platform.js";
   import {
     audibleIds,
     centreView,
@@ -280,6 +280,10 @@
     previewShown,
     streamStage,
   } from "./lib/stores/screenshare.js";
+  import { frameArrived } from "./lib/view-timing.js";
+  import { offerWebViewDecoding, startPull, stopPull } from "./lib/native-view.js";
+  import type { ShareCodec } from "./lib/video-sink.js";
+  import type { SharedFrame } from "./lib/view-tally.js";
 
   // Look up channel name by numeric ID (stable key for chat history). Per
   // server: an id is a slot in one server's list and means nothing on another.
@@ -858,6 +862,9 @@
         )
         .catch(() => {});
     }
+    // The phone decodes a watched share in this WebView (1.13, D1); the desktop keeps its
+    // native decoder (D3)
+    if (isAndroidApp) void offerWebViewDecoding();
     // ...and the file cache follows what the chat still refers to
     const stopFileRetain = startFileRetain();
     // A reload, or a window closed under us: the debounced chat save goes now
@@ -2196,14 +2203,29 @@
         }
       }),
 
-      listenServer<{ sharer_user_id: number }>("watching-screenshare", (server, data) => {
+      listenServer<{ sharer_user_id: number; codec: ShareCodec; view?: string; gen?: number }>("watching-screenshare", (server, data) => {
         if (!inVoice(server)) return;
         watchingUserId.set(data.sharer_user_id);
         currentFrame.set(null);
+        // The app hands this share to the WebView's own decoder (native-view.ts)
+        if (data.view === "webview" && data.gen) {
+          startPull(data.gen, data.codec, {
+            first: () => currentFrame.set("canvas"),
+            tooLarge: () => {
+              invoke("stop_watching_screen_share").catch(() => {});
+              watchingUserId.set(null);
+              currentFrame.set(null);
+              addNotification("Screen share ended: its picture is larger than VoIPC shows", "info");
+            },
+          });
+        } else {
+          stopPull();
+        }
       }),
 
       listenServer<{ reason: string }>("stopped-watching-screenshare", (server, data) => {
         if (!inVoice(server)) return;
+        stopPull();
         watchingUserId.set(null);
         currentFrame.set(null);
         if (data.reason !== "requested") {
@@ -2232,8 +2254,8 @@
         }
       }),
 
-      listen<string>("screenshare-frame", (event) => {
-        currentFrame.set(event.payload);
+      listen<SharedFrame | string>("screenshare-frame", (event) => {
+        currentFrame.set(frameArrived(event.payload));
       }),
 
       // What our own share sends, for the preview (native only)
@@ -2249,6 +2271,19 @@
         watchingUserId.set(null);
         currentFrame.set(null);
         invoke("stop_screen_capture").catch(() => {});
+      }),
+
+      // The system ended our capture (the shared window closed, or the desktop's own "stop
+      // sharing"; screenshare/linux.rs): end the share as Stop does, and say why
+      listen("screenshare-source-ended", () => {
+        if (!$isSharingScreen) return;
+        isSharingScreen.set(false);
+        viewerCount.set(0);
+        invoke("stop_screen_share").catch(() => {});
+        addNotification(
+          "Your screen share ended: the system stopped capturing it (the shared window closed, or sharing was stopped from the desktop)",
+          "info",
+        );
       }),
 
       // A game pressing push-to-talk for us, so the voice bar can say so

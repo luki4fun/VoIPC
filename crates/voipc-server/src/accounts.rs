@@ -2542,6 +2542,22 @@ pub async fn handle_request(
                 }
             }
         }
+        // Only a key of this account goes (l4f looks it up by the user), from any session of
+        // theirs and without a recent sign-in: dropping your own key gives nothing
+        AccountRequest::DeviceForget { device_id } => {
+            if !(16..=64).contains(&device_id.len()) {
+                refused("DeviceForget", "Not a device of this account.")
+            } else {
+                match relay
+                    .accounts
+                    .remove_credential(&ctx, &user, DEVKEY_KIND, &device_id)
+                    .await
+                {
+                    Ok(()) => AccountReply::DeviceForgotten,
+                    Err(e) => refused("DeviceForget", e.message()),
+                }
+            }
+        }
         AccountRequest::TotpSetup => {
             let s = relay.accounts.totp_setup(&user);
             AccountReply::TotpSetup {

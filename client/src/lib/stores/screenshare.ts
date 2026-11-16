@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { derived, writable } from "svelte/store";
+import { derived, get, writable } from "svelte/store";
 import { addNotification } from "./notifications.js";
 import { uiPrefs } from "./ui-prefs.js";
 
@@ -62,9 +62,15 @@ export const previewShown = derived(
   ([$sharing, $stage, $prefs]) => $sharing && ($stage === "preview" || $prefs.share_preview),
 );
 
+/** The last picture of our last share in this run, for the Linux picker's "Share again"
+ *  tile. Memory only: never written anywhere. */
+export const lastShareFrame = writable<string | null>(null);
+
 // A share's preview ends with it
 isSharingScreen.subscribe((sharing) => {
   if (!sharing) {
+    const last = get(previewFrame);
+    if (last) lastShareFrame.set(last);
     previewStage.set(false);
     previewFrame.set(null);
   }

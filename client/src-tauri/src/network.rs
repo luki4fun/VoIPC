@@ -2575,14 +2575,22 @@ async fn handle_server_message(
             // Before the first fragment arrives: the decode task builds its
             // decoder from this and rebuilds it when the value changes.
             watching_codec.store(codec as u8, Ordering::Relaxed);
+            // A codec the WebView decodes goes to it from the first frame (view_queue.rs)
+            let gen = crate::view_queue::watch(codec);
             emit_server(
                 app_handle,
                 server,
                 "watching-screenshare",
-                serde_json::json!({"sharer_user_id": sharer_user_id, "codec": format!("{codec:?}")}),
+                serde_json::json!({
+                    "sharer_user_id": sharer_user_id,
+                    "codec": format!("{codec:?}"),
+                    "view": if gen.is_some() { "webview" } else { "native" },
+                    "gen": gen.unwrap_or(0),
+                }),
             );
         }
         ServerMessage::StoppedWatchingScreenShare { reason } => {
+            crate::view_queue::native();
             emit_server(
                 app_handle,
                 server,
@@ -5715,6 +5723,8 @@ async fn video_stream_receiver_task(
     let mut window_dropped: u32 = 0;
     let mut window_received: u32 = 0;
     let mut budget = FrameBudget::new(std::time::Instant::now());
+    // The frame being put together and when its first fragment came (`share view:`)
+    let mut first_fragment: Option<(u32, std::time::Instant)> = None;
     // At most once a second, which is also all the server relays: a request
     // that went unanswered (rate-limited, or its keyframe lost) is made again.
     let request_keyframe = |last: &mut std::time::Instant| {
@@ -5785,6 +5795,9 @@ async fn video_stream_receiver_task(
                 current_video_session = Some(packet.session_id);
             }
 
+            if first_fragment.is_none_or(|(id, _)| id != packet.frame_id) {
+                first_fragment = Some((packet.frame_id, std::time::Instant::now()));
+            }
             let result = video_assembler.add_fragment(&packet);
 
             // A frame was lost: the next one handed on carries the gap, and
@@ -5799,6 +5812,9 @@ async fn video_stream_receiver_task(
             if let Some((frame_data, is_keyframe)) = result.frame {
                 screen_video_frames_received.fetch_add(1, Ordering::Relaxed);
                 window_received += 1;
+                if let Some((_, at)) = first_fragment.take() {
+                    crate::view_timing::assembled(at.elapsed());
+                }
                 // Past what any share sends: lost like on the wire (S-045)
                 if !budget.take(std::time::Instant::now()) {
                     gap = true;
@@ -5810,16 +5826,29 @@ async fn video_stream_receiver_task(
                     request_keyframe(&mut last_keyframe_request);
                     continue;
                 }
-                // Send to decode task — drop if full to avoid stalling voice.
-                // Lost here is lost like on the wire.
-                match video_decode_tx.try_send((frame_data, is_keyframe, gap)) {
-                    Ok(()) => gap = false,
-                    Err(_) => {
+                // To the WebView when it decodes this share, else to the decode task
+                match crate::view_queue::push(frame_data, is_keyframe, gap) {
+                    crate::view_queue::Pushed::Queued => gap = false,
+                    crate::view_queue::Pushed::TooLarge => {
                         gap = true;
                         screen_video_frames_dropped.fetch_add(1, Ordering::Relaxed);
-                        window_dropped += 1;
-                        warn!("video decode channel full — dropping assembled frame");
-                        request_keyframe(&mut last_keyframe_request);
+                        if log_due(&mut budget_log) {
+                            warn!("a share keyframe is larger than any viewer shows — dropped");
+                        }
+                    }
+                    // Send to decode task — drop if full to avoid stalling voice.
+                    // Lost here is lost like on the wire.
+                    crate::view_queue::Pushed::Native(frame_data) => {
+                        match video_decode_tx.try_send((frame_data, is_keyframe, gap)) {
+                            Ok(()) => gap = false,
+                            Err(_) => {
+                                gap = true;
+                                screen_video_frames_dropped.fetch_add(1, Ordering::Relaxed);
+                                window_dropped += 1;
+                                warn!("video decode channel full — dropping assembled frame");
+                                request_keyframe(&mut last_keyframe_request);
+                            }
+                        }
                     }
                 }
             }
@@ -5827,7 +5856,14 @@ async fn video_stream_receiver_task(
             // Keep asking while there is nothing clean to show: the server
             // rate-limits keyframe relays, so the one a join or a loss
             // triggered may never have come.
-            if needs_keyframe.load(Ordering::Acquire) || !video_assembler.has_keyframe() {
+            // (A WebView that decodes the share says so in its pulls; the decode task's flag
+            // is not its.)
+            let wants = if crate::view_queue::active() {
+                crate::view_queue::wants_key()
+            } else {
+                needs_keyframe.load(Ordering::Acquire)
+            };
+            if wants || !video_assembler.has_keyframe() {
                 request_keyframe(&mut last_keyframe_request);
             }
         }
@@ -5979,7 +6015,13 @@ fn video_decode_render_task(
         let mut batch = 0;
         while let Some((frame_data, is_keyframe, gap_before)) = next {
             batch += 1;
+            let started = std::time::Instant::now();
             let decoded = dec.decode(&frame_data);
+            #[cfg(target_os = "android")]
+            let copy = Some(dec.take_copy_time());
+            #[cfg(not(target_os = "android"))]
+            let copy = None;
+            crate::view_timing::decoded(started.elapsed(), copy);
             if let Err(e) = &decoded {
                 warn!("{want_codec:?} decode error: {}", e);
             }

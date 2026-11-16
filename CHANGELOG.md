@@ -2,6 +2,54 @@
 
 All notable changes to VoIPC are documented here.
 
+## [1.13.0] - release candidate
+
+Protocol 24: a 1.13 relay admits only 1.13 apps, so update the apps first. A 1.13 app still talks to 1.12 relays (and
+older ones, down to 1.0). No database migration.
+
+### Changed
+- **The Android app draws a watched share at its full frame rate**: it decodes the share in its own WebView with
+  WebCodecs, as the browser does, fed the frames over a URI scheme of the app's own (Tauri's IPC carries no bytes on
+  Android), instead of decoding with MediaCodec, converting and JPEG-encoding each shown frame and sending it as base64
+  text. On the emulator: 1080p30 drawn at 29.7 fps (was 15.5), 720p60 at 57.5 and 1080p60 at 58.7 (were 25 and 15), a
+  frame on screen 6-12 ms after it came whole (was 30-40 ms after the JPEG went out). A WebView without a decoder for
+  the share's codec, or one that fails on it, hands it back to the native decoder. The desktop apps keep theirs.
+- **A Linux sharer with an Intel or AMD GPU encodes on it** (VAAPI), where it used x264 on the processor. Every render
+  node is tried, an NVIDIA one never (its VAAPI driver only decodes). On an Intel UHD 770 at 1080p, against x264 as
+  shipped: about a fifth of the processor, 2-10 dB sharper text at each rate, and a still screen settles to 20-40 kbit/s
+  where x264 kept ~900. NVIDIA keeps NVENC. A machine where VAAPI does not open shares with x264 as before.
+  `VOIPC_VIDEO_ENCODER=<FFmpeg encoder>` picks one encoder by name, for testing and support.
+- **The Windows share picker shows what each choice would share**: displays and windows are tiles with a picture of
+  each (a still drawn by Windows itself, so no capture border flashes and nothing is captured until you start), and a
+  window that cannot be pictured (minimised, protected) shows its icon. The names come as fast as before, the
+  pictures follow and keep up while the picker is open; arrow keys move between tiles and Enter starts.
+- **Sharing on Linux is one step, and "Share again" skips the dialog**: the share picker no longer asks first for a
+  screen or a window (the system's dialog offers both, with its own pictures), and a share remembers the portal's
+  choice (portals from version 4, as on current KDE and GNOME). The next time, "Share again", with the last picture of
+  that share, starts it without the dialog; "Forget it" drops the choice. A remembered choice the portal no longer
+  takes is asked for afresh, once. The choice is kept in `settings.json` (0600), see docs/THREAT-MODEL.md. On X11
+  the system's dialog now opens over the VoIPC window (on Wayland it still opens on its own).
+- **The stream view has its own Share button** (and Stop while sharing) in its header, on the desktop and in a browser:
+  in a narrow window (800x600) the stream view covered the voice bar's, so a viewer could not start a share of their
+  own without closing the view.
+- **Watching a share logs what its frames cost** in the desktop and Android apps: one `share view:` line every 10 s
+  while frames come, with frames put together, decoded and shown, the time each step took (p50/p95/max), and how many
+  frames the view drew and how long each took from the app to the screen. Nothing is logged while not watching.
+
+### Fixed
+- **A Linux share whose source went away stood frozen and still "live"**: when the shared window closed, or sharing
+  was stopped from the desktop, the compositor removed the screen's PipeWire node and the app never noticed, so viewers
+  kept a still picture of a share that had ended. The app now sees the node go, ends the share as Stop does (the relay
+  and the portal session too) and says why.
+- **A share watched on Android could freeze for good**: once the phone's video decoder fell behind and had no input
+  buffer free, the app stopped taking its finished pictures out, so the decoder never freed one again and the picture
+  stood still until the share changed (seen on the emulator at 1080p30: frozen after 41 s, 8.5 fps drawn until then).
+  It now takes them out and tries the frame again: 14.2 fps for the whole minute.
+- **A device remembered again left its old key on the relay** (1.12.1, Known): a password or provider sign-in on a
+  device that already remembered the account enrolled a new device key, and the relay kept the old one, unused, until
+  its 90-day sweep. Once the new key is in, the app now asks the relay to drop the old one (`DeviceForget`, protocol
+  24); the relay drops only a key of the signed-in account. On a 1.12 relay the old key stays until the sweep, as before.
+
 ## [1.12.1] - 2026-11-15
 
 Protocol 23, as 1.12.0: apps and relays of both versions talk to each other. No database migration.
