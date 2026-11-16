@@ -1,31 +1,14 @@
-// Screen-share viewer: encrypted fragments -> wasm VideoAssembler -> WebCodecs
-// VideoDecoder -> <canvas>. Port of the receive side of
-// client/src-tauri/src/network.rs (the video arm of udp_receiver_task and
-// video_decode_render_task). Sharing our own screen lives in share.ts, which
-// fills in the sender half of getStats().
+// Screen-share viewer: encrypted fragments -> wasm VideoAssembler -> the shared WebCodecs
+// sink (lib/video-sink.ts) -> <canvas>. Port of the receive side of
+// client/src-tauri/src/network.rs (the video arm of udp_receiver_task). Sharing our own screen
+// lives in share.ts, which fills in the sender half of getStats().
 
-import { frameTooLarge } from "../../lib/share-rules";
+import { probeCodec, VideoSink, type SinkHost } from "../../lib/video-sink";
 import { emit } from "./events";
 import { share } from "./share";
 import { wasm } from "./wasm";
 import type { VideoAssembler } from "./wasm";
 import type { SessionContext, VideoApi, VideoCodec } from "./types";
-
-/**
- * WebCodecs codec strings to try per share codec, best first. Every stream is
- * Annex B (H.264/H.265) or raw frames (VP8/VP9) with the parameter sets in
- * band, so no `description` is needed.
- *
- * H.264: High/Main/Baseline at level 5.1, then 4.2 for decoders that refuse the
- * higher level. H.265: both the hev1 and hvc1 spellings, since some browsers
- * advertise only one.
- */
-const CODEC_CANDIDATES: Record<VideoCodec, string[]> = {
-  H264: ["avc1.640033", "avc1.4d0033", "avc1.420033", "avc1.64002a", "avc1.4d002a"],
-  H265: ["hev1.1.6.L153.B0", "hvc1.1.6.L153.B0", "hev1.1.6.L120.B0", "hvc1.1.6.L120.B0"],
-  Vp8: ["vp8"],
-  Vp9: ["vp09.00.51.08", "vp09.00.10.08"],
-};
 
 /** What to tell the user when their browser has no decoder for this share. */
 function unsupportedReason(codec: VideoCodec): string {
@@ -35,22 +18,13 @@ function unsupportedReason(codec: VideoCodec): string {
   return `This browser cannot decode the ${codec} video this share uses — try another browser or the desktop app`;
 }
 const KEYFRAME_REQUEST_INTERVAL_MS = 1_000;
-/**
- * Chunks the decoder may hold before we stop feeding it deltas: about 130 ms
- * at 30 fps. Past it the decoder is not keeping up.
- */
-const MAX_DECODE_QUEUE = 4;
-/** Decode errors in a row, with no frame in between, before giving up. */
-const MAX_DECODE_FAILURES = 3;
 /** Loss-report window: dropped/received frame counts sent to the sharer via the server. */
 const LOSS_REPORT_INTERVAL_MS = 2_000;
 
-export class VideoViewer implements VideoApi {
+export class VideoViewer implements VideoApi, SinkHost {
   private ctx: SessionContext | null = null;
   private canvas: HTMLCanvasElement | null = null;
-  private decoder: VideoDecoder | null = null;
-  /** WebCodecs codec string the decoder was configured with. */
-  private codec = "";
+  private sink: VideoSink | null = null;
   /** Codec of the share we are watching, from WatchingScreenShare. */
   private shareCodec: VideoCodec = "H264";
   private assembler: VideoAssembler | null = null;
@@ -63,21 +37,7 @@ export class VideoViewer implements VideoApi {
    * nothing could free or clear after that.
    */
   private watchGen = 0;
-  /** A fresh decoder must see a key chunk first (WebCodecs rejects deltas). */
-  private needKeyframe = true;
-  /**
-   * Render suppression (network.rs): after loss or a decode error the
-   * reference chain is broken, so hold the last good frame until the
-   * keyframe submitted at `resumeAtTimestamp` comes out of the decoder.
-   */
-  private suppressRender = false;
-  private resumeAtTimestamp = Infinity;
   private lastKeyframeRequest = -Infinity;
-  /** Decode errors since the last decoded frame. */
-  private decodeFailures = 0;
-  /** Latest decoded frame awaiting the next animation frame. */
-  private pendingFrame: VideoFrame | null = null;
-  private rafScheduled = false;
   private firstFrameShown = false;
   private framesReceived = 0;
   private framesDropped = 0;
@@ -109,20 +69,12 @@ export class VideoViewer implements VideoApi {
     this.firstFrameShown = false;
 
     const gen = this.watchGen;
-    const decoderCodec = await this.probeCodec(codec);
+    const decoderCodec = await probeCodec(codec);
     if (gen !== this.watchGen) return; // stopped, or started again, meanwhile
-    if (!decoderCodec) {
-      this.watching = false;
-      this.sharerUserId = 0;
-      const c = this.ctx;
-      c?.emit("screenshare-error", { reason: unsupportedReason(codec) });
-      c?.stopWatching();
-      c?.emit("stopped-watching-screenshare", { reason: "unsupported" });
-      return;
-    }
-    this.codec = decoderCodec;
+    if (!decoderCodec) return this.unsupported();
     this.assembler = wasm().newVideoAssembler();
-    this.openDecoder();
+    this.sink = new VideoSink(this, decoderCodec);
+    this.sink.setCanvas(this.canvas);
     this.windowDropped = 0;
     this.windowReceived = 0;
     this.lossReportTimer = setInterval(() => this.sendLossReport(), LOSS_REPORT_INTERVAL_MS);
@@ -146,19 +98,15 @@ export class VideoViewer implements VideoApi {
     // The resolution stays: it is the last thing we decoded, and the native
     // client keeps reporting it too until the next share replaces it.
     this.lastKeyframeRequest = -Infinity;
-    this.decodeFailures = 0;
-    this.closeDecoder();
+    this.sink?.close();
+    this.sink = null;
     this.assembler?.free();
     this.assembler = null;
-    this.pendingFrame?.close();
-    this.pendingFrame = null;
-    this.suppressRender = false;
-    const c = this.canvas?.getContext("2d");
-    if (c && this.canvas) c.clearRect(0, 0, this.canvas.width, this.canvas.height);
   }
 
   onVideoPacket(bytes: Uint8Array): void {
-    if (!this.watching || !this.decoder || !this.assembler) return;
+    const sink = this.sink;
+    if (!this.watching || !sink || !this.assembler) return;
     this.bytesReceived += bytes.length;
     const c = this.ctx;
     if (!c?.mediaKeys.hasChannel(c.channelId)) return; // no key: the fragment is dropped
@@ -174,43 +122,16 @@ export class VideoViewer implements VideoApi {
       // Incomplete frame: hold rendering and ask the sharer for a keyframe
       this.framesDropped++;
       this.windowDropped++;
-      this.suppress();
-      this.requestKeyframe();
+      sink.lost();
     }
     // Asked before the early return: the assembler hides every delta until
     // the first keyframe without flagging a drop, and the server rate-limits
     // keyframe relays and relies on the client asking again.
-    if (this.needKeyframe && !r.is_keyframe) this.requestKeyframe();
+    if (sink.waitingForKey && !r.is_keyframe) this.requestKeyframe();
     if (!r.frame) return;
     this.framesReceived++;
     this.windowReceived++;
-    if (this.needKeyframe && !r.is_keyframe) return;
-    const timestamp = r.timestamp * 1000; // ms -> µs
-    // A decoder at or below real time otherwise grows its queue forever and
-    // the picture drifts seconds behind the voice; the native viewer bounds it
-    // with a 64-frame channel. A delta waits for a keyframe; a keyframe starts
-    // over on an empty queue.
-    if (this.decoder.decodeQueueSize > MAX_DECODE_QUEUE) {
-      if (!r.is_keyframe) {
-        this.suppress();
-        this.needKeyframe = true;
-        this.requestKeyframe();
-        return;
-      }
-      this.decoder.reset();
-      this.decoder.configure({ codec: this.codec, optimizeForLatency: true });
-    }
-    try {
-      this.decoder.decode(
-        new EncodedVideoChunk({ type: r.is_keyframe ? "key" : "delta", timestamp, data: r.frame }),
-      );
-      if (r.is_keyframe) {
-        this.needKeyframe = false;
-        if (this.suppressRender) this.resumeAtTimestamp = timestamp;
-      }
-    } catch (e) {
-      this.onDecodeError(e instanceof Error ? e : new Error(String(e)));
-    }
+    sink.push(r.frame, r.is_keyframe, r.timestamp * 1000); // ms -> µs
   }
 
   getStats(): [number, number, number, number, number, number] {
@@ -219,148 +140,48 @@ export class VideoViewer implements VideoApi {
 
   setCanvas(canvas: HTMLCanvasElement | null): void {
     this.canvas = canvas;
-    if (canvas && this.pendingFrame) this.scheduleDraw();
+    this.sink?.setCanvas(canvas);
   }
 
-  private async probeCodec(shareCodec: VideoCodec): Promise<string | null> {
-    if (typeof VideoDecoder === "undefined") return null;
-    for (const codec of CODEC_CANDIDATES[shareCodec] ?? []) {
-      try {
-        const r = await VideoDecoder.isConfigSupported({ codec, optimizeForLatency: true });
-        if (r.supported) return codec;
-      } catch {
-        // try the next profile
-      }
-    }
-    return null;
-  }
+  // ── SinkHost ──────────────────────────────────────────────────────────────
 
-  private openDecoder(): void {
-    this.closeDecoder();
-    const dec = new VideoDecoder({
-      output: (frame) => this.onDecoded(frame),
-      error: (e) => this.onDecodeError(e),
-    });
-    dec.configure({ codec: this.codec, optimizeForLatency: true });
-    this.decoder = dec;
-    this.needKeyframe = true;
-  }
-
-  private closeDecoder(): void {
-    const dec = this.decoder;
-    this.decoder = null;
-    if (dec && dec.state !== "closed") {
-      try {
-        dec.close();
-      } catch {
-        // already closed
-      }
-    }
-  }
-
-  /** Hold rendering until a keyframe submitted after this point is decoded. */
-  private suppress(): void {
-    this.suppressRender = true;
-    this.resumeAtTimestamp = Infinity;
-  }
-
-  private onDecodeError(e: Error): void {
+  failed(why: "unsupported" | "too-large"): void {
     if (!this.watching) return;
-    console.warn(`${this.shareCodec} decode error:`, e.message);
-    // A decoder that probed fine and still fails on every keyframe will never
-    // show anything: say so, as the probe failure does, instead of a viewer
-    // that waits forever.
-    if (++this.decodeFailures >= MAX_DECODE_FAILURES) {
-      const c = this.ctx;
-      c?.emit("screenshare-error", { reason: unsupportedReason(this.shareCodec) });
-      c?.stopWatching();
-      c?.emit("stopped-watching-screenshare", { reason: "unsupported" });
-      this.stopWatching();
-      return;
-    }
-    this.suppress();
-    this.requestKeyframe();
-    // A WebCodecs decoder is closed after an error; build a fresh one that
-    // waits for the next keyframe
-    try {
-      this.openDecoder();
-    } catch (err) {
-      console.warn(`${this.shareCodec} decoder creation failed:`, err);
+    if (why === "unsupported") return this.unsupported();
+    // Not "screenshare-error", which also ends a share of our own
+    const c = this.ctx;
+    c?.stopWatching();
+    c?.emit("stopped-watching-screenshare", { reason: "its picture is larger than VoIPC shows" });
+    this.stopWatching();
+  }
+
+  drawn(_timestamp: number, width: number, height: number): void {
+    this.resolution = (((width & 0xffff) << 16) | (height & 0xffff)) >>> 0;
+    if (!this.firstFrameShown) {
+      // Flips the viewer from "Waiting for video stream..." to the canvas.
+      // Bare, like the native frame event: there is only one viewer.
+      this.firstFrameShown = true;
+      emit("screenshare-frame", "canvas");
     }
   }
 
-  private onDecoded(frame: VideoFrame): void {
-    if (!this.watching) {
-      frame.close();
-      return;
-    }
-    // Over the desktop viewer's cap: stop, as nothing VoIPC sends is this big.
-    // Not "screenshare-error", which also ends a share of our own.
-    if (frameTooLarge(frame)) {
-      console.warn(`share frame ${frame.codedWidth}x${frame.codedHeight} (shown ${frame.displayWidth}x${frame.displayHeight}) is over the decode cap`);
-      frame.close();
-      const c = this.ctx;
-      c?.stopWatching();
-      c?.emit("stopped-watching-screenshare", { reason: "its picture is larger than VoIPC shows" });
-      this.stopWatching();
-      return;
-    }
-    this.decodeFailures = 0;
-    if (this.suppressRender) {
-      if (frame.timestamp < this.resumeAtTimestamp) {
-        frame.close(); // corrupted delta from before the keyframe
-        return;
-      }
-      this.suppressRender = false;
-      console.info("render resumed after keyframe");
-    }
-    this.resolution = (((frame.displayWidth & 0xffff) << 16) | (frame.displayHeight & 0xffff)) >>> 0;
-    // Keep only the latest frame per animation frame
-    this.pendingFrame?.close();
-    this.pendingFrame = frame;
-    this.scheduleDraw();
-  }
-
-  private scheduleDraw(): void {
-    if (this.rafScheduled || !this.canvas) return;
-    this.rafScheduled = true;
-    requestAnimationFrame(() => {
-      this.rafScheduled = false;
-      this.drawPending();
-    });
-  }
-
-  private drawPending(): void {
-    const frame = this.pendingFrame;
-    const canvas = this.canvas;
-    if (!frame || !canvas) return;
-    this.pendingFrame = null;
-    try {
-      const w = frame.displayWidth;
-      const h = frame.displayHeight;
-      if (canvas.width !== w || canvas.height !== h) {
-        canvas.width = w;
-        canvas.height = h;
-      }
-      canvas.getContext("2d")?.drawImage(frame, 0, 0, w, h);
-      if (!this.firstFrameShown) {
-        // Flips the viewer from "Waiting for video stream..." to the canvas.
-        // Bare, like the native frame event: there is only one viewer.
-        this.firstFrameShown = true;
-        emit("screenshare-frame", "canvas");
-      }
-    } finally {
-      frame.close();
-    }
-  }
-
-  private requestKeyframe(): void {
+  requestKeyframe(): void {
     const c = this.ctx;
     if (!c || this.sharerUserId === 0) return;
     const now = performance.now();
     if (now - this.lastKeyframeRequest < KEYFRAME_REQUEST_INTERVAL_MS) return;
     this.lastKeyframeRequest = now;
     c.sendControl({ RequestKeyframe: { sharer_user_id: this.sharerUserId } });
+  }
+
+  /** No decoder here for this share, or one that fails on every keyframe: say so and stop. */
+  private unsupported(): void {
+    const c = this.ctx;
+    const codec = this.shareCodec;
+    this.stopWatching();
+    c?.emit("screenshare-error", { reason: unsupportedReason(codec) });
+    c?.stopWatching();
+    c?.emit("stopped-watching-screenshare", { reason: "unsupported" });
   }
 
   /** Every LOSS_REPORT_INTERVAL_MS: tell the sharer about lost frames (only when there were any). */

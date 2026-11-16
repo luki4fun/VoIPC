@@ -90,6 +90,9 @@ pub struct AccountSession {
     password_based: bool,
     /// The relay knows this device's key (and has not forgotten it since).
     remembered: bool,
+    /// The device id this device kept for the account before (`set_held_device`): once a new
+    /// key is remembered, the relay drops this one (protocol v24), which nothing can use now.
+    held_device: Option<Vec<u8>>,
     /// A role here waits for two-factor codes.
     needs_2fa: bool,
     enrol: Option<DeviceEnrol>,
@@ -279,6 +282,7 @@ impl AccountSession {
             first,
             password_based,
             remembered: !password_based,
+            held_device: None,
             needs_2fa: info.needs_2fa,
             enrol: None,
             roster: HashMap::new(),
@@ -334,6 +338,12 @@ impl AccountSession {
             a.emit.push(p.ended());
         }
         a
+    }
+
+    /// The device id of the record this device holds for the account, if any: told before
+    /// `after_connect`, so the key it named is dropped once a new one is remembered.
+    pub fn set_held_device(&mut self, device_id: Vec<u8>) {
+        self.held_device = Some(device_id);
     }
 
     fn start_enrol(&mut self, a: &mut Actions) {
@@ -767,6 +777,15 @@ impl AccountSession {
             AccountReply::DeviceAdded => {
                 if let Some(e) = self.enrol.take() {
                     self.remembered = true;
+                    let held = self.held_device.replace(e.key.device_id.to_vec());
+                    if let Some(old) = held.filter(|old| {
+                        self.proto >= 24 && old.as_slice() != e.key.device_id.as_slice()
+                    }) {
+                        a.send
+                            .push(ClientMessage::Account(AccountRequest::DeviceForget {
+                                device_id: old,
+                            }));
+                    }
                     a.remember = Some(Remembered {
                         relay_id: self.relay_id,
                         name: self.name.clone(),
@@ -780,12 +799,14 @@ impl AccountSession {
             // a role that waited for them counts now.
             AccountReply::TotpEnabled { .. } => {
                 self.remembered = false;
+                self.held_device = None;
                 self.needs_2fa = false;
             }
             // A new password forgets every device key, this one's too: the
             // person just typed the password, so remember this device again.
             AccountReply::PasswordChanged => {
                 self.remembered = false;
+                self.held_device = None;
                 self.password_based = true;
                 if !self.needs_2fa {
                     self.start_enrol(&mut a);
@@ -808,6 +829,9 @@ impl AccountSession {
                     }
                 }
             }
+            // Housekeeping the person never asked for: a key already gone is no news
+            AccountReply::DeviceForgotten => return a,
+            AccountReply::Error { request, .. } if request == "DeviceForget" => return a,
             AccountReply::Error { request, .. } if request.starts_with("Device") => {
                 self.enrol = None
             }
@@ -2610,6 +2634,66 @@ mod tests {
             0,
             "remembered already"
         );
+    }
+
+    /// Remembered again by password: the key of the record it held goes, once the new one
+    /// is in, and only on a relay that knows the request (protocol v24). Its answer, or a
+    /// refusal, is no news for the person.
+    #[test]
+    fn remembered_again_the_device_drops_the_key_it_held() {
+        let at = |proto: u32, held: Option<Vec<u8>>| {
+            let signed = SignedIn {
+                relay_id: RELAY,
+                name: "me".into(),
+                vault: Vault::create(RELAY, "me"),
+                identity: IdentityKeyPair::generate(&mut crate::rng()),
+                recovery: None,
+                binding: None,
+                keyed: false,
+                login_key: None,
+                blobs: Vec::new(),
+            };
+            let (mut s, _) = AccountSession::start(
+                signed,
+                &info(false),
+                LogMemory::default(),
+                false,
+                true,
+                proto,
+            );
+            if let Some(id) = held {
+                s.set_held_device(id);
+            }
+            assert_eq!(sends(&s.after_connect(), "DeviceChallenge"), 1);
+            s.on_reply(&AccountReply::DeviceChallenge {
+                challenge: "c".into(),
+            });
+            let a = s.on_reply(&AccountReply::DeviceAdded);
+            let forgets: Vec<_> = a
+                .send
+                .iter()
+                .filter_map(|m| match m {
+                    ClientMessage::Account(AccountRequest::DeviceForget { device_id }) => {
+                        Some(device_id.clone())
+                    }
+                    _ => None,
+                })
+                .collect();
+            (s, a.remember.expect("the new key").device_id, forgets)
+        };
+        let old = vec![9u8; 16];
+        let (mut s, new, forgets) = at(24, Some(old.clone()));
+        assert_eq!(forgets, vec![old.clone()], "the old key goes");
+        assert_ne!(new.as_slice(), old.as_slice());
+        assert!(s.on_reply(&AccountReply::DeviceForgotten).emit.is_empty());
+        let refused = AccountReply::Error {
+            request: "DeviceForget".into(),
+            reason: "gone".into(),
+        };
+        assert!(s.on_reply(&refused).emit.is_empty(), "no news");
+        // Control: nothing held, nothing to drop; a relay before 24 hears none
+        assert!(at(24, None).2.is_empty());
+        assert!(at(23, Some(old)).2.is_empty(), "a relay at 23");
     }
 
     #[test]

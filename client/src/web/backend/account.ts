@@ -8,7 +8,7 @@
 
 import { toHex } from "../../lib/hex";
 import { getConfig } from "./config";
-import { cursorStorageKey, findDevice, listDevices, saveDevice } from "./devices";
+import { cursorStorageKey, findDevice, listDevices, saveDevice, type DeviceRecord } from "./devices";
 import { freshPage, keepMemory, markReplay, wholeMemory, type PageMemory } from "./log-memory";
 import { loadNamed, namedOf, saveNamed } from "./log-named";
 import { wasm, type AccountActions, type AccountMethod, type AccountSession, type AccountSignIn, type KeptPins, type SignInStep, type SignalClient } from "./wasm";
@@ -163,6 +163,9 @@ export class AccountDriver {
   private readonly passwordBased: boolean;
   /** For the `stretch` step; none for a device-key sign-in. */
   private readonly password: string | null;
+  /** What this browser holds on this server: remembered again, it drops the key its record
+   *  named (`AccountSession.setHeldDevice`). */
+  private held: DeviceRecord[] = [];
 
   private constructor(signIn: AccountSignIn, passwordBased: boolean, password: string | null) {
     this.signIn = signIn;
@@ -194,11 +197,13 @@ export class AccountDriver {
         .filter(([s]) => s !== server)
         .map(([s, id]) => [id, s]),
     );
+    const held = args.kind === "device" ? [] : (await listDevices()).filter((d) => d.server === server);
     if (args.kind === "provider") {
-      const devices = await listDevices();
-      signIn.rememberedHere(devices.filter((d) => d.server === server).map((d) => [d.name, d.dek]));
+      signIn.rememberedHere(held.map((d) => [d.name, d.dek]));
     }
-    return new AccountDriver(signIn, args.kind !== "device", args.kind === "device" || args.kind === "provider" ? null : args.password);
+    const driver = new AccountDriver(signIn, args.kind !== "device", args.kind === "device" || args.kind === "provider" ? null : args.password);
+    driver.held = held;
+    return driver;
   }
 
   /** `AccountSignIn.midPairing`, and false once the sign-in is over. */
@@ -444,6 +449,9 @@ export class AccountDriver {
     const { session, actions } = signIn.startSession(info, wholeMemory(memory), getConfig().share_channel_history, this.passwordBased);
     signIn.free();
     this.signIn = null;
+    const held = this.held.find((d) => d.name === done.name && toHex(d.relay_id) === toHex(done.relay_id));
+    if (held) session.setHeldDevice(held.device_id);
+    this.held = [];
     this.session = session;
     this.run(host, actions);
   }

@@ -14,6 +14,12 @@
 # every check below then proves the tunnel carries what QUIC does — and a mixed
 # run, that the relay is the same across the two.
 #
+# SHARE_RES (480, 720, 1080), SHARE_FPS (15, 30, 60) and SHARE_NOISE (random blocks a
+# frame, so the encoder needs its bitrate) set what alice's share sends (default 480p at
+# 15 fps, no noise). EXPECT_LADDER=1 is the capped-link lane (CI rates loopback):
+# bob's voice loses at most 2 %, his canvas gets pictures in every 10 s window, and
+# alice's quality ladder steps her bitrate down at least once. Give it DURATION=45000.
+#
 # EXPECT_FALLBACK=1 is for a run with the relay's UDP ports blocked (the CI
 # lane drops them with iptables): both browsers ask for QUIC as usual, and
 # both must have raced over to the TCP fallback on their own.
@@ -142,6 +148,7 @@ grep -qs SELFTEST client/dist-web/assets/*.js ||
 
 TCP_PORT="${TCP_PORT:-19987}"
 DURATION="${DURATION:-15000}"
+SHARE_PARAMS="&share_res=${SHARE_RES:-480}&share_fps=${SHARE_FPS:-15}&share_noise=${SHARE_NOISE:-0}"
 # alice sends bob a file this size (KiB) while she talks; 0 sends none
 FILE_KIB="${FILE_KIB:-10240}"
 WORK="$(mktemp -d)"
@@ -332,7 +339,7 @@ start_page() { # as run_browser
 # alice creates the channel, becomes admin at the end and kicks bob; bob joins
 # through an invite-link fragment (#channel=…) and expects the kick
 # alice also shares her (synthetic) screen; bob watches it
-start_page alice talker "&channel=e2e&textchannel=e2e-text&dm=bob&admin=e2e-admin-token-0001&kick=bob&share=1&proximity=2d&pos=3,0,0&spatialtest=3d&file=$FILE_KIB$(via "$TRANSPORT_ALICE")" \
+start_page alice talker "&channel=e2e&textchannel=e2e-text&dm=bob&admin=e2e-admin-token-0001&kick=bob&share=1$SHARE_PARAMS&proximity=2d&pos=3,0,0&spatialtest=3d&file=$FILE_KIB$(via "$TRANSPORT_ALICE")" \
   "$WORK/alice.log" "$BROWSER_ALICE"
 # Not a fixed stagger: the run asserts that a message alice sent *before* bob
 # arrived reaches him as channel history, so the harness has to make "before"
@@ -350,7 +357,7 @@ for _ in $(seq 1 900); do
 done
 grep -q 'SELFTEST early-chat-sent' "$WORK/alice.log" ||
   echo "warning: alice never reported her first message — bob starts anyway, expect a history failure"
-start_page bob listener "&textchannel=e2e-text&dm=alice&expect_kick=1&watch=1&pos=-3,0,0$(via "$TRANSPORT_BOB")#channel=e2e" \
+start_page bob listener "&textchannel=e2e-text&dm=alice&expect_kick=1&watch=1$SHARE_PARAMS&pos=-3,0,0$(via "$TRANSPORT_BOB")#channel=e2e" \
   "$WORK/bob.log" "$BROWSER_BOB"
 
 deadline=$(( $(date +%s) + DURATION / 1000 + 30 ))
@@ -423,6 +430,28 @@ check "alice sent video frames"         "$WORK/alice.txt" 'screenshare-stats.*"f
 check "bob watched the share"           "$WORK/bob.txt"   'watching-screenshare'
 check "bob decoded video frames"        "$WORK/bob.txt"   'screenshare-stats.*"frames_recv":[1-9]'
 check "bob drew a frame on the canvas"  "$WORK/bob.txt"   'screenshare-stats.*"frames_drawn":[1-9]'
+if [ "${EXPECT_LADDER:-}" = 1 ]; then
+  # Under the cap: voice first, the picture keeps coming, and the ladder gives way (H3-14)
+  ladder=$(node -e '
+    const fs = require("fs");
+    const rows = (f, what) => fs.readFileSync(f, "utf8").split("\n").filter((l) => l.includes(what))
+      .map((l) => JSON.parse(l.slice(l.indexOf("{"), l.lastIndexOf("}") + 1)));
+    const voice = rows(process.argv[2], "SELFTEST voice-stats").pop() ?? { played: 0, lost: 1 };
+    const seen = rows(process.argv[2], "SELFTEST share-window").map((w) => w.drawn);
+    const kbps = rows(process.argv[1], "SELFTEST share-window").map((w) => w.kbps);
+    const lost = voice.lost / Math.max(1, voice.played + voice.lost);
+    const stepped = kbps.some((k, i) => kbps.slice(0, i).some((before) => k < 0.8 * before));
+    console.log(JSON.stringify({ lost: +lost.toFixed(4), drawn: seen, kbps }));
+    console.log(lost <= 0.02 ? "PASS" : "FAIL", "bob lost at most 2 % of voice under the cap");
+    console.log(seen.length >= 2 && seen.every((n) => n > 0) ? "PASS" : "FAIL", "bob drew pictures in every 10 s window");
+    console.log(stepped ? "PASS" : "FAIL", "alice stepped her bitrate down under the cap");
+  ' "$WORK/alice.txt" "$WORK/bob.txt")
+  echo "--- capped link: $(head -1 <<< "$ladder")"
+  while read -r verdict what; do
+    echo "$verdict $what"
+    if [ "$verdict" != PASS ]; then echo "FAIL $what" >> "$WORK/fails.txt"; fail=1; fi
+  done < <(tail -n +2 <<< "$ladder")
+fi
 if grep -q 'screenshare-error' "$WORK/alice.txt" "$WORK/bob.txt"; then
   echo "FAIL screen share error reported:" | tee -a "$WORK/fails.txt"
   grep -h 'screenshare-error' "$WORK/alice.txt" "$WORK/bob.txt" | tee -a "$WORK/fails.txt"; fail=1

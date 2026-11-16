@@ -24,15 +24,20 @@ use voipc_video::convert;
 mod linux;
 #[cfg(target_os = "linux")]
 pub use linux::{
-    enumerate_displays, enumerate_windows, request_screencast, spawn_capture_task, CaptureSession,
+    enumerate_displays, enumerate_windows, share_session, spawn_capture_task, x11_parent,
+    CaptureSession,
 };
 
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(target_os = "windows")]
+mod windows_preview;
+#[cfg(target_os = "windows")]
 pub use windows::{
     enumerate_displays, enumerate_windows, request_screencast, spawn_capture_task, CaptureSession,
 };
+#[cfg(target_os = "windows")]
+pub use windows_preview::source_picture;
 
 // ── Android stubs ────────────────────────────────────────────────────────
 
@@ -1169,6 +1174,7 @@ pub fn render_frame(
     app_handle: &tauri::AppHandle,
     buffers: &mut FrameDecodeBuffers,
 ) {
+    let started = std::time::Instant::now();
     voipc_video::to_jpeg_ycbcr(
         &mut frame.i420_data,
         frame.width as usize,
@@ -1184,6 +1190,7 @@ pub fn render_frame(
         subsamp: turbojpeg::Subsamp::Sub2x2,
     };
 
+    let converted = std::time::Instant::now();
     let jpeg_data = match buffers.compressor.compress_yuv_to_vec(yuv_image) {
         Ok(data) => data,
         Err(e) => {
@@ -1191,9 +1198,11 @@ pub fn render_frame(
             return;
         }
     };
+    let compressed = std::time::Instant::now();
 
     let b64 = base64::engine::general_purpose::STANDARD.encode(&jpeg_data);
-    let data_url = format!("data:image/jpeg;base64,{}", b64);
+    let url = format!("data:image/jpeg;base64,{}", b64);
+    let (seq, at_ms) = crate::view_timing::stamp();
     // Only to the window that draws it: the pop-out while one is open, the
     // main window otherwise. `emit` went to every window, so a popped-out
     // share was serialised and delivered twice a frame — once to a main
@@ -1203,8 +1212,190 @@ pub fn render_frame(
     } else {
         "main"
     };
-    let _ = app_handle.emit_to(target, "screenshare-frame", &data_url);
+    let _ = app_handle.emit_to(
+        target,
+        "screenshare-frame",
+        &SharedFrame { url, seq, at_ms },
+    );
+    crate::view_timing::rendered(
+        converted - started,
+        compressed - converted,
+        compressed.elapsed(),
+    );
+}
+
+/// A shown frame as the WebView gets it: the picture, its number, and the wall-clock ms
+/// it went out at, for `report_view_timing`.
+#[derive(serde::Serialize)]
+struct SharedFrame {
+    url: String,
+    seq: u64,
+    at_ms: u64,
+}
+
+// ── Share picker pictures (Windows; pure, so they test anywhere) ───────────
+
+/// A picker tile's picture: the source's still as a JPEG data URL, and a window's icon as a
+/// PNG one, the tile's picture when there is no still (minimised, protected, one colour).
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct SourcePicture {
+    pub picture: Option<String>,
+    pub icon: Option<String>,
+}
+
+/// The largest a picker tile's picture is made.
+pub(crate) const PREVIEW_MAX: (u32, u32) = (320, 180);
+
+/// The size a source's picture is drawn at: within `PREVIEW_MAX`, its aspect kept, never
+/// larger than the source, at least one pixel a side.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn preview_size(w: u32, h: u32) -> (u32, u32) {
+    if w == 0 || h == 0 {
+        return (1, 1);
+    }
+    let (mw, mh) = PREVIEW_MAX;
+    let scale = (mw as f64 / w as f64).min(mh as f64 / h as f64).min(1.0);
+    let fit = |v: u32| ((v as f64 * scale).round() as u32).max(1);
+    (fit(w), fit(h))
+}
+
+/// A BGRA picture made smaller by area averaging: each output pixel is the mean of the source
+/// pixels it covers, so text and edges blur instead of flickering in and out.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn downscale_bgra(
+    src: &[u8],
+    w: usize,
+    h: usize,
+    stride: usize,
+    ow: usize,
+    oh: usize,
+) -> Vec<u8> {
+    let mut out = vec![0u8; ow * oh * 4];
+    if w == 0 || h == 0 || ow == 0 || oh == 0 || src.len() < stride * (h - 1) + w * 4 {
+        return out;
+    }
+    for oy in 0..oh {
+        let (y0, y1) = (oy * h / oh, ((oy + 1) * h / oh).max(oy * h / oh + 1).min(h));
+        for ox in 0..ow {
+            let (x0, x1) = (ox * w / ow, ((ox + 1) * w / ow).max(ox * w / ow + 1).min(w));
+            let mut sum = [0u32; 4];
+            for y in y0..y1 {
+                let row = &src[y * stride..];
+                for x in x0..x1 {
+                    for (c, s) in sum.iter_mut().enumerate() {
+                        *s += row[x * 4 + c] as u32;
+                    }
+                }
+            }
+            let n = ((y1 - y0) * (x1 - x0)) as u32;
+            let o = (oy * ow + ox) * 4;
+            for c in 0..4 {
+                out[o + c] = (sum[c] / n) as u8;
+            }
+        }
+    }
+    out
+}
+
+/// Whether a picture is (nearly) one colour: black from a minimised, protected or GPU-only
+/// window says nothing, and the tile shows the window's icon instead. Samples a 16x16 grid.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn one_colour(bgra: &[u8], w: usize, h: usize) -> bool {
+    if w == 0 || h == 0 || bgra.len() < w * h * 4 {
+        return true;
+    }
+    let at = |x: usize, y: usize| {
+        let o = (y * w + x) * 4;
+        [bgra[o], bgra[o + 1], bgra[o + 2]]
+    };
+    let first = at(0, 0);
+    (0..16).all(|j| {
+        (0..16).all(|i| {
+            let p = at(i * (w - 1) / 15, j * (h - 1) / 15);
+            (0..3).all(|c| p[c].abs_diff(first[c]) <= 6)
+        })
+    })
+}
+
+/// A tile's picture as a JPEG data URL, or None for one that says nothing (`one_colour`).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn preview_url(bgra: &[u8], w: usize, h: usize) -> Option<String> {
+    if one_colour(bgra, w, h) {
+        return None;
+    }
+    let image = turbojpeg::Image {
+        pixels: bgra,
+        width: w,
+        pitch: w * 4,
+        height: h,
+        format: turbojpeg::PixelFormat::BGRA,
+    };
+    let jpeg = turbojpeg::compress(image, 80, turbojpeg::Subsamp::Sub2x2).ok()?;
+    Some(format!(
+        "data:image/jpeg;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(&*jpeg)
+    ))
 }
 
 /// The pop-out viewer's window label (commands.rs `open_share_popout`).
 pub const POPOUT_LABEL: &str = "screenshare-popout";
+
+#[cfg(test)]
+mod picker_tests {
+    use super::*;
+
+    #[test]
+    fn a_tile_fits_its_box_and_keeps_the_aspect() {
+        assert_eq!(preview_size(1920, 1080), (320, 180));
+        assert_eq!(preview_size(2560, 1440), (320, 180));
+        assert_eq!(preview_size(1080, 1920), (101, 180), "portrait");
+        assert_eq!(preview_size(3440, 1440), (320, 134), "ultra-wide");
+        assert_eq!(preview_size(200, 100), (200, 100), "never enlarged");
+        assert_eq!(preview_size(0, 50), (1, 1));
+    }
+
+    #[test]
+    fn a_smaller_picture_is_the_mean_of_what_it_covers() {
+        // 4x2, a stride with padding: left half black, right half white
+        let mut src = vec![9u8; 20 * 2];
+        for y in 0..2 {
+            for x in 0..4 {
+                let v = if x < 2 { 0 } else { 255 };
+                src[y * 20 + x * 4..y * 20 + x * 4 + 4].copy_from_slice(&[v, v, v, 255]);
+            }
+        }
+        assert_eq!(
+            downscale_bgra(&src, 4, 2, 20, 2, 1),
+            vec![0, 0, 0, 255, 255, 255, 255, 255]
+        );
+        // Everything into one pixel: grey
+        assert_eq!(
+            downscale_bgra(&src, 4, 2, 20, 1, 1),
+            vec![127, 127, 127, 255]
+        );
+        assert_eq!(
+            downscale_bgra(&src[..10], 4, 2, 20, 1, 1),
+            vec![0; 4],
+            "too short: blank"
+        );
+    }
+
+    #[test]
+    fn a_picture_of_one_colour_says_nothing() {
+        let black = vec![0u8; 64 * 36 * 4];
+        assert!(one_colour(&black, 64, 36));
+        assert_eq!(preview_url(&black, 64, 36), None);
+        let mut ramp = black.clone();
+        for (i, p) in ramp.chunks_mut(4).enumerate() {
+            p[1] = (i % 64 * 4) as u8;
+        }
+        assert!(!one_colour(&ramp, 64, 36));
+        assert!(
+            preview_url(&ramp, 64, 36).is_some_and(|u| u.starts_with("data:image/jpeg;base64,"))
+        );
+        // Noise of a few levels (a nearly black window) is still one colour
+        let mut dim = black;
+        dim[4 * 70] = 5;
+        assert!(one_colour(&dim, 64, 36));
+    }
+}

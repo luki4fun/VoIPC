@@ -666,17 +666,29 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
             warn!(server, "could not remember the relay id: {e}");
         }
     }
-    let memory = state
-        .chat
-        .read()
-        .await
-        .log_memory(&memory_key(&signed.relay_id, &signed.name));
+    let (memory, held) = {
+        let chat = state.chat.read().await;
+        let held = chat
+            .archive
+            .devices
+            .iter()
+            .find(|d| d.relay_id == signed.relay_id && d.name == signed.name)
+            .map(|d| d.device_id.to_vec());
+        (
+            chat.log_memory(&memory_key(&signed.relay_id, &signed.name)),
+            held,
+        )
+    };
     // Joiners of a channel's log get our older keys on the same consent as
     // handing them the channel's history in person.
     let share = state.config().share_channel_history;
     info!(server, account = %signed.name, "signed in to account");
-    let (session, started) =
+    let (mut session, started) =
         AccountSession::start(signed, &info, memory, share, password_based, proto);
+    // Remembered again, the device drops the key its record named
+    if let Some(id) = held {
+        session.set_held_device(id);
+    }
     // Nothing to send yet (the sync's first asks wait for `after_connect`);
     // the front end hears it signed in, its choices along with it.
     for (name, payload) in started.emit {

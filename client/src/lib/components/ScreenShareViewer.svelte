@@ -25,6 +25,8 @@
   import { screenAudioSpatial, spatialAudio } from "../stores/settings.js";
   import { pushLayer } from "../stores/back-stack.js";
   import { zoomable } from "../actions/zoom.js";
+  import { framePainted, latestFrame } from "../view-timing.js";
+  import { canvasView, setNativeCanvas } from "../native-view.js";
   import { FIT, type View } from "../zoom-rules.js";
   import Icon from "./Icons.svelte";
 
@@ -52,6 +54,8 @@
 
   // requestAnimationFrame coalescing: only render the latest frame per vsync tick
   let displayFrame = $state<string | null>(null);
+  /** The shown frame's number, for the `share view:` line (view-timing.ts). */
+  let displaySeq = -1;
   let pendingFrame: string | null = null;
   let rafScheduled = false;
   let rafId = 0;
@@ -70,6 +74,7 @@
         rafScheduled = false;
         if (pendingFrame) {
           displayFrame = pendingFrame;
+          displaySeq = latestFrame();
         }
       });
     }
@@ -85,7 +90,11 @@
   // the window bridge so this component never imports web-only code)
   let canvasEl = $state<HTMLCanvasElement | null>(null);
   $effect(() => {
-    if (!isWeb) return;
+    if (!isWeb) {
+      // The app's WebView decoding (native-view.ts) draws here too
+      setNativeCanvas(canvasEl);
+      return () => setNativeCanvas(null);
+    }
     const bridge = (window as any).__voipc_web;
     bridge?.setVideoCanvas(canvasEl);
     return () => bridge?.setVideoCanvas(null);
@@ -279,10 +288,10 @@
       class="zoom-stage"
       style="transform: translate({view.x}px, {view.y}px) scale({view.scale})"
     >
-      {#if isWeb}
+      {#if isWeb || $canvasView}
         <canvas class="frame" class:hidden={!displayFrame} bind:this={canvasEl} aria-hidden="true"></canvas>
       {:else if displayFrame}
-        <img src={displayFrame} alt="" class="frame" />
+        <img src={displayFrame} alt="" class="frame" onload={() => framePainted(displaySeq)} />
       {/if}
     </div>
     {#if !displayFrame}

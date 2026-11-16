@@ -1752,6 +1752,39 @@ pub async fn set_volume(state: State<'_, AppState>, volume: f32) -> Result<(), S
     Ok(())
 }
 
+/// The WebView's side of the `share view:` line (view_timing.rs): every 2 s while it draws
+/// a watched share.
+#[tauri::command]
+pub async fn report_view_timing(
+    state: State<'_, AppState>,
+    report: crate::view_timing::ViewReport,
+) -> Result<(), String> {
+    // A WebView that decodes the share itself knows its size; the stats show it
+    if report.resolution != 0 {
+        let conns = state.connections.read().await;
+        if let Ok(c) = voice(&state, &conns) {
+            c.screen_video_resolution
+                .store(report.resolution, Ordering::Relaxed);
+        }
+    }
+    crate::view_timing::view(report);
+    Ok(())
+}
+
+/// The share codecs this WebView decodes itself (1.13, Android): a watch of one of them
+/// comes to it over `voipcframe` (view_queue.rs) instead of the native decoder.
+#[tauri::command]
+pub async fn set_view_decoder(codecs: Vec<String>) {
+    crate::view_queue::set_codecs(&codecs);
+}
+
+/// The WebView cannot show the share it was handed: the native decoder takes it over from
+/// its next keyframe.
+#[tauri::command]
+pub async fn view_fallback() {
+    crate::view_queue::native();
+}
+
 /// Voice receive stats: (frames_played, frames_lost) since connect.
 /// The UI polls this and computes a windowed loss percentage.
 #[tauri::command]
@@ -1807,15 +1840,25 @@ pub fn enumerate_windows() -> Vec<screenshare::WindowInfo> {
 /// the frontend receives `viewer-count-changed` with count > 0.
 #[tauri::command]
 pub async fn start_screen_share(
+    window: tauri::WebviewWindow,
     state: State<'_, AppState>,
     source_type: String,
     source_id: String,
     resolution: u16,
     _fps: u32,
+    again: Option<bool>,
 ) -> Result<(), String> {
     #[cfg(target_os = "android")]
     {
-        let _ = (state, source_type, source_id, resolution, _fps);
+        let _ = (
+            window,
+            state,
+            source_type,
+            source_id,
+            resolution,
+            _fps,
+            again,
+        );
         return Err("Screen sharing is not available on Android".into());
     }
 
@@ -1825,7 +1868,7 @@ pub async fn start_screen_share(
         // This must happen BEFORE acquiring the connection lock because it may await
         // user interaction (e.g. portal dialog on Linux).
         // (fps is stored in the frontend and passed to start_screen_capture later)
-        let session = screenshare::request_screencast(&source_type, &source_id).await?;
+        let session = capture_session(&window, &state, &source_type, &source_id, again).await?;
 
         let mut conns = state.connections.write().await;
         let connection = voice_mut(&state, &mut conns)?;
@@ -1891,6 +1934,84 @@ pub async fn stop_screen_share(state: State<'_, AppState>) -> Result<(), String>
     // Close the capture session (stops screen capture) once nothing reads it
     drop(session);
     Ok(())
+}
+
+/// The capture session for a share. On Linux through the portal with its "Share again"
+/// token (`again`: restore the last choice without the dialog), and the token it gives back
+/// kept for next time; elsewhere the picked source.
+#[cfg(not(target_os = "android"))]
+async fn capture_session(
+    window: &tauri::WebviewWindow,
+    state: &AppState,
+    source_type: &str,
+    source_id: &str,
+    again: Option<bool>,
+) -> Result<screenshare::CaptureSession, String> {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = source_id;
+        let stored = state.config().screencast_restore_token.clone();
+        let parent = screenshare::x11_parent(window);
+        let (session, change) =
+            screenshare::share_session(source_type, stored, again.unwrap_or(false), parent).await?;
+        if let Some(token) = change {
+            let mut cfg = state.config();
+            cfg.screencast_restore_token = token;
+            if let Err(e) = crate::config::save_config(&cfg) {
+                tracing::warn!("could not keep the share's restore token: {e}");
+            }
+        }
+        Ok(session)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (window, state, again);
+        screenshare::request_screencast(source_type, source_id).await
+    }
+}
+
+/// A picture of a share source for the picker (Windows): its still and, for a window, its
+/// icon. Given up after 300 ms (a window that answers slowly gets its icon from the list's
+/// next refresh, or none); elsewhere nothing, as the system's own picker shows them.
+#[tauri::command]
+pub async fn source_preview(source_type: String, source_id: String) -> screenshare::SourcePicture {
+    #[cfg(target_os = "windows")]
+    {
+        let (tx, rx) = std::sync::mpsc::channel();
+        // Its own thread: a window that blocks in PrintWindow is left to finish alone
+        std::thread::spawn(move || {
+            let _ = tx.send(screenshare::source_picture(&source_type, &source_id));
+        });
+        tokio::task::spawn_blocking(move || {
+            rx.recv_timeout(std::time::Duration::from_millis(300))
+                .unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (source_type, source_id);
+        screenshare::SourcePicture::default()
+    }
+}
+
+/// Whether "Share again" can restore the last screen or window without the portal's dialog.
+#[tauri::command]
+pub fn share_again_known(state: State<'_, AppState>) -> bool {
+    state
+        .config()
+        .screencast_restore_token
+        .as_deref()
+        .is_some_and(|t| !t.is_empty())
+}
+
+/// Forget the remembered screen or window: the next share asks the portal again.
+#[tauri::command]
+pub fn forget_share_again(state: State<'_, AppState>) -> Result<(), String> {
+    let mut cfg = state.config();
+    cfg.screencast_restore_token = None;
+    crate::config::save_config(&cfg)
 }
 
 /// Start watching another user's screen share.
@@ -1980,6 +2101,7 @@ pub async fn stop_watching_screen_share(state: State<'_, AppState>) -> Result<()
     }
 
     network::send_tcp_message(&connection.tcp_tx, &ClientMessage::StopWatchingScreenShare).await?;
+    crate::view_queue::native();
     connection.watching_user_id = None;
     connection
         .watching_user_id_shared
@@ -2161,24 +2283,36 @@ pub async fn stop_screen_capture(state: State<'_, AppState>) -> Result<(), Strin
 /// Stops the current capture, replaces the session, and restarts capture
 /// if viewers are present. The server is not notified — the stream continues.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn switch_screen_share_source(
     app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
     state: State<'_, AppState>,
     source_type: String,
     source_id: String,
     resolution: u16,
     fps: u32,
+    again: Option<bool>,
 ) -> Result<(), String> {
     #[cfg(target_os = "android")]
     {
-        let _ = (app, state, source_type, source_id, resolution, fps);
+        let _ = (
+            app,
+            window,
+            state,
+            source_type,
+            source_id,
+            resolution,
+            fps,
+            again,
+        );
         return Err("Screen sharing is not available on Android".into());
     }
 
     #[cfg(not(target_os = "android"))]
     {
         // Acquire the new capture session BEFORE locking (may show portal on Linux).
-        let new_session = screenshare::request_screencast(&source_type, &source_id).await?;
+        let new_session = capture_session(&window, &state, &source_type, &source_id, again).await?;
 
         let _gate = state.share_gate.lock().await;
         // Stop the current capture, and swap the session, under the lock…

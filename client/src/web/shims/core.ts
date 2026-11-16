@@ -23,3 +23,11 @@ export async function invoke<T>(
   const call = raw ? { body: raw, headers: options?.headers ?? {} } : (args as Record<string, unknown> | undefined);
   return (await dispatch(cmd, call ?? {})) as T;
 }
+
+/**
+ * The apps' own URI schemes (the share view's frame queue, native-view.ts) have no page to
+ * serve them here: the browser decodes a share itself and never pulls from one.
+ */
+export function convertFileSrc(path: string, protocol = "asset"): string {
+  throw new Error(`${protocol}://${path}: not in the browser`);
+}

@@ -549,6 +549,13 @@ pub struct AccountSession {
 
 #[wasm_bindgen]
 impl AccountSession {
+    /// The device id of the record this browser holds for the account, before
+    /// `afterConnect`: remembered again, it drops the key that one named.
+    #[wasm_bindgen(js_name = setHeldDevice)]
+    pub fn set_held_device(&mut self, device_id: Vec<u8>) {
+        self.session.set_held_device(device_id);
+    }
+
     /// Once the session is listed: the sync's first asks, then the
     /// second-factor setup a role waits for, or remembering this browser.
     #[wasm_bindgen(js_name = afterConnect)]

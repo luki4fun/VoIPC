@@ -5,6 +5,8 @@ pub mod decoder;
 #[cfg(not(target_os = "android"))]
 pub mod encoder;
 
+pub mod frame_size;
+
 // Android video decoder via NDK AMediaCodec
 #[cfg(target_os = "android")]
 mod android_decoder;

@@ -349,6 +349,30 @@ pub const RESHAPED: &[(u32, Side, u32, &str)] = &[
         68,
         "Restrictions without the moderator's part and the wait's end",
     ),
+    (
+        22,
+        Side::Client,
+        41,
+        "AccountRequest::DeviceForget is refused",
+    ),
+    (
+        22,
+        Side::Server,
+        46,
+        "AccountReply::DeviceForgotten never comes",
+    ),
+    (
+        23,
+        Side::Client,
+        41,
+        "AccountRequest::DeviceForget is refused",
+    ),
+    (
+        23,
+        Side::Server,
+        46,
+        "AccountReply::DeviceForgotten never comes",
+    ),
 ];
 
 /// How many messages each side had at a protocol: an index at or past it is
@@ -362,7 +386,7 @@ fn client_messages(proto: u32) -> u32 {
         18 => 52,
         19 => 54,
         20 => 55,
-        21..=22 => 64,
+        21..=23 => 64,
         _ => u32::MAX,
     }
 }
@@ -562,6 +586,10 @@ fn frames_for(msg: &ClientMessage, proto: u32) -> Result<Vec<Vec<u8>>, ProtocolE
             | AccountRequest::KeyStepUp { .. }
             | AccountRequest::LoginKeySet { .. },
         ) if proto < 22 => Err(ProtocolError::NotOnThisRelay(proto)),
+        // A relay before 24 has no way to drop one key: the old one ages out there (90 days)
+        ClientMessage::Account(AccountRequest::DeviceForget { .. }) if proto < 24 => {
+            Err(ProtocolError::NotOnThisRelay(proto))
+        }
         ClientMessage::EmoteAdd { emote } if proto == 14 => old(postcard::to_allocvec(&(
             EMOTE_ADD,
             EmoteAdd14 {
@@ -1803,6 +1831,26 @@ mod tests {
                 (list[1].by_voice, list[1].by_text, list[1].wait_in_secs),
                 (false, false, Some(600))
             );
+        }
+    }
+
+    /// A relay before 24 never hears `DeviceForget`: it would not know the request.
+    #[test]
+    fn a_device_forget_goes_only_to_a_relay_at_24() {
+        let msg = ClientMessage::Account(AccountRequest::DeviceForget {
+            device_id: vec![7; 16],
+        });
+        for v in OLDEST_RELAY_PROTOCOL..24 {
+            assert!(
+                matches!(
+                    encode_client_msg_for(&msg, v),
+                    Err(ProtocolError::NotOnThisRelay(_))
+                ),
+                "protocol {v}"
+            );
+        }
+        for v in 24..=PROTOCOL_VERSION {
+            assert!(encode_client_msg_for(&msg, v).is_ok(), "protocol {v}");
         }
     }
 

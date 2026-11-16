@@ -77,6 +77,8 @@ ashpd = { version = "0.9", default-features = false, features = ["tokio"] }
 pipewire = "0.10"
 evdev = "0.12"
 libc = "0.2"
+# The app window's X11 id, to parent the portal's dialog to it (the version Tauri uses)
+raw-window-handle = "0.6"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 cpal = { workspace = true }
@@ -91,6 +93,8 @@ windows = { version = "0.58", features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
+    # The share picker's window stills (PrintWindow)
+    "Win32_Storage_Xps",
     "Win32_System_Com",
     # MumbleLink: the block is a named file mapping on Windows
     "Win32_System_Memory",

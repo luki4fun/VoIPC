@@ -4,10 +4,13 @@
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { onMount } from "svelte";
   import Icon from "./Icons.svelte";
+  import { frameArrived, framePainted, latestFrame } from "../view-timing.js";
+  import type { SharedFrame } from "../view-tally.js";
 
   let { sharerName = "Unknown" }: { sharerName: string } = $props();
 
   let displayFrame = $state<string | null>(null);
+  let displaySeq = -1;
   let pendingFrame: string | null = null;
   let rafScheduled = false;
   let audioReceiving = $state(false);
@@ -28,14 +31,15 @@
     const unlistenFns: Array<() => void> = [];
 
     // Register event listeners and collect unlisten functions
-    listen<string>("screenshare-frame", (event) => {
-      pendingFrame = event.payload;
+    listen<SharedFrame | string>("screenshare-frame", (event) => {
+      pendingFrame = frameArrived(event.payload);
       if (!rafScheduled) {
         rafScheduled = true;
         requestAnimationFrame(() => {
           rafScheduled = false;
           if (pendingFrame) {
             displayFrame = pendingFrame;
+            displaySeq = latestFrame();
           }
         });
       }
@@ -155,7 +159,7 @@
     role="presentation"
   >
     {#if displayFrame}
-      <img src={displayFrame} alt="Screen share" class="frame" />
+      <img src={displayFrame} alt="Screen share" class="frame" onload={() => framePainted(displaySeq)} />
     {:else}
       <div class="waiting">Waiting for video stream...</div>
     {/if}

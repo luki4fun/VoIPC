@@ -77,6 +77,12 @@ test("an <img> draws only a URL made here", () => {
     "lib/components/EmoteManager.svelte: r.url",
     // A frame the app's own video decoder drew, not a picture file
     "lib/components/ScreenSharePopout.svelte: displayFrame",
+    // The share picker (1.13): our own share's last preview frame, and the JPEG stills and
+    // PNG icons the app drew itself of this machine's displays and windows (windows_preview.rs)
+    "lib/components/ScreenShareSourcePicker.svelte: $lastShareFrame",
+    "lib/components/ScreenShareSourcePicker.svelte: pictures[`display:${display.id",
+    "lib/components/ScreenShareSourcePicker.svelte: pictures[`window:${win.id",
+    "lib/components/ScreenShareSourcePicker.svelte: pictures[`window:${win.id",
     "lib/components/ScreenShareViewer.svelte: displayFrame",
     "lib/components/SharePreview.svelte: $previewFrame",
     "lib/components/chat/FileCard.svelte: url",

@@ -4591,6 +4591,126 @@ async fn a_reset_of_an_account_with_codes_needs_a_code() {
         .contains("Wrong"));
 }
 
+/// 1.13 (protocol 24): a device remembered again by password drops the key its record
+/// named, so the relay holds one key for it, not one per sign-in; the new key signs in, the
+/// old does not. Only the account's own key goes: another account's forget removes nothing.
+#[tokio::test]
+async fn a_device_remembered_again_drops_the_key_it_held() {
+    use voipc_crypto::account::{DeviceKey, Method, SignIn};
+    use voipc_crypto::account_session::{AccountSession, Remembered};
+    let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+    drop(register_with(&state, "dot").await);
+    /// A password sign-in on this device that remembers it, handing over the record it held.
+    async fn remember(state: &Arc<ServerState>, held: Option<&Remembered>) -> Remembered {
+        let (mut m, first) = SignIn::start(
+            "dot",
+            Method::Password {
+                password: zeroize::Zeroizing::new("correct horse battery".into()),
+            },
+            PROTOCOL_VERSION,
+            APP_VERSION,
+        );
+        m.bind(Binding::Tls(TEST_BIND));
+        let mut c = open_raw(state, &first).await;
+        let info = drive(&mut c, &mut m).await.unwrap();
+        let (mut s, _) = AccountSession::start(
+            m.finish().unwrap(),
+            &info,
+            Default::default(),
+            false,
+            true,
+            PROTOCOL_VERSION,
+        );
+        if let Some(h) = held {
+            s.set_held_device(h.device_id.to_vec());
+        }
+        let (mut a, mut kept, mut forgotten) = (s.after_connect(), None, held.is_none());
+        while kept.is_none() || !forgotten {
+            for msg in std::mem::take(&mut a.send) {
+                c.send(&msg).await;
+            }
+            let ServerMessage::Account(r) = c.expect("an answer", |m| reply(m).is_some()).await
+            else {
+                unreachable!()
+            };
+            assert!(
+                !matches!(&r, AccountReply::Error { request, .. } if request.starts_with("Device")),
+                "{r:?}"
+            );
+            forgotten |= matches!(r, AccountReply::DeviceForgotten);
+            a = s.on_reply(&r);
+            kept = kept.or(a.remember.take());
+        }
+        kept.unwrap()
+    }
+    let relay = state.accounts.as_ref().unwrap();
+    let id = relay
+        .store()
+        .user_by_username("dot")
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    let keys = || async {
+        let mut ids: Vec<Vec<u8>> = relay
+            .accounts
+            .devkeys(id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.ext_id)
+            .collect();
+        ids.sort();
+        ids
+    };
+    let first = remember(&state, None).await;
+    let second = remember(&state, Some(&first)).await;
+    assert_eq!(
+        keys().await,
+        vec![second.device_id.to_vec()],
+        "one key, the new one"
+    );
+    let signs_in = |r: &Remembered| {
+        let key = DeviceKey::from_parts(r.device_id, r.device_key.to_vec()).unwrap();
+        let (mut m, start) = SignIn::start(
+            "dot",
+            Method::Device {
+                key,
+                relay_id: r.relay_id,
+                dek: *r.dek,
+            },
+            PROTOCOL_VERSION,
+            APP_VERSION,
+        );
+        m.bind(Binding::Tls(TEST_BIND));
+        let state = state.clone();
+        async move {
+            drive(&mut open_raw(&state, &start).await, &mut m)
+                .await
+                .is_ok()
+        }
+    };
+    assert!(signs_in(&second).await, "the new key signs in");
+    assert!(!signs_in(&first).await, "the old one is gone");
+    // Control: a sign-in that hands over no record leaves the old key, as before 24
+    let third = remember(&state, None).await;
+    let mut both = vec![second.device_id.to_vec(), third.device_id.to_vec()];
+    both.sort();
+    assert_eq!(keys().await, both);
+    // Another account cannot drop dot's key
+    let (mut eve, _, _) = register_with(&state, "eve").await;
+    eve.send(&ClientMessage::Account(AccountRequest::DeviceForget {
+        device_id: second.device_id.to_vec(),
+    }))
+    .await;
+    let r = eve.expect("refused", |m| reply(m).is_some()).await;
+    assert!(
+        matches!(&r, ServerMessage::Account(AccountReply::Error { request, .. }) if request == "DeviceForget"),
+        "{r:?}"
+    );
+    assert_eq!(keys().await, both, "nothing of dot's went");
+}
+
 #[tokio::test]
 async fn a_password_change_keeps_this_connection_and_forgets_the_device_keys() {
     use voipc_crypto::account::stretch;

@@ -23,6 +23,8 @@ mod transport;
 mod updater;
 #[cfg(test)]
 mod upgrade_fixtures;
+mod view_queue;
+mod view_timing;
 
 use app_state::AppState;
 use tauri::Manager;
@@ -119,7 +121,13 @@ pub fn run() {
             tauri::plugin::Builder::<tauri::Wry>::new("no-file-pages")
                 .on_navigation(|_, url| page_may_open(url))
                 .build(),
-        );
+        )
+        // A watched share's frames, as bytes, for a WebView that decodes them (1.13)
+        .register_asynchronous_uri_scheme_protocol(view_queue::SCHEME, |_, request, responder| {
+            tauri::async_runtime::spawn(async move {
+                responder.respond(view_queue::serve(request).await);
+            });
+        });
     // No `updater:*` capability: the page reaches it only through updater.rs
     #[cfg(not(target_os = "android"))]
     let builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
@@ -448,6 +456,12 @@ pub fn run() {
             commands::set_volume,
             commands::set_input_gain,
             commands::get_voice_stats,
+            commands::report_view_timing,
+            commands::set_view_decoder,
+            commands::share_again_known,
+            commands::source_preview,
+            commands::forget_share_again,
+            commands::view_fallback,
             commands::set_mute_key,
             commands::set_deafen_key,
             commands::set_chat_history_disabled,
