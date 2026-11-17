@@ -23,6 +23,7 @@ that once crashed.
 | `file` | voipc-crypto | file blobs, claimed sizes, the capped inflate |
 | `vault` | voipc-crypto | vault slots and items |
 | `pair` | voipc-crypto | a pairing's commitment, reveal, answer key and wrapped vault key |
+| `group` | voipc-crypto | group-key welcomes, rows, seals, keyrings, blobs, self-rows and history rows, also sealed so they reach the parsers past the AEAD and the keyring's hash chain; headers through the decoder and the rules; Merkle paths |
 | `jitter` | voipc-audio | sequence numbers in any order |
 | `opus` | voipc-audio | Opus packets into the native decoder |
 | `game` | voipc-audio | SDK frames and messages, origins, MumbleLink |

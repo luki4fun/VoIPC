@@ -203,8 +203,9 @@ const fn high_field_element(low_byte: u8) -> [u8; 32] {
 }
 
 /// A log key as a key: exactly its 33 bytes, since libsignal also takes
-/// trailing bytes and a signature covers them, and not of low order.
-fn log_public(logkey: &[u8]) -> Option<PublicKey> {
+/// trailing bytes and a signature covers them, and not of low order. The
+/// group key (`group_key`) reads every X25519 public key through it too.
+pub(crate) fn log_public(logkey: &[u8]) -> Option<PublicKey> {
     if logkey.len() != 33 {
         return None;
     }

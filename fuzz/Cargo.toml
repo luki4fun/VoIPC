@@ -149,3 +149,10 @@ path = "fuzz_targets/import.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "group"
+path = "fuzz_targets/group.rs"
+test = false
+doc = false
+bench = false
