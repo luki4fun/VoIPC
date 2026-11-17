@@ -28,6 +28,8 @@ quota_mb = 50                     # per account
 kept_window = 10000               # a channel's copy goes once this many newer have stood 3 days
 kept_seats = 5000                 # accounts a channel keeps messages for; 0: no limit
 key_file = "voipc-accounts.key"   # made on first start; VOIPC_ACCOUNTS_KEY overrides it
+db_connections = 32               # to the database at most; how fast a restart signs everyone back in
+password_sign_ins_per_15min = 1000  # new devices, everyone together; remembered ones are not counted
 ```
 
 `--accounts optional` and `--database <url>` do the same on the command line.

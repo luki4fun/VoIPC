@@ -6192,32 +6192,67 @@ async fn one_address_holds_only_a_few_of_the_sign_in_slots() {
     let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
     let relay = state.accounts.clone().unwrap();
     let a: IpAddr = "203.0.113.5".parse().unwrap();
-    let held: Vec<_> = (0..4)
-        .map(|_| relay.pending_slot(a).expect("a share"))
-        .collect();
+    let mut held = Vec::new();
+    for _ in 0..4 {
+        held.push(relay.pending_slot(a).await.expect("a share"));
+    }
     assert!(
-        relay.pending_slot(a).is_none(),
+        relay.pending_slot(a).await.is_none(),
         "that address's share is used up"
     );
     assert!(
-        relay.pending_slot("203.0.113.6".parse().unwrap()).is_some(),
+        relay
+            .pending_slot("203.0.113.6".parse().unwrap())
+            .await
+            .is_some(),
         "another address still gets in"
     );
-    let v6: Vec<_> = (0..4)
-        .map(|i| {
-            relay
-                .pending_slot(format!("2001:db8::{i}").parse().unwrap())
-                .expect("a share")
-        })
-        .collect();
+    let mut v6 = Vec::new();
+    for i in 0..4 {
+        let ip = format!("2001:db8::{i}").parse().unwrap();
+        v6.push(relay.pending_slot(ip).await.expect("a share"));
+    }
     assert!(
         relay
             .pending_slot("2001:db8::99".parse().unwrap())
+            .await
             .is_none(),
         "one /64 is one address"
     );
     drop((held, v6));
-    assert!(relay.pending_slot(a).is_some(), "given back when they end");
+    assert!(
+        relay.pending_slot(a).await.is_some(),
+        "given back when they end"
+    );
+}
+
+#[tokio::test]
+async fn a_sign_in_waits_its_turn_on_a_busy_relay_and_only_so_long() {
+    let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+    let relay = state.accounts.clone().unwrap();
+    // Every slot in use, from addresses of their own
+    let mut held = Vec::new();
+    for i in 0..32 {
+        let ip = format!("198.51.100.{i}").parse().unwrap();
+        held.push(relay.pending_slot(ip).await.expect("a slot"));
+    }
+    let waiter = {
+        let relay = relay.clone();
+        tokio::spawn(async move { relay.pending_slot("203.0.113.9".parse().unwrap()).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        !waiter.is_finished(),
+        "it waits rather than being told the relay is busy"
+    );
+    held.pop();
+    let slot = waiter.await.unwrap();
+    assert!(slot.is_some(), "and takes the slot that comes free");
+    // Nothing comes free: told so after the wait (300 ms in tests), not held for good
+    assert!(relay
+        .pending_slot("203.0.113.10".parse().unwrap())
+        .await
+        .is_none());
 }
 
 #[tokio::test]

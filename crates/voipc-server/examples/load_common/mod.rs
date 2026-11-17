@@ -17,8 +17,10 @@ use voipc_protocol::codec::{try_decode_frame, APP_VERSION, PROTOCOL_VERSION};
 use voipc_protocol::compat::{
     decode_server_msg_from, encode_client_msg_for, OLDEST_RELAY_PROTOCOL,
 };
-use voipc_protocol::messages::{ClientMessage, ServerMessage, REFUSED_VERSION};
-use voipc_protocol::types::{PreKeyBundleData, SessionId, UserId};
+use voipc_protocol::messages::{
+    AuthContinue, AuthStep, ClientMessage, ServerMessage, REFUSED_VERSION,
+};
+use voipc_protocol::types::{AccountStart, PreKeyBundleData, SessionId, UserId};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
@@ -28,7 +30,7 @@ const NATIVE_SNI: &str = "voipc-native";
 
 pub struct Connected {
     /// Holds the socket open for the connection.
-    pub endpoint: Endpoint<wtransport::endpoint::endpoint_side::Client>,
+    pub endpoint: Arc<Endpoint<wtransport::endpoint::endpoint_side::Client>>,
     pub connection: Connection,
     pub send: SendStream,
     pub recv: RecvStream,
@@ -51,15 +53,108 @@ pub async fn connect_with(
 ) -> Result<Connected, Error> {
     // quinn's log lines (its connection drivers start inside this) name the client
     use tracing::Instrument;
-    connect_inner(index, server, keys)
+    connect_inner(index, server, keys, false)
         .instrument(tracing::info_span!("client", index))
         .await
+}
+
+/// Signs in as seeded account `acct<index>` with its remembered device (`load_device`), as an
+/// app does after a restart: the key, then the vault step answered with the account's keys.
+/// A failed sign-in is tried again as the app's reconnect does (`reconnectDelay`, after the
+/// first): doubling from 1 s to 10 s, spread over half to one and a half times that. Each try
+/// counts in `BUSY_RETRIES` when the relay said it was busy, else in `OTHER_RETRIES`.
+pub async fn connect_account(index: usize, server: &str) -> Result<Connected, Error> {
+    use tracing::Instrument;
+    let started = std::time::Instant::now();
+    for attempt in 1u32.. {
+        match connect_inner(index, server, None, true)
+            .instrument(tracing::info_span!("client", index))
+            .await
+        {
+            Ok(c) => return Ok(c),
+            Err(e) if started.elapsed() < Duration::from_secs(300) => {
+                let count = if e.to_string().contains("busy") {
+                    &BUSY_RETRIES
+                } else {
+                    &OTHER_RETRIES
+                };
+                if count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3
+                    && !e.to_string().contains("busy")
+                {
+                    eprintln!("client {index} tries again: {e}");
+                }
+                let base = (1000u64 << (attempt - 1).min(4)).min(10_000) as f64;
+                let wait = base * (0.5 + rand::random::<f64>());
+                tokio::time::sleep(Duration::from_millis(wait as u64)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!()
+}
+
+/// Sign-ins `connect_account` tried again after the relay said it was busy, and after anything else.
+pub static BUSY_RETRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static OTHER_RETRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Seeded account `acct<index>`'s device: its id, its key (PKCS#8 v2) and the public key, all
+/// from the index, so seeding and signing in share no file.
+pub fn load_device(index: usize) -> ([u8; 16], Vec<u8>, Vec<u8>) {
+    use ring::signature::KeyPair;
+    let h = ring::digest::digest(
+        &ring::digest::SHA256,
+        format!("voipc-load-device {index}").as_bytes(),
+    );
+    let seed: [u8; 32] = h.as_ref().try_into().expect("32 bytes");
+    let public = ring::signature::Ed25519KeyPair::from_seed_unchecked(&seed)
+        .expect("any seed")
+        .public_key()
+        .as_ref()
+        .to_vec();
+    // ring's own v2 template: the seed, then the public key
+    let mut pkcs8 = hex_bytes("3053020101300506032b657004220420");
+    pkcs8.extend_from_slice(&seed);
+    pkcs8.extend_from_slice(&hex_bytes("a123032100"));
+    pkcs8.extend_from_slice(&public);
+    (seed[..16].try_into().expect("16 bytes"), pkcs8, public)
+}
+
+fn hex_bytes(s: &str) -> Vec<u8> {
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex"))
+        .collect()
+}
+
+/// A seeded account's keys as the relay stores them: sized right, never used for a session.
+fn account_keys(index: usize) -> (Vec<u8>, PreKeyBundleData) {
+    let mut identity = vec![5u8];
+    identity.extend_from_slice(
+        ring::digest::digest(
+            &ring::digest::SHA256,
+            format!("voipc-load-identity {index}").as_bytes(),
+        )
+        .as_ref(),
+    );
+    let bundle = PreKeyBundleData {
+        registration_id: 1,
+        device_id: 1,
+        identity_key: identity.clone(),
+        signed_prekey_id: 1,
+        signed_prekey: vec![5; 33],
+        signed_prekey_signature: vec![0; 64],
+        prekeys: Vec::new(),
+        kyber_prekey_id: 1,
+        kyber_prekey: vec![8; 1569],
+        kyber_prekey_signature: vec![0; 64],
+    };
+    (identity, bundle)
 }
 
 async fn connect_inner(
     index: usize,
     server: &str,
     keys: Option<(Vec<u8>, PreKeyBundleData)>,
+    device: bool,
 ) -> Result<Connected, Error> {
     // The server caps connections per IP (DoS guard), so spread the load
     // clients across 127.0.0.0/8 source addresses (4 clients per IP).
@@ -73,20 +168,27 @@ async fn connect_inner(
         (index / 4 / 250) as u8,
         2 + (index / 4 % 250) as u8,
     ));
-    let endpoint = client_endpoint(server_addr, local_ip)?;
+    let endpoint = shared_endpoint(server_addr, local_ip)?;
     // At our protocol first; a relay of an older one names its own
     let mut proto = PROTOCOL_VERSION;
     'attempt: loop {
         let connection = endpoint.connect(native_url(server_addr)).await?;
         let (mut send, mut recv) = connection.open_bi().await?.await?;
+        let (device_id, pkcs8, _) = load_device(index);
         let auth = ClientMessage::Authenticate {
             // With a tag: a relay with accounts wants one on a guest's name
-            username: format!("load{index}#0001"),
+            username: if device {
+                format!("acct{index}")
+            } else {
+                format!("load{index}#0001")
+            },
             protocol_version: proto,
             app_version: APP_VERSION.to_string(),
             identity_key: keys.as_ref().map(|k| k.0.clone()),
             prekey_bundle: keys.as_ref().map(|k| k.1.clone()),
-            account: None,
+            account: device.then(|| AccountStart::DeviceKey {
+                device_id: device_id.to_vec(),
+            }),
         };
         send.write_all(&enc(&auth, proto)?).await?;
         let mut buf = bytes::BytesMut::with_capacity(8192);
@@ -107,6 +209,43 @@ async fn connect_inner(
                         session_id,
                         proto,
                     })
+                }
+                ServerMessage::AuthStep(AuthStep::DeviceChallenge {
+                    challenge,
+                    relay_id,
+                }) => {
+                    let mut binding = [0u8; voipc_crypto::bind::BIND_LEN];
+                    connection
+                        .export_keying_material(
+                            &mut binding,
+                            voipc_crypto::bind::EXPORTER_LABEL,
+                            &[],
+                        )
+                        .map_err(|_| "this connection gives no exporter")?;
+                    let key =
+                        voipc_crypto::account::DeviceKey::from_parts(device_id, pkcs8.clone())
+                            .ok_or("a load device key ring refuses")?;
+                    let answer = AuthContinue::DeviceSigBound {
+                        signature: key.sign(&relay_id, &challenge),
+                        bind: key.sign_bound(
+                            &relay_id,
+                            &challenge,
+                            &voipc_crypto::bind::Binding::Tls(binding),
+                        ),
+                        web: false,
+                    };
+                    send.write_all(&enc(&ClientMessage::AuthContinue(answer), proto)?)
+                        .await?;
+                }
+                ServerMessage::AuthStep(AuthStep::Vault { .. }) => {
+                    let (identity_key, prekey_bundle) = account_keys(index);
+                    let keys = AuthContinue::Keys {
+                        identity_key,
+                        prekey_bundle,
+                        reset_identity: false,
+                    };
+                    send.write_all(&enc(&ClientMessage::AuthContinue(keys), proto)?)
+                        .await?;
                 }
                 ServerMessage::AuthError { reason } => return Err(reason.into()),
                 ServerMessage::Refused {
@@ -130,6 +269,23 @@ async fn connect_inner(
             }
         }
     }
+}
+
+/// The endpoint of `local_ip`, which its clients and their retries share. With one per
+/// attempt, each with its own receive buffers and alive until its connection drained, a
+/// 20,000-account storm whose sign-ins were tried again held 28 GiB in this process.
+fn shared_endpoint(
+    server_addr: SocketAddr,
+    local_ip: std::net::IpAddr,
+) -> Result<Arc<Endpoint<wtransport::endpoint::endpoint_side::Client>>, Error> {
+    type Shared = Arc<Endpoint<wtransport::endpoint::endpoint_side::Client>>;
+    static ENDPOINTS: std::sync::LazyLock<dashmap::DashMap<std::net::IpAddr, Shared>> =
+        std::sync::LazyLock::new(dashmap::DashMap::new);
+    if let Some(e) = ENDPOINTS.get(&local_ip) {
+        return Ok(e.clone());
+    }
+    let made = Arc::new(client_endpoint(server_addr, local_ip)?);
+    Ok(ENDPOINTS.entry(local_ip).or_insert(made).clone())
 }
 
 /// A native client's endpoint from `local_ip`, trusting whatever the server shows: these only

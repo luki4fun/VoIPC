@@ -15,6 +15,12 @@
 //     relay's memory per connection, and who it loses while nothing happens.
 //     The load clients hold no keys: their ciphertext is a timestamp and padding,
 //     relayed verbatim, so this measures the relay and nothing else.
+//     `--accounts` signs in seeded accounts `acct<i>` with their device keys instead of
+//     guests: the sign-in storm after a restart, database and all.
+//
+//   community_load seed 50000 postgres://…
+//     That many accounts, each with a remembered device, in the relay's database (start the
+//     relay on it once first: it makes the tables). Seeding again skips who is there.
 //
 //   community_load channels 300 > channels.json
 //     That many text channels everyone follows, for the relay `follow` runs against.
@@ -44,7 +50,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, watch, Notify};
 
-use load_common::{connect, connect_with, enc, next_message, Error};
+use load_common::{connect, connect_account, connect_with, enc, load_device, next_message, Error};
 use voipc_crypto::channel_state::{chain_age_limit, exit_gap, WRAPS_A_FRAME};
 use voipc_crypto::{group, prekey, session, SignalStores};
 use voipc_protocol::codec::{encode_server_msg, CONTROL_MSGS_PER_SEC, MAX_MSG_SIZE};
@@ -90,9 +96,14 @@ async fn main() -> Result<(), Error> {
             };
             let rate = flag("--rate")?.unwrap_or(50.0);
             let idle = flag("--idle")?;
+            ACCOUNTS.store(args.iter().any(|a| a == "--accounts"), Ordering::Relaxed);
             run(number(args.get(1), 100)?, server, pid, rate, idle).await
         }
         Some("channels") => channels_file(number(args.get(1), 300)?),
+        Some("seed") => {
+            let url = args.get(2).ok_or("seed N database-url")?;
+            seed(number(args.get(1), 1000)?, url).await
+        }
         Some("follow") => {
             rustls::crypto::ring::default_provider()
                 .install_default()
@@ -100,7 +111,7 @@ async fn main() -> Result<(), Error> {
             follow(FollowArgs::parse(&args[1..])?).await
         }
         _ => Err(
-            "usage: community_load frames | crypto [N] | run [N] [host:port] [relay-pid] [--rate R] [--idle S] | channels [N] | follow N host:port relay-pid [--writers W] [--rate R] [--each C] [--seconds S] [--churn J] [--leave] [--wave \"command\"]".into(),
+            "usage: community_load frames | crypto [N] | run [N] [host:port] [relay-pid] [--rate R] [--idle S] [--accounts] | seed N database-url | channels [N] | follow N host:port relay-pid [--writers W] [--rate R] [--each C] [--seconds S] [--churn J] [--leave] [--wave \"command\"]".into(),
         ),
     }
 }
@@ -387,8 +398,12 @@ async fn run(
                 }
             }
         });
-        // Paced as people arriving, not as an attack on the connect limits
-        tokio::time::sleep(Duration::from_secs_f64(1.0 / rate)).await;
+        // Paced as people arriving, not as an attack on the connect limits; past 100 a second
+        // in batches each 10 ms, since a sleep takes a millisecond at least
+        let batch = ((rate / 100.0).ceil() as usize).max(1);
+        if (index + 1) % batch == 0 {
+            tokio::time::sleep(Duration::from_secs_f64(batch as f64 / rate)).await;
+        }
     }
     let limit = Duration::from_secs(60 + n as u64 / 10);
     let started = Instant::now();
@@ -407,8 +422,11 @@ async fn run(
     }
     let after_connect = pid.and_then(relay_stats);
     println!(
-        "connected {up}, refused {}, General lists received {}, relay {after_connect:?}",
+        "connected {up} in {:.1} s, refused {}, tried again: busy {}, other {}, General lists received {}, relay {after_connect:?}",
+        clock.elapsed().as_secs_f64(),
         tally.refused.load(Ordering::Relaxed),
+        load_common::BUSY_RETRIES.load(Ordering::Relaxed),
+        load_common::OTHER_RETRIES.load(Ordering::Relaxed),
         tally.general_lists.load(Ordering::Relaxed),
     );
     if let Some(secs) = idle {
@@ -469,6 +487,66 @@ async fn run(
     Ok(())
 }
 
+/// `run --accounts`: seeded accounts sign in, not guests.
+static ACCOUNTS: AtomicBool = AtomicBool::new(false);
+
+/// `seed`: accounts `acct0..n`, each with `load_device`'s key remembered, 32 at a time.
+async fn seed(n: usize, url: &str) -> Result<(), Error> {
+    use l4f_accounts::model::{AccountId, Credential, NewUser};
+    let store = Arc::new(l4f_accounts::store::Store::connect(url).await?);
+    let (made, skipped) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let started = Instant::now();
+    let mut workers = tokio::task::JoinSet::new();
+    const AT_ONCE: usize = 32;
+    for w in 0..AT_ONCE {
+        let (store, made, skipped) = (store.clone(), made.clone(), skipped.clone());
+        workers.spawn(async move {
+            for index in (w..n).step_by(AT_ONCE) {
+                let id = AccountId::new();
+                let user = NewUser {
+                    id,
+                    username: format!("acct{index}"),
+                    display_name: format!("acct{index}"),
+                    email_pending: None,
+                    password_hash: None,
+                    created_at: l4f_accounts::util::now(),
+                };
+                if store.create_user(&user, None).await.is_err() {
+                    skipped.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                let (device_id, _, public) = load_device(index);
+                let device = Credential {
+                    kind: "devkey".into(),
+                    ext_id: device_id.to_vec(),
+                    user_id: id,
+                    public_key: Some(public),
+                    alg: 0,
+                    sign_count: 0,
+                    flags: 0,
+                    name: "community_load".into(),
+                    created_at: l4f_accounts::util::now(),
+                    last_used_at: None,
+                    public: false,
+                };
+                store.insert_credential(&device).await?;
+                made.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok::<(), Error>(())
+        });
+    }
+    while let Some(done) = workers.join_next().await {
+        done??;
+    }
+    println!(
+        "seeded {} accounts in {:.1} s, {} were there",
+        made.load(Ordering::Relaxed),
+        started.elapsed().as_secs_f64(),
+        skipped.load(Ordering::Relaxed),
+    );
+    Ok(())
+}
+
 /// `--idle`: everyone stays connected and quiet; RSS and losses every ten seconds.
 async fn hold(tally: &Tally, up: usize, pid: Option<u32>, secs: Duration) -> Result<(), Error> {
     let started = Instant::now();
@@ -509,7 +587,11 @@ async fn client(
     mut chat_rx: watch::Receiver<u64>,
 ) -> Result<(), Error> {
     let started = Instant::now();
-    let c = connect(index, server).await?;
+    let c = if ACCOUNTS.load(Ordering::Relaxed) {
+        connect_account(index, server).await?
+    } else {
+        connect(index, server).await?
+    };
     tally
         .connect_ms
         .lock()

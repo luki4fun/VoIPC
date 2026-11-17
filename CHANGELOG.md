@@ -23,12 +23,22 @@ to 1.13 relays and older ones.
   relay sends in all (1000 Mbit/s, counted at each share's resolution), and people in a voice room that names no limit
   of its own (250; routed rooms keep none). A viewer past a limit is told so, and nothing else changes. **A voice room
   over 250 now refuses the next joiner** until its limit or `voice_room` is raised.
+- **A relay with accounts keeps up to 32 connections to its database** (`db_connections`, was 10). A sign-in is a few
+  writes, each waiting for the database's disk, and more of them waiting together go in one flush: 50,000 accounts
+  coming back after a restart signed in within 51 to 166 s on this machine's disk, and 38 s with Postgres'
+  `synchronous_commit` off, where 10 connections got 17,700 in in five minutes. Needs l4f-accounts 0.15.
+- **How many password sign-ins a relay takes is a setting** (`[accounts] password_sign_ins_per_15min`, 1000 every
+  15 minutes, everyone together). It was fixed at that, about one a second, so a move's first evening kept new devices
+  waiting for hours. A remembered device signs in with its key and was never counted.
 - **The admin panel has a Load tab**: who is online and where, each share and the video they cost against the budget,
   the relay's memory and processor, datagrams dropped, the last minute's refusals, and warnings where a limit is near,
   asked every two seconds while it is open. A relay with accounts on SQLite and `max_users` above 10,000 says at start
   that Postgres would serve it better.
 
 ### Fixed
+- **Many people signing in at once stopped the relay signing anyone in.** Past 32 sign-ins at once it told the next
+  one it was busy, after its whole handshake, and the app came back with another: 50,000 accounts arriving after a
+  restart went from 390 sign-ins a second to 10. A sign-in now waits its turn for up to 10 s.
 - **A refused watch stopped your own share**: the relay said it in the words it uses for your own share failing. It now
   says it apart (`WatchRefused`), and your share goes on.
 - **About one connect in 2000 hung for 30 s and failed on a busy relay**, with nothing in the relay's log. The QUIC

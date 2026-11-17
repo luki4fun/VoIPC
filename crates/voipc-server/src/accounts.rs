@@ -210,6 +210,11 @@ const PENDING_SIGN_INS: usize = 32;
 /// Of those, at most this many from one address (IPv6: one /64), so one
 /// address cannot hold them all.
 const PENDING_PER_ADDRESS: usize = 4;
+/// How long a sign-in waits its turn when all of `PENDING_SIGN_INS` are working.
+#[cfg(not(test))]
+const SLOT_WAIT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const SLOT_WAIT: Duration = Duration::from_millis(300);
 /// Closes a connection that only asked something (`AccountStart::Providers`,
 /// `Provider`); its `AuthStep` was the answer.
 const ANSWERED: &str = "Answered.";
@@ -474,7 +479,11 @@ impl Drop for PendingSlot {
 impl Relay {
     /// Connects, migrates, and reads or makes the relay id and the master key.
     pub async fn open(cfg: &AccountsConfig) -> Result<Relay> {
-        let store = Store::connect(&cfg.database)
+        let pool = l4f_accounts::store::PoolConfig {
+            max_connections: cfg.db_connections.max(1),
+            ..Default::default()
+        };
+        let store = Store::connect_with(&cfg.database, pool)
             .await
             .with_context(|| format!("accounts database {}", redact(&cfg.database)))?;
         owner_only_sqlite(&cfg.database);
@@ -554,7 +563,10 @@ impl Relay {
             archive_held: tokio::sync::Mutex::default(),
             archive_kick: tokio::sync::Notify::new(),
             archive_searches: Semaphore::new(archive::SEARCHES),
-            pending: Arc::new(Semaphore::new(PENDING_SIGN_INS)),
+            // As many at once as the database takes, so a storm keeps it busy
+            pending: Arc::new(Semaphore::new(
+                PENDING_SIGN_INS.max(cfg.db_connections as usize),
+            )),
             pending_by_address: Arc::default(),
             pow_key,
             link_lock: tokio::sync::Mutex::new(()),
@@ -600,9 +612,11 @@ pub async fn sqlite_backup(store: &Store, path: &std::path::Path) -> Result<()> 
 }
 
 impl Relay {
-    /// A slot for a sign-in from `ip`, or `None` while the relay, or that
-    /// address, has as many open as it takes.
-    pub fn pending_slot(&self, ip: IpAddr) -> Option<PendingSlot> {
+    /// A slot for a sign-in from `ip`: `None` at once while that address has as many open as
+    /// it takes, and when the relay's are all in use for `SLOT_WAIT`. A storm waits in turn
+    /// for the database: refused at once, each sign-in came back with a new handshake, and a
+    /// 50,000-account storm went from 390 sign-ins a second to 10 (63,000 refusals a minute).
+    pub async fn pending_slot(&self, ip: IpAddr) -> Option<PendingSlot> {
         let key = util::ip_key(ip);
         {
             let mut n = self.pending_by_address.entry(key.clone()).or_insert(0);
@@ -617,7 +631,8 @@ impl Relay {
             by_address: self.pending_by_address.clone(),
             key,
         };
-        slot._permit = Some(self.pending.clone().try_acquire_owned().ok()?);
+        let permit = tokio::time::timeout(SLOT_WAIT, self.pending.clone().acquire_owned());
+        slot._permit = Some(permit.await.ok()?.ok()?);
         Some(slot)
     }
 
@@ -996,7 +1011,7 @@ pub(crate) fn l4f_config(cfg: &AccountsConfig, relay_id: [u8; 16]) -> Config {
         // Every new device signs in with the password once: a LAN party does
         // that together. The per-account cap still stops guessing at one name.
         login_per_15min: 30,
-        login_per_15min_global: 1000,
+        login_per_15min_global: cfg.password_sign_ins_per_15min as usize,
         reserved_usernames: vec![
             "voipc".into(),
             "guest".into(),
@@ -1210,13 +1225,13 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
     let mut answers = 0u32;
     let mut registered = false;
     let mut by_secret = false;
-    let work = || relay.pending_slot(ip).ok_or_else(|| BUSY.to_string());
+    let work = || async { relay.pending_slot(ip).await.ok_or_else(|| BUSY.to_string()) };
     let session: NewSession = match start {
         AccountStart::Login => {
             // An account whose password is its login key (22) proves it over this
             // connection; any other name, and an account that has not moved yet, as before
             let keyed = {
-                let _work = work()?;
+                let _work = work().await?;
                 match scope::normalize_username(name, &[]) {
                     Ok(clean) => match relay.store().user_by_username(&clean).await {
                         Ok(Some(u)) => relay.accounts.hostkey(u.id).await.ok().flatten().is_some(),
@@ -1245,7 +1260,7 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
                 let Some(b) = Binding::claimed(web, binding) else {
                     return Err(NOT_THIS_CONNECTION.into());
                 };
-                let _work = work()?;
+                let _work = work().await?;
                 relay
                     .accounts
                     .login_hostkey(&ctx, name, &challenge, &nonce, None, |key| {
@@ -1274,7 +1289,7 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
                     return Err(unexpected());
                 };
                 let pw = secret_text(&auth_secret)?;
-                let _work = work()?;
+                let _work = work().await?;
                 by_secret = true;
                 relay.accounts.login_password(&ctx, name, &pw, None).await
             };
@@ -1309,7 +1324,7 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
             else {
                 return Err(unexpected());
             };
-            let _work = work()?;
+            let _work = work().await?;
             // Before l4f makes a session: the device's own key over this connection
             let key = relay
                 .store()
@@ -1469,7 +1484,7 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
             {
                 return Err(unexpected());
             }
-            let _work = work()?;
+            let _work = work().await?;
             let s = if let Some(code) = invite.as_deref().filter(|c| links::is_link_code(c)) {
                 links::register(
                     relay,
@@ -1591,7 +1606,10 @@ async fn reset<S: AsyncRead + AsyncWrite + Unpin>(
         return Err("Too many resets from your address. Try again later.".into());
     }
     let (user, identity, vault) = {
-        let _work = relay.pending_slot(ip).ok_or_else(|| BUSY.to_string())?;
+        let _work = relay
+            .pending_slot(ip)
+            .await
+            .ok_or_else(|| BUSY.to_string())?;
         let Ok(clean) = scope::normalize_username(name, &[]) else {
             return Err("No account of that name.".into());
         };
@@ -1678,7 +1696,10 @@ async fn reset<S: AsyncRead + AsyncWrite + Unpin>(
     if pass_slot.len() != SLOT_LEN {
         return Err(unexpected());
     }
-    let _work = relay.pending_slot(ip).ok_or_else(|| BUSY.to_string())?;
+    let _work = relay
+        .pending_slot(ip)
+        .await
+        .ok_or_else(|| BUSY.to_string())?;
     if second_factor {
         let factor = match (&totp, &recovery_code) {
             (Some(code), _) => l4f_accounts::service::SecondFactor::Totp(code),
@@ -1792,7 +1813,10 @@ async fn second_factor<S: AsyncRead + AsyncWrite + Unpin>(
         loop {
             step(stream, AuthStep::NeedTotp).await?;
             let answer = next(stream, buf, TOTP_WAIT, answers).await?;
-            let _work = relay.pending_slot(ip).ok_or_else(|| BUSY.to_string())?;
+            let _work = relay
+                .pending_slot(ip)
+                .await
+                .ok_or_else(|| BUSY.to_string())?;
             let r = match answer {
                 AuthContinue::Totp { code } => {
                     relay
@@ -1834,9 +1858,9 @@ async fn finish<S: AsyncRead + AsyncWrite + Unpin>(
     ip: IpAddr,
 ) -> Result<SignedIn, String> {
     let gone = || "Something went wrong. Please try again.".to_string();
-    let work = || relay.pending_slot(ip).ok_or_else(|| BUSY.to_string());
+    let work = || async { relay.pending_slot(ip).await.ok_or_else(|| BUSY.to_string()) };
     let (user, info, scopes, blobs) = {
-        let _work = work()?;
+        let _work = work().await?;
         let (user, info, scopes) = relay
             .accounts
             .session_from_token(&session.token, util::now())
@@ -1869,7 +1893,7 @@ async fn finish<S: AsyncRead + AsyncWrite + Unpin>(
     if identity_key.is_empty() || identity_key.len() > 64 {
         return Err("malformed identity key".into());
     }
-    let _work = work()?;
+    let _work = work().await?;
     match relay.identity(user.id).await.map_err(|_| gone())? {
         Some(known) if known == identity_key => {}
         Some(_) if !reset_identity => {

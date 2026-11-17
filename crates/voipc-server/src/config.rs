@@ -197,6 +197,16 @@ pub struct AccountsConfig {
     /// sign-in back. Empty: no sign-in with a provider. Each provider also needs
     /// its application's `VOIPC_OAUTH_<PROVIDER>_ID` and `_SECRET` in the environment.
     pub public_url: String,
+    /// Connections to the database at most. Each sign-in is a few writes, and a write waits
+    /// for the database's disk: a relay of tens of thousands coming back after a restart
+    /// signs in as fast as this many writes at once go. Postgres' own `max_connections` (100
+    /// by default) has to hold it, and everything else that uses that database.
+    pub db_connections: u32,
+    /// Sign-ins with a password, everyone together, per 15 minutes: how a new device signs in
+    /// (a remembered one signs with its key and is not counted). It holds off guessing spread
+    /// over many addresses; once spent, nobody signs in a new device until the window ends.
+    /// Raise it for a move or a big first evening.
+    pub password_sign_ins_per_15min: u32,
     /// New accounts an hour at most. A move from another service can want more.
     pub signups_per_hour: u32,
     /// How long an account a move from Discord made waits for someone to open it. 0: for
@@ -206,6 +216,9 @@ pub struct AccountsConfig {
     /// removes it, since an owner moved for the history and an expiry cannot be undone.
     pub archive_days: u32,
 }
+
+/// `[accounts] db_connections`, unless set.
+pub const DB_CONNECTIONS: u32 = 32;
 
 impl Default for AccountsConfig {
     fn default() -> Self {
@@ -221,6 +234,8 @@ impl Default for AccountsConfig {
             kept_seats: 5000,
             key_file: "voipc-accounts.key".into(),
             public_url: String::new(),
+            db_connections: DB_CONNECTIONS,
+            password_sign_ins_per_15min: 1000,
             signups_per_hour: 60,
             unclaimed_days: 90,
             archive_days: 0,
@@ -365,6 +380,11 @@ impl ServerConfig {
                         "[accounts] public_url must be like https://voice.example.org:9987, with no path or trailing slash: {url}"
                     ));
                 }
+            }
+            if self.accounts.password_sign_ins_per_15min == 0 {
+                return Err(anyhow!(
+                    "[accounts] password_sign_ins_per_15min must be at least 1: with 0, no new device signs in"
+                ));
             }
             if self.accounts.signups_per_hour == 0 {
                 return Err(anyhow!("[accounts] signups_per_hour must be at least 1"));
@@ -700,6 +720,32 @@ mod tests {
         let one = parse("[accounts]\nmode = \"optional\"\nmodlog_days = 1");
         assert!(one.validate().is_ok());
         assert_eq!(ServerConfig::default().accounts.modlog_days, 180);
+    }
+
+    #[test]
+    fn password_sign_ins_are_a_setting_and_never_zero() {
+        let parse = |extra: &str| {
+            toml::from_str::<ServerConfig>(&format!(
+                "cert_path = \"c\"\nkey_path = \"k\"\n[accounts]\nmode = \"optional\"\n{extra}"
+            ))
+            .unwrap()
+        };
+        assert_eq!(
+            ServerConfig::default().accounts.password_sign_ins_per_15min,
+            1000
+        );
+        let raised = parse("password_sign_ins_per_15min = 20000");
+        raised.validate().unwrap();
+        assert_eq!(
+            crate::accounts::l4f_config(&raised.accounts, [0; 16]).login_per_15min_global,
+            20000
+        );
+        let zero = parse("password_sign_ins_per_15min = 0");
+        assert!(zero
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("password_sign_ins_per_15min"));
     }
 
     #[test]

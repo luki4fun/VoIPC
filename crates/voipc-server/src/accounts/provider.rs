@@ -997,7 +997,10 @@ async fn signup<S: AsyncRead + AsyncWrite + Unpin>(
             ts: &ts,
             ..Default::default()
         };
-        let _work = relay.pending_slot(ip).ok_or_else(|| BUSY.to_string())?;
+        let _work = relay
+            .pending_slot(ip)
+            .await
+            .ok_or_else(|| BUSY.to_string())?;
         if let Some(code) = invite.filter(|c| links::is_link_code(c)) {
             let how = links::How::Provider(cookie);
             match links::register(relay, ctx, code, &name, how, &altcha, &ts).await {
@@ -1148,7 +1151,10 @@ async fn pick_name<S: AsyncRead + AsyncWrite + Unpin>(
         if name.trim().eq_ignore_ascii_case(&user.username) {
             return Ok(());
         }
-        let _work = relay.pending_slot(ip).ok_or_else(|| BUSY.to_string())?;
+        let _work = relay
+            .pending_slot(ip)
+            .await
+            .ok_or_else(|| BUSY.to_string())?;
         match relay.placeholder_rename(ctx, user.id, &name).await? {
             Ok(new) => {
                 user.username = new;
@@ -1175,9 +1181,9 @@ async fn finish<S: AsyncRead + AsyncWrite + Unpin>(
     binding: Option<[u8; voipc_crypto::bind::BIND_LEN]>,
 ) -> Result<SignedIn, String> {
     let gone = || "Something went wrong. Please try again.".to_string();
-    let work = || relay.pending_slot(ip).ok_or_else(|| BUSY.to_string());
+    let work = || async { relay.pending_slot(ip).await.ok_or_else(|| BUSY.to_string()) };
     let (mut user, info, scopes, blobs, known) = {
-        let _work = work()?;
+        let _work = work().await?;
         let (user, info, scopes) = relay
             .accounts
             .session_from_token(&session.token, util::now())
@@ -1213,7 +1219,7 @@ async fn finish<S: AsyncRead + AsyncWrite + Unpin>(
                 identity_key,
                 vault,
             } if claim_it => {
-                let _work = work()?;
+                let _work = work().await?;
                 claim(relay, user.id, &user.username, &identity_key, &vault).await?;
                 info!(user = %user.id.hex(), "account claimed through a provider");
                 break identity_key;
@@ -1261,7 +1267,7 @@ async fn finish<S: AsyncRead + AsyncWrite + Unpin>(
     if sent != identity_key {
         return Err("This device's identity key is not your account's.".into());
     }
-    let _work = work()?;
+    let _work = work().await?;
     let account = relay.info_of(&user, &scopes).await.map_err(|_| gone())?;
     let standing = relay.standing(&user, &scopes).await.map_err(|_| gone())?;
     info!(user = %user.id.hex(), method = %info.method, "account signed in");

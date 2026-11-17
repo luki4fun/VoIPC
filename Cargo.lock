@@ -3396,7 +3396,7 @@ dependencies = [
 [[package]]
 name = "l4f-accounts"
 version = "0.1.0"
-source = "git+https://github.com/luki4fun/l4f-accounts.git?tag=v0.14.1#9c07090c588d6bdd8bbbec6331a13698d10dab71"
+source = "git+https://github.com/luki4fun/l4f-accounts.git?tag=v0.15.0#e4d1c3b3384c4dc3b0f91557bd34139f5ba5e180"
 dependencies = [
  "argon2",
  "base64 0.22.1",

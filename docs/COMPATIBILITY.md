@@ -149,6 +149,10 @@ removes it) and `unclaimed_days` (90, 0 is never) in `[accounts]`. An older rela
 `AdminBans` and `AdminListBans` stay in the enums for relays before protocol 20: an app at 20 sends
 `AdminBansPage` to a relay at 20 and `AdminListBans` below it.
 
+**What changed in 1.14:** `live_lobby` (2000) at the top; a new `[media]` section (`share_viewers`
+100, `video_egress_mbit` 1000, `voice_room` 250); `db_connections` (32) and
+`password_sign_ins_per_15min` (1000) in `[accounts]`. An older relay refuses each of them.
+
 **An older relay on a newer config:** it refuses the unknown key, never ignores it, so a relay
 cannot silently run without a setting it was given. The JSON files stay lenient: a rewrite of
 `channels.json` keeps keys it does not know.

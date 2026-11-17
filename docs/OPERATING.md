@@ -131,6 +131,14 @@ WantedBy=multi-user.target
 - **The key file** (`key_file`, or `VOIPC_ACCOUNTS_KEY`) seals the two-factor secrets and keys
   everything the relay hashes. Without it the database is of no use: back the two up together.
 - **Postgres:** use `sslmode=verify-full` in the URL when the database is on another host.
+- **Database connections** (`db_connections`, 32): a sign-in is a few writes, and a write waits for the database's
+  disk. The more writes are waiting together, the more each flush carries, so this is how fast a relay signs people
+  back in after a restart. Postgres' own `max_connections` (100) has to hold it with everything else on that database.
+  Past them, sign-ins wait their turn for up to 10 s, then the app tries again a moment later. §10a has the numbers.
+- **Password sign-ins** (`password_sign_ins_per_15min`, 1000, everyone together): each new device signs in with the
+  password once; a remembered device signs with its key and is not counted. The cap holds off guessing spread over many
+  addresses, and once it is spent no new device signs in until the 15 minutes end. 1000 is about one a second: raise it
+  for a move or a big first evening, lower it while such guessing runs. Per address it stays 30.
 - **Commands:**
   - `admin grant|revoke <name> <group>` (`admin`, `moderator`, or one made in the app);
   - `admin reset-2fa <name>`;
@@ -546,8 +554,25 @@ load clients on the same machine:
 
 An idle relay of 25,000 used 0.28 of a core. With text channels on the live path (`community_load follow`), the relay
 killed with `kill -9` halfway and started again: 10,000 were all back in 57 s, 25,000 in 89 s. At 25,000 with posts
-going out, every post to that many readers comes back as that many acknowledgements at once, and an 8 MiB buffer (this
-machine's `rmem_max` cap) dropped them: give such a relay the larger buffer above.
+going out, every post to that many readers comes back as that many acknowledgements at once. An 8 MiB buffer dropped
+them: 750,000 datagrams, and 1,159 people who could not come back while their old session waited out its timeout. With
+`rmem_max` at 32 MiB (64 MiB given) nothing dropped while posting, 52,600 dropped in the minute everyone came back
+after `kill -9` (2,585 handshakes tried again), and nobody was lost: give such a relay the larger buffer above.
+
+Signing back in after a restart, with accounts on Postgres (`community_load seed`, then `run --accounts`): 50,000
+accounts with remembered devices arriving 2,000 a second, as after a relay restart. The relay keeps up as long as its
+database does, at 2.6 ms of relay CPU a sign-in. What the database does is its disk's flush:
+
+| Database | Signed in | Wait p95 |
+|---|---|---|
+| 10 connections, before 1.14 (busy refused at once) | stalled at 9,300 in a minute: every refusal came back as a new handshake | — |
+| 10 connections, waiting their turn | 17,700 in 350 s; the rest gave up | 274 s |
+| 32 connections, five runs | 50,000 in 51, 92, 141, 148 and 166 s, by how long the disk's flushes stalled (up to 100 s, this machine's btrfs) | 27 to 146 s |
+| 32 connections, `synchronous_commit = off` | 50,000 in 38 s, as fast as they came | 14 ms |
+
+Put a big relay's Postgres on a disk whose flushes are quick and steady (a server SSD that protects its cache on
+power loss), or set `synchronous_commit = off` for its database: a crash of Postgres then loses the last moment of
+writes, never the database, and a sign-in lost that way is made again.
 
 Screen shares (`share_load`, one HD share at 7.5 Mbit/s, 30 frames a second, viewers on the same machine):
 
