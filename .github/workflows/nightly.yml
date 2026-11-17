@@ -218,6 +218,28 @@ jobs:
             port=$((port + 1))
           done
 
+  # Cargo.toml patches wtransport with the luki4fun/wtransport fork: upstream 0.7.2 plus one
+  # commit, the cancel-safe control-stream reads of upstream issue #331. The fork needs no
+  # upkeep while upstream releases nothing, so this fails on the first upstream release
+  # after 0.7.2. Then run the relay test settings_split_by_the_session_request_still_open_the_session
+  # against that release without the [patch.crates-io] block: it passes, so drop the block,
+  # the fork's line in deny.toml and the fork; it fails, so move the fork's commit onto it.
+  wtransport-fork:
+    name: wtransport fork still needed
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Newest wtransport release
+        run: |
+          newest=$(cargo search wtransport --limit 1 | sed -n 's/^wtransport = "\([^"]*\)".*/\1/p')
+          echo "newest wtransport: ${newest:-unknown}"
+          if [ -z "$newest" ]; then
+            echo "::warning title=wtransport fork::crates.io did not answer"
+          elif [ "$newest" != "0.7.2" ]; then
+            echo "::error title=wtransport fork::wtransport $newest is out: check it against settings_split_by_the_session_request_still_open_the_session without the [patch.crates-io] block (see nightly.yml)"
+            exit 1
+          fi
+
   # The native Windows build: setup.ps1, then the desktop task's Windows branch
   # (MSVC environment, the pinned FFmpeg, DLL staging). Releases are
   # cross-built on Linux, so nothing else runs this path, and a failure here is

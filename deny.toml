@@ -65,6 +65,8 @@ allow-git = [
     "https://github.com/signalapp/libsignal",
     "https://github.com/signalapp/SparsePostQuantumRatchet.git",
     "https://github.com/luki4fun/l4f-accounts.git",
+    # wtransport 0.7.2 + one fix until upstream releases it (nightly.yml, wtransport-fork)
+    "https://github.com/luki4fun/wtransport.git",
 ]
 
 [bans]

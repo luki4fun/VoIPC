@@ -48,6 +48,11 @@ to 1.13 relays and older ones.
   one a live connection already held: that client's next packet went to the other connection. The relay now draws 8
   random bytes. At 2000 clients: 16 connects failed in 18 runs before, none in 8 after. It grows with the relay, to one
   connect in 20 at 100,000 online.
+- **About two connects in 1000 failed on a busy relay** with "QUIC handshake failed" (H3 frame unexpected or excessive
+  load) in its log. The WebTransport library lost the part of a client's settings it had read whenever they arrived in
+  two pieces with anything else in between, and read the rest as garbage. Relay and app now build with a fork of it
+  carrying the fix (upstream issue #331), until upstream releases one. With the relay held to 2 cores and 1000 clients:
+  8 connects failed in 5 runs before, none in 11 after.
 
 ### Changed
 - **The relay writes one line a minute about connections, when anything happened**: connects refused and why, setups

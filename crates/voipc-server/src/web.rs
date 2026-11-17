@@ -1700,6 +1700,96 @@ mod tests {
             .expect("the relay closes the connection");
     }
 
+    /// A client's SETTINGS that arrive in two parts, with its session request in between,
+    /// still open the session. wtransport 0.7.2 reads the control stream inside a select!
+    /// that drops the read at every other event, so the half it had read was lost and the
+    /// rest parsed as garbage: the relay closed with H3_FRAME_UNEXPECTED or EXCESSIVE_LOAD
+    /// (about 2 connects in 1000 on a busy relay, since its own client writes a frame in
+    /// three writes). The workspace patches wtransport for it (`[patch.crates-io]`); once a
+    /// wtransport release passes this test without the patch, the patch goes.
+    #[tokio::test]
+    async fn settings_split_by_the_session_request_still_open_the_session() {
+        use wtransport::proto::bytes::BufferReader;
+        use wtransport::proto::frame::{Frame, FrameKind};
+        use wtransport::proto::headers::Headers;
+        use wtransport::proto::session::SessionRequest as Connect;
+        use wtransport::proto::settings::Settings;
+        use wtransport::proto::stream_header::StreamHeader;
+        use wtransport::quinn;
+
+        let (mut web, state, _) = test_server();
+        web.setup_time = Duration::from_secs(4);
+        let addr = web.local_addr().unwrap();
+        let limits = Arc::new(ConnLimits::from_config(&ServerConfig::default()));
+        tokio::spawn(web.run(state, limits));
+
+        let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(Capture(Arc::default())))
+        .with_no_client_auth();
+        tls.alpn_protocols = vec![b"h3".to_vec()];
+        let config = quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap(),
+        ));
+        let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        endpoint.set_default_client_config(config);
+        let connection = tokio::time::timeout(HANG, endpoint.connect(addr, "localhost").unwrap())
+            .await
+            .expect("handshake")
+            .unwrap();
+
+        let mut control = Vec::new();
+        StreamHeader::new_control().write(&mut control).unwrap();
+        let head = control.len() + 2; // the stream's type, then the frame's kind and length
+        Settings::builder()
+            .enable_connect_protocol()
+            .enable_webtransport()
+            .enable_h3_datagrams()
+            .build()
+            .generate_frame()
+            .write(&mut control)
+            .unwrap();
+        assert!(control.len() > head, "a payload to hold back");
+        let mut uni = connection.open_uni().await.unwrap();
+        uni.write_all(&control[..head]).await.unwrap();
+        // The relay has read the frame's kind and length and waits for the rest
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let mut connect = Vec::new();
+        Connect::new(format!("https://localhost:{}/voipc", addr.port()))
+            .unwrap()
+            .headers()
+            .generate_frame()
+            .write(&mut connect)
+            .unwrap();
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        send.write_all(&connect).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        uni.write_all(&control[head..]).await.unwrap();
+
+        // The answer to the request: a HEADERS frame saying 200
+        let got = tokio::time::timeout(Duration::from_secs(3), async {
+            let mut got = Vec::new();
+            while !matches!(Frame::read(&mut BufferReader::new(&got)), Ok(Some(_))) {
+                let chunk = recv.read_chunk(1024, true).await.unwrap();
+                got.extend_from_slice(&chunk.expect("the relay ended the stream").bytes);
+            }
+            got
+        })
+        .await
+        .expect("no answer to the session request: the relay lost part of the SETTINGS");
+        let answer = Frame::read(&mut BufferReader::new(&got)).unwrap().unwrap();
+        assert!(matches!(answer.kind(), FrameKind::Headers));
+        assert_eq!(
+            Headers::with_frame(&answer).unwrap().get(":status"),
+            Some("200")
+        );
+    }
+
     /// Linux doubles what it reports and caps it at twice `rmem_max`, which is 212,992 on a
     /// stock system: any socket that asked gets more than one that did not.
     #[cfg(target_os = "linux")]
