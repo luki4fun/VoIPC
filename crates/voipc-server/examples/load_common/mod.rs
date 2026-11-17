@@ -49,6 +49,18 @@ pub async fn connect_with(
     server: &str,
     keys: Option<(Vec<u8>, PreKeyBundleData)>,
 ) -> Result<Connected, Error> {
+    // quinn's log lines (its connection drivers start inside this) name the client
+    use tracing::Instrument;
+    connect_inner(index, server, keys)
+        .instrument(tracing::info_span!("client", index))
+        .await
+}
+
+async fn connect_inner(
+    index: usize,
+    server: &str,
+    keys: Option<(Vec<u8>, PreKeyBundleData)>,
+) -> Result<Connected, Error> {
     // The server caps connections per IP (DoS guard), so spread the load
     // clients across 127.0.0.0/8 source addresses (4 clients per IP).
     let server_addr: SocketAddr = tokio::net::lookup_host(server)

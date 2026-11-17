@@ -14,6 +14,8 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use bytes::Bytes;
+
 use tokio::sync::{mpsc, Notify};
 use tracing::warn;
 use voipc_protocol::codec::MAX_MSG_SIZE;
@@ -46,7 +48,7 @@ impl std::error::Error for ControlError {}
 /// The sending half, one clone per place that talks to the connection.
 #[derive(Clone)]
 pub struct ControlTx {
-    tx: mpsc::UnboundedSender<Vec<u8>>,
+    tx: mpsc::UnboundedSender<Bytes>,
     queued: Arc<AtomicUsize>,
     /// The connection's own close handle (`UserSession::close`).
     close: Arc<Notify>,
@@ -56,7 +58,7 @@ pub struct ControlTx {
 
 /// The writer task's half.
 pub struct ControlRx {
-    rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    rx: mpsc::UnboundedReceiver<Bytes>,
     queued: Arc<AtomicUsize>,
 }
 
@@ -86,8 +88,9 @@ impl ControlTx {
         self.tx.is_closed()
     }
 
-    /// Never waits: callers hold shard guards of the session map.
-    pub fn try_send(&self, data: Vec<u8>) -> Result<(), ControlError> {
+    /// Never waits: callers hold shard guards of the session map. A broadcast hands
+    /// every recipient a clone of one `Bytes`, not a copy.
+    pub fn try_send(&self, data: Bytes) -> Result<(), ControlError> {
         let len = data.len();
         if self.queued.fetch_add(len, Ordering::Relaxed) + len > MAX_QUEUED_BYTES {
             self.queued.fetch_sub(len, Ordering::Relaxed);
@@ -105,7 +108,7 @@ impl ControlTx {
 }
 
 impl ControlRx {
-    pub async fn recv(&mut self) -> Option<Vec<u8>> {
+    pub async fn recv(&mut self) -> Option<Bytes> {
         let data = self.rx.recv().await?;
         self.queued.fetch_sub(data.len(), Ordering::Relaxed);
         Some(data)
@@ -121,12 +124,13 @@ mod tests {
     async fn small_messages_wait_their_turn_however_many_there_are() {
         let (tx, mut rx) = control_queue(Arc::default());
         for i in 0..100_000u32 {
-            tx.try_send(i.to_le_bytes().to_vec()).unwrap();
+            tx.try_send(Bytes::copy_from_slice(&i.to_le_bytes()))
+                .unwrap();
         }
         for i in 0..100_000u32 {
             assert_eq!(
                 rx.recv().await.unwrap(),
-                i.to_le_bytes(),
+                i.to_le_bytes()[..],
                 "in order, none lost"
             );
         }
@@ -137,7 +141,7 @@ mod tests {
     async fn past_the_budget_the_connection_is_told_to_end_and_nothing_queued_is_lost() {
         let close = Arc::new(Notify::new());
         let (tx, mut rx) = control_queue(close.clone());
-        let frame = vec![0u8; MAX_MSG_SIZE as usize];
+        let frame = Bytes::from(vec![0u8; MAX_MSG_SIZE as usize]);
         for _ in 0..256 {
             tx.try_send(frame.clone()).unwrap();
         }
@@ -147,7 +151,10 @@ mod tests {
                 .is_err(),
             "exactly the budget is within it"
         );
-        assert_eq!(tx.try_send(vec![0]), Err(ControlError::Overflow));
+        assert_eq!(
+            tx.try_send(Bytes::from_static(&[0])),
+            Err(ControlError::Overflow)
+        );
         tokio::time::timeout(Duration::from_secs(1), close.notified())
             .await
             .expect("told to end");
@@ -164,7 +171,7 @@ mod tests {
     #[tokio::test]
     async fn what_was_read_makes_room_again() {
         let (tx, mut rx) = control_queue(Arc::default());
-        let frame = vec![0u8; MAX_MSG_SIZE as usize];
+        let frame = Bytes::from(vec![0u8; MAX_MSG_SIZE as usize]);
         for _ in 0..256 {
             tx.try_send(frame.clone()).unwrap();
         }
@@ -175,7 +182,10 @@ mod tests {
     #[test]
     fn a_queue_nobody_reads_says_closed_and_counts_nothing() {
         let tx = ControlTx::placeholder();
-        assert_eq!(tx.try_send(vec![0; 10]), Err(ControlError::Closed));
+        assert_eq!(
+            tx.try_send(Bytes::from(vec![0; 10])),
+            Err(ControlError::Closed)
+        );
         assert_eq!(tx.queued.load(Ordering::Relaxed), 0);
     }
 }

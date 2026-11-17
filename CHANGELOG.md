@@ -2,6 +2,20 @@
 
 All notable changes to VoIPC are documented here.
 
+## [Unreleased]
+
+### Fixed
+- **About one connect in 2000 hung for 30 s and failed on a busy relay**, with nothing in the relay's log. The QUIC
+  library puts only 3 random bytes in a connection id, and the id the relay gave a client in its first answer could be
+  one a live connection already held: that client's next packet went to the other connection. The relay now draws 8
+  random bytes. At 2000 clients: 16 connects failed in 18 runs before, none in 8 after. It grows with the relay, to one
+  connect in 20 at 100,000 online.
+
+### Changed
+- **The relay writes one line a minute about connections, when anything happened**: connects refused and why, setups
+  that failed or timed out, how sessions ended (closed by the app, timed out), and UDP datagrams the kernel dropped for
+  a full buffer. The line for each connect stays at debug.
+
 ## [1.13.0] - release candidate
 
 Protocol 24: a 1.13 relay admits only 1.13 apps, so update the apps first. A 1.13 app still talks to 1.12 relays (and

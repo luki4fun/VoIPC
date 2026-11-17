@@ -3348,54 +3348,81 @@ pub async fn revalidate(state: &Arc<ServerState>) {
             })
         })
         .collect();
+    // A few at a time, under the pool's ten connections: one after another, a big relay's pass
+    // took longer than its period
+    let mut checks = tokio::task::JoinSet::new();
     for (session_id, token, scopes, needs_2fa, standing) in live {
-        let read = scope_read(state, session_id);
-        match relay.accounts.session_from_token(&token, util::now()).await {
-            Ok(None) => {
-                // The token may have been rotated while this pass ran (turning
-                // codes on does that): only the token the session still holds
-                // counts (1.0 audit H1-11)
-                let current = state
-                    .sessions
-                    .get(&session_id)
-                    .and_then(|s| s.account.as_ref().map(|a| a.token.clone()));
-                if current.as_deref() == Some(token.as_str()) {
-                    crate::session::eject(state, session_id, "You were signed out of this server.")
-                        .await;
-                }
-            }
-            Ok(Some((user, _, now))) => {
-                // A role given to an account without codes changes no scope
-                // (its rights wait for them), only what the account is asked.
-                // A group without privileges changes standing alone
-                let changed = now != scopes
-                    || relay
-                        .accounts
-                        .needs_2fa(&user)
-                        .await
-                        .is_ok_and(|n| n != needs_2fa)
-                    || relay
-                        .standing(&user, &now)
-                        .await
-                        .is_ok_and(|s| s != standing);
-                if changed {
-                    // The list of who holds what is read once, below
-                    if let Err(e) =
-                        apply_scopes_then(state, &relay, session_id, user, now, read).await
-                    {
-                        warn!("a change from the server's shell: {e}");
-                    }
-                }
-            }
-            Err(e) => warn!("checking a signed-in connection: {e}"),
+        if checks.len() >= REVALIDATE_AT_ONCE {
+            checks.join_next().await;
         }
+        let (state, relay) = (state.clone(), relay.clone());
+        checks.spawn(async move {
+            revalidate_one(
+                &state, &relay, session_id, token, scopes, needs_2fa, standing,
+            )
+            .await
+        });
     }
+    while checks.join_next().await.is_some() {}
     // Holders who are not here too, and every change above: a stored hide is read
     // against them
     refresh_chat_mods(state).await;
     // And the share flag of someone away, whose session cannot clear it
     if let Err(e) = log::recheck_shares(&relay).await {
         warn!("rechecking who shares: {e:#}");
+    }
+}
+
+/// Sessions `revalidate` checks at once.
+const REVALIDATE_AT_ONCE: usize = 8;
+
+/// One signed-in session against what the database says now.
+async fn revalidate_one(
+    state: &Arc<ServerState>,
+    relay: &Relay,
+    session_id: u32,
+    token: String,
+    scopes: Vec<String>,
+    needs_2fa: bool,
+    standing: Standing,
+) {
+    let read = scope_read(state, session_id);
+    match relay.accounts.session_from_token(&token, util::now()).await {
+        Ok(None) => {
+            // The token may have been rotated while this pass ran (turning
+            // codes on does that): only the token the session still holds
+            // counts (1.0 audit H1-11)
+            let current = state
+                .sessions
+                .get(&session_id)
+                .and_then(|s| s.account.as_ref().map(|a| a.token.clone()));
+            if current.as_deref() == Some(token.as_str()) {
+                crate::session::eject(state, session_id, "You were signed out of this server.")
+                    .await;
+            }
+        }
+        Ok(Some((user, _, now))) => {
+            // A role given to an account without codes changes no scope
+            // (its rights wait for them), only what the account is asked.
+            // A group without privileges changes standing alone
+            let changed = now != scopes
+                || relay
+                    .accounts
+                    .needs_2fa(&user)
+                    .await
+                    .is_ok_and(|n| n != needs_2fa)
+                || relay
+                    .standing(&user, &now)
+                    .await
+                    .is_ok_and(|s| s != standing);
+            if changed {
+                // The list of who holds what is read once, at the pass's end
+                if let Err(e) = apply_scopes_then(state, relay, session_id, user, now, read).await {
+                    warn!("a change from the server's shell: {e}");
+                }
+            }
+        }
+        Err(e) => warn!("checking a signed-in connection: {e}"),
     }
 }
 
@@ -3595,13 +3622,15 @@ pub async fn mention_power_at_connect(
     user_id: u32,
     tx: &crate::control::ControlTx,
 ) {
-    let holders: Vec<u32> = state
-        .sessions
-        .iter()
-        .filter(|s| holds_mention_power(s))
-        .map(|s| s.user_id)
-        .collect();
-    if holders.contains(&user_id) {
+    let holds = state.sessions.get(&session_id).is_some_and(|s| {
+        let holds = holds_mention_power(&s);
+        if holds {
+            state.mention_holders.insert(user_id);
+        }
+        holds
+    });
+    let holders: Vec<u32> = state.mention_holders.iter().map(|u| *u).collect();
+    if holds {
         if let Ok(data) = encode_server_msg(&ServerMessage::MentionPower {
             user_ids: vec![user_id],
             on: true,
@@ -3689,6 +3718,12 @@ async fn apply_scopes_then(
             .map(|n| n.my_badges.clone());
         calls = holds_mention_power(&s);
         called_before = could_call;
+        // Under this session's guard, as the connect's own look is
+        if calls {
+            state.mention_holders.insert(s.user_id);
+        } else {
+            state.mention_holders.remove(&s.user_id);
+        }
         editor_changed = s.powers.has(Powers::CHANNELS) != was_editor;
         (
             s.control_tx.clone(),

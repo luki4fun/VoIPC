@@ -394,18 +394,29 @@ pub struct ConnLimits {
     /// under every shard's write lock, so it runs on a timer rather than on
     /// every connect past the threshold — see `take_connect_token`.
     last_sweep: std::sync::Mutex<Instant>,
+    /// Refused connects and how sessions ended, by `(kind, why)`, since the last
+    /// minute's report (`take_counts`): the per-connect lines are debug only.
+    counts: std::sync::Mutex<std::collections::BTreeMap<(&'static str, &'static str), u64>>,
+    /// The constants below, as this relay's size scales them (`new`).
+    pre_total_max: u32,
+    pre_per_ip_max: u32,
+    pre_per_site_max: u32,
+    files_total_max: u32,
+    connect_burst: f64,
 }
 
 impl ConnLimits {
     /// Pre-authentication connections, per address (an office reconnecting
     /// after a restart arrives from one), per IPv6 /48, and in all. Idle ones
-    /// cost a few kilobytes each.
+    /// cost a few kilobytes each. These and `CONNECT_BURST` are for the default
+    /// `max_connections_per_ip` (32) and grow with it, and the pools in all grow
+    /// with `max_users`: a relay with thousands behind one carrier's address raises
+    /// the one setting, and a big relay's restart is not let back in 1024 at a time.
     const PRE_PER_IP: u32 = 16;
     const PRE_PER_SITE: u32 = 32;
     const PRE_TOTAL: u32 = 1024;
     /// File connections with a good ticket: as many per address as the pre
     /// pool takes, and as many in all.
-    const FILES_PER_IP: u32 = 16;
     const FILES_TOTAL: u32 = 1024;
 
     /// Deliberately generous, because the thing this protects against is cheap
@@ -444,7 +455,14 @@ impl ConnLimits {
     }
 
     pub fn new(max_total: u32, max_per_ip: u32) -> Self {
+        let per_ip_scale = (max_per_ip / 32).max(1);
+        let pools = Self::PRE_TOTAL.max(max_total / 10);
         Self {
+            pre_total_max: pools,
+            pre_per_ip_max: Self::PRE_PER_IP.saturating_mul(per_ip_scale),
+            pre_per_site_max: Self::PRE_PER_SITE.saturating_mul(per_ip_scale),
+            files_total_max: Self::FILES_TOTAL.max(pools),
+            connect_burst: Self::CONNECT_BURST * per_ip_scale as f64,
             pre_total: AtomicU32::new(0),
             pre_per_ip: DashMap::new(),
             pre_per_site: DashMap::new(),
@@ -456,12 +474,38 @@ impl ConnLimits {
             per_ip: DashMap::new(),
             connect_rate: DashMap::new(),
             last_sweep: std::sync::Mutex::new(Instant::now()),
+            counts: Default::default(),
         }
+    }
+
+    /// One more of `(kind, why)` for the minute's report.
+    pub fn count(&self, kind: &'static str, why: &'static str) {
+        *self
+            .counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry((kind, why))
+            .or_insert(0) += 1;
+    }
+
+    /// What was counted since the last call.
+    pub fn take_counts(&self) -> std::collections::BTreeMap<(&'static str, &'static str), u64> {
+        std::mem::take(
+            &mut self
+                .counts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 
     /// Take a pre-authentication slot for `ip`. On `Err` nothing was taken;
     /// the value is the reason for the log line.
     pub fn acquire(&self, ip: IpAddr) -> Result<(), &'static str> {
+        self.try_acquire(ip)
+            .inspect_err(|why| self.count("refused", why))
+    }
+
+    fn try_acquire(&self, ip: IpAddr) -> Result<(), &'static str> {
         let key = limit_key(ip);
         // First, because it is the cheapest refusal and the one that protects
         // the most expensive work.
@@ -470,13 +514,13 @@ impl ConnLimits {
         }
         // Each count is checked and taken in one step (S-028): checked first
         // and added after, two connects at once could both pass at the cap
-        if !reserve(&self.pre_total, Self::PRE_TOTAL) {
+        if !reserve(&self.pre_total, self.pre_total_max) {
             return Err("pre-authentication limit reached");
         }
         let site = site_key(ip);
         if let Some(site) = site {
             let mut count = self.pre_per_site.entry(site).or_insert(0);
-            if *count >= Self::PRE_PER_SITE {
+            if *count >= self.pre_per_site_max {
                 drop(count);
                 unreserve(&self.pre_total);
                 return Err("per-site limit reached");
@@ -485,7 +529,7 @@ impl ConnLimits {
         }
         {
             let mut count = self.pre_per_ip.entry(key).or_insert(0);
-            if *count >= Self::PRE_PER_IP {
+            if *count >= self.pre_per_ip_max {
                 drop(count);
                 if let Some(site) = site {
                     decrement(&self.pre_per_site, site);
@@ -501,6 +545,11 @@ impl ConnLimits {
     /// An authenticated session moves `ip`'s slot from the pre pool to the
     /// main one. On `Err` it stays in the pre pool and the session is refused.
     pub fn promote(&self, ip: IpAddr) -> Result<(), &'static str> {
+        self.try_promote(ip)
+            .inspect_err(|why| self.count("refused", why))
+    }
+
+    fn try_promote(&self, ip: IpAddr) -> Result<(), &'static str> {
         let key = limit_key(ip);
         if !reserve(&self.total, self.max_total) {
             return Err("the server has no room for another connection");
@@ -540,12 +589,12 @@ impl ConnLimits {
     /// then stays in the pre pool.
     pub fn to_files(&self, ip: IpAddr) -> bool {
         let key = limit_key(ip);
-        if !reserve(&self.files_total, Self::FILES_TOTAL) {
+        if !reserve(&self.files_total, self.files_total_max) {
             return false;
         }
         {
             let mut count = self.files_per_ip.entry(key).or_insert(0);
-            if *count >= Self::FILES_PER_IP {
+            if *count >= self.pre_per_ip_max {
                 drop(count);
                 unreserve(&self.files_total);
                 return false;
@@ -601,7 +650,7 @@ impl ConnLimits {
             }
         }
         let mut entry = self.connect_rate.entry(ip).or_insert_with(|| ConnectRate {
-            limiter: RateLimiter::new(Self::CONNECT_BURST, Self::CONNECT_REFILL),
+            limiter: RateLimiter::new(self.connect_burst, Self::CONNECT_REFILL),
             last_seen: now,
         });
         entry.last_seen = now;
@@ -1256,6 +1305,39 @@ async fn main() -> Result<()> {
         "QUIC endpoint bound on UDP {}:{} (web client at https://{}:{}/)",
         config.host, config.udp_port, config.host, config.tcp_port
     );
+    // A minute's refusals, failed setups, ended sessions and dropped datagrams, in one
+    // line and only when there is any: one per connect would flood a big relay's log
+    let (counted, udp_port) = (state.clone(), config.udp_port);
+    tokio::spawn(async move {
+        let mut every = tokio::time::interval(Duration::from_secs(60));
+        let mut drops_before = web::udp_drops(udp_port).unwrap_or(0);
+        loop {
+            every.tick().await;
+            let drops = web::udp_drops(udp_port).unwrap_or(drops_before);
+            let counts = counted.limits.take_counts();
+            if counts.is_empty() && drops == drops_before {
+                continue;
+            }
+            let mut line = format!("last minute: {} online", counted.sessions.len());
+            let mut kind_before = "";
+            for ((kind, why), n) in counts {
+                if kind == kind_before {
+                    line.push_str(&format!(", {why} {n}"));
+                } else {
+                    line.push_str(&format!("; {kind}: {why} {n}"));
+                }
+                kind_before = kind;
+            }
+            if drops > drops_before {
+                line.push_str(&format!(
+                    "; UDP datagrams dropped {} (buffer full, see OPERATING.md 10a)",
+                    drops - drops_before
+                ));
+            }
+            drops_before = drops;
+            info!("{line}");
+        }
+    });
     if config.tcp_fallback {
         info!(
             "TCP fallback on: clients that cannot reach UDP {} tunnel through TCP {}",
@@ -1325,6 +1407,7 @@ async fn main() -> Result<()> {
         let peer_ip = peer_addr.ip();
 
         if bans::refused_at_accept(&state, peer_ip) {
+            limits.count("refused", "banned");
             debug!(peer = %peer_addr, "rejecting connection: banned");
             drop(tcp_stream);
             continue;
@@ -1354,6 +1437,7 @@ async fn main() -> Result<()> {
         let tls_acceptor = tls_acceptor.clone();
         let wt_info = wt_info.clone();
         let http_state = state.clone();
+        let http_limits = limits.clone();
 
         tokio::spawn(async move {
             let _slot = slot;
@@ -1383,6 +1467,7 @@ async fn main() -> Result<()> {
                     }
                 }
                 Err(_) => {
+                    http_limits.count("setup failed", "TLS handshake timed out");
                     debug!(peer = %peer_addr, "TLS handshake timed out");
                 }
             }
@@ -1667,6 +1752,42 @@ mod tests {
     /// H1-01: connections that never sign in (idle page loads, stalled
     /// handshakes) fill only their own pool, per address and per IPv6 site,
     /// and never the room signed-in sessions use.
+    /// The defaults are the limits as they always were; a big relay's settings scale them.
+    #[test]
+    fn the_limits_grow_with_the_relay_and_the_address() {
+        let small = ConnLimits::from_config(&ServerConfig::default());
+        assert_eq!(
+            (
+                small.pre_total_max,
+                small.pre_per_ip_max,
+                small.pre_per_site_max
+            ),
+            (
+                ConnLimits::PRE_TOTAL,
+                ConnLimits::PRE_PER_IP,
+                ConnLimits::PRE_PER_SITE
+            )
+        );
+        assert_eq!(small.files_total_max, ConnLimits::FILES_TOTAL);
+        assert_eq!(small.connect_burst, ConnLimits::CONNECT_BURST);
+
+        let config = ServerConfig {
+            max_users: 100_000,
+            max_connections_per_ip: 640,
+            ..ServerConfig::default()
+        };
+        let big = ConnLimits::from_config(&config);
+        assert_eq!(big.pre_total_max, 20_001, "a fifth of max_users");
+        assert_eq!(big.files_total_max, 20_001);
+        assert_eq!((big.pre_per_ip_max, big.pre_per_site_max), (320, 640));
+        assert_eq!(big.connect_burst, 1200.0);
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9));
+        for _ in 0..320 {
+            big.acquire(ip).unwrap();
+        }
+        assert_eq!(big.acquire(ip), Err("per-IP limit reached"));
+    }
+
     #[test]
     fn idle_connections_cannot_take_the_room_signed_in_sessions_use() {
         let limits = ConnLimits::from_config(&ServerConfig::default());

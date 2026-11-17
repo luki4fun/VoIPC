@@ -45,7 +45,7 @@ use voipc_crypto::bind::{BIND_LEN, EXPORTER_LABEL};
 use voipc_protocol::types::UserId;
 use wtransport::config::QuicTransportConfig;
 use wtransport::endpoint::endpoint_side::Server;
-use wtransport::error::SendDatagramError;
+use wtransport::error::{ConnectionError, SendDatagramError};
 use wtransport::tls::Sha256Digest;
 use wtransport::{
     Connection, Endpoint, Identity, SendStream, ServerConfig as WtServerConfig, VarInt,
@@ -727,10 +727,12 @@ impl WebTransport {
             // connect — quinn only skips it with NEW_TOKENs, which need its
             // `bloom` feature, and wtransport does not enable it.
             if !incoming.remote_address_validated() {
+                debug!(%peer, "retry: address not validated yet");
                 incoming.retry();
                 continue;
             }
             if crate::bans::refused_at_accept(&state, peer.ip()) {
+                limits.count("refused", "banned");
                 debug!(%peer, "refusing session: banned");
                 incoming.refuse();
                 continue;
@@ -756,21 +758,29 @@ impl WebTransport {
                 let setup = async {
                     let request = match incoming.await {
                         Ok(request) => request,
-                        Err(e) => return Err(format!("QUIC handshake failed: {e}")),
+                        Err(e) => return Err(("QUIC handshake failed", e.to_string())),
                     };
                     if request.path() != "/voipc" {
                         request.not_found().await;
-                        return Err("unknown path".to_string());
+                        return Err(("unknown path", String::new()));
                     }
                     request
                         .accept()
                         .await
-                        .map_err(|e| format!("session accept failed: {e}"))
+                        .map_err(|e| ("session accept failed", e.to_string()))
                 };
                 match tokio::time::timeout(setup_time, setup).await {
                     Ok(Ok(connection)) => run_session(connection, state, peer).await,
-                    Ok(Err(why)) => debug!(%peer, "rejecting session: {why}"),
-                    Err(_) => debug!(%peer, "session setup timed out"),
+                    Ok(Err((why, detail))) => {
+                        state.limits.count("setup failed", why);
+                        debug!(%peer, "rejecting session: {why} {detail}");
+                    }
+                    Err(_) => {
+                        state
+                            .limits
+                            .count("setup failed", "session setup timed out");
+                        debug!(%peer, "session setup timed out");
+                    }
                 }
             });
         }
@@ -807,7 +817,34 @@ const RECEIVE_WINDOW: u32 = 2 * 1024 * 1024;
 /// word. At Linux's usual 212 KiB, one soak of 2000 clients dropped 340,000 packets, and
 /// clients lost their handshakes to it. Linux caps this at `net.core.rmem_max` and
 /// `wmem_max`, so a relay on the usual limit gets about twice the old size and says so.
-const UDP_BUFFER: usize = 8 * 1024 * 1024;
+/// Asked big for a relay of tens of thousands; told about only below `UDP_BUFFER_ENOUGH`,
+/// which carries a few thousand (5000 idle clients connecting dropped 1621 at 8 MiB).
+const UDP_BUFFER: usize = 64 * 1024 * 1024;
+const UDP_BUFFER_ENOUGH: usize = 8 * 1024 * 1024;
+
+/// Datagrams the kernel dropped on the relay's UDP socket because its buffer was full
+/// (`drops`, the last column of /proc/net/udp and udp6, for sockets bound to `port`). The
+/// relay logs nothing about them otherwise. `None` off Linux.
+pub fn udp_drops(port: u16) -> Option<u64> {
+    let mut found = None;
+    for table in ["/proc/net/udp", "/proc/net/udp6"] {
+        let Ok(text) = std::fs::read_to_string(table) else {
+            continue;
+        };
+        for row in text.lines().skip(1) {
+            let cols: Vec<&str> = row.split_whitespace().collect();
+            let bound = cols
+                .get(1)
+                .and_then(|a| a.rsplit(':').next())
+                .and_then(|p| u16::from_str_radix(p, 16).ok());
+            if bound == Some(port) {
+                let drops: u64 = cols.last().and_then(|d| d.parse().ok()).unwrap_or(0);
+                *found.get_or_insert(0) += drops;
+            }
+        }
+    }
+    found
+}
 
 fn udp_socket(addr: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
     let socket = socket2::Socket::new(
@@ -823,7 +860,7 @@ fn udp_socket(addr: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
     let _ = socket.set_recv_buffer_size(UDP_BUFFER);
     let _ = socket.set_send_buffer_size(UDP_BUFFER);
     let got = socket.recv_buffer_size()?.min(socket.send_buffer_size()?);
-    if got < UDP_BUFFER {
+    if got < UDP_BUFFER_ENOUGH {
         warn!(
             bytes = got,
             "small UDP buffers: a busy relay drops packets. \
@@ -878,13 +915,37 @@ fn server_config(socket: std::net::UdpSocket, picker: Arc<CertPicker>) -> WtServ
         .send_window(512 * 1024)
         .send_fairness(false);
 
-    WtServerConfig::builder()
+    let mut config = WtServerConfig::builder()
         .with_bind_socket(socket)
         .with_custom_tls_and_transport(tls, transport)
         // An idle client must not hit its own idle timeout; a vanished peer
         // still trips ours (30 s default) because it never acks.
         .keep_alive_interval(Some(Duration::from_secs(10)))
-        .build()
+        .build();
+    config
+        .quic_endpoint_config_mut()
+        .cid_generator(|| Box::new(RandomCids));
+    config
+}
+
+/// Connection ids of 8 random bytes. quinn's default draws 3 random bytes of 8 and does not
+/// check a Retry's id against the up to 8 a live connection holds: at 2000 online about one
+/// connect in 2000 drew a live id, its client's next Initial went to that other connection,
+/// and it timed out with nothing in our log. At 100k online that is one connect in 20.
+struct RandomCids;
+
+impl wtransport::quinn::ConnectionIdGenerator for RandomCids {
+    fn generate_cid(&mut self) -> wtransport::quinn::ConnectionId {
+        wtransport::quinn::ConnectionId::new(&rand::random::<[u8; 8]>())
+    }
+
+    fn cid_len(&self) -> usize {
+        8
+    }
+
+    fn cid_lifetime(&self) -> Option<Duration> {
+        None
+    }
 }
 
 // ── Per-session bridge ──────────────────────────────────────────────────
@@ -937,6 +998,7 @@ async fn run_session(connection: Connection, state: Arc<ServerState>, peer: Sock
     // Addresses and names only at debug: the default log keeps no record of
     // who connected from where (the relay knows as little as it can)
     debug!(peer = %label, "session established");
+    let limits = state.limits.clone();
 
     let SessionStart {
         mut handler,
@@ -967,18 +1029,34 @@ async fn run_session(connection: Connection, state: Arc<ServerState>, peer: Sock
     // reason): it drains the duplex, FINs the stream and waits for the ack
     // before ending (see pump_control).
     let drain = Duration::from_secs(2);
-    tokio::select! {
-        _ = &mut control => debug!(peer = %label, "control leg ended"),
+    let ended = tokio::select! {
+        _ = &mut control => {
+            debug!(peer = %label, "control leg ended");
+            "control stream ended"
+        }
         _ = pumps.join_next() => {
             debug!(peer = %label, "media leg ended");
             let _ = tokio::time::timeout(drain, &mut control).await;
+            "media leg ended"
         }
         _ = &mut handler => {
             debug!(peer = %label, "control handler ended");
             let _ = tokio::time::timeout(drain, &mut control).await;
+            "handler ended"
         }
-        e = connection.closed() => debug!(peer = %label, "session closed: {e}"),
-    }
+        e = connection.closed() => {
+            debug!(peer = %label, "session closed: {e}");
+            match e {
+                ConnectionError::TimedOut => "timed out",
+                ConnectionError::ApplicationClosed(_) | ConnectionError::ConnectionClosed(_) => {
+                    "closed by peer"
+                }
+                ConnectionError::LocallyClosed => "closed here",
+                _ => "QUIC error",
+            }
+        }
+    };
+    limits.count("ended", ended);
 
     // Aborting the pumps drops the bridge end of the duplex: the control
     // handler sees EOF and runs its normal session cleanup.
@@ -1084,7 +1162,8 @@ async fn pump_datagrams_in(connection: &Connection, session_id: SessionId, state
 /// arrives — waiting for the frame's FIN would add its whole transmission time
 /// to the viewers' latency.
 async fn pump_video_in(connection: &Connection, session_id: SessionId, state: &ServerState) {
-    let mut chunk = vec![0u8; 16 * 1024];
+    // Made at the first frame: most connections never share, and 16 KiB each adds up
+    let mut chunk = Vec::new();
     loop {
         let mut stream = match connection.accept_uni().await {
             Ok(stream) => stream,
@@ -1093,6 +1172,7 @@ async fn pump_video_in(connection: &Connection, session_id: SessionId, state: &S
                 return;
             }
         };
+        chunk.resize(16 * 1024, 0);
         let mut reader = RecordReader::default();
         let mut total: u64 = 0;
         loop {

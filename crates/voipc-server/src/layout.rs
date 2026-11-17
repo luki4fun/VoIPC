@@ -299,7 +299,7 @@ pub async fn send_styles(state: &ServerState, tx: &ControlTx) {
         })
         .await;
     for data in frames.iter().flat_map(|f| f.iter()) {
-        let _ = tx.try_send(data.clone());
+        let _ = tx.try_send(data.clone().into());
     }
 }
 

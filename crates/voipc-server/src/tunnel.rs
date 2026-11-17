@@ -706,7 +706,7 @@ mod tests {
             };
             session
                 .control_tx
-                .try_send(encode_server_msg(&reason).unwrap())
+                .try_send(encode_server_msg(&reason).unwrap().into())
                 .unwrap();
             session.close.clone()
         };

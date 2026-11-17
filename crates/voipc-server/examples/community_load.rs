@@ -8,9 +8,11 @@
 //     What a real client pays for end-to-end keys in a channel of that many.
 //     The relay is not involved in any of it, so the run below cannot show it.
 //
-//   community_load run 500 127.0.0.1:9987 [relay-pid]
-//     N guests connect, then all join one text channel at once, then chat.
+//   community_load run 500 127.0.0.1:9987 [relay-pid] [--rate R] [--idle S]
+//     N guests connect, R a second (50), then all join one text channel at once, then chat.
 //     Reports latency, what was lost, and with the pid the relay's RSS and CPU.
+//     `--idle S` stops after connecting and holds everyone S seconds instead: the
+//     relay's memory per connection, and who it loses while nothing happens.
 //     The load clients hold no keys: their ciphertext is a timestamp and padding,
 //     relayed verbatim, so this measures the relay and nothing else.
 //
@@ -58,6 +60,14 @@ const CHAT_MESSAGES: u64 = 20;
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
+    // Only when asked: with `RUST_LOG=quinn_proto=debug` each line names its client
+    if std::env::var_os("RUST_LOG").is_some() {
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_writer(std::io::stderr)
+            .with_ansi(false)
+            .init();
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("frames") => frames(),
@@ -66,9 +76,21 @@ async fn main() -> Result<(), Error> {
             rustls::crypto::ring::default_provider()
                 .install_default()
                 .expect("crypto provider");
-            let pid = args.get(3).map(|p| p.parse()).transpose()?;
+            let pid = args
+                .get(3)
+                .filter(|p| !p.starts_with("--"))
+                .map(|p| p.parse())
+                .transpose()?;
             let server = args.get(2).map_or("127.0.0.1:9987", String::as_str);
-            run(number(args.get(1), 100)?, server, pid).await
+            let flag = |name: &str| -> Result<Option<f64>, Error> {
+                let Some(i) = args.iter().position(|a| a == name) else {
+                    return Ok(None);
+                };
+                Ok(Some(args.get(i + 1).ok_or("a flag without its value")?.parse()?))
+            };
+            let rate = flag("--rate")?.unwrap_or(50.0);
+            let idle = flag("--idle")?;
+            run(number(args.get(1), 100)?, server, pid, rate, idle).await
         }
         Some("channels") => channels_file(number(args.get(1), 300)?),
         Some("follow") => {
@@ -78,7 +100,7 @@ async fn main() -> Result<(), Error> {
             follow(FollowArgs::parse(&args[1..])?).await
         }
         _ => Err(
-            "usage: community_load frames | crypto [N] | run [N] [host:port] [relay-pid] | channels [N] | follow N host:port relay-pid [--writers W] [--rate R] [--each C] [--seconds S] [--churn J] [--leave] [--wave \"command\"]".into(),
+            "usage: community_load frames | crypto [N] | run [N] [host:port] [relay-pid] [--rate R] [--idle S] | channels [N] | follow N host:port relay-pid [--writers W] [--rate R] [--each C] [--seconds S] [--churn J] [--leave] [--wave \"command\"]".into(),
         ),
     }
 }
@@ -281,6 +303,8 @@ async fn crypto(n: usize) -> Result<(), Error> {
 struct Tally {
     up: AtomicUsize,
     refused: AtomicUsize,
+    /// Clients that were in and then lost their connection.
+    lost: AtomicUsize,
     /// Everything the relay sent, all clients together.
     messages: AtomicU64,
     connect_ms: Mutex<Vec<u64>>,
@@ -325,7 +349,13 @@ async fn settle(tally: &Tally, limit: Duration) {
     }
 }
 
-async fn run(n: usize, server: &str, pid: Option<u32>) -> Result<(), Error> {
+async fn run(
+    n: usize,
+    server: &str,
+    pid: Option<u32>,
+    rate: f64,
+    idle: Option<f64>,
+) -> Result<(), Error> {
     let tally = Arc::new(Tally {
         roster: Mutex::new(vec![None; n]),
         ..Tally::default()
@@ -347,13 +377,18 @@ async fn run(n: usize, server: &str, pid: Option<u32>) -> Result<(), Error> {
             .await;
             if let Err(e) = result {
                 // A count, or thousands of lines; the first few say why.
-                if tally.refused.fetch_add(1, Ordering::Relaxed) < 3 {
-                    eprintln!("client {index}: {e}");
+                if tally.roster.lock().unwrap()[index].is_none() {
+                    if tally.refused.fetch_add(1, Ordering::Relaxed) < 3 {
+                        eprintln!("client {index}: {e}");
+                    }
+                } else if tally.lost.fetch_add(1, Ordering::Relaxed) < 5 {
+                    let at = clock.elapsed().as_secs_f64();
+                    eprintln!("client {index} lost at {at:.1} s: {e}");
                 }
             }
         });
         // Paced as people arriving, not as an attack on the connect limits
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::sleep(Duration::from_secs_f64(1.0 / rate)).await;
     }
     let limit = Duration::from_secs(60 + n as u64 / 10);
     let started = Instant::now();
@@ -362,7 +397,10 @@ async fn run(n: usize, server: &str, pid: Option<u32>) -> Result<(), Error> {
     {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    settle(&tally, limit).await;
+    // Idle, the relay's pings never let the count stand still: nothing to settle
+    if idle.is_none() {
+        settle(&tally, limit).await;
+    }
     let up = tally.up.load(Ordering::Relaxed);
     if up == 0 {
         return Err("no client connected: is the relay up?".into());
@@ -373,6 +411,9 @@ async fn run(n: usize, server: &str, pid: Option<u32>) -> Result<(), Error> {
         tally.refused.load(Ordering::Relaxed),
         tally.general_lists.load(Ordering::Relaxed),
     );
+    if let Some(secs) = idle {
+        return hold(&tally, up, pid, Duration::from_secs_f64(secs)).await;
+    }
 
     // Everyone joins at once: what the first evening after a move looks like
     let before_join = tally.messages.load(Ordering::Relaxed);
@@ -424,6 +465,34 @@ async fn run(n: usize, server: &str, pid: Option<u32>) -> Result<(), Error> {
         chat_ms.len(),
         cpu(after_connect, after_join),
         cpu(after_join, after_chat),
+    );
+    Ok(())
+}
+
+/// `--idle`: everyone stays connected and quiet; RSS and losses every ten seconds.
+async fn hold(tally: &Tally, up: usize, pid: Option<u32>, secs: Duration) -> Result<(), Error> {
+    let started = Instant::now();
+    let mut rss = pid.and_then(relay_stats);
+    while started.elapsed() < secs {
+        tokio::time::sleep(Duration::from_secs(10).min(secs)).await;
+        rss = pid.and_then(relay_stats).or(rss);
+        println!(
+            "{:>5.0} s: {} lost, relay {rss:?}",
+            started.elapsed().as_secs_f64(),
+            tally.lost.load(Ordering::Relaxed),
+        );
+    }
+    let mut connect_ms = tally.connect_ms.lock().unwrap().clone();
+    let (mib, kib_each) = match rss {
+        Some((mib, _)) => (mib.to_string(), (mib * 1024 / up.max(1) as u64).to_string()),
+        None => ("?".into(), "?".into()),
+    };
+    println!("| clients | connect p95 ms | held s | lost | relay RSS MiB | KiB a client |");
+    println!(
+        "| {up} | {} | {:.0} | {} | {mib} | {kib_each} |",
+        percentile(&mut connect_ms, 95),
+        secs.as_secs_f64(),
+        tally.lost.load(Ordering::Relaxed),
     );
     Ok(())
 }

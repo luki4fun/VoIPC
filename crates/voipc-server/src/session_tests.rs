@@ -34240,12 +34240,20 @@ mod live_path {
         assert_eq!(hellos(&drained(&mut wes).await), 0, "used up");
     }
 
+    /// A departed writer's ask stays (ids are never reused, so it can answer nobody) and is
+    /// not swept at its disconnect, which walked every session; the set is bounded instead.
     #[tokio::test]
-    async fn a_pair_dies_with_the_session() {
+    async fn a_readers_asked_set_stays_bounded() {
         let state = admin_state();
         let id = text_channel(&state, "lobby").await;
         let (mut wes, wes_id) = follower(&state, "wes", &[id]).await;
         let (mut bob, bob_id) = follower(&state, "bob", &[id]).await;
+        state
+            .sessions
+            .get_mut(&bob_id)
+            .unwrap()
+            .session_asked
+            .extend(1_000_000..1_000_000 + crate::state::MAX_ASKED as UserId);
         wes.send(&ClientMessage::OpenSessions {
             channel_id: id,
             targets: vec![bob_id],
@@ -34255,20 +34263,8 @@ mod live_path {
             matches!(m, ServerMessage::SessionAsked { .. })
         })
         .await;
-        assert!(state
-            .sessions
-            .get(&bob_id)
-            .unwrap()
-            .session_asked
-            .contains(&wes_id));
-        drop(wes);
-        gone_from_the_relay(&state, wes_id).await;
-        assert!(state
-            .sessions
-            .get(&bob_id)
-            .unwrap()
-            .session_asked
-            .is_empty());
+        let asked = state.sessions.get(&bob_id).unwrap().session_asked.clone();
+        assert_eq!(asked, [wes_id].into(), "full, so emptied first");
     }
 
     /// Keys go out behind the post that started slow mode's clock, and reading is not posting.

@@ -433,8 +433,14 @@ warns at start if it got less. On the host, a container's included:
 sysctl -w net.core.rmem_max=4194304 net.core.wmem_max=4194304   # and the same in /etc/sysctl.d/ to keep it
 ```
 
+A relay for tens of thousands asks for 64 MiB: give it `33554432` (Linux doubles it) instead.
+
 At 2000 clients on this machine that took the packets dropped from 340,000 to under 11,000 a run, and all of them joining a
 channel from about 3 s to about 1 s. `nstat -az UdpRcvbufErrors` counts what the kernel has dropped this way.
+
+The relay also says so itself. In a minute when anything happened, it writes one line: who is online, connects refused
+and why, setups that failed, how sessions ended, and the datagrams dropped on its own socket, for example
+`last minute: 1998 online; ended: closed by peer 3, timed out 1; refused: per-IP limit reached 2; UDP datagrams dropped 412`.
 
 Measured with `community_load` (below) on one relay and one 32-thread machine with
 62 GiB, load clients on the same machine, 2026-11-04: guests, no voice, N clients arriving at
@@ -533,6 +539,7 @@ networks.
 cargo build -p voipc-server --release --bin voipc-server --example community_load
 target/release/voipc-server -c server.toml &   # max_users above N
 target/release/examples/community_load run 500 127.0.0.1:9987 "$!"
+target/release/examples/community_load run 5000 127.0.0.1:9987 "$!" --rate 200 --idle 60   # memory per connection
 target/release/examples/community_load frames
 target/release/examples/community_load crypto 2000
 ```
@@ -649,7 +656,9 @@ tcp_port = 9987           # HTTPS: the browser page, file transfers (and the TCP
 udp_port = 9987           # QUIC endpoint (all clients) — keep equal to tcp_port so one host:port reaches both
 tcp_fallback = false      # true: clients that cannot reach UDP carry everything over tcp_port (see below)
 max_users = 64
-max_connections_per_ip = 32   # A browser client holds two of these, a native client one — so 32 is sixteen browser users behind one NAT
+max_connections_per_ip = 32   # A browser client holds two of these, a native client one — so 32 is sixteen browser users behind one NAT.
+                              # Mobile carriers put thousands behind one address: raise it on a big public relay
+                              # (each 32 more also lets that address handshake and connect that much faster)
 cert_path = "certs/server.crt"
 key_path = "certs/server.key"
 admin_token = "change-me"  # optional; unset = a random token is printed in the log at every start (with accounts, only while no account is admin)

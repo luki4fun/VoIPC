@@ -50,7 +50,9 @@ pub struct ServerConfig {
     /// users behind one address, because that is what a household, an office
     /// or a school looks like from here — and being refused for sharing a NAT
     /// with your friends is worse than the dial-and-drop loop this bounds,
-    /// which `CONNECT_BURST` is the real answer to.
+    /// which `CONNECT_BURST` is the real answer to. Each 32 above the first also
+    /// adds a share of handshakes and connects a second for that address
+    /// (`ConnLimits::new`), for a relay many reach through one carrier's address.
     #[serde(default = "default_max_connections_per_ip")]
     pub max_connections_per_ip: u32,
 

@@ -97,7 +97,8 @@ pub async fn handle_connection<S>(
 
     // --- Authentication phase (each step with its own timeout) ---
     let mut buf = BytesMut::with_capacity(4096);
-    let auth_result = authenticate(
+    // The big steps boxed: their state would otherwise be held in every idle connection's task
+    let auth_result = Box::pin(authenticate(
         &mut stream,
         &mut buf,
         &state,
@@ -106,7 +107,7 @@ pub async fn handle_connection<S>(
         media_tx,
         sid_tx,
         binding,
-    )
+    ))
     .await;
     let Admitted {
         user_id,
@@ -121,7 +122,13 @@ pub async fn handle_connection<S>(
         }
     };
 
-    info!(user_id, session_id, "user authenticated");
+    // One line a connect floods a big relay's log: counted for the minute's line instead
+    debug!(user_id, session_id, "user authenticated");
+    let signed_in = match state.sessions.get(&session_id) {
+        Some(s) if s.account.is_some() => "account",
+        _ => "guest",
+    };
+    state.limits.count("signed in", signed_in);
     // From here the session is listed: whatever ends this task, a panic
     // included, takes it out again (a ghost would keep its name, its seat and
     // its roster entry until a restart)
@@ -190,7 +197,11 @@ pub async fn handle_connection<S>(
     crate::restrict::at_connect(&state, session_id, user_id, &tx);
 
     // Auto-join General (channel 0)
-    if let Err(e) = handle_join_channel(&state, user_id, session_id, 0, None, &tx).await {
+    if let Err(e) = Box::pin(handle_join_channel(
+        &state, user_id, session_id, 0, None, &tx,
+    ))
+    .await
+    {
         error!("failed to auto-join General: {}", e);
     }
 
@@ -222,7 +233,7 @@ pub async fn handle_connection<S>(
             result = read_half.read_buf(&mut buf) => {
                 match result {
                     Ok(0) => {
-                        info!(user_id, "client disconnected (EOF)");
+                        debug!(user_id, "client disconnected (EOF)");
                         break;
                     }
                     Ok(_) => {
@@ -286,8 +297,11 @@ pub async fn handle_connection<S>(
                     }
                     match decode_client_msg(&payload) {
                         Ok(msg) => {
+                            // Boxed: its 16 KB of state would otherwise sit in every
+                            // idle connection's task, not only while a message runs
                             if let Err(e) =
-                                handle_message(msg, &state, user_id, session_id, &tx).await
+                                Box::pin(handle_message(msg, &state, user_id, session_id, &tx))
+                                    .await
                             {
                                 error!(user_id, "error handling message: {}", e);
                             }
@@ -313,7 +327,7 @@ pub async fn handle_connection<S>(
 
     // --- Cleanup ---
     cleanup.state = None;
-    cleanup_session(&state, user_id, session_id).await;
+    Box::pin(cleanup_session(&state, user_id, session_id)).await;
     // Let the writer flush what is queued (a Disconnected reason, for one):
     // cleanup_session dropped the session's control_tx clone, ours goes here, so
     // the writer sees the channel close once the queue is empty.
@@ -1106,7 +1120,7 @@ async fn handle_message(
             }
         }
         ClientMessage::Disconnect => {
-            info!(user_id, "client sent disconnect");
+            debug!(user_id, "client sent disconnect");
             // Cleanup will happen when the connection loop ends
         }
         ClientMessage::SetMuted { muted } => {
@@ -1833,7 +1847,7 @@ async fn handle_join_channel(
     }
 
     // Now leave the current channel
-    if let Some((left_channel_id, _remaining, remaining_count)) =
+    if let Some((left_channel_id, remaining_count)) =
         state.leave_current_channel(user_id, session_id).await
     {
         crate::files::left_channel(state, session_id, left_channel_id);
@@ -1915,7 +1929,7 @@ fn send_roster(
 pub(crate) fn send_channel_list(tx: &ControlTx, channels: Vec<ChannelInfo>) {
     let whole = ServerMessage::ChannelList { channels };
     if let Ok(data) = encode_server_msg(&whole) {
-        let _ = tx.try_send(data);
+        let _ = tx.try_send(data.into());
         return;
     }
     let ServerMessage::ChannelList { channels } = whole else {
@@ -2069,7 +2083,7 @@ async fn member_gone(state: &ServerState, channel_id: ChannelId, user_id: UserId
         channel_id,
         user_id,
     };
-    if let Ok(data) = encode_server_msg(&msg) {
+    if let Ok(data) = encode_server_msg(&msg).map(bytes::Bytes::from) {
         for tx in txs {
             let _ = tx.try_send(data.clone());
         }
@@ -2097,6 +2111,9 @@ pub(crate) async fn broadcast_user_updated(state: &Arc<ServerState>, user: UserI
 async fn broadcast_user(state: &Arc<ServerState>, user: UserInfo, updated: bool) {
     let (real, alias) = state.names_of_in(user.channel_id, user.user_id).await;
     let roster = roster_audience(state, user.channel_id).await;
+    // What a recipient is told turns on three things only (told the name, an admin, may be
+    // told who): one frame for each, shared, where this encoded one for every session
+    let mut frames: [Option<bytes::Bytes>; 8] = Default::default();
     for entry in state.sessions.iter() {
         let session = entry.value();
         if session.user_id == user.user_id || !crate::gates::passes(session, &roster.gate) {
@@ -2115,40 +2132,52 @@ async fn broadcast_user(state: &Arc<ServerState>, user: UserInfo, updated: bool)
         if updated && !(told_name || session.is_admin) {
             continue;
         }
-        let username = if told_name || session.is_admin {
-            crate::state::pick_name(&real, &alias, session.is_admin)
-        } else {
-            // The client only renders this for its own channel anyway
-            String::new()
-        };
         let may_name = roster.may_name(session.user_id, user.user_id) || session.is_admin;
-        let account = crate::state::account_shown(
-            user.account,
-            told_name && alias.is_none(),
-            session.is_admin,
-        );
-        let mut info = UserInfo {
-            username,
-            user_id: roster.tell(may_name, user.user_id),
-            account,
-            // Where the account is withheld, so are the badges that would name it
-            badges: if account.is_some() {
-                user.badges.clone()
+        let class =
+            told_name as usize | (session.is_admin as usize) << 1 | (may_name as usize) << 2;
+        if frames[class].is_none() {
+            let username = if told_name || session.is_admin {
+                crate::state::pick_name(&real, &alias, session.is_admin)
             } else {
-                Vec::new()
-            },
-            ..user.clone()
-        };
-        // Under a pseudonym, no role or switch of the person behind it (G1)
-        if alias.is_some() && !session.is_admin {
-            crate::state::masked(&mut info);
+                // The client only renders this for its own channel anyway
+                String::new()
+            };
+            let account = crate::state::account_shown(
+                user.account,
+                told_name && alias.is_none(),
+                session.is_admin,
+            );
+            let mut info = UserInfo {
+                username,
+                user_id: roster.tell(may_name, user.user_id),
+                account,
+                // Where the account is withheld, so are the badges that would name it
+                badges: if account.is_some() {
+                    user.badges.clone()
+                } else {
+                    Vec::new()
+                },
+                ..user.clone()
+            };
+            // Under a pseudonym, no role or switch of the person behind it (G1)
+            if alias.is_some() && !session.is_admin {
+                crate::state::masked(&mut info);
+            }
+            let msg = if updated {
+                ServerMessage::UserUpdated { user: info }
+            } else {
+                ServerMessage::UserJoined { user: info }
+            };
+            let Ok(data) = encode_server_msg(&msg)
+                .inspect_err(|e| warn!("refusing to send a message that cannot be framed: {e}"))
+            else {
+                return;
+            };
+            frames[class] = Some(data.into());
         }
-        let msg = if updated {
-            ServerMessage::UserUpdated { user: info }
-        } else {
-            ServerMessage::UserJoined { user: info }
-        };
-        let _ = send_msg(&session.control_tx, &msg);
+        if let Some(frame) = &frames[class] {
+            let _ = session.control_tx.try_send(frame.clone());
+        }
     }
 }
 
@@ -2166,6 +2195,17 @@ async fn broadcast_user_left(
     exclude: Option<UserId>,
 ) {
     let roster = roster_audience(state, channel_id).await;
+    // Named or not: one frame each, shared
+    let frame = |may_name: bool| {
+        encode_server_msg(&ServerMessage::UserLeft {
+            user_id: roster.tell(may_name, user_id),
+            channel_id,
+        })
+        .map(bytes::Bytes::from)
+    };
+    let (Ok(named), Ok(unnamed)) = (frame(true), frame(false)) else {
+        return;
+    };
     for entry in state.sessions.iter() {
         let session = entry.value();
         if Some(session.user_id) == exclude {
@@ -2176,11 +2216,9 @@ async fn broadcast_user_left(
             continue;
         }
         let may_name = roster.may_name(session.user_id, user_id) || session.is_admin;
-        let msg = ServerMessage::UserLeft {
-            user_id: roster.tell(may_name, user_id),
-            channel_id,
-        };
-        let _ = send_msg(&session.control_tx, &msg);
+        let _ = session
+            .control_tx
+            .try_send(if may_name { &named } else { &unnamed }.clone());
     }
 }
 
@@ -2933,7 +2971,9 @@ pub(crate) async fn channel_updated(state: &Arc<ServerState>, channel: ChannelIn
         }
         return;
     }
-    let Ok(data) = encode_server_msg(&ServerMessage::ChannelUpdated { channel }) else {
+    let Ok(data) =
+        encode_server_msg(&ServerMessage::ChannelUpdated { channel }).map(bytes::Bytes::from)
+    else {
         return;
     };
     for entry in state.sessions.iter() {
@@ -4015,7 +4055,7 @@ async fn post_to_keyed(
     else {
         return;
     };
-    if let Ok(data) = encode_server_msg(&msg) {
+    if let Ok(data) = encode_server_msg(&msg).map(bytes::Bytes::from) {
         for tx in readers {
             let _ = tx.try_send(data.clone());
         }
@@ -4143,6 +4183,9 @@ async fn handle_open_sessions(
             return;
         };
         if let Some(mut reader) = state.sessions.get_mut(&target) {
+            if reader.session_asked.len() >= crate::state::MAX_ASKED {
+                reader.session_asked.clear();
+            }
             reader.session_asked.insert(user_id);
             let _ = send_msg(
                 &reader.control_tx,
@@ -4382,7 +4425,7 @@ async fn cleanup_session(state: &Arc<ServerState>, user_id: UserId, session_id: 
     }
 
     // Leave channel and notify ALL users
-    if let Some((left_channel_id, _remaining, remaining_count)) =
+    if let Some((left_channel_id, remaining_count)) =
         state.leave_current_channel(user_id, session_id).await
     {
         broadcast_user_left(state, user_id, left_channel_id, Some(user_id)).await;
@@ -4409,7 +4452,7 @@ async fn cleanup_session(state: &Arc<ServerState>, user_id: UserId, session_id: 
             warn!(user_id, "ending the account session: {e}");
         }
     }
-    info!(user_id, session_id, "session cleaned up");
+    debug!(user_id, session_id, "session cleaned up");
 }
 
 /// Tear down a user's screen-share state in `channel_id` (their own share
@@ -4507,7 +4550,7 @@ pub(crate) async fn broadcast_to_all(
     msg: &ServerMessage,
     exclude_user: Option<UserId>,
 ) {
-    let Ok(data) = encode_server_msg(msg) else {
+    let Ok(data) = encode_server_msg(msg).map(bytes::Bytes::from) else {
         return;
     };
     for entry in state.sessions.iter() {
@@ -4545,6 +4588,7 @@ async fn broadcast_to_channel(
             .collect()
     };
     let Ok(data) = encode_server_msg(msg)
+        .map(bytes::Bytes::from)
         .inspect_err(|e| warn!("refusing to broadcast a message that cannot be framed: {e}"))
     else {
         return;
@@ -4569,9 +4613,26 @@ pub(crate) fn send_msg(tx: &ControlTx, msg: &ServerMessage) -> Result<()> {
         // a key bundle that simply never arrives.
         warn!("refusing to send a message that cannot be framed: {e}");
     })?;
-    Ok(tx.try_send(data)?)
+    Ok(tx.try_send(data.into())?)
 }
 
 #[cfg(test)]
 #[path = "session_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod idle_task_size {
+    /// Every connection's handler task holds this future while the connection is idle: the
+    /// big steps it awaits are boxed, or 100,000 connections hold 2 GB of it (was 19.9 KB).
+    #[test]
+    fn an_idle_connections_task_stays_small() {
+        let state = std::sync::Arc::new(crate::state::test_support::make_state());
+        let (end, _other) = tokio::io::duplex(64);
+        let (media_tx, _media_rx) = tokio::sync::mpsc::channel(1);
+        let (sid_tx, _sid_rx) = tokio::sync::oneshot::channel();
+        let ip = "127.0.0.1".parse().unwrap();
+        let task = super::handle_connection(end, String::new(), ip, media_tx, sid_tx, state, None);
+        let size = std::mem::size_of_val(&task);
+        assert!(size < 4096, "the handler's future grew to {size} bytes");
+    }
+}

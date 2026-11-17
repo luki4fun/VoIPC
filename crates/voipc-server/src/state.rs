@@ -196,10 +196,12 @@ pub struct UserSession {
     ///
     /// An entry appears only once the pair has passed the membership check, so
     /// the map is bounded by the people this user actually shares a channel
-    /// with; `remove_session` drops the departing user's entry from everybody
-    /// else's, because a user id is never handed out twice and the entry would
-    /// otherwise outlive the person for the life of the connection.
+    /// with. Limiters that have refilled are pruned as it grows (`may_relay_key_to`):
+    /// they say nothing a new one would not, and a departed user's refills too.
     pub key_relay_rate: HashMap<UserId, RateLimiter>,
+    /// The size at which `key_relay_rate` is next pruned: doubled each time, so a map of
+    /// live limiters is not walked again at every new target.
+    pub(crate) key_relay_prune_at: usize,
     /// The burst each of those limiters starts with: a sender key per channel
     /// this server can hold, plus the media key and room for a re-key or two.
     pub(crate) key_relay_burst: f64,
@@ -404,6 +406,7 @@ impl UserSession {
             // ~48 KiB of encrypting each.
             history_serve_rate: RateLimiter::new(6.0, 0.5),
             key_relay_rate: HashMap::new(),
+            key_relay_prune_at: KEY_RELAY_PRUNE_AT,
             key_relay_burst: channel_budget as f64 + 8.0,
             create_channel_rate: RateLimiter::new(1.0, 0.2),
             key_check_rate: RateLimiter::new(channel_budget as f64 + 8.0, 5.0),
@@ -415,8 +418,11 @@ impl UserSession {
             // what arriving costs: a pairwise session with everybody, for DMs
             // and for the keys. Draining somebody's one-time pre-keys is not
             // what this guards — running out is answered with a bundle that
-            // has none, which X3DH accepts.
-            prekey_bundle_rate: RateLimiter::new(max_users.max(16) as f64, 10.0),
+            // has none, which X3DH accepts. Past 10,000, though, what it guards is the
+            // relay's egress: 1.7 KB a bundle, 32 guests an address.
+            // shortcut: past 10,000 a newcomer reaches the rest at 10 a second; the group
+            // key (scale plan Track C) ends the pairwise arrival this pays for.
+            prekey_bundle_rate: RateLimiter::new(max_users.clamp(16, 10_000) as f64, 10.0),
             is_screen_sharing: false,
             listen_only: HashSet::new(),
             silence: Default::default(),
@@ -457,6 +463,12 @@ impl UserSession {
     /// Call it only once the pair has passed the membership check: that is
     /// what keeps the map to people this user really shares a channel with.
     pub fn may_relay_key_to(&mut self, target: UserId) -> bool {
+        if self.key_relay_rate.len() >= self.key_relay_prune_at
+            && !self.key_relay_rate.contains_key(&target)
+        {
+            self.key_relay_rate.retain(|_, limiter| !limiter.is_full());
+            self.key_relay_prune_at = KEY_RELAY_PRUNE_AT.max(2 * self.key_relay_rate.len());
+        }
         let burst = self.key_relay_burst;
         self.key_relay_rate
             .entry(target)
@@ -473,6 +485,14 @@ impl UserSession {
 /// follows it, and nothing honest sustains a rate to one person at all — a key
 /// is handed over once per channel and then only when somebody leaves.
 const KEY_RELAY_REFILL: f64 = 2.0;
+/// Below this many targets `key_relay_rate` is never pruned.
+const KEY_RELAY_PRUNE_AT: usize = 1024;
+
+/// Writers a follower may have asked of it at once (`session_asked`). Past that the set is
+/// emptied, departed writers' entries with the rest.
+/// shortcut: a writer still waiting then has its hello refused and asks again; prune by who is
+/// online instead if a relay ever sees this.
+pub const MAX_ASKED: usize = 4096;
 
 /// Tracks an active screen share session within a channel.
 pub struct ScreenShareSession {
@@ -1035,6 +1055,9 @@ pub struct ServerState {
     /// Here rather than on the channel, so leaving and coming back does not
     /// reset the clock; an account's goes across its connections.
     pub post_marks: DashMap<(ChannelId, Poster, PostStamp), Instant>,
+    /// Who online may call on everybody (`accounts::holds_mention_power`), kept as it
+    /// changes so a connect is not a walk of every session to find out.
+    pub mention_holders: dashmap::DashSet<UserId>,
     /// `tcp_fallback`: whether `GET /voipc` is served (`tunnel::serve`).
     pub tcp_fallback: bool,
     /// The encrypted file cache; `None` with `[files] enabled = false`, and
@@ -1226,6 +1249,7 @@ impl ServerState {
             import: tokio::sync::Mutex::new(None),
             account_sessions: DashMap::new(),
             post_marks: DashMap::new(),
+            mention_holders: dashmap::DashSet::new(),
             tcp_fallback: config.tcp_fallback,
             files: None,
             emotes: None,
@@ -1399,8 +1423,9 @@ impl ServerState {
 
     /// Broadcast a raw serialized message to all connected sessions.
     pub async fn broadcast_raw_to_all(&self, data: &[u8]) {
+        let data = bytes::Bytes::copy_from_slice(data);
         for entry in self.sessions.iter() {
-            let _ = entry.value().control_tx.try_send(data.to_vec());
+            let _ = entry.value().control_tx.try_send(data.clone());
         }
     }
 
@@ -1570,7 +1595,7 @@ impl ServerState {
         session_id: SessionId,
         channel_id: ChannelId,
         password: Option<&str>,
-    ) -> anyhow::Result<Vec<SessionId>> {
+    ) -> anyhow::Result<()> {
         let mut channels = self.channels.write().await;
 
         // Read under the lock, which is the only place `channel_id` changes.
@@ -1600,13 +1625,6 @@ impl ServerState {
         if let Some(timer) = channel.delete_timer.take() {
             timer.abort();
         }
-
-        // Get other members before adding (for notification)
-        let others: Vec<SessionId> = channel
-            .members
-            .iter()
-            .filter_map(|&uid| self.sessions.contains_key(&uid).then_some(uid))
-            .collect();
 
         channel.members.insert(user_id);
         channel.info.user_count = channel.members.len() as u32;
@@ -1642,7 +1660,7 @@ impl ServerState {
         // has left, which is exactly what this server should not be keeping.
         self.routing.clear_session(session_id);
 
-        Ok(others)
+        Ok(())
     }
 
     /// Whether a channel exists and is a text channel.
@@ -2021,7 +2039,7 @@ impl ServerState {
         &self,
         user_id: UserId,
         session_id: SessionId,
-    ) -> Option<(ChannelId, Vec<SessionId>, usize)> {
+    ) -> Option<(ChannelId, usize)> {
         let mut channels = self.channels.write().await;
         // Under the lock: a kick moves the session to General under it, and a
         // `channel_id` read before would leave the wrong room (S-002).
@@ -2040,15 +2058,7 @@ impl ServerState {
         // one — stepping back into the lobby — and a stale answer about people
         // somebody has left is exactly what this server should not be keeping.
         self.routing.clear_session(session_id);
-
-        let remaining: Vec<SessionId> = channel
-            .members
-            .iter()
-            .filter_map(|&uid| self.sessions.contains_key(&uid).then_some(uid))
-            .collect();
-
-        let count = channel.members.len();
-        Some((channel_id, remaining, count))
+        Some((channel_id, channel.members.len()))
     }
 
     /// Remove a user session entirely (on disconnect).
@@ -2066,6 +2076,7 @@ impl ServerState {
             self.account_sessions
                 .remove_if(&a.user.id.0, |_, sid| *sid == session_id);
         }
+        self.mention_holders.remove(&session.user_id);
         // A guest's slow-mode clock goes with its connection; an account's stays.
         self.post_marks
             .retain(|(_, p, _), _| *p != Poster::Session(session_id));
@@ -2081,15 +2092,9 @@ impl ServerState {
         for channel in channels.values_mut() {
             channel.end_invite(session.user_id);
         }
-        // And the same for the budget everybody else holds for relaying keys
-        // *to* them. A user id is never handed out twice, so an entry left here
-        // is a limiter for somebody who will never come back — one per person a
-        // long-lived session has ever shared a channel with.
-        for mut other in self.sessions.iter_mut() {
-            other.key_relay_rate.remove(&session.user_id);
-            other.session_asked.remove(&session.user_id);
-        }
-
+        // Not swept from everybody else's `key_relay_rate` and `session_asked` here: a walk
+        // of every session under this lock stalled every voice packet at each disconnect.
+        // Those prune themselves (`may_relay_key_to`, `MAX_ASKED`).
         Some(session)
     }
 
@@ -3406,11 +3411,10 @@ mod tests {
             .create_channel("Test".into(), None, ProximityMode::Off, false, false, uid)
             .await
             .unwrap();
-        let others = state
+        state
             .join_channel(uid, sid, ch.channel_id, None)
             .await
             .unwrap();
-        assert!(others.is_empty());
         let channels = state.channels.read().await;
         let channel = channels.get(&ch.channel_id).unwrap();
         assert!(channel.members.contains(&uid));
@@ -3465,9 +3469,8 @@ mod tests {
             .join_channel(uid, sid, ch.channel_id, None)
             .await
             .unwrap();
-        let (left_ch, remaining, count) = state.leave_current_channel(uid, sid).await.unwrap();
+        let (left_ch, count) = state.leave_current_channel(uid, sid).await.unwrap();
         assert_eq!(left_ch, ch.channel_id);
-        assert!(remaining.is_empty());
         assert_eq!(count, 0);
     }
 
@@ -4737,6 +4740,30 @@ mod tests {
                 "the history budget ran out"
             );
         }
+    }
+
+    /// Refilled limiters (a departed user's among them) are pruned as the map grows, live
+    /// ones never, and a map of live ones is not walked again at the next target.
+    #[test]
+    fn the_key_relay_map_prunes_refilled_limiters_only() {
+        let state = make_state();
+        let (alice, _) = add_user(&state, "alice");
+        let mut s = state.sessions.get_mut(&alice).unwrap();
+        s.key_relay_burst = 1.0;
+        for target in 0..KEY_RELAY_PRUNE_AT as UserId {
+            assert!(s.may_relay_key_to(target + 10));
+        }
+        // All spent: the next target finds nothing to prune, and the next prune waits
+        assert!(s.may_relay_key_to(1));
+        assert_eq!(s.key_relay_rate.len(), KEY_RELAY_PRUNE_AT + 1);
+        assert_eq!(s.key_relay_prune_at, 2 * KEY_RELAY_PRUNE_AT);
+        assert!(!s.may_relay_key_to(10), "a spent limiter is still there");
+        // A second refills one token at KEY_RELAY_REFILL 2/s
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        s.key_relay_prune_at = KEY_RELAY_PRUNE_AT;
+        assert!(s.may_relay_key_to(2));
+        assert_eq!(s.key_relay_rate.len(), 1, "every refilled one went");
+        assert_eq!(s.key_relay_prune_at, KEY_RELAY_PRUNE_AT);
     }
 
     #[tokio::test]
