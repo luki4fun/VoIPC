@@ -582,19 +582,36 @@ Screen shares (`share_load`, one HD share at 7.5 Mbit/s, 30 frames a second, vie
 | 500 | 4.1 Gbit/s | 31 | 2 cores | 0 |
 | 1,000 | 8.5 Gbit/s | 32 | 4.4 cores | 0 |
 | 2,000 | 11.5 of 15 Gbit/s | 22 | 10 cores | 197,000 |
+| 500 over 5 shares | 4.2 Gbit/s | 32 | 4.5 cores; 2.3 with 4 threads | 0 |
 
 So a relay sends about 1,000 HD viewers before its network port is full, and its processor follows at about half a
 core per Gbit/s. `[media]` (§13) keeps it under what its port carries.
 
-Not measured: voice in a big channel (`voice_load` is for that), accounts signing in at once, real
-networks.
+Voice (`voice_load 1000 127.0.0.1:9987 90 --rooms 20 --speakers 3`): 20 rooms of 50 people, three talking in each,
+147,000 packets a second to listeners. Loss was 0.001% (packets in flight at the ends) and the socket dropped none.
+The relay's CPU depends on how many threads it wakes, not on the work:
+
+| Relay threads (`TOKIO_WORKER_THREADS`) | Relay CPU |
+|---|---|
+| 2 | 0.9 of a core |
+| 8 | 3.3 cores |
+| 32, one per core here (the default) | 4.1 cores |
+| 32, held to 2 cores (`taskset -c 0-1`) | 0.85 of a core |
+
+The loss was the same in each run, so the extra CPU goes to the threads themselves (no profile yet says where). On a
+relay that mostly carries voice, `TOKIO_WORKER_THREADS=4` in its environment saves that. A relay that signs thousands
+in at once needs the cores (2.6 ms each, above). The screen-share CPU above ran with 32 threads, which costs it about
+twice what 4 do.
+
+Not measured: one voice room at its limit of 250, real networks.
 
 ```sh
-cargo build -p voipc-server --release --bin voipc-server --example community_load
+cargo build -p voipc-server --release --bin voipc-server --examples
 target/release/voipc-server -c server.toml &   # max_users above N
 target/release/examples/community_load run 500 127.0.0.1:9987 "$!"
 target/release/examples/community_load run 5000 127.0.0.1:9987 "$!" --rate 200 --idle 60   # memory per connection
 target/release/examples/share_load 500 127.0.0.1:9987 "$!" --shares 1 --mbit 7.5 --fps 30   # [media] above what it asks
+target/release/examples/voice_load 1000 127.0.0.1:9987 90 --rooms 20 --speakers 3
 target/release/examples/community_load frames
 target/release/examples/community_load crypto 2000
 ```

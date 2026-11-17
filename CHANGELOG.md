@@ -34,6 +34,8 @@ to 1.13 relays and older ones.
   the relay's memory and processor, datagrams dropped, the last minute's refusals, and warnings where a limit is near,
   asked every two seconds while it is open. A relay with accounts on SQLite and `max_users` above 10,000 says at start
   that Postgres would serve it better.
+- **`voice_load` takes `--rooms` and `--speakers`**, and counts what is lost once everyone is in: 20 rooms of 50 with
+  three talking in each lost 0.001%, and the numbers are in OPERATING §10a.
 
 ### Fixed
 - **Many people signing in at once stopped the relay signing anyone in.** Past 32 sign-ins at once it told the next
