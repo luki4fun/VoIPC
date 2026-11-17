@@ -315,6 +315,58 @@ pub async fn request_channel_page(
     .await
 }
 
+/// A page of the lobby from past `after`, sections then A-Z, with names starting `prefix`
+/// if it is not empty (protocol 25): `lobby-page` answers.
+#[tauri::command]
+pub async fn request_lobby_page(
+    state: State<'_, AppState>,
+    server: String,
+    after: Option<voipc_protocol::types::LobbyCursor>,
+    prefix: String,
+) -> Result<(), String> {
+    let conns = state.connections.read().await;
+    let connection = conn(&conns, &server)?;
+    network::send_tcp_message(
+        &connection.tcp_tx,
+        &ClientMessage::RequestLobbyPage { after, prefix },
+    )
+    .await
+}
+
+/// Who these are, if online (protocol 25): `users` answers.
+#[tauri::command]
+pub async fn lookup_users(
+    state: State<'_, AppState>,
+    server: String,
+    ids: Vec<u32>,
+    names: Vec<String>,
+    accounts: Vec<[u8; 16]>,
+) -> Result<(), String> {
+    let conns = state.connections.read().await;
+    let connection = conn(&conns, &server)?;
+    network::send_tcp_message(
+        &connection.tcp_tx,
+        &ClientMessage::LookupUsers {
+            ids,
+            names,
+            accounts,
+        },
+    )
+    .await
+}
+
+/// The lobby's list is on screen, or not: while the lobby is small its joins come by name.
+#[tauri::command]
+pub async fn watch_lobby(
+    state: State<'_, AppState>,
+    server: String,
+    on: bool,
+) -> Result<(), String> {
+    let conns = state.connections.read().await;
+    let connection = conn(&conns, &server)?;
+    network::send_tcp_message(&connection.tcp_tx, &ClientMessage::WatchLobby { on }).await
+}
+
 /// On mobile data or not, as the front end sees it: a large key job asks first, and fewer
 /// sessions open at once.
 #[tauri::command]
@@ -3969,6 +4021,12 @@ pub async fn admin_unban(
 #[tauri::command]
 pub async fn report_takers_get(state: State<'_, AppState>, server: String) -> Result<(), String> {
     send_admin_message(&state, &server, ClientMessage::ReportTakersGet).await
+}
+
+/// What the relay carries now (admin only, protocol 25): the `admin-load` event.
+#[tauri::command]
+pub async fn admin_load(state: State<'_, AppState>, server: String) -> Result<(), String> {
+    send_admin_message(&state, &server, ClientMessage::AdminLoad).await
 }
 
 /// Request the ban list (admin only) of a relay before protocol 20; delivered as the

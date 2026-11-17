@@ -433,7 +433,7 @@ impl UserSession {
     }
 
     /// This member as a row of `channel_id`'s list.
-    fn row_in(
+    pub(crate) fn row_in(
         &self,
         channel_id: ChannelId,
         username: String,
@@ -502,7 +502,23 @@ pub struct ScreenShareSession {
     pub viewers: HashSet<UserId>,
     /// Codec the sharer encodes with; handed to every viewer on watch.
     pub codec: VideoCodec,
+    /// What it may send each viewer at its resolution (kbit/s), for `[media]`'s budget.
+    pub ceiling_kbps: u32,
 }
+
+/// What a share may send each viewer, by its resolution (kbit/s): the encoders' top rates.
+pub fn share_ceiling_kbps(resolution: u16) -> u32 {
+    match resolution {
+        1080.. => 7500,
+        720.. => 4000,
+        _ => 2000,
+    }
+}
+
+/// A watch refused for room, not because of anything the viewer did.
+pub const SHARE_FULL: &str =
+    "This share is full: it has as many viewers as this server carries. Try again later.";
+pub const VIDEO_FULL: &str = "This server is sending all the video it can. Try again later.";
 
 /// A follower's place in a text channel's count (`Follow`).
 #[derive(Clone, Copy)]
@@ -785,7 +801,7 @@ impl Channel {
 
 /// Whether everyone with an app holds who stands in this room, as a list they asked for or
 /// the joins since: so a bare id tells them who it is.
-fn list_is_public(channel: &Channel) -> bool {
+pub(crate) fn list_is_public(channel: &Channel) -> bool {
     !channel.info.text
         && !channel.info.anonymous
         && !channel.info.hide_members
@@ -793,13 +809,21 @@ fn list_is_public(channel: &Channel) -> bool {
         && !channel.gated()
 }
 
+/// What an anonymous room does is not told under the real name: a mute or a share there
+/// and here at once ties the two (G1).
+pub(crate) fn masked_flags(row: &mut UserInfo) {
+    row.is_muted = false;
+    row.is_deafened = false;
+    row.is_screen_sharing = false;
+}
+
 /// What a page of people may fill: a frame, less what goes around it.
-const PAGE_BYTES: usize = 60 * 1024;
+pub(crate) const PAGE_BYTES: usize = 60 * 1024;
 /// What a bare id costs a page at most.
 const ID_BYTES: usize = 5;
 
 /// What a row costs a page at most: its ids and flags, and its strings.
-fn row_bytes(row: &UserInfo) -> usize {
+pub(crate) fn row_bytes(row: &UserInfo) -> usize {
     48 + row.username.len() + row.badges.iter().map(|b| b.len() + 5).sum::<usize>()
 }
 
@@ -830,6 +854,7 @@ fn check_admission(
     user_id: UserId,
     password: Option<&str>,
     passes_gate: bool,
+    room_cap: u32,
 ) -> anyhow::Result<bool> {
     // Worded as for a channel that is not there: to someone outside its
     // groups, it is not (`gates`). No invite opens it either.
@@ -854,7 +879,14 @@ fn check_admission(
         }
     }
 
-    if channel.info.max_users > 0 && channel.members.len() >= channel.info.max_users as usize {
+    // A voice room with no cap of its own takes `[media] voice_room`: each joiner there trades
+    // keys with every member, and each voice packet is sent to each. A routed room sends each
+    // only to who is near, and keeps no cap it was not given.
+    let cap = match channel.info.max_users {
+        0 if !channel.info.text && !channel.info.routed && channel.info.channel_id != 0 => room_cap,
+        own => own,
+    };
+    if cap > 0 && channel.members.len() >= cap as usize {
         anyhow::bail!("channel is full");
     }
 
@@ -1058,6 +1090,14 @@ pub struct ServerState {
     /// Who online may call on everybody (`accounts::holds_mention_power`), kept as it
     /// changes so a connect is not a walk of every session to find out.
     pub mention_holders: dashmap::DashSet<UserId>,
+    /// The lobby's pages, watchers and size for live news (`lobby`, protocol v25).
+    pub lobby: crate::lobby::Lobby,
+    /// What screen shares may cost (`[media]`).
+    pub media: crate::config::MediaConfig,
+    /// The UDP port, whose socket's drops the Load view reads (`web::udp_drops`).
+    pub udp_port: u16,
+    /// Accounts on SQLite, which a very big relay outgrows (the Load view says so).
+    pub sqlite_accounts: bool,
     /// `tcp_fallback`: whether `GET /voipc` is served (`tunnel::serve`).
     pub tcp_fallback: bool,
     /// The encrypted file cache; `None` with `[files] enabled = false`, and
@@ -1250,6 +1290,11 @@ impl ServerState {
             account_sessions: DashMap::new(),
             post_marks: DashMap::new(),
             mention_holders: dashmap::DashSet::new(),
+            lobby: crate::lobby::Lobby::new(config.live_lobby),
+            media: config.media.clone(),
+            udp_port: config.udp_port,
+            sqlite_accounts: config.accounts.mode != crate::config::AccountsMode::Off
+                && config.accounts.database.starts_with("sqlite"),
             tcp_fallback: config.tcp_fallback,
             files: None,
             emotes: None,
@@ -1581,6 +1626,7 @@ impl ServerState {
             user_id,
             password,
             self.passes(user_id, &channel.gate.groups),
+            self.media.voice_room,
         )?;
 
         Ok(())
@@ -1616,7 +1662,7 @@ impl ServerState {
         // refused for some other reason — so it is consumed only here, once
         // the admission has been granted in full.
         let passes = self.passes(user_id, &channel.gate.groups);
-        if check_admission(channel, user_id, password, passes)? {
+        if check_admission(channel, user_id, password, passes, self.media.voice_room)? {
             channel.end_invite(user_id);
         }
         let speakers = channel.gate.speakers.clone();
@@ -1715,7 +1761,7 @@ impl ServerState {
         }
 
         let passes = self.passes(user_id, &channel.gate.groups);
-        if check_admission(channel, user_id, password, passes)? {
+        if check_admission(channel, user_id, password, passes, self.media.voice_room)? {
             channel.end_invite(user_id);
         }
         if let Some(mut session) = self.sessions.get_mut(&user_id) {
@@ -1787,7 +1833,7 @@ impl ServerState {
             };
             if !channel.members.contains(&user_id) {
                 let passes = crate::gates::passes_without_star(&session, &channel.gate.groups);
-                match check_admission(channel, user_id, None, passes) {
+                match check_admission(channel, user_id, None, passes, self.media.voice_room) {
                     Ok(invited) => {
                         if invited {
                             channel.end_invite(user_id);
@@ -1905,9 +1951,11 @@ impl ServerState {
             let Some(session) = self.sessions.get(uid) else {
                 continue;
             };
-            let public = channels
-                .get(&session.channel_id)
-                .is_some_and(list_is_public);
+            // Since 25 no app holds the lobby whole: someone standing there goes as a row
+            let public = session.channel_id != 0
+                && channels
+                    .get(&session.channel_id)
+                    .is_some_and(list_is_public);
             // Standing in an anonymous room: what it does there is not told under the name
             // here, or a mute or a share there and here at once ties the two (G1)
             let masked_room = channels
@@ -1919,9 +1967,7 @@ impl ServerState {
                 let account = account_shown(session.account_id(), true, false);
                 let mut row = session.row_in(channel_id, session.username.clone(), account);
                 if masked_room {
-                    row.is_muted = false;
-                    row.is_deafened = false;
-                    row.is_screen_sharing = false;
+                    masked_flags(&mut row);
                 }
                 row
             });
@@ -2077,6 +2123,7 @@ impl ServerState {
                 .remove_if(&a.user.id.0, |_, sid| *sid == session_id);
         }
         self.mention_holders.remove(&session.user_id);
+        self.lobby.watchers.remove(&session.user_id);
         // A guest's slow-mode clock goes with its connection; an account's stays.
         self.post_marks
             .retain(|(_, p, _), _| *p != Poster::Session(session_id));
@@ -2792,6 +2839,7 @@ impl ServerState {
         session_id: SessionId,
         channel_id: ChannelId,
         codec: VideoCodec,
+        resolution: u16,
     ) -> anyhow::Result<Vec<SessionId>> {
         if channel_id == 0 {
             anyhow::bail!("cannot screen share in the General channel");
@@ -2831,6 +2879,7 @@ impl ServerState {
                 sharer_session_id: session_id,
                 viewers: HashSet::new(),
                 codec,
+                ceiling_kbps: share_ceiling_kbps(resolution),
             },
         );
 
@@ -2921,9 +2970,30 @@ impl ServerState {
         let channel = channels
             .get_mut(&channel_id)
             .ok_or_else(|| anyhow::anyhow!("channel not found"))?;
-        if !channel.screen_shares.contains_key(&sharer_user_id) {
+        let Some(share) = channel.screen_shares.get(&sharer_user_id) else {
             anyhow::bail!("user is not screen sharing");
+        };
+        // Room for one more, unless they watch it already (`[media]`)
+        if !share.viewers.contains(&viewer_user_id) {
+            if share.viewers.len() as u32 >= self.media.share_viewers {
+                anyhow::bail!(SHARE_FULL);
+            }
+            let sent: u64 = channels
+                .values()
+                .flat_map(|c| c.screen_shares.values())
+                .map(|s| s.ceiling_kbps as u64 * s.viewers.len() as u64)
+                .sum();
+            let this = channels
+                .get(&channel_id)
+                .and_then(|c| c.screen_shares.get(&sharer_user_id))
+                .map_or(0, |s| s.ceiling_kbps as u64);
+            if sent + this > self.media.video_egress_mbit as u64 * 1000 {
+                anyhow::bail!(VIDEO_FULL);
+            }
         }
+        let channel = channels
+            .get_mut(&channel_id)
+            .ok_or_else(|| anyhow::anyhow!("channel not found"))?;
 
         let mut prev_info = None;
         if let Some(prev_sharer_id) = prev_unwatch.filter(|&id| id != sharer_user_id) {
@@ -4317,7 +4387,7 @@ mod tests {
             .unwrap();
 
         let err = state
-            .start_screen_share(alice, alice_sid, ch.channel_id, VideoCodec::H264)
+            .start_screen_share(alice, alice_sid, ch.channel_id, VideoCodec::H264, 1080)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("off in this channel"), "{err}");
@@ -4339,7 +4409,7 @@ mod tests {
             .await
             .unwrap();
         assert!(state
-            .start_screen_share(alice, alice_sid, ch.channel_id, VideoCodec::H264)
+            .start_screen_share(alice, alice_sid, ch.channel_id, VideoCodec::H264, 1080)
             .await
             .is_ok());
     }
@@ -4359,7 +4429,7 @@ mod tests {
             .await
             .unwrap();
         state
-            .start_screen_share(alice, alice_sid, ch.channel_id, VideoCodec::H264)
+            .start_screen_share(alice, alice_sid, ch.channel_id, VideoCodec::H264, 1080)
             .await
             .unwrap();
 
@@ -4481,14 +4551,24 @@ mod tests {
         let right = state.channel_password_attempt(1, 5, Some("pw")).await;
         let wrong = state.channel_password_attempt(1, 5, Some("nope")).await;
         let channels = state.channels.read().await;
+        assert!(check_admission(
+            &channels[&1],
+            5,
+            right.as_deref().map(|p| p.as_str()),
+            true,
+            0
+        )
+        .is_ok());
+        assert!(check_admission(
+            &channels[&1],
+            5,
+            wrong.as_deref().map(|p| p.as_str()),
+            true,
+            0
+        )
+        .is_err());
         assert!(
-            check_admission(&channels[&1], 5, right.as_deref().map(|p| p.as_str()), true).is_ok()
-        );
-        assert!(
-            check_admission(&channels[&1], 5, wrong.as_deref().map(|p| p.as_str()), true).is_err()
-        );
-        assert!(
-            check_admission(&channels[&1], 5, Some("pw"), true).is_err(),
+            check_admission(&channels[&1], 5, Some("pw"), true, 0).is_err(),
             "only an attempt checked against the hash gets in"
         );
     }
@@ -4537,7 +4617,8 @@ mod tests {
                 &channels[&1],
                 5,
                 attempt.as_deref().map(|p| p.as_str()),
-                true
+                true,
+                0
             )
             .is_err(),
             "what comes back matches nothing, should a grant land in between"
@@ -5299,7 +5380,7 @@ mod tests {
             .await
             .unwrap();
         let others = state
-            .start_screen_share(uid, sid, ch.channel_id, VideoCodec::H264)
+            .start_screen_share(uid, sid, ch.channel_id, VideoCodec::H264, 1080)
             .await
             .unwrap();
         assert!(others.is_empty());
@@ -5312,12 +5393,164 @@ mod tests {
             .contains_key(&uid));
     }
 
+    /// `[media]`: a share holds `share_viewers`, and the relay sends what `video_egress_mbit`
+    /// allows, counted at each share's resolution; watching again is never refused.
+    #[tokio::test]
+    async fn a_full_share_or_a_full_relay_refuses_the_next_viewer() {
+        let state = ServerState::new(
+            &ServerConfig {
+                media: crate::config::MediaConfig {
+                    share_viewers: 2,
+                    video_egress_mbit: 10,
+                    voice_room: 0,
+                },
+                ..ServerConfig::default()
+            },
+            ServerSettings::default(),
+            Vec::new(),
+            "test-admin-token".into(),
+        );
+        let people: Vec<_> = ["alice", "bob", "cat", "dan"]
+            .iter()
+            .map(|n| add_user(&state, n))
+            .collect();
+        let (alice, asid) = people[0];
+        let ch = state
+            .create_channel("Room".into(), None, ProximityMode::Off, false, false, alice)
+            .await
+            .unwrap();
+        for &(uid, sid) in &people {
+            state
+                .join_channel(uid, sid, ch.channel_id, None)
+                .await
+                .unwrap();
+        }
+        state
+            .start_screen_share(alice, asid, ch.channel_id, VideoCodec::H264, 1080)
+            .await
+            .unwrap();
+        let watch = |(uid, sid): (UserId, SessionId)| {
+            let state = &state;
+            async move {
+                state
+                    .watch_screen_share(uid, sid, alice, ch.channel_id)
+                    .await
+            }
+        };
+        watch(people[1]).await.unwrap();
+        watch(people[1]).await.unwrap();
+        // 7.5 Mbit/s sent, 7.5 more is past 10
+        let err = watch(people[2]).await.unwrap_err();
+        assert_eq!(err.to_string(), VIDEO_FULL);
+
+        let roomy = ServerState::new(
+            &ServerConfig {
+                media: crate::config::MediaConfig {
+                    share_viewers: 1,
+                    video_egress_mbit: 1000,
+                    voice_room: 0,
+                },
+                ..ServerConfig::default()
+            },
+            ServerSettings::default(),
+            Vec::new(),
+            "test-admin-token".into(),
+        );
+        let (a, a_sid) = add_user(&roomy, "alice");
+        let (b, b_sid) = add_user(&roomy, "bob");
+        let (c, c_sid) = add_user(&roomy, "cat");
+        let ch = roomy
+            .create_channel("Room".into(), None, ProximityMode::Off, false, false, a)
+            .await
+            .unwrap();
+        for (uid, sid) in [(a, a_sid), (b, b_sid), (c, c_sid)] {
+            roomy
+                .join_channel(uid, sid, ch.channel_id, None)
+                .await
+                .unwrap();
+        }
+        roomy
+            .start_screen_share(a, a_sid, ch.channel_id, VideoCodec::H264, 480)
+            .await
+            .unwrap();
+        roomy
+            .watch_screen_share(b, b_sid, a, ch.channel_id)
+            .await
+            .unwrap();
+        let err = roomy
+            .watch_screen_share(c, c_sid, a, ch.channel_id)
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), SHARE_FULL);
+    }
+
+    /// A voice room that names no limit takes `[media] voice_room`; a text channel, a routed
+    /// room and one with its own limit do not.
+    #[tokio::test]
+    async fn a_voice_room_without_a_limit_takes_the_relays() {
+        let state = ServerState::new(
+            &ServerConfig {
+                media: crate::config::MediaConfig {
+                    voice_room: 2,
+                    ..Default::default()
+                },
+                ..ServerConfig::default()
+            },
+            ServerSettings::default(),
+            Vec::new(),
+            "test-admin-token".into(),
+        );
+        let people: Vec<_> = ["a", "b", "c"]
+            .iter()
+            .map(|n| add_user(&state, n))
+            .collect();
+        let (a, _) = people[0];
+        let room = state
+            .create_channel("Room".into(), None, ProximityMode::Off, false, false, a)
+            .await
+            .unwrap();
+        let text = state
+            .create_channel("Text".into(), None, ProximityMode::Off, false, true, a)
+            .await
+            .unwrap();
+        for &(uid, sid) in &people[..2] {
+            state
+                .join_channel(uid, sid, room.channel_id, None)
+                .await
+                .unwrap();
+        }
+        let (c, c_sid) = people[2];
+        let err = state
+            .join_channel(c, c_sid, room.channel_id, None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "channel is full");
+        for &(uid, _) in &people {
+            assert!(state
+                .join_text_channel(uid, text.channel_id, None)
+                .await
+                .unwrap());
+        }
+        state
+            .channels
+            .write()
+            .await
+            .get_mut(&room.channel_id)
+            .unwrap()
+            .info
+            .routed = true;
+        state
+            .join_channel(c, c_sid, room.channel_id, None)
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn start_screen_share_general_fails() {
         let state = make_state();
         let (uid, sid) = add_user(&state, "alice");
         let err = state
-            .start_screen_share(uid, sid, 0, VideoCodec::H264)
+            .start_screen_share(uid, sid, 0, VideoCodec::H264, 1080)
             .await;
         assert!(err.unwrap_err().to_string().contains("General"));
     }
@@ -5335,7 +5568,7 @@ mod tests {
             .await
             .unwrap();
         state
-            .start_screen_share(uid, sid, ch.channel_id, VideoCodec::H264)
+            .start_screen_share(uid, sid, ch.channel_id, VideoCodec::H264, 1080)
             .await
             .unwrap();
         state
@@ -5364,7 +5597,7 @@ mod tests {
             .await
             .unwrap();
         state
-            .start_screen_share(uid, sid, ch.channel_id, VideoCodec::H265)
+            .start_screen_share(uid, sid, ch.channel_id, VideoCodec::H265, 1080)
             .await
             .unwrap();
         let (uid2, sid2) = add_user(&state, "bob");
@@ -5401,7 +5634,7 @@ mod tests {
                 .unwrap();
         }
         state
-            .start_screen_share(alice, alice_sid, ch.channel_id, VideoCodec::H264)
+            .start_screen_share(alice, alice_sid, ch.channel_id, VideoCodec::H264, 1080)
             .await
             .unwrap();
         state
@@ -5436,7 +5669,7 @@ mod tests {
             .await
             .unwrap();
         state
-            .start_screen_share(uid, sid, ch.channel_id, VideoCodec::H264)
+            .start_screen_share(uid, sid, ch.channel_id, VideoCodec::H264, 1080)
             .await
             .unwrap();
         let (uid2, sid2) = add_user(&state, "bob");

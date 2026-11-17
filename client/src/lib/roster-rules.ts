@@ -28,8 +28,11 @@ export function worthAsking(
   admin: boolean,
   joinedTextChannelIds: ReadonlySet<number> = new Set(),
   live = false,
+  lazy = false,
 ): boolean {
   if (channel.channel_id === currentChannelId) return false;
+  // The lobby comes a page at a time since 25 (stores/lobby.ts): asked whole it is nobody
+  if (lazy && channel.channel_id === 0) return false;
   // On the live path nothing asks about a text channel by itself: an ask says which one a
   // person looks at. An open one's list is who is online, and the sweep keeps the others.
   if (live && channel.text) return false;

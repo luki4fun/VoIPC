@@ -23,7 +23,7 @@ import { isAdmin, serverAddress } from "./connection.js";
 import { scoped } from "./scoped.js";
 import { users } from "./users.js";
 import { applyRosterChanges, onlineIn, rosterOf, trustRosterCount, worthAsking, type RosterChange } from "../roster-rules.js";
-import { livePath } from "../relay-rules.js";
+import { lazyLobby, livePath } from "../relay-rules.js";
 import { olderRelay } from "./relay.js";
 import type { UserInfo } from "../types.js";
 
@@ -87,6 +87,8 @@ function schedule(server: string): void {
 }
 
 const liveHere = (server: string) => livePath(get(olderRelay.peek(server))?.protocol ?? null);
+/** The lobby comes in pages and counts on this server (protocol 25). */
+export const lazyHere = (server: string) => lazyLobby(get(olderRelay.peek(server))?.protocol ?? null);
 
 /** When each room's list was last asked for only to bring its flags up to date. */
 const healed = new Map<string, Map<number, number>>();
@@ -133,6 +135,7 @@ export function requestRoster(server: string, channelId: number): void {
       get(isAdmin.peek(server)),
       get(joinedTextChannelIds.peek(server)),
       liveHere(server),
+      lazyHere(server),
     )
   )
     return;
@@ -147,8 +150,9 @@ export function requestAllRosters(server: string): void {
   const joinedText = get(joinedTextChannelIds.peek(server));
   const ids = pendingFor(server).ids;
   const live = liveHere(server);
+  const lazy = lazyHere(server);
   for (const channel of get(channels.peek(server))) {
-    if (worthAsking(channel, currentId, admin, joinedText, live)) ids.add(channel.channel_id);
+    if (worthAsking(channel, currentId, admin, joinedText, live, lazy)) ids.add(channel.channel_id);
   }
   schedule(server);
 }
@@ -221,9 +225,21 @@ export function rosterAccount(server: string, id: number): UserInfo["account"] {
   return undefined;
 }
 
+/** How many stand in each channel, as the relay counted (`channel-counts`, protocol 25). */
+export function setCounts(server: string, counts: [number, number][]): void {
+  const by = new Map(counts);
+  channels.of(server).update((chs) =>
+    chs.some((c) => by.has(c.channel_id) && by.get(c.channel_id) !== c.user_count)
+      ? chs.map((c) => (by.has(c.channel_id) ? { ...c, user_count: by.get(c.channel_id)! } : c))
+      : chs,
+  );
+}
+
 export function setRoster(server: string, channelId: number, list: UserInfo[]): void {
   channelRosters.of(server).update((m) => new Map(m).set(channelId, list));
   const channel = get(channels.peek(server)).find((c) => c.channel_id === channelId);
+  // The lobby's list is our own row since 25, and its count comes counted (`setCounts`)
+  if (channelId === 0 && lazyHere(server)) return;
   if (
     !channel ||
     !trustRosterCount(

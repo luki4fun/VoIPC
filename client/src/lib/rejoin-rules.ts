@@ -56,8 +56,13 @@ export function connectionLostLine(reason: string): string {
  * at most 10 s, then spread over half to one and a half times that. Without
  * the spread, every client a relay restart dropped retried in the same second
  * and met its sign-in and connection limits as one burst (1.0 audit H5-17).
+ *
+ * The first also waits up to a millisecond for each person `online` when it dropped, at
+ * most a minute: a relay of 100,000 that went down is back at about 1700 a second, not
+ * all of them in that one second.
  */
-export function reconnectDelay(attempt: number, random: () => number = Math.random): number {
+export function reconnectDelay(attempt: number, random: () => number = Math.random, online = 0): number {
   const base = Math.min(1000 * Math.pow(2, attempt - 1), 10000);
-  return base * (0.5 + random());
+  const spread = attempt === 1 ? Math.min(60_000, Math.max(0, online)) : 0;
+  return base * (0.5 + random()) + spread * random();
 }

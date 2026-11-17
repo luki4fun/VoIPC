@@ -524,7 +524,7 @@ mod tests {
         )
         .await;
         state
-            .start_screen_share(alice_uid, alice_sid, 5, VideoCodec::H264)
+            .start_screen_share(alice_uid, alice_sid, 5, VideoCodec::H264, 1080)
             .await
             .unwrap();
         state

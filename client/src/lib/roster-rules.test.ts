@@ -45,6 +45,12 @@ function user(id: number, name: string): UserInfo {
   };
 }
 
+test("the lobby is never asked whole where it comes in pages (protocol 25)", () => {
+  assert.equal(worthAsking(channel({ channel_id: 0 }), 5, false, new Set(), true, true), false);
+  assert.equal(worthAsking(channel({ channel_id: 0 }), 5, true, new Set(), true, true), false, "not for an admin either");
+  assert.equal(worthAsking(channel({ channel_id: 0 }), 5, false, new Set(), true, false), true, "an older relay's is");
+});
+
 test("an ordinary channel is worth asking about", () => {
   assert.equal(worthAsking(channel(), 0, false), true);
 });

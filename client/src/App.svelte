@@ -97,7 +97,7 @@
   } from "./lib/stores/chat.js";
   import ChatHistorySetup from "./lib/components/ChatHistorySetup.svelte";
   import AudioSetup from "./lib/components/AudioSetup.svelte";
-  import type { ChannelInfo, ChatMessage, UserInfo } from "./lib/types.js";
+  import type { ChannelInfo, ChatMessage, LobbyCursor, UserInfo } from "./lib/types.js";
   import { parseInviteFragment, parseJoinFragment } from "./lib/invite.js";
   import {
     channelListArrived,
@@ -168,9 +168,13 @@
     requestRoster,
     forgetUser,
     rosterAccount,
+    setCounts,
     setRoster,
     textSeats,
+    lazyHere,
   } from "./lib/stores/rosters.js";
+  import { afterLookup, lobbyPage, lookedUp, resetLobby } from "./lib/stores/lobby.js";
+  import { adminLoad, type LoadReport } from "./lib/stores/load.js";
   import { emoteLimits, metered, setEmotes, type EmoteLimits, type EmoteSet } from "./lib/stores/emotes.js";
   import { UNOPENED_LINE, answersHandOff, clampedLine, spendServe, type ServeBudget } from "./lib/history-rules.js";
   import { olderRelay } from "./lib/stores/relay.js";
@@ -582,8 +586,9 @@
 
   /** Whether someone here is blocked: by their account where a list we see has
    *  it, else by the name. */
-  function blockedSender(server: string, uid: number, name: string): boolean {
-    const known = get(users.peek(server)).find((u) => u.user_id === uid)?.account ?? rosterAccount(server, uid);
+  function blockedSender(server: string, uid: number, name: string, said?: number[] | null): boolean {
+    // `said`: the account the relay put on the frame (protocol 25), where no list may hold them
+    const known = said ?? get(users.peek(server)).find((u) => u.user_id === uid)?.account ?? rosterAccount(server, uid);
     return isBlocked(get(blocked.peek(server)), { account: known, username: name }, false);
   }
 
@@ -613,7 +618,12 @@
    * list. `mayWait`: a stranger to the last list moves the next sweep up, and is looked at once
    * more when it is in.
    */
-  function answerHandOff(server: string, data: HandOffAskEvent, mayWait: boolean): void {
+  function answerHandOff(server: string, data: HandOffAskEvent, mayWait: boolean, looked = false): void {
+    // Someone standing in the lobby is on no list here since 25 until asked about
+    if (!looked) {
+      afterLookup(server, [data.from_user_id], () => answerHandOff(server, data, mayWait, true));
+      return;
+    }
     const channelId = data.channel_id;
     const chName = channelNameById(server, channelId);
     if (!chName) return;
@@ -1081,6 +1091,8 @@
         currentChannelId.of(server).set(newChannelId);
         users.of(server).set(data.users);
         setRoster(server, newChannelId, data.users);
+        // Since 25 the lobby's list is our own row: its people come a page at a time again
+        if (newChannelId === 0 && lazyHere(server)) resetLobby(server);
         // A room can hold an archive too, and the relay is what moved us
         if (newChannelId !== 0 && livePath(get(olderRelay.peek(server))?.protocol ?? null)) askArchiveChannels(server);
         // We just left one, and the channel we joined may have been listed with
@@ -1828,6 +1840,16 @@
         }
       }),
 
+      // The lobby on a big relay (protocol 25): counts, pages, lookups
+      listenServer<{ counts: [number, number][] }>("channel-counts", (server, data) => setCounts(server, data.counts)),
+      listenServer<{ rows: UserInfo[]; next: LobbyCursor | null; total: number; sections: [number, number][]; prefix?: string }>(
+        "lobby-page",
+        (server, data) => lobbyPage(server, { ...data, rows: eachOnce(data.rows, (u) => u.user_id) }),
+      ),
+      listenServer<{ rows: UserInfo[]; gone: number[] }>("users", (server, data) =>
+        lookedUp(server, eachOnce(data.rows, (u) => u.user_id), data.gone),
+      ),
+
       // Invite events
       listenServer<{ channel_id: number; channel_name: string; invited_by: string }>(
         "invite-received",
@@ -1858,10 +1880,10 @@
       }),
 
       // Poke events
-      listenServer<{ from_user_id: number; from_username: string; message: string }>(
+      listenServer<{ from_user_id: number; from_username: string; from_account?: number[] | null; message: string }>(
         "poke-received",
         (server, data) => {
-          if (blockedSender(server, data.from_user_id, data.from_username)) return;
+          if (blockedSender(server, data.from_user_id, data.from_username, data.from_account)) return;
           const poke = createPoke(server, data.from_user_id, data.from_username, data.message);
           let fresh = false;
           pendingPokes.update((p) => {
@@ -2082,6 +2104,8 @@
         reply_to?: string | null;
         thread?: string | null;
         event?: unknown;
+        /** As a roster row would show it (protocol 25); none on an older relay. */
+        from_account?: number[] | null;
       }>("direct-chat-message", (server, data) => {
         const { from_user_id, to_user_id, timestamp } = data;
         const content = receivedText(data.content);
@@ -2097,7 +2121,9 @@
         // the stored log later is recognised (sameMessage).
         const sender = from_user_id === myId
           ? get(account.peek(server))?.info.id
-          : (get(users.peek(server)).find((u) => u.user_id === from_user_id)?.account ?? rosterAccount(server, from_user_id));
+          : (data.from_account ??
+            get(users.peek(server)).find((u) => u.user_id === from_user_id)?.account ??
+            rosterAccount(server, from_user_id));
         // Done to an earlier message of the conversation: no message, no sound
         if (data.event != null) {
           const event = chatEvent(data.event);
@@ -2237,6 +2263,14 @@
         if (!inVoice(server)) return;
         // Capture follows this (captureWanted, above)
         viewerCount.set(data.viewer_count);
+      }),
+
+      // What the relay carries now, for the admin's Load tab (protocol 25)
+      listenServer<LoadReport>("admin-load", (server, report) => adminLoad.of(server).set(report)),
+
+      // A watch the relay would not start (protocol 25): about that share, never ours
+      listenServer<{ sharer_user_id: number; reason: string }>("watch-refused", (server, data) => {
+        addNotification(`${fromServer(server)}${data.reason}`, "error");
       }),
 
       listenServer<{ reason: string }>("screenshare-error", (server, data) => {

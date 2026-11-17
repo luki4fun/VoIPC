@@ -3951,7 +3951,8 @@ async fn a_reader_behind_loses_nobody_in_a_burst_of_joins() {
             UserInfo {
                 user_id: 1_000_000 + i,
                 username: format!("joiner{i}"),
-                channel_id: 0,
+                // A room's: the lobby's are told only to its watchers since 25
+                channel_id: 7,
                 is_muted: false,
                 is_deafened: false,
                 is_screen_sharing: false,
@@ -33397,13 +33398,15 @@ mod live_path {
         assert_eq!((heard.username.as_str(), heard.user_id), ("", 0));
     }
 
-    /// A change of badges reaches who may now hold that row, as a join does.
+    /// A change of badges reaches who may now hold that row, as a join does: for the lobby,
+    /// whoever shows its list (since 25).
     #[tokio::test]
     async fn a_change_reaches_who_was_told_a_public_rooms_name() {
         let state = admin_state();
         let (mut bob, _) = follower(&state, "bob", &[]).await;
         let (mut amy, amy_id) = connect_with_bundle(&state, "amy", test_bundle(1)).await;
         let room = create(&mut bob, "room", false).await;
+        bob.send(&ClientMessage::WatchLobby { on: true }).await;
         settled(&mut amy).await;
         settled(&mut bob).await;
         let info = user_info_for(&state, amy_id, amy_id, 0);
@@ -33623,6 +33626,7 @@ mod live_path {
 
     /// Bare ids for whoever a public list names, so 2000 people are 8 KB, not 66; rows for
     /// who it does not. A row feeds the pin check, and says the text channel, never a room.
+    /// Since 25 no app holds the lobby whole, so someone standing there is a row.
     #[tokio::test]
     async fn keys_owed_names_only_who_no_public_list_names() {
         let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
@@ -33665,9 +33669,7 @@ mod live_path {
             panic!("{got:?}");
         };
         ids.sort_unstable();
-        let mut expected = vec![sid_of_account(&state, bi.id), sid_of_account(&state, ci.id)];
-        expected.sort_unstable();
-        assert_eq!(ids, expected);
+        assert_eq!(ids, [sid_of_account(&state, ci.id)]);
         let mut named: Vec<_> = rows
             .iter()
             .map(|r| (r.username.as_str(), r.account, r.channel_id))
@@ -33675,7 +33677,11 @@ mod live_path {
         named.sort_unstable();
         assert_eq!(
             named,
-            [("dia", Some(di.id), id), ("eve", Some(ei.id), id),],
+            [
+                ("bob", Some(bi.id), id),
+                ("dia", Some(di.id), id),
+                ("eve", Some(ei.id), id),
+            ],
             "their name, their account, and this channel"
         );
         assert!(room > 0);
@@ -35084,18 +35090,27 @@ mod live_path {
         assert!(frames >= 2, "{frames}");
         assert_eq!(total, 2001);
 
-        // Bare ids in one page, once a public list names them
+        // Bare ids in one page, once a public room's list names them
+        let room = 2_000_000;
+        put_in_channel(&state, room, &[]).await;
+        for uid in &everyone {
+            state.sessions.get_mut(uid).unwrap().channel_id = room;
+        }
+        let (seen, frames, _) = walk(&mut ann, id).await;
+        assert_eq!((seen, frames), (everyone.clone(), 1));
+        // The lobby's is none since 25: rows again
         for uid in &everyone {
             state.sessions.get_mut(uid).unwrap().channel_id = 0;
         }
         let (seen, frames, _) = walk(&mut ann, id).await;
-        assert_eq!((seen, frames), (everyone, 1));
+        assert_eq!(seen, everyone);
+        assert!(frames >= 2, "{frames}");
     }
 
-    /// General's list is `UserList` as far as a frame holds and pages behind: past some 800
-    /// people it used to be no list at all.
+    /// Since 25 General's list is one's own row: its people come a page at a time, sections
+    /// and then A-Z, from where the last page ended, and a prefix finds names.
     #[tokio::test]
-    async fn generals_list_comes_whole_at_any_size() {
+    async fn generals_list_is_ones_own_row_and_its_pages_walk_everyone_in_order() {
         let state = Arc::new(ServerState::new(
             &ServerConfig {
                 max_users: 4000,
@@ -35122,28 +35137,70 @@ mod live_path {
         let ServerMessage::UserList { users, .. } = first else {
             unreachable!()
         };
-        assert!(users.len() < 2001);
-        let mut seen: Vec<UserId> = users.iter().map(|u| u.user_id).collect();
-        let mut pages = drained(&mut ann).await.into_iter();
-        for m in &mut pages {
-            if let ServerMessage::ChannelPage {
-                channel_id: 0,
+        assert_eq!(
+            users
+                .iter()
+                .map(|u| u.username.as_str())
+                .collect::<Vec<_>>(),
+            ["ann"]
+        );
+        assert!(!drained(&mut ann)
+            .await
+            .iter()
+            .any(|m| matches!(m, ServerMessage::ChannelPage { channel_id: 0, .. })));
+
+        let (names, frames, total) = walk_lobby(&mut ann, "").await;
+        assert_eq!((names.len(), total), (2001, 2001));
+        assert!(frames >= 2, "{frames}");
+        let mut sorted = names.clone();
+        sorted.sort_unstable_by_key(|n| n.to_lowercase());
+        assert_eq!(names, sorted, "A-Z across pages");
+
+        let (found, _, total) = walk_lobby(&mut ann, "SOMEONE-rather-long-19").await;
+        assert_eq!((found.len(), total), (111, 111), "19, 190-199, 1900-1999");
+        // Nor is it asked the old way
+        ann.send(&ClientMessage::RequestChannelPage {
+            channel_id: 0,
+            after: 0,
+        })
+        .await;
+        let page = ann
+            .expect("ChannelPage", |m| {
+                matches!(m, ServerMessage::ChannelPage { .. })
+            })
+            .await;
+        assert!(matches!(page, ServerMessage::ChannelPage { total: 0, .. }));
+    }
+
+    /// Every name a lobby walk gives, the frames it took and the total it said.
+    async fn walk_lobby(c: &mut Client, prefix: &str) -> (Vec<String>, usize, u32) {
+        let (mut names, mut after, mut frames) = (Vec::new(), None, 0);
+        loop {
+            c.send(&ClientMessage::RequestLobbyPage {
+                after: after.clone(),
+                prefix: prefix.into(),
+            })
+            .await;
+            let ServerMessage::LobbyPage {
                 rows,
-                total,
+                next,
+                total: t,
                 ..
-            } = m
-            {
-                assert_eq!(total, 2001);
-                seen.extend(rows.iter().map(|r| r.user_id));
+            } = c
+                .expect("LobbyPage", |m| {
+                    matches!(m, ServerMessage::LobbyPage { .. })
+                })
+                .await
+            else {
+                unreachable!()
+            };
+            frames += 1;
+            names.extend(rows.into_iter().map(|r| r.username));
+            match next {
+                Some(n) => after = Some(n),
+                None => return (names, frames, t),
             }
         }
-        seen.sort_unstable();
-        seen.dedup();
-        assert_eq!(seen.len(), 2001);
-
-        let (walked, frames, total) = walk(&mut ann, 0).await;
-        assert_eq!((walked.len(), total), (2001, 2001));
-        assert!(frames >= 2);
     }
 
     /// Anyone outside gets the same empty page as for a channel that is not there.
@@ -39426,4 +39483,206 @@ async fn measure_connect_reads() {
         worst = worst.max(r.unwrap());
     }
     eprintln!("ROUND-C W2-16: one connect's reads {one:?}; {n} at once {:?} in all, the slowest {worst:?}", t.elapsed());
+}
+
+/// The lobby on a big relay (protocol v25): not sent whole.
+mod big_lobby {
+    use super::*;
+
+    /// What came before a ping's answer: all a client was sent until then.
+    async fn until_pong(c: &mut Client) -> Vec<ServerMessage> {
+        let stamp: u64 = rand::random();
+        c.send(&ClientMessage::Ping { timestamp: stamp }).await;
+        let mut seen = Vec::new();
+        loop {
+            match c.next().await {
+                Some(ServerMessage::Pong { timestamp }) if timestamp == stamp => return seen,
+                Some(m) => seen.push(m),
+                None => panic!("the connection ended"),
+            }
+        }
+    }
+
+    fn joins(seen: &[ServerMessage]) -> Vec<String> {
+        seen.iter()
+            .filter_map(|m| match m {
+                ServerMessage::UserJoined { user } if user.channel_id == 0 => {
+                    Some(user.username.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A join in the lobby reaches who shows its list, while it is small; nobody else, and
+    /// nobody past `live_lobby`.
+    #[tokio::test]
+    async fn a_lobby_join_reaches_its_watchers_while_it_is_small() {
+        let state = Arc::new(ServerState::new(
+            &ServerConfig {
+                live_lobby: 3,
+                ..ServerConfig::default()
+            },
+            ServerSettings::default(),
+            Vec::new(),
+            "test-admin-token".into(),
+        ));
+        let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let mut watcher = connect(&state, "watcher", lo).await;
+        let mut other = connect(&state, "other", lo).await;
+        watcher.send(&ClientMessage::WatchLobby { on: true }).await;
+        until_pong(&mut watcher).await;
+        until_pong(&mut other).await;
+        let _amy = connect(&state, "amy", lo).await;
+        assert_eq!(joins(&until_pong(&mut watcher).await), ["amy"]);
+        assert!(joins(&until_pong(&mut other).await).is_empty());
+        // Four in the lobby is past three: counts only
+        let _ben = connect(&state, "ben", lo).await;
+        assert!(joins(&until_pong(&mut watcher).await).is_empty());
+        // And no watching once it is off
+        watcher.send(&ClientMessage::WatchLobby { on: false }).await;
+        until_pong(&mut watcher).await;
+        assert!(!state.lobby.watchers.contains(&1));
+    }
+
+    /// Exact matches by id, name and account, one row each; ids not online come back `gone`.
+    #[tokio::test]
+    async fn people_are_looked_up_by_id_name_and_account() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let (mut ann, _) = register(&state, "ann").await;
+        let (_bob, bob_info) = register(&state, "bob").await;
+        let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let _cat = connect(&state, "cat#0001", lo).await;
+        let cat_id = *state.username_to_session.get("cat#0001").unwrap();
+        settled(&mut ann).await;
+        ann.send(&ClientMessage::LookupUsers {
+            ids: vec![cat_id, 999_999],
+            names: vec!["BOB".into()],
+            accounts: vec![bob_info.id],
+        })
+        .await;
+        let got = ann
+            .expect("Users", |m| matches!(m, ServerMessage::Users { .. }))
+            .await;
+        let ServerMessage::Users { rows, gone } = got else {
+            unreachable!()
+        };
+        let mut named: Vec<_> = rows
+            .iter()
+            .map(|r| (r.username.as_str(), r.account))
+            .collect();
+        named.sort_unstable();
+        assert_eq!(named, [("bob", Some(bob_info.id)), ("cat#0001", None)]);
+        assert_eq!(gone, [999_999]);
+    }
+
+    /// Each second, the channels whose count changed, and only those; the lobby's too.
+    #[tokio::test]
+    async fn counts_go_out_for_what_changed() {
+        let state = admin_state();
+        let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let mut ann = connect(&state, "ann", lo).await;
+        let mut last = std::collections::HashMap::new();
+        crate::lobby::send_counts(&state, &mut last).await;
+        let counts = |seen: Vec<ServerMessage>| -> Vec<(ChannelId, u32)> {
+            seen.into_iter()
+                .filter_map(|m| match m {
+                    ServerMessage::ChannelCounts { counts } => Some(counts),
+                    _ => None,
+                })
+                .flatten()
+                .collect()
+        };
+        assert_eq!(counts(until_pong(&mut ann).await), [(0, 1)]);
+        crate::lobby::send_counts(&state, &mut last).await;
+        assert!(
+            counts(until_pong(&mut ann).await).is_empty(),
+            "nothing changed"
+        );
+        let _bob = connect(&state, "bob", lo).await;
+        crate::lobby::send_counts(&state, &mut last).await;
+        assert_eq!(counts(until_pong(&mut ann).await), [(0, 2)]);
+    }
+
+    /// A direct message and a poke name their sender's account, as a roster row would:
+    /// an app may hold no row for them since 25.
+    #[tokio::test]
+    async fn a_direct_message_and_a_poke_name_the_senders_account() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let (mut ann, ann_info) = register(&state, "ann").await;
+        let (mut bob, _) = register(&state, "bob").await;
+        settled(&mut ann).await;
+        settled(&mut bob).await;
+        let bob_id = *state.username_to_session.get("bob").unwrap();
+        ann.send(&ClientMessage::SendEncryptedDirectMessage {
+            target_user_id: bob_id,
+            ciphertext: vec![1, 2, 3],
+            message_type: 1,
+        })
+        .await;
+        let dm = bob
+            .expect("a direct message", |m| {
+                matches!(m, ServerMessage::EncryptedDirectChatMessage { .. })
+            })
+            .await;
+        assert!(
+            matches!(dm, ServerMessage::EncryptedDirectChatMessage { account: Some(a), .. } if a == ann_info.id),
+            "{dm:?}"
+        );
+        ann.send(&ClientMessage::SendPoke {
+            target_user_id: bob_id,
+            ciphertext: vec![4],
+            message_type: 1,
+        })
+        .await;
+        let poke = bob
+            .expect("a poke", |m| {
+                matches!(m, ServerMessage::PokeReceived { .. })
+            })
+            .await;
+        assert!(
+            matches!(poke, ServerMessage::PokeReceived { account: Some(a), .. } if a == ann_info.id),
+            "{poke:?}"
+        );
+    }
+}
+
+/// The admin's Load view (protocol v25): an admin is told what the relay carries; nobody else.
+mod load_view {
+    use super::*;
+
+    #[tokio::test]
+    async fn an_admin_sees_the_load_and_nobody_else_does() {
+        let state = admin_state();
+        let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let mut ann = connect(&state, "ann", lo).await;
+        let mut bob = connect(&state, "bob", lo).await;
+        settled(&mut ann).await;
+        settled(&mut bob).await;
+        bob.send(&ClientMessage::AdminLoad).await;
+        let refused = bob
+            .expect("AdminError", |m| {
+                matches!(m, ServerMessage::AdminError { .. })
+            })
+            .await;
+        assert!(matches!(refused, ServerMessage::AdminError { .. }));
+        ann.send(&ClientMessage::AdminLogin {
+            token: "test-admin-token".into(),
+        })
+        .await;
+        settled(&mut ann).await;
+        ann.send(&ClientMessage::AdminLoad).await;
+        let got = ann
+            .expect("AdminLoad", |m| {
+                matches!(m, ServerMessage::AdminLoad { .. })
+            })
+            .await;
+        let ServerMessage::AdminLoad { report } = got else {
+            unreachable!()
+        };
+        assert_eq!((report.online, report.lobby, report.in_rooms), (2, 2, 0));
+        assert_eq!(report.live_lobby, 2000);
+        assert_eq!(report.video_budget_kbps, 1_000_000);
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    }
 }

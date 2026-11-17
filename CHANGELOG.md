@@ -4,7 +4,33 @@ All notable changes to VoIPC are documented here.
 
 ## [Unreleased]
 
+Protocol 25 (1.14): a 1.14 relay admits only 1.14 apps, so update the apps first. A 1.14 app still talks
+to 1.13 relays and older ones.
+
+### Changed
+- **A big server's lobby is no longer sent whole.** Everyone stands in General, so each app was sent a list of
+  everyone online and told of every join there: work that grew with the square of who is online, 197 s of relay
+  CPU to let 5000 people in. Now the Online list comes a page at a time as it scrolls, sorted as before
+  (sections, then A-Z), with a search box over everyone; how many stand in each channel comes counted. Up to
+  `live_lobby` people (2000) an app showing the list still hears each join and leave there, so a small server
+  looks as it always did. On this machine 5000 people now connect on 7.9 s of relay CPU at 114 KiB each, and
+  25,000 on 2.7 GiB with no packet dropped. Rooms keep their live lists.
+- **After a big relay's restart its apps come back spread out**: the first try waits up to a millisecond for each
+  person who was online, at most a minute, instead of all of them within the same second.
+- **A direct message and a poke name their sender's account**, as a roster row does: blocking by account no longer
+  needs the sender to be on a list this app holds.
+- **What screen shares and voice rooms may cost is a setting** (`[media]`): viewers of one share (100), the video the
+  relay sends in all (1000 Mbit/s, counted at each share's resolution), and people in a voice room that names no limit
+  of its own (250; routed rooms keep none). A viewer past a limit is told so, and nothing else changes. **A voice room
+  over 250 now refuses the next joiner** until its limit or `voice_room` is raised.
+- **The admin panel has a Load tab**: who is online and where, each share and the video they cost against the budget,
+  the relay's memory and processor, datagrams dropped, the last minute's refusals, and warnings where a limit is near,
+  asked every two seconds while it is open. A relay with accounts on SQLite and `max_users` above 10,000 says at start
+  that Postgres would serve it better.
+
 ### Fixed
+- **A refused watch stopped your own share**: the relay said it in the words it uses for your own share failing. It now
+  says it apart (`WatchRefused`), and your share goes on.
 - **About one connect in 2000 hung for 30 s and failed on a busy relay**, with nothing in the relay's log. The QUIC
   library puts only 3 random bytes in a connection id, and the id the relay gave a client in its first answer could be
   one a live connection already held: that client's next packet went to the other connection. The relay now draws 8

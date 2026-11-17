@@ -99,6 +99,25 @@ function bool(v: unknown, name: string): boolean {
   return typeof v === "boolean" ? v : fail(`invalid ${name}`);
 }
 
+/** Where a lobby page ended (protocol 25), or null from the start. */
+function lobbyCursor(v: unknown): { section: number; name: string; user_id: number } | null {
+  if (v === null || v === undefined) return null;
+  if (typeof v !== "object") fail("invalid after");
+  const c = v as Record<string, unknown>;
+  const section = u32(c.section, "after.section");
+  if (section > 0xffff) fail("invalid after.section");
+  return { section, name: str(c.name, "after.name"), user_id: u32(c.user_id, "after.user_id") };
+}
+
+/** Account ids: 16 bytes each. */
+function accountIds(v: unknown): number[][] {
+  if (!Array.isArray(v)) fail("invalid accounts");
+  return v.map((a) => {
+    if (!Array.isArray(a) || a.length !== 16) fail("invalid account");
+    return a.map((b) => (Number.isInteger(b) && b >= 0 && b <= 255 ? (b as number) : fail("invalid account")));
+  });
+}
+
 function clamp(v: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, v));
 }
@@ -376,6 +395,13 @@ const handlers: Record<string, Handler> = {
   set_quiet: ({ server, channels, quiet }) => need(server).setQuiet(ids(channels, "channels"), bool(quiet, "quiet")),
   request_channel_page: ({ server, channelId, after }) =>
     need(server).sendControl({ RequestChannelPage: { channel_id: u32(channelId, "channelId"), after: u32(after, "after") } }),
+  request_lobby_page: ({ server, after, prefix }) =>
+    need(server).sendControl({ RequestLobbyPage: { after: lobbyCursor(after), prefix: str(prefix ?? "", "prefix") } }),
+  lookup_users: ({ server, ids: asked, names, accounts }) => {
+    const n = Array.isArray(names) ? names.map((x) => str(x, "names")) : fail("invalid names");
+    need(server).sendControl({ LookupUsers: { ids: ids(asked, "ids"), names: n, accounts: accountIds(accounts) } });
+  },
+  watch_lobby: ({ server, on }) => need(server).sendControl({ WatchLobby: { on: bool(on, "on") } }),
   set_metered: ({ metered }) => session.setMetered(bool(metered, "metered")),
   key_job_answer: ({ server, channelId, go }) => need(server).keyJobAnswer(u32(channelId, "channelId"), bool(go, "go")),
   create_channel: ({ server, name, password, proximity, anonymous, text }) => {
@@ -629,6 +655,7 @@ const handlers: Record<string, Handler> = {
     return need(server).sendControl({ AdminUnban: { id } });
   },
   admin_list_bans: ({ server }) => need(server).sendControl("AdminListBans"),
+  admin_load: ({ server }) => need(server).sendControl("AdminLoad"),
   admin_bans_page: ({ server, search, offset }) =>
     need(server).sendControl({ AdminBansPage: { search: str(search, "search"), offset: u32(offset, "offset") } }),
 

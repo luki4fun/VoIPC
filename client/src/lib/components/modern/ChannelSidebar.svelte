@@ -34,6 +34,7 @@
   import { restrictions } from "../../stores/restrictions.js";
   import { markTitle } from "../../restrict-rules.js";
   import { showChatPane } from "../../stores/platform.js";
+  import { lookUpNames } from "../../stores/lobby.js";
   import {
     activeDmUserId,
     activeDmUsername,
@@ -88,6 +89,16 @@
   // own, and listing them twice would say they are in two places at once.
   // Which channels are listed at all: stores/roster.ts `visibleChannels`
   const groups = $derived(groupChannels($visibleChannels, $channelLayout));
+  // Who a conversation is with, if they stand in the lobby (protocol 25): asked again each minute
+  let dmTick = $state(0);
+  $effect(() => {
+    void dmTick;
+    lookUpNames($serverAddress, $dmList.map(({ convo }) => convo.username));
+  });
+  $effect(() => {
+    const every = setInterval(() => dmTick++, 60_000);
+    return () => clearInterval(every);
+  });
   const foldedIds = $derived($uiPrefs.folded_categories[serverKey($serverAddress)] ?? []);
   /** What a folded category's heading says is waiting in it. */
   const unreadIn = (g: ChannelGroup) =>

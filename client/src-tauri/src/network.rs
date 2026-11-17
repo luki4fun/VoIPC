@@ -1689,6 +1689,8 @@ async fn handle_server_message(
     // anonymous channel adds nothing here.
     let seen: &[UserInfo] = match &msg {
         ServerMessage::UserList { users, .. } | ServerMessage::ChannelUsers { users, .. } => users,
+        // Since 25 the lobby comes in pages and lookups, not whole
+        ServerMessage::LobbyPage { rows, .. } | ServerMessage::Users { rows, .. } => rows,
         ServerMessage::UserJoined { user } | ServerMessage::UserUpdated { user } => {
             std::slice::from_ref(user)
         }
@@ -2434,6 +2436,50 @@ async fn handle_server_message(
                 serde_json::json!({"channel_id": channel_id, "users": users}),
             );
         }
+        ServerMessage::ChannelCounts { counts } => {
+            emit_server(
+                app_handle,
+                server,
+                "channel-counts",
+                serde_json::json!({"counts": counts}),
+            );
+        }
+        ServerMessage::LobbyPage {
+            rows,
+            next,
+            total,
+            sections,
+            prefix,
+        } => {
+            emit_server(
+                app_handle,
+                server,
+                "lobby-page",
+                serde_json::json!({"rows": rows, "next": next, "total": total, "sections": sections, "prefix": prefix}),
+            );
+        }
+        ServerMessage::WatchRefused {
+            sharer_user_id,
+            reason,
+        } => {
+            emit_server(
+                app_handle,
+                server,
+                "watch-refused",
+                serde_json::json!({"sharer_user_id": sharer_user_id, "reason": reason}),
+            );
+        }
+        ServerMessage::AdminLoad { report } => {
+            emit_server(app_handle, server, "admin-load", serde_json::json!(report));
+        }
+        ServerMessage::Users { rows, gone } => {
+            emit_server(
+                app_handle,
+                server,
+                "users",
+                serde_json::json!({"rows": rows, "gone": gone}),
+            );
+        }
         ServerMessage::InviteReceived {
             channel_id,
             channel_name,
@@ -2473,6 +2519,7 @@ async fn handle_server_message(
             from_username,
             ciphertext,
             message_type,
+            account: from_account,
         } => {
             // Decrypt the poke message using Signal Protocol
             let message = {
@@ -2516,6 +2563,7 @@ async fn handle_server_message(
                 serde_json::json!({
                     "from_user_id": from_user_id,
                     "from_username": from_username,
+                    "from_account": from_account,
                     "message": message,
                 }),
             );
@@ -2533,6 +2581,7 @@ async fn handle_server_message(
                     serde_json::json!({
                         "from_user_id": from_user_id,
                         "from_username": from_username,
+                        "from_account": from_account,
                         "to_user_id": own_user_id,
                         "content": format!("[Poke] {}", message),
                         "timestamp": timestamp,
@@ -2768,10 +2817,12 @@ async fn handle_server_message(
             ciphertext,
             message_type,
             timestamp,
+            account: from_account,
         } => {
             handle_encrypted_direct_message(
                 from_user_id,
                 &from_username,
+                from_account,
                 to_user_id,
                 &ciphertext,
                 message_type,
@@ -4068,6 +4119,7 @@ async fn drain_pending_channel_messages(
 fn handle_encrypted_direct_message(
     from_user_id: u32,
     from_username: &str,
+    from_account: Option<[u8; 16]>,
     to_user_id: u32,
     ciphertext: &[u8],
     message_type: u8,
@@ -4139,6 +4191,7 @@ fn handle_encrypted_direct_message(
                 serde_json::json!({
                     "from_user_id": from_user_id,
                     "from_username": from_username,
+                    "from_account": from_account,
                     "to_user_id": to_user_id,
                     "content": msg.text,
                     "timestamp": timestamp,
@@ -4169,6 +4222,7 @@ fn handle_encrypted_direct_message(
                 serde_json::json!({
                     "from_user_id": from_user_id,
                     "from_username": from_username,
+                    "from_account": from_account,
                     "to_user_id": to_user_id,
                     "content": "[encrypted message — decryption failed]",
                     "timestamp": timestamp,

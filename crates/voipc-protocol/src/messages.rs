@@ -417,6 +417,27 @@ pub enum ClientMessage {
         kyber_prekey: Vec<u8>,
         kyber_prekey_signature: Vec<u8>,
     },
+
+    // ── The lobby on a big relay (protocol v25) ─────────────────────
+    /// A page of who stands in the lobby, sections first and then A-Z, from past `after`
+    /// (`None` from the start). A `prefix` keeps the names that start with it, whatever
+    /// their case. `ServerMessage::LobbyPage` answers. Since 25 the lobby is not sent whole.
+    RequestLobbyPage {
+        after: Option<LobbyCursor>,
+        prefix: String,
+    },
+    /// Who these are, if they are online: by id, by name, by account, exact matches only,
+    /// at most `MAX_LOOKUP` of all three together. `ServerMessage::Users` answers.
+    LookupUsers {
+        ids: Vec<UserId>,
+        names: Vec<String>,
+        accounts: Vec<[u8; 16]>,
+    },
+    /// The app shows the lobby's list. While the lobby is small, a watcher is told each
+    /// join and leave there by name; past that, only `ChannelCounts`.
+    WatchLobby { on: bool },
+    /// What the relay carries now, for an admin: `ServerMessage::AdminLoad` answers.
+    AdminLoad,
 }
 
 /// The client's side of an account sign-in, between `Authenticate` and
@@ -1964,6 +1985,9 @@ pub enum ServerMessage {
         ciphertext: Vec<u8>,
         message_type: u8,
         timestamp: u64,
+        /// The sender's account, as a roster row would show it (since 25: the lobby is
+        /// not sent whole, so an app may hold no row for them).
+        account: Option<[u8; 16]>,
     },
 
     /// An encrypted channel message was received.
@@ -2001,6 +2025,8 @@ pub enum ServerMessage {
         from_username: String,
         ciphertext: Vec<u8>,
         message_type: u8,
+        /// As on `EncryptedDirectChatMessage`.
+        account: Option<[u8; 16]>,
     },
 
     // ── Moderation ───────────────────────────────────────────────────
@@ -2309,6 +2335,36 @@ pub enum ServerMessage {
         channel_id: ChannelId,
         user_id: UserId,
     },
+
+    // ── The lobby on a big relay (protocol v25) ─────────────────────
+    /// How many are in the channels whose count changed, the lobby's included, at most
+    /// once a second. Since 25 the joins and leaves of the lobby are not told to everyone.
+    ChannelCounts { counts: Vec<(ChannelId, u32)> },
+    /// What `RequestLobbyPage` asked. `next`: where to ask on from, `None` at the end.
+    /// `total`: everyone it lists, those matching with a prefix. `sections`: each
+    /// section's rank and how many stand in it, of the whole lobby. `prefix`: as asked, so
+    /// an app tells a list's page from a search for a name being typed.
+    LobbyPage {
+        rows: Vec<UserInfo>,
+        next: Option<LobbyCursor>,
+        total: u32,
+        sections: Vec<(u16, u32)>,
+        prefix: String,
+    },
+    /// What `LookupUsers` asked: whoever was found. `gone`: asked ids that are not online.
+    Users {
+        rows: Vec<UserInfo>,
+        gone: Vec<UserId>,
+    },
+    /// A watch the relay will not start: the share is full, the relay sends all the video
+    /// it may, or the share is gone. Unlike `ScreenShareError` it is no word about one's
+    /// own share (protocol v25).
+    WatchRefused {
+        sharer_user_id: UserId,
+        reason: String,
+    },
+    /// What `ClientMessage::AdminLoad` asked.
+    AdminLoad { report: LoadReport },
 }
 
 /// A relay's refusal of `AccountRequest::KeyChallenge` for an account whose password is not a

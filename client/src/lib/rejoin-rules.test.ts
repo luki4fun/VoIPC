@@ -82,3 +82,10 @@ test("a dropped connection is said once, however the transport words it", () => 
   assert.equal(connectionLostLine("Server closed connection"), "Connection lost: Server closed connection");
   assert.equal(connectionLostLine("Connection lost (code 1006)"), "Connection lost (code 1006)");
 });
+
+test("a big relay's drop spreads the first try over a millisecond each, at most a minute", () => {
+  assert.equal(reconnectDelay(1, () => 0, 100_000), 500, "the earliest is unchanged");
+  assert.equal(reconnectDelay(1, () => 1, 100_000), 1500 + 60_000);
+  assert.equal(reconnectDelay(1, () => 1, 2000), 1500 + 2000);
+  assert.equal(reconnectDelay(2, () => 1, 100_000), 3000, "only the first");
+});

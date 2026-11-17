@@ -532,6 +532,35 @@ so no fsync cost and no cold reads, and these are floors.
 Discord's rate is what limits a run, never this. Search has no index of its own: it scans a channel, and at most two go
 at once.
 
+**Since 1.14 the lobby is not sent whole**, which was what made a join cost the relay more the more people were
+online. Measured on the same machine, 2026-11-16, guests connecting and staying (`community_load run N … --idle S`),
+load clients on the same machine:
+
+| Clients | Relay CPU to let them in | Relay RSS | Each | Connect p95 | Datagrams dropped |
+|---|---|---|---|---|---|
+| 5,000, before 1.14 | 197 s | 1,177 MiB | 241 KiB | 21 ms | 1,621 |
+| 5,000 | 7.9 s | 558 MiB | 114 KiB | 2 ms | 0 |
+| 10,000 | 17 s | 1,111 MiB | 113 KiB | 1 ms | 0 |
+| 25,000 | 103 s | 2,554 MiB | 104 KiB | 8 ms | 0 |
+| 50,000 | 158 s | 4,169 MiB | 85 KiB | 3 ms | 0 |
+
+An idle relay of 25,000 used 0.28 of a core. With text channels on the live path (`community_load follow`), the relay
+killed with `kill -9` halfway and started again: 10,000 were all back in 57 s, 25,000 in 89 s. At 25,000 with posts
+going out, every post to that many readers comes back as that many acknowledgements at once, and an 8 MiB buffer (this
+machine's `rmem_max` cap) dropped them: give such a relay the larger buffer above.
+
+Screen shares (`share_load`, one HD share at 7.5 Mbit/s, 30 frames a second, viewers on the same machine):
+
+| Viewers | Sent to them | Frames a second each | Relay CPU | Datagrams dropped |
+|---|---|---|---|---|
+| 100 | 0.8 Gbit/s | 30 | 0.3 of a core | 0 |
+| 500 | 4.1 Gbit/s | 31 | 2 cores | 0 |
+| 1,000 | 8.5 Gbit/s | 32 | 4.4 cores | 0 |
+| 2,000 | 11.5 of 15 Gbit/s | 22 | 10 cores | 197,000 |
+
+So a relay sends about 1,000 HD viewers before its network port is full, and its processor follows at about half a
+core per Gbit/s. `[media]` (§13) keeps it under what its port carries.
+
 Not measured: voice in a big channel (`voice_load` is for that), accounts signing in at once, real
 networks.
 
@@ -540,6 +569,7 @@ cargo build -p voipc-server --release --bin voipc-server --example community_loa
 target/release/voipc-server -c server.toml &   # max_users above N
 target/release/examples/community_load run 500 127.0.0.1:9987 "$!"
 target/release/examples/community_load run 5000 127.0.0.1:9987 "$!" --rate 200 --idle 60   # memory per connection
+target/release/examples/share_load 500 127.0.0.1:9987 "$!" --shares 1 --mbit 7.5 --fps 30   # [media] above what it asks
 target/release/examples/community_load frames
 target/release/examples/community_load crypto 2000
 ```
@@ -656,12 +686,18 @@ tcp_port = 9987           # HTTPS: the browser page, file transfers (and the TCP
 udp_port = 9987           # QUIC endpoint (all clients) — keep equal to tcp_port so one host:port reaches both
 tcp_fallback = false      # true: clients that cannot reach UDP carry everything over tcp_port (see below)
 max_users = 64
+live_lobby = 2000         # While General holds at most this many, an app showing its list hears each join there by name; above it, counts and pages
 max_connections_per_ip = 32   # A browser client holds two of these, a native client one — so 32 is sixteen browser users behind one NAT.
                               # Mobile carriers put thousands behind one address: raise it on a big public relay
                               # (each 32 more also lets that address handshake and connect that much faster)
 cert_path = "certs/server.crt"
 key_path = "certs/server.key"
 admin_token = "change-me"  # optional; unset = a random token is printed in the log at every start (with accounts, only while no account is admin)
+
+[media]                    # what screen shares and voice rooms may cost (1.14)
+share_viewers = 100        # viewers of one share; one more is told it is full
+video_egress_mbit = 1000   # video sent, all shares together, counted at each share's resolution (1080p 7.5, 720p 4, less 2 Mbit/s)
+voice_room = 250           # people in a voice room that names no limit (0: none); routed rooms keep none
 
 [files]                    # the encrypted file cache, on by default (§11 has every key)
 max_size_mb = 10           # largest file blob

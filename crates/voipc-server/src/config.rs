@@ -56,6 +56,12 @@ pub struct ServerConfig {
     #[serde(default = "default_max_connections_per_ip")]
     pub max_connections_per_ip: u32,
 
+    /// While the lobby holds at most this many, an app showing its list hears each
+    /// join and leave there by name; past it, only how many (protocol v25). Each one told
+    /// is a message to every watcher, so on a big relay the list comes in pages instead.
+    #[serde(default = "default_live_lobby")]
+    pub live_lobby: u32,
+
     /// Let clients that cannot reach the QUIC endpoint — because something
     /// between them and this server drops UDP — tunnel the whole session,
     /// control, voice and video, through a WebSocket on `tcp_port`
@@ -98,6 +104,36 @@ pub struct ServerConfig {
     /// Off by default.
     #[serde(default)]
     pub update: UpdateConfig,
+
+    /// What screen shares may cost this relay (`[media]`, 1.14).
+    #[serde(default)]
+    pub media: MediaConfig,
+}
+
+/// `[media]`: what screen shares may cost this relay. One HD viewer is about 7.5 Mbit/s
+/// out, so a 1 Gbit port carries about 130 of them, whichever shares they watch.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MediaConfig {
+    /// Viewers of one share: one more is told it is full.
+    pub share_viewers: u32,
+    /// Video this relay sends, all shares together (Mbit/s), counted at what each share's
+    /// resolution may send, not at what it sends now: a still screen sends little until it moves.
+    pub video_egress_mbit: u32,
+    /// People in a voice room that names no limit of its own (0: none). Each joiner trades
+    /// keys with every member, and every voice packet goes to each: 250 is a 15 s join.
+    /// Routed (proximity) rooms send each packet only to who is near and keep no such cap.
+    pub voice_room: u32,
+}
+
+impl Default for MediaConfig {
+    fn default() -> Self {
+        Self {
+            share_viewers: 100,
+            video_egress_mbit: 1000,
+            voice_room: 250,
+        }
+    }
 }
 
 /// Whether guests may stay when the relay has accounts.
@@ -451,6 +487,10 @@ fn default_max_connections_per_ip() -> u32 {
     32
 }
 
+fn default_live_lobby() -> u32 {
+    2000
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -460,12 +500,14 @@ impl Default for ServerConfig {
             udp_port: default_udp_port(),
             max_users: default_max_users(),
             max_connections_per_ip: default_max_connections_per_ip(),
+            live_lobby: default_live_lobby(),
             tcp_fallback: false,
             cert_path: "certs/server.crt".into(),
             key_path: "certs/server.key".into(),
             admin_token: None,
             accounts: AccountsConfig::default(),
             files: FilesConfig::default(),
+            media: MediaConfig::default(),
             emotes: EmotesConfig::default(),
             update: UpdateConfig::default(),
         }

@@ -3778,6 +3778,7 @@ mod tests {
                 ciphertext: vec![],
                 message_type: 1,
                 timestamp: 0,
+                account: None,
             };
             assert!(
                 d.k.live_holds_frame(&dm),

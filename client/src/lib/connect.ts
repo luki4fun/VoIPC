@@ -27,7 +27,7 @@ import {
   userId,
   username,
 } from "./stores/connection.js";
-import { voice, voiceServer } from "./stores/channels.js";
+import { channels, voice, voiceServer } from "./stores/channels.js";
 import {
   claimLegacyKeys,
   clearServerUnread,
@@ -667,10 +667,12 @@ async function reconnectLoop(
   // Generous budget: a Wi-Fi roam, VPN flap, or laptop lid-close should
   // not end the session. The overlay has a Cancel button for giving up.
   const RECONNECT_TIMEOUT_MS = 300_000;
+  // How many were online as it dropped: on a big relay the first try waits its turn
+  const online = get(channels.peek(server)).find((c) => c.channel_id === 0)?.user_count ?? 0;
 
   for (let attempt = 1; !run.cancelled; attempt++) {
     info.update((i) => ({ ...i, attempt }));
-    const delay = reconnectDelay(attempt);
+    const delay = reconnectDelay(attempt, Math.random, online);
 
     // Wait before retrying
     await new Promise((resolve) => setTimeout(resolve, delay));

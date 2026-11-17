@@ -373,6 +373,162 @@ pub const RESHAPED: &[(u32, Side, u32, &str)] = &[
         46,
         "AccountReply::DeviceForgotten never comes",
     ),
+    (
+        12,
+        Side::Server,
+        32,
+        "EncryptedDirectChatMessage without the sender's account",
+    ),
+    (
+        12,
+        Side::Server,
+        36,
+        "PokeReceived without the sender's account",
+    ),
+    (
+        13,
+        Side::Server,
+        32,
+        "EncryptedDirectChatMessage without the sender's account",
+    ),
+    (
+        13,
+        Side::Server,
+        36,
+        "PokeReceived without the sender's account",
+    ),
+    (
+        14,
+        Side::Server,
+        32,
+        "EncryptedDirectChatMessage without the sender's account",
+    ),
+    (
+        14,
+        Side::Server,
+        36,
+        "PokeReceived without the sender's account",
+    ),
+    (
+        15,
+        Side::Server,
+        32,
+        "EncryptedDirectChatMessage without the sender's account",
+    ),
+    (
+        15,
+        Side::Server,
+        36,
+        "PokeReceived without the sender's account",
+    ),
+    (
+        16,
+        Side::Server,
+        32,
+        "EncryptedDirectChatMessage without the sender's account",
+    ),
+    (
+        16,
+        Side::Server,
+        36,
+        "PokeReceived without the sender's account",
+    ),
+    (
+        17,
+        Side::Server,
+        32,
+        "EncryptedDirectChatMessage without the sender's account",
+    ),
+    (
+        17,
+        Side::Server,
+        36,
+        "PokeReceived without the sender's account",
+    ),
+    (
+        18,
+        Side::Server,
+        32,
+        "EncryptedDirectChatMessage without the sender's account",
+    ),
+    (
+        18,
+        Side::Server,
+        36,
+        "PokeReceived without the sender's account",
+    ),
+    (
+        19,
+        Side::Server,
+        32,
+        "EncryptedDirectChatMessage without the sender's account",
+    ),
+    (
+        19,
+        Side::Server,
+        36,
+        "PokeReceived without the sender's account",
+    ),
+    (
+        20,
+        Side::Server,
+        32,
+        "EncryptedDirectChatMessage without the sender's account",
+    ),
+    (
+        20,
+        Side::Server,
+        36,
+        "PokeReceived without the sender's account",
+    ),
+    (
+        21,
+        Side::Server,
+        32,
+        "EncryptedDirectChatMessage without the sender's account",
+    ),
+    (
+        21,
+        Side::Server,
+        36,
+        "PokeReceived without the sender's account",
+    ),
+    (
+        22,
+        Side::Server,
+        32,
+        "EncryptedDirectChatMessage without the sender's account",
+    ),
+    (
+        22,
+        Side::Server,
+        36,
+        "PokeReceived without the sender's account",
+    ),
+    (
+        23,
+        Side::Server,
+        32,
+        "EncryptedDirectChatMessage without the sender's account",
+    ),
+    (
+        23,
+        Side::Server,
+        36,
+        "PokeReceived without the sender's account",
+    ),
+    (
+        24,
+        Side::Server,
+        32,
+        "EncryptedDirectChatMessage without the sender's account",
+    ),
+    (
+        24,
+        Side::Server,
+        36,
+        "PokeReceived without the sender's account",
+    ),
 ];
 
 /// How many messages each side had at a protocol: an index at or past it is
@@ -386,7 +542,7 @@ fn client_messages(proto: u32) -> u32 {
         18 => 52,
         19 => 54,
         20 => 55,
-        21..=23 => 64,
+        21..=24 => 64,
         _ => u32::MAX,
     }
 }
@@ -402,6 +558,8 @@ const CHANNEL_USERS: u32 = 18;
 const EMOTE_LIST: u32 = 56;
 const EMOTE_TICKET: u32 = 57;
 const RESTRICTIONS: u32 = 68;
+const DIRECT_MESSAGE: u32 = 32;
+const POKE_RECEIVED: u32 = 36;
 
 /// `encode_client_msg` for a relay at `proto`: the frames to send, one each
 /// so a sender's pacer counts them as the relay does (`EmoteRemove` of many
@@ -647,6 +805,8 @@ pub fn decode_server_msg_from(payload: &[u8], proto: u32) -> Result<ServerMessag
                 emotes: list.emotes.into_iter().map(Emote::from).collect(),
             }
         }
+        (DIRECT_MESSAGE, ..=24) => postcard::from_bytes::<Direct24>(rest)?.into(),
+        (POKE_RECEIVED, ..=24) => postcard::from_bytes::<Poke24>(rest)?.into(),
         (RESTRICTIONS, 19..=22) => ServerMessage::Restrictions {
             list: postcard::from_bytes::<Restrictions22>(rest)?
                 .list
@@ -681,6 +841,54 @@ struct Restriction22 {
     expires_in_secs: Option<u32>,
     by: String,
     reason: String,
+}
+
+/// A direct message before 25, which named no account: the app knew it off the lobby.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename = "EncryptedDirectChatMessage")]
+struct Direct24 {
+    from_user_id: UserId,
+    from_username: String,
+    to_user_id: UserId,
+    ciphertext: Vec<u8>,
+    message_type: u8,
+    timestamp: u64,
+}
+
+impl From<Direct24> for ServerMessage {
+    fn from(m: Direct24) -> ServerMessage {
+        ServerMessage::EncryptedDirectChatMessage {
+            from_user_id: m.from_user_id,
+            from_username: m.from_username,
+            to_user_id: m.to_user_id,
+            ciphertext: m.ciphertext,
+            message_type: m.message_type,
+            timestamp: m.timestamp,
+            account: None,
+        }
+    }
+}
+
+/// A poke before 25, as `Direct24`.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename = "PokeReceived")]
+struct Poke24 {
+    from_user_id: UserId,
+    from_username: String,
+    ciphertext: Vec<u8>,
+    message_type: u8,
+}
+
+impl From<Poke24> for ServerMessage {
+    fn from(m: Poke24) -> ServerMessage {
+        ServerMessage::PokeReceived {
+            from_user_id: m.from_user_id,
+            from_username: m.from_username,
+            ciphertext: m.ciphertext,
+            message_type: m.message_type,
+            account: None,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1050,6 +1258,23 @@ mod tests {
         ];
         let cases = cases
             .into_iter()
+            .chain((OLDEST_RELAY_PROTOCOL..25).flat_map(|v| {
+                [
+                    (
+                        traced::<Direct24>(),
+                        "EncryptedDirectChatMessage",
+                        variant(
+                            v,
+                            &["ServerMessage", "ENUM", "32", "EncryptedDirectChatMessage"],
+                        ),
+                    ),
+                    (
+                        traced::<Poke24>(),
+                        "PokeReceived",
+                        variant(v, &["ServerMessage", "ENUM", "36", "PokeReceived"]),
+                    ),
+                ]
+            }))
             .chain((OLDEST_RELAY_PROTOCOL..16).flat_map(|v| {
                 [
                     (

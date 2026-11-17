@@ -1080,8 +1080,10 @@ async fn handle_message(
             if !state.spend(session_id, |s| &mut s.roster_rate) {
                 return Ok(());
             }
-            let allowed = state.is_channel_public_or_member(channel_id, user_id).await
-                || state.is_admin(session_id);
+            // The lobby comes by `RequestLobbyPage` since 25, sorted and never whole
+            let allowed = channel_id != 0
+                && (state.is_channel_public_or_member(channel_id, user_id).await
+                    || state.is_admin(session_id));
             let (ids, rows, next, total) = if allowed {
                 state.channel_page(channel_id, session_id, after).await
             } else {
@@ -1308,12 +1310,47 @@ async fn handle_message(
             let takers = crate::report::takers_for(state, session_id, user_id).await;
             let _ = send_msg(tx, &ServerMessage::ReportTakers { takers });
         }
+        ClientMessage::RequestLobbyPage { after, prefix } => {
+            if !state.spend(session_id, |s| &mut s.roster_rate) {
+                return Ok(());
+            }
+            let _ = send_msg(tx, &crate::lobby::page(state, after, &prefix).await);
+        }
+        ClientMessage::LookupUsers {
+            ids,
+            names,
+            accounts,
+        } => {
+            if !state.spend(session_id, |s| &mut s.roster_rate) {
+                return Ok(());
+            }
+            let _ = send_msg(
+                tx,
+                &crate::lobby::lookup(state, &ids, &names, &accounts).await,
+            );
+        }
+        ClientMessage::AdminLoad => {
+            if state.is_admin(session_id) {
+                let report = crate::load::report(state).await;
+                let _ = send_msg(tx, &ServerMessage::AdminLoad { report });
+            } else {
+                admin_error(tx, "not an admin").await;
+            }
+        }
+        ClientMessage::WatchLobby { on } => {
+            if on {
+                state.lobby.watchers.insert(user_id);
+            } else {
+                state.lobby.watchers.remove(&user_id);
+            }
+        }
         ClientMessage::RequestChannelUsers { channel_id } => {
             if !state.spend(session_id, |s| &mut s.roster_rate) {
                 return Ok(());
             }
-            let allowed = state.is_channel_public_or_member(channel_id, user_id).await
-                || state.is_admin(session_id);
+            let allowed = channel_id != 0
+                && (state.is_channel_public_or_member(channel_id, user_id).await
+                    || state.is_admin(session_id));
             let users = if allowed {
                 state.users_in_channel_for(channel_id, session_id).await
             } else {
@@ -1866,13 +1903,18 @@ async fn handle_join_channel(
         // Shouldn't happen, but handle gracefully
         warn!(user_id, "join failed after validation: {}", e);
         let _ = state.join_channel(user_id, session_id, 0, None).await;
-        let users = state.users_in_channel_for(0, session_id).await;
+        let users = vec![user_info_for(state, user_id, session_id, 0)];
         send_roster(tx, 0, users, user_list);
         return Ok(());
     }
 
-    // Send user list for the new channel to the joining user
-    let users = state.users_in_channel_for(channel_id, session_id).await;
+    // Send user list for the new channel to the joining user: the lobby's, only their own
+    // row since 25 (its people come a page at a time)
+    let users = if channel_id == 0 {
+        vec![user_info_for(state, user_id, session_id, 0)]
+    } else {
+        state.users_in_channel_for(channel_id, session_id).await
+    };
     send_roster(tx, channel_id, users, user_list);
     tell_listen_only(state, session_id, channel_id, tx);
 
@@ -2114,10 +2156,9 @@ async fn broadcast_user(state: &Arc<ServerState>, user: UserInfo, updated: bool)
     // What a recipient is told turns on three things only (told the name, an admin, may be
     // told who): one frame for each, shared, where this encoded one for every session
     let mut frames: [Option<bytes::Bytes>; 8] = Default::default();
-    for entry in state.sessions.iter() {
-        let session = entry.value();
+    let mut tell = |session: &crate::state::UserSession| {
         if session.user_id == user.user_id || !crate::gates::passes(session, &roster.gate) {
-            continue;
+            return;
         }
         // Two different questions. The name goes to the channel's own people
         // only, always has, and that is what keeps a move between an anonymous
@@ -2130,7 +2171,7 @@ async fn broadcast_user(state: &Arc<ServerState>, user: UserInfo, updated: bool)
         // ask. A bare id in `KeysOwed` leans on this.
         let told_name = roster.knows_them(session.user_id) || roster.public;
         if updated && !(told_name || session.is_admin) {
-            continue;
+            return;
         }
         let may_name = roster.may_name(session.user_id, user.user_id) || session.is_admin;
         let class =
@@ -2178,7 +2219,8 @@ async fn broadcast_user(state: &Arc<ServerState>, user: UserInfo, updated: bool)
         if let Some(frame) = &frames[class] {
             let _ = session.control_tx.try_send(frame.clone());
         }
-    }
+    };
+    for_lobby_or_all(state, user.channel_id, |s| tell(s)).await;
 }
 
 /// Tell every session that somebody left a channel, under the same rule as
@@ -2206,19 +2248,40 @@ async fn broadcast_user_left(
     let (Ok(named), Ok(unnamed)) = (frame(true), frame(false)) else {
         return;
     };
-    for entry in state.sessions.iter() {
-        let session = entry.value();
+    for_lobby_or_all(state, channel_id, |session| {
         if Some(session.user_id) == exclude {
-            continue;
+            return;
         }
         // Outside a gate, not even the count: the channel is not there
         if session.user_id != user_id && !crate::gates::passes(session, &roster.gate) {
-            continue;
+            return;
         }
         let may_name = roster.may_name(session.user_id, user_id) || session.is_admin;
         let _ = session
             .control_tx
             .try_send(if may_name { &named } else { &unnamed }.clone());
+    })
+    .await;
+}
+
+/// Each session a join, leave or change in `channel_id` is told to: everyone, but for the
+/// lobby only its watchers while it is small (`lobby::hearers`); `ChannelCounts` tells the
+/// rest how many.
+async fn for_lobby_or_all(
+    state: &ServerState,
+    channel_id: ChannelId,
+    mut tell: impl FnMut(&crate::state::UserSession),
+) {
+    if channel_id == 0 {
+        for uid in crate::lobby::hearers(state).await {
+            if let Some(session) = state.sessions.get(&uid) {
+                tell(&session);
+            }
+        }
+    } else {
+        for entry in state.sessions.iter() {
+            tell(entry.value());
+        }
     }
 }
 
@@ -2270,6 +2333,17 @@ impl RosterAudience {
 }
 
 async fn roster_audience(state: &ServerState, channel_id: ChannelId) -> RosterAudience {
+    // The lobby: open, ungated, and everyone in it. Its members are not copied: told only to
+    // its watchers, each of whom may be named, and a copy of everyone online each join was
+    // the biggest cost of a join on a big relay
+    if channel_id == 0 {
+        return RosterAudience {
+            members: Default::default(),
+            private: false,
+            public: true,
+            gate: Vec::new(),
+        };
+    }
     let channels = state.channels.read().await;
     match channels.get(&channel_id) {
         Some(channel) => RosterAudience {
@@ -2885,11 +2959,21 @@ async fn handle_send_poke(
         .sessions
         .contains_key(&target_user_id)
         .then_some(target_user_id);
-    let from_username = match target_session {
-        Some(sid) => state.display_name(from_user_id, sid).await,
-        None => String::new(),
+    let (real, alias) = state.names_of(from_user_id).await;
+    let from_account = state
+        .sessions
+        .get(&from_session_id)
+        .and_then(|s| s.account_id());
+    let (from_username, account) = match target_session {
+        Some(sid) => {
+            let admin = state.is_admin(sid);
+            (
+                crate::state::pick_name(&real, &alias, admin),
+                crate::state::account_shown(from_account, alias.is_none(), admin),
+            )
+        }
+        None => (String::new(), None),
     };
-    let _ = from_session_id;
 
     // Relay the encrypted poke. One to an offline user is dropped silently,
     // which prevents user enumeration.
@@ -2901,6 +2985,7 @@ async fn handle_send_poke(
                 from_username,
                 ciphertext,
                 message_type,
+                account,
             },
         );
     }
@@ -3520,7 +3605,7 @@ async fn handle_start_screen_share(
         .unwrap_or(0);
 
     match state
-        .start_screen_share(user_id, session_id, channel_id, codec)
+        .start_screen_share(user_id, session_id, channel_id, codec, resolution)
         .await
     {
         Ok(member_sessions) => {
@@ -3678,10 +3763,12 @@ async fn handle_watch_screen_share(
                 }
             }
         }
+        // Its own message: an app read `ScreenShareError` as its own share failing
         Err(e) => {
             let _ = send_msg(
                 tx,
-                &ServerMessage::ScreenShareError {
+                &ServerMessage::WatchRefused {
+                    sharer_user_id,
                     reason: e.to_string(),
                 },
             );
@@ -3879,24 +3966,30 @@ async fn handle_encrypted_direct_message(
         return Ok(());
     }
     let (real, alias) = state.names_of(from_user_id).await;
+    let from_account = state
+        .sessions
+        .get(&from_session_id)
+        .and_then(|s| s.account_id());
 
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let message = |username: String| ServerMessage::EncryptedDirectChatMessage {
+    // Under a pseudonym, as on a roster: no account but to an admin
+    let message = |username: String, admin: bool| ServerMessage::EncryptedDirectChatMessage {
         from_user_id,
         from_username: username,
         to_user_id: target_user_id,
         ciphertext: ciphertext.clone(),
         message_type,
         timestamp,
+        account: crate::state::account_shown(from_account, alias.is_none(), admin),
     };
 
     let mut delivered = false;
     if let Some(session) = state.sessions.get(&target_user_id) {
         let name = crate::state::pick_name(&real, &alias, session.is_admin);
-        let _ = send_msg(&session.control_tx, &message(name));
+        let _ = send_msg(&session.control_tx, &message(name, session.is_admin));
         // A full queue is a client still here and not reading; a closed
         // one is a session on its way out
         delivered = !session.control_tx.is_closed();
@@ -3916,8 +4009,9 @@ async fn handle_encrypted_direct_message(
     // themselves goes by. Their app shows its own copy and reads none of this: past a
     // short one it is a sealed history answer coming back up to 48 KiB for nothing.
     if ciphertext.len() <= MAX_DM_ECHO {
-        let own = crate::state::pick_name(&real, &alias, state.is_admin(from_session_id));
-        let _ = send_msg(tx, &message(own));
+        let admin = state.is_admin(from_session_id);
+        let own = crate::state::pick_name(&real, &alias, admin);
+        let _ = send_msg(tx, &message(own, admin));
     }
 
     Ok(())
@@ -4575,7 +4669,15 @@ async fn broadcast_to_channel(
     // leave stalls every reader behind it, and holding it across a loop that
     // serializes the message once per recipient puts that stall in the path of
     // every voice packet on the server.
-    let member_txs: Vec<ControlTx> = {
+    let member_txs: Vec<ControlTx> = if channel_id == 0 {
+        // The lobby's switches go to its watchers while it is small; rows carry them
+        crate::lobby::hearers(state)
+            .await
+            .into_iter()
+            .filter(|&uid| Some(uid) != exclude_user)
+            .filter_map(|uid| Some(state.sessions.get(&uid)?.control_tx.clone()))
+            .collect()
+    } else {
         let channels = state.channels.read().await;
         let Some(channel) = channels.get(&channel_id) else {
             return;

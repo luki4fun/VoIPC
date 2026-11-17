@@ -19,6 +19,54 @@ pub type SessionId = u32;
 /// Sequence number for voice packets, monotonically increasing per sender.
 pub type SequenceNumber = u32;
 
+/// Where a page of the lobby ended (protocol v25): its section's rank (`u16::MAX` for
+/// nobody's section), the name in lower case, and the id, in the order the list is in.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct LobbyCursor {
+    pub section: u16,
+    pub name: String,
+    pub user_id: UserId,
+}
+
+/// What a relay carries now, for its admin's Load view (protocol v25).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LoadReport {
+    pub online: u32,
+    pub max_users: u32,
+    /// Standing in a channel other than the lobby.
+    pub in_rooms: u32,
+    /// Standing in the lobby, and up to how many its list's watchers hear each join.
+    pub lobby: u32,
+    pub live_lobby: u32,
+    pub shares: Vec<ShareLoad>,
+    /// Video sent, counted at each share's resolution, and what `[media]` allows (kbit/s).
+    pub video_kbps: u64,
+    pub video_budget_kbps: u64,
+    pub rss_mib: u32,
+    pub cpu_secs: u64,
+    /// Datagrams the kernel dropped on the relay's UDP socket since it started.
+    pub udp_dropped: u64,
+    /// The last minute's refusals, failed setups and ended sessions, one line each.
+    pub last_minute: Vec<String>,
+    /// What the admin should look at, in plain words; empty when all is well.
+    pub warnings: Vec<String>,
+}
+
+/// One screen share, for `LoadReport`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ShareLoad {
+    pub channel_id: ChannelId,
+    pub sharer: String,
+    pub viewers: u32,
+    /// The most one share may have (`[media] share_viewers`).
+    pub cap: u32,
+    /// What it may send each viewer at its resolution.
+    pub kbps: u32,
+}
+
+/// The most `ClientMessage::LookupUsers` asks at once, ids, names and accounts together.
+pub const MAX_LOOKUP: usize = 64;
+
 /// Information about a connected user.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserInfo {

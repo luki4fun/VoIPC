@@ -28,6 +28,13 @@ export interface UserInfo {
   badges?: string[];
 }
 
+/** Where a page of the lobby ended (protocol 25): what `request_lobby_page` asks on from. */
+export interface LobbyCursor {
+  section: number;
+  name: string;
+  user_id: number;
+}
+
 /** An active ban (admin view). An address ban shows the name it was given
  *  under, never the address. */
 export interface BanInfo {

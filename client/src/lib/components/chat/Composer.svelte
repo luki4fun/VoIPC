@@ -36,6 +36,8 @@
     oncancelreply?: () => void;
     /** Names `@` offers to complete (full names, with their tags). */
     mentionables?: readonly string[];
+    /** The `@word` being typed, for whoever can find more names than `mentionables` holds. */
+    onmentionquery?: (q: string) => void;
     /**
      * Send one file as its own message with `caption`, a photo as it is if
      * `original`, reporting under `op`. Absent where files cannot go (the
@@ -56,6 +58,7 @@
     replying = null,
     oncancelreply,
     mentionables = [],
+    onmentionquery,
     onsendfile,
     maxBytes = null,
     onsticker,
@@ -260,6 +263,9 @@
     const before = text.slice(0, caret);
     const m = /(?:^|\s)@([^\s@]{0,32})$/.exec(before);
     return m ? { q: m[1].toLowerCase(), start: before.length - m[1].length - 1 } : null;
+  });
+  $effect(() => {
+    if (query?.q && query.start !== dismissedAt) onmentionquery?.(query.q);
   });
   const suggestions = $derived.by(() => {
     if (!query || query.start === dismissedAt) return [];

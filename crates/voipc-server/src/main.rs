@@ -22,6 +22,8 @@ mod files;
 mod fsutil;
 mod gates;
 mod layout;
+mod load;
+mod lobby;
 mod media;
 mod presets;
 mod report;
@@ -397,6 +399,8 @@ pub struct ConnLimits {
     /// Refused connects and how sessions ended, by `(kind, why)`, since the last
     /// minute's report (`take_counts`): the per-connect lines are debug only.
     counts: std::sync::Mutex<std::collections::BTreeMap<(&'static str, &'static str), u64>>,
+    /// The last minute's report, one line each, for the admin's Load view.
+    last_minute: std::sync::Mutex<Vec<String>>,
     /// The constants below, as this relay's size scales them (`new`).
     pre_total_max: u32,
     pre_per_ip_max: u32,
@@ -475,6 +479,7 @@ impl ConnLimits {
             connect_rate: DashMap::new(),
             last_sweep: std::sync::Mutex::new(Instant::now()),
             counts: Default::default(),
+            last_minute: Default::default(),
         }
     }
 
@@ -486,6 +491,21 @@ impl ConnLimits {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .entry((kind, why))
             .or_insert(0) += 1;
+    }
+
+    /// The last minute's report (`set_last_minute`).
+    pub fn last_minute(&self) -> Vec<String> {
+        self.last_minute
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub fn set_last_minute(&self, lines: Vec<String>) {
+        *self
+            .last_minute
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = lines;
     }
 
     /// What was counted since the last call.
@@ -1037,6 +1057,15 @@ async fn main() -> Result<()> {
         empty_channel_timeout = server_settings.empty_channel_timeout_secs,
         persistent_channels = persistent_channels.len(),
     );
+    if config.accounts.mode != config::AccountsMode::Off
+        && config.accounts.database.starts_with("sqlite")
+        && config.max_users > 10_000
+    {
+        warn!(
+            max_users = config.max_users,
+            "accounts on SQLite sign people in one at a time: above 10,000 use Postgres (OPERATING.md 6)"
+        );
+    }
 
     // Load TLS certificate and key: the QUIC endpoint serves them to native
     // clients (by SNI), the TCP listener to browsers loading the page.
@@ -1225,6 +1254,20 @@ async fn main() -> Result<()> {
             restrict::tick(&ticking, bans::now_secs()).await;
         }
     });
+    // How many stand in each channel, each second, for whatever changed (protocol v25)
+    let counted = state.clone();
+    tokio::spawn(async move {
+        let mut every = tokio::time::interval(Duration::from_secs(1));
+        let mut last = std::collections::HashMap::new();
+        let mut ticks = 0u64;
+        loop {
+            every.tick().await;
+            ticks += 1;
+            if ticks.is_multiple_of(lobby::counts_every(counted.sessions.len())) {
+                lobby::send_counts(&counted, &mut last).await;
+            }
+        }
+    });
     // Exits each second, so a ban across many channels is one frame per writer; quiet
     // channels' news each minute. Neither asks for anything while there is none.
     let ticking = state.clone();
@@ -1315,6 +1358,15 @@ async fn main() -> Result<()> {
             every.tick().await;
             let drops = web::udp_drops(udp_port).unwrap_or(drops_before);
             let counts = counted.limits.take_counts();
+            // The Load view's, kept whether or not anything happened
+            let mut lines: Vec<String> = counts
+                .iter()
+                .map(|((kind, why), n)| format!("{kind}: {why} {n}"))
+                .collect();
+            if drops > drops_before {
+                lines.push(format!("UDP datagrams dropped {}", drops - drops_before));
+            }
+            counted.limits.set_last_minute(lines);
             if counts.is_empty() && drops == drops_before {
                 continue;
             }

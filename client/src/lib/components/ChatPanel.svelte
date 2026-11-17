@@ -18,6 +18,7 @@
   import { channels } from "../stores/channels.js";
   import { uiPrefs } from "../stores/ui-prefs.js";
   import { serverAddress, serverKey, userId, username } from "../stores/connection.js";
+  import { searchNames } from "../stores/lobby.js";
   import { addNotification } from "../stores/notifications.js";
   import { confirmAction } from "../stores/confirm.js";
   import { get } from "svelte/store";
@@ -372,6 +373,15 @@
       ? []
       : ownMentionNames($username, mentionable, !!effectiveChannel?.text && livePath($olderRelay?.protocol ?? null)),
   );
+  /** An `@` being typed in a channel: on a relay that sends the lobby in pages, ask it who
+   *  goes by that name, so the list below can offer them. */
+  let mentionTimer: ReturnType<typeof setTimeout> | undefined;
+  function mentionSearch(q: string) {
+    if (isDmMode || anonymousHere) return;
+    clearTimeout(mentionTimer);
+    const server = $serverAddress;
+    mentionTimer = setTimeout(() => searchNames(server, q), 250);
+  }
   /** Who the message box offers after an `@`: everybody but us. */
   // Once each: an account from before `here` was reserved would otherwise be offered
   // twice, and a keyed list stops the page at a repeat
@@ -1470,6 +1480,7 @@
       bind:this={composer}
       placeholder={`Message ${channelLabel}…`}
       mentionables={mentionOthers}
+      onmentionquery={mentionSearch}
       conversation={`${$serverAddress}|${$displayChannelId}`}
       {held}
       onsend={sendMessage}

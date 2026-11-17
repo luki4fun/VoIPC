@@ -100,10 +100,13 @@ pub const CONTROL_MSGS_PER_SEC: u32 = 50;
 ///      AccountRequest::LogJoinMany/ChainPut/LogMemberIds/ChainFetch/WrapsPage/OwnChains/
 ///      OwnBuckets/BucketLists/OwnChainRows, AccountReply::LogJoinedMany/ChainStored/ChainRekey/
 ///      LogMemberIdsFound/ChainPage/WrapsPage/OwnChains/OwnBuckets/BucketLists/OwnChainRows
+/// v25: the lobby on a big relay, not sent whole — RequestLobbyPage/LookupUsers/WatchLobby,
+///      ChannelCounts/LobbyPage/Users; the sender's account on EncryptedDirectChatMessage and
+///      PokeReceived
 ///
 /// A relay admits only its own protocol; an app speaks its own down to
 /// `compat::OLDEST_RELAY_PROTOCOL` (1.6).
-pub const PROTOCOL_VERSION: u32 = 24;
+pub const PROTOCOL_VERSION: u32 = 25;
 
 /// Application version, read from Cargo.toml at compile time.
 /// Single source of truth: workspace root `Cargo.toml` `[workspace.package] version`.
@@ -519,6 +522,7 @@ mod tests {
             ciphertext: vec![0xCA, 0xFE],
             message_type: 2,
             timestamp: 1000,
+            account: None,
         };
         let encoded = encode_server_msg(&msg).unwrap();
         let decoded = decode_server_msg(&encoded[4..]).unwrap();

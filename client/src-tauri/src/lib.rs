@@ -394,6 +394,9 @@ pub fn run() {
             commands::join_text_channels,
             commands::set_quiet,
             commands::request_channel_page,
+            commands::request_lobby_page,
+            commands::lookup_users,
+            commands::watch_lobby,
             commands::set_metered,
             commands::key_job_answer,
             commands::create_channel,
@@ -533,6 +536,7 @@ pub fn run() {
             commands::admin_unban,
             commands::admin_ban_account,
             commands::admin_list_bans,
+            commands::admin_load,
             commands::admin_bans_page,
             // Persistent config
             commands::load_config,

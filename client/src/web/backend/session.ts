@@ -1102,6 +1102,24 @@ export class Session implements SessionContext, AccountHost {
         this.noteRows(b.users);
         this.emit("channel-users", { channel_id: b.channel_id, users: b.users });
         break;
+      // The lobby on a big relay (protocol 25): counts, pages and lookups, never whole
+      case "ChannelCounts":
+        this.emit("channel-counts", { counts: b.counts });
+        break;
+      case "LobbyPage":
+        this.noteRows(b.rows);
+        this.emit("lobby-page", { rows: b.rows, next: b.next ?? null, total: b.total, sections: b.sections, prefix: b.prefix });
+        break;
+      case "AdminLoad":
+        this.emit("admin-load", b.report);
+        break;
+      case "WatchRefused":
+        this.emit("watch-refused", { sharer_user_id: b.sharer_user_id, reason: b.reason });
+        break;
+      case "Users":
+        this.noteRows(b.rows);
+        this.emit("users", { rows: b.rows, gone: b.gone });
+        break;
       case "InviteReceived":
         this.emit("invite-received", {
           channel_id: b.channel_id,
@@ -1116,7 +1134,7 @@ export class Session implements SessionContext, AccountHost {
         this.emit("invite-declined", { channel_id: b.channel_id, user_id: b.user_id });
         break;
       case "PokeReceived":
-        this.onPokeReceived(b.from_user_id, b.from_username, toBytes(b.ciphertext), b.message_type);
+        this.onPokeReceived(b.from_user_id, b.from_username, toBytes(b.ciphertext), b.message_type, b.account ?? null);
         break;
       // The share and the viewer below are the voice session's; anything
       // another server says about them is late news for a share it no longer has.
@@ -1220,6 +1238,7 @@ export class Session implements SessionContext, AccountHost {
           toBytes(b.ciphertext),
           b.message_type,
           Number(b.timestamp),
+          b.account ?? null,
         );
         break;
       case "EncryptedChannelChatMessage":
@@ -1768,11 +1787,20 @@ export class Session implements SessionContext, AccountHost {
     ciphertext: Uint8Array,
     messageType: number,
     timestamp: number,
+    // The sender's account, as a roster row shows it (protocol 25; null before)
+    fromAccount: number[] | null,
   ): void {
     // The server echoes our own DMs back; the sender emits locally and
     // decrypting our own ciphertext would corrupt the ratchet.
     if (fromUserId === this.userId) return;
-    const event = { from_user_id: fromUserId, from_username: fromUsername, to_user_id: toUserId, timestamp, encrypted: true };
+    const event = {
+      from_user_id: fromUserId,
+      from_username: fromUsername,
+      from_account: fromAccount,
+      to_user_id: toUserId,
+      timestamp,
+      encrypted: true,
+    };
     try {
       const plaintext = this.decrypt(fromUserId, ciphertext, messageType);
       if (messageType === 1) this.markEstablished(fromUserId);
@@ -1848,7 +1876,13 @@ export class Session implements SessionContext, AccountHost {
     }
   }
 
-  private onPokeReceived(fromUserId: number, fromUsername: string, ciphertext: Uint8Array, messageType: number): void {
+  private onPokeReceived(
+    fromUserId: number,
+    fromUsername: string,
+    ciphertext: Uint8Array,
+    messageType: number,
+    fromAccount: number[] | null,
+  ): void {
     let message = "";
     try {
       const plaintext = this.decrypt(fromUserId, ciphertext, messageType);
@@ -1857,12 +1891,18 @@ export class Session implements SessionContext, AccountHost {
     } catch (e) {
       console.warn(`failed to decrypt poke from ${fromUserId}:`, e);
     }
-    this.emit("poke-received", { from_user_id: fromUserId, from_username: fromUsername, message });
+    this.emit("poke-received", {
+      from_user_id: fromUserId,
+      from_username: fromUsername,
+      from_account: fromAccount,
+      message,
+    });
     // Also inject the poke as a DM so it appears in chat history
     if (message !== "") {
       this.emit("direct-chat-message", {
         from_user_id: fromUserId,
         from_username: fromUsername,
+        from_account: fromAccount,
         to_user_id: this.userId,
         content: `[Poke] ${message}`,
         timestamp: Date.now(),
