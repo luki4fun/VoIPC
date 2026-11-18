@@ -1258,6 +1258,40 @@ pub(super) fn drop_db(file: &std::path::Path) {
     for suffix in ["", "-wal", "-shm", ".lock"] {
         let _ = std::fs::remove_file(format!("{}{suffix}", file.display()));
     }
+    // `scratch_db`'s database is `voipc_gkt_` and the file's id (gk_tests' too)
+    if let Some(id) = file
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .and_then(|s| s.rsplit('-').next())
+    {
+        drop_pg(&format!("voipc_gkt_{id}"));
+    }
+}
+
+/// Drops scratch database `name` on the `VOIPC_TEST_POSTGRES` server, when one is set.
+/// Nothing dropped them before: 3000 left behind slowed that server's checkpoints to 30 s.
+pub(crate) fn drop_pg(name: &str) {
+    let Ok(server) = std::env::var("VOIPC_TEST_POSTGRES") else {
+        return;
+    };
+    let sql = format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)");
+    // A runtime of its own: called at a test's end, from Drop or sync code in its runtime
+    let _ = std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        rt.block_on(async {
+            if let Ok(l4f_accounts::store::Store::Pg(b)) =
+                l4f_accounts::store::Store::connect(&server).await
+            {
+                let _ = sqlx::query(sqlx::AssertSqlSafe(sql)).execute(&b.0).await;
+            }
+        });
+    })
+    .join();
 }
 
 /// An account with its identity and published seat keys (counter 1).

@@ -93,6 +93,9 @@ pub struct Mem {
     /// A seat's newest seed welcome until it went out whole (2b: pushed to the online
     /// seats, kept for one offline through a roll until its answer took it, §5.6).
     seed: HashMap<SeatRef, gk::SeedWelcomeIn>,
+    /// How long a commit takes to store, as Postgres can under load.
+    #[cfg(test)]
+    commit_ms: u64,
 }
 
 pub struct DbStore {
@@ -172,6 +175,11 @@ impl Store {
     pub async fn commit(&self, g: &GroupState, t: &Taken, now: u64) -> Result<(), Fail> {
         match self {
             Store::Memory(_) => {
+                #[cfg(test)]
+                {
+                    let ms = self.mem().map_or(0, |m| m.commit_ms);
+                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                }
                 self.commit_mem(t);
                 Ok(())
             }
@@ -283,6 +291,13 @@ impl Store {
             if m.seed.get(seat).is_some_and(|w| w.s == s) {
                 m.seed.remove(seat);
             }
+        }
+    }
+
+    #[cfg(test)]
+    pub fn slow_commits(&self, ms: u64) {
+        if let Some(mut m) = self.mem() {
+            m.commit_ms = ms;
         }
     }
 

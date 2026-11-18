@@ -2504,6 +2504,7 @@ mod tests {
     struct Databases {
         stores: Vec<Store>,
         file: std::path::PathBuf,
+        id: u32,
     }
 
     impl Drop for Databases {
@@ -2511,6 +2512,7 @@ mod tests {
             for suffix in ["", "-wal", "-shm", ".lock"] {
                 let _ = std::fs::remove_file(format!("{}{suffix}", self.file.display()));
             }
+            crate::gk_e2e_tests::drop_pg(&format!("voipc_gk_{:08x}", self.id));
         }
     }
 
@@ -2531,7 +2533,7 @@ mod tests {
             let (base, _) = server.rsplit_once('/').unwrap();
             stores.push(Store::connect(&format!("{base}/{name}")).await.unwrap());
         }
-        Databases { stores, file }
+        Databases { stores, file, id }
     }
 
     /// The relay's bookkeeping, as `migrate_relay` keeps it.

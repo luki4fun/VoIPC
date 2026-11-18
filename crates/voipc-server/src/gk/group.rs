@@ -752,6 +752,27 @@ impl GroupState {
         out.push(Out(d.sid, push::epoch_due(&self.id, d.id, piece)));
     }
 
+    /// The id the next due or page takes: an actor turn notes it before it works.
+    pub fn due_mark(&self) -> u64 {
+        self.next_due
+    }
+
+    /// The dues and the page asked since `mark` count their deadline from `sent`, when the
+    /// turn sends them, not from `asked`, its clock read: the relay's own store writes in
+    /// between are not the keyholder's time.
+    pub fn sent_at(&mut self, mark: u64, asked: u64, sent: u64) {
+        let lag = sent.saturating_sub(asked);
+        if lag == 0 {
+            return;
+        }
+        for d in self.dues.iter_mut().filter(|d| d.id >= mark) {
+            d.deadline += lag;
+        }
+        if let Some(p) = self.page.as_mut().filter(|p| p.id >= mark) {
+            p.deadline += lag;
+        }
+    }
+
     fn put_due(&mut self, due: Due, to: &Volunteer, now: u64, out: &mut Vec<Out>) {
         let (held, head_seed) = self.held_now();
         let d = DueOut {

@@ -9,12 +9,12 @@
 //! `gk_e2e_tests.rs` does). Each account runs the app's two halves on one connection, glued
 //! as N1/W2 glue them: K1's `AccountSync` (seat keys, kept copies, kept reads) and C3b's
 //! `GroupKeying` (live keys, and the past epochs a kept read asks for). The keyholder is
-//! `gk_e2e_tests.rs`'s guest, building honest commits. Accounts with no app ("the crowd")
-//! keep the log only: seated by `LogJoin` alone, and each going by another exit cause, they
-//! make the openings.
+//! `gk_e2e_tests.rs`'s guest, building honest commits on a task of its own (`Keyholder`).
+//! Accounts with no app ("the crowd") keep the log only: seated by `LogJoin` alone, and each
+//! going by another exit cause, they make the openings.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use l4f_accounts::model::{AccountId, NewUser};
@@ -175,13 +175,47 @@ impl Person {
     }
 }
 
+/// The guest keyholder as a client of its own: a task answers each frame as it comes, as a
+/// keyholder in another process would, whatever the test awaits meanwhile. Stepped with the
+/// apps instead, it heard nothing while the test wrote accounts: a Join due asked during
+/// `crowd` (18 accounts' writes, over 6 s on a busy Postgres) passed its 5 s deadline
+/// unheard, a miss, and with no other keyholder online the relay asks again only after
+/// `RETRY_ALL_MISSED_MS` (30 s).
+struct Keyholder {
+    holder: Arc<Mutex<Holder>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Keyholder {
+    fn run(state: Arc<ServerState>, holder: Holder, tx: ControlTx, mut rx: ControlRx) -> Keyholder {
+        let sid = holder.sid;
+        let holder = Arc::new(Mutex::new(holder));
+        let h = holder.clone();
+        let task = tokio::spawn(async move {
+            while let Some(b) = rx.recv().await {
+                let f = voipc_protocol::codec::decode_server_msg(&b[4..]).unwrap();
+                let now = state.gk.now();
+                if tracing_on() {
+                    eprintln!("[{now}] holder {sid} <- {}", show(&f));
+                }
+                let send = h.lock().unwrap().frame(&f, now);
+                for m in send {
+                    state.gk.handle(&state, sid, m, &tx).await;
+                }
+            }
+        });
+        Keyholder { holder, task }
+    }
+}
+
 /// The relay, its keyholder, and the accounts' apps.
 struct World {
     state: Arc<ServerState>,
     db: Store,
     file: std::path::PathBuf,
-    queues: HashMap<UserId, (ControlTx, ControlRx)>,
-    holder: Option<Holder>,
+    /// Each session's queue; the keyholder's own task takes its frames.
+    queues: HashMap<UserId, (ControlTx, Option<ControlRx>)>,
+    holder: Option<Keyholder>,
     people: Vec<Person>,
     followers: Vec<UserId>,
     last_tick: u64,
@@ -190,6 +224,16 @@ struct World {
 impl Drop for World {
     fn drop(&mut self) {
         drop_db(&self.file);
+        // A keyholder that panicked after the last `step` still fails the test
+        if let Some(mut k) = self.holder.take().filter(|k| k.task.is_finished()) {
+            use std::future::Future;
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            if let std::task::Poll::Ready(Err(e)) = std::pin::Pin::new(&mut k.task).poll(&mut cx) {
+                if e.is_panic() && !std::thread::panicking() {
+                    std::panic::resume_unwind(e.into_panic());
+                }
+            }
+        }
     }
 }
 
@@ -241,7 +285,9 @@ impl World {
         w.follow(sid, None);
         let h = Holder::guest(sid, ik, CONV, true);
         w.send(sid, h.volunteer()).await;
-        w.holder = Some(h);
+        let (tx, rx) = w.queues.get_mut(&sid).unwrap();
+        let (tx, rx) = (tx.clone(), rx.take().unwrap());
+        w.holder = Some(Keyholder::run(w.state.clone(), h, tx, rx));
         w
     }
 
@@ -255,10 +301,11 @@ impl World {
 
     /// The epoch of the head the keyholder holds.
     fn head(&self) -> u32 {
-        self.holder
-            .as_ref()
-            .and_then(|h| h.held.as_ref())
-            .map_or(0, |h| h.head.header().epoch)
+        let Some(k) = &self.holder else {
+            return 0;
+        };
+        let h = k.holder.lock().unwrap();
+        h.held.as_ref().map_or(0, |h| h.head.header().epoch)
     }
 
     /// A connection in the channel, signed in to `account` where given.
@@ -283,7 +330,7 @@ impl World {
         }
         crate::state::test_support::put_in_channel(&self.state, CHAN, &[(uid, sid)]).await;
         self.state.gk.on_connect(sid, tx.clone());
-        self.queues.insert(sid, (tx, rx));
+        self.queues.insert(sid, (tx, Some(rx)));
         sid
     }
 
@@ -296,7 +343,7 @@ impl World {
 
     async fn drain(&mut self, sid: UserId) -> Vec<ServerMessage> {
         let mut got = vec![];
-        let Some((_, rx)) = self.queues.get_mut(&sid) else {
+        let Some((_, Some(rx))) = self.queues.get_mut(&sid) else {
             return got;
         };
         while let Ok(Some(b)) = tokio::time::timeout(Duration::ZERO, rx.recv()).await {
@@ -597,22 +644,16 @@ impl World {
         assert!(left);
     }
 
-    /// One round: every queue drained into its keyholder or app, what they send handed over.
+    /// One round: every app's queue drained into it, what it sends handed over.
     async fn step(&mut self) {
-        let now = self.now();
-        if let Some(sid) = self.holder.as_ref().map(|h| h.sid) {
-            let frames = self.drain(sid).await;
-            let mut send = vec![];
-            for f in &frames {
-                if tracing_on() {
-                    eprintln!("[{now}] holder {sid} <- {}", show(f));
-                }
-                send.extend(self.holder.as_mut().unwrap().frame(f, now));
-            }
-            for m in send {
-                self.send(sid, m).await;
+        // A keyholder that panicked fails the test with its own message
+        if self.holder.as_ref().is_some_and(|k| k.task.is_finished()) {
+            let k = self.holder.take().unwrap();
+            if let Err(e) = k.task.await {
+                std::panic::resume_unwind(e.into_panic());
             }
         }
+        let now = self.now();
         let tick = now >= self.last_tick + 1_000;
         for i in 0..self.people.len() {
             if !self.people[i].online {

@@ -996,9 +996,7 @@ async fn scratch_db() -> (l4f_accounts::store::Store, std::path::PathBuf) {
 }
 
 fn drop_db(file: &std::path::Path) {
-    for suffix in ["", "-wal", "-shm", ".lock"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", file.display()));
-    }
+    crate::gk_e2e_tests::drop_db(file);
 }
 
 /// A stored group `id` over a scratch database: guest keyholder 1's Genesis, stored and
@@ -1277,6 +1275,21 @@ fn join_on(
     stored: bool,
     now: u64,
 ) -> Built {
+    join_on_kh(k, id, head, head, h, piece, stored, now)
+}
+
+/// `join_on` with the keyholder set of `kh`, a head before `head`.
+#[allow(clippy::too_many_arguments)]
+fn join_on_kh(
+    k: &Person,
+    id: &str,
+    head: &voipc_crypto::group_key::SignedHeader,
+    kh: &voipc_crypto::group_key::SignedHeader,
+    h: &mut Holds,
+    piece: &DuePiece,
+    stored: bool,
+    now: u64,
+) -> Built {
     let grp = Group::new(GroupKind::Text, id, head.header().gen).unwrap();
     let joiners: Vec<Joiner> = piece
         .joins
@@ -1289,7 +1302,7 @@ fn join_on(
     let hold = Holding {
         g: &grp,
         head,
-        kh: head,
+        kh,
         ring: &h.ring,
         krk: &h.krk,
         me: k.me(),
@@ -2782,14 +2795,30 @@ async fn new_start_eagerly(kept_seats: u32) {
     };
     let b = build_genesis(&st, &mut RowBases::new()).unwrap();
     net.commit(k.sid, &id, due, &b).await;
-    let (_, piece) = due_within(&mut net, k.sid, 10_000).await.expect("a Join");
+    let (due, piece) = due_within(&mut net, k.sid, 10_000).await.expect("a Join");
     assert_eq!(piece.kind, gk::due::JOIN);
     let ann_seat: gk::GkSeat = seat.public().seat(MemberId::Account(a.0)).into();
+    let mut joins: Vec<gk::GkSeat> = piece.joins.iter().map(|j| j.seat).collect();
+    // The members are read beside the actor: when that takes longer than the fetcher's
+    // batch (a slow database), the account goes in the Join after it
+    if !joins.contains(&ann_seat) {
+        let mut h = Holds {
+            ring: b.ring,
+            krk: b.krk,
+            cache: RowBases::new(),
+        };
+        let j = join_on(&k, &id, &b.header, &mut h, &piece, true, net.groups.now());
+        net.commit(k.sid, &id, due, &j).await;
+        let (_, next) = due_within(&mut net, k.sid, 10_000)
+            .await
+            .expect("the next Join");
+        joins.extend(next.joins.iter().map(|j| j.seat));
+    }
     assert!(
-        piece.joins.iter().any(|j| j.seat == ann_seat),
-        "the account is queued with the fetcher (kept_seats {kept_seats})"
+        joins.contains(&ann_seat),
+        "the account is queued eagerly (kept_seats {kept_seats})"
     );
-    assert_eq!(piece.joins.len(), 2);
+    assert_eq!(joins.len(), 2);
     net.groups.on_purge(&id);
     drop_db(&file);
 }
@@ -4214,4 +4243,75 @@ async fn a_ban_reset_or_deletion_reaches_each_group_the_account_holds_keys_of() 
         "ban, reset, shell reset, tombstone, claim"
     );
     drop_db(&file);
+}
+
+/// Review of 2026-11-18: a due's deadline started at the actor turn's clock read, before
+/// the relay's own store writes. A commit that took 5 s to store sent the due asked at its
+/// apply already past its deadline: a miss charged to the keyholder, and with only one a
+/// 30 s stall. The deadline starts when the due goes out.
+#[tokio::test(start_paused = true)]
+async fn a_dues_deadline_starts_when_it_goes_out_not_before_the_relays_own_store_writes() {
+    let mut net = Net::new();
+    let id = net.groups.id_for(9, None);
+    let k = net.guest(9, &id);
+    let people: Vec<Person> = (0..2).map(|_| net.guest(9, &id)).collect();
+    net.volunteer(&k).await;
+    for p in &people {
+        net.fetch(p, &id).await;
+    }
+    let out = net.frames(k.sid, 50).await;
+    let (due, piece) = dues(&out, k.sid).pop().expect("a Genesis due");
+    let b = genesis(&k, &id, &piece, false, net.groups.now());
+    net.commit(k.sid, &id, due, &b).await;
+    let first = b.header.clone();
+    let mut h = Holds {
+        ring: b.ring,
+        krk: b.krk,
+        cache: RowBases::new(),
+    };
+    let out = net.frames(k.sid, 2_500).await;
+    let (due, piece) = dues(&out, k.sid).pop().expect("then a Join due");
+    let b = join_on(&k, &id, &first, &mut h, &piece, false, net.groups.now());
+    let head = b.header.clone();
+    net.commit(k.sid, &id, due, &b).await;
+    h.took(b);
+    // A third joiner's Join is out when a seated member leaves: the exit batch closes
+    // behind it and its opening is asked at the Join's commit
+    let q = net.guest(9, &id);
+    net.fetch(&q, &id).await;
+    let out = net.frames(k.sid, 2_500).await;
+    let (due, piece) = dues(&out, k.sid).pop().expect("the third's Join due");
+    assert_eq!(piece.joins.len(), 1);
+    net.groups.on_unfollow(9, people[0].sid);
+    net.frames(k.sid, 500).await;
+    net.groups.get(&id).unwrap().slow_commits_for_test(6_000);
+    let b = join_on_kh(
+        &k,
+        &id,
+        &head,
+        &first,
+        &mut h,
+        &piece,
+        false,
+        net.groups.now(),
+    );
+    net.commit(k.sid, &id, due, &b).await;
+    let out = net.frames(k.sid, 7_000).await;
+    let (exits, piece) = dues(&out, k.sid).pop().expect("the opening once stored");
+    assert_eq!((piece.kind, piece.exits.len()), (gk::due::EXITS, 1));
+    assert_eq!(
+        stales(&out, k.sid),
+        Vec::<u8>::new(),
+        "not timed out on its way out"
+    );
+    // Its own 4 s from when it went out still count
+    let out = net.frames(k.sid, 4_000).await;
+    assert!(
+        out.iter().flat_map(|o| &o.1).any(|f| matches!(
+            f,
+            ServerMessage::EpochStale { due, reason, .. }
+                if *due == exits && *reason == stale::TIMED_OUT
+        )),
+        "timed out 4 s after it went out"
+    );
 }

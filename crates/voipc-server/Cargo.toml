@@ -77,3 +77,5 @@ unicode-security = "0.1.2"
 # The importer's own driver and its stand-in Discord, against the real relay: no socket to
 # Discord, and nothing of it in the relay's binary.
 voipc-import = { path = "../voipc-import", features = ["mock"] }
+# Paused time, for tests of what the relay's own slow writes do to its deadlines
+tokio = { workspace = true, features = ["test-util"] }

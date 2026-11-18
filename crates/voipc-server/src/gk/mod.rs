@@ -1319,6 +1319,7 @@ async fn actor(
             } => None,
         };
         let now = clock.now();
+        let mark = g.due_mark();
         let exits_from = g.exits.next;
         let mut answers: Vec<(UserId, SeatRef, Option<FloorRef>, bool)> = vec![];
         let touched = match &msg {
@@ -1367,6 +1368,7 @@ async fn actor(
         if head != was || all {
             publish_snap(&h, &g);
         }
+        g.sent_at(mark, now, clock.now());
         deliver(&shared, &h, std::mem::take(&mut out));
         publish(&h, &g, now);
         was = head;
@@ -1817,6 +1819,11 @@ impl Groups {
 impl Handle {
     pub fn inbox_full_for_test(&self) {
         self.inbox.store(INBOX_MAX_BYTES, Ordering::Relaxed);
+    }
+
+    /// Each commit of this memory group takes `ms` to store.
+    pub fn slow_commits_for_test(&self, ms: u64) {
+        self.store.slow_commits(ms);
     }
 
     /// Seed welcomes a memory group keeps.
