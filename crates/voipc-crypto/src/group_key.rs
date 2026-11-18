@@ -45,6 +45,7 @@ pub mod commit;
 pub mod past;
 pub mod timers;
 pub mod tree;
+pub mod wire;
 
 #[cfg(test)]
 mod kat;

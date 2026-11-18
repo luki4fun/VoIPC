@@ -1403,6 +1403,8 @@ pub struct ServerState {
     pub started: Instant,
     /// The media edges of `[pool]`; `None` without any.
     pub pool: Option<Arc<crate::pool::Pool>>,
+    /// The group epoch key (`group_key`), and this start's run.
+    pub gk: Arc<crate::gk::Groups>,
 }
 
 /// Which of a member's posts slow mode counts: the live message, or its copy
@@ -1598,6 +1600,7 @@ impl ServerState {
             share_fans: DashMap::new(),
             started: Instant::now(),
             pool: crate::pool::Pool::new(&config.pool).map(Arc::new),
+            gk: Arc::new(crate::gk::Groups::new(config.group_key)),
         }
     }
 

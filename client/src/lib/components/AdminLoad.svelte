@@ -1,11 +1,15 @@
 <script lang="ts">
   // The admin panel's Load tab (1.14): what this relay carries now, asked every two seconds
   // while the tab is open. Warnings first, in the relay's own words: it knows its limits.
-  // Its media edges (1.15, `[pool]`) get a table of their own, only when it has any.
+  // Its media edges (1.15, `[pool]`) get a table of their own, only when it has any; so do the
+  // group keys of its biggest channels and of those with a warning.
 
   import { invoke } from "@tauri-apps/api/core";
   import { adminLoad } from "../stores/load.js";
+  import { channels } from "../stores/channels.js";
   import { serverAddress } from "../stores/scoped.js";
+  import { formatSize } from "../file-rules.js";
+  import { ago } from "../dm-rules.js";
 
   $effect(() => {
     const server = $serverAddress;
@@ -19,6 +23,13 @@
   // A relay at 25 has no edges to say anything of
   const edges = $derived(r?.edges ?? []);
   const mbit = (kbps: number) => (kbps / 1000).toFixed(kbps < 10_000 ? 1 : 0);
+  // With the group key off, and from a relay without it, there are none
+  const groups = $derived(r?.groups ?? []);
+  const groupName = (g: { channel_id: number; kind: number }) => {
+    const name = $channels.find((c) => c.channel_id === g.channel_id)?.name;
+    if (!name) return `channel ${g.channel_id}`;
+    return g.kind === 0 ? `#${name}` : name;
+  };
 </script>
 
 {#if !r}
@@ -126,6 +137,55 @@
                   <td class="none">—</td>
                   <td class="none">—</td>
                 {/if}
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  {/if}
+
+  {#if groups.length > 0}
+    <section class="section">
+      <div class="section-title">Groups</div>
+      <p class="admin-hint">
+        The channels whose keys this relay keeps, from 1000 seats or with a warning. Waiting is the joins and exits
+        their keyholders have yet to commit.
+      </p>
+      <div class="table-wrap">
+        <table class="edges">
+          <thead>
+            <tr>
+              <th scope="col">Channel</th>
+              <th scope="col">Seats</th>
+              <th scope="col">Keyholders</th>
+              <th scope="col">Keys moved</th>
+              <th scope="col">Waiting</th>
+              <th scope="col">Missed</th>
+              <th scope="col">Memory</th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each groups as g (g.channel_id)}
+              <tr>
+                <td>
+                  <span class="edge-name">{groupName(g)}</span>
+                  <span class="sub">{g.kind === 0 ? "text" : "voice"}</span>
+                </td>
+                <td>{g.seats}</td>
+                <td>
+                  {g.keyholders_online} of {g.keyholders} online
+                </td>
+                <td>{g.last_commit_secs < 60 ? "just now" : `${ago(0, g.last_commit_secs * 1000)} ago`}</td>
+                <td>
+                  {g.joins_waiting} joins
+                  <span class="sub">{g.exits_waiting} exits</span>
+                </td>
+                <td class:offline={g.missed_deadlines > 0}>{g.missed_deadlines}</td>
+                <td>
+                  {formatSize(g.mem_bytes)}
+                  <span class="sub">{formatSize(g.db_bytes)} stored</span>
+                </td>
               </tr>
             {/each}
           </tbody>

@@ -20,6 +20,7 @@
 use serde_reflection::{Tracer, TracerConfig};
 use voipc_protocol::codec::{encode_client_msg, encode_server_msg, MAX_MSG_SIZE, PROTOCOL_VERSION};
 use voipc_protocol::error::ProtocolError;
+use voipc_protocol::gk::{GkMember, VersionMake};
 use voipc_protocol::messages::*;
 use voipc_protocol::pool::{self, CoreMsg, EdgeMsg, EdgeViewMsg, TicketBody, ViewerMsg};
 use voipc_protocol::types::*;
@@ -59,6 +60,8 @@ fn traced_format() -> String {
         ArchiveAction,
         ArchiveScope,
         ArchiveTarget,
+        GkMember,
+        VersionMake,
     );
     let registry = tracer
         .registry()

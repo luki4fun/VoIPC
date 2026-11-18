@@ -63,6 +63,9 @@ export const autoConnect = writable<boolean>(false);
 /** Answer newcomers' requests for recent channel chat (E2E, pairwise), and give who joins a
  *  channel's log our older keys. Off until turned on, and false until the config says. */
 export const shareChannelHistory = writable<boolean>(false);
+/** "Help hold keys for text channels" (desktop only): keep the keys of the text channels we are
+ *  in and give them to new members. On until turned off. */
+export const helpHoldKeys = writable<boolean>(true);
 /**
  * How many conversations the archive keeps: channels and people together,
  * across every server. 0 keeps all of them.
@@ -193,6 +196,8 @@ export interface AppConfig {
   share_off_once: boolean;
   /** That reset turned a saved `true` off: one notice is owed. */
   share_off_notice: boolean;
+  /** "Help hold keys for text channels"; absent from a config before it, and in the browser. */
+  help_hold_keys?: boolean;
   /** Conversations the archive keeps; 0 = all of them. */
   max_conversations: number;
   /**

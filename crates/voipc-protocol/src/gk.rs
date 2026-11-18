@@ -3,8 +3,7 @@
 //! receiver runs before a value reaches `voipc_crypto::group_key`: the length checks, the
 //! in-order part reassembler, the keyring stream, the `Keep` mask and the packed rows.
 //!
-//! W1 adds the message variants to messages.rs and `GroupLoad` to types.rs (its shape is
-//! at the end of this file).
+//! The messages that carry them are in messages.rs; `types::GroupLoad` is the Load view's.
 //!
 //! Byte fields are `Vec<u8>` (serde has no `[u8; 64]`), `[u8; N]` for N ≤ 32. Postcard
 //! gives each `Vec` the length its sender chose, so a receiver calls `check` before it
@@ -15,6 +14,8 @@ use std::fmt;
 use std::mem;
 
 use serde::{Deserialize, Serialize};
+
+use crate::types::UserId;
 
 // ── Sizes (§3, §11) ───────────────────────────────────────────────────────
 
@@ -1018,6 +1019,90 @@ pub struct RowMaker {
     pub v: u64,
 }
 
+// ── The parts of the relay's multi-part messages (plan 1c) ────────────────
+//
+// Each message carries its sequence's group, part and last around one of these, as
+// `EpochCommit` carries a `CommitPiece`; postcard writes a struct's fields inline, so a
+// piece adds no byte. `Parts` takes them.
+
+/// One part of `EpochIn`. Each `Option` sits in any one part, at most once a sequence;
+/// `chain`, `walk` and `self_rows` spread over parts (plan 13). `chain`: contiguous
+/// headers after the floor, oldest first; `walk`: kh links newest first; `kh`: the
+/// header `have.kh` names, on the first answer per connection to a fetch with `have`;
+/// `opening`: the head epoch's opening header when `head` is a Join; `past`: set when
+/// this answers one `at` entry, never taken as a head.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InPiece {
+    pub chain: Vec<HeaderIn>,
+    pub walk: Vec<WalkLinkIn>,
+    pub kh: Option<HeaderIn>,
+    pub head: Option<WalkLinkIn>,
+    pub opening: Option<HeaderIn>,
+    pub own_join: Option<HeaderIn>,
+    pub leaf: Option<LeafIn>,
+    pub path: Option<PathIn>,
+    pub seal: Option<Vec<u8>>,
+    pub seat: Option<SeatKeying>,
+    pub seed_welcome: Option<SeedWelcomeIn>,
+    pub self_rows: Vec<SelfRowIn>,
+    pub past: Option<EpochRef>,
+    pub pushed: bool,
+}
+
+/// One part of `EpochDue`. `kind` is a `due` code; `gated`: what the header must carry;
+/// `seed_seats`: the seats of a seed-welcome page, and in a commit due every seat whose
+/// seed the new floor would drop. The last three are what an opening's builder takes
+/// beyond plan 1c (`build::OpeningAsk`, `build::Holding`): `finish`, every seat holds
+/// the head's seed, so a running roll may finish; `pairs`, the pair of each keyholder of
+/// the set, for its `KRK` welcome; `held`, the seats holding an older seed than the
+/// head's, with that seed, as of this ask (every other seat holds the head's).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DuePiece {
+    pub kind: u8,
+    pub parent: [u8; 32],
+    pub deadline_ms: u32,
+    pub keyring_at: (u32, u32),
+    pub joins: Vec<Joiner>,
+    pub exits: Vec<ExitIn>,
+    pub exits_upto: u64,
+    pub promote: Option<Candidate>,
+    pub remove: Option<HolderRef>,
+    pub gated: bool,
+    pub roll_due: bool,
+    pub seed_seats: Vec<SeedSeat>,
+    pub finish: bool,
+    pub pairs: Vec<EndorsedPair>,
+    pub held: Vec<(GkSeat, u32)>,
+}
+
+/// One part of `KeyringIn`: a slice of the keyring stream, at most
+/// `KEYRING_SLICE_MAX_BYTES`, and this keyholder's `KRK` welcome in one part.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyringPiece {
+    pub krk: Option<KrkIn>,
+    pub stream: Vec<u8>,
+}
+
+/// One part of `EpochNamesIn`: the `added` lists asked or pushed, the signed headers of
+/// pushed gated Joins (`joins`), the opening headers with `removed` lists (`removals`),
+/// and `gone`, the step before the oldest list kept.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamesPiece {
+    pub lists: Vec<NamesListIn>,
+    pub joins: Vec<HeaderIn>,
+    pub removals: Vec<HeaderIn>,
+    pub gone: Option<NamesStepIn>,
+}
+
+/// One part of `VoiceSeats`, at most `VOICE_SEATS_PER_FRAME` entries: each user's voice
+/// seat, and who left. `whole`: the room's every seat, on the sequence to a joiner.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VoiceSeatsPiece {
+    pub seats: Vec<(UserId, GkSeat)>,
+    pub gone: Vec<UserId>,
+    pub whole: bool,
+}
+
 // ── VersionMake::Keep ─────────────────────────────────────────────────────
 
 fn check_mask(mask: u64, seats: usize) -> Result<(), Bad> {
@@ -1247,7 +1332,7 @@ pub fn commit_keyring(stream: &[u8]) -> Result<&[u8], Bad> {
 /// well as the wire: a `Ratchet` version is 5 B encoded and 48 B decoded, a drop 1 B and
 /// 8 B, and a part of 11,456 of them would otherwise hold ten times what it is charged.
 ///
-/// Every type of this module has it; a part type W1 adds sums its fields' `heap()`.
+/// Every type of this module has it; a part type sums its fields' `heap()`.
 pub trait Footprint {
     /// No value of the type holds heap: a `Vec` of it is its capacity alone.
     const FLAT: bool = false;
@@ -1427,6 +1512,47 @@ footprint!(
         krk,
         refused
     },
+    InPiece {
+        chain,
+        walk,
+        kh,
+        head,
+        opening,
+        own_join,
+        leaf,
+        path,
+        seal,
+        seat,
+        seed_welcome,
+        self_rows,
+        past,
+        pushed
+    },
+    DuePiece {
+        kind,
+        parent,
+        deadline_ms,
+        keyring_at,
+        joins,
+        exits,
+        exits_upto,
+        promote,
+        remove,
+        gated,
+        roll_due,
+        seed_seats,
+        finish,
+        pairs,
+        held
+    },
+    KeyringPiece { krk, stream },
+    NamesPiece {
+        lists,
+        joins,
+        removals,
+        gone
+    },
+    VoiceSeatsPiece { seats, gone, whole },
 );
 
 impl Footprint for VersionMake {
@@ -1774,32 +1900,10 @@ pub fn join_commit(parts: Vec<CommitPiece>) -> Result<CommitPiece, Bad> {
     Ok(whole)
 }
 
-// ── For W1: `types::GroupLoad` (plan 1a) ──────────────────────────────────
-//
-// Paste after `EdgeLoad` in types.rs, and append `pub groups: Vec<GroupLoad>,` to
-// `LoadReport` after `edges` (its doc: "The groups with a key (protocol v27); empty with
-// the key off, and from a relay at 26 or older."):
-//
-// /// One group with its key, for `LoadReport` (protocol v27). `kind` is a
-// /// `gk::group_kind` code; `last_commit_secs` is how long ago its head moved.
-// #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-// pub struct GroupLoad {
-//     pub channel_id: ChannelId,
-//     pub kind: u8,
-//     pub seats: u32,
-//     pub keyholders: u32,
-//     pub keyholders_online: u32,
-//     pub last_commit_secs: u32,
-//     pub joins_waiting: u32,
-//     pub exits_waiting: u32,
-//     pub missed_deadlines: u32,
-//     pub mem_bytes: u64,
-//     pub db_bytes: u64,
-// }
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::messages::{ClientMessage, ServerMessage};
     use serde::de::DeserializeOwned;
     use std::fmt::Debug;
 
@@ -3150,46 +3254,29 @@ mod tests {
 
     // ── Commits ──
 
-    /// `ClientMessage::EpochCommit`'s fields, to measure a frame before W1 adds the
-    /// variant (its index, 70, is one more byte).
-    #[derive(Serialize)]
-    struct CommitFrame<'a> {
-        group: &'a str,
+    fn commit_msg(
+        group: &str,
         due: u64,
-        part: u16,
+        part: usize,
         last: bool,
-        piece: &'a CommitPiece,
-    }
-
-    /// The same fields owned, as the relay decodes them.
-    #[derive(Deserialize)]
-    struct CommitFrameIn {
-        group: String,
-        due: u64,
-        part: u16,
-        last: bool,
-        piece: CommitPiece,
+        piece: &CommitPiece,
+    ) -> ClientMessage {
+        ClientMessage::EpochCommit {
+            group: group.into(),
+            due,
+            part: part as u16,
+            last,
+            piece: piece.clone(),
+        }
     }
 
     fn frame(group: &str, part: usize, last: bool, piece: &CommitPiece) -> Vec<u8> {
-        postcard::to_allocvec(&CommitFrame {
-            group,
-            due: 9,
-            part: part as u16,
-            last,
-            piece,
-        })
-        .unwrap()
+        postcard::to_allocvec(&commit_msg(group, 9, part, last, piece)).unwrap()
     }
 
+    /// The frame at its largest: `due` at full width.
     fn frame_len(group: &str, part: usize, last: bool, piece: &CommitPiece) -> usize {
-        1 + encoded_len(&CommitFrame {
-            group,
-            due: u64::MAX,
-            part: part as u16,
-            last,
-            piece,
-        })
+        encoded_len(&commit_msg(group, u64::MAX, part, last, piece))
     }
 
     /// Cuts `whole`, checks every frame against the piece cap, decodes each frame as the
@@ -3210,13 +3297,19 @@ mod tests {
             let bytes = frame_len(group, i, last, &piece);
             assert!(bytes <= PIECE_MAX_BYTES, "frame {i}: {bytes}");
             total += bytes;
-            let got: CommitFrameIn = postcard::from_bytes(&frame(group, i, last, &piece)).unwrap();
-            assert_eq!(
-                (&got.group[..], got.part, got.last),
-                (group, i as u16, last)
-            );
-            parts_heap += got.piece.heap();
-            let t = parts.take(got.due, got.part, got.last, got.piece, bytes);
+            let ClientMessage::EpochCommit {
+                group: got_group,
+                due,
+                part,
+                last: got_last,
+                piece,
+            } = postcard::from_bytes(&frame(group, i, last, &piece)).unwrap()
+            else {
+                panic!("not EpochCommit");
+            };
+            assert_eq!((&got_group[..], part, got_last), (group, i as u16, last));
+            parts_heap += piece.heap();
+            let t = parts.take(due, part, got_last, piece, bytes);
             assert_eq!(t.dropped, None);
             match t.part {
                 Part::Held => assert!(!last),
@@ -3395,28 +3488,6 @@ mod tests {
         assert!(parts <= 10, "{parts}");
     }
 
-    /// `ServerMessage::EpochDue`'s fields (plan 1c), to measure and decode its frames
-    /// before W1 adds the variant (its index, 96, is one more byte).
-    #[derive(Serialize, Deserialize)]
-    struct DueFrame {
-        group: String,
-        due: u64,
-        kind: u8,
-        parent: [u8; 32],
-        deadline_ms: u32,
-        part: u16,
-        last: bool,
-        keyring_at: (u32, u32),
-        joins: Vec<Joiner>,
-        exits: Vec<ExitIn>,
-        exits_upto: u64,
-        promote: Option<Candidate>,
-        remove: Option<HolderRef>,
-        gated: bool,
-        roll_due: bool,
-        seed_seats: Vec<SeedSeat>,
-    }
-
     #[test]
     fn a_due_of_every_exit_at_100k_fits_its_cap() {
         // An admin revokes access for every member of a non-gated 100k group: only a
@@ -3434,27 +3505,25 @@ mod tests {
             })
             .collect();
         let group = format!("c:{}", "g".repeat(62));
-        let frame = |part: u16, last: bool, exits: Vec<ExitIn>| DueFrame {
+        let frame = |part: u16, last: bool, exits: Vec<ExitIn>| ServerMessage::EpochDue {
             group: group.clone(),
             due: u64::MAX,
-            kind: due::EXITS,
-            parent: [0xd0; 32],
-            deadline_ms: 4000,
             part,
             last,
-            keyring_at: (u32::MAX, u32::MAX),
-            joins: vec![],
-            exits,
-            exits_upto: u64::MAX,
-            promote: None,
-            remove: None,
-            gated: false,
-            roll_due: true,
-            seed_seats: vec![],
+            piece: Box::new(DuePiece {
+                kind: due::EXITS,
+                parent: [0xd0; 32],
+                deadline_ms: 4000,
+                keyring_at: (u32::MAX, u32::MAX),
+                exits,
+                exits_upto: u64::MAX,
+                roll_due: true,
+                ..DuePiece::default()
+            }),
         };
-        // Cut as the relay would: as many exits a part as fit 56 KiB, the variant index
-        // and a 3-byte `exits` length counted.
-        let fixed = 1 + encoded_len(&frame(u16::MAX, false, vec![])) + 2;
+        // Cut as the relay would: as many exits a part as fit 56 KiB, a 3-byte `exits`
+        // length counted.
+        let fixed = encoded_len(&frame(u16::MAX, false, vec![])) + 2;
         let mut chunks = vec![Vec::new()];
         let mut used = fixed;
         for e in &exits {
@@ -3467,20 +3536,31 @@ mod tests {
             chunks.last_mut().unwrap().push(*e);
         }
         let count = chunks.len();
-        let mut parts: Parts<u64, Vec<ExitIn>> = Parts::new(Seq::Due);
+        let mut parts: Parts<u64, DuePiece> = Parts::new(Seq::Due);
         let (mut wire, mut out) = (0, None);
         for (i, chunk) in chunks.into_iter().enumerate() {
             let last = i + 1 == count;
             let bytes = postcard::to_allocvec(&frame(i as u16, last, chunk)).unwrap();
-            let len = 1 + bytes.len();
+            let len = bytes.len();
             assert!(len <= PIECE_MAX_BYTES, "frame {i}: {len}");
             wire += len;
-            let got: DueFrame = postcard::from_bytes(&bytes).unwrap();
-            let t = parts.take(got.due, got.part, got.last, got.exits, len);
+            let ServerMessage::EpochDue {
+                due,
+                part,
+                last: got_last,
+                piece,
+                ..
+            } = postcard::from_bytes(&bytes).unwrap()
+            else {
+                panic!("not EpochDue");
+            };
+            let t = parts.take(due, part, got_last, *piece, len);
             assert_eq!(t.dropped, None);
             match t.part {
                 Part::Held => assert!(!last),
-                Part::Whole(_, got) => out = Some(got.concat()),
+                Part::Whole(_, got) => {
+                    out = Some(got.into_iter().flat_map(|p| p.exits).collect::<Vec<_>>())
+                }
                 Part::NotTaken(why) => panic!("part {i} of {count}: {why:?}"),
             }
         }

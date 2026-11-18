@@ -40,6 +40,8 @@
   import { olderRelay } from "../../stores/relay.js";
   import { lazyLobby, livePath } from "../../relay-rules.js";
   import { refreshList } from "../../stores/sweep.js";
+  import { gkChannels } from "../../stores/gk.js";
+  import { holdersLine } from "../../gk-rules.js";
   import { serverAddress } from "../../stores/scoped.js";
   import { openShare, openUserMenu } from "../../stores/user-menu.js";
   import { memberMenu } from "../../actions/member-menu.js";
@@ -114,6 +116,9 @@
   /** A channel whose list comes by the sweep, so it is as old as that. */
   const byList = $derived(!$isPreviewing && !!$displayChannel?.text && !$openTextHere && livePath($olderRelay?.protocol ?? null));
 
+  /** Who holds this channel's keys (plan 3h), named as the room shows them. */
+  const keysHeldBy = $derived(holdersLine($gkChannels.get($displayChannelId)?.holders ?? []));
+
   function menu(user: UserInfo, e: MouseEvent, idle: boolean) {
     e.preventDefault();
     e.stopPropagation();
@@ -122,6 +127,9 @@
 </script>
 
 <aside class="user-list modern">
+  {#if keysHeldBy}
+    <div class="hidden-note keys-held">{keysHeldBy}</div>
+  {/if}
   {#if $hideMembers && !$isPreviewing}
     <div class="hidden-note">Members are hidden here — people appear while they speak</div>
   {:else if byList}

@@ -105,7 +105,14 @@ pub const CONTROL_MSGS_PER_SEC: u32 = 50;
 ///      PokeReceived
 /// v26: the media edge pool — WatchAt (types::EdgeView) and EdgeFailed, LoadReport.edges
 ///      (types::EdgeLoad), ShareLoad.on_edges; VideoLossSummary to a sharer past 8 viewers.
-///      Between a relay and its edges the pool has its own version, `pool::POOL_VERSION`
+///      Between a relay and its edges the pool has its own version, `pool::POOL_VERSION`;
+///      the group epoch key (docs/GROUP-KEY.md, `gk`) — EpochFetch/EpochCommit/EpochDecline/
+///      EpochWelcomes/EpochListsWanted/KeyringWanted/EpochPost/EpochBlobWanted/EpochNames/
+///      EpochFloorAhead/KeyholdVolunteer/KeyholdResign/KeyholdReplace, GroupKeys/EpochIn/
+///      EpochWait/EpochDue/EpochStale/EpochLists/KeyringIn/EpochExit/EpochPostIn/EpochBlob/
+///      EpochNamesIn/EpochRefused/VoiceSeats/EpochReseated, AccountRequest::SeatKeysPublish/
+///      SelfRowPut/EpochChainStart/EpochChainKeys/SelfRowsList/RowMakers and their
+///      AccountReply answers, LoadReport.groups (types::GroupLoad)
 ///
 /// A relay admits only its own protocol; an app speaks its own down to
 /// `compat::OLDEST_RELAY_PROTOCOL` (1.6).

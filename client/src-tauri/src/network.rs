@@ -3081,6 +3081,21 @@ async fn handle_server_message(
         | ServerMessage::EmoteList { .. }
         | ServerMessage::EmoteTicket { .. }
         | ServerMessage::EmoteError { .. } => {}
+        // The group key: nothing takes it yet (N1 routes it)
+        ServerMessage::GroupKeys { .. }
+        | ServerMessage::EpochIn { .. }
+        | ServerMessage::EpochWait { .. }
+        | ServerMessage::EpochDue { .. }
+        | ServerMessage::EpochStale { .. }
+        | ServerMessage::EpochLists { .. }
+        | ServerMessage::KeyringIn { .. }
+        | ServerMessage::EpochExit { .. }
+        | ServerMessage::EpochPostIn { .. }
+        | ServerMessage::EpochBlob { .. }
+        | ServerMessage::EpochNamesIn { .. }
+        | ServerMessage::EpochRefused { .. }
+        | ServerMessage::VoiceSeats { .. }
+        | ServerMessage::EpochReseated { .. } => {}
         ServerMessage::WatchAt {
             sharer_user_id,
             placement,

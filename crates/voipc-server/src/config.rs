@@ -74,6 +74,12 @@ pub struct ServerConfig {
     #[serde(default)]
     pub tcp_fallback: bool,
 
+    /// The group epoch key for text channels and voice rooms (docs/GROUP-KEY.md), read at
+    /// start: on, the relay keys every group that way and refuses the old paths; off, it
+    /// keeps them and refuses the key's messages. Off until the key is whole.
+    #[serde(default)]
+    pub group_key: bool,
+
     /// Path to TLS certificate file (PEM).
     pub cert_path: String,
 
@@ -630,6 +636,7 @@ impl Default for ServerConfig {
             max_connections_per_ip: default_max_connections_per_ip(),
             live_lobby: default_live_lobby(),
             tcp_fallback: false,
+            group_key: false,
             cert_path: "certs/server.crt".into(),
             key_path: "certs/server.key".into(),
             admin_token: None,
@@ -693,6 +700,7 @@ mod tests {
         assert_eq!(config.max_users, 64);
         assert_eq!(config.max_connections_per_ip, 32);
         assert!(!config.tcp_fallback, "the TCP fallback is opt-in");
+        assert!(!config.group_key, "the group key is off until it is whole");
     }
 
     #[test]
@@ -716,6 +724,11 @@ mod tests {
         let config: ServerConfig =
             toml::from_str("tcp_fallback = true\ncert_path = \"c\"\nkey_path = \"k\"").unwrap();
         assert!(config.tcp_fallback);
+        assert!(!config.group_key);
+
+        let config: ServerConfig =
+            toml::from_str("group_key = true\ncert_path = \"c\"\nkey_path = \"k\"").unwrap();
+        assert!(config.group_key);
     }
 
     #[test]

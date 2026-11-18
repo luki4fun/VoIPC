@@ -529,7 +529,31 @@ pub const RESHAPED: &[(u32, Side, u32, &str)] = &[
         36,
         "PokeReceived without the sender's account",
     ),
-    (25, Side::Server, 90, "AdminLoad without edges"),
+    (
+        24,
+        Side::Client,
+        41,
+        "AccountRequest: the group key's requests are refused",
+    ),
+    (
+        24,
+        Side::Server,
+        46,
+        "AccountReply: the group key's replies never come from it",
+    ),
+    (
+        25,
+        Side::Client,
+        41,
+        "AccountRequest: the group key's requests are refused",
+    ),
+    (
+        25,
+        Side::Server,
+        46,
+        "AccountReply: the group key's replies never come from it",
+    ),
+    (25, Side::Server, 90, "AdminLoad without edges and groups"),
 ];
 
 /// How many messages each side had at a protocol: an index at or past it is
@@ -751,6 +775,15 @@ fn frames_for(msg: &ClientMessage, proto: u32) -> Result<Vec<Vec<u8>>, ProtocolE
         ClientMessage::Account(AccountRequest::DeviceForget { .. }) if proto < 24 => {
             Err(ProtocolError::NotOnThisRelay(proto))
         }
+        // The group key (26): its own messages are past every older relay's count
+        ClientMessage::Account(
+            AccountRequest::SeatKeysPublish { .. }
+            | AccountRequest::SelfRowPut { .. }
+            | AccountRequest::EpochChainStart { .. }
+            | AccountRequest::EpochChainKeys { .. }
+            | AccountRequest::SelfRowsList { .. }
+            | AccountRequest::RowMakers { .. },
+        ) if proto < 26 => Err(ProtocolError::NotOnThisRelay(proto)),
         ClientMessage::EmoteAdd { emote } if proto == 14 => old(postcard::to_allocvec(&(
             EMOTE_ADD,
             EmoteAdd14 {
@@ -944,6 +977,7 @@ impl From<LoadReport25> for LoadReport {
             last_minute: r.last_minute,
             warnings: r.warnings,
             edges: vec![],
+            groups: vec![],
         }
     }
 }
@@ -1388,7 +1422,7 @@ mod tests {
     }
 
     #[test]
-    fn the_load_view_of_a_relay_at_25_has_no_edges() {
+    fn the_load_view_of_a_relay_at_25_has_no_edges_or_groups() {
         let report = LoadReport25 {
             online: 3,
             max_users: 10,
@@ -1416,6 +1450,7 @@ mod tests {
             panic!("not AdminLoad");
         };
         assert!(report.edges.is_empty());
+        assert!(report.groups.is_empty());
         assert_eq!((report.online, report.udp_dropped), (3, 1));
         assert_eq!(report.warnings, ["w"]);
         assert_eq!(
@@ -2229,6 +2264,56 @@ mod tests {
         }
         for v in 24..=PROTOCOL_VERSION {
             assert!(encode_client_msg_for(&msg, v).is_ok(), "protocol {v}");
+        }
+    }
+
+    #[test]
+    fn the_group_key_goes_only_to_a_relay_at_26() {
+        let msgs = [
+            ClientMessage::EpochFetch {
+                group: "c:1".into(),
+                have: None,
+                at: vec![],
+                seat: None,
+            },
+            ClientMessage::KeyholdReplace {
+                old: [1; 8],
+                pair: crate::gk::EndorsedPair {
+                    origin: crate::gk::origin::DESKTOP,
+                    u: 0,
+                    kem: vec![],
+                    dh: vec![],
+                    n: 1,
+                    made: 0,
+                    sig: vec![],
+                },
+            },
+            ClientMessage::Account(AccountRequest::SeatKeysPublish {
+                kem: vec![],
+                dh: vec![],
+                n: 1,
+                made: 0,
+                sig: vec![],
+            }),
+            ClientMessage::Account(AccountRequest::RowMakers {
+                group: "c:1".into(),
+                gen: [0; 16],
+                sk: [0; 8],
+                sx: [0; 8],
+                after: None,
+            }),
+        ];
+        for msg in &msgs {
+            for v in OLDEST_RELAY_PROTOCOL..26 {
+                assert!(
+                    matches!(
+                        encode_client_msg_for(msg, v),
+                        Err(ProtocolError::NotOnThisRelay(_))
+                    ),
+                    "{msg:?} at {v}"
+                );
+            }
+            assert!(encode_client_msg_for(msg, 26).is_ok(), "{msg:?}");
         }
     }
 

@@ -42,10 +42,11 @@
   import { marksChannel, type QuietMode } from "../follow-rules.js";
   import { confirmAction } from "../stores/confirm.js";
   import { addNotification } from "../stores/notifications.js";
-  import { isMobile, isWeb, volumeKeyPtt } from "../stores/platform.js";
+  import { isAndroidApp, isMobile, isWeb, volumeKeyPtt } from "../stores/platform.js";
   import {
     micMonitor,
     shareChannelHistory,
+    helpHoldKeys,
     maxConversations,
     spatialAudio,
     screenAudioSpatial,
@@ -1287,6 +1288,25 @@
             <span class="toggle-hint share-reach">{shareReach}</span>
           {/if}
         </label>
+        {#if !isWeb && !isAndroidApp}
+        <label class="toggle-row">
+          <input
+            type="checkbox"
+            checked={$helpHoldKeys}
+            onchange={(e) => {
+              const enabled = (e.target as HTMLInputElement).checked;
+              helpHoldKeys.set(enabled);
+              invoke("set_config_bool", { key: "help_hold_keys", value: enabled }).catch((err: any) => {
+                addNotification(`Failed to save setting: ${err}`, "error");
+              });
+            }}
+          />
+          <span class="toggle-label">Help hold keys for text channels</span>
+          <span class="toggle-hint">
+            Your app keeps the keys of text channels you are in and gives them to new members, so the channels work while others are offline. Voice rooms always share this among the people in them.
+          </span>
+        </label>
+        {/if}
         {#if $connectionState === "connected" && livePath($olderRelay?.protocol ?? null)}
           <div class="ptt-config quiet-mode">
             <span class="hotkey-label">Quiet mode on this server</span>

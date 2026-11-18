@@ -4456,6 +4456,7 @@ pub fn set_config_bool(state: State<'_, AppState>, key: String, value: bool) -> 
         "remember_connection" => config.remember_connection = value,
         "share_channel_history" => config.share_channel_history = value,
         "share_off_notice" => config.share_off_notice = value,
+        "help_hold_keys" => config.help_hold_keys = value,
         _ => return Err(format!("Unknown config key: {key}")),
     }
     crate::config::save_config(&config)

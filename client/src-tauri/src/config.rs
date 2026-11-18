@@ -179,6 +179,9 @@ pub struct AppConfig {
     pub share_off_once: bool,
     /// That reset turned a saved `true` off: one notice is owed.
     pub share_off_notice: bool,
+    /// Volunteer as a keyholder for text channels' group keys (on by default,
+    /// desktop only).
+    pub help_hold_keys: bool,
 
     // Appearance
     /// Everything the UI remembers about how it looks: which layout, which
@@ -281,6 +284,7 @@ impl Default for AppConfig {
             share_channel_history: false,
             share_off_once: true,
             share_off_notice: false,
+            help_hold_keys: true,
             // Null, not `{}`: "nothing has been chosen yet" is the state the
             // whole appearance blob starts in, and an empty object would be
             // indistinguishable from a user who reset every preference. What

@@ -79,7 +79,7 @@ async fn authenticates_over_duplex() {
     let mut buf = BytesMut::new();
     let mut replies = Vec::new();
     let read_replies = async {
-        while replies.len() < 3 {
+        while replies.len() < 4 {
             let n = client.read_buf(&mut buf).await.unwrap();
             assert!(n > 0, "server closed the connection");
             while let Some(payload) = try_decode_frame(&mut buf).unwrap() {
@@ -94,9 +94,14 @@ async fn authenticates_over_duplex() {
     let ServerMessage::Authenticated { session_id, .. } = replies[0] else {
         panic!("expected Authenticated, got {:?}", replies[0]);
     };
-    assert!(matches!(replies[1], ServerMessage::ChannelList { .. }));
+    // The group key's switch comes next, before anything another task sends (plan 1f.8)
     assert!(matches!(
-        replies[2],
+        replies[1],
+        ServerMessage::GroupKeys { on: false, .. }
+    ));
+    assert!(matches!(replies[2], ServerMessage::ChannelList { .. }));
+    assert!(matches!(
+        replies[3],
         ServerMessage::UserList { channel_id: 0, .. }
     ));
     assert_eq!(state.sessions.len(), 1);

@@ -22,6 +22,9 @@ mod emotes;
 mod files;
 mod fsutil;
 mod gates;
+mod gk;
+#[cfg(test)]
+mod gk_tests;
 mod layout;
 mod load;
 mod lobby;

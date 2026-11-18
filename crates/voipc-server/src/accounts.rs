@@ -1116,6 +1116,8 @@ pub(crate) fn asked(ask: Option<u32>, reply: AccountReply) -> AccountReply {
     }
 }
 
+const GROUP_KEY_OFF: &str = "This relay does not use the group key.";
+
 fn refused(request: &str, reason: &str) -> AccountReply {
     AccountReply::Error {
         request: request.into(),
@@ -3114,6 +3116,13 @@ pub async fn handle_request(
         AccountRequest::ArchiveChannels => archive::channels(state, &relay, session_id)
             .await
             .unwrap_or_else(|e| read_failed("ArchiveChannels", e)),
+        // The group key's: refused until K2 routes them (plan 2a)
+        AccountRequest::SeatKeysPublish { .. } => refused("SeatKeysPublish", GROUP_KEY_OFF),
+        AccountRequest::SelfRowPut { .. } => refused("SelfRowPut", GROUP_KEY_OFF),
+        AccountRequest::EpochChainStart { .. } => refused("EpochChainStart", GROUP_KEY_OFF),
+        AccountRequest::EpochChainKeys { .. } => refused("EpochChainKeys", GROUP_KEY_OFF),
+        AccountRequest::SelfRowsList { .. } => refused("SelfRowsList", GROUP_KEY_OFF),
+        AccountRequest::RowMakers { .. } => refused("RowMakers", GROUP_KEY_OFF),
     };
     crate::session::send_msg(tx, &reply(out))
 }

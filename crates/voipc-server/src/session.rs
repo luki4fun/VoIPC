@@ -158,18 +158,10 @@ pub async fn handle_connection<S>(
         }
     });
 
-    // Store the sender in the session
-    match state.sessions.get_mut(&session_id) {
-        Some(mut session) => session.control_tx = tx.clone(),
-        None => {
-            writer_handle.abort();
-            return;
-        }
-    }
-
     // Sent from here (not inside authenticate) so that a failed write
     // still flows through cleanup_session below instead of leaking the
-    // registered session and username.
+    // registered session and username. Both are queued before the sender is
+    // stored in the session, so no other task's frame comes first (plan 1f.8).
     let _ = send_msg(
         &tx,
         &ServerMessage::Authenticated {
@@ -181,6 +173,16 @@ pub async fn handle_connection<S>(
             emotes: state.emotes.as_ref().map(|e| e.access(session_id)),
         },
     );
+    let _ = send_msg(&tx, &state.gk.hello());
+
+    // Store the sender in the session
+    match state.sessions.get_mut(&session_id) {
+        Some(mut session) => session.control_tx = tx.clone(),
+        None => {
+            writer_handle.abort();
+            return;
+        }
+    }
 
     // Send channel list
     let channel_list = state.channel_list_for(session_id).await;
@@ -1531,6 +1533,25 @@ async fn handle_message(
                 Some((true, _, false)) => state.limits.count("edge failed", "over rate"),
                 _ => {}
             }
+        }
+        // The group key's: dropped until R1 handles them (plan 2a, `gk/session.rs`)
+        ClientMessage::EpochFetch { .. }
+        | ClientMessage::EpochCommit { .. }
+        | ClientMessage::EpochDecline { .. }
+        | ClientMessage::EpochWelcomes { .. }
+        | ClientMessage::EpochListsWanted { .. }
+        | ClientMessage::KeyringWanted { .. }
+        | ClientMessage::EpochPost { .. }
+        | ClientMessage::EpochBlobWanted { .. }
+        | ClientMessage::EpochNames { .. }
+        | ClientMessage::EpochFloorAhead { .. }
+        | ClientMessage::KeyholdVolunteer { .. }
+        | ClientMessage::KeyholdResign { .. }
+        | ClientMessage::KeyholdReplace { .. } => {
+            debug!(
+                user_id,
+                "a group key message, which this relay does not take yet"
+            );
         }
         ClientMessage::Authenticate { .. } | ClientMessage::AuthContinue(_) => {
             // debug, like the other things a client can repeat at line rate:

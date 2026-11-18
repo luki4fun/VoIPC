@@ -53,6 +53,9 @@ pub struct LoadReport {
     /// The media edges of `[pool]`, linked or not (protocol v26); empty without a pool, and
     /// from a relay at 25, so the Load view shows no Edges table then.
     pub edges: Vec<EdgeLoad>,
+    /// The groups with a key (protocol v26); empty with the key off, and from a relay at 25
+    /// or older.
+    pub groups: Vec<GroupLoad>,
 }
 
 /// One screen share, for `LoadReport`.
@@ -95,6 +98,23 @@ pub struct EdgeLoad {
     pub cpu_secs: u64,
     pub rss_mib: u32,
     pub report_age_secs: u32,
+}
+
+/// One group with its key, for `LoadReport` (protocol v26). `kind` is a
+/// `gk::group_kind` code; `last_commit_secs` is how long ago its head moved.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct GroupLoad {
+    pub channel_id: ChannelId,
+    pub kind: u8,
+    pub seats: u32,
+    pub keyholders: u32,
+    pub keyholders_online: u32,
+    pub last_commit_secs: u32,
+    pub joins_waiting: u32,
+    pub exits_waiting: u32,
+    pub missed_deadlines: u32,
+    pub mem_bytes: u64,
+    pub db_bytes: u64,
 }
 
 /// Where a viewer fetches a share from a media edge (`ServerMessage::WatchAt`, protocol

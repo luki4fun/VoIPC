@@ -811,6 +811,80 @@
       },
       "54": {
         "DeviceForgotten": "UNIT"
+      },
+      "55": {
+        "SeatKeysStored": {
+          "STRUCT": [
+            {
+              "n": "U32"
+            }
+          ]
+        }
+      },
+      "56": {
+        "SelfRowsStored": {
+          "STRUCT": [
+            {
+              "count": "U32"
+            }
+          ]
+        }
+      },
+      "57": {
+        "EpochChainKeys": {
+          "STRUCT": [
+            {
+              "conv": "STR"
+            },
+            {
+              "keys": {
+                "SEQ": {
+                  "TYPENAME": "GkChainKey"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "58": {
+        "SelfRows": {
+          "STRUCT": [
+            {
+              "rows": {
+                "SEQ": {
+                  "TYPENAME": "SelfRowIn"
+                }
+              }
+            },
+            {
+              "next": {
+                "OPTION": {
+                  "SEQ": "U8"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "59": {
+        "RowMakers": {
+          "STRUCT": [
+            {
+              "makers": {
+                "SEQ": {
+                  "TYPENAME": "RowMaker"
+                }
+              }
+            },
+            {
+              "next": {
+                "OPTION": {
+                  "SEQ": "U8"
+                }
+              }
+            }
+          ]
+        }
       }
     }
   },
@@ -1560,6 +1634,177 @@
             {
               "device_id": {
                 "SEQ": "U8"
+              }
+            }
+          ]
+        }
+      },
+      "47": {
+        "SeatKeysPublish": {
+          "STRUCT": [
+            {
+              "kem": {
+                "SEQ": "U8"
+              }
+            },
+            {
+              "dh": {
+                "SEQ": "U8"
+              }
+            },
+            {
+              "n": "U32"
+            },
+            {
+              "made": "U64"
+            },
+            {
+              "sig": {
+                "SEQ": "U8"
+              }
+            }
+          ]
+        }
+      },
+      "48": {
+        "SelfRowPut": {
+          "STRUCT": [
+            {
+              "rows": {
+                "SEQ": {
+                  "TYPENAME": "SelfRowIn"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "49": {
+        "EpochChainStart": {
+          "STRUCT": [
+            {
+              "conv": "STR"
+            },
+            {
+              "epoch": "U32"
+            },
+            {
+              "self_wrap": {
+                "SEQ": "U8"
+              }
+            },
+            {
+              "link": {
+                "OPTION": {
+                  "TUPLE": [
+                    "U32",
+                    {
+                      "SEQ": "U8"
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "group": "STR"
+            },
+            {
+              "gen": {
+                "TUPLEARRAY": {
+                  "CONTENT": "U8",
+                  "SIZE": 16
+                }
+              }
+            },
+            {
+              "gk_epoch": "U32"
+            },
+            {
+              "sealed": {
+                "SEQ": "U8"
+              }
+            },
+            {
+              "last": "BOOL"
+            }
+          ]
+        }
+      },
+      "50": {
+        "EpochChainKeys": {
+          "STRUCT": [
+            {
+              "conv": "STR"
+            },
+            {
+              "chains": {
+                "SEQ": {
+                  "TUPLE": [
+                    {
+                      "TUPLEARRAY": {
+                        "CONTENT": "U8",
+                        "SIZE": 16
+                      }
+                    },
+                    "U32"
+                  ]
+                }
+              }
+            }
+          ]
+        }
+      },
+      "51": {
+        "SelfRowsList": {
+          "STRUCT": [
+            {
+              "after": {
+                "OPTION": {
+                  "SEQ": "U8"
+                }
+              }
+            },
+            {
+              "limit": "U16"
+            }
+          ]
+        }
+      },
+      "52": {
+        "RowMakers": {
+          "STRUCT": [
+            {
+              "group": "STR"
+            },
+            {
+              "gen": {
+                "TUPLEARRAY": {
+                  "CONTENT": "U8",
+                  "SIZE": 16
+                }
+              }
+            },
+            {
+              "sk": {
+                "TUPLEARRAY": {
+                  "CONTENT": "U8",
+                  "SIZE": 8
+                }
+              }
+            },
+            {
+              "sx": {
+                "TUPLEARRAY": {
+                  "CONTENT": "U8",
+                  "SIZE": 8
+                }
+              }
+            },
+            {
+              "after": {
+                "OPTION": {
+                  "SEQ": "U8"
+                }
               }
             }
           ]
@@ -3712,6 +3957,28 @@
       }
     ]
   },
+  "Candidate": {
+    "STRUCT": [
+      {
+        "m": {
+          "TYPENAME": "GkMember"
+        }
+      },
+      {
+        "ik": {
+          "TUPLEARRAY": {
+            "CONTENT": "U8",
+            "SIZE": 32
+          }
+        }
+      },
+      {
+        "pair": {
+          "TYPENAME": "EndorsedPair"
+        }
+      }
+    ]
+  },
   "ChainAsk": {
     "STRUCT": [
       {
@@ -4953,8 +5220,478 @@
             }
           ]
         }
+      },
+      "69": {
+        "EpochFetch": {
+          "STRUCT": [
+            {
+              "group": "STR"
+            },
+            {
+              "have": {
+                "OPTION": {
+                  "TYPENAME": "FloorRef"
+                }
+              }
+            },
+            {
+              "at": {
+                "SEQ": {
+                  "TYPENAME": "EpochRef"
+                }
+              }
+            },
+            {
+              "seat": {
+                "OPTION": {
+                  "TYPENAME": "EndorsedPair"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "70": {
+        "EpochCommit": {
+          "STRUCT": [
+            {
+              "group": "STR"
+            },
+            {
+              "due": "U64"
+            },
+            {
+              "part": "U16"
+            },
+            {
+              "last": "BOOL"
+            },
+            {
+              "piece": {
+                "TYPENAME": "CommitPiece"
+              }
+            }
+          ]
+        }
+      },
+      "71": {
+        "EpochDecline": {
+          "STRUCT": [
+            {
+              "group": "STR"
+            },
+            {
+              "due": "U64"
+            },
+            {
+              "why": "U8"
+            },
+            {
+              "detail": "STR"
+            }
+          ]
+        }
+      },
+      "72": {
+        "EpochWelcomes": {
+          "STRUCT": [
+            {
+              "group": "STR"
+            },
+            {
+              "due": "U64"
+            },
+            {
+              "gen": {
+                "TUPLEARRAY": {
+                  "CONTENT": "U8",
+                  "SIZE": 16
+                }
+              }
+            },
+            {
+              "seed": "U32"
+            },
+            {
+              "welcomes": {
+                "SEQ": {
+                  "TYPENAME": "SeedWelcomeOut"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "73": {
+        "EpochListsWanted": {
+          "STRUCT": [
+            {
+              "group": "STR"
+            },
+            {
+              "gen": {
+                "TUPLEARRAY": {
+                  "CONTENT": "U8",
+                  "SIZE": 16
+                }
+              }
+            },
+            {
+              "versions": {
+                "SEQ": {
+                  "TUPLEARRAY": {
+                    "CONTENT": "U64",
+                    "SIZE": 2
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "74": {
+        "KeyringWanted": {
+          "STRUCT": [
+            {
+              "group": "STR"
+            },
+            {
+              "gen": {
+                "TUPLEARRAY": {
+                  "CONTENT": "U8",
+                  "SIZE": 16
+                }
+              }
+            },
+            {
+              "have": {
+                "OPTION": {
+                  "TUPLEARRAY": {
+                    "CONTENT": "U32",
+                    "SIZE": 2
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "75": {
+        "EpochPost": {
+          "STRUCT": [
+            {
+              "channel_id": "U32"
+            },
+            {
+              "group": "STR"
+            },
+            {
+              "gen": {
+                "TUPLEARRAY": {
+                  "CONTENT": "U8",
+                  "SIZE": 16
+                }
+              }
+            },
+            {
+              "epoch": "U32"
+            },
+            {
+              "blob": {
+                "OPTION": {
+                  "SEQ": "U8"
+                }
+              }
+            },
+            {
+              "ciphertext": {
+                "SEQ": "U8"
+              }
+            }
+          ]
+        }
+      },
+      "76": {
+        "EpochBlobWanted": {
+          "STRUCT": [
+            {
+              "group": "STR"
+            },
+            {
+              "gen": {
+                "TUPLEARRAY": {
+                  "CONTENT": "U8",
+                  "SIZE": 16
+                }
+              }
+            },
+            {
+              "epoch": "U32"
+            },
+            {
+              "writer": {
+                "TYPENAME": "GkWriter"
+              }
+            }
+          ]
+        }
+      },
+      "77": {
+        "EpochNames": {
+          "STRUCT": [
+            {
+              "group": "STR"
+            },
+            {
+              "from": {
+                "TYPENAME": "NamesRef"
+              }
+            },
+            {
+              "to": {
+                "TYPENAME": "NamesRef"
+              }
+            },
+            {
+              "removals": "BOOL"
+            }
+          ]
+        }
+      },
+      "78": {
+        "EpochFloorAhead": {
+          "STRUCT": [
+            {
+              "group": "STR"
+            },
+            {
+              "header": {
+                "TYPENAME": "HeaderIn"
+              }
+            }
+          ]
+        }
+      },
+      "79": {
+        "KeyholdVolunteer": {
+          "STRUCT": [
+            {
+              "on": "BOOL"
+            },
+            {
+              "platform": "U8"
+            },
+            {
+              "pair": {
+                "OPTION": {
+                  "TYPENAME": "EndorsedPair"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "80": {
+        "KeyholdResign": {
+          "STRUCT": [
+            {
+              "group": "STR"
+            },
+            {
+              "entry": {
+                "OPTION": {
+                  "TUPLEARRAY": {
+                    "CONTENT": "U8",
+                    "SIZE": 32
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "81": {
+        "KeyholdReplace": {
+          "STRUCT": [
+            {
+              "old": {
+                "TUPLEARRAY": {
+                  "CONTENT": "U8",
+                  "SIZE": 8
+                }
+              }
+            },
+            {
+              "pair": {
+                "TYPENAME": "EndorsedPair"
+              }
+            }
+          ]
+        }
       }
     }
+  },
+  "CommitPiece": {
+    "STRUCT": [
+      {
+        "header": {
+          "OPTION": {
+            "TYPENAME": "HeaderIn"
+          }
+        }
+      },
+      {
+        "versions": {
+          "SEQ": {
+            "TYPENAME": "VersionOut"
+          }
+        }
+      },
+      {
+        "drops": {
+          "SEQ": "U64"
+        }
+      },
+      {
+        "welcomes": {
+          "SEQ": {
+            "TYPENAME": "WelcomeOut"
+          }
+        }
+      },
+      {
+        "rows": {
+          "SEQ": {
+            "TYPENAME": "RowsOut"
+          }
+        }
+      },
+      {
+        "seals": {
+          "SEQ": {
+            "TYPENAME": "SealOut"
+          }
+        }
+      },
+      {
+        "seed_welcomes": {
+          "SEQ": {
+            "TYPENAME": "SeedWelcomeOut"
+          }
+        }
+      },
+      {
+        "keyring": {
+          "SEQ": "U8"
+        }
+      },
+      {
+        "krk": {
+          "SEQ": {
+            "TYPENAME": "KrkOut"
+          }
+        }
+      },
+      {
+        "refused": {
+          "SEQ": {
+            "TYPENAME": "JoinRefused"
+          }
+        }
+      }
+    ]
+  },
+  "DuePiece": {
+    "STRUCT": [
+      {
+        "kind": "U8"
+      },
+      {
+        "parent": {
+          "TUPLEARRAY": {
+            "CONTENT": "U8",
+            "SIZE": 32
+          }
+        }
+      },
+      {
+        "deadline_ms": "U32"
+      },
+      {
+        "keyring_at": {
+          "TUPLEARRAY": {
+            "CONTENT": "U32",
+            "SIZE": 2
+          }
+        }
+      },
+      {
+        "joins": {
+          "SEQ": {
+            "TYPENAME": "Joiner"
+          }
+        }
+      },
+      {
+        "exits": {
+          "SEQ": {
+            "TYPENAME": "ExitIn"
+          }
+        }
+      },
+      {
+        "exits_upto": "U64"
+      },
+      {
+        "promote": {
+          "OPTION": {
+            "TYPENAME": "Candidate"
+          }
+        }
+      },
+      {
+        "remove": {
+          "OPTION": {
+            "TYPENAME": "HolderRef"
+          }
+        }
+      },
+      {
+        "gated": "BOOL"
+      },
+      {
+        "roll_due": "BOOL"
+      },
+      {
+        "seed_seats": {
+          "SEQ": {
+            "TYPENAME": "SeedSeat"
+          }
+        }
+      },
+      {
+        "finish": "BOOL"
+      },
+      {
+        "pairs": {
+          "SEQ": {
+            "TYPENAME": "EndorsedPair"
+          }
+        }
+      },
+      {
+        "held": {
+          "SEQ": {
+            "TUPLE": [
+              {
+                "TYPENAME": "GkSeat"
+              },
+              "U32"
+            ]
+          }
+        }
+      }
+    ]
   },
   "EdgeLoad": {
     "STRUCT": [
@@ -5079,6 +5816,67 @@
       }
     ]
   },
+  "EndorsedPair": {
+    "STRUCT": [
+      {
+        "origin": "U8"
+      },
+      {
+        "u": "U32"
+      },
+      {
+        "kem": {
+          "SEQ": "U8"
+        }
+      },
+      {
+        "dh": {
+          "SEQ": "U8"
+        }
+      },
+      {
+        "n": "U32"
+      },
+      {
+        "made": "U64"
+      },
+      {
+        "sig": {
+          "SEQ": "U8"
+        }
+      }
+    ]
+  },
+  "EpochRef": {
+    "STRUCT": [
+      {
+        "gen": {
+          "TUPLEARRAY": {
+            "CONTENT": "U8",
+            "SIZE": 16
+          }
+        }
+      },
+      {
+        "epoch": "U32"
+      }
+    ]
+  },
+  "ExitIn": {
+    "STRUCT": [
+      {
+        "seq": "U64"
+      },
+      {
+        "seat": {
+          "TYPENAME": "GkSeat"
+        }
+      },
+      {
+        "b": "U64"
+      }
+    ]
+  },
   "FileConv": {
     "ENUM": {
       "0": {
@@ -5116,6 +5914,133 @@
       }
     ]
   },
+  "FloorRef": {
+    "STRUCT": [
+      {
+        "gen": {
+          "TUPLEARRAY": {
+            "CONTENT": "U8",
+            "SIZE": 16
+          }
+        }
+      },
+      {
+        "epoch": "U32"
+      },
+      {
+        "join": "U32"
+      },
+      {
+        "d": {
+          "TUPLEARRAY": {
+            "CONTENT": "U8",
+            "SIZE": 32
+          }
+        }
+      },
+      {
+        "kh": {
+          "TUPLEARRAY": {
+            "CONTENT": "U8",
+            "SIZE": 32
+          }
+        }
+      }
+    ]
+  },
+  "GkChainKey": {
+    "STRUCT": [
+      {
+        "owner": {
+          "TUPLEARRAY": {
+            "CONTENT": "U8",
+            "SIZE": 16
+          }
+        }
+      },
+      {
+        "chain": "U32"
+      },
+      {
+        "index": "U8"
+      },
+      {
+        "group": "STR"
+      },
+      {
+        "gen": {
+          "TUPLEARRAY": {
+            "CONTENT": "U8",
+            "SIZE": 16
+          }
+        }
+      },
+      {
+        "epoch": "U32"
+      },
+      {
+        "sealed": {
+          "SEQ": "U8"
+        }
+      }
+    ]
+  },
+  "GkMember": {
+    "ENUM": {
+      "0": {
+        "Account": {
+          "NEWTYPE": {
+            "TUPLEARRAY": {
+              "CONTENT": "U8",
+              "SIZE": 16
+            }
+          }
+        }
+      },
+      "1": {
+        "Conn": {
+          "NEWTYPE": "U32"
+        }
+      }
+    }
+  },
+  "GkSeat": {
+    "STRUCT": [
+      {
+        "m": {
+          "TYPENAME": "GkMember"
+        }
+      },
+      {
+        "sk": {
+          "TUPLEARRAY": {
+            "CONTENT": "U8",
+            "SIZE": 8
+          }
+        }
+      },
+      {
+        "sx": {
+          "TUPLEARRAY": {
+            "CONTENT": "U8",
+            "SIZE": 8
+          }
+        }
+      }
+    ]
+  },
+  "GkWriter": {
+    "STRUCT": [
+      {
+        "m": {
+          "TYPENAME": "GkMember"
+        }
+      },
+      {
+        "u": "U32"
+      }
+    ]
+  },
   "GroupInfo": {
     "STRUCT": [
       {
@@ -5137,6 +6062,43 @@
       }
     ]
   },
+  "GroupLoad": {
+    "STRUCT": [
+      {
+        "channel_id": "U32"
+      },
+      {
+        "kind": "U8"
+      },
+      {
+        "seats": "U32"
+      },
+      {
+        "keyholders": "U32"
+      },
+      {
+        "keyholders_online": "U32"
+      },
+      {
+        "last_commit_secs": "U32"
+      },
+      {
+        "joins_waiting": "U32"
+      },
+      {
+        "exits_waiting": "U32"
+      },
+      {
+        "missed_deadlines": "U32"
+      },
+      {
+        "mem_bytes": "U64"
+      },
+      {
+        "db_bytes": "U64"
+      }
+    ]
+  },
   "GroupStyle": {
     "STRUCT": [
       {
@@ -5149,6 +6111,37 @@
       },
       {
         "section": "BOOL"
+      }
+    ]
+  },
+  "HeaderIn": {
+    "STRUCT": [
+      {
+        "body": {
+          "SEQ": "U8"
+        }
+      },
+      {
+        "sig": {
+          "SEQ": "U8"
+        }
+      }
+    ]
+  },
+  "HolderRef": {
+    "STRUCT": [
+      {
+        "m": {
+          "TYPENAME": "GkMember"
+        }
+      },
+      {
+        "kx": {
+          "TUPLEARRAY": {
+            "CONTENT": "U8",
+            "SIZE": 32
+          }
+        }
       }
     ]
   },
@@ -5505,6 +6498,104 @@
       }
     ]
   },
+  "InPiece": {
+    "STRUCT": [
+      {
+        "chain": {
+          "SEQ": {
+            "TYPENAME": "HeaderIn"
+          }
+        }
+      },
+      {
+        "walk": {
+          "SEQ": {
+            "TYPENAME": "WalkLinkIn"
+          }
+        }
+      },
+      {
+        "kh": {
+          "OPTION": {
+            "TYPENAME": "HeaderIn"
+          }
+        }
+      },
+      {
+        "head": {
+          "OPTION": {
+            "TYPENAME": "WalkLinkIn"
+          }
+        }
+      },
+      {
+        "opening": {
+          "OPTION": {
+            "TYPENAME": "HeaderIn"
+          }
+        }
+      },
+      {
+        "own_join": {
+          "OPTION": {
+            "TYPENAME": "HeaderIn"
+          }
+        }
+      },
+      {
+        "leaf": {
+          "OPTION": {
+            "TYPENAME": "LeafIn"
+          }
+        }
+      },
+      {
+        "path": {
+          "OPTION": {
+            "TYPENAME": "PathIn"
+          }
+        }
+      },
+      {
+        "seal": {
+          "OPTION": {
+            "SEQ": "U8"
+          }
+        }
+      },
+      {
+        "seat": {
+          "OPTION": {
+            "TYPENAME": "SeatKeying"
+          }
+        }
+      },
+      {
+        "seed_welcome": {
+          "OPTION": {
+            "TYPENAME": "SeedWelcomeIn"
+          }
+        }
+      },
+      {
+        "self_rows": {
+          "SEQ": {
+            "TYPENAME": "SelfRowIn"
+          }
+        }
+      },
+      {
+        "past": {
+          "OPTION": {
+            "TYPENAME": "EpochRef"
+          }
+        }
+      },
+      {
+        "pushed": "BOOL"
+      }
+    ]
+  },
   "InviteInfo": {
     "STRUCT": [
       {
@@ -5553,6 +6644,124 @@
       }
     ]
   },
+  "JoinRefused": {
+    "STRUCT": [
+      {
+        "seat": {
+          "TYPENAME": "GkSeat"
+        }
+      },
+      {
+        "why": "U8"
+      }
+    ]
+  },
+  "Joiner": {
+    "STRUCT": [
+      {
+        "seat": {
+          "TYPENAME": "GkSeat"
+        }
+      },
+      {
+        "ik": {
+          "TUPLEARRAY": {
+            "CONTENT": "U8",
+            "SIZE": 32
+          }
+        }
+      },
+      {
+        "keys": {
+          "TYPENAME": "EndorsedPair"
+        }
+      },
+      {
+        "returning": "BOOL"
+      }
+    ]
+  },
+  "KeyringPiece": {
+    "STRUCT": [
+      {
+        "krk": {
+          "OPTION": {
+            "TYPENAME": "KrkIn"
+          }
+        }
+      },
+      {
+        "stream": {
+          "SEQ": "U8"
+        }
+      }
+    ]
+  },
+  "KrkIn": {
+    "STRUCT": [
+      {
+        "from": {
+          "TYPENAME": "HolderRef"
+        }
+      },
+      {
+        "bytes": {
+          "SEQ": "U8"
+        }
+      }
+    ]
+  },
+  "KrkOut": {
+    "STRUCT": [
+      {
+        "to": {
+          "TYPENAME": "HolderRef"
+        }
+      },
+      {
+        "from_kx": {
+          "TUPLEARRAY": {
+            "CONTENT": "U8",
+            "SIZE": 32
+          }
+        }
+      },
+      {
+        "bytes": {
+          "SEQ": "U8"
+        }
+      }
+    ]
+  },
+  "LeafIn": {
+    "STRUCT": [
+      {
+        "b": "U64"
+      },
+      {
+        "v": "U64"
+      },
+      {
+        "pool": "U8"
+      },
+      {
+        "seats": "U16"
+      },
+      {
+        "list": {
+          "TUPLEARRAY": {
+            "CONTENT": "U8",
+            "SIZE": 32
+          }
+        }
+      },
+      {
+        "via": {
+          "OPTION": "U64"
+        }
+      }
+    ]
+  },
   "LinkedProvider": {
     "STRUCT": [
       {
@@ -5562,6 +6771,37 @@
       },
       {
         "name": "STR"
+      }
+    ]
+  },
+  "ListIn": {
+    "STRUCT": [
+      {
+        "b": "U64"
+      },
+      {
+        "v": "U64"
+      },
+      {
+        "seats": {
+          "SEQ": {
+            "TYPENAME": "ListSeat"
+          }
+        }
+      }
+    ]
+  },
+  "ListSeat": {
+    "STRUCT": [
+      {
+        "seat": {
+          "TYPENAME": "GkSeat"
+        }
+      },
+      {
+        "dh": {
+          "SEQ": "U8"
+        }
       }
     ]
   },
@@ -5618,6 +6858,13 @@
         "edges": {
           "SEQ": {
             "TYPENAME": "EdgeLoad"
+          }
+        }
+      },
+      {
+        "groups": {
+          "SEQ": {
+            "TYPENAME": "GroupLoad"
           }
         }
       }
@@ -5812,6 +7059,103 @@
       }
     }
   },
+  "NamesListIn": {
+    "STRUCT": [
+      {
+        "time": "U64"
+      },
+      {
+        "epoch": "U32"
+      },
+      {
+        "join": "U32"
+      },
+      {
+        "added": {
+          "SEQ": "U8"
+        }
+      }
+    ]
+  },
+  "NamesPiece": {
+    "STRUCT": [
+      {
+        "lists": {
+          "SEQ": {
+            "TYPENAME": "NamesListIn"
+          }
+        }
+      },
+      {
+        "joins": {
+          "SEQ": {
+            "TYPENAME": "HeaderIn"
+          }
+        }
+      },
+      {
+        "removals": {
+          "SEQ": {
+            "TYPENAME": "HeaderIn"
+          }
+        }
+      },
+      {
+        "gone": {
+          "OPTION": {
+            "TYPENAME": "NamesStepIn"
+          }
+        }
+      }
+    ]
+  },
+  "NamesRef": {
+    "STRUCT": [
+      {
+        "gen": {
+          "TUPLEARRAY": {
+            "CONTENT": "U8",
+            "SIZE": 16
+          }
+        }
+      },
+      {
+        "epoch": "U32"
+      },
+      {
+        "join": "U32"
+      }
+    ]
+  },
+  "NamesStepIn": {
+    "STRUCT": [
+      {
+        "before": {
+          "TUPLEARRAY": {
+            "CONTENT": "U8",
+            "SIZE": 32
+          }
+        }
+      },
+      {
+        "time": "U64"
+      },
+      {
+        "epoch": "U32"
+      },
+      {
+        "join": "U32"
+      },
+      {
+        "list": {
+          "TUPLEARRAY": {
+            "CONTENT": "U8",
+            "SIZE": 32
+          }
+        }
+      }
+    ]
+  },
   "OneTimePreKey": {
     "STRUCT": [
       {
@@ -5864,6 +7208,26 @@
       {
         "older": {
           "OPTION": "U32"
+        }
+      }
+    ]
+  },
+  "PathIn": {
+    "STRUCT": [
+      {
+        "index": "U32"
+      },
+      {
+        "n": "U32"
+      },
+      {
+        "siblings": {
+          "SEQ": {
+            "TUPLEARRAY": {
+              "CONTENT": "U8",
+              "SIZE": 32
+            }
+          }
         }
       }
     ]
@@ -6034,6 +7398,19 @@
       }
     }
   },
+  "RatchetStep": {
+    "STRUCT": [
+      {
+        "e": "U32"
+      },
+      {
+        "from": "U64"
+      },
+      {
+        "to": "U64"
+      }
+    ]
+  },
   "Registration": {
     "ENUM": {
       "0": {
@@ -6126,6 +7503,194 @@
       {
         "wait_in_secs": {
           "OPTION": "U32"
+        }
+      }
+    ]
+  },
+  "RowMaker": {
+    "STRUCT": [
+      {
+        "from": {
+          "TYPENAME": "HolderRef"
+        }
+      },
+      {
+        "s": "U32"
+      },
+      {
+        "b": "U64"
+      },
+      {
+        "v": "U64"
+      }
+    ]
+  },
+  "RowsOut": {
+    "STRUCT": [
+      {
+        "b": "U64"
+      },
+      {
+        "v": "U64"
+      },
+      {
+        "s": "U32"
+      },
+      {
+        "up": "U64"
+      },
+      {
+        "rows": {
+          "SEQ": "U8"
+        }
+      }
+    ]
+  },
+  "SealOut": {
+    "STRUCT": [
+      {
+        "b": "U64"
+      },
+      {
+        "v": "U64"
+      },
+      {
+        "bytes": {
+          "SEQ": "U8"
+        }
+      }
+    ]
+  },
+  "SeatKeying": {
+    "STRUCT": [
+      {
+        "b": "U64"
+      },
+      {
+        "base_v": "U64"
+      },
+      {
+        "s": "U32"
+      },
+      {
+        "from": {
+          "TYPENAME": "HolderRef"
+        }
+      },
+      {
+        "welcome": {
+          "OPTION": {
+            "SEQ": "U8"
+          }
+        }
+      },
+      {
+        "row": {
+          "OPTION": {
+            "SEQ": "U8"
+          }
+        }
+      },
+      {
+        "ratchets": {
+          "SEQ": {
+            "TYPENAME": "RatchetStep"
+          }
+        }
+      }
+    ]
+  },
+  "SeedSeat": {
+    "STRUCT": [
+      {
+        "seat": {
+          "TYPENAME": "GkSeat"
+        }
+      },
+      {
+        "ik": {
+          "TUPLEARRAY": {
+            "CONTENT": "U8",
+            "SIZE": 32
+          }
+        }
+      },
+      {
+        "keys": {
+          "TYPENAME": "EndorsedPair"
+        }
+      }
+    ]
+  },
+  "SeedWelcomeIn": {
+    "STRUCT": [
+      {
+        "s": "U32"
+      },
+      {
+        "from": {
+          "TYPENAME": "HolderRef"
+        }
+      },
+      {
+        "bytes": {
+          "SEQ": "U8"
+        }
+      }
+    ]
+  },
+  "SeedWelcomeOut": {
+    "STRUCT": [
+      {
+        "seat": {
+          "TYPENAME": "GkSeat"
+        }
+      },
+      {
+        "bytes": {
+          "SEQ": "U8"
+        }
+      }
+    ]
+  },
+  "SelfRowIn": {
+    "STRUCT": [
+      {
+        "group": "STR"
+      },
+      {
+        "gen": {
+          "TUPLEARRAY": {
+            "CONTENT": "U8",
+            "SIZE": 16
+          }
+        }
+      },
+      {
+        "seed": "U32"
+      },
+      {
+        "sk": {
+          "TUPLEARRAY": {
+            "CONTENT": "U8",
+            "SIZE": 8
+          }
+        }
+      },
+      {
+        "sx": {
+          "TUPLEARRAY": {
+            "CONTENT": "U8",
+            "SIZE": 8
+          }
+        }
+      },
+      {
+        "kind": "U8"
+      },
+      {
+        "sealed": {
+          "SEQ": "U8"
         }
       }
     ]
@@ -7562,6 +9127,360 @@
             }
           ]
         }
+      },
+      "93": {
+        "GroupKeys": {
+          "STRUCT": [
+            {
+              "on": "BOOL"
+            },
+            {
+              "run": {
+                "TUPLEARRAY": {
+                  "CONTENT": "U8",
+                  "SIZE": 16
+                }
+              }
+            },
+            {
+              "clock": "U64"
+            }
+          ]
+        }
+      },
+      "94": {
+        "EpochIn": {
+          "STRUCT": [
+            {
+              "group": "STR"
+            },
+            {
+              "part": "U16"
+            },
+            {
+              "last": "BOOL"
+            },
+            {
+              "piece": {
+                "TYPENAME": "InPiece"
+              }
+            }
+          ]
+        }
+      },
+      "95": {
+        "EpochWait": {
+          "STRUCT": [
+            {
+              "group": "STR"
+            },
+            {
+              "why": "U8"
+            },
+            {
+              "detail": "STR"
+            }
+          ]
+        }
+      },
+      "96": {
+        "EpochDue": {
+          "STRUCT": [
+            {
+              "group": "STR"
+            },
+            {
+              "due": "U64"
+            },
+            {
+              "part": "U16"
+            },
+            {
+              "last": "BOOL"
+            },
+            {
+              "piece": {
+                "TYPENAME": "DuePiece"
+              }
+            }
+          ]
+        }
+      },
+      "97": {
+        "EpochStale": {
+          "STRUCT": [
+            {
+              "group": "STR"
+            },
+            {
+              "due": "U64"
+            },
+            {
+              "reason": "U8"
+            },
+            {
+              "detail": "STR"
+            },
+            {
+              "head": {
+                "OPTION": {
+                  "TYPENAME": "WalkLinkIn"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "98": {
+        "EpochLists": {
+          "STRUCT": [
+            {
+              "group": "STR"
+            },
+            {
+              "gen": {
+                "TUPLEARRAY": {
+                  "CONTENT": "U8",
+                  "SIZE": 16
+                }
+              }
+            },
+            {
+              "lists": {
+                "SEQ": {
+                  "TYPENAME": "ListIn"
+                }
+              }
+            },
+            {
+              "more": "BOOL"
+            }
+          ]
+        }
+      },
+      "99": {
+        "KeyringIn": {
+          "STRUCT": [
+            {
+              "group": "STR"
+            },
+            {
+              "gen": {
+                "TUPLEARRAY": {
+                  "CONTENT": "U8",
+                  "SIZE": 16
+                }
+              }
+            },
+            {
+              "epoch": "U32"
+            },
+            {
+              "join": "U32"
+            },
+            {
+              "part": "U16"
+            },
+            {
+              "last": "BOOL"
+            },
+            {
+              "piece": {
+                "TYPENAME": "KeyringPiece"
+              }
+            }
+          ]
+        }
+      },
+      "100": {
+        "EpochExit": {
+          "STRUCT": [
+            {
+              "group": "STR"
+            },
+            {
+              "gen": {
+                "TUPLEARRAY": {
+                  "CONTENT": "U8",
+                  "SIZE": 16
+                }
+              }
+            },
+            {
+              "seq": "U64"
+            }
+          ]
+        }
+      },
+      "101": {
+        "EpochPostIn": {
+          "STRUCT": [
+            {
+              "channel_id": "U32"
+            },
+            {
+              "group": "STR"
+            },
+            {
+              "gen": {
+                "TUPLEARRAY": {
+                  "CONTENT": "U8",
+                  "SIZE": 16
+                }
+              }
+            },
+            {
+              "epoch": "U32"
+            },
+            {
+              "user_id": "U32"
+            },
+            {
+              "username": "STR"
+            },
+            {
+              "account": {
+                "OPTION": {
+                  "TUPLEARRAY": {
+                    "CONTENT": "U8",
+                    "SIZE": 16
+                  }
+                }
+              }
+            },
+            {
+              "is_admin": "BOOL"
+            },
+            {
+              "is_moderator": "BOOL"
+            },
+            {
+              "writer": {
+                "TYPENAME": "GkMember"
+              }
+            },
+            {
+              "blob": {
+                "OPTION": {
+                  "SEQ": "U8"
+                }
+              }
+            },
+            {
+              "ciphertext": {
+                "SEQ": "U8"
+              }
+            },
+            {
+              "timestamp": "U64"
+            }
+          ]
+        }
+      },
+      "102": {
+        "EpochBlob": {
+          "STRUCT": [
+            {
+              "group": "STR"
+            },
+            {
+              "gen": {
+                "TUPLEARRAY": {
+                  "CONTENT": "U8",
+                  "SIZE": 16
+                }
+              }
+            },
+            {
+              "epoch": "U32"
+            },
+            {
+              "writer": {
+                "TYPENAME": "GkWriter"
+              }
+            },
+            {
+              "blobs": {
+                "SEQ": {
+                  "SEQ": "U8"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "103": {
+        "EpochNamesIn": {
+          "STRUCT": [
+            {
+              "group": "STR"
+            },
+            {
+              "part": "U16"
+            },
+            {
+              "last": "BOOL"
+            },
+            {
+              "piece": {
+                "TYPENAME": "NamesPiece"
+              }
+            }
+          ]
+        }
+      },
+      "104": {
+        "EpochRefused": {
+          "STRUCT": [
+            {
+              "group": "STR"
+            },
+            {
+              "what": "U8"
+            },
+            {
+              "why": "U8"
+            },
+            {
+              "detail": "STR"
+            }
+          ]
+        }
+      },
+      "105": {
+        "VoiceSeats": {
+          "STRUCT": [
+            {
+              "channel_id": "U32"
+            },
+            {
+              "group": "STR"
+            },
+            {
+              "part": "U16"
+            },
+            {
+              "last": "BOOL"
+            },
+            {
+              "piece": {
+                "TYPENAME": "VoiceSeatsPiece"
+              }
+            }
+          ]
+        }
+      },
+      "106": {
+        "EpochReseated": {
+          "STRUCT": [
+            {
+              "n": "U32"
+            },
+            {
+              "left": "U32"
+            }
+          ]
+        }
       }
     }
   },
@@ -7648,6 +9567,58 @@
       }
     ]
   },
+  "VersionMake": {
+    "ENUM": {
+      "0": {
+        "Ratchet": {
+          "STRUCT": [
+            {
+              "from_v": "U64"
+            }
+          ]
+        }
+      },
+      "1": {
+        "Keep": {
+          "STRUCT": [
+            {
+              "from_v": "U64"
+            },
+            {
+              "mask": "U64"
+            }
+          ]
+        }
+      },
+      "2": {
+        "Seats": {
+          "NEWTYPE": {
+            "SEQ": {
+              "TYPENAME": "GkSeat"
+            }
+          }
+        }
+      }
+    }
+  },
+  "VersionOut": {
+    "STRUCT": [
+      {
+        "b": "U64"
+      },
+      {
+        "v": "U64"
+      },
+      {
+        "pool": "U8"
+      },
+      {
+        "make": {
+          "TYPENAME": "VersionMake"
+        }
+      }
+    ]
+  },
   "VideoCodec": {
     "ENUM": {
       "0": {
@@ -7663,6 +9634,69 @@
         "Vp9": "UNIT"
       }
     }
+  },
+  "VoiceSeatsPiece": {
+    "STRUCT": [
+      {
+        "seats": {
+          "SEQ": {
+            "TUPLE": [
+              "U32",
+              {
+                "TYPENAME": "GkSeat"
+              }
+            ]
+          }
+        }
+      },
+      {
+        "gone": {
+          "SEQ": "U32"
+        }
+      },
+      {
+        "whole": "BOOL"
+      }
+    ]
+  },
+  "WalkLinkIn": {
+    "STRUCT": [
+      {
+        "header": {
+          "TYPENAME": "HeaderIn"
+        }
+      },
+      {
+        "parent": {
+          "OPTION": {
+            "TYPENAME": "HeaderIn"
+          }
+        }
+      }
+    ]
+  },
+  "WelcomeOut": {
+    "STRUCT": [
+      {
+        "seat": {
+          "TYPENAME": "GkSeat"
+        }
+      },
+      {
+        "b": "U64"
+      },
+      {
+        "v": "U64"
+      },
+      {
+        "s": "U32"
+      },
+      {
+        "bytes": {
+          "SEQ": "U8"
+        }
+      }
+    ]
   },
   "WrapIn": {
     "STRUCT": [

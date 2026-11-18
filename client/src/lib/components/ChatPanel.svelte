@@ -97,6 +97,8 @@
   import { channelRosters, goneFrom, textSeats } from "../stores/rosters.js";
   import { askSharers, channelOpened, handOffs } from "../stores/handoff.js";
   import { channelRings } from "../stores/marks.js";
+  import { dismissGk, gkChannels } from "../stores/gk.js";
+  import { gkLines } from "../gk-rules.js";
   import { emptyLine, ringLine, sharersIn } from "../history-rules.js";
   import { ownMentionNames } from "../mention-rules.js";
   import Icon from "./Icons.svelte";
@@ -535,6 +537,9 @@
     }),
   );
   const ring = $derived(!isDmMode && $channelRings.has($displayChannelId) ? ringLine(askState) : null);
+  // The channel's group key (plan 3h): what becomes of our posts here, then what to know
+  const gkHere = $derived(isDmMode || isLobby ? undefined : $gkChannels.get($displayChannelId));
+  const gkShown = $derived(gkHere ? gkLines(channelLabel, gkHere) : []);
 
   $effect(() => {
     if (!followedHere || !liveHere) return;
@@ -1440,6 +1445,17 @@
     </div>
   {/if}
 
+  {#each gkShown as g (g.key)}
+    <div class="preview-footer post-block gk-line" role="status">
+      <Icon name={g.wait ? "hourglass" : "shield"} size={14} /> {g.line}
+      {#if g.key !== "state"}
+        <button class="gk-dismiss" aria-label="Dismiss" onclick={() => dismissGk($serverAddress, $displayChannelId, g.key)}
+          ><Icon name="close" size={14} /></button
+        >
+      {/if}
+    </div>
+  {/each}
+
   {#if isDmMode && dmReach === "readonly"}
     <div class="preview-footer post-block">
       <Icon name="lock" size={14} /> {readOnlyWhy}
@@ -2172,6 +2188,17 @@
     align-items: center;
     justify-content: center;
     gap: 6px;
+  }
+
+  .gk-dismiss {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: var(--hit);
+    min-height: var(--hit);
+    background: none;
+    border: none;
+    color: var(--text-muted);
   }
 
   .nsfw-label {

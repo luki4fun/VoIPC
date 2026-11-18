@@ -156,5 +156,7 @@ pub async fn report(state: &ServerState) -> LoadReport {
         last_minute,
         warnings,
         edges,
+        // R2 fills it from `gk::Groups::stats` (plan 2j)
+        groups: vec![],
     }
 }

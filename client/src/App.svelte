@@ -137,6 +137,7 @@
     chatHistoryDisabled,
     chatHistoryLater,
     shareChannelHistory,
+    helpHoldKeys,
     maxConversations,
     screenShareCodec,
     spatialAudio,
@@ -175,6 +176,7 @@
   } from "./lib/stores/rosters.js";
   import { afterLookup, lobbyPage, lookedUp, resetLobby } from "./lib/stores/lobby.js";
   import { adminLoad, type LoadReport } from "./lib/stores/load.js";
+  import { gkListeners } from "./lib/stores/gk.js";
   import { emoteLimits, metered, setEmotes, type EmoteLimits, type EmoteSet } from "./lib/stores/emotes.js";
   import { UNOPENED_LINE, answersHandOff, clampedLine, spendServe, type ServeBudget } from "./lib/history-rules.js";
   import { olderRelay } from "./lib/stores/relay.js";
@@ -949,6 +951,7 @@
       deafenKey.set(config.deafen_key ?? "");
       chatHistoryDisabled.set(config.chat_history_disabled ?? false);
       shareChannelHistory.set(config.share_channel_history ?? false);
+      helpHoldKeys.set(config.help_hold_keys ?? true);
       if (config.share_off_notice) {
         addNotification("Sharing with newcomers is off now, until you turn it on: it used to start on. Settings → Privacy & data.", "info", 15000);
         invoke("set_config_bool", { key: "share_off_notice", value: false }).catch(() => {});
@@ -2267,6 +2270,8 @@
 
       // What the relay carries now, for the admin's Load tab (protocol 25)
       listenServer<LoadReport>("admin-load", (server, report) => adminLoad.of(server).set(report)),
+      // Group-key status lines (protocol 26)
+      ...Object.entries(gkListeners).map(([name, fn]) => listenServer(name, fn as (server: string, e: any) => void)),
 
       // A watch the relay would not start (protocol 25): about that share, never ours
       listenServer<{ sharer_user_id: number; reason: string }>("watch-refused", (server, data) => {
