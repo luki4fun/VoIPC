@@ -82,6 +82,53 @@ impl RowBase {
         ))
     }
 
+    /// The keyholder's side from the seat's X25519 public key alone (33
+    /// bytes, as a seat list carries it): a keyholder that did not seat a
+    /// member has only the list's `dh`, never its whole `SeatPublic`. `dh`
+    /// must be the key `tag_sx` names (`Forged` otherwise) and not of low
+    /// order. The same row base as `keyholder_side`.
+    pub fn keyholder_side_dh(
+        g: &Group,
+        s: u32,
+        me: &Me,
+        m: &MemberId,
+        tag_sx: &[u8; 8],
+        dh: &[u8],
+        s_m: &[u8; 32],
+    ) -> Result<RowBase, GkError> {
+        let theirs = super::keys::dh_public(dh)?;
+        let agreed = agree(&me.keys.dh.private_key, &theirs)?;
+        RowBase::keyholder_side_agreed(g, s, me, m, tag_sx, dh, &agreed, s_m)
+    }
+
+    /// `keyholder_side_dh` with the static X25519 between our `KX` and the
+    /// seat's `SX` already made: a seat welcome needs the same agreement
+    /// (`ss_k`, §3.2), so a builder makes it once for both.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn keyholder_side_agreed(
+        g: &Group,
+        s: u32,
+        me: &Me,
+        m: &MemberId,
+        tag_sx: &[u8; 8],
+        dh: &[u8],
+        agreed: &[u8],
+        s_m: &[u8; 32],
+    ) -> Result<RowBase, GkError> {
+        if super::keys::tag(dh) != *tag_sx {
+            return Err(GkError::Forged);
+        }
+        Ok(RowBase::derive(
+            g,
+            s,
+            agreed,
+            [&me.keys.dh.public_key.serialize(), dh],
+            s_m,
+            (m, tag_sx),
+            &me.holder_id(),
+        ))
+    }
+
     /// The member's side: our `SX` private key, the keyholder's `KX`.
     pub fn member_side(
         g: &Group,

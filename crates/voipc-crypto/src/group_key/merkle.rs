@@ -68,7 +68,7 @@ pub fn leaf_hash(leaf: &Leaf) -> [u8; 32] {
         .into()
 }
 
-fn node(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+pub(super) fn node(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
     Sha256::new()
         .chain_update(NODE_LABEL)
         .chain_update(left)

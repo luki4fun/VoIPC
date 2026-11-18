@@ -40,6 +40,12 @@ mod rules;
 mod welcome;
 mod writer;
 
+pub mod build;
+pub mod commit;
+pub mod past;
+pub mod timers;
+pub mod tree;
+
 #[cfg(test)]
 mod kat;
 #[cfg(test)]

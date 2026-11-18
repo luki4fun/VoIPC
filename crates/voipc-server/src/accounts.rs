@@ -247,6 +247,7 @@ pub mod archive;
 pub mod at_connect;
 pub mod bans;
 pub mod gates;
+pub mod gk;
 pub mod import;
 #[cfg(test)]
 mod kept_sync_tests;
