@@ -589,7 +589,9 @@ mod tests {
     /// - `item.pins` as the index of all 56 pages, each generation a 10-byte
     ///   varint. At 21 and later the pins themselves are pages outside the
     ///   sign-in frame;
-    /// - `item.seat_kem` holding the old seat keys too.
+    /// - `item.seat_kem` holding the old seat keys too;
+    /// - `item.gk_floors`, the index of the group key's floor and counter pages, every page
+    ///   at its widest generation (plan 3d: about 500 B inside the margin).
     #[test]
     fn the_largest_vault_with_seat_keys_fits_the_sign_in_frame() {
         let vault = Vault::from_dek([7; 16], "alice", [9; 32]);
@@ -615,6 +617,12 @@ mod tests {
             .rotate(1_702_592_000)
             .unwrap();
         let seat_item = vault.seal_item(ITEM_SEAT_KEM, 7, &seat.to_bytes());
+        let gk_index = crate::sync::GkIndex {
+            format: 1,
+            floor_pages: vec![u64::MAX; crate::sync::FLOOR_PAGES as usize],
+            counter_pages: vec![u64::MAX; crate::sync::COUNTER_PAGES as usize],
+        };
+        let gk_item = vault.seal_item(crate::sync::ITEM_GK_FLOORS, u64::MAX, &gk_index.to_bytes());
         let items = [
             vault.pass_slot(&[1; 32]).v,
             vault.recovery_slot(&[2; 32]).v,
@@ -625,6 +633,7 @@ mod tests {
             vault.seal_item("item.blocks", 1, &blocks).v,
             vault.seal_item_as("item.pins", 1, 2, &pins_index).v,
             seat_item.v.clone(),
+            gk_item.v.clone(),
         ];
         let seat_bytes = seat_item.v.len();
         let total: usize = items.iter().map(Vec::len).sum();
@@ -645,7 +654,12 @@ mod tests {
             total <= VAULT_TOTAL_BYTES,
             "{total} bytes of {VAULT_TOTAL_BYTES}"
         );
-        // The margin today: about 29.8 KB left, more than three more rotations' worth.
+        assert!(
+            (450..600).contains(&gk_item.v.len()),
+            "item.gk_floors at its widest: {}",
+            gk_item.v.len()
+        );
+        // The margin today: about 29.3 KB left, more than three more rotations' worth.
         assert!(
             VAULT_TOTAL_BYTES - total > 29_000,
             "margin {}",

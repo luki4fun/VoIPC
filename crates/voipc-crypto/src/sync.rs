@@ -32,6 +32,10 @@ use voipc_protocol::types::VaultBlob;
 use zeroize::Zeroizing;
 
 use crate::account::{Item, PinCheck, Pins, SignedIn, Vault, VaultError, ITEM_PINS};
+use crate::group_key::timers::OLD_KEYS_SECS;
+use crate::group_key::{Floor, NamesFloor, PinThen, SeatKeys, Seen, ITEM_SEAT_KEM};
+use crate::group_state::seat_keys;
+use crate::group_state::{GkPins, VaultFloor};
 use crate::log::{
     endorsed, epoch_key, open_entry, seal_entry, self_unwrap, self_wrap, unwrap, wrap, LogKey,
     StaticKey,
@@ -41,6 +45,10 @@ mod chains;
 mod gk_floors;
 mod pins;
 
+pub use gk_floors::{
+    higher as higher_floor, higher_counter, Counter, FloorPair, GkIndex, KeptGkFloors, Pending,
+    COUNTER_PAGES, FLOOR_PAGES, ITEM_GK_FLOORS,
+};
 pub use pins::KeptPins;
 
 pub const ITEM_LOGKEY: &str = "item.logkey";
@@ -611,6 +619,45 @@ pub struct AccountSync {
     join_asks: VecDeque<String>,
     join_many_asks: VecDeque<Vec<String>>,
     join_many_due: Vec<String>,
+    /// The group key's floors and counters in the vault (`sync::gk_floors`), and the seat keys.
+    gk: GkSeat,
+}
+
+/// What an account keeps of the group key: its floors and counters (`GkFloors`) and its
+/// seat keys, `item.seat_kem` (§5.11, plan 3e).
+struct GkSeat {
+    floors: gk_floors::GkFloors,
+    /// The relay uses the group key (`gk_on`); the floor pages are read once the pins are in.
+    on: bool,
+    /// Every pin was timed this connection (`GkFloors::pins_held`).
+    pins_timed: bool,
+    /// Pins were merged in since: timed again (a pin already timed is left as it is).
+    pins_moved: bool,
+    /// The pages came in and the host has not heard, or another device raised a floor.
+    news: bool,
+    handed: bool,
+    keys: Option<SeatKeys>,
+    version: i64,
+    /// Made or rotated this run and not yet in the vault: published only once it is.
+    unsettled: bool,
+    /// Settled keys the host has not handed to `GroupKeying` yet.
+    handover: bool,
+    /// When the last rotation was made (unix seconds), while the old keys are kept.
+    rotated_at: Option<u64>,
+    /// The relay said every group is re-seated at the current counter.
+    reseated: bool,
+    /// The kept history's self-rows are sealed again under the new self key (K1 clears this
+    /// at a rotation of an account with groups that keep history, and sets it once done).
+    resealed: bool,
+    /// A rotation waits for the old keys to go (`SeatKeys::rotate` would drop them at once).
+    rotate_due: bool,
+    /// `SeatKeysPublish` refused for now: again at the next tick.
+    publish_due: bool,
+    /// Self-rows to keep (`SelfRowPut`), and the batch out.
+    rows: VecDeque<voipc_protocol::gk::SelfRowIn>,
+    rows_out: bool,
+    /// What a pin taken on a group key's word sent (`GkPins::pin_new`).
+    send: Vec<ClientMessage>,
 }
 
 fn ask(r: AccountRequest) -> ClientMessage {
@@ -688,6 +735,8 @@ impl AccountSync {
         let blocks = load(ITEM_BLOCKS, &|b| Blocks::from_bytes(b).is_some())
             .and_then(|b| Blocks::from_bytes(&b))
             .unwrap_or_default();
+        let seat = load(ITEM_SEAT_KEM, &|b| SeatKeys::from_bytes(b).is_some())
+            .and_then(|b| SeatKeys::from_bytes(&Zeroizing::new(b)));
         let (logkey, logkey_version, fresh) =
             match load(ITEM_LOGKEY, &|b| LogKey::from_bytes(b).is_some())
                 .and_then(|b| LogKey::from_bytes(&b))
@@ -695,6 +744,7 @@ impl AccountSync {
                 Some(k) => (k, version(ITEM_LOGKEY), false),
                 None => (LogKey::generate(), 0, true),
             };
+        let floors = gk_floors::GkFloors::start(&signed.vault, blobs, &mut gens);
         let mut s = AccountSync {
             me,
             name: signed.name.clone(),
@@ -778,7 +828,28 @@ impl AccountSync {
             join_asks: VecDeque::new(),
             join_many_asks: VecDeque::new(),
             join_many_due: Vec::new(),
+            gk: GkSeat {
+                floors,
+                on: false,
+                pins_timed: false,
+                pins_moved: false,
+                news: false,
+                handed: false,
+                keys: seat,
+                version: version(ITEM_SEAT_KEM),
+                unsettled: false,
+                handover: false,
+                rotated_at: None,
+                reseated: false,
+                resealed: true,
+                rotate_due: false,
+                publish_due: false,
+                rows: VecDeque::new(),
+                rows_out: false,
+                send: Vec::new(),
+            },
         };
+        s.later.extend(s.gk.floors.take_events());
         if fresh {
             out.extend(s.save(ITEM_LOGKEY));
         } else {
@@ -909,6 +980,7 @@ impl AccountSync {
             ITEM_PINS => self.pins.to_bytes(),
             ITEM_PREFS => postcard::to_allocvec(&self.prefs).expect("prefs encode"),
             ITEM_BLOCKS => self.blocks.to_padded(),
+            ITEM_SEAT_KEM => unreachable!("sealed from its secret bytes in `save`"),
             _ => self.logkey.to_bytes().to_vec(),
         }
     }
@@ -918,6 +990,7 @@ impl AccountSync {
             ITEM_PINS => &mut self.pins_version,
             ITEM_PREFS => &mut self.prefs_version,
             ITEM_BLOCKS => &mut self.blocks_version,
+            ITEM_SEAT_KEM => &mut self.gk.version,
             _ => &mut self.logkey_version,
         }
     }
@@ -933,7 +1006,13 @@ impl AccountSync {
         self.dirty.remove(k);
         let gen = self.gens.get(k).copied().unwrap_or(0) + 1;
         self.writing_gen.insert(k, gen);
-        let blob = if k == ITEM_PINS && self.book.paged {
+        let blob = if k == ITEM_SEAT_KEM {
+            let Some(keys) = self.gk.keys.as_ref() else {
+                self.saving.remove(k);
+                return Vec::new();
+            };
+            self.vault.seal_item(k, gen, &keys.to_bytes())
+        } else if k == ITEM_PINS && self.book.paged {
             self.vault
                 .seal_item_as(k, gen, pins::PIN_INDEX_FORMAT, &self.item_bytes(k))
         } else {
@@ -948,9 +1027,15 @@ impl AccountSync {
     }
 
     fn which(k: &str) -> Option<&'static str> {
-        [ITEM_PINS, ITEM_PREFS, ITEM_BLOCKS, ITEM_LOGKEY]
-            .into_iter()
-            .find(|i| *i == k)
+        [
+            ITEM_PINS,
+            ITEM_PREFS,
+            ITEM_BLOCKS,
+            ITEM_LOGKEY,
+            ITEM_SEAT_KEM,
+        ]
+        .into_iter()
+        .find(|i| *i == k)
     }
 
     /// A vault answer for one of our items.
@@ -989,6 +1074,11 @@ impl AccountSync {
                             ITEM_PREFS => {
                                 if let Ok(p) = postcard::from_bytes(&plain) {
                                     self.prefs = p;
+                                }
+                            }
+                            ITEM_SEAT_KEM => {
+                                if let Some(theirs) = SeatKeys::from_bytes(&Zeroizing::new(plain)) {
+                                    settled = self.seat_keys_theirs(theirs);
                                 }
                             }
                             ITEM_BLOCKS => {
@@ -1035,6 +1125,11 @@ impl AccountSync {
         if k == ITEM_PINS {
             out.extend(self.pins_read_more());
         }
+        // Settled only with no newer write of it out: a rotation made meanwhile is not
+        // published before the vault keeps it
+        if k == ITEM_SEAT_KEM && settled && !self.saving.contains(k) {
+            out.extend(self.seat_keys_settled());
+        }
         if k == ITEM_LOGKEY && settled && self.logkey_unsettled {
             // The vault keeps this key now: the relay may hand it out, and
             // what waited for it can go.
@@ -1063,6 +1158,12 @@ impl AccountSync {
             .then(|| self.pins.owner_of_name(name))
             .flatten();
         let check = self.pins.check(account, name, identity);
+        if check != PinCheck::Same {
+            if let Some(raw) = crate::group_state::raw_ik(identity) {
+                let now = crate::time::now_millis() / 1000;
+                self.gk.floors.pin_seen(*account, &raw, now);
+            }
+        }
         let out = if self.book.paged {
             self.pin_noted(account, name.len(), name_was, check)
         } else if check == PinCheck::Same {
@@ -1501,6 +1602,7 @@ impl AccountSync {
         out.extend(self.flush());
         out.extend(self.answer());
         out.extend(self.pins_tick(crate::time::now_millis()));
+        out.extend(self.gk_tick(crate::time::now_millis() / 1000));
         let mut all = std::mem::take(&mut self.later);
         all.extend(events);
         (out, all)
@@ -1925,7 +2027,62 @@ impl AccountSync {
         if self.holds_for_pages(reply) {
             return Some((out, std::mem::take(&mut self.later)));
         }
+        // Pins merged in from another device's page or write are timed again (P3)
+        if let AccountReply::VaultPageFound { k, .. } | AccountReply::VaultConflict { k, .. } =
+            reply
+        {
+            self.gk.pins_moved |= k == ITEM_PINS || k.starts_with("pins.");
+        }
         match reply {
+            AccountReply::VaultStored { k, version } if gk_floors::GkFloors::is_ours(k) => {
+                let io = gk_floors::Io {
+                    vault: &self.vault,
+                    gens: &mut self.gens,
+                };
+                out.extend(self.gk.floors.on_stored(io, k, *version));
+            }
+            AccountReply::VaultConflict { k, blob } if gk_floors::GkFloors::is_ours(k) => {
+                let io = gk_floors::Io {
+                    vault: &self.vault,
+                    gens: &mut self.gens,
+                };
+                out.extend(self.gk.floors.on_conflict(io, k, blob.as_ref()));
+                self.gk.news = true;
+            }
+            AccountReply::VaultPageFound { k, blob } if gk_floors::GkFloors::is_ours(k) => {
+                let io = gk_floors::Io {
+                    vault: &self.vault,
+                    gens: &mut self.gens,
+                };
+                out.extend(self.gk.floors.on_page(io, k, blob.as_ref()));
+                self.gk.news = true;
+            }
+            AccountReply::Error { request, reason }
+                if request == "VaultPage" && self.gk.floors.asking() =>
+            {
+                let io = gk_floors::Io {
+                    vault: &self.vault,
+                    gens: &mut self.gens,
+                };
+                out.extend(self.gk.floors.on_read_refused(io, reason));
+            }
+            AccountReply::SeatKeysStored { .. } => self.gk.publish_due = false,
+            AccountReply::Error { request, reason } if request == "SeatKeysPublish" => {
+                self.gk.publish_due = reason.contains(SLOW_DOWN);
+                if !self.gk.publish_due {
+                    tracing::warn!(%reason, "the relay refused this account's seat keys");
+                }
+            }
+            AccountReply::SelfRowsStored { .. } => {
+                self.gk.rows_out = false;
+                out.extend(self.self_rows_next());
+            }
+            AccountReply::Error { request, reason } if request == "SelfRowPut" => {
+                self.gk.rows_out = false;
+                if !reason.contains(SLOW_DOWN) {
+                    tracing::warn!(%reason, "the relay refused to keep self-rows");
+                }
+            }
             AccountReply::VaultStored { k, version } if k.starts_with("pins.") => {
                 out.extend(self.on_page_stored(k, *version))
             }
@@ -1950,6 +2107,7 @@ impl AccountSync {
             AccountReply::Error { request, reason } if request == "VaultPut" => {
                 self.saving.clear();
                 self.pin_write_refused(reason);
+                self.gk.floors.write_refused(reason);
                 // For now is not news when it goes again by itself
                 if !self.book.paged || !reason.contains(SLOW_DOWN) {
                     events.push(Event::NotKept {
@@ -2430,9 +2588,345 @@ impl AccountSync {
             AccountReply::LogNews { conv } => out.extend(self.read_news(conv)),
             _ => return None,
         }
+        out.extend(self.gk_go_on());
         let mut all = std::mem::take(&mut self.later);
         all.extend(events);
         Some((out, all))
+    }
+
+    // ── the group key (plan 3d, 3e) ──
+
+    /// `GroupKeys` came: whether this relay uses the group key. The floor pages are read once
+    /// the pins are in; the seat keys are made at this first need, rotated when 30 days old,
+    /// or else published as they are.
+    pub fn gk_on(&mut self, on: bool) -> Vec<ClientMessage> {
+        if !on || self.gk.on {
+            return Vec::new();
+        }
+        self.gk.on = true;
+        let now = crate::time::now_millis() / 1000;
+        let mut out = match self.gk.keys.as_ref() {
+            None => {
+                self.gk.keys = Some(SeatKeys::generate(1, now));
+                self.gk.unsettled = true;
+                self.save(ITEM_SEAT_KEM)
+            }
+            Some(k) if seat_keys::due(k, now) => self.seat_keys_rotate(),
+            Some(_) => self.seat_keys_settled(),
+        };
+        out.extend(self.gk_go_on());
+        out
+    }
+
+    /// The pages, once the pins are in (one `VaultPage` out at a time), and every pin timed
+    /// once they are, at every connection.
+    fn gk_go_on(&mut self) -> Vec<ClientMessage> {
+        let mut out = std::mem::take(&mut self.gk.send);
+        if !self.gk.on || !self.pins_in() {
+            return out;
+        }
+        let now = crate::time::now_millis() / 1000;
+        out.extend(self.gk.floors.begin(&self.gens, now));
+        if self.gk.floors.pages_in() && (!self.gk.pins_timed || self.gk.pins_moved) {
+            self.gk.pins_moved = false;
+            let pins: Vec<([u8; 16], [u8; 32])> = self
+                .pins
+                .accounts()
+                .filter_map(|a| Some((*a, crate::group_state::raw_ik(self.pins.get(a)?)?)))
+                .collect();
+            // At every connection, and again after pins merged in: a pin whose key has no
+            // time yet is timed now, one already timed is left as it is
+            self.gk.floors.pins_held(pins, now);
+            if !self.gk.pins_timed {
+                self.gk.pins_timed = true;
+                self.gk.news = true;
+            }
+        }
+        self.later.extend(self.gk.floors.take_events());
+        self.memory_changed |= self.gk.floors.take_memory_changed();
+        out
+    }
+
+    fn gk_tick(&mut self, now: u64) -> Vec<ClientMessage> {
+        let mut out = self.gk_go_on();
+        let io = gk_floors::Io {
+            vault: &self.vault,
+            gens: &mut self.gens,
+        };
+        out.extend(self.gk.floors.tick(io, now));
+        self.later.extend(self.gk.floors.take_events());
+        self.memory_changed |= self.gk.floors.take_memory_changed();
+        if !self.gk.on {
+            return out;
+        }
+        if std::mem::take(&mut self.gk.publish_due) {
+            out.extend(self.seat_keys_publish());
+        }
+        // The old keys go once every group is re-seated and the kept rows re-sealed, and at
+        // most 7 days after the rotation (§5.11 step 4)
+        if let Some(at) = self.gk.rotated_at {
+            let done = self.gk.reseated && self.gk.resealed;
+            if done || now >= at.saturating_add(OLD_KEYS_SECS) {
+                self.gk.rotated_at = None;
+                if let Some(k) = self.gk.keys.as_mut() {
+                    k.drop_old();
+                }
+                out.extend(self.save(ITEM_SEAT_KEM));
+                self.gk.handover = true;
+            }
+        }
+        let due = self
+            .gk
+            .keys
+            .as_ref()
+            .is_some_and(|k| seat_keys::due(k, now));
+        if (self.gk.rotate_due || due) && self.gk.rotated_at.is_none() && !self.gk.unsettled {
+            out.extend(self.seat_keys_rotate());
+        }
+        if !self.gk.rows_out {
+            out.extend(self.self_rows_next());
+        }
+        out
+    }
+
+    /// The account's seat keys rotate (§5.11): new `SK`, `SX` and self key under counter
+    /// `n + 1`, saved, then published. A rotation while the old keys are still kept waits
+    /// for them to go.
+    pub fn seat_keys_rotate(&mut self) -> Vec<ClientMessage> {
+        let now = crate::time::now_millis() / 1000;
+        if self.gk.rotated_at.is_some() || self.gk.unsettled {
+            self.gk.rotate_due = true;
+            return Vec::new();
+        }
+        let Some(keys) = self.gk.keys.take() else {
+            return Vec::new();
+        };
+        let Some(new) = SeatKeys::rotate(seat_keys::copy(&keys), now) else {
+            self.gk.keys = Some(keys);
+            return Vec::new();
+        };
+        self.gk.keys = Some(new);
+        self.gk.rotate_due = false;
+        self.gk.unsettled = true;
+        self.gk.rotated_at = Some(now);
+        self.gk.reseated = false;
+        self.save(ITEM_SEAT_KEM)
+    }
+
+    /// Another device's `item.seat_kem` won the vault. Theirs at the same counter or above is
+    /// the account's now; an older one is rotated again, if ours was a rotation. Whether ours
+    /// settled as theirs.
+    fn seat_keys_theirs(&mut self, theirs: SeatKeys) -> bool {
+        let ours = self.gk.keys.as_ref().map_or(0, |k| k.n);
+        if theirs.n < ours && self.gk.rotated_at.is_some() {
+            self.gk.rotate_due = true;
+            self.gk.rotated_at = None;
+        }
+        self.gk.keys = Some(theirs);
+        self.dirty.remove(ITEM_SEAT_KEM);
+        true
+    }
+
+    /// The vault keeps the seat keys: published now, the account's own counter noted, and the
+    /// host hands them to `GroupKeying`.
+    fn seat_keys_settled(&mut self) -> Vec<ClientMessage> {
+        self.gk.unsettled = false;
+        self.gk.handover = true;
+        if let Some(k) = self.gk.keys.as_ref() {
+            let seen = Seen {
+                n: k.n,
+                made: k.made,
+            };
+            self.gk.floors.raise(self.me, seen);
+        }
+        self.seat_keys_publish()
+    }
+
+    fn seat_keys_publish(&mut self) -> Vec<ClientMessage> {
+        match self.gk.keys.as_ref().filter(|_| !self.gk.unsettled) {
+            Some(k) => vec![ask(seat_keys::publish(k, &self.identity, self.me))],
+            None => Vec::new(),
+        }
+    }
+
+    /// The relay holds no seat keys of this account (`GkOut::seat_keys_wanted`).
+    pub fn seat_keys_wanted(&mut self) -> Vec<ClientMessage> {
+        self.seat_keys_publish()
+    }
+
+    /// The seat keys, once the vault keeps them.
+    pub fn seat_keys(&self) -> Option<SeatKeys> {
+        self.gk
+            .keys
+            .as_ref()
+            .filter(|_| !self.gk.unsettled)
+            .map(seat_keys::copy)
+    }
+
+    /// Settled seat keys `GroupKeying` has not had yet (`GroupKeying::seat_keys_changed`).
+    pub fn take_seat_keys(&mut self) -> Option<SeatKeys> {
+        if !std::mem::take(&mut self.gk.handover) {
+            return None;
+        }
+        self.seat_keys()
+    }
+
+    /// `EpochReseated`: groups not yet re-seated at counter `n`. A counter above ours is
+    /// another device's rotation (every session of the account hears it): the vault's
+    /// newer `item.seat_kem` comes back as the conflict of writing ours again, as when two
+    /// devices write at once, and goes to `GroupKeying` as settled keys do.
+    pub fn gk_reseated(&mut self, n: u32, left: u32) -> Vec<ClientMessage> {
+        let ours = self.gk.keys.as_ref().map(|k| k.n);
+        if ours == Some(n) {
+            self.gk.reseated = left == 0;
+        }
+        let behind = ours.is_some_and(|o| n > o);
+        if behind && !self.gk.unsettled && !self.saving.contains(ITEM_SEAT_KEM) {
+            return self.save(ITEM_SEAT_KEM);
+        }
+        Vec::new()
+    }
+
+    /// A stored group's vault floor, for `GroupKeying::track`: it is in use now.
+    pub fn gk_floor(&mut self, group: &str) -> VaultFloor {
+        if !self.gk.on || !group.starts_with("c:") {
+            return VaultFloor::None;
+        }
+        self.gk
+            .floors
+            .touch(group, crate::time::now_millis() / 1000);
+        match self.gk.floors.floor(group) {
+            Err(_) => VaultFloor::Pending,
+            Ok(None) => VaultFloor::None,
+            Ok(Some((f, n))) => VaultFloor::Some(Box::new(f), n),
+        }
+    }
+
+    /// Whether the floors moved for the host (`gk_floors_moved`). Clears the flag.
+    pub fn take_gk_news(&mut self) -> bool {
+        std::mem::take(&mut self.gk.news)
+    }
+
+    /// For `GroupKeying::floors_in`: once the pages are in, every tracked stored group's floor;
+    /// after that, those another device raised. A group the host does not track is left out.
+    pub fn gk_floors_moved(&mut self, tracked: &[String]) -> Vec<(String, Option<FloorPair>)> {
+        if !self.gk.floors.pages_in() {
+            return Vec::new();
+        }
+        let raised = self.gk.floors.take_raised();
+        if !std::mem::replace(&mut self.gk.handed, true) {
+            return tracked
+                .iter()
+                .filter(|g| g.starts_with("c:"))
+                .map(|g| (g.clone(), self.gk.floors.floor(g).ok().flatten()))
+                .collect();
+        }
+        raised
+            .into_iter()
+            .filter(|(g, _)| tracked.contains(g))
+            .map(|(g, f)| (g, Some(f)))
+            .collect()
+    }
+
+    /// `GkOut::vault_floors`: kept, a new generation at once, the rest within the minute.
+    pub fn gk_put_floors(
+        &mut self,
+        floors: Vec<(String, Floor, Option<NamesFloor>)>,
+    ) -> Vec<ClientMessage> {
+        let now = crate::time::now_millis() / 1000;
+        for (group, floor, names) in floors {
+            self.gk.floors.put_floor(&group, floor, names, now);
+        }
+        if !self.gk.floors.save_now() {
+            return Vec::new();
+        }
+        let io = gk_floors::Io {
+            vault: &self.vault,
+            gens: &mut self.gens,
+        };
+        self.gk.floors.flush(io, now)
+    }
+
+    /// `GkOut::self_rows`: kept by `SelfRowPut`, one batch out at a time.
+    pub fn gk_self_rows(&mut self, rows: Vec<voipc_protocol::gk::SelfRowIn>) -> Vec<ClientMessage> {
+        self.gk.rows.extend(rows);
+        if self.gk.rows_out {
+            return Vec::new();
+        }
+        self.self_rows_next()
+    }
+
+    fn self_rows_next(&mut self) -> Vec<ClientMessage> {
+        if self.gk.rows.is_empty() {
+            return Vec::new();
+        }
+        let n = self.gk.rows.len().min(voipc_protocol::gk::SELF_ROWS_MAX);
+        let rows: Vec<_> = self.gk.rows.drain(..n).collect();
+        self.gk.rows_out = true;
+        vec![ask(AccountRequest::SelfRowPut { rows })]
+    }
+
+    /// Every floor with news out now: the person is leaving.
+    pub fn gk_flush(&mut self) -> Vec<ClientMessage> {
+        let io = gk_floors::Io {
+            vault: &self.vault,
+            gens: &mut self.gens,
+        };
+        self.gk.floors.flush(io, crate::time::now_millis() / 1000)
+    }
+
+    /// Whether the floors are stored: a sign-out waits a moment for it.
+    pub fn gk_saved(&self) -> bool {
+        self.gk.floors.saved()
+    }
+
+    /// What this connection hands the next of the floors (`adopt_gk`).
+    pub fn keep_gk(&self) -> Option<KeptGkFloors> {
+        self.gk.floors.keep()
+    }
+
+    /// Takes over what an earlier connection kept, before `gk_on`.
+    pub fn adopt_gk(&mut self, kept: KeptGkFloors) {
+        self.gk.floors.adopt(kept);
+    }
+}
+
+/// An account's book for `GroupKeying` (3d): its pins, when it first saw each, and the
+/// counters, from the vault pages. Nothing is answered before the pins and pages are in.
+impl GkPins for AccountSync {
+    fn ready(&self) -> bool {
+        self.pins_in() && self.gk.floors.pages_in() && self.gk.pins_timed
+    }
+
+    fn pin(&self, account: &[u8; 16]) -> Option<[u8; 32]> {
+        crate::group_state::raw_ik(self.pins.get(account)?)
+    }
+
+    fn pin_then(&self, account: &[u8; 16], time: u64) -> PinThen {
+        let pin = self.pin(account);
+        self.gk
+            .floors
+            .pin_then(account, pin.as_ref(), time)
+            .unwrap_or(PinThen::Unknown)
+    }
+
+    fn seen(&self, account: &[u8; 16]) -> Option<Seen> {
+        self.gk.floors.seen(account).ok().flatten()
+    }
+
+    fn pin_new(&mut self, account: [u8; 16], ik: [u8; 32], _now: u64) {
+        if self.pins.get(&account).is_some() {
+            return;
+        }
+        let Some(key) = crate::group_state::ik_serialized(&ik) else {
+            return;
+        };
+        let (_, out) = self.check_peer(&account, "", &key);
+        self.gk.send.extend(out);
+    }
+
+    fn raise(&mut self, account: [u8; 16], seen: Seen, rotation: bool) {
+        self.gk.floors.raise_counter(account, seen, rotation);
     }
 }
 
@@ -2441,6 +2935,7 @@ mod tests {
     use super::*;
     use crate::account::{SignedIn, Vault};
     use crate::envelope::envelope;
+    use crate::group_key::SeatKeys;
     use crate::log::{dm_conv, open_entry};
     use voipc_protocol::messages::WrapOut;
 
@@ -3983,5 +4478,251 @@ mod tests {
             .len(),
             1
         );
+    }
+    // ── the group key (plan 3d, 3e) ──
+
+    fn stored(s: &mut AccountSync, k: &str, version: i64) -> Vec<ClientMessage> {
+        s.on_reply(&AccountReply::VaultStored {
+            k: k.into(),
+            version,
+        })
+        .map(|(out, _)| out)
+        .unwrap_or_default()
+    }
+
+    fn published(out: &[ClientMessage]) -> Option<(u32, u64)> {
+        match &sent(out, "SeatKeysPublish")[..] {
+            [AccountRequest::SeatKeysPublish { n, made, .. }] => Some((*n, *made)),
+            [] => None,
+            more => panic!("{} publishes", more.len()),
+        }
+    }
+
+    /// 3e: an account's seat keys are made at the first need, and published (and handed to
+    /// `GroupKeying`) only once the vault keeps them, endorsed by its identity; its own counter
+    /// counts from then.
+    #[test]
+    fn seat_keys_are_published_only_once_the_vault_keeps_them() {
+        let me = account(1);
+        let mut s = sync_for(&me);
+        assert!(s.gk_on(false).is_empty(), "a relay without the group key");
+        let out = s.gk_on(true);
+        assert_eq!(put_of(&out).0, ITEM_SEAT_KEM);
+        assert_eq!(published(&out), None);
+        assert!(s.seat_keys().is_none() && s.take_seat_keys().is_none());
+        let out = stored(&mut s, ITEM_SEAT_KEM, 1);
+        let (n, made) = published(&out).expect("published now");
+        assert_eq!(n, 1);
+        let keys = s.take_seat_keys().expect("handed over once");
+        assert!(s.take_seat_keys().is_none());
+        let AccountRequest::SeatKeysPublish { kem, dh, sig, .. } = sent(&out, "SeatKeysPublish")[0]
+        else {
+            unreachable!()
+        };
+        let public = crate::group_key::SeatPublic::from_bytes(kem, dh).unwrap();
+        assert_eq!(public.tag_kem(), keys.pair.public().tag_kem());
+        let e = crate::group_key::Endorsement {
+            origin: crate::group_key::Origin::VaultSeat,
+            m: crate::group_key::MemberId::Account(me.id),
+            n,
+            made,
+            sig: sig[..].try_into().unwrap(),
+        };
+        assert!(e.verify(me.identity.identity_key(), &public));
+        assert_eq!(GkPins::seen(&s, &me.id), Some(Seen { n: 1, made }));
+    }
+
+    /// 3e: seat keys the vault holds are published as they are at the next connection; once
+    /// 30 days old they rotate first, under the next counter.
+    #[test]
+    fn seat_keys_are_published_as_kept_and_rotated_first_once_30_days_old() {
+        let me = account(1);
+        let now = crate::time::now_millis() / 1000;
+        for (age, n) in [(24 * 60 * 60, 3), (31 * 24 * 60 * 60, 4)] {
+            let keys = SeatKeys::generate(3, now - age);
+            let items = [(ITEM_SEAT_KEM, 1, keys.to_bytes().to_vec())];
+            let (mut s, _) = start_with_items(&me, &items, LogMemory::default());
+            let out = s.gk_on(true);
+            let out = match published(&out) {
+                Some(_) => out,
+                None => {
+                    assert_eq!(put_of(&out).0, ITEM_SEAT_KEM);
+                    stored(&mut s, ITEM_SEAT_KEM, 2)
+                }
+            };
+            assert_eq!(published(&out).map(|(n, _)| n), Some(n), "{age}");
+        }
+    }
+
+    /// 3e: a second rotation while the old keys are kept waits for them to go (`rotate` would
+    /// drop them at once); they go once the relay reports every group re-seated, or 7 days
+    /// after the rotation; then the waiting rotation runs.
+    #[test]
+    fn the_old_seat_keys_go_once_reseated_or_after_seven_days() {
+        let me = account(1);
+        let mut s = sync_for(&me);
+        s.gk_on(true);
+        stored(&mut s, ITEM_SEAT_KEM, 1);
+        let out = s.seat_keys_rotate();
+        assert_eq!(put_of(&out).0, ITEM_SEAT_KEM);
+        stored(&mut s, ITEM_SEAT_KEM, 2);
+        let keys = s.take_seat_keys().unwrap();
+        assert_eq!((keys.n, keys.old.as_ref().map(|o| o.n)), (2, Some(1)));
+        assert!(
+            s.seat_keys_rotate().is_empty(),
+            "waits for the old keys to go"
+        );
+        s.gk_reseated(1, 0);
+        assert!(
+            sent(&s.tick().0, "VaultPut").is_empty(),
+            "another counter's report"
+        );
+        s.gk_reseated(2, 3);
+        assert!(sent(&s.tick().0, "VaultPut").is_empty(), "groups left");
+        s.gk_reseated(2, 0);
+        let (out, _) = s.tick();
+        assert_eq!(put_of(&out).0, ITEM_SEAT_KEM, "the old keys dropped");
+        // The rotation that waited runs with it, its write after the drop's
+        let out = stored(&mut s, ITEM_SEAT_KEM, 3);
+        assert_eq!(put_of(&out).0, ITEM_SEAT_KEM);
+        assert_eq!(published(&out), None, "not before the vault keeps it");
+        assert!(s.take_seat_keys().is_none());
+        let out = stored(&mut s, ITEM_SEAT_KEM, 4);
+        assert_eq!(published(&out).map(|(n, _)| n), Some(3));
+        let keys = s.take_seat_keys().unwrap();
+        assert_eq!((keys.n, keys.old.as_ref().map(|o| o.n)), (3, Some(2)));
+        // Nobody reports: at 7 days
+        s.gk.rotated_at = Some(crate::time::now_millis() / 1000 - OLD_KEYS_SECS);
+        let (out, _) = s.tick();
+        assert_eq!(put_of(&out).0, ITEM_SEAT_KEM);
+        assert!(s.gk.rotated_at.is_none());
+    }
+
+    /// §5.11, 3e: another device's rotation reaches this one when the relay names a counter
+    /// above its own (`EpochReseated` goes to every session of the account): the vault's
+    /// newer item comes back as the conflict of writing its own again, and is handed on.
+    #[test]
+    fn another_devices_rotation_is_taken_when_the_relay_names_its_counter() {
+        let me = account(1);
+        let now = crate::time::now_millis() / 1000;
+        let keys = SeatKeys::generate(3, now - 60);
+        let items = [(ITEM_SEAT_KEM, 1, keys.to_bytes().to_vec())];
+        let (mut s, vault) = start_with_items(&me, &items, LogMemory::default());
+        s.gk_on(true);
+        assert_eq!(s.take_seat_keys().map(|k| k.n), Some(3));
+        assert!(s.gk_reseated(3, 0).is_empty(), "its own counter");
+        assert!(s.gk_reseated(2, 0).is_empty(), "an older one");
+        let out = s.gk_reseated(4, 2);
+        assert_eq!(put_of(&out).0, ITEM_SEAT_KEM);
+        let theirs = SeatKeys::rotate(seat_keys::copy(&keys), now).unwrap();
+        let blob = VaultBlob {
+            version: 2,
+            ..vault.seal_item(ITEM_SEAT_KEM, 2, &theirs.to_bytes())
+        };
+        s.on_reply(&AccountReply::VaultConflict {
+            k: ITEM_SEAT_KEM.into(),
+            blob: Some(blob),
+        });
+        let keys = s.take_seat_keys().expect("handed over");
+        assert_eq!((keys.n, keys.old.as_ref().map(|o| o.n)), (4, Some(3)));
+    }
+
+    fn floor_row(group: &str, epoch: u32) -> gk_floors::FloorRow {
+        gk_floors::FloorRow {
+            group: group.into(),
+            floor: Floor {
+                gen: [1; 16],
+                gen_time: 10,
+                epoch,
+                join: 0,
+                d: [epoch as u8; 32],
+                d_e: [epoch as u8; 32],
+                kh: [2; 32],
+                time: 100,
+                gated: false,
+                gens: vec![([1; 16], 10)],
+            },
+            names: None,
+            last_used: 100,
+        }
+    }
+
+    fn floor_page(
+        vault: &Vault,
+        gen: u64,
+        version: i64,
+        rows: &[gk_floors::FloorRow],
+    ) -> VaultBlob {
+        VaultBlob {
+            version,
+            ..vault.seal_item("gkf.0", gen, &postcard::to_allocvec(rows).unwrap())
+        }
+    }
+
+    /// 3d: no header is answered for before the floor pages are in (`GkPins::ready`, a
+    /// stored group `Pending`); once in, the host gets every tracked stored group's floor once,
+    /// and after that only the tracked groups another device raised.
+    #[test]
+    fn floors_reach_the_host_once_in_and_only_for_groups_it_tracks() {
+        let me = account(1);
+        let index = GkIndex {
+            format: 1,
+            floor_pages: vec![1],
+            counter_pages: vec![],
+        };
+        let items = [(ITEM_GK_FLOORS, 1, index.to_bytes())];
+        let (mut s, vault) = start_with_items(&me, &items, LogMemory::default());
+        assert_eq!(s.gk_floor("c:a"), VaultFloor::None, "the group key is off");
+        let out = s.gk_on(true);
+        assert_eq!(sent(&out, "VaultPage").len(), 1);
+        assert!(!GkPins::ready(&s));
+        assert_eq!(s.gk_floor("c:a"), VaultFloor::Pending);
+        assert_eq!(s.gk_floor("r:00:1"), VaultFloor::None, "memory-only");
+        assert!(s.gk_floors_moved(&["c:a".into()]).is_empty());
+        let page = floor_page(&vault, 1, 1, &[floor_row("c:a", 3), floor_row("c:z", 3)]);
+        s.on_reply(&AccountReply::VaultPageFound {
+            k: "gkf.0".into(),
+            blob: Some(page),
+        });
+        assert!(GkPins::ready(&s));
+        assert!(s.take_gk_news());
+        let tracked = vec!["c:a".to_string(), "c:b".to_string(), "r:00:1".to_string()];
+        let first = s.gk_floors_moved(&tracked);
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0].1.as_ref().map(|f| f.0.epoch), Some(3));
+        assert_eq!(first[1], ("c:b".to_string(), None));
+        assert!(s.gk_floors_moved(&tracked).is_empty());
+        // Another device raised c:a and c:z: c:z is not tracked here
+        let theirs = floor_page(&vault, 2, 2, &[floor_row("c:a", 5), floor_row("c:z", 5)]);
+        s.on_reply(&AccountReply::VaultConflict {
+            k: "gkf.0".into(),
+            blob: Some(theirs),
+        });
+        let raised = s.gk_floors_moved(&tracked);
+        assert_eq!(raised.len(), 1);
+        assert_eq!(raised[0].0, "c:a");
+        assert_eq!(raised[0].1.as_ref().map(|f| f.0.epoch), Some(5));
+    }
+
+    /// P3: every pin is timed once the pages are in, at every connection; a pin made or
+    /// changed later from then. A pin made on a group key's word is a pin like any other.
+    #[test]
+    fn pins_are_timed_at_every_connection_and_when_made() {
+        let (me, bob) = (account(1), account(2));
+        let mut s = sync_for(&me);
+        let (check, _) = s.check_peer(&bob.id, "bob", &bob.identity.public_key().serialize());
+        assert_eq!(check, PinCheck::New);
+        let raw = crate::group_state::raw_ik(&bob.identity.public_key().serialize()).unwrap();
+        s.gk_on(true);
+        let now = crate::time::now_millis() / 1000;
+        let later = now + 2 * crate::group_key::CLOCK_SLACK;
+        assert_eq!(GkPins::pin(&s, &bob.id), Some(raw));
+        assert_eq!(GkPins::pin_then(&s, &bob.id, later), PinThen::Pin(raw));
+        assert_eq!(GkPins::pin_then(&s, &bob.id, now - 3600), PinThen::Unknown);
+        let carol = account(3);
+        let raw_c = crate::group_state::raw_ik(&carol.identity.public_key().serialize()).unwrap();
+        GkPins::pin_new(&mut s, carol.id, raw_c, now);
+        assert_eq!(GkPins::pin(&s, &carol.id), Some(raw_c));
+        assert_eq!(GkPins::pin_then(&s, &carol.id, later), PinThen::Pin(raw_c));
     }
 }

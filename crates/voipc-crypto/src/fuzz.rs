@@ -233,6 +233,7 @@ pub fn fuzz_group(data: &[u8]) {
     );
     fuzz_keyring(g, f.genesis.clone(), &f.ik, &key, data);
     fuzz_wire(&f.genesis, &f.ik, &f.holder.public(), data);
+    fuzz_keying(&f.ik, data);
 
     // The Merkle path check: a root, a leaf, an index and a count, siblings.
     if data.len() >= 32 + 8 {
@@ -350,6 +351,109 @@ pub fn fuzz_group(data: &[u8]) {
         }
         let _ = take_keyring(g, &h, &h, &key, body, &[]);
     }
+}
+
+/// A member's state machine (`GroupKeying::frame`) on the input as relay frames: a whole
+/// frame, an `EpochIn`, an `EpochNamesIn` and a `VoiceSeats` piece, each in one part, and a
+/// post whose blob and ciphertext are the input, into a text group and a voice room.
+fn fuzz_keying(ik: &libsignal_protocol::IdentityKeyPair, data: &[u8]) {
+    use crate::group_key::GroupKind;
+    use crate::group_state::{
+        group_id, GkCtx, GkStart, GkTrack, GroupKeying, MemoryPins, Platform, VaultFloor,
+    };
+    use voipc_protocol::gk;
+    use voipc_protocol::messages::ServerMessage;
+
+    let run = [0x11; 16];
+    let mut st = crate::stores::SignalStores::new(ik, 1);
+    let mut keying = GroupKeying::default();
+    let _ = keying.start(GkStart {
+        on: true,
+        run,
+        relay_clock: 1,
+        platform: Platform::Desktop,
+        help_hold_keys: false,
+        user_id: 7,
+        identity: *ik,
+        account: None,
+        seat_keys: None,
+        local: None,
+        visible: true,
+    });
+    let text = "c:fuzz".to_string();
+    let voice = group_id(GroupKind::Voice, "", &run, 2);
+    for (channel_id, group, kind) in [
+        (1, text.clone(), GroupKind::Text),
+        (2, voice.clone(), GroupKind::Voice),
+    ] {
+        let t = GkTrack {
+            channel_id,
+            group,
+            kind,
+            anonymous: false,
+            hide_members: false,
+            viewer_admin: false,
+            keeps_history: false,
+        };
+        let _ = keying.track(t, VaultFloor::None);
+    }
+    let mut frames = Vec::new();
+    frames.extend(postcard::from_bytes::<ServerMessage>(data).ok());
+    for group in [&text, &voice] {
+        if let Ok(p) = postcard::from_bytes::<gk::InPiece>(data) {
+            frames.push(ServerMessage::EpochIn {
+                group: group.clone(),
+                part: 0,
+                last: true,
+                piece: Box::new(p),
+            });
+        }
+        if let Ok(p) = postcard::from_bytes::<gk::NamesPiece>(data) {
+            frames.push(ServerMessage::EpochNamesIn {
+                group: group.clone(),
+                part: 0,
+                last: true,
+                piece: p,
+            });
+        }
+        if let Ok(p) = postcard::from_bytes::<gk::VoiceSeatsPiece>(data) {
+            frames.push(ServerMessage::VoiceSeats {
+                channel_id: 2,
+                group: group.clone(),
+                part: 0,
+                last: true,
+                piece: p,
+            });
+        }
+        frames.push(ServerMessage::EpochPostIn {
+            channel_id: 1,
+            group: group.clone(),
+            gen: [0x11; 16],
+            epoch: 1,
+            user_id: 9,
+            username: "fuzz".into(),
+            account: None,
+            is_admin: false,
+            is_moderator: false,
+            writer: gk::GkMember::Conn(9),
+            blob: Some(data.to_vec()),
+            ciphertext: data.to_vec(),
+            timestamp: 1,
+        });
+    }
+    let mut pins = MemoryPins::default();
+    for f in &frames {
+        let c = GkCtx {
+            pins: &mut pins,
+            now: 1_800_000_000_000,
+        };
+        let _ = keying.frame(&mut st, f, c);
+    }
+    let c = GkCtx {
+        pins: &mut pins,
+        now: 1_800_000_100_000,
+    };
+    let _ = keying.tick(&mut st, c);
 }
 
 /// The group key's wire as the relay and a member take it: each part decoded from the

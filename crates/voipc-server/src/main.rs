@@ -24,6 +24,12 @@ mod fsutil;
 mod gates;
 mod gk;
 #[cfg(test)]
+mod gk_e2e_c3c;
+#[cfg(test)]
+mod gk_e2e_r2;
+#[cfg(test)]
+mod gk_e2e_tests;
+#[cfg(test)]
 mod gk_tests;
 mod layout;
 mod load;

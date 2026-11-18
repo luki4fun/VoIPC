@@ -1,6 +1,5 @@
 //! The group key's floors and counters in an account's vault (docs/GROUP-KEY.md §5.7, §5.11),
-//! as `AccountSync` runs them on a relay that keeps group keys. Unwired until C3b: nothing
-//! calls it yet.
+//! as `AccountSync` runs them on a relay that keeps group keys.
 //!
 //! - `item.gk_floors`, in the sign-in frame, is the index: each page's generation.
 //! - Pages `gkf.N` (N < 16) hold each stored group's rollback floor and names floor, with the
@@ -25,8 +24,9 @@
 //! (§5.7).
 //!
 //! Two devices merge per group: `Floor::merge`, and for names floors the later generation,
-//! then the higher `(epoch, join)`. Counters keep the higher `n`, and of one `n` the earliest
-//! `made`. A pin time belongs to one pin: of the same pin the earliest, else the later.
+//! then the higher `(epoch, join)`. Counters keep the higher `n`, and of one `n` the `made` of
+//! the vault-seat rotation (0x01) that raised it once that is seen, else the earliest
+//! (`Counter`). A pin time belongs to one pin: of the same pin the earliest, else the later.
 //!
 //! Pin times: every pin the account holds is timed once the pages are in (`pins_held`), so a
 //! pin met before group keys is checked from the first sign-in on. A pin made or changed
@@ -36,9 +36,6 @@
 //!
 //! A floor moving to a new generation is saved at once; anything else at most once a minute.
 //! Times are unix seconds, as in headers.
-
-// C3b wires this into `AccountSync`; until then only the tests call it.
-#![allow(dead_code)]
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, VecDeque};
@@ -123,12 +120,35 @@ pub struct FloorRow {
     pub last_used: u64,
 }
 
+/// The highest seat-key counter seen for an account (P3 finding 5): its `n`, and the `made`
+/// of the vault-seat rotation (0x01) that raised it, where this device saw that endorsement
+/// (`rotation`). A connection or desktop pair (0x02, 0x03) is made under an existing `n`,
+/// after its rotation: its `made` stands in only until the rotation's own is seen, and never
+/// moves one that is. Neither the earliest `made` under `n` (a device with a slow clock would
+/// fail others' folds) nor the latest (every connection would push it on, and rule 8 would
+/// never flag) is the rotation's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Counter {
+    pub n: u32,
+    pub made: u64,
+    pub rotation: bool,
+}
+
+impl Counter {
+    pub fn seen(&self) -> Seen {
+        Seen {
+            n: self.n,
+            made: self.made,
+        }
+    }
+}
+
 /// One account, as a `gkc.N` page holds it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CounterRow {
     pub account: Id,
-    /// The highest seat-key counter seen, with its endorsement's `made`.
-    pub counter: Option<(u32, u64)>,
+    /// The highest seat-key counter seen (`Counter`).
+    pub counter: Option<Counter>,
     /// When this account first saw the account's pin, with `tag` of that pin's `IK`: a time
     /// says nothing of another pin.
     pub pin: Option<(u64, [u8; 8])>,
@@ -167,10 +187,19 @@ fn is_stored(group: &str) -> bool {
     group.starts_with("c:") && valid_group_id(group)
 }
 
-fn higher_counter(a: Option<(u32, u64)>, b: Option<(u32, u64)>) -> Option<(u32, u64)> {
+/// The higher `n`; of one `n`, the rotation's `made` over a pair's, else the earlier of two
+/// alike. The same whichever is which.
+pub fn higher_counter(a: Option<Counter>, b: Option<Counter>) -> Option<Counter> {
     match (a, b) {
-        (Some(x), Some(y)) if x.0 == y.0 => Some((x.0, x.1.min(y.1))),
-        (Some(x), Some(y)) => Some(if x.0 > y.0 { x } else { y }),
+        (Some(x), Some(y)) if x.n == y.n => Some(match (x.rotation, y.rotation) {
+            (true, false) => x,
+            (false, true) => y,
+            _ => Counter {
+                made: x.made.min(y.made),
+                ..x
+            },
+        }),
+        (Some(x), Some(y)) => Some(if x.n > y.n { x } else { y }),
         (x, None) => x,
         (None, y) => y,
     }
@@ -244,7 +273,7 @@ impl Row for CounterRow {
     /// The counter's `made`; with no counter, the pin's time.
     fn age(&self) -> u64 {
         self.counter
-            .map(|(_, made)| made)
+            .map(|c| c.made)
             .or(self.pin.map(|(since, _)| since))
             .unwrap_or(0)
     }
@@ -1386,16 +1415,27 @@ impl GkFloors {
                 .rows
                 .get(account)
                 .and_then(|h| h.row.counter)
-                .map(|(n, made)| Seen { n, made })
+                .map(|c| c.seen())
         };
         self.pages_in.then(seen).ok_or(Pending)
     }
 
-    /// An endorsement seen for `account`: whether it raised what is held.
+    /// The vault-seat rotation (0x01) of `account` at `seen`: whether it raised what is held.
     pub fn raise(&mut self, account: Id, seen: Seen) -> bool {
+        self.raise_counter(account, seen, true)
+    }
+
+    /// An endorsement of `account` at `seen`; `rotation`: its vault-seat rotation (0x01),
+    /// else a pair made under that counter (0x02, 0x03), whose time the caller checked
+    /// against the header or join it came with. Whether it raised what is held.
+    pub fn raise_counter(&mut self, account: Id, seen: Seen, rotation: bool) -> bool {
         self.counters.put(CounterRow {
             account,
-            counter: Some((seen.n, seen.made)),
+            counter: Some(Counter {
+                n: seen.n,
+                made: seen.made,
+                rotation,
+            }),
             pin: None,
         })
     }
@@ -1665,6 +1705,24 @@ mod tests {
         format!("c:group{n}")
     }
 
+    /// A counter as its vault-seat rotation raised it.
+    fn rot(n: u32, made: u64) -> Counter {
+        Counter {
+            n,
+            made,
+            rotation: true,
+        }
+    }
+
+    /// A counter as a connection or desktop pair made under it raised it.
+    fn pair(n: u32, made: u64) -> Counter {
+        Counter {
+            n,
+            made,
+            rotation: false,
+        }
+    }
+
     fn account(n: u32) -> Id {
         let mut id = [0xA0; 16];
         id[12..].copy_from_slice(&n.to_be_bytes());
@@ -1750,7 +1808,7 @@ mod tests {
         let floors = page_blob(&vault, "gkf.0", 1, 3, &[row(1, f.clone(), NOW)]);
         let counter = CounterRow {
             account: account(1),
-            counter: Some((4, NOW - 50)),
+            counter: Some(rot(4, NOW - 50)),
             pin: None,
         };
         let counters = page_blob(&vault, "gkc.0", 1, 3, &[counter]);
@@ -1798,7 +1856,7 @@ mod tests {
             1,
             &[CounterRow {
                 account: account(1),
-                counter: Some((9, NOW)),
+                counter: Some(rot(9, NOW)),
                 pin: None,
             }],
         );
@@ -1859,7 +1917,7 @@ mod tests {
             3,
             &[CounterRow {
                 account: account(1),
-                counter: Some((1, NOW)),
+                counter: Some(rot(1, NOW)),
                 pin: None,
             }],
         );
@@ -2480,10 +2538,53 @@ mod tests {
             })
         );
         assert_eq!(d.book.seen_in(&account(2)), None);
-        for (x, y) in [((4, 9), (5, 20)), ((5, 20), (4, 9)), ((5, 1), (5, 20))] {
+        for (x, y) in [
+            (rot(4, 9), rot(5, 20)),
+            (rot(5, 20), rot(4, 9)),
+            (rot(5, 1), rot(5, 20)),
+            (pair(5, 1), rot(5, 20)),
+            (pair(5, 1), pair(5, 20)),
+        ] {
             let want = higher_counter(Some(x), Some(y));
             assert_eq!(want, higher_counter(Some(y), Some(x)), "either way round");
         }
+    }
+
+    /// P3 finding 5: of one counter, the `made` of the rotation that raised it, once seen; a
+    /// pair made under that counter later moves it neither back nor on, and stands in for the
+    /// rotation's only until that comes. Merged, the rotation's wins either way round.
+    #[test]
+    fn a_counter_keeps_the_made_of_the_rotation_that_raised_it() {
+        let vault = Vault::create(RELAY, "me");
+        let mut relay = Relay::default();
+        let mut d = Device::new(&vault, &relay, HashMap::new());
+        d.begin(&mut relay);
+        let a = account(1);
+        let at = |n, made| Seen { n, made };
+        // A pair first: its `made` stands in, and an earlier pair's replaces it
+        assert!(d.book.raise_counter(a, at(3, NOW), false));
+        assert!(d.book.raise_counter(a, at(3, NOW - 60), false));
+        assert_eq!(d.book.seen_in(&a), Some(at(3, NOW - 60)));
+        // The rotation's own, later than the pair's, still wins
+        assert!(d.book.raise_counter(a, at(3, NOW + 30), true));
+        assert_eq!(d.book.seen_in(&a), Some(at(3, NOW + 30)));
+        // Pairs under it move it neither way
+        assert!(!d.book.raise_counter(a, at(3, NOW - 600), false), "earlier");
+        assert!(!d.book.raise_counter(a, at(3, NOW + 600), false), "later");
+        assert_eq!(d.book.seen_in(&a), Some(at(3, NOW + 30)));
+        // A higher counter from a pair raises it, until its rotation is seen
+        assert!(d.book.raise_counter(a, at(4, NOW + 900), false));
+        assert!(d.book.raise(a, at(4, NOW + 700)));
+        assert_eq!(d.book.seen_in(&a), Some(at(4, NOW + 700)));
+        assert_eq!(
+            higher_counter(Some(rot(4, 9)), Some(pair(4, 1))),
+            Some(rot(4, 9)),
+            "merged, the rotation's"
+        );
+        assert_eq!(
+            higher_counter(Some(pair(4, 1)), Some(rot(4, 9))),
+            Some(rot(4, 9))
+        );
     }
 
     /// A pin's time checks entries made after it (with a header clock's slack) against the pin;
@@ -2699,7 +2800,7 @@ mod tests {
         let vault = Vault::create(RELAY, "me");
         let counter = CounterRow {
             account: account(1),
-            counter: Some((9, NOW - 50)),
+            counter: Some(rot(9, NOW - 50)),
             pin: Some((NOW - 50, tag(&[7; 32]))),
         };
         let counters = page_blob(&vault, "gkc.0", 1, 1, &[counter]);
