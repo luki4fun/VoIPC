@@ -2472,6 +2472,9 @@ async fn relay_state_then(
     let mut config = ServerConfig::default();
     config.accounts.mode = mode;
     config.accounts.registration = registration;
+    // The kept path before the group key (0010 chains and buckets): its tests hold to it
+    // whatever the default becomes. `mod kept_group_key` has it on.
+    config.group_key = false;
     let db = TempDb(std::env::temp_dir().join(format!(
         "voipc-relay-{}.db",
         hex::encode(rand::random::<[u8; 8]>())
@@ -41020,4 +41023,934 @@ async fn subscribe_without_a_placement_is_ignored() {
 #[tokio::test]
 async fn edge_failed_moves_and_avoids() {
     edge_pool::moves_and_avoids().await;
+}
+
+// ── The group key (plan 2k, 1b, 1f) ────────────────────────────────
+
+mod group_key {
+    use super::*;
+    use crate::gk_e2e_r2::{gk_state, lounge_group, Conn, World, LOUNGE};
+    use crate::state::RateLimiter;
+    use voipc_protocol::gk::{refused_what, refused_why, wait, GkMember, GkWriter, NamesRef};
+
+    fn ik() -> voipc_crypto::IdentityKeyPair {
+        voipc_crypto::generate_identity_key_pair()
+    }
+
+    /// `EpochRefused`'s `(what, why)`, each one `frames` holds.
+    fn refusals(frames: &[ServerMessage]) -> Vec<(u8, u8)> {
+        frames
+            .iter()
+            .filter_map(|f| match f {
+                ServerMessage::EpochRefused { what, why, .. } => Some((*what, *why)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn with_the_key_on_group_keys_comes_right_after_authenticated_and_says_on() {
+        let state = gk_state();
+        // `Conn::open` takes `Authenticated`, then `GroupKeys` as the very next frame
+        let c = Conn::open(&state, "ann", &ik()).await;
+        assert!(c.on);
+        assert_eq!(c.run, state.gk.run);
+    }
+
+    #[tokio::test]
+    async fn a_followers_fetch_is_answered_and_once_it_left_or_never_followed_it_is_not() {
+        let state = gk_state();
+        let mut ann = Conn::open(&state, "ann", &ik()).await;
+        let mut bob = Conn::open(&state, "bob", &ik()).await;
+        let group = lounge_group(&state, &ann.run).await;
+        let fetch = ClientMessage::EpochFetch {
+            group: group.clone(),
+            have: None,
+            at: vec![],
+            seat: None,
+        };
+        ann.follow().await;
+        ann.send(&fetch).await;
+        // Following made it a member: its fetch is answered (with no seat pair, it waits)
+        ann.expect(|m| {
+            matches!(m, ServerMessage::EpochWait { group: g, why, .. }
+                if *g == group && *why == wait::NO_SEAT_KEYS)
+        })
+        .await;
+        let not_member = |m: &ServerMessage| {
+            matches!(m, ServerMessage::EpochRefused { what, why, .. }
+                if *what == refused_what::FETCH && *why == refused_why::NOT_MEMBER)
+        };
+        bob.send(&fetch).await;
+        bob.expect(not_member).await;
+        ann.send(&ClientMessage::LeaveChannel { channel_id: LOUNGE })
+            .await;
+        ann.send(&fetch).await;
+        ann.expect(not_member).await;
+    }
+
+    #[tokio::test]
+    async fn an_epoch_post_goes_to_the_channels_other_followers_under_its_channel_id() {
+        let mut w = World::new(gk_state()).await;
+        w.member("ann").await;
+        assert!(
+            w.until(20_000, |w| w.holder.head().is_some()).await,
+            "the keyholder's Genesis was taken"
+        );
+        let (gen, epoch) = w.holder.head().unwrap();
+        let state = w.state.clone();
+        let mut writer = Conn::open(&state, "wes", &ik()).await;
+        let mut reader = Conn::open(&state, "rae", &ik()).await;
+        writer.follow().await;
+        reader.follow().await;
+        let group = lounge_group(&state, &writer.run).await;
+        let post = |group: &str, epoch: u32| ClientMessage::EpochPost {
+            channel_id: LOUNGE,
+            group: group.to_string(),
+            gen,
+            epoch,
+            blob: None,
+            ciphertext: b"sealed".to_vec(),
+        };
+        writer.send(&post(&group, epoch)).await;
+        let got = reader
+            .expect(|m| matches!(m, ServerMessage::EpochPostIn { .. }))
+            .await;
+        let ServerMessage::EpochPostIn {
+            channel_id,
+            group: g,
+            user_id,
+            writer: m,
+            ciphertext,
+            account,
+            ..
+        } = got
+        else {
+            unreachable!()
+        };
+        assert_eq!(channel_id, LOUNGE);
+        assert_eq!(g, group);
+        assert_eq!(user_id, writer.sid);
+        assert_eq!(
+            m,
+            GkMember::Conn(writer.sid),
+            "a guest writes as its connection"
+        );
+        assert_eq!(account, None);
+        assert_eq!(ciphertext, b"sealed");
+        // Under an epoch the head is past, or another group's id: refused to the writer, the
+        // second (no blob, the relay's own rule) as the old path refuses
+        writer.send(&post(&group, epoch + 5)).await;
+        writer.send(&post("r:00:9", epoch)).await;
+        let frames = writer.settled().await;
+        assert!(
+            !frames
+                .iter()
+                .any(|f| matches!(f, ServerMessage::EpochPostIn { .. })),
+            "no echo to the writer"
+        );
+        assert_eq!(
+            refusals(&frames),
+            vec![(refused_what::POST, refused_why::OLD_EPOCH)]
+        );
+        assert!(frames
+            .iter()
+            .any(|f| matches!(f, ServerMessage::ChannelError { .. })));
+        let later = reader.settled().await;
+        assert!(
+            !later
+                .iter()
+                .any(|f| matches!(f, ServerMessage::EpochPostIn { .. })),
+            "a refused post reaches nobody"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetches_blob_asks_and_name_lists_over_their_budget_are_refused_rate() {
+        let state = gk_state();
+        let mut ann = Conn::open(&state, "ann", &ik()).await;
+        ann.follow().await;
+        let group = lounge_group(&state, &ann.run).await;
+        {
+            let mut s = state.sessions.get_mut(&ann.sid).unwrap();
+            s.gk_fetch_rate = RateLimiter::new(0.0, 0.0);
+            s.gk_blob_rate = RateLimiter::new(0.0, 0.0);
+            s.gk_names_rate = RateLimiter::new(0.0, 0.0);
+        }
+        let at = NamesRef {
+            gen: [1; 16],
+            epoch: 1,
+            join: 0,
+        };
+        for msg in [
+            ClientMessage::EpochFetch {
+                group: group.clone(),
+                have: None,
+                at: vec![],
+                seat: None,
+            },
+            ClientMessage::EpochBlobWanted {
+                group: group.clone(),
+                gen: [1; 16],
+                epoch: 1,
+                writer: GkWriter {
+                    m: GkMember::Conn(9),
+                    u: 9,
+                },
+            },
+            ClientMessage::EpochNames {
+                group: group.clone(),
+                from: at,
+                to: at,
+                removals: false,
+            },
+        ] {
+            ann.send(&msg).await;
+        }
+        let frames = ann.settled().await;
+        assert_eq!(
+            refusals(&frames),
+            vec![
+                (refused_what::FETCH, refused_why::RATE),
+                (refused_what::BLOB, refused_why::RATE),
+                (refused_what::NAMES, refused_why::RATE)
+            ]
+        );
+        assert!(
+            !frames
+                .iter()
+                .any(|f| matches!(f, ServerMessage::EpochWait { .. })),
+            "nothing reached the group"
+        );
+    }
+
+    #[tokio::test]
+    async fn volunteer_offers_go_once_a_minute_after_four_then_are_held_and_an_off_only_after_an_offer(
+    ) {
+        let state = gk_state();
+        let (uid, _) = crate::state::test_support::add_user(&state, "ann");
+        let mut s = state.sessions.get_mut(&uid).unwrap();
+        let vol = |on| ClientMessage::KeyholdVolunteer {
+            on,
+            platform: voipc_protocol::gk::platform::BROWSER,
+            pair: None,
+        };
+        assert_eq!(gk_budget(&mut s, &vol(false)), Err(None), "nothing offered");
+        for _ in 0..4 {
+            assert_eq!(gk_budget(&mut s, &vol(true)), Ok(()));
+        }
+        assert_eq!(
+            gk_budget(&mut s, &vol(true)),
+            Err(None),
+            "held, not refused"
+        );
+        assert!(matches!(
+            s.gk_volunteer_held,
+            Some(ClientMessage::KeyholdVolunteer { on: true, .. })
+        ));
+        assert_eq!(gk_budget(&mut s, &vol(false)), Ok(()), "taken back");
+        assert!(s.gk_volunteer_held.is_none(), "the held offer with it");
+        assert_eq!(gk_budget(&mut s, &vol(false)), Err(None));
+    }
+
+    #[tokio::test]
+    async fn a_floor_ahead_notice_goes_once_a_minute_a_group() {
+        let state = gk_state();
+        let (uid, _) = crate::state::test_support::add_user(&state, "ann");
+        let mut s = state.sessions.get_mut(&uid).unwrap();
+        let ahead = |group: &str| ClientMessage::EpochFloorAhead {
+            group: group.to_string(),
+            header: voipc_protocol::gk::HeaderIn {
+                body: vec![],
+                sig: vec![],
+            },
+        };
+        assert_eq!(gk_budget(&mut s, &ahead("g")), Ok(()));
+        assert_eq!(
+            gk_budget(&mut s, &ahead("g")),
+            Err(None),
+            "within the minute"
+        );
+        for i in 1..FLOOR_AHEAD_GROUPS {
+            assert_eq!(gk_budget(&mut s, &ahead(&format!("g{i}"))), Ok(()));
+        }
+        assert_eq!(
+            gk_budget(&mut s, &ahead("one more")),
+            Err(None),
+            "groups at once"
+        );
+        for at in s.gk_ahead.values_mut() {
+            *at = at.checked_sub(FLOOR_AHEAD_GAP).unwrap();
+        }
+        assert_eq!(gk_budget(&mut s, &ahead("g")), Ok(()), "a minute on");
+    }
+
+    #[tokio::test]
+    async fn a_post_waiting_on_its_group_holds_no_other_frame_up_and_the_next_goes_after_it() {
+        let mut w = World::new(gk_state()).await;
+        w.member("ann").await;
+        assert!(
+            w.until(20_000, |w| w.holder.head().is_some()).await,
+            "the keyholder's Genesis was taken"
+        );
+        let (gen, epoch) = w.holder.head().unwrap();
+        let state = w.state.clone();
+        let mut writer = Conn::open(&state, "wes", &ik()).await;
+        let mut reader = Conn::open(&state, "rae", &ik()).await;
+        writer.follow().await;
+        reader.follow().await;
+        let group = lounge_group(&state, &writer.run).await;
+        // As if the writer's last post still waited on the group's task to store its blob
+        let (stored, waiting) = tokio::sync::oneshot::channel();
+        state.sessions.get_mut(&writer.sid).unwrap().gk_post_tail = Some(waiting);
+        writer
+            .send(&ClientMessage::EpochPost {
+                channel_id: LOUNGE,
+                group,
+                gen,
+                epoch,
+                blob: None,
+                ciphertext: b"after".to_vec(),
+            })
+            .await;
+        // Its ping is answered meanwhile; the post waits behind the last
+        assert!(refusals(&writer.settled().await).is_empty());
+        let posted = |f: &ServerMessage| matches!(f, ServerMessage::EpochPostIn { .. });
+        assert!(!reader.settled().await.iter().any(posted));
+        stored.send(()).unwrap();
+        reader.expect(posted).await;
+    }
+
+    #[tokio::test]
+    async fn with_the_key_on_a_text_channels_old_key_path_is_refused_once_and_a_rooms_is_not() {
+        let state = gk_state();
+        let mut ann = Conn::open(&state, "ann", &ik()).await;
+        let mut bob = Conn::open(&state, "bob", &ik()).await;
+        ann.follow().await;
+        bob.follow().await;
+        for msg in [
+            ClientMessage::KeyCheck {
+                channel_id: LOUNGE,
+                restart: true,
+            },
+            ClientMessage::OpenSessions {
+                channel_id: LOUNGE,
+                targets: vec![bob.sid],
+            },
+            ClientMessage::DistributeSenderKeys {
+                channel_id: LOUNGE,
+                keys: vec![],
+            },
+            ClientMessage::SendEncryptedChannelMessage {
+                channel_id: LOUNGE,
+                ciphertext: b"old".to_vec(),
+            },
+            // General is a voice room: its path is not the text channels' (V2 builds its own)
+            ClientMessage::KeyCheck {
+                channel_id: 0,
+                restart: true,
+            },
+        ] {
+            ann.send(&msg).await;
+        }
+        let frames = ann.settled().await;
+        assert_eq!(
+            refusals(&frames),
+            vec![(refused_what::LEGACY, refused_why::LEGACY_PATH)],
+            "told once a connection"
+        );
+        let owed: Vec<ChannelId> = frames
+            .iter()
+            .filter_map(|f| match f {
+                ServerMessage::KeysOwed { channel_id, .. } => Some(*channel_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(owed, vec![0], "only the room's key check was answered");
+        assert!(
+            !bob.settled().await.iter().any(|f| matches!(
+                f,
+                ServerMessage::TextPost { .. } | ServerMessage::EncryptedChannelChatMessage { .. }
+            )),
+            "the old post reached nobody"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_the_key_off_the_old_paths_work_and_the_keys_messages_go_nowhere() {
+        let state = Arc::new(ServerState::new(
+            &ServerConfig::default(),
+            ServerSettings::default(),
+            vec![crate::channels::ChannelEntry {
+                name: "lounge".into(),
+                text: true,
+                ..Default::default()
+            }],
+            "test-admin-token".into(),
+        ));
+        let mut ann = Conn::open(&state, "ann", &ik()).await;
+        assert!(!ann.on);
+        ann.follow().await;
+        let group = lounge_group(&state, &ann.run).await;
+        for msg in [
+            ClientMessage::KeyCheck {
+                channel_id: LOUNGE,
+                restart: true,
+            },
+            ClientMessage::KeyholdVolunteer {
+                on: true,
+                platform: voipc_protocol::gk::platform::DESKTOP,
+                pair: None,
+            },
+            ClientMessage::EpochNames {
+                group: group.clone(),
+                from: NamesRef {
+                    gen: [1; 16],
+                    epoch: 1,
+                    join: 0,
+                },
+                to: NamesRef {
+                    gen: [1; 16],
+                    epoch: 1,
+                    join: 0,
+                },
+                removals: false,
+            },
+            ClientMessage::EpochFetch {
+                group: group.clone(),
+                have: None,
+                at: vec![],
+                seat: None,
+            },
+            ClientMessage::EpochPost {
+                channel_id: LOUNGE,
+                group: group.clone(),
+                gen: [1; 16],
+                epoch: 1,
+                blob: None,
+                ciphertext: b"x".to_vec(),
+            },
+        ] {
+            ann.send(&msg).await;
+        }
+        let frames = ann.settled().await;
+        assert!(
+            frames.iter().any(|f| matches!(
+                f,
+                ServerMessage::KeysOwed {
+                    channel_id: LOUNGE,
+                    refused: false,
+                    ..
+                }
+            )),
+            "the old key path answers as before"
+        );
+        // The volunteer and the names ask are dropped; a fetch (kept reads stay, 2i) and a
+        // post are told the key is off
+        assert_eq!(
+            refusals(&frames),
+            vec![
+                (refused_what::FETCH, refused_why::OFF),
+                (refused_what::POST, refused_why::OFF)
+            ]
+        );
+        assert!(state.gk.stats().is_empty(), "no group started");
+    }
+
+    /// `KeyholdVolunteer{on}` with `conn`'s own pair, as a guest desktop offers.
+    fn volunteer(ik: &voipc_crypto::IdentityKeyPair, sid: UserId) -> ClientMessage {
+        let (_, wire) = crate::gk_e2e_r2::conn_pair(ik, sid);
+        ClientMessage::KeyholdVolunteer {
+            on: true,
+            platform: voipc_protocol::gk::platform::DESKTOP,
+            pair: Some((&wire).into()),
+        }
+    }
+
+    /// `conn`'s fetch of `group` with its own seat pair: unseated, it is told why it waits.
+    async fn fetch_waits(conn: &mut Conn, ik: &voipc_crypto::IdentityKeyPair, group: &str) -> u8 {
+        let (_, wire) = crate::gk_e2e_r2::conn_pair(ik, conn.sid);
+        conn.send(&ClientMessage::EpochFetch {
+            group: group.to_string(),
+            have: None,
+            at: vec![],
+            seat: Some((&wire).into()),
+        })
+        .await;
+        match conn
+            .expect(|m| matches!(m, ServerMessage::EpochWait { group: g, .. } if g == group))
+            .await
+        {
+            ServerMessage::EpochWait { why, .. } => why,
+            _ => unreachable!(),
+        }
+    }
+
+    /// Whichever path starts a gated channel's group (a hook before the gate reached the
+    /// group key, a hook after it did, a sweep or an account hook naming no channel), the
+    /// group holds the gate before its first due: no guest is asked an ungated Genesis.
+    #[tokio::test]
+    async fn a_gated_channels_group_asks_no_due_ungated_whichever_path_started_it() {
+        for path in ["before the gate", "after the gate", "naming no channel"] {
+            let state = gk_state();
+            let (keys_ik, ann_ik) = (ik(), ik());
+            let mut keys = Conn::open(&state, "keys", &keys_ik).await;
+            let mut ann = Conn::open(&state, "ann", &ann_ik).await;
+            let group = lounge_group(&state, &ann.run).await;
+            // Started with no follow here, as an eager seat or a sweep starts a group
+            let start = |channel| {
+                state.gk.on_follow(
+                    channel,
+                    &group,
+                    voipc_crypto::group_key::GroupKind::Text,
+                    9_999,
+                    None,
+                )
+            };
+            match path {
+                "before the gate" => start(LOUNGE),
+                "naming no channel" => start(0),
+                _ => {}
+            }
+            {
+                let mut channels = state.channels.write().await;
+                let c = channels.get_mut(&LOUNGE).unwrap();
+                c.gate.groups = vec!["crew".into()];
+                c.members.extend([keys.sid, ann.sid]);
+            }
+            // A gate set later tells the group key (gates.rs); a channel loaded or made with
+            // its gate does not, and its first follow here does
+            if path != "before the gate" {
+                state.gk.on_gate(LOUNGE, true);
+            }
+            if path == "after the gate" {
+                start(LOUNGE);
+            }
+            keys.follow().await;
+            keys.send(&volunteer(&keys_ik, keys.sid)).await;
+            keys.settled().await;
+            ann.follow().await;
+            // Gated, no guest may start its keys: the group has no keyholder
+            assert_eq!(
+                fetch_waits(&mut ann, &ann_ik, &group).await,
+                wait::NO_KEYHOLDER,
+                "{path}"
+            );
+            assert!(
+                !keys
+                    .settled()
+                    .await
+                    .iter()
+                    .any(|f| matches!(f, ServerMessage::EpochDue { .. })),
+                "{path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_offer_past_its_budget_is_held_not_refused_and_goes_at_a_tick_unless_taken_back() {
+        let state = gk_state();
+        let (keys_ik, ann_ik) = (ik(), ik());
+        let mut keys = Conn::open(&state, "keys", &keys_ik).await;
+        let mut ann = Conn::open(&state, "ann", &ann_ik).await;
+        let group = lounge_group(&state, &ann.run).await;
+        keys.follow().await;
+        ann.follow().await;
+        let tx = state.sessions.get(&keys.sid).unwrap().control_tx.clone();
+        let sid = keys.sid;
+        let budget = |tokens: f64| {
+            state.sessions.get_mut(&sid).unwrap().gk_volunteer_rate = RateLimiter::new(tokens, 0.0);
+        };
+        // Over the budget, taken back before a token came: nothing goes
+        budget(0.0);
+        keys.send(&volunteer(&keys_ik, keys.sid)).await;
+        assert!(refusals(&keys.settled().await).is_empty(), "never refused");
+        keys.send(&ClientMessage::KeyholdVolunteer {
+            on: false,
+            platform: voipc_protocol::gk::platform::DESKTOP,
+            pair: None,
+        })
+        .await;
+        keys.settled().await;
+        budget(1.0);
+        gk_volunteer_late(&state, keys.sid, &tx).await;
+        assert_eq!(
+            fetch_waits(&mut ann, &ann_ik, &group).await,
+            wait::NO_KEYHOLDER
+        );
+        // Over the budget again: held, and at a tick with a token it goes
+        budget(0.0);
+        keys.send(&volunteer(&keys_ik, keys.sid)).await;
+        assert!(refusals(&keys.settled().await).is_empty(), "never refused");
+        gk_volunteer_late(&state, keys.sid, &tx).await;
+        assert_eq!(
+            fetch_waits(&mut ann, &ann_ik, &group).await,
+            wait::NO_KEYHOLDER
+        );
+        budget(1.0);
+        gk_volunteer_late(&state, keys.sid, &tx).await;
+        keys.expect(|m| matches!(m, ServerMessage::EpochDue { group: g, .. } if *g == group))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_removed_text_channels_group_stops_and_its_followers_taken_out_in_bulk_follow_it_no_more(
+    ) {
+        let state = gk_state();
+        let mut ann = Conn::open(&state, "ann", &ik()).await;
+        ann.follow().await;
+        let group = lounge_group(&state, &ann.run).await;
+        assert!(state.gk.get(&group).is_some());
+        {
+            // As layout's delete does: the followers out in bulk, then the channel
+            let mut channels = state.channels.write().await;
+            let c = channels.get_mut(&LOUNGE).unwrap();
+            c.follow = Default::default();
+            c.members.clear();
+            state.remove_channel(&mut channels, LOUNGE);
+        }
+        assert!(state.gk.get(&group).is_none(), "its group stopped");
+        ann.send(&ClientMessage::EpochFetch {
+            group: group.clone(),
+            have: None,
+            at: vec![],
+            seat: None,
+        })
+        .await;
+        ann.expect(|m| {
+            matches!(m, ServerMessage::EpochRefused { what, why, .. }
+                if *what == refused_what::FETCH && *why == refused_why::NOT_MEMBER)
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn with_the_key_off_a_relay_that_had_it_on_still_attaches_its_database_for_kept_reads() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let store = state.accounts.as_ref().unwrap().store();
+        let start = || {
+            ServerState::new(
+                &ServerConfig::default(),
+                ServerSettings::default(),
+                vec![],
+                "test-admin-token".into(),
+            )
+        };
+        // Never on: no incarnation, nothing kept to read, nothing attached
+        crate::gk_switch(&state, store, false).await.unwrap();
+        assert!(state.gk.id_for(LOUNGE, Some("conv")).starts_with("r:"));
+        // On once, then off: the next start still reads kept groups from the database (1h)
+        crate::gk_switch(&start(), store, true).await.unwrap();
+        let off = start();
+        crate::gk_switch(&off, store, false).await.unwrap();
+        assert_eq!(off.gk.id_for(LOUNGE, Some("conv")), "c:conv");
+    }
+}
+
+/// The kept path under the group key (C4, K2): the accounts side of a relay with the switch
+/// on, through real sessions. The legacy kept tests hold to `group_key = false`
+/// (`relay_state_then`).
+mod kept_group_key {
+    use super::*;
+    use crate::state::RateLimiter;
+    use voipc_crypto::group_key::{SeatPair, SeatPublic};
+
+    /// A relay with accounts and the group key on, its database attached as `gk_switch` does.
+    async fn gk_relay_state(quota_mb: Option<u32>) -> (Arc<ServerState>, TempDb) {
+        let mut config = ServerConfig::default();
+        config.accounts.mode = AccountsMode::Optional;
+        config.accounts.registration = RegistrationMode::Open;
+        if let Some(q) = quota_mb {
+            config.accounts.quota_mb = q;
+        }
+        config.group_key = true;
+        let db = TempDb(std::env::temp_dir().join(format!(
+            "voipc-relay-{}.db",
+            hex::encode(rand::random::<[u8; 8]>())
+        )));
+        let store = l4f_accounts::store::Store::connect(&format!("sqlite://{}", db.0.display()))
+            .await
+            .unwrap();
+        let relay = crate::accounts::Relay::open_with(&config.accounts, store.clone(), &[9u8; 32])
+            .await
+            .unwrap();
+        let inc = crate::accounts::gk::gk_start(&store, true)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut state = ServerState::new(
+            &config,
+            ServerSettings::default(),
+            Vec::new(),
+            "test-admin-token".into(),
+        );
+        state.accounts = Some(Arc::new(relay));
+        let state = Arc::new(state);
+        state.gk.attach(store, inc);
+        (state, db)
+    }
+
+    /// `keys` at counter `n`, as `ik` endorsed them for `account`.
+    fn publish(
+        ik: &voipc_crypto::IdentityKeyPair,
+        account: [u8; 16],
+        n: u32,
+        made: u64,
+        keys: &SeatPublic,
+    ) -> ClientMessage {
+        let e = voipc_crypto::group_key::Endorsement::sign(
+            ik,
+            voipc_crypto::group_key::Origin::VaultSeat,
+            voipc_crypto::group_key::MemberId::Account(account),
+            n,
+            made,
+            keys,
+        )
+        .unwrap();
+        ClientMessage::Account(AccountRequest::SeatKeysPublish {
+            kem: keys.kem_bytes().into(),
+            dh: keys.dh_bytes().into(),
+            n,
+            made,
+            sig: e.sig.to_vec(),
+        })
+    }
+
+    /// A registered account's identity, a real key pair in place of `IDENTITY`.
+    async fn real_identity(
+        state: &ServerState,
+        account: [u8; 16],
+    ) -> voipc_crypto::IdentityKeyPair {
+        let ik = voipc_crypto::generate_identity_key_pair();
+        state
+            .accounts
+            .as_ref()
+            .unwrap()
+            .set_identity(
+                l4f_accounts::model::AccountId(account),
+                &ik.public_key().serialize(),
+            )
+            .await
+            .unwrap();
+        ik
+    }
+
+    async fn ask(c: &mut Client, m: ClientMessage) -> AccountReply {
+        c.send(&m).await;
+        reply(&c.expect("an answer", |m| reply(m).is_some()).await)
+            .unwrap()
+            .clone()
+    }
+
+    /// `SeatKeysPublish` (§5.11): held at a counter above every earlier one, current from
+    /// then; the same keys again (another device of the account, signed anew) are held
+    /// already; other keys at a counter not above it, or keys that are none, are refused.
+    #[tokio::test]
+    async fn seat_keys_are_held_at_a_higher_counter_and_the_same_keys_again_are_held_already() {
+        let (state, _db) = gk_relay_state(None).await;
+        let (mut c, info) = register(&state, "kim").await;
+        let ik = real_identity(&state, info.id).await;
+        let keys = SeatPair::generate().public();
+        let other = SeatPair::generate().public();
+        for (n, made, k, held) in [
+            (1, 100, &keys, true),
+            (1, 100, &keys, true),
+            (1, 100, &other, false),
+            (0, 100, &other, false),
+            (2, 200, &other, true),
+        ] {
+            let out = ask(&mut c, publish(&ik, info.id, n, made, k)).await;
+            match held {
+                true => assert!(
+                    matches!(out, AccountReply::SeatKeysStored { n: got } if got == n),
+                    "{n}: {out:?}"
+                ),
+                false => assert!(
+                    matches!(&out, AccountReply::Error { request, .. } if request == "SeatKeysPublish"),
+                    "{n}: {out:?}"
+                ),
+            }
+        }
+        let relay = state.accounts.clone().unwrap();
+        let now = crate::accounts::gk::seat_keys(relay.store(), &info.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((now.n, &now.kem[..]), (2, &*other.kem_bytes()));
+        let none = ClientMessage::Account(AccountRequest::SeatKeysPublish {
+            kem: vec![1; 5],
+            dh: vec![2; 33],
+            n: 3,
+            made: 300,
+            sig: vec![3; 64],
+        });
+        assert!(matches!(
+            ask(&mut c, none).await,
+            AccountReply::Error { reason, .. } if reason == "malformed"
+        ));
+    }
+
+    /// Plan 2d: old seat keys offered again are refused. An identity reset wipes the
+    /// counter that rule reads, so a device still on the old identity could publish at a
+    /// higher one and seat the account under keys its new devices cannot open: only keys
+    /// the account's identity now endorsed are held, and none for another account.
+    #[tokio::test]
+    async fn seat_keys_another_identity_endorsed_are_refused_whatever_their_counter() {
+        let (state, _db) = gk_relay_state(None).await;
+        let (mut c, info) = register(&state, "kim").await;
+        let old = real_identity(&state, info.id).await;
+        let new = real_identity(&state, info.id).await;
+        let keys = SeatPair::generate().public();
+        for m in [
+            publish(&old, info.id, 8, 100, &keys),
+            publish(&new, [7; 16], 8, 100, &keys),
+        ] {
+            let out = ask(&mut c, m).await;
+            assert!(
+                matches!(&out, AccountReply::Error { request, reason }
+                    if request == "SeatKeysPublish" && reason.contains("not your identity's")),
+                "{out:?}"
+            );
+        }
+        let relay = state.accounts.clone().unwrap();
+        assert!(crate::accounts::gk::seat_keys(relay.store(), &info.id)
+            .await
+            .unwrap()
+            .is_none());
+        let out = ask(&mut c, publish(&new, info.id, 1, 100, &keys)).await;
+        assert!(
+            matches!(out, AccountReply::SeatKeysStored { n: 1 }),
+            "{out:?}"
+        );
+    }
+
+    /// Plan 2g: the group key's floor pages (`gkf.N`, `gkc.N`) are a namespace of their own,
+    /// read one at a time and never in the sign-in frame. l4f adds up all three namespaces of
+    /// an account against the quota: the vault keeps its 56 KiB, the pins theirs, and the
+    /// floors take what is left, so a full set of either never blocks a vault write.
+    #[tokio::test]
+    async fn the_floor_pages_have_their_own_namespace_and_the_three_share_the_quota() {
+        let (state, _db) = gk_relay_state(Some(3)).await;
+        let (mut c, info) = register(&state, "kim").await;
+        for mut s in state.sessions.iter_mut() {
+            s.account_rate = RateLimiter::new(1e9, 1e9);
+            s.global_rate = RateLimiter::new(1e9, 1e9);
+        }
+        let put = |k: &str, v: Vec<u8>, expect: i64| {
+            ClientMessage::Account(AccountRequest::VaultPut {
+                k: k.into(),
+                v,
+                expect,
+            })
+        };
+        let full = vec![7u8; 48 * 1024];
+        for n in 0..56 {
+            let out = ask(&mut c, put(&format!("pins.{n}"), full.clone(), 0)).await;
+            assert!(
+                matches!(out, AccountReply::VaultStored { .. }),
+                "{n}: {out:?}"
+            );
+        }
+        // 3 MiB less the vault's 56 KiB and the pins' 56 pages: six pages of floors
+        for k in ["gkf.0", "gkf.15", "gkc.0", "gkc.1", "gkc.2", "gkc.31"] {
+            let out = ask(&mut c, put(k, full.clone(), 0)).await;
+            assert!(
+                matches!(out, AccountReply::VaultStored { .. }),
+                "{k}: {out:?}"
+            );
+        }
+        let out = ask(&mut c, put("gkc.3", full.clone(), 0)).await;
+        assert!(
+            matches!(&out, AccountReply::Error { reason, .. } if reason.contains("full")),
+            "{out:?}"
+        );
+        let out = ask(&mut c, put("item.big", full.clone(), 0)).await;
+        assert!(matches!(out, AccountReply::VaultStored { .. }), "{out:?}");
+        for k in ["gkf.16", "gkc.32", "gkf.01", "gkc.x"] {
+            let out = ask(&mut c, put(k, vec![1], 0)).await;
+            assert!(matches!(out, AccountReply::Error { .. }), "{k}: {out:?}");
+        }
+        let page = ClientMessage::Account(AccountRequest::VaultPage { k: "gkc.31".into() });
+        let AccountReply::VaultPageFound { blob: Some(b), .. } = ask(&mut c, page).await else {
+            panic!("a page");
+        };
+        assert_eq!(b.v.len(), 48 * 1024);
+        let relay = state.accounts.clone().unwrap();
+        let id = l4f_accounts::model::AccountId(info.id);
+        assert!(relay
+            .vault(id)
+            .await
+            .unwrap()
+            .iter()
+            .all(|b| !b.k.starts_with("gk")));
+        assert_eq!(
+            relay
+                .store()
+                .blob_count(id, crate::accounts::GK_NS)
+                .await
+                .unwrap(),
+            6
+        );
+    }
+
+    /// Plan 2i/1h: with the switch off the group key's writes are refused in so many words,
+    /// and the kept reads are served as ever.
+    #[tokio::test]
+    async fn with_the_switch_off_only_the_kept_reads_are_served() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        assert!(!state.gk.on);
+        let (mut c, _) = register(&state, "kim").await;
+        let keys = SeatPair::generate().public();
+        let start = AccountRequest::EpochChainStart {
+            conv: "c:hall".into(),
+            epoch: 1 << 22,
+            self_wrap: vec![1; 80],
+            link: None,
+            group: "c:hall".into(),
+            gen: [1; 16],
+            gk_epoch: 1,
+            sealed: vec![2; 80],
+            last: true,
+        };
+        for (name, m) in [
+            (
+                "SeatKeysPublish",
+                publish(
+                    &voipc_crypto::generate_identity_key_pair(),
+                    [1; 16],
+                    1,
+                    100,
+                    &keys,
+                ),
+            ),
+            (
+                "SelfRowPut",
+                ClientMessage::Account(AccountRequest::SelfRowPut { rows: vec![] }),
+            ),
+            ("EpochChainStart", ClientMessage::Account(start)),
+        ] {
+            let out = ask(&mut c, m).await;
+            assert!(
+                matches!(&out, AccountReply::Error { request, reason }
+                    if request == name && reason.contains("does not use the group key")),
+                "{out:?}"
+            );
+        }
+        let keys = ClientMessage::Account(AccountRequest::EpochChainKeys {
+            conv: "c:hall".into(),
+            chains: vec![],
+        });
+        assert!(matches!(
+            ask(&mut c, keys).await,
+            AccountReply::Error { reason, .. } if reason == "not a conversation of yours"
+        ));
+        let list = ClientMessage::Account(AccountRequest::SelfRowsList {
+            after: None,
+            limit: 16,
+        });
+        assert!(matches!(
+            ask(&mut c, list).await,
+            AccountReply::SelfRows { rows, next: None } if rows.is_empty()
+        ));
+    }
 }

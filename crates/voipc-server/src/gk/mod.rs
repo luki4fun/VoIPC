@@ -6,9 +6,10 @@
 //! actor, plain posts checked against `HeadView`. Every multi-part sequence to a session
 //! is queued whole under the group's send lock, so none interleaves with another.
 //!
-//! The hooks other slices call: `on_*` (R2: session.rs, state.rs; K2: the accounts paths;
-//! V2: voice rooms), `chain_epoch_ref`, `row_makers`, `stats`.
-#![cfg_attr(not(test), allow(dead_code))]
+//! The hooks other slices call: `on_*` and `set_device`, `set_kept_seats` (R2: session.rs,
+//! state.rs; K2: the accounts paths; V2: voice rooms), `past_epoch`, `rows_of`,
+//! `row_makers` (K2), `stats`, `warnings` (R2's Load). Sweeps run on a task of their own
+//! from `attach`.
 
 pub mod due;
 pub mod group;
@@ -29,7 +30,9 @@ use dashmap::{DashMap, DashSet};
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 use voipc_crypto::group_key::commit::{Joiner, Pair, ReplaceAsk};
-use voipc_crypto::group_key::timers::{ACTOR_IDLE_MS, INBOX_MAX_BYTES, OPEN_PER_CONN_BYTES};
+use voipc_crypto::group_key::timers::{
+    ACTOR_IDLE_MS, INBOX_MAX_BYTES, MATERIAL_SWEEP_MS, OPEN_PER_CONN_BYTES, SEAT_EXPIRY_SECS,
+};
 use voipc_crypto::group_key::{seat_record, GroupKind, SeatRef};
 use voipc_protocol::gk::{
     refused_what, refused_why, CommitPiece, EpochRef, FloorRef, GkWriter, HeaderIn, NamesRef,
@@ -95,6 +98,7 @@ enum Msg {
     Volunteer {
         sid: UserId,
         v: Option<Volunteer>,
+        device: Option<Vec<u8>>,
     },
     Fetch {
         sid: UserId,
@@ -157,6 +161,44 @@ enum Msg {
     Gate {
         gated: bool,
     },
+    /// A seed-welcome page's welcomes (`EpochWelcomes`).
+    Welcomes {
+        sid: UserId,
+        due: u64,
+        gen: [u8; 16],
+        seed: u32,
+        welcomes: Vec<voipc_protocol::gk::SeedWelcomeOut>,
+        /// What the commit lane carries for it.
+        bytes: usize,
+    },
+    /// A seat behind a running roll fetched: first in the next page.
+    SeedWanted {
+        seat: SeatRef,
+    },
+    /// An account's newest seat-key counter, since when (unix ms).
+    Counter {
+        account: [u8; 16],
+        n: u32,
+        since: u64,
+    },
+    DeviceRemoved {
+        account: [u8; 16],
+        device: Vec<u8>,
+    },
+    /// Eager seats a page at a time, read off the actor.
+    EagerMany(Vec<([u8; 16], Joiner)>),
+    /// The 10-minute sweep (orphans), and the daily one (names).
+    Sweep {
+        daily: bool,
+    },
+    /// Seats unused for 90 days.
+    Expire(Vec<SeatRef>),
+    /// An account's seat keys rotated: its seats other than `keep` exit (a memory group's;
+    /// a stored group's go by `AccountExit`).
+    Rotated {
+        account: [u8; 16],
+        keep: SeatRef,
+    },
 }
 
 /// A live group: its inbox, what is read outside its actor, its send lock.
@@ -187,6 +229,8 @@ pub struct Handle {
     stop: tokio::sync::Notify,
     store: Arc<Store>,
     stats: Mutex<GroupLoad>,
+    /// The admin warnings its actor raised last (plan 2j).
+    warnings: Mutex<Vec<String>>,
 }
 
 type Inbox = mpsc::UnboundedReceiver<(Msg, usize)>;
@@ -222,10 +266,50 @@ impl Handle {
                 },
                 ..GroupLoad::default()
             }),
+            warnings: Mutex::default(),
         });
         (h, rx)
     }
 }
+
+/// The live group `id`, its actor started if it was not (a stored group whose channel
+/// moved back to it starts a new generation), knowing its channel's gate from its first
+/// due. A group a sweep or an account hook started takes its channel, and that channel's
+/// gate, from the first hook that names one: no due goes before a follow, which names it.
+/// So does a group another channel named before (a deleted one whose conversation came
+/// back in a new channel).
+fn start(shared: &Arc<Shared>, id: &str, kind: GroupKind, channel: ChannelId) -> Arc<Handle> {
+    use dashmap::mapref::entry::Entry;
+    let e = match shared.map.entry(id.to_string()) {
+        Entry::Occupied(e) => {
+            let h = e.get().clone();
+            let mut s = h.stats.lock().unwrap_or_else(|e| e.into_inner());
+            if channel != 0 && s.channel_id != channel {
+                s.channel_id = channel;
+                let gated = shared.gated.contains(&channel);
+                let _ = h.tx.send((Msg::Gate { gated }, 0));
+            }
+            drop(s);
+            return h;
+        }
+        Entry::Vacant(e) => e,
+    };
+    let store = match (id.starts_with("c:"), shared.db.get()) {
+        (true, Some(db)) => Store::Db(db.clone()),
+        _ => Store::memory(),
+    };
+    let (h, rx) = Handle::new(id, kind, channel, Arc::new(store));
+    e.insert(h.clone());
+    let mut g = GroupState::new(id.to_string(), kind, h.store.stored(), shared.caps.clone());
+    g.new_gen = shared.moved_back.remove(id).is_some();
+    g.kept_seats = shared.kept_seats.load(Ordering::Relaxed);
+    g.gate = shared.gated.contains(&channel);
+    tokio::spawn(actor(shared.clone(), h.clone(), rx, g));
+    h
+}
+
+/// A seat used: its generation and record.
+type Used = ([u8; 16], [u8; 33]);
 
 /// What the actors share with the registry.
 pub struct Shared {
@@ -241,6 +325,19 @@ pub struct Shared {
     accounts: DashMap<UserId, [u8; 16]>,
     /// Rotations not yet re-seated everywhere, per account (2d "Rotation").
     reseat: DashMap<[u8; 16], Reseat>,
+    /// Seats used (a fetch answered, a post) since the daily write of `last_use`, per
+    /// stored group: `(gen, seat record)`.
+    used: DashMap<String, HashSet<Used>>,
+    /// The device each session signed in with, where it named one (`set_device`).
+    devices: DashMap<UserId, Vec<u8>>,
+    /// Eager seats queued at most per group (`[accounts] kept_seats`).
+    kept_seats: AtomicUsize,
+    /// Each stored group's bytes in the database, as the last sweep counted them.
+    db_bytes: DashMap<String, u64>,
+    /// Stored groups whose channel moved back to them: a new generation at their start.
+    moved_back: DashSet<String>,
+    /// The channels whose gate is on, as `on_gate` last told: a group's start reads its own.
+    gated: DashSet<ChannelId>,
 }
 
 /// A rotation's progress: counter `n`, the new seat, the groups still to seat it.
@@ -308,8 +405,6 @@ pub struct Groups {
     by_channel: DashMap<ChannelId, String>,
     follows: DashMap<UserId, HashSet<String>>,
     vols: DashMap<UserId, Volunteer>,
-    /// Stored groups whose channel moved back to them: a new generation at their start.
-    moved_back: DashSet<String>,
 }
 
 fn hex(b: &[u8]) -> String {
@@ -341,11 +436,16 @@ impl Groups {
                 map: DashMap::new(),
                 accounts: DashMap::new(),
                 reseat: DashMap::new(),
+                used: DashMap::new(),
+                devices: DashMap::new(),
+                kept_seats: AtomicUsize::new(group::KEPT_SEATS),
+                db_bytes: DashMap::new(),
+                moved_back: DashSet::new(),
+                gated: DashSet::new(),
             }),
             by_channel: DashMap::new(),
             follows: DashMap::new(),
             vols: DashMap::new(),
-            moved_back: DashSet::new(),
         }
     }
 
@@ -361,9 +461,33 @@ impl Groups {
     }
 
     /// The accounts database and its `gk_incarnation` (`accounts::gk::gk_start`): from
-    /// here `c:` groups are stored. Without it every group is in memory (2h).
+    /// here `c:` groups are stored, and swept every 10 minutes and daily by a task of their
+    /// own (plan 2e). Without it every group is in memory (2h). With the switch off the
+    /// relay attaches it too (any incarnation): kept reads are served read-only (1h).
     pub fn attach(&self, db: l4f_accounts::store::Store, incarnation: [u8; 16]) {
-        let _ = self.shared.db.set(Arc::new(DbStore { db, incarnation }));
+        if self
+            .shared
+            .db
+            .set(Arc::new(DbStore { db, incarnation }))
+            .is_ok()
+            && self.on
+        {
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                rt.spawn(sweeper(Arc::downgrade(&self.shared)));
+            }
+        }
+    }
+
+    /// Whether `attach` ran: the relay's own process, not a shell command's.
+    pub fn attached(&self) -> bool {
+        self.shared.db.get().is_some()
+    }
+
+    /// `[accounts] kept_seats`: eager seats queued at most per group (default 5000); 0 is
+    /// no limit there, as the logs it caps take it.
+    pub fn set_kept_seats(&self, n: u32) {
+        let n = if n == 0 { usize::MAX } else { n as usize };
+        self.shared.kept_seats.store(n, Ordering::Relaxed);
     }
 
     pub fn now(&self) -> u64 {
@@ -385,26 +509,7 @@ impl Groups {
 
     /// The live group `id`, its actor started if it was not.
     fn live(&self, id: &str, kind: GroupKind, channel: ChannelId) -> Arc<Handle> {
-        use dashmap::mapref::entry::Entry;
-        let e = match self.shared.map.entry(id.to_string()) {
-            Entry::Occupied(e) => return e.get().clone(),
-            Entry::Vacant(e) => e,
-        };
-        let store = match (id.starts_with("c:"), self.shared.db.get()) {
-            (true, Some(db)) => Store::Db(db.clone()),
-            _ => Store::memory(),
-        };
-        let (h, rx) = Handle::new(id, kind, channel, Arc::new(store));
-        e.insert(h.clone());
-        let mut g = GroupState::new(
-            id.to_string(),
-            kind,
-            h.store.stored(),
-            self.shared.caps.clone(),
-        );
-        g.new_gen = self.moved_back.remove(id).is_some();
-        tokio::spawn(actor(self.shared.clone(), h.clone(), rx, g));
-        h
+        start(&self.shared, id, kind, channel)
     }
 
     /// Queues `msg` for group `id`'s actor; `false` when its inbox is full (`RATE`).
@@ -472,8 +577,25 @@ impl Groups {
             .insert(group.to_string());
         self.post(group, Msg::Follow { sid, account }, 0, true);
         if let Some(v) = self.vols.get(&sid).map(|v| v.clone()) {
-            self.post(group, Msg::Volunteer { sid, v: Some(v) }, 0, true);
+            let device = self.shared.devices.get(&sid).map(|d| d.clone());
+            let msg = Msg::Volunteer {
+                sid,
+                v: Some(v),
+                device,
+            };
+            self.post(group, msg, 0, true);
         }
+    }
+
+    /// Whether the channel's gate is on, as `on_gate` last told.
+    pub fn gated(&self, channel: ChannelId) -> bool {
+        self.shared.gated.contains(&channel)
+    }
+
+    /// The device a session signed in with (a device-key sign-in): the keyholder entries it
+    /// makes are that device's, so removing the device from its account removes them.
+    pub fn set_device(&self, sid: UserId, device: Vec<u8>) {
+        self.shared.devices.insert(sid, device);
     }
 
     fn leave_channel(&self, channel: ChannelId, sid: UserId, cause: u8) {
@@ -498,6 +620,7 @@ impl Groups {
     /// The connection ended: it leaves every group, its volunteering ends.
     pub fn on_session_end(&self, sid: UserId) {
         self.vols.remove(&sid);
+        self.shared.devices.remove(&sid);
         if let Some((_, groups)) = self.follows.remove(&sid) {
             for id in groups {
                 self.post(
@@ -517,8 +640,14 @@ impl Groups {
         self.shared.lane.remove(&sid);
     }
 
-    /// The channel's gate turned on or off.
+    /// The channel's gate turned on or off (or went with its channel): kept for the group's
+    /// next start, and told to the live one.
     pub fn on_gate(&self, channel: ChannelId, gated: bool) {
+        if gated {
+            self.shared.gated.insert(channel);
+        } else {
+            self.shared.gated.remove(&channel);
+        }
         if let Some(id) = self.by_channel.get(&channel).map(|g| g.clone()) {
             self.post(&id, Msg::Gate { gated }, 0, true);
         }
@@ -535,8 +664,17 @@ impl Groups {
             f.remove(old);
         }
         if new.starts_with("c:") {
-            self.moved_back.insert(new.to_string());
+            self.shared.moved_back.insert(new.to_string());
         }
+    }
+
+    /// The channel is deleted: its group stops as a moved one does, and the channel names
+    /// it no more and keeps no gate, so a hook that starts the group again (its rows outlive
+    /// the channel) takes no channel that is gone.
+    pub fn on_channel_gone(&self, channel: ChannelId, id: &str) {
+        self.on_group_moved(channel, id, id);
+        self.by_channel.remove(&channel);
+        self.shared.gated.remove(&channel);
     }
 
     /// A conversation is purged: its group stops (K2 deletes its rows in batches).
@@ -552,10 +690,16 @@ impl Groups {
     }
 
     // ── Hooks (K2: the accounts paths) ───────────────────────────────────
+    //
+    // With the switch off each returns at once: the database is attached for kept reads
+    // alone (1h), so no group starts and no gk table is written.
 
     /// An account that keeps a channel's history is seated eagerly in its stored group
     /// (plan 2d), with its published seat keys. `ik`: its identity key, raw.
     pub async fn on_log_join(&self, conv: &str, account: [u8; 16], ik: [u8; 32]) {
+        if !self.on {
+            return;
+        }
         let id = stored_id(conv);
         let Some(joiner) = self.account_joiner(account, ik).await else {
             return;
@@ -567,18 +711,35 @@ impl Groups {
 
     /// Every seat of `account` in a stored conversation's group exits.
     pub fn on_log_leave(&self, conv: &str, account: [u8; 16], cause: u8) {
+        if !self.on {
+            return;
+        }
         let id = stored_id(conv);
         let channel = self.channel_of(&id);
         let _ = self.live(&id, GroupKind::Text, channel);
         self.post(&id, Msg::AccountExit { account, cause }, 0, true);
     }
 
-    /// An identity reset or account deletion: its seats exit everywhere, online or not.
+    /// A ban, identity reset or account deletion: its seats exit everywhere, online or not,
+    /// and its keyholder entries go (each group it sits in or holds keys of).
     pub async fn on_account_gone(&self, account: [u8; 16], cause: u8) {
+        if !self.on {
+            return;
+        }
+        // Its sessions from before a reset volunteer no more, in no group they follow later
+        // (`GroupState::account_exit`)
+        if cause == group::cause::RESET {
+            self.vols
+                .retain(|_, v| v.m != voipc_crypto::group_key::MemberId::Account(account));
+        }
         let mut ids: HashSet<String> = self.shared.map.iter().map(|h| h.key().clone()).collect();
         if let Some(db) = self.shared.db.get() {
             if let Ok(seats) = crate::accounts::gk::seats_of_account(&db.db, &account).await {
                 ids.extend(seats.into_iter().map(|(grp, _, _)| grp));
+            }
+            let m = voipc_crypto::group_key::MemberId::Account(account).seat_id();
+            if let Ok(rows) = crate::accounts::gk::holders_of(&db.db, &m, None).await {
+                ids.extend(rows.into_iter().map(|(grp, _)| grp));
             }
         }
         for id in ids {
@@ -591,7 +752,7 @@ impl Groups {
     /// A seat-key rotation (`SeatKeysPublish` with a higher `n`): in each group where an
     /// old seat of the account sits, it exits and the new seat is queued eagerly.
     pub async fn on_seat_keys(&self, account: [u8; 16], pair: Pair, ik: [u8; 32]) {
-        let Some(db) = self.shared.db.get() else {
+        let Some(db) = self.shared.db.get().filter(|_| self.on) else {
             return;
         };
         let Ok(seats) = crate::accounts::gk::seats_of_account(&db.db, &account).await else {
@@ -608,9 +769,9 @@ impl Groups {
             returning: false,
         };
         let groups: HashSet<String> = seats
-            .into_iter()
+            .iter()
             .filter(|(_, _, s)| s.seat != seat_record(&new))
-            .map(|(grp, _, _)| grp)
+            .map(|(grp, _, _)| grp.clone())
             .collect();
         // `EpochReseated{n, left}` as each group seats the new seat, `left = 0` at the end
         // (at once with none): the device drops its old seat keys then, not after 7 days
@@ -629,11 +790,18 @@ impl Groups {
             );
             self.shared.reseated(&account, n, groups.len() as u32);
         }
-        for id in groups {
-            let channel = self.channel_of(&id);
-            let _ = self.live(&id, GroupKind::Text, channel);
+        // A live memory group's old seat exits too (plan 2d "Rotation": in each group where
+        // the old seat sits), so no seat sits whose keys no seed welcome can reach
+        for h in self.shared.map.iter() {
+            if h.kind == GroupKind::Text && !h.store.stored() {
+                let _ = h.tx.send((Msg::Rotated { account, keep: new }, 0));
+            }
+        }
+        for id in &groups {
+            let channel = self.channel_of(id);
+            let _ = self.live(id, GroupKind::Text, channel);
             self.post(
-                &id,
+                id,
                 Msg::AccountExit {
                     account,
                     cause: group::cause::ROTATION,
@@ -642,7 +810,7 @@ impl Groups {
                 true,
             );
             self.post(
-                &id,
+                id,
                 Msg::Eager {
                     joiner: joiner.clone(),
                     account,
@@ -650,6 +818,87 @@ impl Groups {
                 0,
                 true,
             );
+        }
+        // Its keyholder entries are measured against this counter from now (removal after
+        // seven days below it, plan 2d): every live group, and each stored one it holds keys of
+        let since = self.now();
+        let mut kh: HashSet<String> = self.shared.map.iter().map(|h| h.key().clone()).collect();
+        let m = voipc_crypto::group_key::MemberId::Account(account).seat_id();
+        if let Ok(rows) = crate::accounts::gk::holders_of(&db.db, &m, None).await {
+            kh.extend(rows.into_iter().map(|(grp, _)| grp));
+        }
+        for id in kh {
+            let channel = self.channel_of(&id);
+            let _ = self.live(&id, store_kind(&id), channel);
+            self.post(&id, Msg::Counter { account, n, since }, 0, true);
+        }
+        // Eager seats in every stored group of its conversations it has no seat in (plan 2d:
+        // an account's first `SeatKeysPublish`), a page of conversations at a time
+        let seated: HashSet<String> = seats.iter().map(|(grp, _, _)| grp.clone()).collect();
+        let mut after: Option<String> = None;
+        loop {
+            let page =
+                match store::member_convs(&db.db, &account, after.as_deref(), EAGER_PAGE).await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!("reading an account's conversations failed: {e}");
+                        break;
+                    }
+                };
+            let n_page = page.len();
+            for conv in page {
+                let id = stored_id(&conv);
+                after = Some(conv);
+                if seated.contains(&id) || groups.contains(&id) {
+                    continue;
+                }
+                let stored = self.get(&id).is_some()
+                    || crate::accounts::gk::group(&db.db, &id)
+                        .await
+                        .is_ok_and(|g| g.is_some());
+                if !stored {
+                    continue;
+                }
+                let channel = self.channel_of(&id);
+                let _ = self.live(&id, GroupKind::Text, channel);
+                self.post(
+                    &id,
+                    Msg::Eager {
+                        joiner: joiner.clone(),
+                        account,
+                    },
+                    0,
+                    true,
+                );
+            }
+            if n_page < EAGER_PAGE as usize {
+                break;
+            }
+        }
+    }
+
+    /// A device removed from `account` (`DeviceForget`): the keyholder entries it made are
+    /// proposed for removal (plan 2d), in every live group and each stored group where the
+    /// database names that device for one.
+    pub async fn on_device_removed(&self, account: [u8; 16], device: &[u8]) {
+        if !self.on {
+            return;
+        }
+        let mut ids: HashSet<String> = self.shared.map.iter().map(|h| h.key().clone()).collect();
+        if let Some(db) = self.shared.db.get() {
+            let m = voipc_crypto::group_key::MemberId::Account(account).seat_id();
+            if let Ok(rows) = crate::accounts::gk::holders_of(&db.db, &m, Some(device)).await {
+                ids.extend(rows.into_iter().map(|(grp, _)| grp));
+            }
+        }
+        for id in ids {
+            let channel = self.channel_of(&id);
+            let _ = self.live(&id, store_kind(&id), channel);
+            let msg = Msg::DeviceRemoved {
+                account,
+                device: device.to_vec(),
+            };
+            self.post(&id, msg, 0, true);
         }
     }
 
@@ -694,22 +943,6 @@ impl Groups {
 
     // ── What other slices read ───────────────────────────────────────────
 
-    /// Whether a kept chain may name `(gen, epoch)` of `group` (C4): the head's generation,
-    /// at or before its epoch. `Err` is a `refused_why` code.
-    pub fn chain_epoch_ref(&self, group: &str, gen: &[u8; 16], epoch: u32) -> Result<(), u8> {
-        if !group.starts_with("c:") {
-            return Err(refused_why::NOT_STORED);
-        }
-        let h = self.get(group).ok_or(refused_why::NOT_MEMBER)?;
-        let view =
-            (*h.head.read().unwrap_or_else(|e| e.into_inner())).ok_or(refused_why::OLD_EPOCH)?;
-        if view.gen == *gen && epoch <= view.epoch && epoch > 0 {
-            Ok(())
-        } else {
-            Err(refused_why::OLD_EPOCH)
-        }
-    }
-
     /// The keyholders that made live rows to `seat` (C4 `RowMakers`).
     pub async fn row_makers(&self, group: &str, gen: &[u8; 16], seat: &SeatRef) -> Vec<RowMaker> {
         let Some(db) = self.shared.db.get() else {
@@ -732,13 +965,77 @@ impl Groups {
             .collect()
     }
 
-    /// One row per live group, for `AdminLoad` (R2 picks which to show, 2j).
+    /// One row per live group, for `AdminLoad` (R2 picks which to show, 2j): `mem_bytes`
+    /// as its actor last counted, `db_bytes` as the last sweep did (stored groups).
     pub fn stats(&self) -> Vec<GroupLoad> {
         self.shared
             .map
             .iter()
-            .map(|h| h.stats.lock().unwrap_or_else(|e| e.into_inner()).clone())
+            .map(|h| {
+                let mut s = h.stats.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                s.db_bytes = self.shared.db_bytes.get(h.key()).map_or(0, |b| *b);
+                s
+            })
             .collect()
+    }
+
+    /// The admin warnings of the live groups (plan 2j): each kind at most once in 10
+    /// minutes, logged at warn when raised, as `(channel, "#<channel id>: <what>")`. R2's
+    /// Load lists them with its warnings and shows the groups they name.
+    pub fn warnings(&self) -> Vec<(ChannelId, String)> {
+        let mut out = vec![];
+        for h in self.shared.map.iter() {
+            let channel = h.stats.lock().unwrap_or_else(|e| e.into_inner()).channel_id;
+            for w in h.warnings.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+                out.push((channel, format!("#{channel}: {w}")));
+            }
+        }
+        out
+    }
+
+    /// One `at` entry's answer for member `m` of stored group `group` (C4, plan 2d), from
+    /// the database: `None` when it is not to be had (an `r:` group, material swept, no seat
+    /// of `m` then). `have`: the member's floor, whose `kh` the keyholder links lead back
+    /// from.
+    pub async fn past_epoch(
+        &self,
+        group: &str,
+        m: voipc_crypto::group_key::MemberId,
+        at: EpochRef,
+        have: Option<&FloorRef>,
+    ) -> Option<voipc_protocol::gk::InPiece> {
+        if !group.starts_with("c:") {
+            return None;
+        }
+        let db = self.shared.db.get()?;
+        let anchor = have.filter(|f| f.gen == at.gen).map(|f| f.kh);
+        match store::past(&db.db, group, m, at, anchor).await {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(group, "reading a past epoch failed: {e}");
+                None
+            }
+        }
+    }
+
+    /// An account's self-rows and history rows (`SelfRowsList`, §3.11), every group,
+    /// generation and seed: at most `limit` (≤ 256) after `after`, the `next` of the page
+    /// before; with the next page's `after` while more remain.
+    pub async fn rows_of(
+        &self,
+        account: [u8; 16],
+        after: Option<&[u8]>,
+        limit: u16,
+    ) -> (Vec<voipc_protocol::gk::SelfRowIn>, Option<Vec<u8>>) {
+        let Some(db) = self.shared.db.get() else {
+            return (vec![], None);
+        };
+        store::rows_of(&db.db, &account, after, limit.min(256))
+            .await
+            .unwrap_or_else(|e| {
+                warn!("reading an account's self-rows failed: {e}");
+                (vec![], None)
+            })
     }
 
     /// Whether a post under `(gen, epoch)` of `group` may go out now (rule 1f.1).
@@ -846,7 +1143,9 @@ fn publish(h: &Handle, g: &GroupState, now: u64) {
         s.joins_waiting = g.joins.queue.len() as u32;
         s.exits_waiting = g.exits.waiting() as u32;
         s.missed_deadlines = g.missed_total;
+        s.mem_bytes = g.mem_bytes() + h.store.mem_bytes();
     }
+    *h.warnings.lock().unwrap_or_else(|e| e.into_inner()) = g.warnings(now);
     *h.head.write().unwrap_or_else(|e| e.into_inner()) = g.head_view();
 }
 
@@ -873,18 +1172,42 @@ fn touch(h: &Handle, g: &GroupState, sid: UserId) {
 }
 
 /// What an answer sent that its connection remembers once it is queued: the `kh` header's
-/// digest, and that it carried the seat's keying.
+/// digest, and that it carried the seat's keying; and what the group learns of the seat:
+/// it was used, and it is behind a running roll with no seed welcome stored.
 struct Sent {
     kh: Option<[u8; 32]>,
     keyed: bool,
+    behind: bool,
+    gen: [u8; 16],
+    /// The seed of the seed welcome it carried.
+    seed: Option<u32>,
 }
 
-fn took(h: &Handle, sid: UserId, s: Sent) {
+fn took(shared: &Shared, h: &Handle, sid: UserId, seat: &SeatRef, s: Sent) {
     if let Some(d) = s.kh {
         h.kh_sent.insert(sid, d);
     }
     if s.keyed {
         h.keyed.insert(sid);
+    }
+    if s.behind {
+        let _ = h.tx.send((Msg::SeedWanted { seat: *seat }, 0));
+    }
+    if let Some(x) = s.seed {
+        h.store.seed_sent(seat, x);
+    }
+    used(shared, h, s.gen, seat);
+}
+
+/// A stored group's seat was used (a fetch answered, a post): its `last_use` moves at the
+/// daily write (plan 2d, at most once a day per seat).
+fn used(shared: &Shared, h: &Handle, gen: [u8; 16], seat: &SeatRef) {
+    if h.store.stored() {
+        shared
+            .used
+            .entry(h.id.clone())
+            .or_default()
+            .insert((gen, seat_record(seat)));
     }
 }
 
@@ -921,11 +1244,29 @@ async fn answer(
         }
         p.seat = snap.keying(seat, base);
     }
+    // The seed welcome under the seed of the row it is keyed by (a connection that never
+    // took it, a seat offline through a roll, §5.6), else a running roll's
     let hd = snap.head.header();
-    if hd.seed_floor < hd.seed {
-        p.seed_welcome = h.store.seed_welcome(&h.id, &gen, seat, hd.seed).await;
+    if let Some(s) = p.seat.as_ref().filter(|k| k.row.is_some()).map(|k| k.s) {
+        p.seed_welcome = h.store.seed_welcome(&h.id, &gen, seat, s).await;
     }
-    (push::epoch_in(&h.id, p), Sent { kh, keyed })
+    let rolls = hd.seed_floor < hd.seed;
+    if rolls && p.seed_welcome.as_ref().is_none_or(|w| w.s != hd.seed) {
+        p.seed_welcome = h
+            .store
+            .seed_welcome(&h.id, &gen, seat, hd.seed)
+            .await
+            .or(p.seed_welcome);
+    }
+    let behind = rolls && p.seed_welcome.as_ref().is_none_or(|w| w.s < hd.seed);
+    let sent = Sent {
+        kh,
+        keyed,
+        behind,
+        gen,
+        seed: p.seed_welcome.as_ref().map(|w| w.s),
+    };
+    (push::epoch_in(&h.id, p), sent)
 }
 
 async fn actor(
@@ -947,6 +1288,8 @@ async fn actor(
     }
     publish_snap(&h, &g);
     publish(&h, &g, now);
+    // The keyholder set and who of it is online, as the database last had them
+    let mut kh_was = holders_now(&g);
     let mut idle_since: Option<u64> = None;
     // The snapshot and the seated map are rebuilt when the head moves; one session's
     // entry when only it changed (a 100k join storm is not 100k rebuilds)
@@ -961,7 +1304,7 @@ async fn actor(
             m = rx.recv() => match m {
                 Some((m, charge)) => {
                     h.inbox.fetch_sub(charge, Ordering::Relaxed);
-                    if let Msg::Commit { sid, bytes, .. } = &m {
+                    if let Msg::Commit { sid, bytes, .. } | Msg::Welcomes { sid, bytes, .. } = &m {
                         shared.lane_free(*sid, *bytes);
                     }
                     Some(m)
@@ -998,10 +1341,27 @@ async fn actor(
         if g.exits.next != exits_from {
             h.store.exits_entered(&h.id, &g, exits_from, now).await;
         }
+        // A seed-welcome page, with the KEM keys of its seats (plan 2d "Seed rolls")
+        if let Some(want) = g.page_wanted(now) {
+            let (keyed, gone) = page_keys(&shared, &g, &want).await;
+            g.ask_page(keyed, gone, now, &mut out);
+        }
+        // The keyholder entries, their pairs and when each was last online outlive a
+        // restart (2i): written when the set or who of it is online changes
+        let kh_now = holders_now(&g);
+        if kh_now != kh_was {
+            h.store.put_holders(&g, now).await;
+            kh_was = kh_now;
+        }
         // Before the dues go out: a keyholder's first part may come back at once
-        h.asked.retain(|s| g.dues.iter().any(|d| d.sid == *s));
+        let page = g.page.as_ref().map(|p| p.sid);
+        h.asked
+            .retain(|s| g.dues.iter().any(|d| d.sid == *s) || page == Some(*s));
         for d in &g.dues {
             h.asked.insert(d.sid);
+        }
+        if let Some(s) = page {
+            h.asked.insert(s);
         }
         let head = g.head.as_ref().map(|x| x.sh.d());
         if head != was || all {
@@ -1027,6 +1387,76 @@ async fn actor(
 }
 
 type Answer = (UserId, SeatRef, Option<FloorRef>, bool);
+
+/// The keyholder set and its online entries, by KX.
+fn holders_now(g: &GroupState) -> (Vec<[u8; 32]>, Vec<[u8; 32]>) {
+    (
+        g.holders.set.iter().map(|k| k.kx).collect(),
+        g.holders
+            .online(&g.vols)
+            .iter()
+            .map(|v| v.pair.kx())
+            .collect(),
+    )
+}
+
+/// A page's seats with their identity keys and pairs, and the seats no seed welcome can
+/// reach.
+type PageKeys = (Vec<(SeatRef, [u8; 32], Pair)>, Vec<(SeatRef, u8)>);
+
+/// The identity keys and pairs of `seats` a seed-welcome page asks: an account seat's from
+/// its published seat keys (`voipc_gk_seatkeys`), a connection seat's from its join. A seat
+/// whose keys are not found, or make another seat (rotated since), is gone (cause
+/// `ROTATION`): it can never take this seed, so it exits and the roll can end (plan 2d).
+/// When the database read fails nobody is gone: the account seats wait for the next page.
+async fn page_keys(shared: &Shared, g: &GroupState, seats: &[SeatRef]) -> PageKeys {
+    let accounts: Vec<[u8; 16]> = seats.iter().filter_map(|s| s.m.account()).collect();
+    let mut read = true;
+    let found = match shared.db.get() {
+        Some(db) if !accounts.is_empty() => match store::seat_kems(&db.db, &accounts).await {
+            Ok(f) => f,
+            Err(e) => {
+                warn!(group = %g.id, "reading seat keys failed: {e}");
+                read = false;
+                HashMap::new()
+            }
+        },
+        _ => HashMap::new(),
+    };
+    let (mut keyed, mut gone) = (vec![], vec![]);
+    for s in seats {
+        let keys = match s.m.account() {
+            Some(_) if !read => continue,
+            Some(a) => found.get(&a),
+            None => g.conn_keys.get(s),
+        };
+        match keys.filter(|(_, pair)| pair.keys.seat(s.m) == *s) {
+            Some((ik, pair)) => keyed.push((*s, *ik, pair.clone())),
+            None => gone.push((*s, group::cause::ROTATION)),
+        }
+    }
+    (keyed, gone)
+}
+
+/// Whether `seat`'s keying is gone for a new connection: a memory group keeps a welcome
+/// only until it went out, rows only of re-keyed versions, and a seed welcome only until it
+/// went out (2b), so a seat seated by a welcome another connection took has no base, and
+/// one keyed by a row has no `s_m` to open it without its seed's welcome (no self-rows).
+async fn lost(h: &Handle, seat: &SeatRef) -> bool {
+    if h.store.stored() {
+        return false;
+    }
+    let snap = h.snap.read().unwrap_or_else(|e| e.into_inner()).clone();
+    let Some((snap, at)) = snap.and_then(|s| s.base_of(seat).map(|at| (s, at))) else {
+        return false;
+    };
+    let gen = snap.gen();
+    match h.store.base(&h.id, &gen, seat, at).await {
+        None => true,
+        Some((_, _, true, _)) => false,
+        Some((s, _, false, _)) => h.store.seed_welcome(&h.id, &gen, seat, s).await.is_none(),
+    }
+}
 
 /// The answers a taken commit owes (`apply`'s list), each from the floor its session's
 /// queued fetch named, as a seated fetch's is (2d "walk+head since `have`"): one built from
@@ -1059,7 +1489,7 @@ async fn answer_all(shared: &Shared, h: &Handle, answers: Vec<Answer>) {
         let (frames, s) = answer(h, &snap, sid, &seat, have.as_ref(), own_join).await;
         let whole = deliver(shared, h, vec![Out(sid, frames)]);
         if whole {
-            took(h, sid, s);
+            took(shared, h, sid, &seat, s);
         }
         *sent.entry(seat).or_insert(true) &= whole;
     }
@@ -1075,28 +1505,33 @@ const EAGER_PAGE: u32 = 256;
 
 /// After a stored group's Genesis or Regenesis: every account that keeps its conversation's
 /// log with published seat keys is queued eagerly, online or not (plan 2d "Eager seats"),
-/// since they never send `LogJoin` again.
-async fn eager_all(h: &Handle, g: &mut GroupState, now: u64, out: &mut Vec<Out>) {
-    // The group id is its conversation's (`stored_id`), as `voipc_members` names it
-    let conv = h.id.as_str();
-    let mut after: Option<[u8; 16]> = None;
-    loop {
-        let page = match h.store.eager_seats(conv, after.as_ref(), EAGER_PAGE).await {
-            Ok(p) => p,
-            Err(e) => {
-                warn!(group = %h.id, "reading the eager seats failed: {e}");
+/// since they never send `LogJoin` again. Read a page at a time off the actor, at most
+/// `kept_seats`, each page queued to it.
+fn eager_all(h: &Handle, kept_seats: usize) {
+    let Store::Db(db) = &*h.store else {
+        return;
+    };
+    let (db, tx, conv) = (db.clone(), h.tx.clone(), h.id.clone());
+    tokio::spawn(async move {
+        let mut after: Option<[u8; 16]> = None;
+        let mut queued = 0;
+        while queued < kept_seats {
+            // The group id is its conversation's (`stored_id`), as `voipc_members` names it
+            let page = match store::eager_page(&db.db, &conv, after.as_ref(), EAGER_PAGE).await {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(group = %conv, "reading the eager seats failed: {e}");
+                    return;
+                }
+            };
+            let full = page.len() == EAGER_PAGE as usize;
+            queued += page.len();
+            after = page.last().map(|(a, _)| *a);
+            if page.is_empty() || tx.send((Msg::EagerMany(page), 0)).is_err() || !full {
                 return;
             }
-        };
-        let n = page.len();
-        for (account, joiner) in page {
-            after = Some(account);
-            g.eager(joiner, account, now, out);
         }
-        if n < EAGER_PAGE as usize {
-            return;
-        }
-    }
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1124,11 +1559,21 @@ async fn handle_msg(
                 shared.reseat_done(&h.id, &seat);
             }
         }
-        Msg::Volunteer { sid, v } => g.volunteer(sid, v, now, out),
+        Msg::Volunteer { sid, v, device } => {
+            if let Some(d) = device {
+                g.devices.insert(sid, d);
+            }
+            g.volunteer(sid, v, now, out)
+        }
         Msg::Fetch { sid, f } => {
             let have = f.have;
+            let again = f.clone();
             if let Fetched::Seated(seat) = g.fetch(sid, f, now, out) {
-                answers.push((sid, seat, have, false));
+                if !h.keyed.contains(&sid) && lost(h, &seat).await {
+                    g.rejoin(sid, again, now, out);
+                } else {
+                    answers.push((sid, seat, have, false));
+                }
             }
         }
         Msg::Commit {
@@ -1162,7 +1607,7 @@ async fn handle_msg(
                         shared.reseat_done(&h.id, s);
                     }
                     if anew && g.stored {
-                        eager_all(h, g, now, out).await;
+                        eager_all(h, g.kept_seats);
                     }
                 }
                 Err(Fail::Check(d)) => {
@@ -1225,6 +1670,146 @@ async fn handle_msg(
         } => g.names(sid, &from, &to, removals, out),
         Msg::FloorAhead { sid, header } => g.floor_ahead(sid, &header, now, out),
         Msg::Gate { gated } => g.set_gate(gated, now, out),
+        Msg::Welcomes {
+            sid,
+            due,
+            gen,
+            seed,
+            welcomes,
+            ..
+        } => {
+            let Some((by, took)) = g.take_welcomes(sid, due, gen, seed, welcomes, out) else {
+                return;
+            };
+            if let Err(e) = h.store.seeds(&h.id, &gen, seed, &by, &took, now).await {
+                warn!(group = %h.id, "storing seed welcomes failed: {e}");
+                return;
+            }
+            let mut pushed = vec![];
+            g.seeded(by, seed, &took, now, &mut pushed);
+            if h.store.stored() {
+                out.extend(pushed);
+                return;
+            }
+            // A memory group pushes them and keeps one only for a seat a push missed (an
+            // account seat offline, a full queue): 2b, so 100k seats keep no 110 MB
+            let mut whole: HashMap<SeatRef, bool> = HashMap::new();
+            for o in pushed {
+                let seat = g.members.get(&o.0).and_then(|m| m.seat);
+                let ok = deliver(shared, h, vec![o]);
+                if let Some(seat) = seat {
+                    *whole.entry(seat).or_insert(true) &= ok;
+                }
+            }
+            for (seat, ok) in whole {
+                if ok {
+                    h.store.seed_sent(&seat, seed);
+                }
+            }
+        }
+        Msg::SeedWanted { seat } => g.seed_wanted(seat),
+        Msg::Counter { account, n, since } => g.counter(account, n, since, now, out),
+        Msg::DeviceRemoved { account, device } => g.device_removed(&account, &device, now, out),
+        Msg::EagerMany(page) => {
+            for (account, joiner) in page {
+                g.eager(joiner, account, now, out);
+            }
+        }
+        Msg::Sweep { daily } => h.store.sweep_live(g, now, daily).await,
+        Msg::Expire(seats) => g.expire(&seats, now, out),
+        Msg::Rotated { account, keep } => g.rotated(&account, &keep, now, out),
+    }
+}
+
+// ── Sweeps (plan 2e) ──────────────────────────────────────────────────────
+
+const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// The relay's sweeps, while its groups live: every 10 minutes, then daily too (`sweep`).
+async fn sweeper(shared: std::sync::Weak<Shared>) {
+    let mut tick = tokio::time::interval(Duration::from_millis(MATERIAL_SWEEP_MS));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The first tick is at once: each actor sweeps its orphans as it starts
+    tick.tick().await;
+    let mut daily_at = 0;
+    loop {
+        tick.tick().await;
+        let Some(shared) = shared.upgrade() else {
+            return;
+        };
+        let now = shared.clock.now();
+        let daily = now >= daily_at;
+        if daily {
+            daily_at = now + DAY_MS;
+        }
+        sweep(&shared, now, daily).await;
+    }
+}
+
+/// Every 10 minutes: each live group's orphans (its actor, between commits) and each
+/// stored group's epoch material, headers, keyrings and stale rows (`store::sweep_material`,
+/// which spares a pending commit's), and its bytes for Load. Daily also: the `last_use` of
+/// every seat used since (at most once a day per seat), names past 90 days (each live
+/// group's actor), and seats unused for 90 days exit (their group's actor is started).
+async fn sweep(shared: &Arc<Shared>, now: u64, daily: bool) {
+    for h in shared.map.iter() {
+        let _ = h.tx.send((Msg::Sweep { daily }, 0));
+    }
+    let Some(db) = shared.db.get() else {
+        return;
+    };
+    if daily {
+        let ids: Vec<String> = shared.used.iter().map(|e| e.key().clone()).collect();
+        for id in ids {
+            let Some((_, set)) = shared.used.remove(&id) else {
+                continue;
+            };
+            let mut by_gen: HashMap<[u8; 16], Vec<[u8; 33]>> = HashMap::new();
+            for (gen, rec) in set {
+                by_gen.entry(gen).or_default().push(rec);
+            }
+            for (gen, recs) in by_gen {
+                if let Err(e) =
+                    crate::accounts::gk::touch_seats(&db.db, &id, &gen, &recs, now).await
+                {
+                    warn!(group = %id, "writing seats' last use failed: {e}");
+                }
+            }
+        }
+    }
+    let grps = match crate::accounts::gk::groups(&db.db).await {
+        Ok(g) => g,
+        Err(e) => {
+            warn!("listing the stored groups failed: {e}");
+            return;
+        }
+    };
+    for grp in grps {
+        if let Err(e) = store::sweep_material(&db.db, &grp, now).await {
+            warn!(group = %grp, "sweeping epoch material failed: {e}");
+        }
+        if let Ok(n) = crate::accounts::gk::stored_bytes(&db.db, &grp).await {
+            shared.db_bytes.insert(grp.clone(), n);
+        }
+        if daily {
+            let before = now.saturating_sub(SEAT_EXPIRY_SECS * 1000);
+            match store::expired(&db.db, &grp, before).await {
+                Ok(seats) if !seats.is_empty() => {
+                    let h = start(shared, &grp, GroupKind::Text, 0);
+                    let _ = h.tx.send((Msg::Expire(seats), 0));
+                }
+                Ok(_) => {}
+                Err(e) => warn!(group = %grp, "reading expired seats failed: {e}"),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+impl Groups {
+    /// One sweep now, as the timer runs it.
+    pub async fn sweep_for_test(&self, daily: bool) {
+        sweep(&self.shared, self.now(), daily).await;
     }
 }
 
@@ -1232,6 +1817,16 @@ async fn handle_msg(
 impl Handle {
     pub fn inbox_full_for_test(&self) {
         self.inbox.store(INBOX_MAX_BYTES, Ordering::Relaxed);
+    }
+
+    /// Seed welcomes a memory group keeps.
+    pub fn seed_kept_for_test(&self) -> usize {
+        self.store.seed_kept()
+    }
+
+    /// Whether a new connection of `seat` finds its keying gone (`lost`).
+    pub async fn lost_for_test(&self, seat: &SeatRef) -> bool {
+        lost(self, seat).await
     }
 }
 
@@ -1244,6 +1839,11 @@ impl Groups {
 
     pub fn lane_for_test(&self, sid: UserId) -> usize {
         self.shared.lane.get(&sid).map_or(0, |q| *q)
+    }
+
+    /// Whether `sid`'s offer is kept, for the groups it follows later.
+    pub fn volunteers_for_test(&self, sid: UserId) -> bool {
+        self.vols.contains_key(&sid)
     }
 
     /// The answers the actor sends after `g` took a commit (`apply`'s list), from a group
@@ -1292,6 +1892,14 @@ impl Groups {
     pub fn reseat_done_for_test(&self, id: &str, seat: &SeatRef) {
         self.shared.reseat_done(id, seat);
     }
+
+    /// A live group of `channel` whose actor raised `text` (plan 2j), with no actor behind it.
+    pub fn warn_for_test(&self, channel: ChannelId, text: &str) {
+        let id = format!("r:{}:{channel}", hex(&self.run));
+        let (h, _inbox) = Handle::new(&id, GroupKind::Text, channel, Arc::new(Store::memory()));
+        h.warnings.lock().unwrap().push(text.into());
+        self.shared.map.insert(id, h);
+    }
 }
 
 /// The session's answer from the snapshot, outside the actor, queued whole (part 13);
@@ -1318,7 +1926,7 @@ async fn answer_seated(shared: &Shared, h: &Handle, sid: UserId, have: Option<&F
         match deliver_from(shared, h, &snap, Out(sid, frames)) {
             Some(whole) => {
                 if whole {
-                    took(h, sid, s);
+                    took(shared, h, sid, &seat, s);
                 }
                 return true;
             }
@@ -1326,17 +1934,6 @@ async fn answer_seated(shared: &Shared, h: &Handle, sid: UserId, have: Option<&F
         }
     }
     false
-}
-
-/// A fetch with `at` (kept history, C4) is not answered here yet. `EpochRefused{FETCH,
-/// NOT_STORED}` is only ever this answer to `at`: C3b leaves a member's live state alone on
-/// it (member.rs `on_refused`), and its live fetch is still answered.
-fn past_refused(groups: &Groups, sid: UserId, group: &str, at: &[EpochRef]) -> bool {
-    if at.is_empty() {
-        return false;
-    }
-    groups.refuse(sid, group, refused_what::FETCH, refused_why::NOT_STORED);
-    true
 }
 
 /// `EpochStale` for a commit part the lane does not take: `NOT_DUE` from a session with no

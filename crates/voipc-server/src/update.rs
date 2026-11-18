@@ -163,11 +163,7 @@ pub fn after_restart() {
         }
         Marker::Failed(v) => match roll_back(&paths, &v) {
             Ok(()) => {
-                error!(
-                    "update: {v} did not start; back to the previous binary. If it had migrated the accounts database already, \
-                     the previous one refuses it: restore {} (OPERATING.md §14)",
-                    paths.backup(&v).display()
-                );
+                error!("{}", rolled_back(&v, &paths.backup(&v)));
                 exec(&paths.exe);
             }
             Err(e) => error!(
@@ -175,6 +171,17 @@ pub fn after_restart() {
             ),
         },
     }
+}
+
+/// What a roll-back says, the binary it goes back to unknown: one older than the group key
+/// has no `db new-incarnation`, and needs none (its backup holds no group key tables).
+fn rolled_back(version: &str, backup: &Path) -> String {
+    format!(
+        "update: {version} did not start; back to the previous binary. If it had migrated the accounts database already, \
+         the previous one refuses it: restore {}, and if the previous version knows `voipc-server db new-incarnation`, \
+         run that before starting (OPERATING.md §14)",
+        backup.display()
+    )
 }
 
 fn roll_back(paths: &Paths, version: &str) -> Result<()> {
@@ -670,5 +677,18 @@ mod tests {
         fake("voipc-server 1.6.0");
         assert!(preflight(&paths.download, "1.6.1").await.is_err());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_roll_back_names_new_incarnation_only_for_a_previous_binary_that_knows_it() {
+        let said = rolled_back(
+            "1.16.0",
+            Path::new("/srv/voipc-server.accounts-before-1.16.0.db"),
+        );
+        assert!(said.contains("restore /srv/voipc-server.accounts-before-1.16.0.db"));
+        // The previous binary may be older than the group key, which has no such command
+        assert!(said.contains(
+            "if the previous version knows `voipc-server db new-incarnation`, run that before starting"
+        ));
     }
 }

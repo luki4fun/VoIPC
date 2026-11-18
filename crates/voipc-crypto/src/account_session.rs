@@ -20,7 +20,7 @@ use crate::account::{
     PinCheck, SignedIn, Vault,
 };
 use crate::group_key::{Floor, NamesFloor, SeatKeys};
-use crate::group_state::{GkPins, VaultFloor};
+use crate::group_state::{GkEpoch, GkPins, VaultFloor};
 use crate::sync::{AccountSync, Event, FloorPair, KeptGkFloors, KeptPins, LogMemory, Prefs};
 
 /// A device the relay remembers now: what signs this account in there next
@@ -52,6 +52,10 @@ pub struct Actions {
     pub seat_keys: Option<SeatKeys>,
     /// The group key's vault floors moved: `gk_floors_moved`, then `GroupKeying::floors_in`.
     pub gk_floors: bool,
+    /// Past epochs kept history needs (C4): for each, `GroupKeying::past_epoch`, then
+    /// `gk_past_in` or `gk_past_none` (an asked one when `GkOut::past_ready` names it), and
+    /// `GroupKeying::past_asks` sent.
+    pub gk_past: Vec<(String, [u8; 16], u32)>,
 }
 
 impl Actions {
@@ -69,6 +73,7 @@ impl Actions {
         self.memory_named |= other.memory_named;
         self.seat_keys = other.seat_keys.or(self.seat_keys.take());
         self.gk_floors |= other.gk_floors;
+        self.gk_past.extend(other.gk_past);
     }
 }
 
@@ -1090,6 +1095,21 @@ impl AccountSession {
             a.seat_keys = Some(keys);
         }
         a.gk_floors |= self.sync.take_gk_news();
+        a.gk_past.extend(self.sync.take_gk_past());
+    }
+
+    /// A past epoch's key `GroupKeying::past_epoch` gave (`Actions::gk_past`): what kept
+    /// history sealed under it opens.
+    pub fn gk_past_in(&mut self, ep: &GkEpoch) -> Actions {
+        let (send, events) = self.sync.gk_past_in(ep);
+        let mut a = Actions::sending(send);
+        self.events(events, &mut a);
+        a
+    }
+
+    /// A past epoch `GroupKeying::past_epoch` cannot give (`PastEpoch::Unknown`).
+    pub fn gk_past_none(&mut self, group: &str, gen: [u8; 16], epoch: u32) -> Actions {
+        Actions::sending(self.sync.gk_past_none(group, gen, epoch))
     }
 
     /// Told by user id where they are here, else by name: they may be away,
@@ -1248,6 +1268,22 @@ impl AccountSession {
             return Actions::default();
         }
         Actions::sending(self.sync.send_channel(log, envelope, sent_at, ttl_secs))
+    }
+
+    /// A post the group key let out in a channel with log `log` (`GkOut::released`), under
+    /// the epoch it went under: its kept copy goes on a gk chain of that epoch (C4).
+    pub fn outgoing_channel_gk(
+        &mut self,
+        log: &str,
+        envelope: Vec<u8>,
+        sent_at: u64,
+        ttl_secs: Option<u32>,
+        ep: GkEpoch,
+    ) -> Actions {
+        Actions::sending(
+            self.sync
+                .send_channel_gk(log, envelope, sent_at, ttl_secs, ep),
+        )
     }
 
     /// In a channel with log `conv`: keep it, and read what it kept.
@@ -3117,10 +3153,15 @@ mod tests {
             version: 2,
         });
         assert_eq!(a.seat_keys.as_ref().map(|k| k.n), Some(2));
+        assert_eq!(sends(&a, "SelfRowsList"), 1, "the kept rows go again");
         // Mid-rotation a password change waits for the old keys to go, then rotates
         let a = s.on_reply(&AccountReply::PasswordChanged);
         assert_eq!(sends(&a, "VaultPut"), 0);
         s.gk_reseated(2, 0);
+        s.on_reply(&AccountReply::SelfRows {
+            rows: Vec::new(),
+            next: None,
+        });
         assert_eq!(sends(&s.tick(), "VaultPut"), 1, "the old keys dropped");
         let a = s.on_reply(&AccountReply::VaultStored {
             k: item.into(),

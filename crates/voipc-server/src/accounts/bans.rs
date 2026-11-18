@@ -5,9 +5,11 @@ use l4f_accounts::store::Store;
 
 use super::Relay;
 use crate::bans::{Ban, Key};
+use crate::gk::group::cause::BAN;
 
 /// Out of every channel's log, or the writers go on wrapping each new key to them. A
-/// direct conversation is not in these and stays.
+/// direct conversation is not in these and stays. Their seats in every group exit too
+/// (`Relay::gk_account_gone`), online or not.
 const OUT_OF_LOGS: [&str; 2] = [
     "DELETE FROM voipc_members WHERE account = $1",
     "DELETE FROM voipc_pending WHERE owner = $1 OR recipient = $1",
@@ -69,6 +71,9 @@ impl Relay {
             tx.commit().await?;
             id
         });
+        if let Key::Account(a) = key {
+            self.gk_account_gone(a, BAN).await;
+        }
         Ok(id as u64)
     }
 
@@ -82,6 +87,7 @@ impl Relay {
             }
             tx.commit().await?;
         });
+        self.gk_account_gone(account, BAN).await;
         Ok(())
     }
 

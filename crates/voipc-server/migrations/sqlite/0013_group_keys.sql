@@ -204,7 +204,8 @@ CREATE TABLE IF NOT EXISTS voipc_gk_exits (
   at BIGINT NOT NULL,
   PRIMARY KEY (grp, seq)
 ) WITHOUT ROWID;
--- A keyholder entry, by its KX: what outlives a restart. `missed`: postcard.
+-- A keyholder entry, by its KX: what outlives a restart. `missed`: postcard misses; `pair`: its
+-- endorsed pair (postcard), for `KRK` welcomes to it while it is offline.
 CREATE TABLE IF NOT EXISTS voipc_gk_holders (
   grp VARCHAR(140) NOT NULL,
   kx BLOB NOT NULL,
@@ -213,6 +214,7 @@ CREATE TABLE IF NOT EXISTS voipc_gk_holders (
   rank SMALLINT NOT NULL,
   last_online BIGINT NOT NULL,
   missed BLOB NOT NULL,
+  pair BLOB NULL,
   PRIMARY KEY (grp, kx)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS voipc_gk_holders_m ON voipc_gk_holders (m, device);

@@ -11,12 +11,12 @@
 //! `b`, `v` and commit ids are random u64, bound as i64 by their bits and compared for equality
 //! only, never ordered in SQL. Epochs, joins, seeds, exit `seq` and times are counters, refused
 //! past i64. Exit `seq` counts from 1, so `exits_upto` 0 is none.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use anyhow::{anyhow, bail, Result};
 use l4f_accounts::store::Store;
 use serde::{Deserialize, Serialize};
-use voipc_crypto::group_key::{GroupKind, Kind, Pool, SeedRolls};
+use voipc_crypto::group_key::{seat_record, GroupKind, Kind, MemberId, Pool, SeatRef, SeedRolls};
+use voipc_protocol::gk::SelfRowIn;
 
 use super::log::now_ms;
 
@@ -195,6 +195,8 @@ pub struct Holder {
     pub rank: u8,
     pub last_online: u64,
     pub missed: Misses,
+    /// Its endorsed pair: `KRK` welcomes go to it while it is offline (2i).
+    pub pair: Option<voipc_protocol::gk::EndorsedPair>,
 }
 
 /// A gated group's names: `kind` 0 an `added` list, 1 a header carrying `removed`, 2 the step
@@ -440,6 +442,7 @@ pub async fn gk_incarnation(store: &Store) -> Result<Option<[u8; 16]>> {
 }
 
 /// The switch at the last start.
+#[cfg(test)]
 pub async fn gk_switch(store: &Store) -> Result<Option<bool>> {
     Ok(meta(store, "gk_switch").await?.map(|v| v == [1]))
 }
@@ -1420,6 +1423,7 @@ pub async fn opening(store: &Store, grp: &str, gen: &Gen, epoch: u32) -> Result<
     row.map(header_of).transpose()
 }
 
+#[cfg(test)]
 pub async fn set_keep(store: &Store, grp: &str, d: &Digest, keep: u32) -> Result<bool> {
     Ok(db!(store, pool => {
         sqlx::query("UPDATE voipc_gk_headers SET keep = $1 WHERE grp = $2 AND d = $3")
@@ -1434,6 +1438,7 @@ pub async fn set_keep(store: &Store, grp: &str, d: &Digest, keep: u32) -> Result
 }
 
 /// Headers with no reason left to stay; the count taken.
+#[cfg(test)]
 pub async fn sweep_headers(store: &Store, grp: &str) -> Result<u64> {
     Ok(in_batches!(
         store,
@@ -1475,6 +1480,7 @@ pub async fn seats(store: &Store, grp: &str, gen: &Gen) -> Result<Vec<Seat>> {
     rows.into_iter().map(seat_of).collect()
 }
 
+#[cfg(test)]
 pub async fn seat(store: &Store, grp: &str, gen: &Gen, seat: &SeatRec) -> Result<Option<Seat>> {
     let row: Option<SeatTuple> = db!(store, pool => {
         sqlx::query_as(
@@ -1525,6 +1531,32 @@ pub async fn seats_of_account(
             Ok((grp, fixed(gen, "gen")?, s))
         })
         .collect()
+}
+
+/// The accounts seated in stored group `grp` now: by a seat in its log or by a live follow
+/// alone, which no `voipc_members` row names (plan 2d: a gate or a new password takes both).
+pub async fn seated_accounts(store: &Store, grp: &str) -> Result<Vec<[u8; 16]>> {
+    let rows: Vec<Vec<u8>> = db!(store, pool => {
+        sqlx::query_scalar(
+            "SELECT DISTINCT account FROM voipc_gk_seats s
+             WHERE grp = $1 AND account IS NOT NULL AND b IS NOT NULL AND EXISTS (SELECT 1 FROM voipc_gk_lists l
+               WHERE l.grp = s.grp AND l.gen = s.gen AND l.b = s.b AND l.current)",
+        )
+        .bind(grp)
+        .fetch_all(pool)
+        .await?
+    });
+    rows.into_iter().map(|a| fixed(a, "account")).collect()
+}
+
+/// How many seats an account holds in any stored group, of any generation.
+pub async fn seats_of(store: &Store, account: &[u8; 16]) -> Result<i64> {
+    Ok(db!(store, pool => {
+        sqlx::query_scalar("SELECT CAST(COUNT(*) AS BIGINT) FROM voipc_gk_seats WHERE account = $1")
+            .bind(&account[..])
+            .fetch_one(pool)
+            .await?
+    }))
 }
 
 /// A seat's last use, written by the caller at most once a day per seat.
@@ -1617,6 +1649,7 @@ pub async fn list(store: &Store, grp: &str, gen: &Gen, b: u64, v: u64) -> Result
 /// `lists_at`: the current lists (`voipc_gk_lists_current`), then those that ended after the
 /// epoch (`voipc_gk_lists_until`), each found by key in its index first, never every list the
 /// generation kept. A pending list is neither current nor ended.
+#[cfg(test)]
 const LISTS_AT: &str =
     "SELECT b, v, pool, via, base_v, epoch_made, epoch_until, seats, digest, current
      FROM voipc_gk_lists WHERE (grp, gen, b, v) IN
@@ -1629,6 +1662,7 @@ const LISTS_AT: &str =
         AND epoch_until IS NOT NULL AND epoch_until > $3 AND epoch_made <= $3)";
 
 /// The lists that were current at some point of `epoch`.
+#[cfg(test)]
 pub async fn lists_at(store: &Store, grp: &str, gen: &Gen, epoch: u32) -> Result<Vec<List>> {
     let rows: Vec<ListTuple> = db!(store, pool => {
         sqlx::query_as(LISTS_AT)
@@ -1891,6 +1925,7 @@ pub async fn krk(
     row.map(krk_of).transpose()
 }
 
+#[cfg(test)]
 pub async fn krks(store: &Store, grp: &str, gen: &Gen, epoch: u32) -> Result<Vec<Krk>> {
     let rows: Vec<KrkTuple> = db!(store, pool => {
         sqlx::query_as(
@@ -1904,64 +1939,6 @@ pub async fn krks(store: &Store, grp: &str, gen: &Gen, epoch: u32) -> Result<Vec
         .await?
     });
     rows.into_iter().map(krk_of).collect()
-}
-
-/// The keyrings and KRK welcomes of other generations and of epochs before `epoch`: readers
-/// never need them. A pending commit's are spared (a new generation's Genesis, stored over the
-/// old head). The count taken.
-pub async fn sweep_keyrings(store: &Store, grp: &str, gen: &Gen, epoch: u32) -> Result<u64> {
-    let (gen, epoch) = (gen.to_vec(), i64::from(epoch));
-    let a = in_batches!(
-        store,
-        "DELETE FROM voipc_gk_keyring WHERE (grp, gen, epoch, j) IN
-         (SELECT grp, gen, epoch, j FROM voipc_gk_keyring k WHERE grp = $1 AND (gen <> $2 OR epoch < $3)
-          AND NOT EXISTS (SELECT 1 FROM voipc_gk_pending p WHERE p.grp = k.grp AND p.commit_id = k.commit_id) LIMIT $4)",
-        grp,
-        gen.as_slice(),
-        epoch
-    );
-    let b = in_batches!(
-        store,
-        "DELETE FROM voipc_gk_krk WHERE (grp, gen, epoch, holder) IN
-         (SELECT grp, gen, epoch, holder FROM voipc_gk_krk k WHERE grp = $1 AND (gen <> $2 OR epoch < $3)
-          AND NOT EXISTS (SELECT 1 FROM voipc_gk_pending p WHERE p.grp = k.grp AND p.commit_id = k.commit_id) LIMIT $4)",
-        grp,
-        gen.as_slice(),
-        epoch
-    );
-    Ok(a + b)
-}
-
-/// Seats no read returns any more (of other generations, or of this one in a bucket with no
-/// current version), and other generations' version ids and exits. A pending commit's seats and
-/// version ids are spared. The count taken.
-pub async fn sweep_stale(store: &Store, grp: &str, gen: &Gen) -> Result<u64> {
-    let gen = gen.to_vec();
-    let a = in_batches!(
-        store,
-        "DELETE FROM voipc_gk_seats WHERE (grp, gen, seat) IN
-         (SELECT s.grp, s.gen, s.seat FROM voipc_gk_seats s WHERE s.grp = $1 AND s.next_commit IS NULL
-          AND (s.gen <> $2 OR NOT EXISTS (SELECT 1 FROM voipc_gk_lists l
-            WHERE l.grp = s.grp AND l.gen = s.gen AND l.b = s.b AND l.current)) LIMIT $3)",
-        grp,
-        gen.as_slice()
-    );
-    let b = in_batches!(
-        store,
-        "DELETE FROM voipc_gk_vids WHERE (grp, gen, v) IN
-         (SELECT grp, gen, v FROM voipc_gk_vids x WHERE grp = $1 AND gen <> $2
-          AND NOT EXISTS (SELECT 1 FROM voipc_gk_pending p WHERE p.grp = x.grp AND p.commit_id = x.commit_id) LIMIT $3)",
-        grp,
-        gen.as_slice()
-    );
-    let c = in_batches!(
-        store,
-        "DELETE FROM voipc_gk_exits WHERE (grp, seq) IN
-         (SELECT grp, seq FROM voipc_gk_exits WHERE grp = $1 AND gen <> $2 LIMIT $3)",
-        grp,
-        gen.as_slice()
-    );
-    Ok(a + b + c)
 }
 
 // --- exits ---
@@ -2006,6 +1983,7 @@ pub async fn add_exits(store: &Store, grp: &str, exits: &[Exit]) -> Result<()> {
 }
 
 /// Exits that no longer stand (the seat came back before its batch closed).
+#[cfg(test)]
 pub async fn drop_exits(store: &Store, grp: &str, seqs: &[u64]) -> Result<()> {
     for batch in seqs.chunks(STORE_BATCH) {
         write_tx!(store, tx => {
@@ -2050,11 +2028,27 @@ pub async fn exits(store: &Store, grp: &str) -> Result<Vec<Exit>> {
 
 // --- keyholders ---
 
-type HolderTuple = (Vec<u8>, Vec<u8>, Option<Vec<u8>>, i16, i64, Vec<u8>);
-type GrpHolderTuple = (String, Vec<u8>, Vec<u8>, Option<Vec<u8>>, i16, i64, Vec<u8>);
-
+type HolderTuple = (
+    Vec<u8>,
+    Vec<u8>,
+    Option<Vec<u8>>,
+    i16,
+    i64,
+    Vec<u8>,
+    Option<Vec<u8>>,
+);
+type GrpHolderTuple = (
+    String,
+    Vec<u8>,
+    Vec<u8>,
+    Option<Vec<u8>>,
+    i16,
+    i64,
+    Vec<u8>,
+    Option<Vec<u8>>,
+);
 fn holder_of(t: HolderTuple) -> Result<Holder> {
-    let (kx, m, device, rank, last_online, missed) = t;
+    let (kx, m, device, rank, last_online, missed, pair) = t;
     Ok(Holder {
         kx: fixed(kx, "kx")?,
         m: fixed(m, "m")?,
@@ -2062,17 +2056,21 @@ fn holder_of(t: HolderTuple) -> Result<Holder> {
         rank: u8_of(rank, "rank")?,
         last_online: u64_of(last_online, "last_online")?,
         missed: postcard_of(&missed, "missed")?,
+        pair: pair.map(|p| postcard_of(&p, "pair")).transpose()?,
     })
 }
 
+/// A keyholder entry, written whole.
+#[cfg(test)]
 pub async fn put_holder(store: &Store, grp: &str, h: &Holder) -> Result<()> {
     let missed = postcard::to_allocvec(&h.missed)?;
+    let pair = h.pair.as_ref().map(postcard::to_allocvec).transpose()?;
     let last_online = count(h.last_online, "last_online")?;
     db!(store, pool => {
         sqlx::query(
-            "INSERT INTO voipc_gk_holders (grp, kx, m, device, rank, last_online, missed) VALUES ($1, $2, $3, $4, $5, $6, $7)
+            "INSERT INTO voipc_gk_holders (grp, kx, m, device, rank, last_online, missed, pair) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
              ON CONFLICT (grp, kx) DO UPDATE SET m = excluded.m, device = excluded.device, rank = excluded.rank,
-             last_online = excluded.last_online, missed = excluded.missed",
+             last_online = excluded.last_online, missed = excluded.missed, pair = excluded.pair",
         )
         .bind(grp)
         .bind(&h.kx[..])
@@ -2081,6 +2079,7 @@ pub async fn put_holder(store: &Store, grp: &str, h: &Holder) -> Result<()> {
         .bind(i16::from(h.rank))
         .bind(last_online)
         .bind(missed.as_slice())
+        .bind(pair.as_deref())
         .execute(pool)
         .await?;
     });
@@ -2088,6 +2087,7 @@ pub async fn put_holder(store: &Store, grp: &str, h: &Holder) -> Result<()> {
 }
 
 /// When it was last online and what it missed, on its own.
+#[cfg(test)]
 pub async fn set_holder_seen(
     store: &Store,
     grp: &str,
@@ -2124,7 +2124,7 @@ pub async fn drop_holder(store: &Store, grp: &str, kx: &[u8; 32]) -> Result<bool
 
 pub async fn holders(store: &Store, grp: &str) -> Result<Vec<Holder>> {
     let rows: Vec<HolderTuple> = db!(store, pool => {
-        sqlx::query_as("SELECT kx, m, device, rank, last_online, missed FROM voipc_gk_holders WHERE grp = $1")
+        sqlx::query_as("SELECT kx, m, device, rank, last_online, missed, pair FROM voipc_gk_holders WHERE grp = $1")
             .bind(grp)
             .fetch_all(pool)
             .await?
@@ -2142,14 +2142,14 @@ pub async fn holders_of(
     let rows: Vec<GrpHolderTuple> = db!(store, pool => {
         match device {
             Some(d) => sqlx::query_as(
-                "SELECT grp, kx, m, device, rank, last_online, missed FROM voipc_gk_holders WHERE m = $1 AND device = $2",
+                "SELECT grp, kx, m, device, rank, last_online, missed, pair FROM voipc_gk_holders WHERE m = $1 AND device = $2",
             )
             .bind(&m[..])
             .bind(d)
             .fetch_all(pool)
             .await?,
             None => sqlx::query_as(
-                "SELECT grp, kx, m, device, rank, last_online, missed FROM voipc_gk_holders WHERE m = $1",
+                "SELECT grp, kx, m, device, rank, last_online, missed, pair FROM voipc_gk_holders WHERE m = $1",
             )
             .bind(&m[..])
             .fetch_all(pool)
@@ -2157,8 +2157,11 @@ pub async fn holders_of(
         }
     });
     rows.into_iter()
-        .map(|(grp, kx, m, device, rank, last_online, missed)| {
-            Ok((grp, holder_of((kx, m, device, rank, last_online, missed))?))
+        .map(|(grp, kx, m, device, rank, last_online, missed, pair)| {
+            Ok((
+                grp,
+                holder_of((kx, m, device, rank, last_online, missed, pair))?,
+            ))
         })
         .collect()
 }
@@ -2318,6 +2321,7 @@ pub async fn seat_keys(store: &Store, account: &[u8; 16]) -> Result<Option<SeatK
     row.map(seat_keys_of).transpose()
 }
 
+#[cfg(test)]
 pub async fn seat_keys_at(store: &Store, account: &[u8; 16], n: u32) -> Result<Option<SeatKeys>> {
     let row: Option<SeatKeysTuple> = db!(store, pool => {
         sqlx::query_as("SELECT n, kem, dh, made, sig, published FROM voipc_gk_seatkeys WHERE account = $1 AND n = $2")
@@ -2329,6 +2333,7 @@ pub async fn seat_keys_at(store: &Store, account: &[u8; 16], n: u32) -> Result<O
     row.map(seat_keys_of).transpose()
 }
 
+#[cfg(test)]
 pub async fn drop_seat_keys(store: &Store, account: &[u8; 16]) -> Result<u64> {
     Ok(db!(store, pool => {
         sqlx::query("DELETE FROM voipc_gk_seatkeys WHERE account = $1")
@@ -2339,10 +2344,12 @@ pub async fn drop_seat_keys(store: &Store, account: &[u8; 16]) -> Result<u64> {
     }))
 }
 
+#[cfg(test)]
 type MemberKeysTuple = (Vec<u8>, i64, Vec<u8>, Vec<u8>, i64, Vec<u8>, i64);
 
 /// A page of the accounts keeping `conv`'s log that have current seat keys, after `after`, by
 /// account id: the eager seats of a new generation (plan 2d).
+#[cfg(test)]
 pub async fn members_with_seat_keys(
     store: &Store,
     conv: &str,
@@ -2369,6 +2376,97 @@ pub async fn members_with_seat_keys(
             ))
         })
         .collect()
+}
+
+// --- an account's own rows (C4, §3.11) ---
+
+/// An account's self-rows and history rows, each kept only for a stored group where the
+/// account holds or held that seat under that seed or a later one (its seat, or a row to it),
+/// in place of one of the same `(group, gen, seed, seat, kind)`: so at most one each. One
+/// already kept is replaced whatever became of its seat: a rotation seals every row
+/// `SelfRowsList` gave again, those of seats gone since too. The count kept, replaced ones
+/// included (what the app takes as "all stored").
+pub async fn put_self_rows(store: &Store, account: &[u8; 16], rows: &[SelfRowIn]) -> Result<u32> {
+    let mut kept = 0;
+    for r in rows {
+        if r.check().is_err() || !r.group.starts_with("c:") {
+            continue;
+        }
+        let replaced = db!(store, pool => {
+            sqlx::query(
+                "UPDATE voipc_gk_self SET sealed = $1 WHERE grp = $2 AND account = $3 AND gen = $4
+                 AND seed = $5 AND tag_sk = $6 AND tag_sx = $7 AND kind = $8",
+            )
+            .bind(r.sealed.as_slice())
+            .bind(&r.group)
+            .bind(&account[..])
+            .bind(&r.gen[..])
+            .bind(i64::from(r.seed))
+            .bind(&r.sk[..])
+            .bind(&r.sx[..])
+            .bind(i16::from(r.kind))
+            .execute(pool)
+            .await?
+            .rows_affected()
+        });
+        if replaced > 0 {
+            kept += 1;
+            continue;
+        }
+        let seat = seat_record(&SeatRef {
+            m: MemberId::Account(*account),
+            tag_sk: r.sk,
+            tag_sx: r.sx,
+        });
+        let held: Option<i64> = db!(store, pool => {
+            sqlx::query_scalar(
+                "SELECT CAST(1 AS BIGINT) FROM voipc_gk_seats WHERE grp = $1 AND gen = $2 AND seat = $3 AND seed >= $4
+                 UNION ALL SELECT CAST(1 AS BIGINT) FROM voipc_gk_rows WHERE grp = $1 AND gen = $2 AND seat = $3 AND s >= $4
+                 LIMIT 1",
+            )
+            .bind(&r.group)
+            .bind(&r.gen[..])
+            .bind(&seat[..])
+            .bind(i64::from(r.seed))
+            .fetch_optional(pool)
+            .await?
+        });
+        if held.is_none() {
+            continue;
+        }
+        db!(store, pool => {
+            sqlx::query(
+                "INSERT INTO voipc_gk_self (grp, account, gen, seed, tag_sk, tag_sx, kind, sealed) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                 ON CONFLICT (grp, account, gen, seed, tag_sk, tag_sx, kind) DO UPDATE SET sealed = excluded.sealed",
+            )
+            .bind(&r.group)
+            .bind(&account[..])
+            .bind(&r.gen[..])
+            .bind(i64::from(r.seed))
+            .bind(&r.sk[..])
+            .bind(&r.sx[..])
+            .bind(i16::from(r.kind))
+            .bind(r.sealed.as_slice())
+            .execute(pool)
+            .await?;
+        });
+        kept += 1;
+    }
+    Ok(kept)
+}
+
+/// What an account's identity endorsed, gone (an identity reset, a deleted account's
+/// tombstone): its seat keys and its self-rows. No foreign key takes these (plan 2g). Its
+/// seats go by their groups' exits, and its keyholder entries by their groups' Removes: the
+/// signed head names them, and their rows tell `Groups::on_account_gone` (in this process or,
+/// after the shell's reset, the relay's) where they are; each goes once its Remove lands.
+pub async fn forget_account(store: &Store, account: &[u8; 16]) -> Result<()> {
+    write_tx!(store, tx => {
+        sqlx::query("DELETE FROM voipc_gk_seatkeys WHERE account = $1").bind(&account[..]).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM voipc_gk_self WHERE account = $1").bind(&account[..]).execute(&mut *tx).await?;
+        tx.commit().await?;
+    });
+    Ok(())
 }
 
 // --- load ---
@@ -3267,8 +3365,10 @@ mod tests {
                 .await
                 .unwrap();
             // The 10-minute sweeps, by the head's generation
-            sweep_keyrings(store, GRP, &GEN, 1).await.unwrap();
-            sweep_stale(store, GRP, &GEN).await.unwrap();
+            crate::gk::store::sweep_keyrings(store, GRP, &GEN, 1)
+                .await
+                .unwrap();
+            crate::gk::store::sweep_stale(store, GRP).await.unwrap();
             let hs = [header_at(5, GEN2, 1, 0, Kind::Genesis)];
             let mv = HeadMove {
                 was: Some([1; 32]),
@@ -3665,7 +3765,7 @@ mod tests {
                 left.iter().map(|s| s.seat).collect::<Vec<_>>(),
                 vec![rec(1)]
             );
-            assert_eq!(sweep_stale(store, GRP, &GEN).await.unwrap(), 1);
+            assert_eq!(crate::gk::store::sweep_stale(store, GRP).await.unwrap(), 1);
             assert_eq!(
                 scalar(store, "SELECT COUNT(*) FROM voipc_gk_seats").await,
                 1
@@ -3775,7 +3875,7 @@ mod tests {
                 rows_of_seat(store, GRP, &GEN, &rec(2)).await.unwrap().len(),
                 1
             );
-            assert_eq!(sweep_stale(store, GRP, &GEN2).await.unwrap(), 3);
+            assert_eq!(crate::gk::store::sweep_stale(store, GRP).await.unwrap(), 3);
             assert_eq!(
                 scalar(store, "SELECT COUNT(*) FROM voipc_gk_seats").await,
                 1
@@ -3883,7 +3983,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn keyholders_are_found_by_member_and_device() {
+    async fn keyholders_are_found_by_member_and_device_and_keep_their_pair_in_a_column_of_its_own()
+    {
         let dbs = databases().await;
         for store in &dbs.stores {
             open(store).await;
@@ -3895,10 +3996,22 @@ mod tests {
                 rank: 4,
                 last_online: 9,
                 missed: Misses::default(),
+                pair: None,
             };
-            put_holder(store, GRP, &holder(1, b"desk-one-0000000"))
-                .await
-                .unwrap();
+            let pair = voipc_protocol::gk::EndorsedPair {
+                origin: voipc_protocol::gk::origin::DESKTOP,
+                u: 0,
+                kem: vec![0x31; 1184],
+                dh: vec![0x32; 33],
+                n: 3,
+                made: 1_800_000_000,
+                sig: vec![0x33; 64],
+            };
+            let one = Holder {
+                pair: Some(pair.clone()),
+                ..holder(1, b"desk-one-0000000")
+            };
+            put_holder(store, GRP, &one).await.unwrap();
             put_holder(store, GRP, &holder(2, b"desk-two-0000000"))
                 .await
                 .unwrap();
@@ -3923,9 +4036,217 @@ mod tests {
             let h = holders(store, GRP).await.unwrap();
             let h1 = h.iter().find(|h| h.kx == [1; 32]).unwrap();
             assert_eq!((h1.last_online, &h1.missed), (99, &missed));
+            // The misses written alone leave the pair as it was
+            assert_eq!(h1.pair.as_ref(), Some(&pair));
+            let h2 = h.iter().find(|h| h.kx == [2; 32]).unwrap();
+            assert_eq!(h2.pair, None);
             assert!(drop_holder(store, GRP, &[1; 32]).await.unwrap());
             assert!(!drop_holder(store, GRP, &[1; 32]).await.unwrap());
             assert_eq!(holders(store, GRP).await.unwrap().len(), 1);
+        }
+    }
+
+    /// An account seat's record in `GRP`, by its tags.
+    fn own_seat(a: &[u8; 16], sk: u8) -> SeatRec {
+        seat_record(&SeatRef {
+            m: MemberId::Account(*a),
+            tag_sk: [sk; 8],
+            tag_sx: [2; 8],
+        })
+    }
+
+    async fn sit(store: &Store, seat: &SeatRec, seed: i64, account: &[u8; 16]) {
+        db!(store, pool => {
+            sqlx::query(
+                "INSERT INTO voipc_gk_seats (grp, gen, seat, dh, b, pool, seed, last_use, account)
+                 VALUES ($1, $2, $3, $4, 1, 0, $5, 0, $6)",
+            )
+            .bind(GRP)
+            .bind(&GEN[..])
+            .bind(&seat[..])
+            .bind(&[5u8; 33][..])
+            .bind(seed)
+            .bind(&account[..])
+            .execute(pool)
+            .await
+            .unwrap();
+        });
+    }
+
+    fn self_row(seed: u32, kind: u8, sk: u8, sealed: usize) -> SelfRowIn {
+        SelfRowIn {
+            group: GRP.into(),
+            gen: GEN,
+            seed,
+            sk: [sk; 8],
+            sx: [2; 8],
+            kind,
+            sealed: vec![9; sealed],
+        }
+    }
+
+    /// C4 `SelfRowPut`: a row only for a seat the account holds (or a row reaches) under that
+    /// seed or a later one, one per key, a second replacing the first and counted all the same
+    /// (K1: the count is the rows sent); none for another account's seat or an `r:` group.
+    #[tokio::test]
+    async fn self_rows_are_kept_only_for_a_seat_the_account_holds_or_held_and_replace_their_own() {
+        use voipc_protocol::gk::SELF_ROW_BYTES;
+        let dbs = databases().await;
+        for store in &dbs.stores {
+            open(store).await;
+            let a = account(store, "ann").await;
+            sit(store, &own_seat(&a, 1), 3, &a).await;
+            let rows = [
+                self_row(3, 0, 1, SELF_ROW_BYTES),
+                self_row(2, 0, 1, SELF_ROW_BYTES),
+                self_row(3, 1, 1, 300),
+            ];
+            assert_eq!(put_self_rows(store, &a, &rows).await.unwrap(), 3);
+            let again = self_row(3, 0, 1, SELF_ROW_BYTES);
+            let again = SelfRowIn {
+                sealed: vec![8; SELF_ROW_BYTES],
+                ..again
+            };
+            assert_eq!(put_self_rows(store, &a, &[again]).await.unwrap(), 1);
+            assert_eq!(scalar(store, "SELECT COUNT(*) FROM voipc_gk_self").await, 3);
+            let (held, _) = crate::gk::store::rows_of(store, &a, None, 16)
+                .await
+                .unwrap();
+            let replaced = held.iter().find(|r| (r.seed, r.kind) == (3, 0)).unwrap();
+            assert_eq!(
+                replaced.sealed,
+                vec![8; SELF_ROW_BYTES],
+                "replaced, not added"
+            );
+            // A later seed than it holds, a seat of no one's, another account, an `r:` group
+            let other = account(store, "bob").await;
+            let r_group = SelfRowIn {
+                group: "r:00:7".into(),
+                ..self_row(3, 0, 1, SELF_ROW_BYTES)
+            };
+            assert_eq!(
+                put_self_rows(
+                    store,
+                    &a,
+                    &[
+                        self_row(4, 0, 1, SELF_ROW_BYTES),
+                        self_row(3, 0, 5, SELF_ROW_BYTES),
+                        r_group
+                    ]
+                )
+                .await
+                .unwrap(),
+                0
+            );
+            assert_eq!(
+                put_self_rows(store, &other, &[self_row(3, 0, 1, SELF_ROW_BYTES)])
+                    .await
+                    .unwrap(),
+                0
+            );
+            // A seat gone that a kept row still reaches, under its seed
+            db!(store, pool => {
+                sqlx::query(
+                    "INSERT INTO voipc_gk_rows (grp, gen, b, v, seat, s, maker, bytes, epoch_made, commit_id)
+                     VALUES ($1, $2, 1, 1, $3, 6, $4, $5, 1, 1)",
+                )
+                .bind(GRP)
+                .bind(&GEN[..])
+                .bind(&own_seat(&a, 7)[..])
+                .bind(&maker()[..])
+                .bind(&[1u8; 60][..])
+                .execute(pool)
+                .await
+                .unwrap();
+            });
+            assert_eq!(
+                put_self_rows(store, &a, &[self_row(6, 1, 7, 300)])
+                    .await
+                    .unwrap(),
+                1
+            );
+            // What an identity reset leaves: nothing of the account's
+            forget_account(store, &a).await.unwrap();
+            assert_eq!(scalar(store, "SELECT COUNT(*) FROM voipc_gk_self").await, 0);
+        }
+    }
+
+    /// K1 seals every row `SelfRowsList` gave again at a rotation, those of a seat gone since
+    /// too (it left, its rows were swept): each replaces its own and is counted, or the app
+    /// keeps its old seat keys a week. A new row for a seat gone is still refused.
+    #[tokio::test]
+    async fn a_rotation_sealing_again_a_row_of_a_seat_gone_since_replaces_it_and_counts() {
+        use voipc_protocol::gk::SELF_ROW_BYTES;
+        let dbs = databases().await;
+        for store in &dbs.stores {
+            open(store).await;
+            let a = account(store, "ann").await;
+            sit(store, &own_seat(&a, 1), 3, &a).await;
+            let row = self_row(3, 0, 1, SELF_ROW_BYTES);
+            assert_eq!(
+                put_self_rows(store, &a, std::slice::from_ref(&row))
+                    .await
+                    .unwrap(),
+                1
+            );
+            // Its exit: the seat goes, and nothing reaches it any more
+            db!(store, pool => {
+                sqlx::query("DELETE FROM voipc_gk_seats").execute(pool).await.unwrap();
+            });
+            let again = SelfRowIn {
+                sealed: vec![8; SELF_ROW_BYTES],
+                ..row
+            };
+            assert_eq!(put_self_rows(store, &a, &[again]).await.unwrap(), 1);
+            let (held, _) = crate::gk::store::rows_of(store, &a, None, 16)
+                .await
+                .unwrap();
+            assert_eq!(held.len(), 1);
+            assert_eq!(held[0].sealed, vec![8; SELF_ROW_BYTES]);
+            assert_eq!(
+                put_self_rows(store, &a, &[self_row(3, 1, 1, 300)])
+                    .await
+                    .unwrap(),
+                0
+            );
+        }
+    }
+
+    /// `SelfRowsList` (K1): a page stays under the 64 KiB frame however big the history rows
+    /// in it, and its `next` goes on from its last row until every one was read.
+    #[tokio::test]
+    async fn a_self_rows_page_stays_under_a_frame_and_the_pages_read_every_row() {
+        use voipc_protocol::gk::HISTORY_ROW_MAX_BYTES;
+        let dbs = databases().await;
+        for store in &dbs.stores {
+            open(store).await;
+            let a = account(store, "ann").await;
+            sit(store, &own_seat(&a, 1), 20, &a).await;
+            let rows: Vec<SelfRowIn> = (0..10)
+                .map(|seed| self_row(seed, 1, 1, HISTORY_ROW_MAX_BYTES))
+                .collect();
+            assert_eq!(put_self_rows(store, &a, &rows).await.unwrap(), 10);
+            let (mut read, mut after) = (Vec::new(), None::<Vec<u8>>);
+            loop {
+                let (page, next) = crate::gk::store::rows_of(store, &a, after.as_deref(), 256)
+                    .await
+                    .unwrap();
+                use voipc_protocol::messages::{AccountReply, ServerMessage};
+                let frame = AccountReply::SelfRows {
+                    rows: page.clone(),
+                    next: next.clone(),
+                };
+                let frame =
+                    voipc_protocol::codec::encode_server_msg(&ServerMessage::Account(frame))
+                        .unwrap();
+                assert!(frame.len() <= 64 * 1024, "a page of {} bytes", frame.len());
+                read.extend(page.into_iter().map(|r| r.seed));
+                match next {
+                    Some(n) => after = Some(n),
+                    None => break,
+                }
+            }
+            assert_eq!(read, (0..10).collect::<Vec<u32>>());
         }
     }
 
@@ -4032,7 +4353,12 @@ mod tests {
             assert_eq!(header(store, GRP, &[1; 32]).await.unwrap(), None);
             assert!(header(store, GRP, &[2; 32]).await.unwrap().is_some());
             // And the keyrings of epochs before the head's
-            assert_eq!(sweep_keyrings(store, GRP, &GEN, 2).await.unwrap(), 2);
+            assert_eq!(
+                crate::gk::store::sweep_keyrings(store, GRP, &GEN, 2)
+                    .await
+                    .unwrap(),
+                2
+            );
         }
     }
 

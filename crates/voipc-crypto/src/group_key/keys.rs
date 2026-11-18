@@ -113,6 +113,18 @@ impl SeatPair {
             dh: KeyPair::new(public, private),
         })
     }
+
+    /// The pair, private parts included, as a device keeps a desktop keyholder pair
+    /// (`gk_local.bin`, plan 3d): postcard of the pairs as libsignal serializes them, the
+    /// layout `SeatKeys` uses.
+    pub fn to_bytes(&self) -> Zeroizing<Vec<u8>> {
+        encode_secret(&self.to_wire())
+    }
+
+    pub fn from_bytes(b: &[u8]) -> Option<SeatPair> {
+        let wire: PairWire = postcard::from_bytes(b).ok()?;
+        SeatPair::from_wire(&wire)
+    }
 }
 
 /// The public half of a `SeatPair`, with its two tags.

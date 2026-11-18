@@ -1,7 +1,6 @@
 //! Dues on the relay (plan 2d "Joins", "Exits", "How dues interleave", 2e): the join and
 //! exit batches and when each closes, which due is asked next, and the due out with what
 //! it was asked against.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::{HashMap, VecDeque};
 
@@ -155,6 +154,15 @@ impl Exits {
             .chain(self.open.iter())
             .map(|b| b.exits.len())
             .sum()
+    }
+
+    /// Every seat waiting to exit.
+    pub fn seats(&self) -> std::collections::HashSet<SeatRef> {
+        self.closed
+            .iter()
+            .chain(self.open.iter())
+            .flat_map(|b| b.exits.iter().map(|l| l.exit.seat))
+            .collect()
     }
 }
 

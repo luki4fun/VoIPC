@@ -21,9 +21,10 @@
 //! And as a reader: a row opens only as a static wrap, by length and label, and only once
 //! an entry on that chain needs it, with the writer's log key in hand first.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
+use voipc_protocol::gk::{GkChainKey, CHAIN_KEYS_MAX};
 use voipc_protocol::messages::{
     AccountRequest, BucketIn, ChainAsk, ChainKeys, ChainRow, ChainSeal, ClientMessage, LogEntry,
     OwnBucket, OwnChain, WrapIn,
@@ -31,9 +32,11 @@ use voipc_protocol::messages::{
 use zeroize::Zeroizing;
 
 use super::{ask, AccountSync, Event, Fetch, Outgoing, LOST_AFTER_TICKS, MAX_REKEYS};
+use crate::group_key::{chain_seal, open_chain_seal, Epoch, Group, GroupKind, MemberId};
+use crate::group_state::GkEpoch;
 use crate::log::{
     blank_row, bucket_id, chain_epoch, epoch_key, epoch_parts, open_chain_entry, seal_chain_entry,
-    self_open_state, self_wrap_state, Bucket, Chain, ListedSeat, StaticKey,
+    self_open_state, self_wrap_state, Bucket, Chain, ListedSeat, StaticKey, MAX_CHAIN,
 };
 
 type Id = [u8; 16];
@@ -68,6 +71,65 @@ const MOST_READERS: usize = 32_000;
 const MAX_WALK: u32 = 4096;
 /// `behind`s in a row before giving up on what waits. Each is a read back and another frame.
 const MAX_BEHINDS: u32 = 3;
+/// gk chains (part 4, open choice 12) are numbered past every 0010 chain, from here, and
+/// packed `chain << 1 | index`: a chain number above `MAX_CHAIN` is a gk chain's wherever a
+/// chain is named, and a gk chain's epochs lie above every 0010 epoch of its writer.
+const GK_CHAIN_MIN: u32 = MAX_CHAIN + 1;
+/// A gk chain takes posts for an hour at most, and only in its epoch.
+const GK_CHAIN_SECS: u64 = 60 * 60;
+/// `tick`s the host gets to answer a past epoch, and the times it is asked.
+const GK_PAST_TICKS: u32 = 5;
+const GK_PAST_TRIES: u32 = 3;
+
+fn is_gk(chain: u32) -> bool {
+    chain >= GK_CHAIN_MIN
+}
+
+/// The wire's epoch of `chain` at `index`: a gk chain's (index 0 or 1) or a 0010 one's.
+pub(super) fn chain_at(chain: u32, index: u32) -> Option<u32> {
+    if !is_gk(chain) {
+        return chain_epoch(chain, index);
+    }
+    (index <= 1 && chain < 1 << 31).then_some(chain << 1 | index)
+}
+
+/// `(chain, index)` of an epoch on a gk chain, if it can be one.
+fn gk_parts(epoch: u32) -> Option<(u32, u32)> {
+    let chain = epoch >> 1;
+    is_gk(chain).then_some((chain, epoch & 1))
+}
+
+/// The 0010 chain whose epochs a gk chain's lie among. A writer's gk chains and 0010 chains
+/// never share one (`make_gk_chain` numbers past its 0010 chains, and a 0010 chain made
+/// after gk ones past them), so once one gk chain asked for there is none, every entry there
+/// is that 0010 chain's.
+fn gk_range(chain: u32) -> u32 {
+    chain >> 11
+}
+
+/// Index 1 of a gk chain with a back-link, from its start: one way, so the seal (index 1)
+/// opens no link, while whoever a sharer gave the start reads the chain's entries too. A gk
+/// chain stores no step, so this is the only way from 0 to 1.
+fn gk_index1(conv: &str, owner: &Id, chain: u32, start: &[u8; 32]) -> Key {
+    let info = format!(
+        "voipc-chain/v1/gk-index1|{conv}|{}|{chain}",
+        voipc_protocol::conv::hex(owner)
+    );
+    let mut k = Zeroizing::new([0u8; 32]);
+    hkdf::Hkdf::<sha2::Sha256>::new(None, start)
+        .expand(info.as_bytes(), &mut *k)
+        .expect("32 bytes is a valid HKDF length");
+    k
+}
+
+/// A row nobody opens goes at `top`, or at 0 on a gk chain, where the relay takes no other.
+fn blank_at(chain: u32, top: u32) -> u32 {
+    if is_gk(chain) {
+        0
+    } else {
+        top
+    }
+}
 
 /// Where our newest chain in a channel stands.
 struct Standing {
@@ -75,6 +137,18 @@ struct Standing {
     index: u32,
     state: Key,
     start: Key,
+}
+
+/// Our gk chain in a channel (part 4): its one `EpochChainStart`, sealed under the key of
+/// the epoch it lives in.
+struct GkStanding {
+    chain: u32,
+    index: u32,
+    state: Key,
+    gen: Id,
+    epoch: u32,
+    /// When it was made (unix seconds).
+    made: u64,
 }
 
 /// A bucket the newest chain is sealed to, as our own row opened it.
@@ -133,6 +207,11 @@ enum Done {
     Rows {
         joiners: Vec<Id>,
     },
+    Gk {
+        standing: GkStanding,
+        start: Key,
+        info: OwnChain,
+    },
 }
 
 /// One writer's business in one channel, read back from the relay as far as a post needs.
@@ -165,6 +244,8 @@ pub(super) struct Writer {
     last_missing: BTreeSet<Id>,
     /// `ChainStored { behind }` in a row.
     behinds: u32,
+    /// Our gk chain, once stored.
+    gk: Option<GkStanding>,
 }
 
 impl WrapsAsked {
@@ -174,6 +255,11 @@ impl WrapsAsked {
 }
 
 impl Writer {
+    /// The one ask of this writer out, by its request's name.
+    pub(super) fn out(&self) -> Option<&'static str> {
+        self.out
+    }
+
     /// A post may go on `now`.
     fn ready(&self) -> bool {
         self.chains_read
@@ -203,6 +289,7 @@ impl Writer {
         self.idle = 0;
         self.frames.clear();
         self.done = None;
+        self.gk = None;
         if let Some(want) = &mut self.want {
             want.proof = Proof::default();
             want.proof_after = None;
@@ -210,12 +297,14 @@ impl Writer {
         }
     }
 
-    fn highest(&self) -> Option<u32> {
+    /// The highest chain number known; with `gk` false of 0010 chains only.
+    fn highest(&self, gk: bool) -> Option<u32> {
+        let keep = |c: &u32| gk || !is_gk(*c);
         self.chains
             .keys()
-            .next_back()
             .copied()
-            .max(self.newest)
+            .rfind(keep)
+            .max(self.newest.filter(keep))
             .max(self.now.as_ref().map(|n| n.chain))
     }
 
@@ -323,6 +412,42 @@ pub(super) struct Holds {
     /// `(owner, asked)`: a run of links too long for one answer goes on at this chain, after
     /// this many hops.
     walks: HashMap<(Id, u32), (u32, u32)>,
+    /// gk chains' seals by `(owner, chain)`; and `(owner, 0010 chain)` where a chain asked
+    /// for was none (`gk_range`): every entry there is the 0010 chain's.
+    gk: HashMap<(Id, u32), GkChainKey>,
+    not_gk: HashSet<(Id, u32)>,
+}
+
+/// What reading gk chains waits on (part 4): the seals asked of the relay, and the past
+/// epochs whose keys the host asks `GroupKeying` for.
+#[derive(Default)]
+pub(super) struct GkReads {
+    /// Each `EpochChainKeys` not answered yet, in order, with what it named.
+    asked: VecDeque<(String, Vec<(Id, u32)>)>,
+    /// `(group, gen, epoch)` for the host (`take_gk_past`).
+    new: Vec<(String, Id, u32)>,
+    /// Handed to the host and not answered: ticks since, and times asked.
+    waiting: HashMap<(String, Id, u32), (u32, u32)>,
+    /// In, and answered with nothing.
+    have: HashMap<(String, Id, u32), GkEpoch>,
+    none: HashSet<(String, Id, u32)>,
+}
+
+impl GkReads {
+    /// The seals asked for count as lost: the reads they were for go again.
+    pub(super) fn lost(&mut self) {
+        self.asked.clear();
+    }
+}
+
+/// Where an entry stands that may be on a gk chain.
+enum GkPlace {
+    /// Its chain's seal is to be asked for.
+    Ask(u32),
+    /// The past epoch its seal is under is asked of the host.
+    Wait,
+    /// Read at `(chain, index)`: by the seal's state, or by a sharer's rows.
+    At(u32, u32),
 }
 
 /// What opening an entry still takes.
@@ -361,6 +486,7 @@ fn rows_frame(conv: &str, epoch: u32, wraps: Vec<ChainRow>, last: bool) -> Accou
 fn frame_name(frame: &AccountRequest) -> &'static str {
     match frame {
         AccountRequest::EpochPut { .. } => "EpochPut",
+        AccountRequest::EpochChainStart { .. } => "EpochChainStart",
         _ => "ChainPut",
     }
 }
@@ -450,10 +576,15 @@ impl AccountSync {
             out.push(self.own_ask(conv, w, "OwnChains", request));
             return out;
         }
+        if let Some(ep) = self.gk_wanted(conv, w) {
+            self.make_gk_chain(conv, w, &ep, &mut out);
+            return out;
+        }
         if !w.standing_read && self.read_standing(conv, w, &mut out) {
             return out;
         }
-        if w.want.is_none() && self.outbox.iter().any(|o| o.conv == conv) {
+        let posts = self.outbox.iter().any(|o| o.conv == conv && o.gk.is_none());
+        if w.want.is_none() && posts {
             if w.now.is_none() {
                 w.want = Some(Want {
                     new_chain: true,
@@ -891,7 +1022,9 @@ impl AccountSync {
         out: &mut Vec<ClientMessage>,
     ) {
         let me = self.me;
-        let chain = w.highest().map_or(1, |h| h.saturating_add(1));
+        // Its epochs above every gk chain of ours too, so none reads as one (`gk_parts`)
+        let gk = w.highest(true).filter(|h| is_gk(*h)).map(|h| h >> 11);
+        let chain = w.highest(false).max(gk).map_or(1, |h| h.saturating_add(1));
         let Some(epoch0) = chain_epoch(chain, 0) else {
             self.outbox.retain(|o| o.conv != conv);
             self.later.push(Event::NotKept {
@@ -1247,14 +1380,9 @@ impl AccountSync {
             .values()
             .filter(|c| c.done && !linked.contains(&c.chain))
             .filter_map(|c| {
-                let start = self_open_state(
-                    &self.logkey,
-                    &c.self_wrap,
-                    conv,
-                    &me,
-                    chain_epoch(c.chain, 0)?,
-                )
-                .ok()?;
+                let start =
+                    self_open_state(&self.logkey, &c.self_wrap, conv, &me, chain_at(c.chain, 0)?)
+                        .ok()?;
                 Some((c.chain, c.top, start))
             })
             .collect();
@@ -1268,8 +1396,7 @@ impl AccountSync {
             .filter(|_| tops.is_empty());
         for chunk in people.chunks(ROWS_PER_FRAME) {
             for (i, (chain, top, start)) in tops.iter().enumerate() {
-                let (Some(at_top), Some(at_start)) =
-                    (chain_epoch(*chain, *top), chain_epoch(*chain, 0))
+                let (Some(at_top), Some(at_start)) = (chain_at(*chain, *top), chain_at(*chain, 0))
                 else {
                     continue;
                 };
@@ -1284,7 +1411,7 @@ impl AccountSync {
                         }),
                         None => last.then(|| ChainRow {
                             recipient: *j,
-                            index: *top,
+                            index: blank_at(*chain, *top),
                             wrapped: blank_row(),
                         }),
                     })
@@ -1294,12 +1421,12 @@ impl AccountSync {
                 }
             }
             if let Some((chain, top)) = fallback {
-                if let Some(at_top) = chain_epoch(chain, top) {
+                if let Some(at_top) = chain_at(chain, top) {
                     let wraps = chunk
                         .iter()
                         .map(|(j, _)| ChainRow {
                             recipient: *j,
-                            index: top,
+                            index: blank_at(chain, top),
                             wrapped: blank_row(),
                         })
                         .collect();
@@ -1580,6 +1707,24 @@ impl AccountSync {
             }
             Some(Done::Rows { .. }) => {
                 self.rekeys.remove(conv);
+            }
+            Some(Done::Gk {
+                standing,
+                start,
+                info,
+            }) => {
+                let held = self
+                    .holds
+                    .entry(conv.to_string())
+                    .or_default()
+                    .chains
+                    .entry((self.me, standing.chain))
+                    .or_default();
+                held.states.insert(0, start);
+                held.states.insert(standing.index, standing.state.clone());
+                w.newest = Some(standing.chain);
+                w.chains.insert(standing.chain, info);
+                w.gk = Some(standing);
             }
             None => {}
         }
@@ -2035,14 +2180,14 @@ impl AccountSync {
         for k in rows {
             let mut opened: Vec<(u32, Key)> = Vec::new();
             if owner == me {
-                if let (Some(row), Some(epoch)) = (&k.self_wrap, chain_epoch(chain, 0)) {
+                if let (Some(row), Some(epoch)) = (&k.self_wrap, chain_at(chain, 0)) {
                     if let Ok(s) = self_open_state(&self.logkey, row, conv, &me, epoch) {
                         opened.push((0, s));
                     }
                 }
             } else {
                 if let (Some((i, row)), Some(sk)) = (&k.direct, self.static_key(&owner)) {
-                    if let Some(epoch) = chain_epoch(chain, *i) {
+                    if let Some(epoch) = chain_at(chain, *i) {
                         if let Ok(s) = sk.open_state(row, conv, &owner, epoch, &me) {
                             opened.push((*i, s));
                         }
@@ -2169,6 +2314,12 @@ impl AccountSync {
             self.down_links(conv, owner, chain);
         }
         let held = self.held_mut(conv, owner, chain);
+        if is_gk(chain) && index == 1 && !held.states.contains_key(&1) {
+            if let Some(start) = held.states.get(&0).cloned() {
+                held.states
+                    .insert(1, gk_index1(conv, &owner, chain, &start));
+            }
+        }
         let (from, state) = held.states.range(..=index).next_back()?;
         let (mut at, mut state) = (*from, state.clone());
         let walker = Chain {
@@ -2245,6 +2396,7 @@ impl AccountSync {
             return out;
         }
         let mut asks: BTreeMap<(Id, u32), (ChainAsk, u32, u32)> = BTreeMap::new();
+        let mut gk_asks: BTreeSet<(Id, u32)> = BTreeSet::new();
         let mut nothing = false;
         for (owner, epoch) in entries {
             if self.distrusted.contains(&owner)
@@ -2252,7 +2404,15 @@ impl AccountSync {
             {
                 continue;
             }
-            let (chain, index) = epoch_parts(epoch);
+            let (chain, index) = match self.gk_place(conv, owner, epoch) {
+                Some(GkPlace::Ask(chain)) => {
+                    gk_asks.insert((owner, chain));
+                    continue;
+                }
+                Some(GkPlace::Wait) => continue,
+                Some(GkPlace::At(chain, index)) => (chain, index),
+                None => epoch_parts(epoch),
+            };
             match self.need(conv, owner, chain, index) {
                 Need::Ask(a) => {
                     if asks.len() < MAX_CHAIN_ASKS || asks.contains_key(&(owner, a.chain)) {
@@ -2263,6 +2423,20 @@ impl AccountSync {
                 Need::No => nothing = true,
                 Need::Have => {}
             }
+        }
+        // Which chains are gk chains first: what is not is read as a 0010 one after
+        if !gk_asks.is_empty() {
+            let chains: Vec<(Id, u32)> = gk_asks.into_iter().take(CHAIN_KEYS_MAX).collect();
+            self.fetching.insert(conv.to_string(), Fetch::Wraps);
+            self.fetch_asks.push_back(conv.to_string());
+            self.gk_reads
+                .asked
+                .push_back((conv.to_string(), chains.clone()));
+            out.push(ask(AccountRequest::EpochChainKeys {
+                conv: conv.to_string(),
+                chains,
+            }));
+            return out;
         }
         if !asks.is_empty() {
             self.fetching.insert(conv.to_string(), Fetch::Wraps);
@@ -2456,7 +2630,11 @@ impl AccountSync {
         e: &LogEntry,
         signer: &[u8],
     ) -> Result<Option<(Vec<u8>, u64)>, ()> {
-        let (chain, index) = epoch_parts(e.epoch);
+        let (chain, index) = match self.gk_place(conv, e.sender, e.epoch) {
+            Some(GkPlace::Ask(_) | GkPlace::Wait) => return Ok(None),
+            Some(GkPlace::At(chain, index)) => (chain, index),
+            None => epoch_parts(e.epoch),
+        };
         match self.need(conv, e.sender, chain, index) {
             Need::Have => {}
             Need::Ask(_) => return Ok(None),
@@ -2481,4 +2659,304 @@ impl AccountSync {
             }
         }
     }
+
+    // ── gk chains (part 4) ────────────────────────────────────────────────
+
+    /// The epoch of the first post under the group key our gk chain does not take: none
+    /// stands, it is another epoch's, or it is an hour old.
+    fn gk_wanted(&self, conv: &str, w: &Writer) -> Option<GkEpoch> {
+        let now = crate::time::now_millis() / 1000;
+        self.outbox
+            .iter()
+            .filter(|o| o.conv == conv)
+            .filter_map(|o| o.gk.as_ref())
+            .find(|ep| !gk_takes(w, ep, now))
+            .cloned()
+    }
+
+    /// A gk chain for posts under `ep`: one `EpochChainStart` with its start wrapped for our
+    /// other devices, sealed once under the epoch's key (§3.9). With the right to share it
+    /// links back to the chain before (0010 or gk), and the seal holds index 1: index 0,
+    /// which opens the link, goes only to whom a sharer gives it. Whatever chain came before
+    /// ends here.
+    fn make_gk_chain(
+        &mut self,
+        conv: &str,
+        w: &mut Writer,
+        ep: &GkEpoch,
+        out: &mut Vec<ClientMessage>,
+    ) {
+        let me = self.me;
+        // Past every gk chain of ours, and its epochs above every epoch of our 0010 chains
+        let after_gk = w
+            .highest(true)
+            .filter(|h| is_gk(*h))
+            .map_or(0, |h| h.saturating_add(1));
+        let after_0010 = w.highest(false).map_or(0, |h| (h + 1) << 11);
+        let next = after_gk.max(after_0010).max(GK_CHAIN_MIN);
+        let Some(chain) = Some(next).filter(|c| *c < 1 << 31) else {
+            self.outbox.retain(|o| o.conv != conv);
+            self.later.push(Event::NotKept {
+                reason: "This channel has used up its keys here.".into(),
+            });
+            return;
+        };
+        let Ok(g) = Group::new(GroupKind::Text, &ep.group, ep.gen) else {
+            return;
+        };
+        let start = epoch_key();
+        let at = Chain {
+            conv,
+            owner: &me,
+            chain,
+        };
+        let self_wrap = self_wrap_state(&self.logkey, &start, conv, &me, chain << 1);
+        let older = w.highest(true).filter(|_| self.share).and_then(|n| {
+            let c = w.chains.get(&n)?;
+            let start =
+                self_open_state(&self.logkey, &c.self_wrap, conv, &me, chain_at(n, 0)?).ok()?;
+            Some((n, start))
+        });
+        let link = older.as_ref().map(|(n, s)| (*n, at.link(&start, *n, s)));
+        let (index, state) = match link {
+            Some(_) => (1, gk_index1(conv, &me, chain, &start)),
+            None => (0, start.clone()),
+        };
+        let epoch = Epoch {
+            e: ep.epoch,
+            d_e: ep.d_e,
+        };
+        let owner = MemberId::Account(me);
+        let Ok(sealed) = chain_seal(&g, &epoch, &owner, chain, index, &ep.ck, &state) else {
+            return;
+        };
+        w.frames.push_back(AccountRequest::EpochChainStart {
+            conv: conv.to_string(),
+            epoch: chain << 1 | index,
+            self_wrap: self_wrap.clone(),
+            link,
+            group: ep.group.clone(),
+            gen: ep.gen,
+            gk_epoch: ep.epoch,
+            sealed,
+            last: true,
+        });
+        w.done = Some(Done::Gk {
+            standing: GkStanding {
+                chain,
+                index,
+                state,
+                gen: ep.gen,
+                epoch: ep.epoch,
+                made: crate::time::now_millis() / 1000,
+            },
+            start,
+            info: OwnChain {
+                chain,
+                top: index,
+                done: true,
+                self_wrap,
+                older: older.map(|(n, _)| n),
+            },
+        });
+        self.send_next_frame(conv, w, out);
+    }
+
+    /// A post under the group key, sealed on our gk chain of its epoch, if one stands.
+    pub(super) fn seal_on_gk(&self, o: &Outgoing, ep: &GkEpoch) -> Option<(u32, Vec<u8>)> {
+        let w = self.writers.get(&o.conv)?;
+        if !gk_takes(w, ep, crate::time::now_millis() / 1000) {
+            return None;
+        }
+        let s = w.gk.as_ref()?;
+        let epoch = chain_at(s.chain, s.index)?;
+        let ct = seal_chain_entry(
+            &s.state,
+            &o.conv,
+            &self.me,
+            epoch,
+            &self.logkey,
+            &o.envelope,
+            o.sent_at,
+        );
+        Some((epoch, ct))
+    }
+
+    /// Where an entry stands if it may be on a gk chain (`None`: on a 0010 one). Its seal is
+    /// asked for once, the past epoch it is under goes to the host once, and a seal whose
+    /// key is in opens here. What a seal does not open is read by a sharer's rows.
+    fn gk_place(&mut self, conv: &str, owner: Id, epoch: u32) -> Option<GkPlace> {
+        if !self.gk_chains {
+            return None;
+        }
+        let (chain, index) = gk_parts(epoch)?;
+        let holds = self.holds.entry(conv.to_string()).or_default();
+        if !holds.gk.contains_key(&(owner, chain))
+            && holds.not_gk.contains(&(owner, gk_range(chain)))
+        {
+            return None;
+        }
+        let held = holds
+            .chains
+            .get(&(owner, chain))
+            .is_some_and(|h| h.states.contains_key(&index) || h.states.contains_key(&0));
+        if held {
+            return Some(GkPlace::At(chain, index));
+        }
+        let Some(k) = holds.gk.get(&(owner, chain)) else {
+            return Some(GkPlace::Ask(chain));
+        };
+        let past = (k.group.clone(), k.gen, k.epoch);
+        // A seal at index 1 opens no entry at 0
+        if u32::from(k.index) > index || self.gk_reads.none.contains(&past) {
+            return Some(GkPlace::At(chain, index));
+        }
+        if let Some(ep) = self.gk_reads.have.get(&past) {
+            let at = Epoch {
+                e: ep.epoch,
+                d_e: ep.d_e,
+            };
+            let opened = Group::new(GroupKind::Text, &k.group, k.gen)
+                .ok()
+                .and_then(|g| {
+                    let owner = MemberId::Account(owner);
+                    let index = k.index.into();
+                    open_chain_seal(&g, &at, &owner, chain, index, &ep.ck, &k.sealed).ok()
+                });
+            let sealed_at = u32::from(k.index);
+            if let Some(state) = opened {
+                let held = holds.chains.entry((owner, chain)).or_default();
+                held.states.insert(sealed_at, state);
+            }
+            return Some(GkPlace::At(chain, index));
+        }
+        if !self.gk_reads.waiting.contains_key(&past) && !self.gk_reads.new.contains(&past) {
+            self.gk_reads.new.push(past);
+        }
+        Some(GkPlace::Wait)
+    }
+
+    /// `EpochChainKeys`: the seals of the chains asked for. A chain with none is a 0010 one.
+    pub(super) fn on_gk_chain_keys(
+        &mut self,
+        conv: &str,
+        keys: &[GkChainKey],
+    ) -> Vec<ClientMessage> {
+        let at = self.gk_reads.asked.iter().position(|(c, _)| c == conv);
+        let Some((_, asked)) = at.and_then(|at| self.gk_reads.asked.remove(at)) else {
+            return Vec::new();
+        };
+        let holds = self.holds.entry(conv.to_string()).or_default();
+        for (owner, chain) in asked {
+            // Only the channel's own group: a seal named elsewhere would have the host ask
+            // for epochs of a group the chain is not in
+            let key = keys.iter().find(|k| {
+                (k.owner, k.chain) == (owner, chain) && k.group == conv && k.check().is_ok()
+            });
+            match key {
+                Some(k) => {
+                    holds.gk.insert((owner, chain), k.clone());
+                }
+                // A range where this answer names a gk chain is not a 0010 chain's
+                None if !keys
+                    .iter()
+                    .any(|k| k.owner == owner && gk_range(k.chain) == gk_range(chain)) =>
+                {
+                    holds.not_gk.insert((owner, gk_range(chain)));
+                }
+                None => {}
+            }
+        }
+        self.answered(conv);
+        self.chain_read(conv)
+    }
+
+    /// `EpochChainKeys` refused: for now, the read goes again; else what it named is read as
+    /// 0010 chains (a relay without the group key keeps no gk chain).
+    pub(super) fn gk_keys_refused(&mut self, for_now: bool) -> Vec<ClientMessage> {
+        let Some((conv, asked)) = self.gk_reads.asked.pop_front() else {
+            return Vec::new();
+        };
+        if let Some(at) = self.fetch_asks.iter().position(|c| *c == conv) {
+            self.fetch_asks.remove(at);
+        }
+        if for_now {
+            self.held = true;
+            self.ask_again(&conv);
+            return Vec::new();
+        }
+        self.holds
+            .entry(conv.clone())
+            .or_default()
+            .not_gk
+            .extend(asked.into_iter().map(|(o, c)| (o, gk_range(c))));
+        self.chain_read(&conv)
+    }
+
+    /// Past epochs for the host to ask `GroupKeying::past_epoch` for: each answered by
+    /// `gk_past_in` or `gk_past_none` (`AccountSession` hands them over in `Actions`).
+    pub fn take_gk_past(&mut self) -> Vec<(String, Id, u32)> {
+        let new = std::mem::take(&mut self.gk_reads.new);
+        for p in &new {
+            let w = self.gk_reads.waiting.entry(p.clone()).or_default();
+            *w = (0, w.1 + 1);
+        }
+        new
+    }
+
+    /// A past epoch's key from `GroupKeying`: the gk chains sealed under it open, and so do
+    /// their entries.
+    pub fn gk_past_in(&mut self, ep: &GkEpoch) -> (Vec<ClientMessage>, Vec<Event>) {
+        let past = (ep.group.clone(), ep.gen, ep.epoch);
+        self.gk_reads.waiting.remove(&past);
+        self.gk_reads.new.retain(|p| *p != past);
+        self.gk_reads.have.insert(past, ep.clone());
+        let (mut out, mut events) = (Vec::new(), Vec::new());
+        self.drain(&mut out, &mut events);
+        events.extend(std::mem::take(&mut self.later));
+        (out, events)
+    }
+
+    /// A past epoch `GroupKeying` cannot give: what is sealed under it is read by a sharer's
+    /// rows where there are any, so a channel whose entries wait is read again.
+    pub fn gk_past_none(&mut self, group: &str, gen: Id, epoch: u32) -> Vec<ClientMessage> {
+        let past = (group.to_string(), gen, epoch);
+        self.gk_reads.waiting.remove(&past);
+        self.gk_reads.new.retain(|p| *p != past);
+        self.gk_reads.none.insert(past);
+        if self.waiting.iter().any(|(c, _)| c == group) {
+            self.fetch(group)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Every couple of seconds: a past epoch the host did not answer goes to it again, and
+    /// after `GK_PAST_TRIES` is given up.
+    pub(super) fn gk_past_tick(&mut self) -> Vec<ClientMessage> {
+        let mut gone = Vec::new();
+        for (past, (ticks, tries)) in &mut self.gk_reads.waiting {
+            *ticks += 1;
+            if *ticks < GK_PAST_TICKS {
+                continue;
+            }
+            if *tries >= GK_PAST_TRIES {
+                gone.push(past.clone());
+            } else if !self.gk_reads.new.contains(past) {
+                self.gk_reads.new.push(past.clone());
+            }
+        }
+        let mut out = Vec::new();
+        for (group, gen, epoch) in gone {
+            out.extend(self.gk_past_none(&group, gen, epoch));
+        }
+        out
+    }
+}
+
+/// Whether our gk chain takes a post under `ep` now.
+fn gk_takes(w: &Writer, ep: &GkEpoch, now: u64) -> bool {
+    w.gk.as_ref().is_some_and(|s| {
+        (s.gen, s.epoch) == (ep.gen, ep.epoch) && now < s.made.saturating_add(GK_CHAIN_SECS)
+    })
 }

@@ -61,6 +61,15 @@ pub(super) fn can_pair(who: &Who) -> bool {
 /// (§5.11 step 3), and a welcome or row to it opens only under its keys.
 pub(super) fn mine(who: &Who, kind: GroupKind) -> Vec<Me<'_>> {
     let mut seats: Vec<Me> = me(who, kind).into_iter().collect();
+    // V1: a signed-in member's voice seat is named by the connection in an anonymous room
+    // that is not gated (open choice 11), and the relay names it: a welcome to either opens
+    // (the media key names the seat as `writer_m` does, voice.rs)
+    if let (Some(_), GroupKind::Voice, Some(keys)) = (who.account, kind, who.conn.pair()) {
+        seats.push(Me {
+            m: MemberId::Conn(who.user_id),
+            keys,
+        });
+    }
     let old = who.seat_keys.as_ref().and_then(|k| k.old.as_ref());
     if let (Some(a), GroupKind::Text, Some(old)) = (who.account, kind, old) {
         seats.push(Me {

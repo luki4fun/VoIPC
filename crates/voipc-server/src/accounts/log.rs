@@ -14,8 +14,10 @@ use anyhow::Result;
 use l4f_accounts::model::AccountId;
 use l4f_accounts::store::Store;
 use l4f_accounts::util;
-use voipc_crypto::log::{endorsed, epoch_parts, OWN_ROW_BYTES, ROW_BYTES};
+use voipc_crypto::group_key::timers::HOLD_MS;
+use voipc_crypto::log::{endorsed, epoch_parts, MAX_CHAIN, OWN_ROW_BYTES, ROW_BYTES};
 use voipc_protocol::conv::dm_parties;
+use voipc_protocol::gk::{GkChainKey, CHAIN_KEYS_MAX, CHAIN_SEAL_BYTES};
 use voipc_protocol::messages::{
     AccountReply, BucketIn, ChainAsk, ChainKeys, ChainRow, ChainSeal, LogEntry, LogKeyInfo,
     OwnBucket, OwnChain, WrapIn, WrapOut,
@@ -95,6 +97,10 @@ const WALK_BATCH: i64 = 500;
 /// only on a vault reset.
 const NEW_LOGKEY_SECS: i64 = 60;
 const NEW_LOGKEY_MAX_SECS: i64 = 86_400;
+/// gk chains a writer starts in one gk epoch at most (C4). An app starts one at its first
+/// post in an epoch and again after an hour, which `NEW_EPOCHS_PER_HOUR` does not count: the
+/// epochs bound it. The rest are for an app that lost what it held (a restart in the epoch).
+const GK_STARTS_PER_EPOCH: i64 = 4;
 
 /// How long `strikes` changes in a row ask to wait before the next.
 fn logkey_wait(strikes: u32) -> i64 {
@@ -179,6 +185,35 @@ fn id16(v: Vec<u8>) -> [u8; 16] {
 
 fn is_channel(conv: &str) -> bool {
     conv.starts_with("c:")
+}
+
+/// A gk chain (part 4, open choice 12): numbered above every 0010 chain, whose 20 bits the
+/// 0010 epoch packs; its wire epoch is `chain << 1 | index`, with index 0, or 1 under a link.
+/// Only `EpochChainStart` makes one, and each has a `voipc_gk_chains` row.
+fn is_gk(chain: i32) -> bool {
+    i64::from(chain) > i64::from(MAX_CHAIN)
+}
+
+fn gk_parts(epoch: u32) -> (u32, u32) {
+    (epoch >> 1, epoch & 1)
+}
+
+/// The writer's gk chain an `epoch` is on, if it is on one: its id. A writer's gk epochs lie
+/// above all of its 0010 ones (part 4), so this never takes a 0010 epoch for a gk one.
+async fn gk_chain(store: &Store, writer: i32, epoch: u32) -> Result<Option<i32>> {
+    let chain = epoch >> 1;
+    if chain <= MAX_CHAIN {
+        return Ok(None);
+    }
+    Ok(db!(store, pool => {
+        sqlx::query_scalar(
+            "SELECT c.id FROM voipc_chains c JOIN voipc_gk_chains g ON g.chain_id = c.id WHERE c.writer = $1 AND c.chain = $2",
+        )
+        .bind(writer)
+        .bind(chain as i32)
+        .fetch_optional(pool)
+        .await?
+    }))
 }
 
 /// Whether `me` may read `conv`, which is one key lookup: a read never needs every seat.
@@ -938,43 +973,41 @@ async fn take_seats(relay: &Relay, me: &[u8; 16], convs: &[&str], cap: i64) -> R
 
 /// Makes `me` a stored member of a channel's log; `present` says the session
 /// is in that channel now (the relay's own admission decided that). Also
-/// says which writers to tell: each one that keeps keys here owes us an answer.
+/// says which writers to tell: each one that keeps keys here owes us an answer. `None`: no
+/// seat was taken now (one held already, or refused).
 pub(crate) async fn join(
     relay: &Relay,
     me: AccountId,
     conv: &str,
     present: bool,
-) -> Result<(AccountReply, Vec<[u8; 16]>)> {
+) -> Result<(AccountReply, Option<Vec<[u8; 16]>>)> {
     if !relay.cloud {
-        return Ok((
-            refused("LogJoin", "This server keeps no messages."),
-            Vec::new(),
-        ));
+        return Ok((refused("LogJoin", "This server keeps no messages."), None));
     }
     if !is_channel(conv) || !present {
-        return Ok((refused("LogJoin", "Join the channel first."), Vec::new()));
+        return Ok((refused("LogJoin", "Join the channel first."), None));
     }
     let joined = || AccountReply::LogJoined {
         conv: conv.to_string(),
     };
     let seat = take_seats(relay, &me.0, &[conv], relay.kept_seats).await?;
     Ok(match seat.into_iter().next() {
-        Some(Seat::Taken(owners)) => (joined(), owners),
+        Some(Seat::Taken(owners)) => (joined(), Some(owners)),
         Some(Seat::Full) => (
             refused(
                 "LogJoin",
                 "This channel keeps history for as many people as it can.",
             ),
-            Vec::new(),
+            None,
         ),
         Some(Seat::Wait) => (
             refused(
                 "LogJoin",
                 "You stopped keeping this channel a moment ago. It can keep it for you again later.",
             ),
-            Vec::new(),
+            None,
         ),
-        _ => (joined(), Vec::new()),
+        _ => (joined(), None),
     })
 }
 
@@ -982,7 +1015,7 @@ pub(crate) async fn join(
 /// could seat, the rest in `refused`, one answer for all reasons. A silent follow takes a
 /// log only up to half of `kept_seats`: the rest of its seats are for someone who asked.
 /// A returning account is seated already, and writes nothing. Also says, per conversation,
-/// the writers to tell.
+/// the writers to tell, which names every log a seat was taken in now.
 pub(crate) async fn join_many(
     relay: &Relay,
     me: AccountId,
@@ -1043,14 +1076,22 @@ pub(crate) async fn join_many(
     ))
 }
 
-pub(super) async fn leave(relay: &Relay, me: AccountId, conv: &str) -> Result<AccountReply> {
+/// `me` stops keeping a channel's log; also whether it held a seat there.
+pub(super) async fn leave(
+    relay: &Relay,
+    me: AccountId,
+    conv: &str,
+) -> Result<(AccountReply, bool)> {
     if !is_channel(conv) {
-        return Ok(refused("LogLeave", "not a channel's log"));
+        return Ok((refused("LogLeave", "not a channel's log"), false));
     }
-    remove(relay.store(), conv, &me.0).await?;
-    Ok(AccountReply::LogLeft {
-        conv: conv.to_string(),
-    })
+    let gone = remove(relay.store(), conv, &me.0).await?;
+    Ok((
+        AccountReply::LogLeft {
+            conv: conv.to_string(),
+        },
+        gone,
+    ))
 }
 
 /// Deletes what `me` wrote to the stored logs, in `conv` or everywhere, and
@@ -1083,8 +1124,9 @@ pub(super) async fn purge(
 
 /// Takes `account` out of a channel's log: it leaves, is kicked, or no longer
 /// knows the channel's password. Every writer's next entry needs a new key, so if it
-/// held one, a seat here waits (`take_seats`).
-pub async fn remove(store: &Store, conv: &str, account: &[u8; 16]) -> Result<()> {
+/// held one, a seat here waits (`take_seats`). Whether it held a seat: then the caller tells
+/// the group key (`Relay::gk_left_log`).
+pub async fn remove(store: &Store, conv: &str, account: &[u8; 16]) -> Result<bool> {
     let held: Option<i64> = db!(store, pool => {
         sqlx::query_scalar(
             "SELECT CAST(1 AS BIGINT) FROM voipc_writers w WHERE w.conv = $1 AND w.owner <> $2 AND (
@@ -1117,26 +1159,30 @@ pub async fn remove(store: &Store, conv: &str, account: &[u8; 16]) -> Result<()>
 /// `remove` with no wait for a seat, for someone a gate put out. The wait stops a person
 /// walking out and back at will, and this was someone else's doing: they follow the channel
 /// again if they win it back, and each log would count against them, across every channel.
-pub async fn unseat(store: &Store, conv: &str, account: &[u8; 16]) -> Result<()> {
-    db!(store, pool => {
-        sqlx::query("DELETE FROM voipc_members WHERE conv = $1 AND account = $2").bind(conv).bind(&account[..]).execute(pool).await?;
+/// Whether it held a seat, as `remove`.
+pub async fn unseat(store: &Store, conv: &str, account: &[u8; 16]) -> Result<bool> {
+    let gone = db!(store, pool => {
+        sqlx::query("DELETE FROM voipc_members WHERE conv = $1 AND account = $2").bind(conv).bind(&account[..]).execute(pool).await?.rows_affected()
     });
     db!(store, pool => {
         sqlx::query("DELETE FROM voipc_pending WHERE conv = $1 AND (owner = $2 OR recipient = $2)").bind(conv).bind(&account[..]).execute(pool).await?;
     });
-    Ok(())
+    Ok(gone > 0)
 }
 
 /// Keeps only `keep` of a channel's stored members (a new password: those in
-/// the channel now are the ones who knew it).
-pub async fn keep_only(store: &Store, conv: &str, keep: &[[u8; 16]]) -> Result<()> {
+/// the channel now are the ones who knew it). The members taken out.
+pub async fn keep_only(store: &Store, conv: &str, keep: &[[u8; 16]]) -> Result<Vec<[u8; 16]>> {
     let rows: Vec<Vec<u8>> = db!(store, pool => {
         sqlx::query_scalar("SELECT account FROM voipc_members WHERE conv = $1").bind(conv).fetch_all(pool).await?
     });
+    let mut out = Vec::new();
     for a in rows.into_iter().map(id16).filter(|a| !keep.contains(a)) {
-        remove(store, conv, &a).await?;
+        if remove(store, conv, &a).await? {
+            out.push(a);
+        }
     }
-    Ok(())
+    Ok(out)
 }
 
 pub(super) async fn members_of(relay: &Relay, me: AccountId, conv: &str) -> Result<AccountReply> {
@@ -1205,7 +1251,7 @@ pub async fn sweep(relay: &Relay) -> Result<u64> {
     for conv in convs {
         swept += sweep_channel(relay, &conv, now_ms).await?;
     }
-    sweep_tombstones(store).await?;
+    sweep_tombstones(relay).await?;
     let walks: Vec<Vec<u8>> = db!(store, pool => {
         sqlx::query_scalar("SELECT account FROM voipc_logkeys WHERE walk_after IS NOT NULL").fetch_all(pool).await?
     });
@@ -1361,7 +1407,9 @@ async fn owed_on_chain(
 }
 
 /// Whether a post may go on `epoch` (`append`), and if not, what to do. It goes only on a
-/// writer's newest chain, at its top, reaching exactly the members there are now.
+/// writer's newest chain, at its top, reaching exactly the members there are now. On a gk
+/// chain whoever holds its epoch's key reads it, which is the group's to say, never these
+/// tables' (C4): only "newest, at its top" is asked there.
 async fn chain_gate(
     store: &Store,
     w: &Writer,
@@ -1370,13 +1418,17 @@ async fn chain_gate(
     epoch: u32,
     members: &[[u8; 16]],
 ) -> Result<Option<AccountReply>> {
-    let (chain, index) = epoch_parts(epoch);
     let newest = match w.newest {
         Some(n) => chain_row(store, w.id, n).await?.map(|r| (n, r)),
         None => None,
     };
     let Some((n, (id, top, _))) = newest else {
         return owed_on_chain(store, conv, w.id, None, me, members, Vec::new()).await;
+    };
+    let (chain, index) = if is_gk(n) {
+        gk_parts(epoch)
+    } else {
+        epoch_parts(epoch)
     };
     if chain as i32 != n || index as i16 != top {
         return Ok(Some(AccountReply::ChainRekey {
@@ -1385,6 +1437,9 @@ async fn chain_gate(
             missing: Vec::new(),
             gone: Vec::new(),
         }));
+    }
+    if is_gk(n) {
+        return Ok(None);
     }
     owed_on_chain(store, conv, w.id, Some(id), me, members, Vec::new()).await
 }
@@ -1437,6 +1492,18 @@ fn well_formed(put: &ChainFrame, me: &[u8; 16]) -> bool {
         && put.wraps.iter().all(|w| w.index <= MAX_CHAIN_STEPS)
 }
 
+/// What a frame on a gk chain may carry (C4): a sharer's rows of its start to newcomers, at
+/// index 0, and nothing else. Its start, seal and link came whole in `EpochChainStart`, and no
+/// step is ever needed: a member reads the chain by the group's key.
+fn gk_rows_only(put: &ChainFrame) -> bool {
+    put.self_wrap.is_none()
+        && put.step.is_none()
+        && put.link.is_none()
+        && put.buckets.is_empty()
+        && put.seals.is_empty()
+        && put.wraps.iter().all(|w| w.index == 0)
+}
+
 /// Whether this account's session shares history now, and whether it may.
 pub(super) struct Sharing {
     pub shares: bool,
@@ -1465,7 +1532,6 @@ pub(super) async fn chain_put(
 ) -> Result<(AccountReply, Vec<[u8; 16]>)> {
     let store = relay.store();
     let epoch = put.epoch;
-    let (chain, index) = epoch_parts(epoch);
     let refuse = |why: &str| Ok((refused("ChainPut", why), Vec::new()));
     let behind = || {
         Ok((
@@ -1489,11 +1555,26 @@ pub(super) async fn chain_put(
     if !well_formed(&put, &me.0) {
         return refuse("malformed");
     }
+    let writer = writer_of(store, conv, &me.0).await?;
+    let gk = match &writer {
+        Some(w) => gk_chain(store, w.id, epoch).await?.is_some(),
+        None => false,
+    };
+    let (chain, index) = if gk {
+        gk_parts(epoch)
+    } else {
+        epoch_parts(epoch)
+    };
+    if gk && !gk_rows_only(&put) {
+        return refuse("malformed");
+    }
+    if gk && !sharing.may {
+        return refuse("Sharing history takes a privilege you do not hold.");
+    }
     if index > MAX_CHAIN_STEPS {
         return behind();
     }
     let chain_no = chain as i32;
-    let writer = writer_of(store, conv, &me.0).await?;
     let row = match &writer {
         Some(w) => chain_row(store, w.id, chain_no).await?,
         None => None,
@@ -1515,12 +1596,16 @@ pub(super) async fn chain_put(
             return behind();
         }
         if let Some(w) = &writer {
+            // 0010 chains go up among themselves: a gk chain's number is of another range,
+            // and a 0010 chain made after the switch went off lies below it (K1)
             let highest: Option<i32> = db!(store, pool => {
-                sqlx::query_scalar("SELECT MAX(chain) FROM voipc_chains WHERE writer = $1")
+                sqlx::query_scalar("SELECT MAX(chain) FROM voipc_chains WHERE writer = $1 AND chain <= $2")
                     .bind(w.id)
+                    .bind(MAX_CHAIN as i32)
                     .fetch_one(pool)
                     .await?
             });
+            let newest = newest.filter(|n| !is_gk(*n));
             if highest.max(newest).is_some_and(|h| chain_no <= h) {
                 return behind();
             }
@@ -1734,7 +1819,7 @@ pub(super) async fn chain_put(
         return refuse("Your stored messages are over this server's limit.");
     }
     let finishes = put.last && !done;
-    if finishes && newest.is_some_and(|n| chain_no <= n) {
+    if finishes && newest.is_some_and(|n| is_gk(n) == is_gk(chain_no) && chain_no <= n) {
         return behind();
     }
     let mut told = Vec::new();
@@ -1947,6 +2032,257 @@ pub(super) async fn chain_put(
     ))
 }
 
+/// An `EpochChainStart`'s content: a gk chain's one frame (C4).
+pub(super) struct GkChainStart {
+    pub epoch: u32,
+    pub self_wrap: Vec<u8>,
+    pub link: Option<(u32, Vec<u8>)>,
+    pub group: String,
+    pub gen: [u8; 16],
+    pub gk_epoch: u32,
+    pub sealed: Vec<u8>,
+    pub last: bool,
+}
+
+/// Files a gk chain (C4): its start for our other devices, a sharer's link, and the chain's
+/// state sealed once under the key of the group's epoch it lives in, in one transaction. It
+/// is our newest chain from here, and a post goes on it at its top. Held to:
+///
+/// - The group is the channel log's own, and the epoch its head's, or the one before until
+///   `HOLD_MS` after the opening that ended it, while its seals are kept. The sweep keeps an
+///   epoch `HOLD_MS` + 2 min past that opening, and from here this chain keeps it.
+/// - gk chains go up among themselves, numbered past every 0010 chain.
+/// - Not `NEW_EPOCHS_PER_HOUR`: a start comes once per gk epoch and hour, and the group's
+///   epochs bound those (`GK_STARTS_PER_EPOCH`).
+/// - A link takes the right to share history.
+pub(super) async fn chain_start(
+    relay: &Relay,
+    me: AccountId,
+    conv: &str,
+    s: GkChainStart,
+    sharing: Sharing,
+) -> Result<(AccountReply, Vec<[u8; 16]>)> {
+    let store = relay.store();
+    let refuse = |why: &str| Ok((refused("EpochChainStart", why), Vec::new()));
+    let behind = || {
+        Ok((
+            AccountReply::ChainStored {
+                conv: conv.to_string(),
+                epoch: s.epoch,
+                behind: true,
+            },
+            Vec::new(),
+        ))
+    };
+    if !relay.cloud {
+        return refuse("This server keeps no messages.");
+    }
+    if !is_channel(conv) {
+        return refuse("not a channel's log");
+    }
+    if members(relay, conv, &me.0).await?.is_none() {
+        return refuse("not a conversation of yours");
+    }
+    let (chain, index) = gk_parts(s.epoch);
+    let row = |r: &[u8]| r.len() == ROW_BYTES;
+    if s.group != conv
+        || !s.last
+        || chain <= MAX_CHAIN
+        || index != u32::from(s.link.is_some())
+        || !row(&s.self_wrap)
+        || s.sealed.len() != CHAIN_SEAL_BYTES
+        || s.link.as_ref().is_some_and(|(_, l)| !row(l))
+    {
+        return refuse("malformed");
+    }
+    if s.link.is_some() && !sharing.may {
+        return refuse("Sharing history takes a privilege you do not hold.");
+    }
+    let chain_no = chain as i32;
+    let writer = writer_of(store, conv, &me.0).await?;
+    if let Some(w) = &writer {
+        let highest: Option<i32> = db!(store, pool => {
+            sqlx::query_scalar("SELECT MAX(chain) FROM voipc_chains WHERE writer = $1 AND chain > $2")
+                .bind(w.id)
+                .bind(MAX_CHAIN as i32)
+                .fetch_one(pool)
+                .await?
+        });
+        if highest.is_some_and(|h| chain_no <= h) {
+            return behind();
+        }
+        let starts: i64 = db!(store, pool => {
+            sqlx::query_scalar(
+                "SELECT CAST(COUNT(*) AS BIGINT) FROM voipc_gk_chains g JOIN voipc_chains c ON c.id = g.chain_id
+                  WHERE c.writer = $1 AND g.grp = $2 AND g.gen = $3 AND g.epoch = $4",
+            )
+            .bind(w.id)
+            .bind(conv)
+            .bind(&s.gen[..])
+            .bind(i64::from(s.gk_epoch))
+            .fetch_one(pool)
+            .await?
+        });
+        if starts >= GK_STARTS_PER_EPOCH {
+            return refuse("Too many new keys for this conversation; try again later.");
+        }
+    }
+    if let Some((older, _)) = &s.link {
+        let known = match &writer {
+            Some(w) if *older < chain => chain_row(store, w.id, *older as i32).await?,
+            _ => None,
+        };
+        if known.is_none() {
+            return behind();
+        }
+    }
+    let bytes =
+        (s.self_wrap.len() + s.sealed.len() + s.link.as_ref().map_or(0, |(_, l)| l.len())) as i64;
+    forget_room(relay, &me);
+    if used_bytes(relay, &me).await? + bytes > relay.quota {
+        return refuse("Your stored messages are over this server's limit.");
+    }
+    let now = util::now();
+    // Header times are the keyholder's seconds
+    let held_since = (now_ms() - HOLD_MS as i64) / 1000;
+    let mut told = Vec::new();
+    let filed: bool = db!(store, pool => {
+        let mut tx = pool.begin().await?;
+        let writer_id: i32 = sqlx::query_scalar(
+            "INSERT INTO voipc_writers (conv, owner, shares) VALUES ($1, $2, $3)
+             ON CONFLICT (conv, owner) DO UPDATE SET shares = excluded.shares RETURNING id",
+        )
+        .bind(conv)
+        .bind(&me.0[..])
+        .bind(sharing.shares)
+        .fetch_one(&mut *tx)
+        .await?;
+        let chain_id: i32 = sqlx::query_scalar(
+            "INSERT INTO voipc_chains (writer, chain, top, done, self_wrap, older, link, created_at) VALUES ($1, $2, $3, TRUE, $4, $5, $6, $7) RETURNING id",
+        )
+        .bind(writer_id)
+        .bind(chain_no)
+        .bind(index as i16)
+        .bind(s.self_wrap.as_slice())
+        .bind(s.link.as_ref().map(|(o, _)| *o as i32))
+        .bind(s.link.as_ref().map(|(_, l)| l.as_slice()))
+        .bind(now)
+        .fetch_one(&mut *tx)
+        .await?;
+        let kept = sqlx::query(
+            "INSERT INTO voipc_gk_chains (chain_id, grp, gen, epoch, idx, sealed)
+             SELECT $1, $2, $3, $4, $5, $6
+              WHERE EXISTS (SELECT 1 FROM voipc_gk_groups g WHERE g.grp = $2 AND g.gen = $3
+                AND (g.head_epoch = $4 OR (g.head_epoch = $4 + 1 AND EXISTS (SELECT 1 FROM voipc_gk_headers h
+                  WHERE h.grp = $2 AND h.gen = $3 AND h.epoch = g.head_epoch AND h.j = 0 AND h.time >= $7))))
+                AND EXISTS (SELECT 1 FROM voipc_gk_seals x WHERE x.grp = $2 AND x.gen = $3 AND x.epoch = $4
+                  AND NOT EXISTS (SELECT 1 FROM voipc_gk_pending p WHERE p.grp = x.grp AND p.commit_id = x.commit_id))",
+        )
+        .bind(chain_id)
+        .bind(conv)
+        .bind(&s.gen[..])
+        .bind(i64::from(s.gk_epoch))
+        .bind(index as i16)
+        .bind(s.sealed.as_slice())
+        .bind(held_since)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if kept == 1 {
+            sqlx::query("UPDATE voipc_writers SET newest_chain = $1, last_post_hour = $2, key_bytes = key_bytes + $3 WHERE id = $4")
+                .bind(chain_no)
+                .bind(now / 3600)
+                .bind(bytes)
+                .bind(writer_id)
+                .execute(&mut *tx)
+                .await?;
+            // A writer who does not share owes nobody more than this
+            if !sharing.shares {
+                let answered: Vec<Vec<u8>> = sqlx::query_scalar("DELETE FROM voipc_pending WHERE conv = $1 AND owner = $2 RETURNING recipient")
+                    .bind(conv)
+                    .bind(&me.0[..])
+                    .fetch_all(&mut *tx)
+                    .await?;
+                told.extend(answered.into_iter().map(id16));
+            }
+            tx.commit().await?;
+        }
+        kept == 1
+    });
+    if !filed {
+        return refuse("That epoch's key is gone here; the next post starts anew.");
+    }
+    Ok((
+        AccountReply::ChainStored {
+            conv: conv.to_string(),
+            epoch: s.epoch,
+            behind: false,
+        },
+        told,
+    ))
+}
+
+/// A gk chain's seal as kept: index, group, generation, epoch, seal.
+type GkChainRow = (i16, String, Vec<u8>, i64, Vec<u8>);
+
+/// The gk seals of `chains` of a channel a member reads (C4): each `(owner, chain)` with a
+/// `voipc_gk_chains` row; a chain with none is a 0010 one and gets no key. Every stored
+/// member of the conversation is served: who opens a seal is the group key's to say.
+pub(super) async fn gk_chain_keys(
+    relay: &Relay,
+    me: AccountId,
+    conv: &str,
+    chains: &[([u8; 16], u32)],
+) -> Result<AccountReply> {
+    if !is_channel(conv) || !is_member(relay, conv, &me.0).await? {
+        return Ok(refused("EpochChainKeys", "not a conversation of yours"));
+    }
+    if chains.len() > CHAIN_KEYS_MAX {
+        return Ok(refused("EpochChainKeys", "too many chains at once"));
+    }
+    let mut keys = Vec::new();
+    for (owner, chain) in chains {
+        let Ok(chain_no) = i32::try_from(*chain) else {
+            continue;
+        };
+        let row: Option<GkChainRow> = db!(relay.store(), pool => {
+            sqlx::query_as(
+                "SELECT g.idx, g.grp, g.gen, g.epoch, g.sealed FROM voipc_gk_chains g
+                   JOIN voipc_chains c ON c.id = g.chain_id JOIN voipc_writers w ON w.id = c.writer
+                  WHERE w.conv = $1 AND w.owner = $2 AND c.chain = $3",
+            )
+            .bind(conv)
+            .bind(&owner[..])
+            .bind(chain_no)
+            .fetch_optional(pool)
+            .await?
+        });
+        let Some((index, group, gen, epoch, sealed)) = row else {
+            continue;
+        };
+        let (Ok(index), Ok(gen), Ok(epoch)) = (
+            u8::try_from(index),
+            <[u8; 16]>::try_from(gen),
+            u32::try_from(epoch),
+        ) else {
+            continue;
+        };
+        keys.push(GkChainKey {
+            owner: *owner,
+            chain: *chain,
+            index,
+            group,
+            gen,
+            epoch,
+            sealed,
+        });
+    }
+    Ok(AccountReply::EpochChainKeys {
+        conv: conv.to_string(),
+        keys,
+    })
+}
+
 /// A writer's rows, counted again: the running count only goes up between sweeps, and
 /// this is what brings it back. Seat rows at half: a first post in 300 channels at 5000
 /// seats is then 45 MB of a 50 MB quota, where whole it would stop at 166 channels, and
@@ -2111,6 +2447,10 @@ fn run_up(chains: &HashMap<i32, (i32, Option<i32>)>, held: &HashSet<i32>, from: 
 /// What a reader can open of one writer's entries, found as a page of them is read.
 struct Reach {
     writer: Option<i32>,
+    /// Whether an entry's epoch is on a gk chain, by `epoch >> 1`: every stored member may
+    /// be able to open those, by the group's key (C4). Asked only of a writer with one.
+    gk: HashMap<u32, bool>,
+    has_gk: Option<bool>,
     lowest: HashMap<i32, Option<i16>>,
     run: Option<HashSet<i32>>,
     /// Keys of a version before chains that this reader holds from this writer, the
@@ -2123,6 +2463,8 @@ impl Reach {
         let writer = writer_of(store, conv, owner).await?.map(|w| w.id);
         Ok(Reach {
             writer,
+            gk: HashMap::new(),
+            has_gk: None,
             lowest: HashMap::new(),
             run: None,
             old: None,
@@ -2163,6 +2505,24 @@ impl Reach {
         let (Some(writer), (chain, index)) = (self.writer, epoch_parts(epoch)) else {
             return Ok(false);
         };
+        if self.has_gk.is_none() {
+            let any: Option<i64> = db!(store, pool => {
+                sqlx::query_scalar("SELECT CAST(1 AS BIGINT) FROM voipc_chains WHERE writer = $1 AND chain > $2 LIMIT 1")
+                    .bind(writer)
+                    .bind(MAX_CHAIN as i32)
+                    .fetch_optional(pool)
+                    .await?
+            });
+            self.has_gk = Some(any.is_some());
+        }
+        if self.has_gk == Some(true) {
+            if let std::collections::hash_map::Entry::Vacant(e) = self.gk.entry(epoch >> 1) {
+                e.insert(gk_chain(store, writer, epoch).await?.is_some());
+            }
+            if self.gk[&(epoch >> 1)] {
+                return Ok(true);
+            }
+        }
         let chain = chain as i32;
         if let std::collections::hash_map::Entry::Vacant(e) = self.lowest.entry(chain) {
             e.insert(match chain_row(store, writer, chain).await? {
@@ -2895,21 +3255,25 @@ async fn sweep_channel(relay: &Relay, conv: &str, now_ms: i64) -> Result<u64> {
 /// left, unless it is a writer's newest and they posted lately, it was made in the last
 /// hour, or a chain below it in its run of links is still alive, which a reader walks
 /// through it to reach. Self-wraps go with their chains. Direct conversations never come here.
+/// A gk chain goes by its entries alone (C4): no newest-chain spare, and young only for
+/// `HOLD_MS`, so `kept_window` and `retention_days` bound the group key's material it keeps.
 async fn sweep_keys(relay: &Relay, conv: &str, floor: i64, now_ms: i64) -> Result<()> {
     let store = relay.store();
     let now = util::now();
-    let live: HashSet<(Vec<u8>, i64)> = db!(store, pool => {
-        sqlx::query_as::<_, (Vec<u8>, i64)>(
-            "SELECT DISTINCT sender, CAST(epoch / 4096 AS BIGINT) FROM voipc_log WHERE conv = $1 AND seq >= $2 AND keep_until > $3",
-        )
-        .bind(conv)
-        .bind(floor)
-        .bind(now_ms)
-        .fetch_all(pool)
-        .await?
-    })
-    .into_iter()
-    .collect();
+    // By the entries' chains as 0010 epochs pack them, and as gk epochs do
+    let live_by = |q: &'static str| async move {
+        let rows: Vec<(Vec<u8>, i64)> = db!(store, pool => {
+            sqlx::query_as::<_, (Vec<u8>, i64)>(q)
+                .bind(conv)
+                .bind(floor)
+                .bind(now_ms)
+                .fetch_all(pool)
+                .await?
+        });
+        anyhow::Ok(rows.into_iter().collect::<HashSet<(Vec<u8>, i64)>>())
+    };
+    let live = live_by("SELECT DISTINCT sender, CAST(epoch / 4096 AS BIGINT) FROM voipc_log WHERE conv = $1 AND seq >= $2 AND keep_until > $3").await?;
+    let live_gk = live_by("SELECT DISTINCT sender, CAST(epoch / 2 AS BIGINT) FROM voipc_log WHERE conv = $1 AND seq >= $2 AND keep_until > $3").await?;
     let writers: Vec<(i32, Vec<u8>, Option<i32>, i64)> = db!(store, pool => {
         sqlx::query_as("SELECT id, owner, newest_chain, last_post_hour FROM voipc_writers WHERE conv = $1")
             .bind(conv)
@@ -2928,15 +3292,24 @@ async fn sweep_keys(relay: &Relay, conv: &str, floor: i64, now_ms: i64) -> Resul
         let mut unfinished = Vec::new();
         let mut drop = Vec::new();
         for (id, chain, older, done, created_at) in chains {
-            let young = created_at > now - UNFINISHED_SECS;
+            let gk = is_gk(chain);
+            let young = created_at
+                > now
+                    - if gk {
+                        HOLD_MS as i64 / 1000
+                    } else {
+                        UNFINISHED_SECS
+                    };
             if !done && !young {
                 unfinished.push(id);
                 continue;
             }
-            let has = live.contains(&(owner.clone(), i64::from(chain)));
+            let has =
+                if gk { &live_gk } else { &live }.contains(&(owner.clone(), i64::from(chain)));
             let below = older.is_some_and(|o| alive_below.get(&o).copied().unwrap_or(false));
             alive_below.insert(chain, has || below);
-            let recent = newest == Some(chain) && last_post_hour > now / 3600 - NEWEST_KEPT_HOURS;
+            let recent =
+                !gk && newest == Some(chain) && last_post_hour > now / 3600 - NEWEST_KEPT_HOURS;
             if !(has || below || young || recent) {
                 drop.push(id);
             }
@@ -3091,13 +3464,17 @@ async fn sweep_buckets(store: &Store, writer: i32, unfinished: &[i32], now: i64)
 /// A deleted account's rows per writer: those frozen, on no newest chain, go now. One a
 /// newest chain still reaches stays until that writer's next post has started a new chain
 /// without it, since it is what says to. The stone goes when no row names the account.
-async fn sweep_tombstones(store: &Store) -> Result<()> {
+/// The group key's (no foreign key to accounts, plan 2g): its self-rows go now, its seats
+/// exit and its keyholder entries are removed, whatever path deleted it; the stone stays
+/// while a seat sits or an entry is held.
+async fn sweep_tombstones(relay: &Relay) -> Result<()> {
+    let store = relay.store();
     let stones: Vec<Vec<u8>> = db!(store, pool => {
         sqlx::query_scalar("SELECT account FROM voipc_tombstones").fetch_all(pool).await?
     });
     for account in stones {
         let mut after = 0i32;
-        let mut left = 0i64;
+        let mut left = relay.gk_tombstone(&id16(account.clone())).await?;
         loop {
             let writers: Vec<(i32, Option<i32>)> = db!(store, pool => {
                 sqlx::query_as(

@@ -1,7 +1,6 @@
 //! The head as the actor last took it (plan 2a): a `HeadSnapshot` published as an `Arc`
 //! at each taken commit, from which seated fetches are answered outside the actor, and the
 //! `HeadView` the plain-post check reads.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::HashMap;
 use std::sync::Arc;

@@ -69,6 +69,9 @@ pub(super) struct Member {
     /// Headers taken this run, newest last: an answer built before a push it overtook is
     /// below the floor but no sign of a relay behind it (3c).
     recent: VecDeque<[u8; 32]>,
+    /// Headers taken since the keyholder duty last looked (`D`, parent's `D`): one `EpochIn`
+    /// may carry many (a reconnect's catch-up), and a Join of ours among them is named.
+    pub(super) took: Vec<([u8; 32], [u8; 32])>,
     /// When this device last took a header, by its clock (unix seconds).
     pub(super) taken: Option<u64>,
     /// The head epoch's opening `time`, where known.
@@ -152,6 +155,7 @@ impl Member {
             head: None,
             floor_hdr: None,
             recent: VecDeque::new(),
+            took: Vec::new(),
             taken: None,
             opened: None,
             kh_seen: BTreeMap::new(),
@@ -339,9 +343,12 @@ impl Member {
             let waiting = !self.writer.is_empty();
             self.tell(GkState::Late { waiting }, out);
         }
-        // Asked again once its pause is over, while a post of ours or one to read waits
+        // Asked again once its pause is over, while a post of ours or one to read waits; a
+        // voice room always waits for its keys (V1)
         let again = self.retry_at.is_some_and(|t| c.now >= t)
-            && (!self.writer.is_empty() || self.reader.waiting());
+            && (!self.writer.is_empty()
+                || self.reader.waiting()
+                || self.t.kind == GroupKind::Voice);
         if unanswered || old || again {
             self.fetch(who, c.now, out);
         }
@@ -543,8 +550,9 @@ impl Member {
         c: &mut GkCtx,
         out: &mut GkOut,
     ) {
-        // A push answers no fetch: one out is still awaited
-        if !p.pushed {
+        // A push answers no fetch, nor does a past epoch (a kept read's): one out is still
+        // awaited
+        if !p.pushed && p.past.is_none() {
             self.fetching = None;
         }
         if p.past.is_some() {
@@ -1021,6 +1029,7 @@ impl Member {
         while self.recent.len() > RECENT_MOST {
             self.recent.pop_front();
         }
+        self.took.push((h.d(), hd.parent));
         self.taken = Some(c.secs());
         self.moved = true;
         if self.stored() && who.account.is_some() {
@@ -1315,4 +1324,87 @@ pub(super) fn merge_in(parts: Vec<InPiece>) -> Result<InPiece, gk::Bad> {
         return Err(gk::Bad::Length("seal"));
     }
     Ok(w)
+}
+
+#[cfg(test)]
+mod tests {
+    use libsignal_protocol::IdentityKeyPair;
+    use voipc_protocol::gk;
+    use voipc_protocol::messages::{ClientMessage, ServerMessage};
+
+    use super::super::{
+        GkCtx, GkOut, GkStart, GkTrack, GroupKeying, MemoryPins, Platform, VaultFloor,
+    };
+    use crate::group_key::build::world::{T0, TEXT_ID};
+    use crate::group_key::timers::CHECK_WAIT_MS;
+    use crate::group_key::{GroupKind, SeatKeys};
+    use crate::stores::SignalStores;
+
+    fn fetches(out: &GkOut) -> usize {
+        out.send
+            .iter()
+            .filter(|m| matches!(m, ClientMessage::EpochFetch { .. }))
+            .count()
+    }
+
+    /// K1: a kept read's answer (`past`) answers no live fetch; the one out is still awaited,
+    /// and asked again only once its wait is over.
+    #[test]
+    fn a_past_answer_leaves_the_live_fetch_out() {
+        let ik = IdentityKeyPair::generate(&mut crate::rng());
+        let mut keying = GroupKeying::default();
+        let _ = keying.start(GkStart {
+            on: true,
+            run: [0x11; 16],
+            relay_clock: T0,
+            platform: Platform::Desktop,
+            help_hold_keys: false,
+            user_id: 20,
+            identity: ik,
+            account: Some([7; 16]),
+            seat_keys: Some(SeatKeys::generate(1, T0)),
+            local: None,
+            visible: true,
+        });
+        let t = GkTrack {
+            channel_id: 1,
+            group: TEXT_ID.into(),
+            kind: GroupKind::Text,
+            anonymous: false,
+            hide_members: false,
+            viewer_admin: false,
+            keeps_history: true,
+        };
+        assert_eq!(fetches(&keying.track(t, VaultFloor::None)), 1);
+        let (mut st, mut pins) = (SignalStores::new(&ik, 20), MemoryPins::default());
+        let now = crate::time::now_millis();
+        let past = ServerMessage::EpochIn {
+            group: TEXT_ID.into(),
+            part: 0,
+            last: true,
+            piece: Box::new(gk::InPiece {
+                past: Some(gk::EpochRef {
+                    gen: [1; 16],
+                    epoch: 1,
+                }),
+                ..gk::InPiece::default()
+            }),
+        };
+        let c = GkCtx {
+            pins: &mut pins,
+            now,
+        };
+        let _ = keying.frame(&mut st, &past, c);
+        assert_eq!(
+            fetches(&keying.floors_in(TEXT_ID, None)),
+            0,
+            "the live fetch is still out"
+        );
+        let c = GkCtx {
+            pins: &mut pins,
+            now: now + CHECK_WAIT_MS,
+        };
+        let out = keying.tick(&mut st, c);
+        assert_eq!(fetches(&out), 1, "asked again once its wait is over");
+    }
 }

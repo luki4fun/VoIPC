@@ -183,6 +183,10 @@ pub async fn handle_connection<S>(
             return;
         }
     }
+    // Where its groups send it what they push, before it can follow any
+    if state.gk.on {
+        state.gk.on_connect(session_id, tx.clone());
+    }
 
     // Send channel list
     let channel_list = state.channel_list_for(session_id).await;
@@ -261,6 +265,7 @@ pub async fn handle_connection<S>(
                 let ping = ServerMessage::Ping { timestamp };
                 let _ = send_msg(&tx, &ping);
                 debug!(user_id, "sent keepalive ping");
+                Box::pin(gk_volunteer_late(&state, session_id, &tx)).await;
                 false
             }
             _ = close.notified() => {
@@ -1005,13 +1010,17 @@ async fn handle_message(
             channel_id,
             restart,
         } => {
-            handle_key_check(state, user_id, session_id, channel_id, restart, tx).await;
+            if !legacy_refused(state, session_id, channel_id, tx).await {
+                handle_key_check(state, user_id, session_id, channel_id, restart, tx).await;
+            }
         }
         ClientMessage::OpenSessions {
             channel_id,
             targets,
         } => {
-            handle_open_sessions(state, user_id, session_id, channel_id, targets, tx).await;
+            if !legacy_refused(state, session_id, channel_id, tx).await {
+                handle_open_sessions(state, user_id, session_id, channel_id, targets, tx).await;
+            }
         }
         ClientMessage::SessionHello {
             to,
@@ -1023,7 +1032,9 @@ async fn handle_message(
             }
         }
         ClientMessage::DistributeSenderKeys { channel_id, keys } => {
-            handle_distribute_sender_keys(state, user_id, session_id, channel_id, keys).await;
+            if !legacy_refused(state, session_id, channel_id, tx).await {
+                handle_distribute_sender_keys(state, user_id, session_id, channel_id, keys).await;
+            }
         }
         ClientMessage::RenewSessionKeys {
             signed_prekey_id,
@@ -1534,24 +1545,37 @@ async fn handle_message(
                 _ => {}
             }
         }
-        // The group key's: dropped until R1 handles them (plan 2a, `gk/session.rs`)
-        ClientMessage::EpochFetch { .. }
+        ClientMessage::EpochPost {
+            channel_id,
+            group,
+            gen,
+            epoch,
+            blob,
+            ciphertext,
+        } => {
+            let post = GkPost {
+                channel_id,
+                group,
+                gen,
+                epoch,
+                blob,
+                ciphertext,
+            };
+            handle_epoch_post(state, user_id, session_id, post, tx).await;
+        }
+        msg @ (ClientMessage::EpochFetch { .. }
         | ClientMessage::EpochCommit { .. }
         | ClientMessage::EpochDecline { .. }
         | ClientMessage::EpochWelcomes { .. }
         | ClientMessage::EpochListsWanted { .. }
         | ClientMessage::KeyringWanted { .. }
-        | ClientMessage::EpochPost { .. }
         | ClientMessage::EpochBlobWanted { .. }
         | ClientMessage::EpochNames { .. }
         | ClientMessage::EpochFloorAhead { .. }
         | ClientMessage::KeyholdVolunteer { .. }
         | ClientMessage::KeyholdResign { .. }
-        | ClientMessage::KeyholdReplace { .. } => {
-            debug!(
-                user_id,
-                "a group key message, which this relay does not take yet"
-            );
+        | ClientMessage::KeyholdReplace { .. }) => {
+            handle_gk(state, session_id, msg, tx).await;
         }
         ClientMessage::Authenticate { .. } | ClientMessage::AuthContinue(_) => {
             // debug, like the other things a client can repeat at line rate:
@@ -1647,7 +1671,9 @@ async fn handle_message(
             channel_id,
             ciphertext,
         } => {
-            if relayable(&ciphertext, tx).await {
+            if !legacy_refused(state, session_id, channel_id, tx).await
+                && relayable(&ciphertext, tx).await
+            {
                 let allowed = state.spend(session_id, |s| &mut s.chat_rate);
                 if !allowed {
                     channel_error(tx, "sending too fast, slow down").await;
@@ -4127,6 +4153,337 @@ async fn handle_encrypted_channel_message(
     }
 
     Ok(())
+}
+
+/// The group key's asks but `EpochPost` (`gk::session`), past this connection's budgets (plan
+/// 1b): over one, `EpochRefused{RATE}`, which the app paces, or for what needs no answer
+/// nothing. With the key off only a fetch goes on, for the kept reads such a relay still
+/// serves (2i); the rest is dropped.
+async fn handle_gk(
+    state: &Arc<ServerState>,
+    session_id: SessionId,
+    msg: ClientMessage,
+    tx: &ControlTx,
+) {
+    use voipc_protocol::gk::refused_why;
+    if !state.gk.on && !matches!(msg, ClientMessage::EpochFetch { .. }) {
+        debug!(session_id, "a group key message with the key off, dropped");
+        return;
+    }
+    let budget = state
+        .sessions
+        .get_mut(&session_id)
+        .map_or(Err(None), |mut s| gk_budget(&mut s, &msg));
+    match budget {
+        Ok(()) => state.gk.handle(state, session_id, msg, tx).await,
+        Err(Some((group, what))) => {
+            let _ = send_msg(
+                tx,
+                &ServerMessage::EpochRefused {
+                    group,
+                    what,
+                    why: refused_why::RATE,
+                    detail: String::new(),
+                },
+            );
+        }
+        Err(None) => debug!(session_id, "a group key message over its budget, dropped"),
+    }
+}
+
+/// A `KeyholdVolunteer{on}` held past its budget goes once a token is there, looked at each
+/// keepalive tick: the page that sent it is shown still (an `off` would have dropped it).
+async fn gk_volunteer_late(state: &Arc<ServerState>, session_id: SessionId, tx: &ControlTx) {
+    let held = state.sessions.get_mut(&session_id).and_then(|mut s| {
+        if s.gk_volunteer_held.is_none() || !s.gk_volunteer_rate.try_consume() {
+            return None;
+        }
+        s.gk_volunteered = true;
+        s.gk_volunteer_held.take()
+    });
+    if let Some(msg) = held {
+        state.gk.handle(state, session_id, msg, tx).await;
+    }
+}
+
+/// How often one connection may tell a group its floor is ahead (plan 1b), and of how many
+/// groups at once. The app tells each once an hour (`FLOOR_AHEAD_GAP_SECS`).
+const FLOOR_AHEAD_GAP: Duration = Duration::from_secs(60);
+const FLOOR_AHEAD_GROUPS: usize = 64;
+
+/// Whether `msg` is within this connection's budget (plan 1b): `Err(Some((group, what)))`
+/// to refuse `RATE`, `Err(None)` to drop what the app needs no answer to.
+fn gk_budget(
+    s: &mut crate::state::UserSession,
+    msg: &ClientMessage,
+) -> std::result::Result<(), Option<(String, u8)>> {
+    use voipc_protocol::gk::refused_what;
+    let paced = |within: bool, group: &str, what: u8| match within {
+        true => Ok(()),
+        false => Err(Some((group.to_string(), what))),
+    };
+    match msg {
+        ClientMessage::EpochFetch { group, .. } => {
+            paced(s.gk_fetch_rate.try_consume(), group, refused_what::FETCH)
+        }
+        ClientMessage::EpochBlobWanted { group, .. } => {
+            paced(s.gk_blob_rate.try_consume(), group, refused_what::BLOB)
+        }
+        ClientMessage::EpochNames { group, .. } => {
+            paced(s.gk_names_rate.try_consume(), group, refused_what::NAMES)
+        }
+        // An offer reads the database and reaches every group followed. Past its budget the
+        // newest is held for a later tick (`gk_volunteer_late`), never refused
+        ClientMessage::KeyholdVolunteer { on: true, .. } => {
+            if !s.gk_volunteer_rate.try_consume() {
+                s.gk_volunteer_held = Some(msg.clone());
+                return Err(None);
+            }
+            s.gk_volunteer_held = None;
+            s.gk_volunteered = true;
+            Ok(())
+        }
+        ClientMessage::KeyholdVolunteer { on: false, .. } => {
+            s.gk_volunteer_held = None;
+            match std::mem::take(&mut s.gk_volunteered) {
+                true => Ok(()),
+                false => Err(None),
+            }
+        }
+        // A notice: it costs the group's task a signature check and a log line
+        ClientMessage::EpochFloorAhead { group, .. } => {
+            let now = Instant::now();
+            s.gk_ahead
+                .retain(|_, at| now.duration_since(*at) < FLOOR_AHEAD_GAP);
+            if s.gk_ahead.contains_key(group) || s.gk_ahead.len() >= FLOOR_AHEAD_GROUPS {
+                return Err(None);
+            }
+            s.gk_ahead.insert(group.clone(), now);
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// An `EpochPost`'s fields.
+struct GkPost {
+    channel_id: ChannelId,
+    group: String,
+    gen: [u8; 16],
+    epoch: u32,
+    blob: Option<Vec<u8>>,
+    ciphertext: Vec<u8>,
+}
+
+/// `EpochPost`: a text channel's post under its group's epoch key (plan 1f). Its size and
+/// budgets here, as it is read; the rest (`finish_epoch_post`) right away, or, when it
+/// carries a blob (which the group's task stores before the post goes) or this
+/// connection's last post still waits on one, in a task behind that one: the connection's
+/// posts keep their order and its other frames are read meanwhile (2a). The budgets bound
+/// what waits so. Voice rooms are not here yet (V2).
+async fn handle_epoch_post(
+    state: &Arc<ServerState>,
+    user_id: UserId,
+    session_id: SessionId,
+    post: GkPost,
+    tx: &ControlTx,
+) {
+    use voipc_protocol::gk::refused_why;
+    if !state.gk.on {
+        return epoch_refused(tx, &post, refused_why::OFF, "");
+    }
+    if post.ciphertext.len() > MAX_TEXT_POST.min(MAX_RELAY_CIPHERTEXT) {
+        return rule_refused(tx, &post, refused_why::TOO_LARGE, "message too large").await;
+    }
+    let bytes = post.ciphertext.len() as f64;
+    let Some(budget) = state
+        .sessions
+        .get_mut(&session_id)
+        .map(|mut s| s.gk_post_rate.try_consume() && s.post_bytes_rate.try_consume_n(bytes))
+    else {
+        return;
+    };
+    if !budget {
+        let reason = "sending too fast, slow down";
+        return rule_refused(tx, &post, refused_why::NOT_MEMBER, reason).await;
+    }
+    let waiting = |t: &mut oneshot::Receiver<()>| {
+        matches!(t.try_recv(), Err(oneshot::error::TryRecvError::Empty))
+    };
+    let tail = state
+        .sessions
+        .get_mut(&session_id)
+        .and_then(|mut s| s.gk_post_tail.take())
+        .and_then(|mut t| waiting(&mut t).then_some(t));
+    if tail.is_none() && post.blob.is_none() {
+        return finish_epoch_post(state, user_id, session_id, post, tx).await;
+    }
+    let (done, next) = oneshot::channel::<()>();
+    if let Some(mut s) = state.sessions.get_mut(&session_id) {
+        s.gk_post_tail = Some(next);
+    }
+    let (state, tx) = (state.clone(), tx.clone());
+    tokio::spawn(async move {
+        if let Some(tail) = tail {
+            let _ = tail.await;
+        }
+        finish_epoch_post(&state, user_id, session_id, post, &tx).await;
+        let _ = done.send(());
+    });
+}
+
+/// `EpochRefused{POST, why}` for `post`.
+fn epoch_refused(tx: &ControlTx, post: &GkPost, why: u8, detail: &str) {
+    let _ = send_msg(
+        tx,
+        &ServerMessage::EpochRefused {
+            group: post.group.clone(),
+            what: voipc_protocol::gk::refused_what::POST,
+            why,
+            detail: detail.to_string(),
+        },
+    );
+}
+
+/// A post the relay's own rules refused (size, budgets, the channel's): a post carrying a
+/// blob is refused `EpochRefused{POST, why}` with the words in `detail`, which the app
+/// shows as it drops the latest post that started a chain, this one. Any other is told as
+/// the old path tells it (`ChannelError`): refused `POST`, the app would drop an earlier
+/// post that went, with its chain, and the next chain's blob would be one more of the
+/// epoch's two (`THIRD_BLOB`; gk/session.rs `post_check`).
+async fn rule_refused(tx: &ControlTx, post: &GkPost, why: u8, reason: &str) {
+    match post.blob {
+        Some(_) => epoch_refused(tx, post, why, reason),
+        None => channel_error(tx, reason).await,
+    }
+}
+
+/// The rest of an `EpochPost` past its budgets: the live path's rules (`post_rules`), then
+/// the group key's (`post_check`: the epoch, a blob stored before the post goes), then
+/// `EpochPostIn` to everyone following whole, the same bytes to each. At `OLD_EPOCH` and
+/// `RATE` the app sends it again, so slow mode's clock starts only once a post goes.
+async fn finish_epoch_post(
+    state: &Arc<ServerState>,
+    user_id: UserId,
+    session_id: SessionId,
+    post: GkPost,
+    tx: &ControlTx,
+) {
+    use voipc_protocol::gk::{refused_why, GkMember};
+    // The group the channel has now: one that moved (`hide_members`) is not this one
+    let here = state
+        .channels
+        .read()
+        .await
+        .get(&post.channel_id)
+        .filter(|c| c.info.text)
+        .map(|c| state.gk_id(c));
+    if here.as_deref() != Some(post.group.as_str()) {
+        let reason = "that channel's key changed, send it again";
+        return rule_refused(tx, &post, refused_why::NOT_MEMBER, reason).await;
+    }
+    use crate::state::PostStamp;
+    let channel_id = post.channel_id;
+    let rules = move |stamp| state.post_rules(session_id, user_id, channel_id, stamp);
+    if let Err(reason) = rules(PostStamp::Check).await {
+        return rule_refused(tx, &post, refused_why::NOT_MEMBER, &reason).await;
+    }
+    let (gen, epoch) = (post.gen, post.epoch);
+    if let Err(why) = state
+        .gk
+        .post_check(user_id, &post.group, gen, epoch, post.blob.clone())
+        .await
+    {
+        return epoch_refused(tx, &post, why, "");
+    }
+    if let Err(reason) = rules(PostStamp::Live).await {
+        return rule_refused(tx, &post, refused_why::NOT_MEMBER, &reason).await;
+    }
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let readers: Vec<ControlTx> = {
+        let channels = state.channels.read().await;
+        let Some(channel) = channels.get(&channel_id) else {
+            return;
+        };
+        channel
+            .follow
+            .last_post_ms
+            .store(timestamp, std::sync::atomic::Ordering::Relaxed);
+        channel
+            .follow
+            .joined
+            .keys()
+            .filter(|uid| **uid != user_id)
+            .filter_map(|uid| Some(state.sessions.get(uid)?.control_tx.clone()))
+            .collect()
+    };
+    let GkPost {
+        group,
+        blob,
+        ciphertext,
+        ..
+    } = post;
+    let Some(msg) = state.sessions.get(&session_id).map(|s| {
+        let account = s.account_id();
+        ServerMessage::EpochPostIn {
+            channel_id,
+            group,
+            gen,
+            epoch,
+            user_id,
+            username: s.username.clone(),
+            account,
+            is_admin: s.is_admin,
+            is_moderator: s.powers.has(Powers::CHANNELS),
+            writer: account.map_or(GkMember::Conn(user_id), GkMember::Account),
+            blob,
+            ciphertext,
+            timestamp,
+        }
+    }) else {
+        return;
+    };
+    if let Ok(data) = encode_server_msg(&msg).map(bytes::Bytes::from) {
+        for tx in readers {
+            let _ = tx.try_send(data.clone());
+        }
+    }
+}
+
+/// A text channel's old key path with the group key on (plan 2k): `KeyCheck`,
+/// `OpenSessions`, `DistributeSenderKeys` and `SendEncryptedChannelMessage` would reach nobody
+/// there, so they are dropped, and the app is told once a connection. Voice rooms keep theirs
+/// until their group is built (V2); a room's kept log stays on its own path either way (open
+/// choice 26). Whether it was refused.
+async fn legacy_refused(
+    state: &ServerState,
+    session_id: SessionId,
+    channel_id: ChannelId,
+    tx: &ControlTx,
+) -> bool {
+    use voipc_protocol::gk::{refused_what, refused_why};
+    if !state.gk.on || !state.is_text_channel(channel_id).await {
+        return false;
+    }
+    let first = state
+        .sessions
+        .get_mut(&session_id)
+        .is_some_and(|mut s| !std::mem::replace(&mut s.gk_legacy_told, true));
+    if first {
+        let _ = send_msg(
+            tx,
+            &ServerMessage::EpochRefused {
+                group: String::new(),
+                what: refused_what::LEGACY,
+                why: refused_why::LEGACY_PATH,
+                detail: String::new(),
+            },
+        );
+    }
+    true
 }
 
 /// A post on the live path: to whoever its writer has been told of, so a key is always ahead

@@ -3,7 +3,6 @@
 //! `PIECE_MAX_BYTES` with its frame around it. A list spreads over parts in order; an
 //! `Option` goes whole into the first part with room, once a sequence. Every item fits a
 //! part alone (part 13), so nothing here splits one.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use serde::Serialize;
 use voipc_protocol::gk::{

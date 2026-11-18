@@ -11,12 +11,14 @@ use tokio::sync::{mpsc, RwLock};
 use tracing::warn;
 use zeroize::Zeroizing;
 
+use voipc_crypto::group_key::GroupKind;
 use voipc_protocol::messages::ServerMessage;
 use voipc_protocol::types::*;
 
 use crate::channels::{ChannelEntry, MAX_SLOW_MODE_SECS};
 use crate::config::ServerConfig;
 use crate::control::ControlTx;
+use crate::gk::group::cause as gk_cause;
 use crate::settings::ServerSettings;
 
 /// Simple token-bucket rate limiter.
@@ -239,6 +241,34 @@ pub struct UserSession {
     /// The edges that failed this viewer lately, with when: none of them is picked for it
     /// again for `pool::AVOID_FOR`. At most `pool::MAX_AVOID`.
     pub edge_avoid: Vec<(String, Instant)>,
+    /// The group key's asks (plan 1b), each refused `RATE` past its budget, which the app
+    /// paces: `EpochFetch` 10/s after a burst of 50 (one token a frame, however many past
+    /// epochs it names), `EpochBlobWanted` 20/s, `EpochNames` 1/s (a connect into a few
+    /// gated channels asks each once).
+    pub gk_fetch_rate: RateLimiter,
+    pub gk_blob_rate: RateLimiter,
+    pub gk_names_rate: RateLimiter,
+    /// `EpochPost`s: `chat_rate`'s 5 a second, but 32 at once, since an app sends everything
+    /// of the last `HOLD_MS` at once after `OLD_EPOCH` or `RATE`, and every post it held
+    /// while it waited for its key (writer.rs `flush`); a post refused here is lost to it.
+    pub gk_post_rate: RateLimiter,
+    /// `KeyholdVolunteer{on}`: 1 a minute after a burst of 4 (plan 1b). A browser offers
+    /// each time its page shows; past the budget its newest offer is held, not refused.
+    pub gk_volunteer_rate: RateLimiter,
+    /// The newest `KeyholdVolunteer{on}` past its budget: it goes at the first keepalive
+    /// tick with a token (`gk_volunteer_late`), unless an `off` came after it. Refused, the
+    /// app would think itself offered for good (a refusal names no group it could place).
+    pub gk_volunteer_held: Option<voipc_protocol::messages::ClientMessage>,
+    /// The last `KeyholdVolunteer` let through was `on`: an `off` changes nothing otherwise.
+    pub gk_volunteered: bool,
+    /// When an `EpochFloorAhead` went last, per group (plan 1b: 1 a minute a group).
+    pub gk_ahead: HashMap<String, Instant>,
+    /// This connection's last `EpochPost` still waiting on its group's task (a blob does):
+    /// the next one waits behind it, so its posts keep their order while its other frames
+    /// are read on (plan 2a: never a blocked session).
+    pub gk_post_tail: Option<tokio::sync::oneshot::Receiver<()>>,
+    /// An old key path was refused on this connection already (plan 2k): told once.
+    pub gk_legacy_told: bool,
 
     // ── E2E Encryption fields ─────────────────────────────────────────
     /// Client's long-term identity public key (Curve25519). Opaque to server.
@@ -438,6 +468,16 @@ impl UserSession {
             tunnel: false,
             edge_failed_rate: RateLimiter::new(1.0, 0.5),
             edge_avoid: Vec::new(),
+            gk_fetch_rate: RateLimiter::new(50.0, 10.0),
+            gk_blob_rate: RateLimiter::new(20.0, 20.0),
+            gk_names_rate: RateLimiter::new(4.0, 1.0),
+            gk_post_rate: RateLimiter::new(32.0, 5.0),
+            gk_volunteer_rate: RateLimiter::new(4.0, 1.0 / 60.0),
+            gk_volunteer_held: None,
+            gk_volunteered: false,
+            gk_ahead: HashMap::new(),
+            gk_post_tail: None,
+            gk_legacy_told: false,
             identity_key: None,
             bundle: None,
         }
@@ -2162,9 +2202,31 @@ impl ServerState {
             let listen = !crate::gates::passes(&session, &channel.gate.speakers);
             crate::gates::mark(&mut session.listen_only, channel_id, listen);
             joined.push(channel.seat_row(listen));
+            self.gk_follow(channel, user_id, session.account_id());
         }
         drop(session);
         send_text_joined(tx, joined, refused);
+    }
+
+    /// A text channel's group id (spec §11.1): `c:` its offered log, else `r:`.
+    pub(crate) fn gk_id(&self, channel: &Channel) -> String {
+        let log = Some(channel.info.log.as_str()).filter(|l| !l.is_empty());
+        self.gk.id_for(channel.info.channel_id, log)
+    }
+
+    /// A follower of a text channel, whole or quiet, follows its group (plan 2a). The
+    /// channel's gate goes first where the group key does not hold it yet (a channel loaded
+    /// or made with one): the group, whichever path started it, holds it before any due.
+    fn gk_follow(&self, channel: &Channel, user_id: UserId, account: Option<[u8; 16]>) {
+        if !self.gk.on {
+            return;
+        }
+        let (channel_id, id) = (channel.info.channel_id, self.gk_id(channel));
+        if self.gk.gated(channel_id) != channel.gated() {
+            self.gk.on_gate(channel_id, channel.gated());
+        }
+        self.gk
+            .on_follow(channel_id, &id, GroupKind::Text, user_id, account);
     }
 
     /// Takes followed channels whole or quiet. Going quiet is no exit: nobody rotates, and
@@ -2361,6 +2423,7 @@ impl ServerState {
         if let Some(first) = channel.follow.remove(user_id) {
             self.exit_due(channel_id, &channel.follow, first);
         }
+        self.gk.on_unfollow(channel_id, user_id);
         Some(channel.members.len())
     }
 
@@ -2381,6 +2444,12 @@ impl ServerState {
                 if ejected {
                     self.exit_due(channel.info.channel_id, &channel.follow, first);
                 }
+            }
+            // Put out, their seat exits at once; going offline is the group's to judge
+            // (`on_session_end`: an account's text seat stays)
+            if ejected {
+                self.gk
+                    .on_kick(channel.info.channel_id, user_id, gk_cause::KICK);
             }
             left.push((channel.info.channel_id, channel.members.len()));
         }
@@ -2420,6 +2489,8 @@ impl ServerState {
         let (_, session) = self.sessions.remove(&session_id)?;
 
         self.routing.clear_session(session_id);
+        // Out of every group it followed, its volunteering and its commit lane with it
+        self.gk.on_session_end(session_id);
         // Only if it is still ours: an account signing in again elsewhere
         // took the name over, and this cleanup runs after that.
         self.username_to_session
@@ -2633,6 +2704,15 @@ impl ServerState {
                 }
             }
         }
+        // A text channel's group goes with it, retired as a moved one is and followed by
+        // nobody: a delete takes its followers out in bulk (layout's, with no word to the
+        // group), a purged conversation's rows must not be written back, and an `r:` id
+        // comes back with the channel id. Its name for the group and its gate go with it: an
+        // id made again starts open
+        if self.gk.on && gone.info.text {
+            let id = self.gk_id(&gone);
+            self.gk.on_channel_gone(channel_id, &id);
+        }
     }
 
     /// Change a channel's password (creator or admin). Returns the updated
@@ -2763,6 +2843,7 @@ impl ServerState {
         if !overrides && channel.info.created_by != Some(user_id) {
             anyhow::bail!("only the channel creator can change the channel options");
         }
+        let group_was = self.gk_id(channel);
 
         // A text channel carries no voice, so the options about voice do not
         // apply there — and turning screen share "on" in one would advertise
@@ -2853,8 +2934,29 @@ impl ServerState {
         // ponytail: a log switched off this way keeps its stored members and
         // entries until they expire; clients just stop writing to it.
         channel.refresh_log();
+        self.gk_moved(channel, &group_was);
 
         Ok((channel.info.clone(), changed))
+    }
+
+    /// A text channel's offered log came or went (`hide_members`, spec §5.12): its group id
+    /// moved from `was`, and every follower follows the group under the new one. A voice
+    /// room's id is `r:` either way.
+    fn gk_moved(&self, channel: &Channel, was: &str) {
+        let now = self.gk_id(channel);
+        if !self.gk.on || !channel.info.text || now == was {
+            return;
+        }
+        self.gk.on_group_moved(channel.info.channel_id, was, &now);
+        for uid in channel
+            .follow
+            .joined
+            .keys()
+            .chain(channel.follow.quiet.keys())
+        {
+            let account = self.sessions.get(uid).and_then(|s| s.account_id());
+            self.gk_follow(channel, *uid, account);
+        }
     }
 
     /// The real name of `subject`, and the pseudonym they currently go by if
@@ -2992,6 +3094,15 @@ impl ServerState {
         channel.pseudonyms.remove(&target_id);
         if let Some(first) = channel.follow.remove(target_id) {
             self.exit_due(channel_id, &channel.follow, first);
+        }
+        if channel.info.text {
+            // Requester 0 is the relay putting out who lost the gate (`session::evict`)
+            let cause = if requester_id == 0 {
+                gk_cause::GATE
+            } else {
+                gk_cause::KICK
+            };
+            self.gk.on_kick(channel_id, target_id, cause);
         }
 
         let target_session_id = self

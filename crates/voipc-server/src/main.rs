@@ -26,6 +26,8 @@ mod gk;
 #[cfg(test)]
 mod gk_e2e_c3c;
 #[cfg(test)]
+mod gk_e2e_k2;
+#[cfg(test)]
 mod gk_e2e_r2;
 #[cfg(test)]
 mod gk_e2e_tests;
@@ -363,6 +365,9 @@ enum DbCommand {
     /// Copy a SQLite accounts database while the server runs (VACUUM INTO).
     /// For Postgres use pg_dump. Keep the key file with the copy.
     Backup { path: String },
+    /// After restoring the database, with the server stopped: every group with a key
+    /// starts a new generation when it next starts (its exits since reached no keyholder).
+    NewIncarnation,
 }
 
 /// One IP's connect budget, and when we last saw it. The timestamp is only
@@ -925,6 +930,10 @@ async fn run_command(config: &ServerConfig, command: Command) -> Result<()> {
                 config.accounts.key_file
             );
         }
+        Command::Db(DbCommand::NewIncarnation) => {
+            accounts::gk::new_incarnation(store).await?;
+            println!("every group with a key starts anew at its next start");
+        }
     }
     Ok(())
 }
@@ -1212,6 +1221,12 @@ async fn main() -> Result<()> {
     // Create shared state
     let mut state = ServerState::new(&config, server_settings, persistent_channels, admin_token);
     state.accounts = relay;
+    if let Some(relay) = &state.accounts {
+        gk_switch(&state, relay.store(), config.group_key)
+            .await
+            .context("starting the group key")?;
+        state.gk.set_kept_seats(config.accounts.kept_seats);
+    }
     layout::load(&state, kept, &apps).await;
     if state.accounts.is_none() {
         state.bans_file = Some(std::path::PathBuf::from(BANS_FILE));
@@ -1588,6 +1603,24 @@ async fn main() -> Result<()> {
         update::restart(paths, &version);
     }
     info!("server shut down");
+    Ok(())
+}
+
+/// The group key's start (plan 2i), before anyone can follow: the switch noted, and the
+/// database attached with its incarnation. On, `c:` groups are stored and measured against
+/// it; off, the kept reads are still served from it, read-only (1h), once the key was ever on.
+async fn gk_switch(
+    state: &ServerState,
+    store: &l4f_accounts::store::Store,
+    on: bool,
+) -> Result<()> {
+    let incarnation = match accounts::gk::gk_start(store, on).await? {
+        Some(incarnation) => Some(incarnation),
+        None => accounts::gk::gk_incarnation(store).await?,
+    };
+    if let Some(incarnation) = incarnation {
+        state.gk.attach(store.clone(), incarnation);
+    }
     Ok(())
 }
 

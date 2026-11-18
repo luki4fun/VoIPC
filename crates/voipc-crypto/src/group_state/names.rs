@@ -48,6 +48,8 @@ pub(super) struct Names {
     parts: Parts<(), NamesPiece>,
     /// When the last `EpochNames` went (ms), until answered.
     asked: Option<u64>,
+    /// The last ask, `(from, to, removals)`, and when it went (ms), answered or not.
+    last: Option<((gk::NamesRef, gk::NamesRef, bool), u64)>,
     asked_removals: bool,
     /// An answer came and the fold from the names floor still did not reach the head: the
     /// floor is from an earlier gated period (C1 note 1), so the fold starts over.
@@ -55,6 +57,9 @@ pub(super) struct Names {
     answered: bool,
     /// The relay refused to send names.
     refused: bool,
+    /// An answer came since a voice room last folded (voice.rs): a fold that waited for its
+    /// lists goes again, though no header was taken.
+    pub(super) fresh: bool,
 }
 
 impl Default for Names {
@@ -68,10 +73,12 @@ impl Default for Names {
             gated_start: None,
             parts: Parts::new(Seq::Names),
             asked: None,
+            last: None,
             asked_removals: false,
             from_start: false,
             answered: false,
             refused: false,
+            fresh: false,
         }
     }
 }
@@ -182,6 +189,7 @@ pub(super) fn names_in(m: &mut Member, pieces: Vec<NamesPiece>) -> Option<gk::In
     n.asked = None;
     n.answered = true;
     n.refused = false;
+    n.fresh = true;
     let mut joins = Vec::new();
     for p in pieces {
         for l in &p.lists {
@@ -219,21 +227,19 @@ pub(super) fn names_in(m: &mut Member, pieces: Vec<NamesPiece>) -> Option<gk::In
 }
 
 /// Asks for the lists from where the fold starts to the head, and with `removals` the
-/// opening headers between that remove someone. At most one out, again after 10 s.
+/// opening headers between that remove someone. At most one out, again after 10 s; the same
+/// ask again after 10 s too, answered or not: its answer would come back the same, and a fold
+/// it did not settle (a voice room folds at every answer) would ask once per round trip.
 fn ask(m: &mut Member, removals: bool, c: &GkCtx, out: &mut GkOut) {
     let Some(head) = m.head.as_ref() else {
         return;
     };
     let hd = head.header();
     let n = &mut m.names;
-    if n.asked
-        .is_some_and(|at| c.now < at.saturating_add(CHECK_WAIT_MS))
-        || n.refused
-    {
+    let recent = |at: u64| c.now < at.saturating_add(CHECK_WAIT_MS);
+    if n.asked.is_some_and(recent) || n.refused {
         return;
     }
-    n.asked = Some(c.now);
-    n.asked_removals |= removals;
     // From the names floor, or from the generation's start (epoch 0)
     let from = match n.from(&hd.gen) {
         NamesFrom::Floor(f) | NamesFrom::Gone { floor: f, .. } => gk::NamesRef {
@@ -247,14 +253,22 @@ fn ask(m: &mut Member, removals: bool, c: &GkCtx, out: &mut GkOut) {
             join: 0,
         },
     };
+    let to = gk::NamesRef {
+        gen: hd.gen,
+        epoch: hd.epoch,
+        join: hd.join,
+    };
+    let this = (from, to, removals);
+    if n.last.is_some_and(|(last, at)| last == this && recent(at)) {
+        return;
+    }
+    n.asked = Some(c.now);
+    n.last = Some((this, c.now));
+    n.asked_removals |= removals;
     out.send.push(ClientMessage::EpochNames {
         group: m.t.group.clone(),
         from,
-        to: gk::NamesRef {
-            gen: hd.gen,
-            epoch: hd.epoch,
-            join: hd.join,
-        },
+        to,
         removals,
     });
 }

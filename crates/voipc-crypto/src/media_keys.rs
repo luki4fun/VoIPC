@@ -1,11 +1,19 @@
 //! Symmetric AES-256-GCM encryption for voice/video media packets.
 //!
 //! Media encryption uses per-channel symmetric keys that are
-//! distributed to channel members via pairwise Signal sessions.
+//! distributed to channel members via pairwise Signal sessions — or, in a
+//! room under the group epoch key (`MediaKeyRing::install_gk`), keys derived
+//! per sender seat and stream from the room's epoch key, which nobody sends.
+
+use std::collections::HashMap;
 
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
+
+use crate::group_key::{media_key, Epoch, Group, GroupKind, MemberId};
+use crate::group_state::VoiceKeys;
 
 /// AES-256-GCM authentication tag size.
 pub const GCM_TAG_SIZE: usize = 16;
@@ -257,6 +265,8 @@ pub struct MediaKeyRing {
     current: Option<MediaKey>,
     previous: Option<MediaKey>,
     stream_id: u32,
+    /// The room under the group epoch key, in group-key mode.
+    gk: Option<GkRoom>,
 }
 
 impl Default for MediaKeyRing {
@@ -265,6 +275,44 @@ impl Default for MediaKeyRing {
             current: None,
             previous: None,
             stream_id: random_stream_id(),
+            gk: None,
+        }
+    }
+}
+
+/// Senders' keys a room keeps derived at most. Past it they are derived
+/// again as packets come, so stream ids a sender makes up cost memory nobody.
+const SENDERS_MOST: usize = 4096;
+
+/// A voice room under the group epoch key (spec §3.10, §5.9): nothing is
+/// minted or sent; every key comes from the room's `CK_e`, one per sender
+/// seat and stream, with `key_id = e mod 2¹⁶` and minter 0.
+struct GkRoom {
+    channel_id: u32,
+    group: Group,
+    /// `(epoch, CK_e)`, oldest first: the current and the one before.
+    epochs: Vec<(Epoch, Zeroizing<[u8; 32]>)>,
+    /// Ours, one per epoch in `epochs`.
+    own: Vec<MediaKey>,
+    /// From when we send under the newest epoch (unix ms).
+    switch_at: u64,
+    /// Each sender's seat by session id, as the room's roster gives it.
+    seats: HashMap<u32, (MemberId, [u8; 8])>,
+    /// Senders' keys by `(sid, stream, e)`, each derived at its first packet.
+    senders: HashMap<(u32, u32, u32), MediaKey>,
+}
+
+impl GkRoom {
+    fn newest(&self) -> Option<u32> {
+        self.epochs.last().map(|(ep, _)| ep.e)
+    }
+
+    /// Ours under the newest epoch from `switch_at`, under the one before
+    /// until then: a receiver a little slower to take it loses no packet.
+    fn sending(&self, now: u64) -> Option<&MediaKey> {
+        match self.own.as_slice() {
+            [before, _] if now < self.switch_at => Some(before),
+            own => own.last(),
         }
     }
 }
@@ -305,13 +353,22 @@ impl MediaKeyRing {
         if key.channel_id != own_channel {
             return false;
         }
+        // A room under the group key has its keys from its epoch key only
+        if self
+            .gk
+            .as_ref()
+            .is_some_and(|r| r.channel_id == own_channel)
+        {
+            return false;
+        }
         // The room we were in is not one we can still decrypt for. Normally
         // the caller has already cleared the ring on the way out; this is the
         // same decision made from what the ring holds, so the two cannot drift.
-        if self
-            .current
-            .as_ref()
-            .is_some_and(|cur| cur.channel_id != own_channel)
+        if self.gk.is_some()
+            || self
+                .current
+                .as_ref()
+                .is_some_and(|cur| cur.channel_id != own_channel)
         {
             self.clear();
         }
@@ -323,9 +380,75 @@ impl MediaKeyRing {
         true
     }
 
-    /// The key we encrypt with.
+    /// Group-key mode (spec §5.9): the room's keys from its epoch key, as
+    /// `GroupKeying` hands them out (`GkOut::voice`). Ours is the one we send
+    /// with (`current`); each sender's is derived from its seat at its first
+    /// packet (`get_for`). A newest epoch new to the ring is sent under from
+    /// `switch_at`, one it holds keeps its time (a roster update moves
+    /// nothing), and an older one never replaces it. Another generation starts
+    /// the ring's keys over, since `e` starts again at 1; another room, or a
+    /// key of the old kind, starts the whole ring over. Returns whether it took
+    /// them.
+    pub fn install_gk(&mut self, keys: &VoiceKeys, own_channel: u32) -> bool {
+        if keys.channel_id != own_channel {
+            return false;
+        }
+        let Ok(group) = Group::new(GroupKind::Voice, &keys.group, keys.gen) else {
+            return false;
+        };
+        let mut epochs: Vec<(Epoch, Zeroizing<[u8; 32]>)> = keys
+            .epochs
+            .iter()
+            .map(|(e, d_e, ck)| (Epoch { e: *e, d_e: *d_e }, ck.clone()))
+            .collect();
+        epochs.sort_by_key(|(ep, _)| ep.e);
+        epochs.dedup_by_key(|(ep, _)| ep.e);
+        epochs.drain(..epochs.len().saturating_sub(2));
+        let Some(newest) = epochs.last().map(|(ep, _)| ep.e) else {
+            return false;
+        };
+        let held = self.gk.as_ref().filter(|r| r.channel_id == own_channel);
+        let same = held.filter(|r| r.group == group);
+        if same.is_some_and(|r| r.newest() > Some(newest)) {
+            return false;
+        }
+        let switch_at = match same {
+            Some(r) if r.newest() == Some(newest) => r.switch_at,
+            _ => keys.switch_at,
+        };
+        if held.is_none() && (self.gk.is_some() || self.current.is_some()) {
+            self.clear();
+        }
+        let (m, tag) = &keys.own;
+        let own: Option<Vec<MediaKey>> = epochs
+            .iter()
+            .map(|(ep, ck)| {
+                let k = media_key(&group, ep, m, tag, self.stream_id, ck).ok()?;
+                Some(MediaKey::new(own_channel, ep.e as u16, 0, *k))
+            })
+            .collect();
+        let Some(own) = own else {
+            return false;
+        };
+        self.gk = Some(GkRoom {
+            channel_id: own_channel,
+            group,
+            epochs,
+            own,
+            switch_at,
+            seats: keys.seats.iter().map(|(u, m, t)| (*u, (*m, *t))).collect(),
+            senders: HashMap::new(),
+        });
+        true
+    }
+
+    /// The key we encrypt with: in group-key mode our own, under the epoch
+    /// the switch time says.
     pub fn current(&self) -> Option<&MediaKey> {
-        self.current.as_ref()
+        match &self.gk {
+            Some(r) => r.sending(crate::time::now_millis()),
+            None => self.current.as_ref(),
+        }
     }
 
     /// The generation the member elected to mint should mint next for
@@ -349,9 +472,13 @@ impl MediaKeyRing {
 
     /// Whether we hold a key for this channel at all.
     pub fn has_channel(&self, channel_id: u32) -> bool {
-        self.current
-            .as_ref()
-            .is_some_and(|k| k.channel_id == channel_id)
+        match &self.gk {
+            Some(r) => r.channel_id == channel_id,
+            None => self
+                .current
+                .as_ref()
+                .is_some_and(|k| k.channel_id == channel_id),
+        }
     }
 
     /// The key a received packet names, if we still hold it.
@@ -362,10 +489,44 @@ impl MediaKeyRing {
             .find(|k| k.channel_id == channel_id && k.key_id == key_id)
     }
 
+    /// The key a received packet names. In group-key mode it is its sender's
+    /// own, from the seat the roster gives the packet's session id, its stream
+    /// and the epoch `key_id` names (derived once, then kept): a sender the
+    /// roster does not seat has none, and a roster that lies only makes that
+    /// sender's packets fail. Otherwise the room's key (`get`).
+    pub fn get_for(
+        &mut self,
+        channel_id: u32,
+        sid: u32,
+        stream: u32,
+        key_id: u16,
+    ) -> Option<&MediaKey> {
+        if self.gk.is_none() {
+            return self.get(channel_id, key_id);
+        }
+        let r = self.gk.as_mut()?;
+        if r.channel_id != channel_id {
+            return None;
+        }
+        let (ep, ck) = r.epochs.iter().find(|(ep, _)| ep.e as u16 == key_id)?;
+        let at = (sid, stream, ep.e);
+        if !r.senders.contains_key(&at) {
+            let (m, tag) = r.seats.get(&sid)?;
+            let k = media_key(&r.group, ep, m, tag, stream, ck).ok()?;
+            if r.senders.len() >= SENDERS_MOST {
+                r.senders.clear();
+            }
+            r.senders
+                .insert(at, MediaKey::new(channel_id, key_id, 0, *k));
+        }
+        r.senders.get(&at)
+    }
+
     /// Forget everything — we left the channel.
     pub fn clear(&mut self) {
         self.current = None;
         self.previous = None;
+        self.gk = None;
         self.stream_id = random_stream_id();
     }
 }
@@ -610,6 +771,174 @@ mod tests {
         assert!(ring.get(1, 2).is_none());
         // ...and a new room gets a nonce prefix of its own
         assert_ne!(ring.stream_id(), 0);
+    }
+
+    // ── group-key mode ──
+
+    const ROOM: u32 = 7;
+
+    /// User `u`'s voice seat: a connection pair's tag.
+    fn seat(u: u32) -> (u32, MemberId, [u8; 8]) {
+        (u, MemberId::Conn(u), [u as u8; 8])
+    }
+
+    /// The room's keys as `GroupKeying` hands them to user `own`, for `epochs` of
+    /// generation `gen`, with users 5 and 6 in the roster.
+    fn gk(own: u32, gen: u8, epochs: &[u32], switch_at: u64) -> VoiceKeys {
+        let (_, m, tag) = seat(own);
+        VoiceKeys {
+            channel_id: ROOM,
+            group: "r:00112233445566778899aabbccddeeff:7".into(),
+            gen: [gen; 16],
+            epochs: epochs
+                .iter()
+                .map(|e| (*e, [*e as u8; 32], Zeroizing::new([gen ^ *e as u8; 32])))
+                .collect(),
+            own: (m, tag),
+            seats: vec![seat(5), seat(6)],
+            switch_at,
+            new_generation: false,
+        }
+    }
+
+    fn sent(ring: &MediaKeyRing, from: u32) -> (u16, Vec<u8>) {
+        let key = ring.current().unwrap();
+        let aad = build_aad(ROOM, 0x05, from);
+        let packet = media_encrypt(key, ring.stream_id(), 1, 0, &aad, b"hello").unwrap();
+        (key.key_id, packet)
+    }
+
+    fn opens(
+        ring: &mut MediaKeyRing,
+        from: u32,
+        stream: u32,
+        (id, packet): &(u16, Vec<u8>),
+    ) -> bool {
+        let aad = build_aad(ROOM, 0x05, from);
+        ring.get_for(ROOM, from, stream, *id)
+            .is_some_and(|k| media_decrypt(k, stream, 1, 0, &aad, packet).is_ok())
+    }
+
+    /// §3.10: a sender's key comes from its own seat and stream, and a receiver derives the
+    /// same from the seat the roster gives its session id. A session the roster does not
+    /// seat, or one it seats under another pair, opens nothing.
+    #[test]
+    fn under_the_group_key_a_receiver_derives_each_senders_key_from_its_seat() {
+        let (mut alice, mut bob) = (MediaKeyRing::default(), MediaKeyRing::default());
+        assert!(alice.install_gk(&gk(5, 1, &[1], 0), ROOM));
+        assert!(bob.install_gk(&gk(6, 1, &[1], 0), ROOM));
+        assert!(alice.has_channel(ROOM) && !alice.has_channel(8));
+        let packet = sent(&alice, 5);
+        assert_eq!(packet.0, 1, "key_id = e mod 2^16");
+        assert!(opens(&mut bob, 5, alice.stream_id(), &packet));
+        assert!(
+            !opens(&mut bob, 6, alice.stream_id(), &packet),
+            "another seat"
+        );
+        assert!(
+            bob.get_for(ROOM, 9, alice.stream_id(), 1).is_none(),
+            "not seated"
+        );
+        assert!(
+            bob.get_for(ROOM, 5, alice.stream_id(), 2).is_none(),
+            "no such epoch"
+        );
+        assert!(
+            bob.get_for(8, 5, alice.stream_id(), 1).is_none(),
+            "another room"
+        );
+        // A roster that lies about alice fails her packets, and only hers
+        let mut carol = MediaKeyRing::default();
+        let mut lie = gk(7, 1, &[1], 0);
+        lie.seats[0].2 = [0xee; 8];
+        carol.install_gk(&lie, ROOM);
+        assert!(!opens(&mut carol, 5, alice.stream_id(), &packet));
+        assert!(opens(&mut carol, 6, bob.stream_id(), &sent(&bob, 6)));
+    }
+
+    /// Open choice 8: a new epoch is sent under from its switch time, the one before until
+    /// then, and both open; a roster update keeps the time; an older epoch never comes back.
+    #[test]
+    fn a_new_epoch_is_sent_under_from_its_switch_time() {
+        let mut ring = MediaKeyRing::default();
+        assert!(ring.install_gk(&gk(5, 1, &[1], 0), ROOM));
+        let at = crate::time::now_millis() + 60_000;
+        assert!(ring.install_gk(&gk(5, 1, &[1, 2], at), ROOM));
+        assert_eq!(ring.current().unwrap().key_id, 1, "before its time");
+        let room = ring.gk.as_ref().unwrap();
+        assert_eq!(room.sending(at).unwrap().key_id, 2, "from its time");
+        assert!(ring.install_gk(&gk(5, 1, &[1, 2], 0), ROOM));
+        assert_eq!(ring.gk.as_ref().unwrap().switch_at, at, "a roster update");
+        let mut bob = MediaKeyRing::default();
+        bob.install_gk(&gk(6, 1, &[1, 2], 0), ROOM);
+        assert_eq!(bob.current().unwrap().key_id, 2);
+        assert!(opens(&mut ring, 6, bob.stream_id(), &sent(&bob, 6)));
+        assert!(!ring.install_gk(&gk(5, 1, &[1], 0), ROOM), "older");
+        assert!(ring.install_gk(&gk(5, 1, &[2, 3], 0), ROOM));
+        assert!(
+            ring.get_for(ROOM, 6, 1, 1).is_none(),
+            "two epochs kept, no more"
+        );
+    }
+
+    /// §5.9: a new generation starts the keys over (`e` starts again at 1); another room
+    /// starts the whole ring over, with a stream id of its own.
+    #[test]
+    fn a_new_generation_starts_the_keys_over() {
+        let mut ring = MediaKeyRing::default();
+        ring.install_gk(&gk(5, 1, &[1, 2], 0), ROOM);
+        let (stream, old) = (ring.stream_id(), ring.current().unwrap().key_bytes);
+        assert!(ring.install_gk(&gk(5, 2, &[1], u64::MAX), ROOM));
+        let new = ring.current().unwrap();
+        assert_eq!(
+            new.key_id, 1,
+            "at its own switch time, with nothing older to send"
+        );
+        assert_ne!(new.key_bytes, old);
+        assert!(
+            ring.get_for(ROOM, 6, 1, 2).is_none(),
+            "the old generation's"
+        );
+        assert_eq!(ring.stream_id(), stream);
+        let mut other = gk(5, 2, &[1], 0);
+        other.channel_id = 8;
+        assert!(!ring.install_gk(&other, ROOM), "not the room we are in");
+        assert!(ring.install_gk(&other, 8));
+        assert!(!ring.has_channel(ROOM));
+        assert_ne!(ring.stream_id(), stream);
+    }
+
+    /// A room under the group key takes no key of the old kind, and a ring of the old kind
+    /// gives its keys up for it. Outside the mode `get_for` is `get`.
+    #[test]
+    fn the_group_key_and_the_old_keys_never_mix() {
+        let mut ring = MediaKeyRing::default();
+        let old = MediaKey::generate(ROOM, 4, 1).unwrap();
+        ring.install(old.clone(), ROOM);
+        assert_eq!(
+            ring.get_for(ROOM, 5, 1, 4).unwrap().key_bytes,
+            old.key_bytes
+        );
+        assert!(ring.install_gk(&gk(5, 1, &[1], 0), ROOM));
+        assert!(ring.get(ROOM, 4).is_none());
+        assert!(!ring.install(MediaKey::generate(ROOM, 9, 0).unwrap(), ROOM));
+        assert_eq!(ring.current().unwrap().key_id, 1);
+        assert!(
+            ring.install(MediaKey::generate(8, 0, 1).unwrap(), 8),
+            "another room"
+        );
+        assert!(ring.gk.is_none());
+    }
+
+    /// Stream ids a sender makes up cost memory nobody: the keys kept are bounded.
+    #[test]
+    fn the_senders_keys_kept_are_bounded() {
+        let mut ring = MediaKeyRing::default();
+        ring.install_gk(&gk(5, 1, &[1], 0), ROOM);
+        for stream in 0..SENDERS_MOST as u32 + 10 {
+            assert!(ring.get_for(ROOM, 6, stream, 1).is_some());
+        }
+        assert!(ring.gk.as_ref().unwrap().senders.len() <= SENDERS_MOST);
     }
 
     #[test]

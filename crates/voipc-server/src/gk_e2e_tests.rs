@@ -14,9 +14,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use voipc_crypto::group_key::build::{
-    build_genesis, build_join, build_opening, Built, Holding, Lists, OpeningAsk, RowBases, Start,
+    build_genesis, build_join, build_opening, build_seed_welcomes, Built, Holding, Lists,
+    OpeningAsk, RowBases, Start,
 };
-use voipc_crypto::group_key::commit::{DueKind, Exit, Joiner, Pair};
+use voipc_crypto::group_key::commit::{Candidate, DueKind, Exit, HolderRef, Joiner, Pair};
 use voipc_crypto::group_key::{
     wire, Endorsement, Group, GroupKind, Keyholder, Keyring, Kind, Me, MemberId, Origin, SeatKeys,
     SeatPair, SeatPublic, SeatRef, SeedRolls, SignedHeader,
@@ -38,10 +39,10 @@ use crate::control::{ControlRx, ControlTx};
 use crate::gk::group::cause;
 use crate::gk::Groups;
 
-const CHANNEL: ChannelId = 7;
+pub(super) const CHANNEL: ChannelId = 7;
 
 /// `GK_E2E_TRACE=1`: the crates' logs and every frame each session takes, on stderr.
-fn tracing_on() -> bool {
+pub(super) fn tracing_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         let on = std::env::var_os("GK_E2E_TRACE").is_some();
@@ -56,7 +57,7 @@ fn tracing_on() -> bool {
 }
 
 /// A frame, shortly.
-fn show(f: &ServerMessage) -> String {
+pub(super) fn show(f: &ServerMessage) -> String {
     match f {
         ServerMessage::EpochIn {
             part, last, piece, ..
@@ -121,8 +122,8 @@ fn raw(ik: &IdentityKeyPair) -> [u8; 32] {
 // ── The relay ─────────────────────────────────────────────────────────────
 
 /// A relay's `Groups` over sessions on control queues, with R2's post path stood in.
-struct Relay {
-    groups: Groups,
+pub(super) struct Relay {
+    pub(super) groups: Groups,
     state: Arc<crate::state::ServerState>,
     rxs: HashMap<UserId, ControlRx>,
     txs: HashMap<UserId, ControlTx>,
@@ -133,11 +134,11 @@ struct Relay {
     /// Every `EpochPostIn` the fan-out sent.
     fanned: Vec<ServerMessage>,
     /// Every `EpochRefused{POST}` the post path sent: (writer, why).
-    post_refusals: Vec<(UserId, u8)>,
+    pub(super) post_refusals: Vec<(UserId, u8)>,
 }
 
 impl Relay {
-    fn new() -> Relay {
+    pub(super) fn new() -> Relay {
         Relay {
             groups: Groups::new(true),
             state: Arc::new(crate::state::test_support::make_state()),
@@ -152,7 +153,7 @@ impl Relay {
     }
 
     /// A session with identity `ik`, signed in to `account` where given.
-    fn session(&mut self, ik: &IdentityKeyPair, account: Option<[u8; 16]>) -> UserId {
+    pub(super) fn session(&mut self, ik: &IdentityKeyPair, account: Option<[u8; 16]>) -> UserId {
         let (sid, _) = crate::state::test_support::add_user(
             &self.state,
             &format!("u{}", rand::random::<u32>()),
@@ -174,7 +175,7 @@ impl Relay {
         sid
     }
 
-    fn follow(&mut self, sid: UserId, group: &str) {
+    pub(super) fn follow(&mut self, sid: UserId, group: &str) {
         let account = self.accounts.get(&sid).copied();
         self.groups
             .on_follow(CHANNEL, group, GroupKind::Text, sid, account);
@@ -184,14 +185,22 @@ impl Relay {
             .push(sid);
     }
 
-    fn unfollow(&mut self, sid: UserId, group: &str) {
+    pub(super) fn unfollow(&mut self, sid: UserId, group: &str) {
         self.groups.on_unfollow(CHANNEL, sid);
         if let Some(f) = self.followers.get_mut(group) {
             f.retain(|s| *s != sid);
         }
     }
 
-    fn kick(&mut self, sid: UserId, group: &str) {
+    /// The connection ends.
+    fn end(&mut self, sid: UserId) {
+        self.groups.on_session_end(sid);
+        for f in self.followers.values_mut() {
+            f.retain(|s| *s != sid);
+        }
+    }
+
+    pub(super) fn kick(&mut self, sid: UserId, group: &str) {
         self.groups.on_kick(CHANNEL, sid, cause::KICK);
         if let Some(f) = self.followers.get_mut(group) {
             f.retain(|s| *s != sid);
@@ -199,7 +208,7 @@ impl Relay {
     }
 
     /// Frames `sid`'s control queue holds now.
-    async fn drain(&mut self, sid: UserId) -> Vec<ServerMessage> {
+    pub(super) async fn drain(&mut self, sid: UserId) -> Vec<ServerMessage> {
         let mut got = vec![];
         let Some(rx) = self.rxs.get_mut(&sid) else {
             return got;
@@ -216,7 +225,7 @@ impl Relay {
         }
     }
 
-    async fn send(&mut self, sid: UserId, msg: ClientMessage) {
+    pub(super) async fn send(&mut self, sid: UserId, msg: ClientMessage) {
         match msg {
             ClientMessage::EpochPost {
                 channel_id,
@@ -292,7 +301,7 @@ impl Relay {
 }
 
 /// A signed-in connection's account, as session.rs sets it at sign-in.
-fn account_session(a: [u8; 16]) -> crate::state::AccountSession {
+pub(super) fn account_session(a: [u8; 16]) -> crate::state::AccountSession {
     use l4f_accounts::model::{AccountId, SessionInfo, User, UserStatus};
     crate::state::AccountSession {
         user: User {
@@ -338,8 +347,8 @@ fn account_session(a: [u8; 16]) -> crate::state::AccountSession {
 // ── Keyholders ────────────────────────────────────────────────────────────
 
 /// What a keyholder holds once its commit was taken.
-struct Held {
-    head: SignedHeader,
+pub(super) struct Held {
+    pub(super) head: SignedHeader,
     kh: SignedHeader,
     ring: Keyring,
     krk: Zeroizing<[u8; 32]>,
@@ -349,15 +358,15 @@ struct Held {
 /// A keyholder app as C3c will be: volunteers, takes each due whole, asks the lists of the
 /// versions it holds, builds with `group_key::build`, sends the commit in parts, and holds
 /// the result once the relay shows the header taken.
-struct Holder {
-    sid: UserId,
+pub(super) struct Holder {
+    pub(super) sid: UserId,
     ik: IdentityKeyPair,
     m: MemberId,
     pair: SeatPair,
     wire: Pair,
     group: String,
     stored: bool,
-    held: Option<Held>,
+    pub(super) held: Option<Held>,
     cache: RowBases,
     /// The commit sent, until taken.
     out: Option<(u64, Built)>,
@@ -368,11 +377,13 @@ struct Holder {
     /// Due kinds asked, in order.
     asked: Vec<u8>,
     stales: Vec<u8>,
+    /// Seconds its Genesis is dated back: a group a day old in a test that cannot wait one.
+    back: u64,
 }
 
 impl Holder {
     /// A guest: its connection pair (0x02, counter 0) is its keyholder pair and its seat.
-    fn guest(sid: UserId, ik: IdentityKeyPair, group: &str, stored: bool) -> Holder {
+    pub(super) fn guest(sid: UserId, ik: IdentityKeyPair, group: &str, stored: bool) -> Holder {
         Holder::new(
             sid,
             ik,
@@ -440,10 +451,11 @@ impl Holder {
             lists: Lists::new(),
             asked: vec![],
             stales: vec![],
+            back: 0,
         }
     }
 
-    fn volunteer(&self) -> ClientMessage {
+    pub(super) fn volunteer(&self) -> ClientMessage {
         ClientMessage::KeyholdVolunteer {
             on: true,
             platform: gk::platform::DESKTOP,
@@ -458,7 +470,7 @@ impl Holder {
     }
 
     /// One frame from the relay; what it sends back.
-    fn frame(&mut self, f: &ServerMessage, now: u64) -> Vec<ClientMessage> {
+    pub(super) fn frame(&mut self, f: &ServerMessage, now: u64) -> Vec<ClientMessage> {
         match f {
             ServerMessage::EpochDue {
                 due,
@@ -559,6 +571,9 @@ impl Holder {
         let Some(held) = &self.held else {
             return vec![];
         };
+        if piece.kind == gk::due::SEED_WELCOMES {
+            return self.seed_page(due, &piece);
+        }
         // The lists of every version it holds: a Join may add to one, an opening re-keys
         let versions: Vec<(u64, u64)> = held.ring.buckets.iter().map(|k| (k.b, k.v)).collect();
         self.waiting = Some((due, piece));
@@ -567,6 +582,44 @@ impl Holder {
             gen: held.head.header().gen,
             versions,
         }]
+    }
+
+    /// A seed-welcome page: a welcome under the head's seed to each seat asked, in frames
+    /// of `WELCOMES_PER_FRAME`.
+    fn seed_page(&mut self, due: u64, piece: &DuePiece) -> Vec<ClientMessage> {
+        let held = self.held.as_ref().expect("a head");
+        let gen = held.head.header().gen;
+        let s = held.head.header().seed;
+        let g = Group::new(GroupKind::Text, &self.group, gen).unwrap();
+        let seed = *held.ring.seed(s).expect("the head's seed");
+        let seats: Vec<(SeatRef, SeatPublic)> = piece
+            .seed_seats
+            .iter()
+            .map(|x| {
+                let p = wire::pair(&x.keys, x.seat.m).unwrap();
+                (SeatRef::from(x.seat), p.keys)
+            })
+            .collect();
+        let me = Me {
+            m: self.m,
+            keys: &self.pair,
+        };
+        let out = build_seed_welcomes(&g, s, &seed, &me, &seats).unwrap();
+        out.chunks(gk::WELCOMES_PER_FRAME)
+            .map(|c| ClientMessage::EpochWelcomes {
+                group: self.group.clone(),
+                due,
+                gen,
+                seed: s,
+                welcomes: c
+                    .iter()
+                    .map(|w| gk::SeedWelcomeOut {
+                        seat: w.seat.into(),
+                        bytes: w.bytes.clone(),
+                    })
+                    .collect(),
+            })
+            .collect()
     }
 
     fn build(&mut self, due: u64, piece: &DuePiece, now: u64) -> Vec<ClientMessage> {
@@ -585,7 +638,7 @@ impl Holder {
                     joiners: &[&joiner],
                     gated: piece.gated,
                     stored: self.stored,
-                    now: now / 1000,
+                    now: now / 1000 - self.back,
                 };
                 build_genesis(&st, &mut self.cache)
             }
@@ -640,14 +693,18 @@ impl Holder {
                         })
                     };
                     let seed_seats = HashMap::new();
+                    let candidate = piece
+                        .promote
+                        .as_ref()
+                        .map(|c| Candidate::try_from(c).unwrap());
                     let ask = OpeningAsk {
                         kind: DueKind::from_code(kind).unwrap().header_kind(),
                         exits: &exits,
                         exits_upto: piece.exits_upto,
                         refresh: kind == gk::due::REFRESH,
                         gated: piece.gated,
-                        candidate: None,
-                        remove: None,
+                        candidate: candidate.as_ref(),
+                        remove: piece.remove.map(HolderRef::from),
                         replace: None,
                         finish: piece.finish,
                         seed_seats: &seed_seats,
@@ -682,22 +739,22 @@ impl Holder {
 // ── Members (C3b) ─────────────────────────────────────────────────────────
 
 /// One connection's `GroupKeying`, as the app runs it.
-struct Member {
-    sid: UserId,
-    keying: GroupKeying,
+pub(super) struct Member {
+    pub(super) sid: UserId,
+    pub(super) keying: GroupKeying,
     st: SignalStores,
     pins: MemoryPins,
     group: String,
-    posts: Vec<OpenedPost>,
-    events: Vec<GkEvent>,
-    sent: Vec<ClientMessage>,
+    pub(super) posts: Vec<OpenedPost>,
+    pub(super) events: Vec<GkEvent>,
+    pub(super) sent: Vec<ClientMessage>,
     /// Frames in flight: kept back while set, taken in order once released.
     hold: bool,
     backlog: Vec<ServerMessage>,
 }
 
 impl Member {
-    fn new(
+    pub(super) fn new(
         relay: &Relay,
         sid: UserId,
         ik: IdentityKeyPair,
@@ -734,7 +791,7 @@ impl Member {
         }
     }
 
-    fn track(&mut self) -> Vec<ClientMessage> {
+    pub(super) fn track(&mut self) -> Vec<ClientMessage> {
         let out = self.keying.track(
             GkTrack {
                 channel_id: CHANNEL,
@@ -757,7 +814,7 @@ impl Member {
         out.send
     }
 
-    fn frame(&mut self, f: &ServerMessage, now: u64) -> Vec<ClientMessage> {
+    pub(super) fn frame(&mut self, f: &ServerMessage, now: u64) -> Vec<ClientMessage> {
         let c = GkCtx {
             pins: &mut self.pins,
             now,
@@ -766,7 +823,7 @@ impl Member {
         self.took(out)
     }
 
-    fn tick(&mut self, now: u64) -> Vec<ClientMessage> {
+    pub(super) fn tick(&mut self, now: u64) -> Vec<ClientMessage> {
         let c = GkCtx {
             pins: &mut self.pins,
             now,
@@ -775,7 +832,7 @@ impl Member {
         self.took(out)
     }
 
-    fn post(&mut self, id: u8, text: &[u8], now: u64) -> Vec<ClientMessage> {
+    pub(super) fn post(&mut self, id: u8, text: &[u8], now: u64) -> Vec<ClientMessage> {
         let c = GkCtx {
             pins: &mut self.pins,
             now,
@@ -785,11 +842,11 @@ impl Member {
     }
 
     /// The head epoch it holds `CK` of.
-    fn epoch(&self) -> Option<u32> {
+    pub(super) fn epoch(&self) -> Option<u32> {
         self.keying.current_epoch(&self.group).map(|e| e.epoch)
     }
 
-    fn texts(&self) -> Vec<Vec<u8>> {
+    pub(super) fn texts(&self) -> Vec<Vec<u8>> {
         self.posts.iter().map(|p| p.envelope.clone()).collect()
     }
 
@@ -1163,7 +1220,7 @@ async fn e2e_an_old_epoch_refusal_makes_the_writer_post_again_under_the_head_and
 
 // ── With a database ───────────────────────────────────────────────────────
 
-async fn scratch_db() -> (l4f_accounts::store::Store, std::path::PathBuf) {
+pub(super) async fn scratch_db() -> (l4f_accounts::store::Store, std::path::PathBuf) {
     let id = rand::random::<u32>();
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/gk-tests");
     std::fs::create_dir_all(&dir).unwrap();
@@ -1197,7 +1254,7 @@ async fn scratch_db() -> (l4f_accounts::store::Store, std::path::PathBuf) {
     (store, file)
 }
 
-fn drop_db(file: &std::path::Path) {
+pub(super) fn drop_db(file: &std::path::Path) {
     for suffix in ["", "-wal", "-shm", ".lock"] {
         let _ = std::fs::remove_file(format!("{}{suffix}", file.display()));
     }
@@ -1555,5 +1612,527 @@ async fn e2e_a_member_whose_names_floor_predates_the_gate_folds_from_the_gate_on
         w.members[b].events
     );
     assert_eq!(w.members[a].texts(), vec![b"after the gate".to_vec()]);
+    drop_db(&file);
+}
+
+// ── R1b: kept reads, seed rolls, re-joins, keyholders across a restart ────
+
+/// The `EpochIn` answering a past epoch among `frames`, its parts merged.
+fn past_piece(frames: &[ServerMessage]) -> Option<gk::InPiece> {
+    let mut cur = gk::InPiece::default();
+    for f in frames {
+        if let ServerMessage::EpochIn { last, piece, .. } = f {
+            let p = (**piece).clone();
+            cur.walk.extend(p.walk);
+            cur.self_rows.extend(p.self_rows);
+            cur.head = cur.head.or(p.head);
+            cur.leaf = cur.leaf.or(p.leaf);
+            cur.path = cur.path.or(p.path);
+            cur.seal = cur.seal.or(p.seal);
+            cur.seat = cur.seat.or(p.seat);
+            cur.past = cur.past.or(p.past);
+            if *last {
+                if cur.past.is_some() {
+                    return Some(cur);
+                }
+                cur = gk::InPiece::default();
+            }
+        }
+    }
+    None
+}
+
+/// The epoch key a past answer gives `acc`, taken as a reader with no anchor takes it: its
+/// seat's welcome, or its row under `s_m` (here from the group's `seed`, where the app has
+/// its self-row), opened with its seat keys; the seal under that `BK`; `confirm` (C1).
+fn open_past(
+    id: &str,
+    acc: &Account,
+    seed: &[u8; 32],
+    p: &gk::InPiece,
+) -> (u32, Zeroizing<[u8; 32]>) {
+    use voipc_crypto::group_key::past::{take_past, PastIn};
+    use voipc_crypto::group_key::{
+        member_secret, open_seat_welcome, Holder as Kh, Leaf, Path, RowBase, Version,
+    };
+    let head = p.head.as_ref().expect("the opening");
+    let sh =
+        SignedHeader::decode(&head.header.body, &head.header.sig, GroupKind::Text, id).unwrap();
+    let g = Group::new(GroupKind::Text, id, sh.header().gen).unwrap();
+    let k = p.seat.as_ref().expect("its keying then");
+    let me = Me {
+        m: MemberId::Account(acc.a),
+        keys: &acc.keys.pair,
+    };
+    let from = Kh::from_raw(k.from.m.into(), &k.from.kx).unwrap();
+    let at = Version {
+        b: k.b,
+        v: k.base_v,
+    };
+    assert!(k.ratchets.is_empty(), "no promotion here");
+    let bk = match (&k.welcome, &k.row) {
+        (Some(w), _) => open_seat_welcome(&g, k.s, at, &me, &from, w).unwrap().1,
+        (None, Some(row)) => {
+            let seat = acc.keys.pair.public().seat(me.m);
+            let s_m = member_secret(&g, k.s, seed, &seat);
+            RowBase::member_side(&g, k.s, &me, &from, &s_m)
+                .unwrap()
+                .open_row(at, row)
+                .unwrap()
+        }
+        _ => panic!("a welcome or a row"),
+    };
+    let leaf = Leaf::try_from(p.leaf.unwrap()).unwrap();
+    let path = Path::from(p.path.clone().unwrap());
+    let past = PastIn {
+        header: &sh,
+        khs: &[],
+        leaf: &leaf,
+        path: &path,
+        seal: p.seal.as_ref().unwrap(),
+    };
+    let took = take_past(GroupKind::Text, id, None, &past, &bk).unwrap();
+    (took.epoch.e, took.ck)
+}
+
+/// R1b (H): a kept read. A member's `EpochFetch{at}` for an epoch the head moved past is
+/// answered with that epoch's opening, the member's leaf, path and seal then and its seat's
+/// welcome: opened with its seat keys, it gives the very key the member held then. An
+/// account that keeps the log reads it without following, a relay with the switch off
+/// serves it too, and a guest that keeps no log is refused `NOT_STORED`.
+#[tokio::test]
+async fn e2e_a_stored_groups_past_epoch_is_answered_with_what_opens_its_key() {
+    let (db, file) = scratch_db().await;
+    let inc = crate::accounts::gk::gk_start(&db, true)
+        .await
+        .unwrap()
+        .unwrap();
+    let ann = Account::new(&db, "ann").await;
+    let bob = Account::new(&db, "bob").await;
+    let cat = Account::new(&db, "cat").await;
+    let mut w = World::new(Relay::new());
+    w.relay.groups.attach(db.clone(), inc);
+    let id = w.relay.groups.id_for(CHANNEL, Some("hall"));
+    w.guest_holder(&id, true).await;
+    let a = w.account(&ann, &id, None).await;
+    let b = w.account(&bob, &id, None).await;
+    let c = w.account(&cat, &id, None).await;
+    assert!(w.seated(&[a, b, c], 15_000).await, "seated");
+    // ann and cat write, so each is pushed the openings that follow with its keys
+    w.post(a, 1, b"one").await;
+    w.post(c, 2, b"two").await;
+    w.run(500).await;
+    let head = |w: &World| w.holders[0].held.as_ref().unwrap().head.header().epoch;
+    let joined = head(&w);
+    // An exit opens an epoch the others sit in (a seat a Join made mid-epoch has no leaf in
+    // its epoch's opening, so no past answer for it)
+    let leave = |w: &mut World, i: usize| {
+        let sid = w.members[i].sid;
+        w.relay.unfollow(sid, &id);
+        let _ = w.members[i].keying.untrack(CHANNEL);
+    };
+    leave(&mut w, b);
+    let opened = w
+        .until(15_000, |w| {
+            head(w) > joined && w.members[a].epoch() == Some(head(w))
+        })
+        .await;
+    assert!(opened, "asked {:?}", w.holders[0].asked);
+    let then = w.members[a].keying.current_epoch(&id).unwrap();
+    // cat leaves too: the head moves past that epoch
+    let sid_c = w.members[c].sid;
+    leave(&mut w, c);
+    let moved = w.until(15_000, |w| head(w) > then.epoch).await;
+    assert!(moved, "asked {:?}", w.holders[0].asked);
+    let held = w.holders[0].held.as_ref().unwrap();
+    let seed = *held.ring.seed(held.head.header().seed).unwrap();
+    let at = gk::EpochRef {
+        gen: then.gen,
+        epoch: then.epoch,
+    };
+    let ask = |id: &str| ClientMessage::EpochFetch {
+        group: id.to_string(),
+        have: None,
+        at: vec![at],
+        seat: None,
+    };
+    // ann follows
+    let sid_a = w.members[a].sid;
+    let _ = w.relay.drain(sid_a).await;
+    w.relay.send(sid_a, ask(&id)).await;
+    let p = past_piece(&w.relay.drain(sid_a).await).expect("a past answer");
+    assert_eq!(p.past, Some(at));
+    let (e, ck) = open_past(&id, &ann, &seed, &p);
+    assert_eq!((e, *ck), (then.epoch, *then.ck));
+    // cat follows no longer but keeps the log
+    sqlx_exec(
+        &db,
+        &format!("INSERT INTO voipc_members (conv, account, joined_at) VALUES ('{id}', $1, 0)"),
+        &cat.a,
+    )
+    .await;
+    let _ = w.relay.drain(sid_c).await;
+    w.relay.send(sid_c, ask(&id)).await;
+    let p = past_piece(&w.relay.drain(sid_c).await).expect("an answer to a non-follower");
+    assert_eq!(
+        open_past(&id, &cat, &seed, &p).1.as_slice(),
+        then.ck.as_slice()
+    );
+    // A guest keeps no log
+    let gik = voipc_crypto::generate_identity_key_pair();
+    let guest = w.relay.session(&gik, None);
+    w.relay.send(guest, ask(&id)).await;
+    let refused = w.relay.drain(guest).await.into_iter().any(|f| {
+        matches!(
+            f,
+            ServerMessage::EpochRefused { what, why, .. }
+                if what == refused_what::FETCH && why == refused_why::NOT_STORED
+        )
+    });
+    assert!(refused);
+    // The switch off: served read-only
+    let mut off = Relay::new();
+    off.groups = Groups::new(false);
+    off.groups.attach(db.clone(), inc);
+    let o = off.session(&cat.ik, Some(cat.a));
+    off.send(o, ask(&id)).await;
+    let p = past_piece(&off.drain(o).await).expect("an answer with the switch off");
+    assert_eq!(
+        open_past(&id, &cat, &seed, &p).1.as_slice(),
+        then.ck.as_slice()
+    );
+    drop_db(&file);
+}
+
+/// One statement binding one blob, on either backend.
+async fn sqlx_exec(db: &l4f_accounts::store::Store, q: &str, b: &[u8]) {
+    let q = q.to_string();
+    match db {
+        l4f_accounts::store::Store::Lite(x) => {
+            sqlx::query(sqlx::AssertSqlSafe(q))
+                .bind(b)
+                .execute(&x.0)
+                .await
+                .unwrap();
+        }
+        l4f_accounts::store::Store::Pg(x) => {
+            sqlx::query(sqlx::AssertSqlSafe(q))
+                .bind(b)
+                .execute(&x.0)
+                .await
+                .unwrap();
+        }
+    }
+}
+
+/// R1b (J): a text seed roll. The group's Genesis is dated a day back, as if it were a
+/// day old. A second guest keyholder is promoted; its connection ends, and the
+/// KeyholdersRemove that takes its entry starts a roll (seed 2, floor 1). The relay asks a
+/// seed-welcome page of the remaining keyholder for every seat, stores and pushes the
+/// welcomes, and the next opening (a member's exit), told every seat holds seed 2, finishes
+/// the roll (floor 2). The members still read each other under seed 2's rows.
+#[tokio::test]
+async fn e2e_a_text_seed_roll_finishes_with_its_members_still_reading() {
+    let mut w = World::new(Relay::new());
+    let id = w.relay.groups.id_for(CHANNEL, None);
+    let k = w.guest_holder(&id, false).await;
+    w.holders[k].back = 25 * 3600;
+    for _ in 0..3 {
+        w.guest(&id).await;
+    }
+    assert!(w.seated(&[0, 1, 2], 15_000).await, "seated");
+    let k2 = w.guest_holder(&id, false).await;
+    let two = w
+        .until(15_000, |w| {
+            w.holders[0]
+                .held
+                .as_ref()
+                .is_some_and(|h| h.kh.header().keyholders.len() == 2)
+        })
+        .await;
+    assert!(
+        two,
+        "the second guest promoted: asked {:?}",
+        w.holders[0].asked
+    );
+    let sid2 = w.holders[k2].sid;
+    w.relay.end(sid2);
+    w.holders.remove(k2);
+    let rolled = w
+        .until(15_000, |w| {
+            w.holders[0]
+                .held
+                .as_ref()
+                .is_some_and(|h| h.head.header().seed == 2)
+        })
+        .await;
+    assert!(
+        rolled,
+        "the removal starts a roll: asked {:?}",
+        w.holders[0].asked
+    );
+    let paged = w
+        .until(15_000, |w| {
+            w.holders[0].asked.contains(&gk::due::SEED_WELCOMES)
+        })
+        .await;
+    assert!(paged, "a seed-welcome page: asked {:?}", w.holders[0].asked);
+    w.run(500).await;
+    // Member 0 writes during the roll: the opening that finishes it is pushed to it
+    w.post(0, 1, b"during the roll").await;
+    let read = w.until(15_000, |w| !w.members[1].posts.is_empty()).await;
+    assert!(read, "events {:?}", w.members[1].events);
+    // A member leaves: the exit's opening is told every seat holds seed 2
+    let sid_c = w.members[2].sid;
+    w.relay.unfollow(sid_c, &id);
+    let _ = w.members[2].keying.untrack(CHANNEL);
+    let finished = w
+        .until(15_000, |w| {
+            w.holders[0].held.as_ref().is_some_and(|h| {
+                let x = h.head.header();
+                (x.seed, x.seed_floor) == (2, 2) && w.members[0].epoch() == Some(x.epoch)
+            })
+        })
+        .await;
+    assert!(
+        finished,
+        "an opening that finishes the roll: asked {:?}, stales {:?}",
+        w.holders[0].asked, w.holders[0].stales
+    );
+    // Every seat was online: its seed welcome was pushed and not kept (2b)
+    assert_eq!(
+        w.relay.groups.get(&id).unwrap().seed_kept_for_test(),
+        0,
+        "a memory group keeps no seed welcome that went out"
+    );
+    // The members read each other under the rows of seed 2
+    w.post(0, 3, b"after the roll").await;
+    let read = w.until(15_000, |w| w.members[1].posts.len() == 2).await;
+    assert!(
+        read,
+        "events {:?} {:?}",
+        w.members[0].events, w.members[1].events
+    );
+    assert_eq!(
+        w.members[1].texts(),
+        vec![b"during the roll".to_vec(), b"after the roll".to_vec()]
+    );
+    let e = w.holders[0].held.as_ref().unwrap().head.header().epoch;
+    assert_eq!(
+        w.members[0].epoch(),
+        Some(e),
+        "the writer holds the head epoch"
+    );
+}
+
+/// R1b (B): a memory group's account seat whose welcome went to an earlier connection. The
+/// account's text seat stays when that connection ends; its next connection holds no `BK`,
+/// and the relay keeps neither the welcome nor a row, so the seat exits and joins again,
+/// and the new connection reads what is posted after.
+#[tokio::test]
+async fn e2e_a_memory_seat_that_lost_its_welcome_joins_again_and_reads() {
+    let (db, file) = scratch_db().await;
+    let inc = crate::accounts::gk::gk_start(&db, true)
+        .await
+        .unwrap()
+        .unwrap();
+    let ann = Account::new(&db, "ann").await;
+    let bob = Account::new(&db, "bob").await;
+    let mut w = World::new(Relay::new());
+    w.relay.groups.attach(db.clone(), inc);
+    let id = w.relay.groups.id_for(CHANNEL, None);
+    assert!(id.starts_with("r:"), "a memory group");
+    w.guest_holder(&id, false).await;
+    let a = w.account(&ann, &id, None).await;
+    let b = w.account(&bob, &id, None).await;
+    assert!(w.seated(&[a, b], 15_000).await, "seated");
+    // bob writes, so he is pushed the openings that follow with his keys
+    w.post(b, 1, b"hello").await;
+    w.run(500).await;
+    let asked = w.holders[0].asked.len();
+    // ann's connection ends; her account seat stays
+    let sid_a = w.members[a].sid;
+    w.relay.end(sid_a);
+    w.members[a].hold = true;
+    let a2 = w.account(&ann, &id, None).await;
+    assert!(
+        w.seated(&[a2], 30_000).await,
+        "seated again: asked {:?}, events {:?}",
+        w.holders[0].asked,
+        w.members[a2].events
+    );
+    let again = &w.holders[0].asked[asked..];
+    assert!(
+        again.contains(&gk::due::EXITS) && again.ends_with(&[gk::due::JOIN]),
+        "an exit, then a Join: {again:?}"
+    );
+    w.post(b, 2, b"welcome back").await;
+    let read = w.until(15_000, |w| !w.members[a2].posts.is_empty()).await;
+    assert!(read, "events {:?}", w.members[a2].events);
+    assert_eq!(w.members[a2].texts(), vec![b"welcome back".to_vec()]);
+    drop_db(&file);
+}
+
+/// R1b (K, P): keyholder entries across a stored relay's restart. Three account desktops
+/// hold keys (lee went offline before max was promoted). After a restart only kim comes
+/// back; max's device is removed from its account, and the KeyholdersRemove that takes
+/// max's entry needs lee's pair for its `KRK` welcome: reloaded from the database, it lands.
+#[tokio::test]
+async fn e2e_reloaded_keyholder_pairs_let_a_removal_land_after_a_restart() {
+    let (db, file) = scratch_db().await;
+    let inc = crate::accounts::gk::gk_start(&db, true)
+        .await
+        .unwrap()
+        .unwrap();
+    let kim = Account::new(&db, "kim").await;
+    let lee = Account::new(&db, "lee").await;
+    let max = Account::new(&db, "max").await;
+    let ann = Account::new(&db, "ann").await;
+    let mut w = World::new(Relay::new());
+    w.relay.groups.attach(db.clone(), inc);
+    let id = w.relay.groups.id_for(CHANNEL, Some("vault"));
+    let desktop = |w: &mut World, acc: &Account, device: Option<&[u8]>| {
+        let sid = w.relay.session(&acc.ik, Some(acc.a));
+        if let Some(d) = device {
+            w.relay.groups.set_device(sid, d.to_vec());
+        }
+        w.relay.follow(sid, &id);
+        Holder::desktop(sid, acc.ik, acc.a, 1, &id, true)
+    };
+    let k = desktop(&mut w, &kim, None);
+    w.relay.send(k.sid, k.volunteer()).await;
+    w.holders.push(k);
+    let a = w.account(&ann, &id, None).await;
+    assert!(w.seated(&[a], 15_000).await, "kim's Genesis");
+    let entries = |w: &World| {
+        w.holders[0]
+            .held
+            .as_ref()
+            .map_or(0, |h| h.kh.header().keyholders.len())
+    };
+    let l = desktop(&mut w, &lee, None);
+    w.relay.send(l.sid, l.volunteer()).await;
+    w.holders.push(l);
+    assert!(
+        w.until(30_000, |w| entries(w) == 2).await,
+        "lee promoted: asked {:?}",
+        w.holders[0].asked
+    );
+    let sid_l = w.holders[1].sid;
+    w.relay.end(sid_l);
+    w.holders.remove(1);
+    let m = desktop(&mut w, &max, Some(b"max-laptop"));
+    w.relay.send(m.sid, m.volunteer()).await;
+    w.holders.push(m);
+    assert!(
+        w.until(30_000, |w| entries(w) == 3).await,
+        "max promoted: asked {:?}",
+        w.holders[0].asked
+    );
+    // Give the actor a moment to write the set, then the relay stops
+    w.run(500).await;
+    let mut kh = w.holders.remove(0);
+    let local = {
+        let _ = w.members[a].keying.end();
+        w.members[a].keying.local().cloned()
+    };
+    w.relay.groups.on_purge(&id);
+    drop(w);
+
+    let mut w = World::new(Relay::new());
+    w.relay.groups.attach(db.clone(), inc);
+    kh.sid = w.relay.session(&kim.ik, Some(kim.a));
+    kh.out = None;
+    kh.dues = Parts::new(Seq::Due);
+    w.relay.follow(kh.sid, &id);
+    w.relay.send(kh.sid, kh.volunteer()).await;
+    w.holders.push(kh);
+    let _ = w.account(&ann, &id, local).await;
+    w.run(300).await;
+    w.relay.groups.on_device_removed(max.a, b"max-laptop").await;
+    let removed = w
+        .until(30_000, |w| {
+            w.holders[0]
+                .held
+                .as_ref()
+                .is_some_and(|h| h.head.header().kind == Kind::KeyholdersRemove)
+        })
+        .await;
+    assert!(
+        removed,
+        "the removal lands: asked {:?}, stales {:?}",
+        w.holders[0].asked, w.holders[0].stales
+    );
+    let set = &w.holders[0].held.as_ref().unwrap().kh.header().keyholders;
+    let mut accounts: Vec<MemberId> = set.iter().map(|k| k.m).collect();
+    let mut want = vec![MemberId::Account(kim.a), MemberId::Account(lee.a)];
+    accounts.sort_by_key(|m| m.seat_id());
+    want.sort_by_key(|m| m.seat_id());
+    assert_eq!(accounts, want, "max's entry gone, lee's kept");
+    drop_db(&file);
+}
+
+/// R1b fixer (review 8): an account's seat keys rotate while it sits in a memory group (an
+/// anonymous channel). Its old seat can take no seed welcome, so it exits there too, as in
+/// a stored group, and no roll is held open by it.
+#[tokio::test]
+async fn e2e_a_rotation_exits_the_old_seat_of_an_account_in_a_memory_group() {
+    let (db, file) = scratch_db().await;
+    let inc = crate::accounts::gk::gk_start(&db, true)
+        .await
+        .unwrap()
+        .unwrap();
+    let ann = Account::new(&db, "ann").await;
+    let bob = Account::new(&db, "bob").await;
+    let mut w = World::new(Relay::new());
+    w.relay.groups.attach(db.clone(), inc);
+    let id = w.relay.groups.id_for(CHANNEL, None);
+    assert!(id.starts_with("r:"), "a memory group");
+    w.guest_holder(&id, false).await;
+    let a = w.account(&ann, &id, None).await;
+    let b = w.account(&bob, &id, None).await;
+    assert!(w.seated(&[a, b], 15_000).await, "seated");
+    w.run(500).await;
+    let asked = w.holders[0].asked.len();
+    let keys = SeatKeys::generate(2, wall_ms() / 1000);
+    let public = keys.pair.public();
+    let e = Endorsement::sign(
+        &ann.ik,
+        Origin::VaultSeat,
+        MemberId::Account(ann.a),
+        2,
+        keys.made,
+        &public,
+    )
+    .unwrap();
+    crate::accounts::gk::put_seat_keys(
+        &db,
+        &ann.a,
+        &crate::accounts::gk::SeatKeys {
+            n: 2,
+            kem: public.kem_bytes().into(),
+            dh: public.dh_bytes().into(),
+            made: e.made,
+            sig: e.sig.to_vec(),
+            published: wall_ms(),
+        },
+    )
+    .await
+    .unwrap();
+    let pair = Pair {
+        keys: public,
+        endorsement: e,
+    };
+    w.relay.groups.on_seat_keys(ann.a, pair, raw(&ann.ik)).await;
+    let exited = w
+        .until(15_000, |w| {
+            w.holders[0].asked[asked..].contains(&gk::due::EXITS)
+        })
+        .await;
+    assert!(
+        exited,
+        "the old seat's exit is asked: {:?}",
+        &w.holders[0].asked[asked..]
+    );
     drop_db(&file);
 }

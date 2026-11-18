@@ -3,9 +3,21 @@
 //! drops, the last minute's refusals, and plain warnings where a limit is near. With
 //! `[pool]`, its media edges too (protocol v26).
 
-use voipc_protocol::types::{LoadReport, ShareLoad};
+use std::cmp::Reverse;
+use std::collections::{HashMap, HashSet};
+
+use voipc_crypto::group_key::timers::EPOCH_AGE_MAX_SECS;
+use voipc_protocol::types::{ChannelId, GroupLoad, LoadReport, ShareLoad};
 
 use crate::state::ServerState;
+
+/// A group this large has a row in Load whatever its state (plan 2j).
+const GROUP_ROW_SEATS: u32 = 1000;
+/// Groups' rows at most.
+const GROUP_ROWS: usize = 50;
+/// The group key's warnings listed at most, the rest counted: each live group raises up to
+/// four, and the whole report goes in one frame (64 KiB).
+const GK_WARNINGS: usize = 50;
 
 /// `(RSS in MiB, CPU seconds)` of this process, from /proc; zeros off Linux.
 pub(crate) fn own_usage() -> (u32, u64) {
@@ -135,6 +147,20 @@ pub async fn report(state: &ServerState) -> LoadReport {
         }
         None => Vec::new(),
     };
+    // The group key's warnings (plan 2j), each naming the channel whose group shows a row:
+    // the largest groups' first, as the table lists them, at most `GK_WARNINGS`
+    let groups = state.gk.stats();
+    let mut gk_warned = state.gk.warnings();
+    let named: HashSet<ChannelId> = gk_warned.iter().map(|(c, _)| *c).collect();
+    let seats: HashMap<ChannelId, u32> = groups.iter().map(|g| (g.channel_id, g.seats)).collect();
+    gk_warned.sort_by_cached_key(|(c, w)| (Reverse(seats.get(c).copied()), *c, w.clone()));
+    let more = gk_warned.len().saturating_sub(GK_WARNINGS);
+    warnings.extend(gk_warned.into_iter().take(GK_WARNINGS).map(|(_, w)| w));
+    if more > 0 {
+        warnings.push(format!(
+            "{more} more group key warnings: the server's log has each."
+        ));
+    }
     if state.sqlite_accounts && state.max_users > 10_000 {
         warnings.push(
             "Accounts are on SQLite, which signs people in one at a time: above 10,000 use Postgres."
@@ -156,7 +182,111 @@ pub async fn report(state: &ServerState) -> LoadReport {
         last_minute,
         warnings,
         edges,
-        // R2 fills it from `gk::Groups::stats` (plan 2j)
-        groups: vec![],
+        groups: groups_shown(groups, &named),
+    }
+}
+
+/// The groups worth a row (plan 2j): those with something amiss or a warning naming their
+/// channel first, then the largest from `GROUP_ROW_SEATS` seats, at most `GROUP_ROWS`.
+fn groups_shown(mut all: Vec<GroupLoad>, named: &HashSet<ChannelId>) -> Vec<GroupLoad> {
+    let flagged = |g: &GroupLoad| amiss(g) || named.contains(&g.channel_id);
+    all.retain(|g| g.seats >= GROUP_ROW_SEATS || flagged(g));
+    all.sort_by_key(|g| (!flagged(g), Reverse(g.seats)));
+    all.truncate(GROUP_ROWS);
+    all
+}
+
+/// No keyholder online for seated members, a head older than writers wait for (70 min), or
+/// missed deadlines: what the relay's warnings name.
+fn amiss(g: &GroupLoad) -> bool {
+    (g.seats > 0 && g.keyholders_online == 0)
+        || u64::from(g.last_commit_secs) > EPOCH_AGE_MAX_SECS
+        || g.missed_deadlines > 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn group(channel_id: u32, seats: u32, keyholders_online: u32) -> GroupLoad {
+        GroupLoad {
+            channel_id,
+            seats,
+            keyholders_online,
+            ..GroupLoad::default()
+        }
+    }
+
+    #[test]
+    fn load_shows_large_groups_and_amiss_ones_first_and_at_most_fifty() {
+        let mut all = vec![
+            group(1, 10, 1),
+            group(2, 2000, 1),
+            group(3, 5, 0),
+            group(4, 1000, 2),
+            GroupLoad {
+                missed_deadlines: 1,
+                ..group(5, 3, 1)
+            },
+            GroupLoad {
+                last_commit_secs: 71 * 60,
+                ..group(6, 4, 1)
+            },
+        ];
+        let shown: Vec<u32> = groups_shown(all.clone(), &HashSet::new())
+            .iter()
+            .map(|g| g.channel_id)
+            .collect();
+        assert_eq!(
+            shown,
+            vec![3, 6, 5, 2, 4],
+            "a small healthy group has no row"
+        );
+        all.extend((100..200).map(|c| group(c, 5000, 1)));
+        assert_eq!(groups_shown(all, &HashSet::new()).len(), GROUP_ROWS);
+    }
+
+    #[test]
+    fn load_shows_a_small_group_a_warning_names_among_the_first() {
+        let all = vec![group(1, 10, 1), group(2, 2000, 1), group(7, 4, 1)];
+        let shown: Vec<u32> = groups_shown(all, &HashSet::from([7]))
+            .iter()
+            .map(|g| g.channel_id)
+            .collect();
+        assert_eq!(
+            shown,
+            vec![7, 2],
+            "the group a warning names, then the large one"
+        );
+    }
+
+    /// The group key's warnings reach Load's list, as `#<channel id>: <what>`.
+    #[tokio::test]
+    async fn load_lists_the_group_keys_warnings() {
+        let state = crate::state::test_support::make_state();
+        // Raised by a group's actor (gk_tests), with no seats: only the warning shows it
+        state.gk.warn_for_test(7, "no keyholder online for 11 min");
+        let load = report(&state).await;
+        assert!(load
+            .warnings
+            .contains(&"#7: no keyholder online for 11 min".to_string()));
+        assert!(load.groups.iter().any(|g| g.channel_id == 7));
+    }
+
+    /// Finding: every live group's warnings went into the report, whose one frame a
+    /// keyholder of thousands of groups gone quiet would overflow (no reply at all). At
+    /// most `GK_WARNINGS` are listed, the rest counted.
+    #[tokio::test]
+    async fn load_lists_at_most_fifty_group_key_warnings_and_counts_the_rest() {
+        let state = crate::state::test_support::make_state();
+        for channel in 1..=60 {
+            state.gk.warn_for_test(channel, "keys late");
+        }
+        let load = report(&state).await;
+        let listed = load.warnings.iter().filter(|w| w.starts_with('#')).count();
+        assert_eq!(listed, GK_WARNINGS);
+        assert!(load
+            .warnings
+            .contains(&"10 more group key warnings: the server's log has each.".to_string()));
     }
 }

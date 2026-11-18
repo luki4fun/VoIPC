@@ -2,25 +2,63 @@
 //! without accounts (nothing reaches the database, a restart is a new generation), `Db`
 //! over `accounts::gk` for stored `c:` groups. The actor stores a checked commit here
 //! before anything is pushed; answers read seat keying, the keyring and `KRK` welcomes.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use l4f_accounts::store::Store as Db;
-use voipc_crypto::group_key::commit::{HolderRef, Joiner, Listed, RowsOut, WelcomeOut};
+use voipc_crypto::group_key::commit::{HolderRef, Joiner, Listed, Pair, RowsOut, WelcomeOut};
+use voipc_crypto::group_key::timers::{HOLD_MS, KEYHOLDER_SKEW_SECS, MATERIAL_SWEEP_MARGIN_MS};
 use voipc_crypto::group_key::tree::BucketTree;
 use voipc_crypto::group_key::{
-    seat_record, Kind, Leaf, MemberId, Pool, SeatRef, SignedHeader, Via,
+    seat_record, GroupKind, Kind, Leaf, MemberId, Pool, SeatRef, SignedHeader, Via, MAX_WALK,
 };
-use voipc_protocol::gk::{self, HeaderIn, KrkIn, NamesListIn, NamesStepIn, RatchetStep};
+use voipc_protocol::gk::{
+    self, EpochRef, HeaderIn, InPiece, KrkIn, LeafIn, NamesListIn, NamesStepIn, PathIn,
+    RatchetStep, SeatKeying, SelfRowIn,
+};
 
 use super::due::{Exits, Leaving};
 use super::group::{GroupState, Head, Seat, Taken};
 use super::names::{starts_names, Kept};
-use super::snapshot::Ver;
+use super::snapshot::{link, Ver};
 use crate::accounts::gk as db;
+
+/// Dispatch over the two backends, as accounts.rs's `db!` (which this module cannot see).
+macro_rules! on {
+    ($store:expr, $pool:ident => $body:block) => {
+        match $store {
+            Db::Pg(b) => {
+                let $pool = &b.0;
+                $body
+            }
+            Db::Lite(b) => {
+                let $pool = &b.0;
+                $body
+            }
+        }
+    };
+}
+
+/// Runs `$q` (one DELETE with `LIMIT $n` as its last bound value) until it takes nothing,
+/// a short transaction each (Round C keeps SQLite's writer free); the rows it took.
+macro_rules! batched {
+    ($store:expr, $q:expr, $($bind:expr),*) => {{
+        let mut gone: u64 = 0;
+        loop {
+            let n = on!($store, pool => {
+                sqlx::query($q)$(.bind($bind))*.bind(db::STORE_BATCH as i64).execute(pool).await?.rows_affected()
+            });
+            gone += n;
+            if n == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        gone
+    }};
+}
 
 /// Why kept, a bit each (`voipc_gk_headers.keep`).
 pub const KEEP_RECENT: u32 = 1;
@@ -52,6 +90,9 @@ pub struct Mem {
     rows: HashMap<(u64, u64), (HolderRef, RowsOut)>,
     keyring: (u32, Vec<u8>),
     krk: HashMap<[u8; 32], KrkIn>,
+    /// A seat's newest seed welcome until it went out whole (2b: pushed to the online
+    /// seats, kept for one offline through a roll until its answer took it, §5.6).
+    seed: HashMap<SeatRef, gk::SeedWelcomeIn>,
 }
 
 pub struct DbStore {
@@ -60,6 +101,8 @@ pub struct DbStore {
     pub incarnation: [u8; 16],
 }
 
+// One a group, made once: the memory variant's size is no matter
+#[allow(clippy::large_enum_variant)]
 pub enum Store {
     Memory(Mutex<Mem>),
     Db(Arc<DbStore>),
@@ -184,6 +227,7 @@ impl Store {
             m.rows.retain(|k, _| bases.contains(k));
             m.welcomes
                 .retain(|s, (_, w)| g.seats.contains_key(s) && bases.contains(&(w.b, w.v)));
+            m.seed.retain(|s, _| g.seats.contains_key(s));
         }
     }
 
@@ -232,8 +276,36 @@ impl Store {
         }
     }
 
-    /// A seed welcome waiting for `seat` under `s` (stored groups; a memory group's went out
-    /// at once).
+    /// `seat`'s seed welcome under `s` went out whole: a memory group keeps it no longer
+    /// (2b, a lost one means the seat re-joins).
+    pub fn seed_sent(&self, seat: &SeatRef, s: u32) {
+        if let Some(mut m) = self.mem() {
+            if m.seed.get(seat).is_some_and(|w| w.s == s) {
+                m.seed.remove(seat);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub fn seed_kept(&self) -> usize {
+        self.mem().map_or(0, |m| m.seed.len())
+    }
+
+    /// A memory group's material in bytes, about (Load's `mem_bytes` beside the state's).
+    pub fn mem_bytes(&self) -> u64 {
+        let Some(m) = self.mem() else {
+            return 0;
+        };
+        let rows: usize = m.rows.values().map(|(_, r)| r.rows.len() + 64).sum();
+        let krk: usize = m.krk.values().map(|k| k.bytes.len() + 64).sum();
+        (m.welcomes.len() * (gk::SEAT_WELCOME_BYTES + 120)
+            + m.seed.len() * (gk::SEED_WELCOME_BYTES + 80)
+            + rows
+            + krk
+            + m.keyring.1.len()) as u64
+    }
+
+    /// A seed welcome waiting for `seat` under `s`.
     pub async fn seed_welcome(
         &self,
         grp: &str,
@@ -241,7 +313,12 @@ impl Store {
         seat: &SeatRef,
         s: u32,
     ) -> Option<gk::SeedWelcomeIn> {
-        let Store::Db(d) = self else { return None };
+        let d = match self {
+            Store::Memory(_) => {
+                return self.mem()?.seed.get(seat).filter(|w| w.s == s).cloned();
+            }
+            Store::Db(d) => d,
+        };
         let w = db::welcome(
             &d.db,
             grp,
@@ -257,6 +334,88 @@ impl Store {
             from: holder_of(&w.maker)?.into(),
             bytes: w.bytes,
         })
+    }
+
+    /// A seed-welcome page's welcomes under seed `s`, made by `by` (§5.6): each seat holds
+    /// `s` from now on. Stored (`voipc_gk_seats.seed` moves with them), or a memory group's
+    /// kept for its seat.
+    pub async fn seeds(
+        &self,
+        grp: &str,
+        gen: &[u8; 16],
+        s: u32,
+        by: &HolderRef,
+        welcomes: &[(SeatRef, Vec<u8>)],
+        now: u64,
+    ) -> Result<(), String> {
+        match self {
+            Store::Memory(_) => {
+                let mut m = self.mem().expect("memory");
+                for (seat, bytes) in welcomes {
+                    let w = gk::SeedWelcomeIn {
+                        s,
+                        from: (*by).into(),
+                        bytes: bytes.clone(),
+                    };
+                    m.seed.insert(*seat, w);
+                }
+                Ok(())
+            }
+            Store::Db(d) => {
+                let rows: Vec<db::Welcome> = welcomes
+                    .iter()
+                    .map(|(seat, bytes)| db::Welcome {
+                        seat: seat_record(seat),
+                        kind: db::WelcomeKind::Seed,
+                        s,
+                        version: None,
+                        maker: maker(by),
+                        bytes: bytes.clone(),
+                        made: now,
+                    })
+                    .collect();
+                db::put_seed_welcomes(&d.db, grp, gen, &rows)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        }
+    }
+
+    /// The keyholder entries of a stored group as its actor holds them (2i): each with its
+    /// pair, rank, device and when it was last online; an entry no longer in the set goes.
+    pub async fn put_holders(&self, g: &GroupState, now: u64) {
+        if let Store::Db(d) = self {
+            if let Err(e) = put_holders(&d.db, g, now).await {
+                tracing::warn!(group = %g.id, "keeping the keyholders failed: {e}");
+            }
+        }
+    }
+
+    /// A live group's own sweep (plan 2e): a stored group's orphans, between its commits,
+    /// and its keyholder entries with `last_online` now for those online (a restart counts
+    /// an entry away only from when it was last seen, 2i); daily, names past 90 days, with
+    /// the step before the oldest kept.
+    pub async fn sweep_live(&self, g: &mut GroupState, now: u64, daily: bool) {
+        if let Store::Db(d) = self {
+            if let Err(e) = db::sweep_orphans(&d.db, &g.id, None).await {
+                tracing::warn!(group = %g.id, "sweeping orphans failed: {e}");
+            }
+            if !g.holders.online(&g.vols).is_empty() {
+                self.put_holders(g, now).await;
+            }
+        }
+        let Some(gen) = g.gen().filter(|_| daily) else {
+            return;
+        };
+        g.names.sweep(&gen, now / 1000);
+        if let Some(step) = g.names.take_swept() {
+            self.names_step(&g.id, &gen, &step).await;
+        }
+        if let (Store::Db(d), Some(step)) = (self, g.names.step_at(&gen)) {
+            if let Err(e) = db::sweep_names(&d.db, &g.id, &gen, step).await {
+                tracing::warn!(group = %g.id, "sweeping names failed: {e}");
+            }
+        }
     }
 
     /// The head epoch's keyring stream from piece `from_j` on.
@@ -405,52 +564,6 @@ impl Store {
                 sealed,
             })
             .collect()
-    }
-
-    /// A page of the eager seats of a stored group's new start (plan 2d): the accounts that
-    /// keep `conv`'s log with published seat keys, after `after`, each as a joiner with its
-    /// identity key. An account with no identity key on file is skipped.
-    pub async fn eager_seats(
-        &self,
-        conv: &str,
-        after: Option<&[u8; 16]>,
-        limit: u32,
-    ) -> Result<Vec<([u8; 16], Joiner)>> {
-        let Store::Db(d) = self else {
-            return Ok(vec![]);
-        };
-        let page = db::members_with_seat_keys(&d.db, conv, after, limit).await?;
-        let mut out = Vec::with_capacity(page.len());
-        for (account, k) in page {
-            let Some(ik) = identity_key(&d.db, &account).await? else {
-                continue;
-            };
-            let wire = gk::EndorsedPair {
-                origin: gk::origin::VAULT_SEAT,
-                u: 0,
-                kem: k.kem,
-                dh: k.dh,
-                n: k.n,
-                made: k.made,
-                sig: k.sig,
-            };
-            let Ok(pair) =
-                voipc_crypto::group_key::wire::pair(&wire, gk::GkMember::Account(account))
-            else {
-                continue;
-            };
-            out.push((
-                account,
-                Joiner {
-                    seat: pair.keys.seat(MemberId::Account(account)),
-                    ik,
-                    keys: pair.keys,
-                    endorsement: pair.endorsement,
-                    returning: false,
-                },
-            ));
-        }
-        Ok(out)
     }
 
     /// A stored group as the database holds it, into `g`. An old incarnation's group is
@@ -634,7 +747,37 @@ impl Store {
             }
         }
         g.names.restore(lists, removals, step.map(|s| (gen, s)));
-        g.holders.set_to(kh.header().keyholders.clone(), |_| None);
+        // Keyholder entries with their pairs (a later Add, Remove or Replace makes `KRK`
+        // welcomes to offline ones too), ranks, devices, misses and last online (2i)
+        let kept = holder_rows(&d.db, &grp).await?;
+        g.holders.set_to(kh.header().keyholders.clone(), |kx| {
+            kept.iter()
+                .find(|r| r.kx == *kx)
+                .and_then(|r| r.pair.clone())
+        });
+        for r in kept {
+            if !g.holders.set.iter().any(|k| k.kx == r.kx) {
+                continue;
+            }
+            if r.rank != u8::MAX {
+                g.holders.rank.insert(r.kx, r.rank);
+            }
+            if let Some(dev) = r.device {
+                g.holders.device.insert(r.kx, dev);
+            }
+            let st = g.holders.stats.entry(r.kx).or_default();
+            st.away_since = Some(r.last_online);
+            st.missed = r.misses.missed.into();
+            st.declined = r.misses.declined.into();
+        }
+        // Each account entry's newest counter: below it seven days, an entry goes (2d)
+        let accounts: HashSet<[u8; 16]> =
+            g.holders.set.iter().filter_map(|k| k.m.account()).collect();
+        for a in accounts {
+            if let Some(k) = db::seat_keys(&d.db, &a).await? {
+                g.holders.newest.insert(a, (k.n, k.published));
+            }
+        }
         g.rolls = row.head.rolls;
         g.gen_time = row.head.gen_time;
         g.head = Some(Head {
@@ -739,7 +882,7 @@ async fn commit_db(d: &DbStore, g: &GroupState, t: &Taken, now: u64) -> Result<(
         }
     }
     db::put_rows(s, grp, c, &gen, &rows).await?;
-    let mut welcomes: Vec<db::Welcome> = t
+    let welcomes: Vec<db::Welcome> = t
         .commit
         .welcomes
         .iter()
@@ -753,15 +896,6 @@ async fn commit_db(d: &DbStore, g: &GroupState, t: &Taken, now: u64) -> Result<(
             made: now,
         })
         .collect();
-    welcomes.extend(t.commit.seed_welcomes.iter().map(|w| db::Welcome {
-        seat: seat_record(&w.seat),
-        kind: db::WelcomeKind::Seed,
-        s: h.seed,
-        version: None,
-        maker: maker_b,
-        bytes: w.bytes.clone(),
-        made: now,
-    }));
     db::put_welcomes(s, grp, c, &gen, &welcomes).await?;
     let seals: Vec<db::Seal> = t
         .commit
@@ -895,31 +1029,922 @@ async fn commit_db(d: &DbStore, g: &GroupState, t: &Taken, now: u64) -> Result<(
     if moved != db::Moved::Done {
         return Err(Fail::Store(format!("{moved:?}")).into());
     }
+    // A commit's own seed welcomes (a voice KeyholdersRemove's; a text commit owes none, 2d)
+    // go in as a page does, once the head moved: no read takes them before
+    let seed: Vec<db::Welcome> = t
+        .commit
+        .seed_welcomes
+        .iter()
+        .map(|w| db::Welcome {
+            seat: seat_record(&w.seat),
+            kind: db::WelcomeKind::Seed,
+            s: h.seed,
+            version: None,
+            maker: maker_b,
+            bytes: w.bytes.clone(),
+            made: now,
+        })
+        .collect();
+    if !seed.is_empty() {
+        db::put_seed_welcomes(s, grp, &gen, &seed).await?;
+    }
     Ok(())
 }
 
-/// An account's identity key, raw (the 0x05 type byte dropped), as `voipc_identity` holds it.
-async fn identity_key(db: &Db, account: &[u8; 16]) -> Result<Option<[u8; 32]>> {
-    const Q: &str = "SELECT identity_key FROM voipc_identity WHERE account = $1";
-    let key: Option<Vec<u8>> = match db {
-        Db::Lite(b) => {
-            sqlx::query_scalar(Q)
-                .bind(&account[..])
-                .fetch_optional(&b.0)
-                .await?
+// ── Keyholder entries (2i) ────────────────────────────────────────────────
+
+/// A keyholder entry as the database keeps it, its pair in a column of its own.
+struct HolderRow {
+    kx: [u8; 32],
+    device: Option<Vec<u8>>,
+    rank: u8,
+    last_online: u64,
+    misses: db::Misses,
+    pair: Option<Pair>,
+}
+
+async fn holder_rows(store: &Db, grp: &str) -> Result<Vec<HolderRow>> {
+    type T = (
+        Vec<u8>,
+        Vec<u8>,
+        Option<Vec<u8>>,
+        i16,
+        i64,
+        Vec<u8>,
+        Option<Vec<u8>>,
+    );
+    let rows: Vec<T> = on!(store, pool => {
+        sqlx::query_as("SELECT kx, m, device, rank, last_online, missed, pair FROM voipc_gk_holders WHERE grp = $1")
+            .bind(grp)
+            .fetch_all(pool)
+            .await?
+    });
+    let mut out = vec![];
+    for (kx, m, device, rank, last_online, missed, pair) in rows {
+        let Ok(kx) = <[u8; 32]>::try_from(kx) else {
+            continue;
+        };
+        let misses = postcard::from_bytes::<db::Misses>(&missed).unwrap_or_default();
+        let pair = pair
+            .and_then(|p| postcard::from_bytes::<gk::EndorsedPair>(&p).ok())
+            .zip(member_of(&m))
+            .and_then(|(p, m)| voipc_crypto::group_key::wire::pair(&p, m.into()).ok());
+        out.push(HolderRow {
+            kx,
+            device,
+            rank: u8::try_from(rank).unwrap_or(u8::MAX),
+            last_online: u64::try_from(last_online).unwrap_or(0),
+            misses,
+            pair,
+        });
+    }
+    Ok(out)
+}
+
+async fn put_holders(store: &Db, g: &GroupState, now: u64) -> Result<()> {
+    let grp = g.id.as_str();
+    let online: HashSet<[u8; 32]> = g
+        .holders
+        .online(&g.vols)
+        .iter()
+        .map(|v| v.pair.kx())
+        .collect();
+    const Q: &str =
+        "INSERT INTO voipc_gk_holders (grp, kx, m, device, rank, last_online, missed, pair)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         ON CONFLICT (grp, kx) DO UPDATE SET m = excluded.m, device = excluded.device,
+         rank = excluded.rank, last_online = excluded.last_online, missed = excluded.missed,
+         pair = excluded.pair";
+    for k in &g.holders.set {
+        let st = g.holders.stats.get(&k.kx);
+        let misses = db::Misses {
+            missed: st
+                .map(|s| s.missed.iter().copied().collect())
+                .unwrap_or_default(),
+            declined: st
+                .map(|s| s.declined.iter().copied().collect())
+                .unwrap_or_default(),
+        };
+        let pair = g
+            .holders
+            .pairs
+            .get(&k.kx)
+            .map(|p| postcard::to_allocvec(&gk::EndorsedPair::from(p)))
+            .transpose()?;
+        let missed = postcard::to_allocvec(&misses)?;
+        let last = if online.contains(&k.kx) {
+            now
+        } else {
+            st.and_then(|s| s.away_since).unwrap_or(now)
+        };
+        let rank = g.holders.rank.get(&k.kx).copied().unwrap_or(u8::MAX);
+        let device = g.holders.device.get(&k.kx).cloned();
+        on!(store, pool => {
+            sqlx::query(Q)
+                .bind(grp)
+                .bind(&k.kx[..])
+                .bind(&k.m.seat_id()[..])
+                .bind(device)
+                .bind(i16::from(rank))
+                .bind(i64::try_from(last)?)
+                .bind(missed.as_slice())
+                .bind(pair.as_deref())
+                .execute(pool)
+                .await?;
+        });
+    }
+    for h in db::holders(store, grp).await? {
+        if !g.holders.set.iter().any(|k| k.kx == h.kx) {
+            db::drop_holder(store, grp, &h.kx).await?;
         }
-        Db::Pg(b) => {
-            sqlx::query_scalar(Q)
-                .bind(&account[..])
-                .fetch_optional(&b.0)
-                .await?
-        }
-    };
-    Ok(key.and_then(|k| match k.as_slice() {
+    }
+    Ok(())
+}
+
+// ── Seat keys of accounts ─────────────────────────────────────────────────
+
+pub(crate) fn ik_raw(k: &[u8]) -> Option<[u8; 32]> {
+    match k {
         [0x05, rest @ ..] if rest.len() == 32 => rest.try_into().ok(),
         k if k.len() == 32 => k.try_into().ok(),
         _ => None,
+    }
+}
+
+type KeysTuple = (Vec<u8>, i64, Vec<u8>, Vec<u8>, i64, Vec<u8>, Vec<u8>);
+
+/// An account's current seat keys (origin 0x01) with its identity key, as a joiner's pair.
+fn keyed(t: KeysTuple) -> Option<([u8; 16], [u8; 32], Pair)> {
+    let (a, n, kem, dh, made, sig, ik) = t;
+    let a: [u8; 16] = a.try_into().ok()?;
+    let wire = gk::EndorsedPair {
+        origin: gk::origin::VAULT_SEAT,
+        u: 0,
+        kem,
+        dh,
+        n: u32::try_from(n).ok()?,
+        made: u64::try_from(made).ok()?,
+        sig,
+    };
+    let pair = voipc_crypto::group_key::wire::pair(&wire, gk::GkMember::Account(a)).ok()?;
+    Some((a, ik_raw(&ik)?, pair))
+}
+
+/// A page of the eager seats of a stored group's new start (plan 2d): the accounts that keep
+/// `conv`'s log with published seat keys and an identity key, after `after`, by account.
+pub async fn eager_page(
+    store: &Db,
+    conv: &str,
+    after: Option<&[u8; 16]>,
+    limit: u32,
+) -> Result<Vec<([u8; 16], Joiner)>> {
+    let rows: Vec<KeysTuple> = on!(store, pool => {
+        sqlx::query_as(
+            "SELECT k.account, k.n, k.kem, k.dh, k.made, k.sig, i.identity_key
+             FROM voipc_members m JOIN voipc_gk_seatkeys k ON k.account = m.account AND k.current
+             JOIN voipc_identity i ON i.account = m.account
+             WHERE m.conv = $1 AND m.account > $2 ORDER BY m.account LIMIT $3",
+        )
+        .bind(conv)
+        .bind(after.map_or(&[][..], |a| &a[..]))
+        .bind(i64::from(limit))
+        .fetch_all(pool)
+        .await?
+    });
+    // A page is whole even where one account's keys do not decode: the next starts after it
+    let mut out = Vec::with_capacity(rows.len());
+    for t in rows {
+        let last: Option<[u8; 16]> = t.0.clone().try_into().ok();
+        match keyed(t) {
+            Some((a, ik, pair)) => out.push((
+                a,
+                Joiner {
+                    seat: pair.keys.seat(MemberId::Account(a)),
+                    ik,
+                    keys: pair.keys,
+                    endorsement: pair.endorsement,
+                    returning: false,
+                },
+            )),
+            None => tracing::debug!(account = ?last, "seat keys that do not decode"),
+        }
+    }
+    Ok(out)
+}
+
+/// The identity keys and current seat keys of `accounts` (a seed-welcome page's KEM keys).
+pub async fn seat_kems(
+    store: &Db,
+    accounts: &[[u8; 16]],
+) -> Result<HashMap<[u8; 16], ([u8; 32], Pair)>> {
+    let mut out = HashMap::new();
+    for part in accounts.chunks(100) {
+        let rows: Vec<KeysTuple> = on!(store, pool => {
+            let mut q = sqlx::QueryBuilder::new(
+                "SELECT k.account, k.n, k.kem, k.dh, k.made, k.sig, i.identity_key
+                 FROM voipc_gk_seatkeys k JOIN voipc_identity i ON i.account = k.account
+                 WHERE k.current AND k.account IN (",
+            );
+            let mut sep = q.separated(", ");
+            for a in part {
+                sep.push_bind(a.to_vec());
+            }
+            sep.push_unseparated(")");
+            q.build_query_as().persistent(false).fetch_all(pool).await?
+        });
+        out.extend(
+            rows.into_iter()
+                .filter_map(keyed)
+                .map(|(a, ik, p)| (a, (ik, p))),
+        );
+    }
+    Ok(out)
+}
+
+/// A page of the conversations `account` keeps the log of (`voipc_members`), after `after`.
+pub async fn member_convs(
+    store: &Db,
+    account: &[u8; 16],
+    after: Option<&str>,
+    limit: u32,
+) -> Result<Vec<String>> {
+    Ok(on!(store, pool => {
+        sqlx::query_scalar(
+            "SELECT conv FROM voipc_members WHERE account = $1 AND conv > $2 ORDER BY conv LIMIT $3",
+        )
+        .bind(&account[..])
+        .bind(after.unwrap_or(""))
+        .bind(i64::from(limit))
+        .fetch_all(pool)
+        .await?
     }))
+}
+
+/// Whether `account` keeps `conv`'s log (`voipc_members`): kept reads need no follow.
+pub async fn is_member(store: &Db, conv: &str, account: &[u8; 16]) -> Result<bool> {
+    let row: Option<i32> = on!(store, pool => {
+        sqlx::query_scalar("SELECT 1 FROM voipc_members WHERE conv = $1 AND account = $2")
+            .bind(conv)
+            .bind(&account[..])
+            .fetch_optional(pool)
+            .await?
+    });
+    Ok(row.is_some())
+}
+
+// ── Kept history (C4, plan 2d "`at` entries") ─────────────────────────────
+
+/// A leaf a past epoch's opening committed to, with its version's base and when it was made.
+struct PastLeaf {
+    leaf: Leaf,
+    base_v: u64,
+    made: u32,
+}
+
+fn pool_of(x: i16) -> Option<Pool> {
+    match x {
+        0 => Some(Pool::Accounts),
+        1 => Some(Pool::Conns),
+        _ => None,
+    }
+}
+
+/// The leaves the opening `sh` committed to, and their tree: an opening seals every current
+/// version and a Join only those it made, so the seals of the one commit at that epoch
+/// whose versions make the header's bucket root are the opening's.
+async fn opening_leaves(
+    store: &Db,
+    grp: &str,
+    sh: &SignedHeader,
+) -> Result<Option<(Vec<PastLeaf>, BucketTree)>> {
+    type T = (i64, i64, i16, Option<i64>, i64, i64, Vec<u8>, i64, i64);
+    let h = sh.header();
+    let rows: Vec<T> = on!(store, pool => {
+        sqlx::query_as(
+            "SELECT l.b, l.v, l.pool, l.via, l.base_v, l.epoch_made, l.digest,
+               CAST(LENGTH(l.seats) AS BIGINT), s.commit_id
+             FROM voipc_gk_seals s JOIN voipc_gk_lists l
+               ON l.grp = s.grp AND l.gen = s.gen AND l.b = s.b AND l.v = s.v
+             WHERE s.grp = $1 AND s.gen = $2 AND s.epoch = $3
+             AND NOT EXISTS (SELECT 1 FROM voipc_gk_pending p WHERE p.grp = s.grp AND p.commit_id = s.commit_id)",
+        )
+        .bind(grp)
+        .bind(&h.gen[..])
+        .bind(i64::from(h.epoch))
+        .fetch_all(pool)
+        .await?
+    });
+    let mut by: HashMap<i64, Vec<PastLeaf>> = HashMap::new();
+    for (b, v, pool, via, base_v, made, digest, n, c) in rows {
+        let (Some(pool), Ok(list), Ok(seats)) = (
+            pool_of(pool),
+            <[u8; 32]>::try_from(digest),
+            u16::try_from(n / 33),
+        ) else {
+            continue;
+        };
+        by.entry(c).or_default().push(PastLeaf {
+            leaf: Leaf {
+                b: b as u64,
+                v: v as u64,
+                pool,
+                seats,
+                list,
+                via: via.map_or(Via::Row, |from| Via::Ratchet { from: from as u64 }),
+            },
+            base_v: base_v as u64,
+            made: u32::try_from(made).unwrap_or(0),
+        });
+    }
+    for (_, mut leaves) in by {
+        if leaves.len() != h.buckets as usize {
+            continue;
+        }
+        leaves.sort_by_key(|l| l.leaf.b);
+        let flat: Vec<Leaf> = leaves.iter().map(|l| l.leaf).collect();
+        if let Ok(tree) = BucketTree::new(&flat) {
+            if tree.root() == h.bucket_root {
+                return Ok(Some((leaves, tree)));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// The welcomes (seat) and rows to any seat of `m` in generation `gen`, by version.
+async fn member_bases(
+    store: &Db,
+    grp: &str,
+    gen: &[u8; 16],
+    m: &MemberId,
+) -> Result<HashMap<(u64, u64), (SeatRef, Base)>> {
+    type T = (i64, i64, Vec<u8>, i64, Vec<u8>, Vec<u8>);
+    let id = m.seat_id();
+    let lo = [&id[..], &[0u8; 16][..]].concat();
+    let hi = [&id[..], &[0xffu8; 16][..]].concat();
+    let welcomes: Vec<T> = on!(store, pool => {
+        sqlx::query_as(
+            "SELECT b, v, seat, s, maker, bytes FROM voipc_gk_welcomes w
+             WHERE grp = $1 AND gen = $2 AND seat >= $3 AND seat <= $4 AND kind = 0 AND b IS NOT NULL
+             AND NOT EXISTS (SELECT 1 FROM voipc_gk_pending p WHERE p.grp = w.grp AND p.commit_id = w.commit_id)",
+        )
+        .bind(grp)
+        .bind(&gen[..])
+        .bind(lo.as_slice())
+        .bind(hi.as_slice())
+        .fetch_all(pool)
+        .await?
+    });
+    let rows: Vec<T> = on!(store, pool => {
+        sqlx::query_as(
+            "SELECT r.b, r.v, r.seat, r.s, r.maker, r.bytes
+             FROM voipc_gk_rows r JOIN voipc_gk_lists l
+               ON l.grp = r.grp AND l.gen = r.gen AND l.b = r.b AND l.v = r.v AND l.commit_id = r.commit_id
+             WHERE r.grp = $1 AND r.gen = $2 AND r.seat >= $3 AND r.seat <= $4
+             AND NOT EXISTS (SELECT 1 FROM voipc_gk_pending p WHERE p.grp = r.grp AND p.commit_id = r.commit_id)",
+        )
+        .bind(grp)
+        .bind(&gen[..])
+        .bind(lo.as_slice())
+        .bind(hi.as_slice())
+        .fetch_all(pool)
+        .await?
+    });
+    let mut out = HashMap::new();
+    for (welcome, list) in [(true, welcomes), (false, rows)] {
+        for (b, v, seat, s, mk, bytes) in list {
+            let (Ok(rec), Ok(mk), Ok(s)) = (
+                <[u8; 33]>::try_from(seat),
+                <[u8; 49]>::try_from(mk),
+                u32::try_from(s),
+            ) else {
+                continue;
+            };
+            let (Some(seat), Some(from)) = (seat_of(&rec), holder_of(&mk)) else {
+                continue;
+            };
+            out.entry((b as u64, v as u64))
+                .or_insert((seat, (s, from, welcome, bytes)));
+        }
+    }
+    Ok(out)
+}
+
+/// One `at` entry's answer (plan 2d, C4): the epoch's opening header (with a Regenesis's
+/// parent), the keyholder links back from `anchor` (the member's floor's `kh`) to the one
+/// the opening names when `anchor` is a keyholder header at or after it, the member's leaf,
+/// path and seal then, its keying (the welcome or row of its version then, or of the
+/// version it ratcheted from, with the steps), the seed welcome under that row's seed if
+/// one is kept, and its self-rows and history rows for that seed. `None` when the opening,
+/// its versions or any seat of `m` in them is not kept.
+pub async fn past(
+    store: &Db,
+    grp: &str,
+    m: MemberId,
+    at: EpochRef,
+    anchor: Option<[u8; 32]>,
+) -> Result<Option<InPiece>> {
+    let decode = |h: &db::Header| SignedHeader::decode(&h.body, &h.sig, GroupKind::Text, grp).ok();
+    let Some(sh) = db::opening(store, grp, &at.gen, at.epoch)
+        .await?
+        .and_then(|h| decode(&h))
+    else {
+        return Ok(None);
+    };
+    let h = sh.header();
+    let parent = match h.kind {
+        Kind::Regenesis => db::header(store, grp, &h.parent)
+            .await?
+            .and_then(|x| decode(&x)),
+        _ => None,
+    };
+    let Some((leaves, tree)) = opening_leaves(store, grp, &sh).await? else {
+        return Ok(None);
+    };
+    let bases = member_bases(store, grp, &at.gen, &m).await?;
+    let Some((l, (seat, base))) = leaves
+        .iter()
+        .find_map(|l| bases.get(&(l.leaf.b, l.base_v)).map(|x| (l, x)))
+    else {
+        return Ok(None);
+    };
+    let Some(seal) = db::seal(store, grp, &at.gen, at.epoch, l.leaf.b, l.leaf.v).await? else {
+        return Ok(None);
+    };
+    // The ratchet steps from its base to the version it held then, oldest first
+    let mut ratchets = vec![];
+    let (mut to, mut via, mut e) = (l.leaf.v, l.leaf.via, l.made);
+    while let Via::Ratchet { from } = via {
+        ratchets.push(RatchetStep { e, from, to });
+        let Some(prev) = db::list(store, grp, &at.gen, l.leaf.b, from).await? else {
+            return Ok(None);
+        };
+        to = from;
+        via = prev.via.map_or(Via::Row, |f| Via::Ratchet { from: f });
+        e = prev.epoch_made;
+    }
+    ratchets.reverse();
+    let (s, from, welcome, bytes) = base.clone();
+    let keying = SeatKeying {
+        b: l.leaf.b,
+        base_v: l.base_v,
+        s,
+        from: from.into(),
+        welcome: welcome.then(|| bytes.clone()),
+        row: (!welcome).then_some(bytes),
+        ratchets,
+    };
+    let seed_welcome = if welcome {
+        None
+    } else {
+        let w = db::welcome(
+            store,
+            grp,
+            &at.gen,
+            &seat_record(seat),
+            db::WelcomeKind::Seed,
+            s,
+        )
+        .await?;
+        w.and_then(|w| {
+            Some(gk::SeedWelcomeIn {
+                s,
+                from: holder_of(&w.maker)?.into(),
+                bytes: w.bytes,
+            })
+        })
+    };
+    let self_rows = match seat.m.account() {
+        Some(a) => own_rows(store, grp, &a, &at.gen, seat, s).await?,
+        None => vec![],
+    };
+    // Keyholder links back from the anchor, newest first, to the one the opening names
+    let mut walk = vec![];
+    if let Some(a) = anchor {
+        let ah = db::header(store, grp, &a).await?.and_then(|x| decode(&x));
+        if let Some(ah) = ah.filter(|x| {
+            let x = x.header();
+            x.gen == h.gen && x.kind.sets_keyholders() && (h.epoch <= x.epoch || sh.kh() == a)
+        }) {
+            let target = sh.kh();
+            let mut cur = ah;
+            while cur.d() != target && walk.len() < MAX_WALK {
+                let want = cur.header().kh_parent;
+                let Some(next) = db::header(store, grp, &want)
+                    .await?
+                    .and_then(|x| decode(&x))
+                else {
+                    break;
+                };
+                let p = match next.header().kind {
+                    Kind::Regenesis => db::header(store, grp, &next.header().parent)
+                        .await?
+                        .and_then(|x| decode(&x)),
+                    _ => None,
+                };
+                walk.push(link(&next, p.as_ref()));
+                cur = next;
+            }
+        }
+    }
+    Ok(Some(InPiece {
+        walk,
+        head: Some(link(&sh, parent.as_ref())),
+        leaf: Some(LeafIn::from(l.leaf)),
+        path: tree
+            .path_of(l.leaf.b)
+            .and_then(|p| PathIn::try_from(p).ok()),
+        seal: Some(seal.bytes),
+        seat: Some(keying),
+        seed_welcome,
+        self_rows,
+        past: Some(at),
+        ..InPiece::default()
+    }))
+}
+
+/// An account's self-rows and history rows for its seat `seat` under seed `s`.
+async fn own_rows(
+    store: &Db,
+    grp: &str,
+    account: &[u8; 16],
+    gen: &[u8; 16],
+    seat: &SeatRef,
+    s: u32,
+) -> Result<Vec<SelfRowIn>> {
+    let rows: Vec<(i16, Vec<u8>)> = on!(store, pool => {
+        sqlx::query_as(
+            "SELECT kind, sealed FROM voipc_gk_self WHERE grp = $1 AND account = $2
+             AND gen = $3 AND seed = $4 AND tag_sk = $5 AND tag_sx = $6",
+        )
+        .bind(grp)
+        .bind(&account[..])
+        .bind(&gen[..])
+        .bind(i64::from(s))
+        .bind(&seat.tag_sk[..])
+        .bind(&seat.tag_sx[..])
+        .fetch_all(pool)
+        .await?
+    });
+    Ok(rows
+        .into_iter()
+        .filter_map(|(kind, sealed)| {
+            Some(SelfRowIn {
+                group: grp.to_string(),
+                gen: *gen,
+                seed: s,
+                sk: seat.tag_sk,
+                sx: seat.tag_sx,
+                kind: u8::try_from(kind).ok()?,
+                sealed,
+            })
+        })
+        .collect())
+}
+
+/// Where a `SelfRowsList` page ends: the next page starts after this row.
+type RowsAfter = (String, [u8; 16], u32, [u8; 8], [u8; 8], u8);
+
+/// A `SelfRows` page's rows, under the 64 KiB frame: history rows are up to 16 KiB each.
+const SELF_ROWS_PAGE_BYTES: usize = 48 * 1024;
+
+/// A page of `account`'s self-rows and history rows (`SelfRowsList`), every group,
+/// generation and seed, after `after` (the `next` of the page before, opaque to the app).
+pub async fn rows_of(
+    store: &Db,
+    account: &[u8; 16],
+    after: Option<&[u8]>,
+    limit: u16,
+) -> Result<(Vec<SelfRowIn>, Option<Vec<u8>>)> {
+    type T = (String, Vec<u8>, i64, Vec<u8>, Vec<u8>, i16, Vec<u8>);
+    let from: RowsAfter = match after {
+        Some(a) => postcard::from_bytes(a)?,
+        None => (String::new(), [0; 16], 0, [0; 8], [0; 8], 0),
+    };
+    // The first page takes the smallest key too
+    let first = after.is_none();
+    let rows: Vec<T> = on!(store, pool => {
+        sqlx::query_as(
+            "SELECT grp, gen, seed, tag_sk, tag_sx, kind, sealed FROM voipc_gk_self
+             WHERE account = $1 AND ($8 OR (grp, gen, seed, tag_sk, tag_sx, kind) > ($2, $3, $4, $5, $6, $7))
+             ORDER BY grp, gen, seed, tag_sk, tag_sx, kind LIMIT $9",
+        )
+        .bind(&account[..])
+        .bind(&from.0)
+        .bind(&from.1[..])
+        .bind(i64::from(from.2))
+        .bind(&from.3[..])
+        .bind(&from.4[..])
+        .bind(i16::from(from.5))
+        .bind(first)
+        .bind(i64::from(limit))
+        .fetch_all(pool)
+        .await?
+    });
+    let mut out = Vec::with_capacity(rows.len());
+    let (mut bytes, mut full) = (0, rows.len() == usize::from(limit));
+    for (grp, gen, seed, sk, sx, kind, sealed) in rows {
+        bytes += grp.len() + sealed.len() + 64;
+        if bytes > SELF_ROWS_PAGE_BYTES && !out.is_empty() {
+            full = true;
+            break;
+        }
+        let (Ok(gen), Ok(seed), Ok(sk), Ok(sx), Ok(kind)) = (
+            <[u8; 16]>::try_from(gen),
+            u32::try_from(seed),
+            <[u8; 8]>::try_from(sk),
+            <[u8; 8]>::try_from(sx),
+            u8::try_from(kind),
+        ) else {
+            continue;
+        };
+        out.push(SelfRowIn {
+            group: grp,
+            gen,
+            seed,
+            sk,
+            sx,
+            kind,
+            sealed,
+        });
+    }
+    let next = match out.last() {
+        Some(r) if full => Some(postcard::to_allocvec(&(
+            r.group.clone(),
+            r.gen,
+            r.seed,
+            r.sk,
+            r.sx,
+            r.kind,
+        ))?),
+        _ => None,
+    };
+    Ok((out, next))
+}
+
+// ── Sweeps (plan 2e, C4 retention) ────────────────────────────────────────
+
+/// Header kinds by their code in `voipc_gk_headers.kind` (accounts::gk's postcard order).
+const KINDS: [Kind; 7] = [
+    Kind::Genesis,
+    Kind::Regenesis,
+    Kind::Fresh,
+    Kind::Join,
+    Kind::KeyholdersAdd,
+    Kind::KeyholdersRemove,
+    Kind::KeyholdersReplace,
+];
+
+/// A stored group's material no read needs any more (plan 2e, C4 "Retention"), sparing a
+/// pending commit's; the rows taken. An epoch's seals, the lists it read and their rows go
+/// once the next opening is `HOLD_MS` + 2 min old (by its header's time, less the keyholder
+/// clock skew), unless a kept chain (`voipc_gk_chains`) references the epoch; a list stays
+/// while a current version ratchets from it; other generations' go unless referenced. Seat
+/// welcomes go with their version's list, seed welcomes below the floor or of another
+/// generation. Headers keep §4.4's set (`sweep_headers`); keyrings and `KRK` welcomes of
+/// earlier epochs and stale seats, version ids and exits go (`sweep_keyrings`, `sweep_stale`).
+pub async fn sweep_material(store: &Db, grp: &str, now: u64) -> Result<u64> {
+    let Some(row) = db::group(store, grp).await? else {
+        return Ok(0);
+    };
+    sweep_material_from(store, grp, &row, now).await
+}
+
+/// The head's generation, read inside each sweep statement (`$1` is the group).
+const HEAD_GEN: &str = "(SELECT hg.gen FROM voipc_gk_groups hg WHERE hg.grp = $1)";
+
+/// `sweep_material` from `row`, the group as read when the sweep began. The sweep runs
+/// beside the group's actor, which may move the head meanwhile, even to a new generation:
+/// so each statement reads the head's generation itself, and `row`'s cut and floor take
+/// material of `row`'s generation only. A generation the head moved to keeps all of its.
+pub async fn sweep_material_from(
+    store: &Db,
+    grp: &str,
+    row: &db::GroupRow,
+    now: u64,
+) -> Result<u64> {
+    let gen = row.head.gen.to_vec();
+    let Some(head) = db::header(store, grp, &row.head.d).await? else {
+        return Ok(0);
+    };
+    let floor = SignedHeader::decode(&head.body, &head.sig, row.head.kind, grp)
+        .map_or(0, |sh| sh.header().seed_floor);
+    let old = (now.saturating_sub(HOLD_MS + MATERIAL_SWEEP_MARGIN_MS) / 1000)
+        .saturating_sub(KEYHOLDER_SKEW_SECS);
+    let cut: Option<i64> = on!(store, pool => {
+        sqlx::query_scalar(
+            "SELECT MAX(epoch) FROM voipc_gk_headers WHERE grp = $1 AND gen = $2 AND j = 0 AND time <= $3",
+        )
+        .bind(grp)
+        .bind(gen.as_slice())
+        .bind(i64::try_from(old)?)
+        .fetch_one(pool)
+        .await?
+    });
+    let cut = cut.unwrap_or(0);
+    let q = format!(
+        "DELETE FROM voipc_gk_seals WHERE (grp, gen, epoch, b, v) IN
+         (SELECT s.grp, s.gen, s.epoch, s.b, s.v FROM voipc_gk_seals s
+          WHERE s.grp = $1 AND (s.gen <> {HEAD_GEN} OR (s.gen = $2 AND s.epoch < $3))
+          AND NOT EXISTS (SELECT 1 FROM voipc_gk_chains k WHERE k.grp = s.grp AND k.gen = s.gen AND k.epoch = s.epoch)
+          AND NOT EXISTS (SELECT 1 FROM voipc_gk_pending p WHERE p.grp = s.grp AND p.commit_id = s.commit_id)
+          LIMIT $4)"
+    );
+    let mut n = batched!(
+        store,
+        sqlx::AssertSqlSafe(q.as_str()),
+        grp,
+        gen.as_slice(),
+        cut
+    );
+    let q = format!(
+        "DELETE FROM voipc_gk_lists WHERE (grp, gen, b, v) IN
+         (SELECT l.grp, l.gen, l.b, l.v FROM voipc_gk_lists l WHERE l.grp = $1
+          AND (l.gen <> {HEAD_GEN} OR (l.gen = $2 AND l.current = FALSE AND l.epoch_until IS NOT NULL AND l.epoch_until <= $3
+            AND NOT EXISTS (SELECT 1 FROM voipc_gk_lists c WHERE c.grp = l.grp AND c.gen = l.gen
+              AND c.b = l.b AND c.base_v = l.base_v AND c.current)))
+          AND NOT EXISTS (SELECT 1 FROM voipc_gk_lists r JOIN voipc_gk_chains k
+              ON k.grp = r.grp AND k.gen = r.gen AND k.epoch >= r.epoch_made
+              AND (r.epoch_until IS NULL OR k.epoch < r.epoch_until)
+            WHERE r.grp = l.grp AND r.gen = l.gen AND r.b = l.b AND r.base_v = l.base_v)
+          AND NOT EXISTS (SELECT 1 FROM voipc_gk_pending p WHERE p.grp = l.grp AND p.commit_id = l.commit_id)
+          LIMIT $4)"
+    );
+    n += batched!(
+        store,
+        sqlx::AssertSqlSafe(q.as_str()),
+        grp,
+        gen.as_slice(),
+        cut
+    );
+    n += batched!(
+        store,
+        "DELETE FROM voipc_gk_rows WHERE (grp, gen, b, v, seat) IN
+         (SELECT r.grp, r.gen, r.b, r.v, r.seat FROM voipc_gk_rows r WHERE r.grp = $1
+          AND NOT EXISTS (SELECT 1 FROM voipc_gk_lists l WHERE l.grp = r.grp AND l.gen = r.gen AND l.b = r.b AND l.v = r.v)
+          AND NOT EXISTS (SELECT 1 FROM voipc_gk_pending p WHERE p.grp = r.grp AND p.commit_id = r.commit_id)
+          LIMIT $2)",
+        grp
+    );
+    let q = format!(
+        "DELETE FROM voipc_gk_welcomes WHERE (grp, gen, seat, kind, s) IN
+         (SELECT w.grp, w.gen, w.seat, w.kind, w.s FROM voipc_gk_welcomes w WHERE w.grp = $1
+          AND ((w.kind = 0 AND NOT EXISTS (SELECT 1 FROM voipc_gk_lists l
+                WHERE l.grp = w.grp AND l.gen = w.gen AND l.b = w.b AND l.v = w.v))
+            OR (w.kind = 1 AND (w.gen <> {HEAD_GEN} OR (w.gen = $2 AND w.s < $3))))
+          AND NOT EXISTS (SELECT 1 FROM voipc_gk_pending p WHERE p.grp = w.grp AND p.commit_id = w.commit_id)
+          LIMIT $4)"
+    );
+    n += batched!(
+        store,
+        sqlx::AssertSqlSafe(q.as_str()),
+        grp,
+        gen.as_slice(),
+        i64::from(floor)
+    );
+    n += sweep_headers(store, grp).await?;
+    n += sweep_keyrings(store, grp, &gen, row.head.epoch).await?;
+    n += sweep_stale(store, grp).await?;
+    Ok(n)
+}
+
+/// Keyrings and `KRK` welcomes of epochs before `row`'s head epoch in `row`'s generation
+/// (`gen`), and of every generation but the head's as each statement reads it (safe
+/// beside a head move).
+pub(crate) async fn sweep_keyrings(store: &Db, grp: &str, gen: &[u8], epoch: u32) -> Result<u64> {
+    let epoch = i64::from(epoch);
+    let mut n = 0;
+    for (table, key) in [("voipc_gk_keyring", "j"), ("voipc_gk_krk", "holder")] {
+        let q = format!(
+            "DELETE FROM {table} WHERE (grp, gen, epoch, {key}) IN
+             (SELECT k.grp, k.gen, k.epoch, k.{key} FROM {table} k WHERE k.grp = $1
+              AND (k.gen <> {HEAD_GEN} OR (k.gen = $2 AND k.epoch < $3))
+              AND NOT EXISTS (SELECT 1 FROM voipc_gk_pending p WHERE p.grp = k.grp AND p.commit_id = k.commit_id)
+              LIMIT $4)"
+        );
+        n += batched!(store, sqlx::AssertSqlSafe(q.as_str()), grp, gen, epoch);
+    }
+    Ok(n)
+}
+
+/// Seats no read returns any more (of a generation not the head's, or of the head's in a
+/// bucket with no current version), and other generations' version ids and exits; a
+/// pending commit's are spared; the head's generation is read by each statement.
+pub(crate) async fn sweep_stale(store: &Db, grp: &str) -> Result<u64> {
+    let seats = format!(
+        "DELETE FROM voipc_gk_seats WHERE (grp, gen, seat) IN
+         (SELECT s.grp, s.gen, s.seat FROM voipc_gk_seats s WHERE s.grp = $1 AND s.next_commit IS NULL
+          AND (s.gen <> {HEAD_GEN} OR NOT EXISTS (SELECT 1 FROM voipc_gk_lists l
+            WHERE l.grp = s.grp AND l.gen = s.gen AND l.b = s.b AND l.current)) LIMIT $2)"
+    );
+    let vids = format!(
+        "DELETE FROM voipc_gk_vids WHERE (grp, gen, v) IN
+         (SELECT x.grp, x.gen, x.v FROM voipc_gk_vids x WHERE x.grp = $1 AND x.gen <> {HEAD_GEN}
+          AND NOT EXISTS (SELECT 1 FROM voipc_gk_pending p WHERE p.grp = x.grp AND p.commit_id = x.commit_id) LIMIT $2)"
+    );
+    let exits = format!(
+        "DELETE FROM voipc_gk_exits WHERE (grp, seq) IN
+         (SELECT e.grp, e.seq FROM voipc_gk_exits e WHERE e.grp = $1 AND e.gen <> {HEAD_GEN} LIMIT $2)"
+    );
+    let mut n = 0;
+    for q in [seats, vids, exits] {
+        n += batched!(store, sqlx::AssertSqlSafe(q.as_str()), grp);
+    }
+    Ok(n)
+}
+
+/// The headers §4.4 keeps, the rest taken: of the head's generation the last 64, the head
+/// epoch's, every keyholder-setting one, each Regenesis's parent, the last seed raise's, and
+/// the openings kept chains reference; of an older generation, while kept chains reference
+/// its epochs, those openings, its keyholder headers and Regenesis parents (C4).
+async fn sweep_headers(store: &Db, grp: &str) -> Result<u64> {
+    type M = (Vec<u8>, Vec<u8>, i64, i64, i16, i64);
+    let metas: Vec<M> = on!(store, pool => {
+        sqlx::query_as("SELECT d, gen, epoch, j, kind, time FROM voipc_gk_headers WHERE grp = $1")
+            .bind(grp)
+            .fetch_all(pool)
+            .await?
+    });
+    // The head as it is after those were read: a head move writes its headers in the same
+    // transaction, so every header read is of this head's generation or an older one
+    let Some(row) = db::group(store, grp).await? else {
+        return Ok(0);
+    };
+    let refs: Vec<(Vec<u8>, i64)> = on!(store, pool => {
+        sqlx::query_as("SELECT DISTINCT gen, epoch FROM voipc_gk_chains WHERE grp = $1")
+            .bind(grp)
+            .fetch_all(pool)
+            .await?
+    });
+    let refs: HashSet<(Vec<u8>, i64)> = refs.into_iter().collect();
+    let head_gen = row.head.gen.to_vec();
+    let mut recent: Vec<(i64, i64)> = metas
+        .iter()
+        .filter(|m| m.1 == head_gen)
+        .map(|m| (m.2, m.3))
+        .collect();
+    recent.sort_unstable();
+    let last64: HashSet<(i64, i64)> = recent.iter().rev().take(64).copied().collect();
+    let referenced: HashSet<&Vec<u8>> = refs.iter().map(|(g, _)| g).collect();
+    let mut keep: HashSet<Vec<u8>> = HashSet::new();
+    for (d, gen, epoch, j, kind, time) in &metas {
+        let kind = usize::try_from(*kind)
+            .ok()
+            .and_then(|i| KINDS.get(i).copied());
+        let kh = kind.is_some_and(|k| k.sets_keyholders());
+        let opening_ref = *j == 0 && refs.contains(&(gen.clone(), *epoch));
+        let kept = if *gen == head_gen {
+            last64.contains(&(*epoch, *j))
+                || *epoch == i64::from(row.head.epoch)
+                || kh
+                || *time == row.head.rolls.raised as i64
+                || opening_ref
+        } else {
+            referenced.contains(gen) && (kh || opening_ref)
+        };
+        if !kept {
+            continue;
+        }
+        keep.insert(d.clone());
+        if kind == Some(Kind::Regenesis) {
+            let parent = db::header(store, grp, &d[..].try_into()?)
+                .await?
+                .and_then(|h| SignedHeader::decode(&h.body, &h.sig, row.head.kind, grp).ok());
+            if let Some(p) = parent {
+                keep.insert(p.header().parent.to_vec());
+            }
+        }
+    }
+    let mut n = 0;
+    for (d, ..) in metas.iter().filter(|m| !keep.contains(&m.0)) {
+        n += on!(store, pool => {
+            sqlx::query("DELETE FROM voipc_gk_headers WHERE grp = $1 AND d = $2")
+                .bind(grp)
+                .bind(d.as_slice())
+                .execute(pool)
+                .await?
+                .rows_affected()
+        });
+    }
+    Ok(n)
+}
+
+/// Seats of the head's generation unused since `before` (unix ms): they exit (daily sweep).
+pub async fn expired(store: &Db, grp: &str, before: u64) -> Result<Vec<SeatRef>> {
+    let rows: Vec<Vec<u8>> = on!(store, pool => {
+        sqlx::query_scalar(
+            "SELECT s.seat FROM voipc_gk_seats s JOIN voipc_gk_groups g ON g.grp = s.grp AND g.gen = s.gen
+             WHERE s.grp = $1 AND s.b IS NOT NULL AND s.last_use < $2 LIMIT 10000",
+        )
+        .bind(grp)
+        .bind(i64::try_from(before)?)
+        .fetch_all(pool)
+        .await?
+    });
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| seat_of(&r.try_into().ok()?))
+        .collect())
 }
 
 impl std::fmt::Display for Fail {

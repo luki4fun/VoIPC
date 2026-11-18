@@ -81,6 +81,11 @@ impl Relay {
     pub async fn identity(&self, _: AccountId) -> Result<Option<Vec<u8>>> {
         Ok(None)
     }
+
+    /// The group key's part of the tombstone sweep: no groups here.
+    pub async fn gk_tombstone(&self, _: &Id) -> Result<i64> {
+        Ok(0)
+    }
 }
 
 fn refused(request: &str, reason: &str) -> AccountReply {

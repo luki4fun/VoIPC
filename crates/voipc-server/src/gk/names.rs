@@ -9,7 +9,6 @@
 //! answers from it inclusive (a list at `from` itself is one the writer skips), so a fold
 //! from the start may ask from `(gated_start - 1, 0)` or `(0, 0)` (C3b names.rs says the
 //! same).
-#![cfg_attr(not(test), allow(dead_code))]
 
 use voipc_crypto::group_key::{
     names_start, NamesList, NamesStep, Removed, SignedHeader, NAMES_KEPT,
@@ -147,6 +146,15 @@ impl Names {
             self.step = Some((*gen, s));
             self.swept = Some(s);
         }
+    }
+
+    /// Where the step before the oldest list kept stands in `gen`: names before it may go
+    /// from the database.
+    pub fn step_at(&self, gen: &[u8; 16]) -> Option<(u32, u32)> {
+        self.step
+            .as_ref()
+            .filter(|(g, _)| g == gen)
+            .map(|(_, s)| (s.epoch, s.join))
     }
 
     /// The step the last sweep made, once (a stored group keeps it, kind 2).

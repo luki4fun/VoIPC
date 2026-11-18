@@ -103,6 +103,38 @@ pub enum Refusal {
     Versions(&'static str),
 }
 
+/// For a log, or an `EpochDecline`'s detail: what broke, never a key.
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Refusal::Form(why) => write!(f, "form: {why}"),
+            Refusal::WrongGroup => f.write_str("another group"),
+            Refusal::Signature => f.write_str("not its signer's signature"),
+            Refusal::NotKeyholder => f.write_str("signed by no keyholder of its set"),
+            Refusal::KeyholderChange(why) => write!(f, "keyholders: {why}"),
+            Refusal::Pin(_) => f.write_str("an identity key not the one pinned"),
+            Refusal::Chain(why) => write!(f, "chain: {why}"),
+            Refusal::BelowFloor => f.write_str("at or below the floor"),
+            Refusal::EpochBound => f.write_str("further in epochs than the time allows"),
+            Refusal::Walk(why) => write!(f, "walk: {why}"),
+            Refusal::Names => f.write_str("the names do not fold to the head"),
+            Refusal::NamesNotGone => f.write_str("a names answer of gone too early"),
+            Refusal::Confirm => f.write_str("the epoch key does not confirm"),
+            Refusal::GatedChanged => f.write_str("gated changed on a Join"),
+            Refusal::GuestSeat(_) => f.write_str("a guest seat in a gated group"),
+            Refusal::GuestKeyholder => f.write_str("a guest keyholder in a gated group"),
+            Refusal::Ahead => f.write_str("ahead of this device's clock"),
+            Refusal::OldCounter { n, highest, .. } => {
+                write!(f, "seat-key counter {n} below the highest seen, {highest}")
+            }
+            Refusal::Generation(why) => write!(f, "generation: {why}"),
+            Refusal::VoiceKeyholder(u) => write!(f, "voice keyholder {u} not among the lowest"),
+            Refusal::Roll(why) => write!(f, "seed roll: {why}"),
+            Refusal::Versions(why) => write!(f, "versions: {why}"),
+        }
+    }
+}
+
 /// What a member takes but tells its user about.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Warning {

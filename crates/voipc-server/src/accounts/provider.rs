@@ -54,8 +54,8 @@ use voipc_protocol::types::{LinkedProvider, PowChallenge, ProviderKind, VaultBlo
 
 use super::links;
 use super::{
-    next, refused, second_factor, step, unexpected, vault_item_ok, Relay, SignedIn, BUSY, PINS_NS,
-    RESET_KEY_LEN, SLOT_RESET, STEP_WAIT, VAULT_MAX_ITEMS, VAULT_NS, VAULT_TOTAL_BYTES,
+    next, refused, second_factor, step, unexpected, vault_item_ok, Relay, SignedIn, BUSY, GK_NS,
+    PINS_NS, RESET_KEY_LEN, SLOT_RESET, STEP_WAIT, VAULT_MAX_ITEMS, VAULT_NS, VAULT_TOTAL_BYTES,
 };
 use crate::state::{RateLimiter, ServerState};
 
@@ -1083,8 +1083,10 @@ pub(crate) async fn claim(
         warn!(user = %user.hex(), "a claim refused: {e:#}");
         return Err(gone());
     }
-    // What a claim that died halfway left, which nobody could open
-    for ns in [VAULT_NS, PINS_NS] {
+    // What a claim that died halfway left, which nobody could open, and what an identity
+    // before it endorsed in the group key (`reclaim` in the shell reaches no live group)
+    relay.gk_identity_reset(&user.0).await;
+    for ns in [VAULT_NS, PINS_NS, GK_NS] {
         relay
             .store()
             .delete_blobs(user, ns)
@@ -1445,7 +1447,7 @@ impl Relay {
             .reset_2fa_as_host(ctx, user.id)
             .await
             .map_err(|e| e.message().to_string())?;
-        for ns in [VAULT_NS, PINS_NS] {
+        for ns in [VAULT_NS, PINS_NS, GK_NS] {
             self.store()
                 .delete_blobs(user.id, ns)
                 .await
@@ -1468,6 +1470,9 @@ impl Relay {
         super::log::walk(self.store(), &user.id.0)
             .await
             .map_err(|e| e.to_string())?;
+        // Its seat keys and what they made go too; its seats exit at the claim that opens it
+        // anew, in the relay's own process
+        self.gk_identity_reset(&user.id.0).await;
         info!(user = %user.id.hex(), "account reclaimed from the shell");
         Ok(())
     }

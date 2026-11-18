@@ -1,23 +1,24 @@
 //! The group key's client messages (plan 2a): `handle` takes every new `ClientMessage`
 //! but `EpochPost`, whose post rules are session.rs's (R2's post helper calls
 //! `Groups::post_check`). Nothing here waits on another session.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use std::sync::Arc;
 
 use tokio::sync::oneshot;
 use voipc_crypto::group_key::commit::{Pair, ReplaceAsk};
+use voipc_crypto::group_key::timers::PAST_A_FETCH;
 use voipc_crypto::group_key::wire;
 use voipc_crypto::group_key::{GroupKind, MemberId};
 use voipc_protocol::gk::{
-    self, platform, refused_what, refused_why, stale, EndorsedPair, GkMember,
+    self, platform, refused_what, refused_why, stale, EndorsedPair, EpochRef, FloorRef, GkMember,
 };
 use voipc_protocol::messages::ClientMessage;
+use voipc_protocol::messages::ServerMessage;
 use voipc_protocol::types::UserId;
 
 use super::group::Fetch;
 use super::holders::Volunteer;
-use super::{answer_seated, lane_refused, past_refused, push, Groups, Msg, SMALL};
+use super::{answer_seated, lane_refused, push, used, Groups, Msg, SMALL};
 use crate::control::ControlTx;
 use crate::state::ServerState;
 
@@ -79,11 +80,15 @@ impl Groups {
             return Err(refused_why::OFF);
         }
         let Some(blob) = blob else {
-            return if self.post_ok(group, &gen, epoch) {
-                Ok(())
-            } else {
-                Err(refused_why::OLD_EPOCH)
-            };
+            if !self.post_ok(group, &gen, epoch) {
+                return Err(refused_why::OLD_EPOCH);
+            }
+            if let Some(h) = self.get(group) {
+                if let Some(seat) = h.seated.get(&sid).map(|s| *s) {
+                    used(&self.shared, &h, gen, &seat);
+                }
+            }
+            return Ok(());
         };
         let (reply, answer) = oneshot::channel();
         let bytes = SMALL + blob.len();
@@ -119,14 +124,13 @@ impl Groups {
                 at,
                 seat,
             } => {
+                // A kept read (C4), with the switch off too (1h): its `at` entries alone,
+                // `have` only the floor its keyholder links lead back from
+                if !at.is_empty() {
+                    return self.past(state, sid, &group, have.as_ref(), &at).await;
+                }
                 if !self.on {
                     return off(refused_what::FETCH, &group);
-                }
-                // Past epochs are C4's: refused; a follower's live fetch is still answered
-                if past_refused(self, sid, &group, &at)
-                    && !self.follows.get(&sid).is_some_and(|f| f.contains(&group))
-                {
-                    return;
                 }
                 let Some(h) = self.get(&group) else {
                     return self.refuse(sid, &group, refused_what::FETCH, refused_why::NOT_MEMBER);
@@ -259,13 +263,19 @@ impl Groups {
                         self.vols.remove(&sid);
                     }
                 }
+                let device = self.shared.devices.get(&sid).map(|d| d.clone());
                 for id in self
                     .follows
                     .get(&sid)
                     .map(|f| f.clone())
                     .unwrap_or_default()
                 {
-                    self.post(&id, Msg::Volunteer { sid, v: v.clone() }, 0, true);
+                    let msg = Msg::Volunteer {
+                        sid,
+                        v: v.clone(),
+                        device: device.clone(),
+                    };
+                    self.post(&id, msg, 0, true);
                 }
             }
             ClientMessage::KeyholdResign { group, entry } => {
@@ -296,10 +306,94 @@ impl Groups {
                     );
                 }
             }
-            // Seed-welcome pages are asked by no due yet (see the slice notes); the post is
-            // session.rs's
-            ClientMessage::EpochWelcomes { .. } | ClientMessage::EpochPost { .. } => {}
+            ClientMessage::EpochWelcomes {
+                group,
+                due,
+                gen,
+                seed,
+                welcomes,
+            } => {
+                if !self.on {
+                    return off(refused_what::COMMIT, &group);
+                }
+                // A page's welcomes take the commit lane, as commit parts do (2a): a frame a
+                // full inbox dropped would be the keyholder's miss. Only from a session with a
+                // due or page out, ≤ 12 MB a connection.
+                if !self.get(&group).is_some_and(|h| h.asked.contains(&sid)) {
+                    return lane_refused(self, sid, &group, due, stale::NOT_DUE);
+                }
+                let bytes = SMALL + push::len(&welcomes);
+                if !self.shared.lane_take(sid, bytes) {
+                    return lane_refused(self, sid, &group, due, stale::TOO_LARGE);
+                }
+                let msg = Msg::Welcomes {
+                    sid,
+                    due,
+                    gen,
+                    seed,
+                    welcomes,
+                    bytes,
+                };
+                if !self.post(&group, msg, bytes, true) {
+                    self.shared.lane_free(sid, bytes);
+                    lane_refused(self, sid, &group, due, stale::TOO_LARGE);
+                }
+            }
+            // The post is session.rs's
+            ClientMessage::EpochPost { .. } => {}
             _ => {}
+        }
+    }
+
+    /// The `at` entries of a kept read (C4, plan 2d), each answered in the order asked by
+    /// one reply: an `EpochIn` with `past` set to it, or `EpochRefused{FETCH, NOT_STORED}`
+    /// when it is not to be had (an `r:` group, the material swept, no seat then, past the
+    /// 16 a frame). Served to a follower of the group, or to an account that keeps its
+    /// conversation's log (`voipc_members`): a kept read needs no follow. Never a live
+    /// fetch: nobody is queued or seated by it.
+    async fn past(
+        &self,
+        state: &ServerState,
+        sid: UserId,
+        group: &str,
+        have: Option<&FloorRef>,
+        at: &[EpochRef],
+    ) {
+        let (account, _) = who(state, sid);
+        let follows = self.follows.get(&sid).is_some_and(|f| f.contains(group));
+        let member = match (account, self.shared.db.get()) {
+            (Some(a), Some(db)) if !follows => super::store::is_member(&db.db, group, &a)
+                .await
+                .unwrap_or(false),
+            _ => follows,
+        };
+        let m = account.map_or(MemberId::Conn(sid), MemberId::Account);
+        for (i, e) in at.iter().enumerate() {
+            let piece = if member && i < PAST_A_FETCH {
+                self.past_epoch(group, m, *e, have).await
+            } else {
+                None
+            };
+            let frames = match piece {
+                Some(p) => push::epoch_in(group, p),
+                None => vec![ServerMessage::EpochRefused {
+                    group: group.to_string(),
+                    what: refused_what::FETCH,
+                    why: refused_why::NOT_STORED,
+                    detail: String::new(),
+                }],
+            };
+            // Whole, and not inside another sequence its group sends this session
+            match self.get(group) {
+                Some(h) => {
+                    super::deliver(&self.shared, &h, vec![super::group::Out(sid, frames)]);
+                }
+                None => {
+                    for f in frames {
+                        self.send_now(sid, f);
+                    }
+                }
+            }
         }
     }
 
@@ -316,6 +410,16 @@ impl Groups {
         let (account, ik) = who(state, sid);
         let ik = ik?;
         let p = pair?;
+        // A session from before its account's identity reset holds an identity the account
+        // has no more (plan 2g)
+        if let (Some(a), Some(relay)) = (account, &state.accounts) {
+            let now = relay.identity(l4f_accounts::model::AccountId(a)).await;
+            if let Ok(Some(now)) = now {
+                if super::store::ik_raw(&now) != Some(ik) {
+                    return None;
+                }
+            }
+        }
         let (m, pair) = match (account, p.origin) {
             (Some(a), gk::origin::DESKTOP) if platform == platform::DESKTOP => (
                 MemberId::Account(a),

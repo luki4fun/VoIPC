@@ -577,9 +577,7 @@ pub(super) struct Who {
     pub(super) on: bool,
     pub(super) run: [u8; 16],
     /// C3c: a volunteer's platform, and its clock against the relay's (`DECLINE_CLOCK`).
-    #[allow(dead_code)]
     pub(super) relay_clock: u64,
-    #[allow(dead_code)]
     pub(super) platform: Platform,
     pub(super) help: bool,
     pub(super) visible: bool,
@@ -619,6 +617,7 @@ impl GroupKeying {
             None => true,
         });
         out.local_dirty = local.floors.len() != before;
+        self.duty.keep_in(&local.holder); // C3c
         self.local = Some(local);
         let mut who = Who {
             on: s.on,
@@ -714,6 +713,7 @@ impl GroupKeying {
             }
             self.duty.untrack(&group);
         }
+        self.voice.untrack(channel_id); // V1
         out
     }
 
@@ -775,6 +775,18 @@ impl GroupKeying {
                     taken = true;
                 }
             }
+            // K1: only ever an `at` entry's answer (kept history)
+            ServerMessage::EpochRefused {
+                what: gk::refused_what::FETCH,
+                why: gk::refused_why::NOT_STORED,
+                ..
+            } => self.kept.not_stored(who, m, &mut out),
+            // K1: the oldest kept frame's while none of it is answered (`Kept::rate`)
+            ServerMessage::EpochRefused {
+                what: gk::refused_what::FETCH,
+                why: gk::refused_why::RATE,
+                ..
+            } if self.kept.rate(m) => {}
             ServerMessage::EpochRefused {
                 what, why, detail, ..
             } => m.on_refused(who, *what, *why, detail, &mut c, &mut out),
@@ -793,13 +805,13 @@ impl GroupKeying {
 
     /// After a header was taken: held posts may go, queued posts may open, voice keys move.
     fn after_take(&mut self, group: &str, st: &mut SignalStores, c: &mut GkCtx, out: &mut GkOut) {
+        self.duty_saw(group, out); // C3c
         let (Some(who), Some(m)) = (self.who.as_mut(), self.groups.get_mut(group)) else {
             return;
         };
         let moved = m.take_moved();
-        if moved {
-            self.voice.epoch_taken(who, m, c.now, out);
-        }
+        // V1: voice keys go out whenever the head epoch's key is new; a gated room folds
+        self.voice.after_take(who, m, moved, c, out);
         reader::retry(m, who, st, &mut self.tofu, c, out);
         writer::flush(m, who, st, c, out);
         if moved {
@@ -863,6 +875,7 @@ impl GroupKeying {
         if let Some(who) = self.who.as_mut() {
             self.duty.tick(who, &mut self.groups, &mut c, &mut out);
         }
+        self.keep_out(&mut out); // C3c
         out
     }
 
@@ -963,10 +976,27 @@ impl GroupKeying {
             self.local_floor(g);
         }
         out.local_dirty = self.local.is_some() && !groups.is_empty();
+        self.keep_out(&mut out); // C3c
         let local = self.local.take();
         *self = GroupKeying::default();
         self.local = local;
         out
+    }
+
+    // C3c: the keyholder's own (`HolderKeep`) from the duty into `local`, where it moved.
+    fn keep_out(&mut self, out: &mut GkOut) {
+        if let (Some(keep), Some(local)) = (self.duty.take_keep(), self.local.as_mut()) {
+            local.holder = keep;
+            out.local_dirty = true;
+        }
+    }
+
+    // C3c: every header the member took, to the duty (a Join of ours named under it, §5.2).
+    fn duty_saw(&mut self, group: &str, out: &mut GkOut) {
+        if let (Some(who), Some(m)) = (self.who.as_mut(), self.groups.get_mut(group)) {
+            self.duty.head_taken(who, m, out);
+            m.took.clear();
+        }
     }
 }
 
@@ -994,5 +1024,25 @@ fn ready<T>(fut: impl Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
     {
         Poll::Ready(result) => result,
         Poll::Pending => anyhow::bail!("an in-memory store pended"),
+    }
+}
+
+// K1: kept history (part 4): the account's re-seal for `AccountSync`, and the past epochs'
+// asks for the host.
+pub(crate) use kept::Reseal;
+
+impl GroupKeying {
+    /// The past epochs `past_epoch` asked for, in `EpochFetch` frames of at most 16 (C4): the
+    /// host sends them after its `past_epoch` calls and at every `tick`. A few frames are
+    /// out at once per group, the rest go as their answers come in, all paced under the
+    /// relay's fetch budget.
+    pub fn past_asks(&mut self) -> GkOut {
+        let mut out = GkOut::default();
+        if let Some(who) = self.who.as_ref() {
+            for m in self.groups.values() {
+                self.kept.send(who, m, &mut out);
+            }
+        }
+        out
     }
 }
