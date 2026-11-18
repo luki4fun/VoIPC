@@ -7,6 +7,7 @@ pub mod error;
 pub mod fuzz;
 pub mod messages;
 pub mod names;
+pub mod pool;
 pub mod types;
 pub mod video;
 pub mod voice;

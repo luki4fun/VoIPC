@@ -18,7 +18,7 @@
 
 import { wasm } from "./wasm";
 import { displayConstraints } from "../../lib/display-capture";
-import { paceFrame, shouldForceKey } from "../../lib/share-rules";
+import { lossMajority, paceFrame, shouldForceKey } from "../../lib/share-rules";
 import type { SessionContext, ShareApi, VideoCodec } from "./types";
 import { audio } from "./audio";
 
@@ -325,6 +325,10 @@ export class ShareSender implements ShareApi {
 
   onLossReport(framesDropped: number): void {
     if (framesDropped > 0) this.lossAt = performance.now();
+  }
+
+  onLossSummary(reporters: number, viewers: number): void {
+    if (lossMajority(reporters, viewers)) this.lossAt = performance.now();
   }
 
   toggleAudio(): boolean {

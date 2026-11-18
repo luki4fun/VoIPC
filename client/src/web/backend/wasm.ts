@@ -492,6 +492,10 @@ export interface WasmApi {
   encodeClientMsg(msg: unknown): Uint8Array;
   /** Decodes postcard bytes (without length prefix) into a ServerMessage object. */
   decodeServerMsg(bytes: Uint8Array): unknown;
+  /** A viewer's hello to a media edge (`pool::ViewerMsg::Hello`), WITH its u32 length prefix. */
+  encodeViewerHello(ticket: Uint8Array): Uint8Array;
+  /** An edge's word to its viewer (`pool::EdgeViewMsg`, no length prefix): "Ready" or { Ended: { reason } }. */
+  decodeEdgeViewMsg(bytes: Uint8Array): unknown;
   /** Fresh ephemeral identity + registration id + signed pre-key 1 + 100 one-time pre-keys. */
   newSignalClient(): SignalClient;
   /** The PBKDF2 rounds a password is stretched with. */
@@ -634,6 +638,8 @@ export async function loadWasm(): Promise<WasmApi> {
     appVersion: () => mod.appVersion(),
     encodeClientMsg: (m) => mod.encodeClientMsg(m),
     decodeServerMsg: (b) => mod.decodeServerMsg(b),
+    encodeViewerHello: (t) => mod.encodeViewerHello(t),
+    decodeEdgeViewMsg: (b) => mod.decodeEdgeViewMsg(b),
     newSignalClient: () => new mod.SignalClient(),
     kdfRounds: () => mod.kdfRounds(),
     newAccountSignIn: (name, method) => new mod.AccountSignIn(name, method),

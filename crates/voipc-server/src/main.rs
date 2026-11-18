@@ -17,6 +17,7 @@ mod bans;
 mod channels;
 mod config;
 mod control;
+mod edge;
 mod emotes;
 mod files;
 mod fsutil;
@@ -25,6 +26,10 @@ mod layout;
 mod load;
 mod lobby;
 mod media;
+mod pool;
+mod pool_keys;
+#[cfg(test)]
+mod pool_tests;
 mod presets;
 mod report;
 mod restrict;
@@ -124,6 +129,10 @@ enum Command {
     /// Exit 0 when this server answers on its TCP port (for container and
     /// service health checks).
     Health,
+    /// Run as a media edge of a relay: forward its big screen shares to the
+    /// viewers it sends here. Reads edge.toml, named before the command:
+    /// `voipc-server -c edge.toml edge`.
+    Edge,
 }
 
 #[derive(clap::Subcommand)]
@@ -893,7 +902,11 @@ async fn run_command(config: &ServerConfig, command: Command) -> Result<()> {
                 days.clamp(1, 30)
             );
         }
-        Command::Channels(_) | Command::Cert(_) | Command::Health | Command::Ban(_) => {
+        Command::Channels(_)
+        | Command::Cert(_)
+        | Command::Health
+        | Command::Ban(_)
+        | Command::Edge => {
             unreachable!("handled before the database is opened")
         }
         Command::Db(DbCommand::Backup { path }) => {
@@ -931,6 +944,10 @@ async fn main() -> Result<()> {
     if let Some(Command::Channels(command)) = args.command {
         return presets::run(command, args.channels.as_deref(), args.settings.as_deref());
     }
+    // An edge has a file of its own and none of a relay's state, and is updated by hand
+    if let Some(Command::Edge) = args.command {
+        return edge::run(args.config).await;
+    }
     // The first start after a self-update, or back from one that never got
     // ready: before the config, which a broken binary may fail to read
     if args.command.is_none() {
@@ -941,7 +958,8 @@ async fn main() -> Result<()> {
     let mut config = if let Some(config_path) = &args.config {
         let content = fs::read_to_string(config_path)
             .with_context(|| format!("failed to read config file: {}", config_path))?;
-        toml::from_str(&content)?
+        config::parse(&content)
+            .with_context(|| format!("{config_path} is not a valid server.toml"))?
     } else {
         ServerConfig::default()
     };
@@ -1266,6 +1284,16 @@ async fn main() -> Result<()> {
             if ticks.is_multiple_of(lobby::counts_every(counted.sessions.len())) {
                 lobby::send_counts(&counted, &mut last).await;
             }
+        }
+    });
+    // What sharers hear of their viewers, each second: a count that moved, and above 8
+    // viewers how many lose frames (protocol v26). Asks for nothing while nobody shares.
+    let ticking = state.clone();
+    tokio::spawn(async move {
+        let mut every = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            every.tick().await;
+            ticking.share_tick();
         }
     });
     // Exits each second, so a ban across many channels is one frame per writer; quiet

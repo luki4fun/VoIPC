@@ -24,6 +24,11 @@
 # lane drops them with iptables): both browsers ask for QUIC as usual, and
 # both must have raced over to the TCP fallback on their own.
 #
+# EDGE=1 puts a media edge between alice's share and bob (protocol 26): the relay lists
+# edge e1 in its [pool] with local_first = 0, one `voipc-server -c edge.toml edge` links to
+# it, and bob, the share's first viewer, is sent there. He must report the edge ready, never
+# failed, and decode alice's frames, which then came through the edge.
+#
 # UI_TEST=0 skips test-ui.mjs. It drives its own Chromium and reads none of the
 # settings above, so CI runs it only where the network differs.
 #
@@ -229,6 +234,12 @@ key_path = "server.key"
 [files]
 cache_mins = 1
 TOML
+# EDGE=1: edge e1 may link, and takes a share's viewers from the first on
+EDGE_PORT=$((TCP_PORT + 3))
+EDGE_SECRET="e2e-edge-secret-of-at-least-32-chars"
+if [ "${EDGE:-}" = 1 ]; then
+  printf '[pool]\nedges = { e1 = "%s" }\nlocal_first = 0\n' "$EDGE_SECRET" >> "$WORK/server.toml"
+fi
 (cd "$WORK" && exec "$SCRIPT_DIR/$SERVER" --config server.toml --host 127.0.0.1 --tcp-port "$TCP_PORT" --udp-port "$TCP_PORT" \
   --cert server.crt --key server.key --admin-token e2e-admin-token-0001 --channels channels.json --tcp-fallback \
   > "$WORK/server.log" 2>&1) &
@@ -239,6 +250,31 @@ for _ in $(seq 1 50); do
 done
 grep -q '"hash"' "$WORK/wt.json" || die "server did not come up: $(cat "$WORK/server.log")"
 echo "server up: $(cat "$WORK/wt.json")"
+
+# The edge pins the relay's certificate by what `cert fingerprint` prints, as OPERATING
+# tells an operator to: the relay is an IP here, which no public certificate names.
+# -c before the command: it is not a global argument.
+if [ "${EDGE:-}" = 1 ]; then
+  mkdir -p "$WORK/edge"
+  fingerprint=$(cd "$WORK" && "$SCRIPT_DIR/$SERVER" -c server.toml cert fingerprint)
+  cat > "$WORK/edge/edge.toml" <<TOML
+core = "127.0.0.1:$TCP_PORT"
+core_fingerprint = "$fingerprint"
+name = "e1"
+secret = "$EDGE_SECRET"
+host = "127.0.0.1"
+udp_port = $EDGE_PORT
+public = "127.0.0.1:$EDGE_PORT"
+TOML
+  (cd "$WORK/edge" && exec "$SCRIPT_DIR/$SERVER" -c edge.toml edge > "$WORK/edge.log" 2>&1) &
+  for _ in $(seq 1 100); do
+    grep -q 'edge e1 linked from' "$WORK/server.log" && break
+    sleep 0.2
+  done
+  grep -q 'edge e1 linked from' "$WORK/server.log" ||
+    die "the edge did not link: $(cat "$WORK/edge.log")"
+  echo "edge up: $(grep -o 'edge e1 linked from.*' "$WORK/server.log")"
+fi
 
 # A second, empty server for test-ui.mjs's multi-server lane: one client holding
 # two connections at once is the thing to prove, and two ports on one host are
@@ -430,6 +466,15 @@ check "alice sent video frames"         "$WORK/alice.txt" 'screenshare-stats.*"f
 check "bob watched the share"           "$WORK/bob.txt"   'watching-screenshare'
 check "bob decoded video frames"        "$WORK/bob.txt"   'screenshare-stats.*"frames_recv":[1-9]'
 check "bob drew a frame on the canvas"  "$WORK/bob.txt"   'screenshare-stats.*"frames_drawn":[1-9]'
+if [ "${EDGE:-}" = 1 ]; then
+  # Only a relay that lost him (an EdgeFailed, the edge gone) would feed bob itself: then
+  # his frames above did not come through the edge
+  check "bob watched from the edge"     "$WORK/bob.txt"   'event edge-view.*"state":"ready"'
+  if grep -q 'event edge-view.*"state":"failed"' "$WORK/bob.txt" || grep -q 'edge e1 offline' "$WORK/server.log"; then
+    echo "FAIL bob's edge failed him, or went:" | tee -a "$WORK/fails.txt"
+    grep -h 'event edge-view.*"state":"failed"\|edge e1 offline' "$WORK/bob.txt" "$WORK/server.log" | tee -a "$WORK/fails.txt"; fail=1
+  fi
+fi
 if [ "${EXPECT_LADDER:-}" = 1 ]; then
   # Under the cap: voice first, the picture keeps coming, and the ladder gives way (H3-14)
   ladder=$(node -e '

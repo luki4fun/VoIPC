@@ -737,6 +737,9 @@ where
     // What this particular client brought with it; the budgets
     // and the rest are the same for everybody (state.rs).
     session.identity_key = identity_key;
+    // The tunnel's label (`tunnel::run`): such a client watches shares from here, never
+    // from an edge
+    session.tunnel = peer_addr.starts_with("tcp:");
     session.bundle = prekey_bundle.map(|mut b| {
         b.prekeys.truncate(MAX_PREKEYS);
         b
@@ -1491,8 +1494,9 @@ async fn handle_message(
             frames_dropped,
             frames_received,
         } => {
-            // Relayed to the sharer, which lowers its bitrate/fps. Only
-            // viewers of that share may report, at most ~1/s each.
+            // Relayed to the sharer, which lowers its bitrate/fps; past 8 viewers
+            // summed up once a second (`ShareNews`). Only viewers of that share
+            // may report, at most ~1/s each.
             let allowed = state
                 .sessions
                 .get_mut(&session_id)
@@ -1502,20 +1506,30 @@ async fn handle_message(
                 })
                 .unwrap_or(false);
             if allowed {
-                let sharer_tx = state
-                    .sessions
-                    .get(&sharer_user_id)
-                    .map(|s| s.control_tx.clone());
-                if let Some(sharer_tx) = sharer_tx {
-                    let _ = send_msg(
-                        &sharer_tx,
-                        &ServerMessage::VideoLossReported {
-                            viewer_user_id: user_id,
-                            frames_dropped,
-                            frames_received,
-                        },
-                    );
+                state.loss_reported(sharer_user_id, user_id, frames_dropped, frames_received);
+            }
+        }
+        ClientMessage::EdgeFailed {
+            sharer_user_id,
+            placement,
+        } => {
+            // Only a viewer of that share, at most one in 2 s; the state checks the rest
+            // (its placement, the share's own silence) and moves it
+            let watching = state.sessions.get_mut(&session_id).map(|mut s| {
+                (
+                    s.watching_screenshare == Some(sharer_user_id),
+                    s.channel_id,
+                    s.edge_failed_rate.try_consume(),
+                )
+            });
+            match watching {
+                Some((true, channel_id, true)) => {
+                    state
+                        .edge_failed(user_id, sharer_user_id, placement, channel_id)
+                        .await;
                 }
+                Some((true, _, false)) => state.limits.count("edge failed", "over rate"),
+                _ => {}
             }
         }
         ClientMessage::Authenticate { .. } | ClientMessage::AuthContinue(_) => {
@@ -3719,48 +3733,45 @@ async fn handle_watch_screen_share(
         )
         .await
     {
-        Ok((sharer_sid, _old_count, new_count, prev_unwatch, codec)) => {
+        // The sharer, and the one of a share this viewer left for it, were told the new
+        // counts by the state (`ShareNews`)
+        Ok(watched) => {
             // Confirm to viewer, with the codec its decoder needs
             let _ = send_msg(
                 tx,
                 &ServerMessage::WatchingScreenShare {
                     sharer_user_id,
-                    codec,
+                    codec: watched.codec,
                 },
             );
-
-            // Notify the sharer of the new viewer count and get the newcomer a
-            // keyframe: it would otherwise wait up to 4 s for the periodic one.
-            // Capped per share like viewer requests (a burst of joiners is one
-            // IDR per second, not one each). The guard is dropped before awaiting.
-            let sharer = state.sessions.get_mut(&sharer_sid).map(|mut session| {
-                let want_keyframe = new_count > 0 && session.keyframe_relay_rate.try_consume();
-                (session.control_tx.clone(), want_keyframe)
-            });
-            if let Some((sharer_tx, want_keyframe)) = sharer {
+            // On an edge: where, with its ticket. The edge asks for the keyframe once the
+            // viewer is there.
+            if let Some((placement, view)) = watched.edge {
                 let _ = send_msg(
-                    &sharer_tx,
-                    &ServerMessage::ViewerCountChanged {
-                        viewer_count: new_count,
+                    tx,
+                    &ServerMessage::WatchAt {
+                        sharer_user_id,
+                        placement,
+                        edge: Some(view),
                     },
                 );
-                if want_keyframe {
-                    let _ = send_msg(&sharer_tx, &ServerMessage::KeyframeRequested);
-                }
+                return Ok(());
             }
 
-            // If viewer was auto-unwatched from a previous sharer, notify that sharer
-            if let Some((prev_sharer_id, prev_sharer_sid, prev_new_count)) = prev_unwatch {
-                if prev_sharer_id != sharer_user_id {
-                    if let Some(session) = state.sessions.get(&prev_sharer_sid) {
-                        let _ = send_msg(
-                            &session.control_tx,
-                            &ServerMessage::ViewerCountChanged {
-                                viewer_count: prev_new_count,
-                            },
-                        );
-                    }
-                }
+            // Get the newcomer a keyframe: it would otherwise wait up to 4 s for
+            // the periodic one. Capped per share like viewer requests (a burst of
+            // joiners is one IDR per second, not one each). The guard is dropped
+            // before awaiting.
+            let sharer = state
+                .sessions
+                .get_mut(&watched.sharer_sid)
+                .and_then(|mut session| {
+                    let want_keyframe =
+                        watched.new_count > 0 && session.keyframe_relay_rate.try_consume();
+                    want_keyframe.then(|| session.control_tx.clone())
+                });
+            if let Some(sharer_tx) = sharer {
+                let _ = send_msg(&sharer_tx, &ServerMessage::KeyframeRequested);
             }
         }
         // Its own message: an app read `ScreenShareError` as its own share failing
@@ -3794,7 +3805,8 @@ async fn handle_stop_watching(
         .stop_watching_screen_share(viewer_user_id, viewer_session_id, channel_id)
         .await
     {
-        Ok((_sharer_uid, sharer_sid, _old_count, new_count)) => {
+        // The sharer was told the new count by the state (`ShareNews`)
+        Ok(_) => {
             // Confirm to viewer
             let _ = send_msg(
                 tx,
@@ -3802,16 +3814,6 @@ async fn handle_stop_watching(
                     reason: "requested".into(),
                 },
             );
-
-            // Notify sharer of updated viewer count
-            if let Some(session) = state.sessions.get(&sharer_sid) {
-                let _ = send_msg(
-                    &session.control_tx,
-                    &ServerMessage::ViewerCountChanged {
-                        viewer_count: new_count,
-                    },
-                );
-            }
         }
         Err(e) => {
             let _ = send_msg(
@@ -3835,13 +3837,13 @@ async fn handle_request_keyframe(state: &Arc<ServerState>, sharer_user_id: UserI
     else {
         return Ok(());
     };
-    relay_keyframe_request(state, sharer_sid).await;
+    relay_keyframe_request(state, sharer_sid);
     Ok(())
 }
 
 /// Ask a sharer for a keyframe, within the per-share budget every viewer's
 /// request shares (a burst of joiners or of losses is one IDR a second).
-pub(crate) async fn relay_keyframe_request(state: &ServerState, sharer_sid: SessionId) {
+pub(crate) fn relay_keyframe_request(state: &ServerState, sharer_sid: SessionId) {
     let sharer_tx = match state.sessions.get_mut(&sharer_sid) {
         Some(mut session) => {
             if !session.keyframe_relay_rate.try_consume() {
@@ -4586,18 +4588,7 @@ pub(crate) async fn cleanup_and_notify_screen_shares(
             }
         }
     }
-
-    // Notify sharer of viewer count change (if the user was watching someone)
-    if let Some((sharer_sid, new_count)) = cleanup.sharer_viewer_count_changed {
-        if let Some(session) = state.sessions.get(&sharer_sid) {
-            let _ = send_msg(
-                &session.control_tx,
-                &ServerMessage::ViewerCountChanged {
-                    viewer_count: new_count,
-                },
-            );
-        }
-    }
+    // The sharer of what the user watched was told the new count by the state (`ShareNews`)
 }
 
 /// Start an auto-delete timer for an empty channel.

@@ -201,6 +201,12 @@ export interface ShareApi {
   requestKeyframe(): void;
   /** A viewer reported lost frames (VideoLossReported): step the quality down. */
   onLossReport(framesDropped: number): void;
+  /**
+   * Above 8 viewers the relay counts the reports instead (VideoLossSummary,
+   * protocol 26): `reporters` of `viewers` lost frames lately. A majority steps
+   * the quality down.
+   */
+  onLossSummary(reporters: number, viewers: number): void;
   /** toggle_screen_audio: returns the new state. */
   toggleAudio(): boolean;
   /** [frames_sent, bytes_sent] for get_screen_share_stats. */

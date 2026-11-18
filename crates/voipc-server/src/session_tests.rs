@@ -24496,6 +24496,70 @@ mod layouts {
             "the control"
         );
     }
+
+    /// A channel deleted with a share still in it, of a sharer and a viewer moved out
+    /// before their moves' cleanup ran: the share ends with it, on its edge too, whose
+    /// counts go back to nothing, and its sharer may share again.
+    #[tokio::test]
+    async fn a_share_left_in_a_deleted_channel_ends_on_its_edges() {
+        use super::edge_pool::{assigned, edge, joined, roomy, told, watch_on_edge, CoreMsg};
+        let (state, _db) =
+            relay_state_then(AccountsMode::Optional, RegistrationMode::Open, |state| {
+                let mut config = crate::config::PoolConfig::default();
+                config
+                    .edges
+                    .insert("e1".into(), super::edge_pool::E1_SECRET.into());
+                config.local_first = 0;
+                state.pool = crate::pool::Pool::new(&config).map(Arc::new);
+            })
+            .await;
+        let (_e1, mut e1) = edge(&state, "e1", roomy()).await;
+        let mut m = manager(&state, "mona").await;
+        let deck = made(&mut m, save(None, "deck", false, None)).await;
+        let mut alice = joined(&state, "alice#1001", deck).await;
+        alice
+            .send(&ClientMessage::StartScreenShare {
+                source: "portal".into(),
+                resolution: 1080,
+                codec: VideoCodec::H264,
+            })
+            .await;
+        super::edge_pool::drained(&mut alice).await;
+        let alice_uid = *state.username_to_session.get("alice#1001").unwrap();
+        let mut bob = joined(&state, "bob#1002", deck).await;
+        watch_on_edge(&mut bob, alice_uid).await;
+        let bob_uid = *state.username_to_session.get("bob#1002").unwrap();
+        for uid in [alice_uid, bob_uid] {
+            state.join_channel(uid, uid, 0, None).await.unwrap();
+        }
+        assert_eq!(assigned(&state, "e1"), (1, 7500, 1));
+
+        let mona = *state.account_sessions.iter().next().unwrap().value();
+        state
+            .sessions
+            .get_mut(&mona)
+            .unwrap()
+            .account
+            .as_mut()
+            .unwrap()
+            .step_up_at = Some(std::time::Instant::now());
+        ok(&mut m, AdminOp::ChannelDelete { id: deck }).await;
+        assert!(!state.channels.read().await.contains_key(&deck));
+        assert_eq!(
+            told(&mut e1),
+            [CoreMsg::ShareEnded {
+                share: alice_uid,
+                core_ms: 0
+            }]
+        );
+        assert_eq!(assigned(&state, "e1"), (0, 0, 0));
+        assert!(state.share_fans.get(&alice_uid).is_none());
+        assert!(!state.sessions.get(&alice_uid).unwrap().is_screen_sharing);
+        assert_eq!(
+            state.sessions.get(&bob_uid).unwrap().watching_screenshare,
+            None
+        );
+    }
 }
 
 /// Group colours and order (1.9).
@@ -39720,4 +39784,1235 @@ mod load_view {
         assert_eq!(report.video_budget_kbps, 1_000_000);
         assert!(report.warnings.is_empty(), "{:?}", report.warnings);
     }
+}
+
+/// What a sharer hears of its viewers (protocol v26): the count at most once a second, and at
+/// once when it goes to nobody or from nobody; above 8 viewers, the loss as one summary a
+/// second, kept beside the fan and not under `channels`.
+mod sharer_news {
+    use super::*;
+
+    /// All `c` is sent before a ping comes back, so all it was sent by then.
+    async fn drained(c: &mut Client) -> Vec<ServerMessage> {
+        let stamp: u64 = rand::random();
+        c.send(&ClientMessage::Ping { timestamp: stamp }).await;
+        let mut seen = Vec::new();
+        loop {
+            match c.next().await.expect("the connection stays") {
+                ServerMessage::Pong { timestamp } if timestamp == stamp => return seen,
+                m => seen.push(m),
+            }
+        }
+    }
+
+    /// No `ViewerCountChanged` at all.
+    const NO_COUNT: [u32; 0] = [];
+
+    fn counts(seen: &[ServerMessage]) -> Vec<u32> {
+        seen.iter()
+            .filter_map(|m| match m {
+                ServerMessage::ViewerCountChanged { viewer_count } => Some(*viewer_count),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn summaries(seen: &[ServerMessage]) -> Vec<(u32, u32)> {
+        seen.iter()
+            .filter_map(|m| match m {
+                ServerMessage::VideoLossSummary { reporters, viewers } => {
+                    Some((*reporters, *viewers))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn relayed(seen: &[ServerMessage]) -> Vec<(UserId, u32, u32)> {
+        seen.iter()
+            .filter_map(|m| match m {
+                ServerMessage::VideoLossReported {
+                    viewer_user_id,
+                    frames_dropped,
+                    frames_received,
+                } => Some((*viewer_user_id, *frames_dropped, *frames_received)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Alice shares in a room of her own, which `n` others stand in, none watching yet:
+    /// Alice, her user id and the others, each past all it was told so far.
+    async fn a_share(state: &Arc<ServerState>, n: usize) -> (Client, UserId, Vec<Client>) {
+        let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let mut alice = connect(state, "alice", lo).await;
+        alice
+            .send(&ClientMessage::CreateChannel {
+                name: "room".into(),
+                password: None,
+                proximity: ProximityMode::Off,
+                anonymous: false,
+                text: false,
+            })
+            .await;
+        let ServerMessage::ChannelCreated { channel } = alice
+            .expect("ChannelCreated", |m| {
+                matches!(m, ServerMessage::ChannelCreated { .. })
+            })
+            .await
+        else {
+            unreachable!()
+        };
+        let room = channel.channel_id;
+        let mut others = Vec::new();
+        for i in 0..n {
+            let mut c = connect(state, &format!("viewer{i}"), lo).await;
+            c.send(&ClientMessage::JoinChannel {
+                channel_id: room,
+                password: None,
+            })
+            .await;
+            c.expect(
+                "UserList",
+                |m| matches!(m, ServerMessage::UserList { channel_id, .. } if *channel_id == room),
+            )
+            .await;
+            others.push(c);
+        }
+        alice
+            .send(&ClientMessage::StartScreenShare {
+                source: "portal".into(),
+                resolution: 1080,
+                codec: VideoCodec::H264,
+            })
+            .await;
+        drained(&mut alice).await;
+        for c in &mut others {
+            drained(c).await;
+        }
+        let alice_uid = *state.username_to_session.get("alice").unwrap();
+        (alice, alice_uid, others)
+    }
+
+    async fn watch(c: &mut Client, sharer_user_id: UserId) {
+        c.send(&ClientMessage::WatchScreenShare { sharer_user_id })
+            .await;
+        c.expect("WatchingScreenShare", |m| {
+            matches!(m, ServerMessage::WatchingScreenShare { .. })
+        })
+        .await;
+    }
+
+    /// `a_share` with all `n` watching, and Alice told of them all.
+    async fn watched_by(state: &Arc<ServerState>, n: usize) -> (Client, UserId, Vec<Client>) {
+        let (mut alice, alice_uid, mut viewers) = a_share(state, n).await;
+        for c in &mut viewers {
+            watch(c, alice_uid).await;
+        }
+        drained(&mut alice).await;
+        state.share_tick();
+        let seen = drained(&mut alice).await;
+        assert_eq!(
+            counts(&seen),
+            [n as u32],
+            "told of the last count by the tick"
+        );
+        (alice, alice_uid, viewers)
+    }
+
+    async fn report_loss(c: &mut Client, sharer_user_id: UserId) {
+        c.send(&ClientMessage::VideoLossReport {
+            sharer_user_id,
+            frames_dropped: 4,
+            frames_received: 56,
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn five_watches_in_a_second_reach_the_sharer_as_at_most_two_counts() {
+        let state = admin_state();
+        let (mut alice, alice_uid, mut viewers) = a_share(&state, 5).await;
+        for c in &mut viewers {
+            watch(c, alice_uid).await;
+        }
+        let first = counts(&drained(&mut alice).await);
+        assert_eq!(
+            first,
+            [1],
+            "the first viewer at once, the rest with the tick"
+        );
+        state.share_tick();
+        let then = counts(&drained(&mut alice).await);
+        assert_eq!(then, [5]);
+        assert!(first.len() + then.len() <= 2);
+        state.share_tick();
+        assert_eq!(
+            counts(&drained(&mut alice).await),
+            NO_COUNT,
+            "nothing moved since"
+        );
+    }
+
+    /// The app captures only while somebody watches, so a count to or from nobody never
+    /// waits for the tick: not on a watch, a stop, or a viewer leaving the room.
+    #[tokio::test]
+    async fn the_first_viewer_and_the_last_to_go_are_told_at_once() {
+        let state = admin_state();
+        let (mut alice, alice_uid, mut viewers) = a_share(&state, 2).await;
+        watch(&mut viewers[0], alice_uid).await;
+        assert_eq!(counts(&drained(&mut alice).await), [1]);
+        watch(&mut viewers[1], alice_uid).await;
+        assert_eq!(
+            counts(&drained(&mut alice).await),
+            NO_COUNT,
+            "2 waits for the tick"
+        );
+
+        for c in viewers.iter_mut().rev() {
+            c.send(&ClientMessage::StopWatchingScreenShare).await;
+            c.expect("StoppedWatchingScreenShare", |m| {
+                matches!(m, ServerMessage::StoppedWatchingScreenShare { .. })
+            })
+            .await;
+        }
+        assert_eq!(
+            counts(&drained(&mut alice).await),
+            [0],
+            "1 was told; 0 at once"
+        );
+        state.share_tick();
+        assert_eq!(counts(&drained(&mut alice).await), NO_COUNT);
+
+        // Through the cleanup of somebody who leaves the room too
+        watch(&mut viewers[0], alice_uid).await;
+        assert_eq!(counts(&drained(&mut alice).await), [1]);
+        viewers[0]
+            .send(&ClientMessage::JoinChannel {
+                channel_id: 0,
+                password: None,
+            })
+            .await;
+        drained(&mut viewers[0]).await;
+        assert_eq!(counts(&drained(&mut alice).await), [0]);
+    }
+
+    #[tokio::test]
+    async fn past_8_viewers_three_lossy_reports_are_one_summary() {
+        let state = admin_state();
+        let (mut alice, alice_uid, mut viewers) = watched_by(&state, 9).await;
+        for c in &mut viewers[..3] {
+            report_loss(c, alice_uid).await;
+            drained(c).await;
+        }
+        let seen = drained(&mut alice).await;
+        assert_eq!(relayed(&seen), [], "no viewer's own report");
+        assert_eq!(summaries(&seen), [], "the summary waits for the tick");
+
+        state.share_tick();
+        let seen = drained(&mut alice).await;
+        assert_eq!(summaries(&seen), [(3, 9)]);
+        assert_eq!(relayed(&seen), []);
+        state.share_tick();
+        assert_eq!(
+            summaries(&drained(&mut alice).await),
+            [],
+            "one summary for one round of reports"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_8_viewers_each_report_is_relayed_as_before() {
+        let state = admin_state();
+        let (mut alice, alice_uid, mut viewers) = watched_by(&state, 8).await;
+        report_loss(&mut viewers[0], alice_uid).await;
+        drained(&mut viewers[0]).await;
+        let reporter = *state.username_to_session.get("viewer0").unwrap();
+        assert_eq!(relayed(&drained(&mut alice).await), [(reporter, 4, 56)]);
+        state.share_tick();
+        assert_eq!(summaries(&drained(&mut alice).await), []);
+    }
+
+    /// Reporters live beside the fan: a report waits for no change of who is where, and the
+    /// tick sends its summary while one is held.
+    #[tokio::test]
+    async fn a_lossy_report_takes_no_channels_lock() {
+        let state = admin_state();
+        let (mut alice, alice_uid, mut viewers) = watched_by(&state, 9).await;
+        let held = state.channels.write().await;
+        report_loss(&mut viewers[0], alice_uid).await;
+        tokio::time::timeout(Duration::from_secs(5), drained(&mut viewers[0]))
+            .await
+            .expect("the report waited for the channels lock");
+        state.share_tick();
+        let seen = tokio::time::timeout(Duration::from_secs(5), drained(&mut alice))
+            .await
+            .expect("the sharer's ping waited for the channels lock");
+        assert_eq!(summaries(&seen), [(1, 9)]);
+        drop(held);
+    }
+}
+
+/// The media edge pool (`[pool]`, protocol v26), with edges that are queues in the test
+/// (`pool::test_edge`): who is placed where, what each edge is told, and that every way out
+/// of a share gives back what it took on its edge.
+mod edge_pool {
+    use super::*;
+    use crate::pool::{test_edge, EdgeCaps};
+    pub(super) use voipc_protocol::pool::{CoreMsg, EdgeMsg};
+
+    pub(super) const E1_SECRET: &str = "the-secret-of-edge-one-0123456789";
+
+    /// A relay with edges `e1`, `e2` and `e3` configured, none linked yet, keeping
+    /// `local_first` viewers of a share itself, at most `share_viewers` of them, and sending
+    /// `video_mbit` of video.
+    pub(super) fn pool_state(
+        local_first: u32,
+        share_viewers: u32,
+        video_mbit: u32,
+    ) -> Arc<ServerState> {
+        let mut config = ServerConfig::default();
+        config.media.share_viewers = share_viewers;
+        config.media.video_egress_mbit = video_mbit;
+        config.pool.local_first = local_first;
+        config.pool.edges = [
+            ("e1", E1_SECRET),
+            ("e2", "the-secret-of-edge-two-0123456789"),
+            ("e3", "the-secret-of-edge-three-01234567"),
+        ]
+        .into_iter()
+        .map(|(n, s)| (n.to_string(), s.to_string()))
+        .collect();
+        config.validate().unwrap();
+        Arc::new(ServerState::new(
+            &config,
+            ServerSettings::default(),
+            Vec::new(),
+            "test-admin-token".into(),
+        ))
+    }
+
+    /// An edge linked as `name`: its link id, and what it is told after its `Welcome`.
+    pub(super) async fn edge(
+        state: &ServerState,
+        name: &str,
+        caps: EdgeCaps,
+    ) -> (u64, mpsc::Receiver<CoreMsg>) {
+        let mut rx = test_edge(state, name, caps).await;
+        let Ok(CoreMsg::Welcome { link, .. }) = rx.try_recv() else {
+            panic!("no Welcome first");
+        };
+        (link, rx)
+    }
+
+    /// An edge with room for 1000 viewers, 8 Gbit/s and 16 shares.
+    pub(super) fn roomy() -> EdgeCaps {
+        EdgeCaps::test(1000, 8000, 16)
+    }
+
+    /// What an edge was told since the last look, with the core's clock in a `Revoke` or a
+    /// `ShareEnded` as 0, to compare.
+    pub(super) fn told(rx: &mut mpsc::Receiver<CoreMsg>) -> Vec<CoreMsg> {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|msg| match msg {
+                CoreMsg::Revoke { slot, .. } => CoreMsg::Revoke { slot, core_ms: 0 },
+                CoreMsg::ShareEnded { share, .. } => CoreMsg::ShareEnded { share, core_ms: 0 },
+                msg => msg,
+            })
+            .collect()
+    }
+
+    /// What `name` was assigned: viewers, kbit/s, and how many shares.
+    pub(super) fn assigned(state: &ServerState, name: &str) -> (u32, u64, usize) {
+        let (viewers, kbps, shares) = state.pool.as_ref().unwrap().assigned(name).unwrap();
+        (viewers, kbps, shares.len())
+    }
+
+    /// All `c` is sent before a ping comes back, so all it was sent by then.
+    pub(super) async fn drained(c: &mut Client) -> Vec<ServerMessage> {
+        let stamp: u64 = rand::random();
+        c.send(&ClientMessage::Ping { timestamp: stamp }).await;
+        let mut seen = Vec::new();
+        loop {
+            match c.next().await.expect("the connection stays") {
+                ServerMessage::Pong { timestamp } if timestamp == stamp => return seen,
+                m => seen.push(m),
+            }
+        }
+    }
+
+    /// The `WatchAt`s among `seen`: placement and edge.
+    pub(super) fn watch_ats(seen: &[ServerMessage]) -> Vec<(u64, Option<EdgeView>)> {
+        seen.iter()
+            .filter_map(|m| match m {
+                ServerMessage::WatchAt {
+                    placement, edge, ..
+                } => Some((*placement, edge.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The slot a ticket of `e1` holds.
+    pub(super) fn e1_slot(view: &EdgeView) -> u64 {
+        crate::pool_keys::open(&crate::pool_keys::ticket_key(E1_SECRET), &view.ticket)
+            .unwrap()
+            .slot
+    }
+
+    /// `connect`, with `label` where the transport's goes (`quic:…`, `tcp:…`).
+    pub(super) async fn connect_via(
+        state: &Arc<ServerState>,
+        username: &str,
+        label: &str,
+    ) -> Client {
+        let (stream, server) = tokio::io::duplex(65536);
+        let (media_tx, _media_rx) = mpsc::channel(8);
+        let (sid_tx, _sid_rx) = oneshot::channel();
+        let handler = tokio::spawn(handle_connection(
+            server,
+            label.into(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            media_tx,
+            sid_tx,
+            state.clone(),
+            Some(TEST_BIND),
+        ));
+        let mut client = Client {
+            stream,
+            handler,
+            buf: BytesMut::new(),
+        };
+        client
+            .send(&ClientMessage::Authenticate {
+                username: username.into(),
+                protocol_version: PROTOCOL_VERSION,
+                app_version: APP_VERSION.to_string(),
+                identity_key: None,
+                prekey_bundle: None,
+                account: None,
+            })
+            .await;
+        client
+            .expect("Authenticated", |m| {
+                matches!(m, ServerMessage::Authenticated { .. })
+            })
+            .await;
+        client
+    }
+
+    /// `name` in `room`, past all it was told so far.
+    pub(super) async fn joined(state: &Arc<ServerState>, name: &str, room: ChannelId) -> Client {
+        let mut c = connect(state, name, IpAddr::V4(Ipv4Addr::LOCALHOST)).await;
+        join(&mut c, room).await;
+        c
+    }
+
+    pub(super) async fn join(c: &mut Client, room: ChannelId) {
+        c.send(&ClientMessage::JoinChannel {
+            channel_id: room,
+            password: None,
+        })
+        .await;
+        c.expect(
+            "UserList",
+            |m| matches!(m, ServerMessage::UserList { channel_id, .. } if *channel_id == room),
+        )
+        .await;
+        drained(c).await;
+    }
+
+    /// Alice shares at 1080 in a room of her own: Alice, her user id and the room.
+    pub(super) async fn a_share(state: &Arc<ServerState>) -> (Client, UserId, ChannelId) {
+        let mut alice = connect(state, "alice", IpAddr::V4(Ipv4Addr::LOCALHOST)).await;
+        let room = make_room(&mut alice, "room").await;
+        alice
+            .send(&ClientMessage::StartScreenShare {
+                source: "portal".into(),
+                resolution: 1080,
+                codec: VideoCodec::H264,
+            })
+            .await;
+        drained(&mut alice).await;
+        let alice_uid = *state.username_to_session.get("alice").unwrap();
+        (alice, alice_uid, room)
+    }
+
+    pub(super) async fn make_room(c: &mut Client, name: &str) -> ChannelId {
+        c.send(&ClientMessage::CreateChannel {
+            name: name.into(),
+            password: None,
+            proximity: ProximityMode::Off,
+            anonymous: false,
+            text: false,
+        })
+        .await;
+        let ServerMessage::ChannelCreated { channel } = c
+            .expect("ChannelCreated", |m| {
+                matches!(m, ServerMessage::ChannelCreated { .. })
+            })
+            .await
+        else {
+            unreachable!()
+        };
+        drained(c).await;
+        channel.channel_id
+    }
+
+    /// `c` watches `sharer`: all it was told for it.
+    pub(super) async fn watch(c: &mut Client, sharer_user_id: UserId) -> Vec<ServerMessage> {
+        c.send(&ClientMessage::WatchScreenShare { sharer_user_id })
+            .await;
+        drained(c).await
+    }
+
+    /// `c` watches `sharer` from an edge: the placement and where.
+    pub(super) async fn watch_on_edge(c: &mut Client, sharer: UserId) -> (u64, EdgeView) {
+        let seen = watch(c, sharer).await;
+        match watch_ats(&seen).as_slice() {
+            [(placement, Some(view))] => (*placement, view.clone()),
+            other => panic!("not placed on an edge: {other:?} of {seen:?}"),
+        }
+    }
+
+    /// Marks `sharer`'s share as sending now, as a video fragment does.
+    pub(super) fn sending(state: &ServerState, sharer: UserId) {
+        state.share_fans.get(&sharer).unwrap().last_packet_ms.store(
+            state.uptime_ms().max(1),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    #[tokio::test]
+    async fn the_ninth_viewer_is_sent_to_an_edge() {
+        let state = pool_state(8, 100, 1000);
+        let (_e1, mut e1) = edge(&state, "e1", roomy()).await;
+        let (_alice, alice_uid, room) = a_share(&state).await;
+        let mut viewers = Vec::new();
+        for i in 0..9 {
+            viewers.push(joined(&state, &format!("viewer{i}"), room).await);
+        }
+        for c in &mut viewers[..8] {
+            let seen = watch(c, alice_uid).await;
+            assert!(
+                watch_ats(&seen).is_empty(),
+                "the first 8 stay here: {seen:?}"
+            );
+        }
+        let (_, view) = watch_on_edge(&mut viewers[8], alice_uid).await;
+        assert_eq!((view.host.as_str(), view.port), ("127.0.0.1", 9991));
+        assert_eq!(view.cert_hashes, [[7; 32]]);
+        let ticket = crate::pool_keys::open(&crate::pool_keys::ticket_key(E1_SECRET), &view.ticket)
+            .expect("sealed for e1");
+        assert_eq!(ticket.share, alice_uid);
+        assert_eq!(assigned(&state, "e1"), (1, 7500, 1));
+        assert!(
+            told(&mut e1).is_empty(),
+            "the edge hears of the viewer when it arrives"
+        );
+        assert_eq!(state.share_fans.get(&alice_uid).unwrap().local.len(), 8);
+        // The count is of everyone
+        let channels = state.channels.read().await;
+        let share = &channels[&room].screen_shares[&alice_uid];
+        assert_eq!((share.viewers.len(), share.local_viewers()), (9, 8));
+    }
+
+    #[tokio::test]
+    async fn a_viewer_through_the_tunnel_is_never_sent_to_an_edge() {
+        let state = pool_state(0, 100, 1000);
+        let (_e1, _rx) = edge(&state, "e1", roomy()).await;
+        let (_alice, alice_uid, room) = a_share(&state).await;
+        let mut tunnelled = connect_via(&state, "bob", "tcp:127.0.0.1").await;
+        join(&mut tunnelled, room).await;
+        let seen = watch(&mut tunnelled, alice_uid).await;
+        assert!(watch_ats(&seen).is_empty(), "{seen:?}");
+        let mut quic = connect_via(&state, "carol", "quic:127.0.0.1").await;
+        join(&mut quic, room).await;
+        watch_on_edge(&mut quic, alice_uid).await;
+        assert_eq!(assigned(&state, "e1").0, 1);
+    }
+
+    /// Without an edge online, or with every edge full, the relay serves a viewer itself
+    /// under its own caps, as without a pool.
+    #[tokio::test]
+    async fn with_no_edge_that_has_room_the_relay_serves_or_refuses_as_before() {
+        let state = pool_state(0, 1, 1000);
+        let (_alice, alice_uid, room) = a_share(&state).await;
+        let mut bob = joined(&state, "bob", room).await;
+        let seen = watch(&mut bob, alice_uid).await;
+        assert!(watch_ats(&seen).is_empty(), "no edge online: {seen:?}");
+        let (_e1, _rx) = edge(&state, "e1", EdgeCaps::test(1, 8000, 16)).await;
+        let mut carol = joined(&state, "carol", room).await;
+        watch_on_edge(&mut carol, alice_uid).await;
+        let mut dan = joined(&state, "dan", room).await;
+        let seen = watch(&mut dan, alice_uid).await;
+        assert!(
+            seen.iter().any(|m| matches!(m, ServerMessage::WatchRefused { reason, .. } if reason == crate::state::SHARE_FULL)),
+            "e1 is full and this relay serves its one: {seen:?}"
+        );
+    }
+
+    /// An edge new to a share costs this relay one more copy, counted from its first
+    /// placement: a budget that fits one more copy fits one new edge, not two.
+    #[tokio::test]
+    async fn two_new_edges_cannot_both_take_a_budget_that_fits_one() {
+        let state = pool_state(0, 100, 10);
+        let (_e1, _r1) = edge(&state, "e1", EdgeCaps::test(1, 8000, 16)).await;
+        let (_e2, _r2) = edge(&state, "e2", EdgeCaps::test(1, 8000, 16)).await;
+        let (_alice, alice_uid, room) = a_share(&state).await;
+        let mut bob = joined(&state, "bob", room).await;
+        watch_on_edge(&mut bob, alice_uid).await;
+        let mut carol = joined(&state, "carol", room).await;
+        let seen = watch(&mut carol, alice_uid).await;
+        assert!(
+            seen.iter().any(|m| matches!(m, ServerMessage::WatchRefused { reason, .. } if reason == crate::state::VIDEO_FULL)),
+            "{seen:?}"
+        );
+        let on = |name| assigned(&state, name).0;
+        assert_eq!((on("e1"), on("e2")), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn a_viewer_who_stops_watching_is_revoked_on_its_edge() {
+        let state = pool_state(0, 100, 1000);
+        let (_e1, mut e1) = edge(&state, "e1", roomy()).await;
+        let (_alice, alice_uid, room) = a_share(&state).await;
+        let mut bob = joined(&state, "bob", room).await;
+        let (_, view) = watch_on_edge(&mut bob, alice_uid).await;
+        bob.send(&ClientMessage::StopWatchingScreenShare).await;
+        drained(&mut bob).await;
+        assert_eq!(
+            told(&mut e1),
+            [CoreMsg::Revoke {
+                slot: e1_slot(&view),
+                core_ms: 0
+            }]
+        );
+        assert_eq!(assigned(&state, "e1"), (0, 0, 0));
+    }
+
+    /// A viewer who clicks the share it watches again holds one ticket still: a new one,
+    /// and the old one's slot revoked.
+    #[tokio::test]
+    async fn watching_again_on_an_edge_swaps_the_slot() {
+        let state = pool_state(0, 100, 1000);
+        let (_e1, mut e1) = edge(&state, "e1", roomy()).await;
+        let (_alice, alice_uid, room) = a_share(&state).await;
+        let mut bob = joined(&state, "bob", room).await;
+        let (first, old) = watch_on_edge(&mut bob, alice_uid).await;
+        let (second, new) = watch_on_edge(&mut bob, alice_uid).await;
+        assert_ne!(first, second, "a new placement");
+        assert_ne!(e1_slot(&old), e1_slot(&new), "a new slot");
+        assert_eq!(
+            told(&mut e1),
+            [CoreMsg::Revoke {
+                slot: e1_slot(&old),
+                core_ms: 0
+            }]
+        );
+        assert_eq!(assigned(&state, "e1"), (1, 7500, 1), "still one viewer");
+        bob.send(&ClientMessage::StopWatchingScreenShare).await;
+        drained(&mut bob).await;
+        assert_eq!(
+            told(&mut e1),
+            [CoreMsg::Revoke {
+                slot: e1_slot(&new),
+                core_ms: 0
+            }]
+        );
+        assert_eq!(assigned(&state, "e1"), (0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn a_viewer_who_watches_another_share_is_revoked_on_the_first() {
+        let state = pool_state(0, 100, 1000);
+        let (_e1, mut e1) = edge(&state, "e1", EdgeCaps::test(1, 8000, 16)).await;
+        let (_alice, alice_uid, room) = a_share(&state).await;
+        let mut carol = joined(&state, "carol", room).await;
+        carol
+            .send(&ClientMessage::StartScreenShare {
+                source: "portal".into(),
+                resolution: 720,
+                codec: VideoCodec::H264,
+            })
+            .await;
+        drained(&mut carol).await;
+        let carol_uid = *state.username_to_session.get("carol").unwrap();
+        let mut bob = joined(&state, "bob", room).await;
+        let (_, view) = watch_on_edge(&mut bob, alice_uid).await;
+        // e1 takes one viewer: Bob's next share comes from here once Alice's is let go
+        let seen = watch(&mut bob, carol_uid).await;
+        assert!(watch_ats(&seen).is_empty(), "{seen:?}");
+        assert_eq!(
+            told(&mut e1),
+            [CoreMsg::Revoke {
+                slot: e1_slot(&view),
+                core_ms: 0
+            }]
+        );
+        assert_eq!(assigned(&state, "e1"), (0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn a_sharer_who_stops_ends_the_share_on_its_edges() {
+        let state = pool_state(0, 100, 1000);
+        let (e1_link, mut e1) = edge(&state, "e1", roomy()).await;
+        let (mut alice, alice_uid, room) = a_share(&state).await;
+        let mut bob = joined(&state, "bob", room).await;
+        watch_on_edge(&mut bob, alice_uid).await;
+        crate::pool::on_edge_msg(
+            &state,
+            "e1",
+            e1_link,
+            EdgeMsg::Subscribe { share: alice_uid },
+        )
+        .unwrap();
+        assert!(state.pool.as_ref().unwrap().feeds("e1", alice_uid));
+        alice.send(&ClientMessage::StopScreenShare).await;
+        drained(&mut alice).await;
+        assert_eq!(
+            told(&mut e1),
+            [CoreMsg::ShareEnded {
+                share: alice_uid,
+                core_ms: 0
+            }]
+        );
+        assert_eq!(assigned(&state, "e1"), (0, 0, 0));
+        assert!(
+            !state.pool.as_ref().unwrap().feeds("e1", alice_uid),
+            "its feed ends"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sharer_who_disconnects_ends_the_share_on_its_edges() {
+        let state = pool_state(0, 100, 1000);
+        let (_e1, mut e1) = edge(&state, "e1", roomy()).await;
+        let (alice, alice_uid, room) = a_share(&state).await;
+        let mut bob = joined(&state, "bob", room).await;
+        watch_on_edge(&mut bob, alice_uid).await;
+        drop(alice);
+        bob.expect("StoppedWatchingScreenShare", |m| {
+            matches!(m, ServerMessage::StoppedWatchingScreenShare { .. })
+        })
+        .await;
+        assert_eq!(
+            told(&mut e1),
+            [CoreMsg::ShareEnded {
+                share: alice_uid,
+                core_ms: 0
+            }]
+        );
+        assert_eq!(assigned(&state, "e1"), (0, 0, 0));
+    }
+
+    /// Leaving the room, a kick and the room's sharing turned off all go through the one
+    /// cleanup; leaving stands for them.
+    #[tokio::test]
+    async fn a_viewer_who_leaves_the_room_is_revoked_on_its_edge() {
+        let state = pool_state(0, 100, 1000);
+        let (_e1, mut e1) = edge(&state, "e1", roomy()).await;
+        let (_alice, alice_uid, room) = a_share(&state).await;
+        let mut bob = joined(&state, "bob", room).await;
+        let (_, view) = watch_on_edge(&mut bob, alice_uid).await;
+        bob.send(&ClientMessage::JoinChannel {
+            channel_id: 0,
+            password: None,
+        })
+        .await;
+        drained(&mut bob).await;
+        assert_eq!(
+            told(&mut e1),
+            [CoreMsg::Revoke {
+                slot: e1_slot(&view),
+                core_ms: 0
+            }]
+        );
+        assert_eq!(assigned(&state, "e1"), (0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn a_viewer_who_disconnects_is_revoked_on_its_edge() {
+        let state = pool_state(0, 100, 1000);
+        let (_e1, mut e1) = edge(&state, "e1", roomy()).await;
+        let (mut alice, alice_uid, room) = a_share(&state).await;
+        let mut bob = joined(&state, "bob", room).await;
+        let (_, view) = watch_on_edge(&mut bob, alice_uid).await;
+        drop(bob);
+        // Alice hears the count go to 0 once the cleanup ran
+        alice
+            .expect("ViewerCountChanged 0", |m| {
+                matches!(m, ServerMessage::ViewerCountChanged { viewer_count: 0 })
+            })
+            .await;
+        assert_eq!(
+            told(&mut e1),
+            [CoreMsg::Revoke {
+                slot: e1_slot(&view),
+                core_ms: 0
+            }]
+        );
+        assert_eq!(assigned(&state, "e1"), (0, 0, 0));
+    }
+
+    /// A viewer whose edge failed it is moved, and that edge is not picked for it again
+    /// while it is avoided: here to e2, then, with e1 and e2 avoided, to this relay.
+    pub(super) async fn moves_and_avoids() {
+        let state = pool_state(0, 100, 1000);
+        let (_e1, mut e1) = edge(&state, "e1", roomy()).await;
+        let (_alice, alice_uid, room) = a_share(&state).await;
+        let mut bob = joined(&state, "bob", room).await;
+        let (placement, view) = watch_on_edge(&mut bob, alice_uid).await;
+        let (_e2, mut e2) = edge(&state, "e2", EdgeCaps::test(1000, 4000, 16)).await;
+        sending(&state, alice_uid);
+        bob.send(&ClientMessage::EdgeFailed {
+            sharer_user_id: alice_uid,
+            placement,
+        })
+        .await;
+        let seen = drained(&mut bob).await;
+        let (moved, to_e2) = match watch_ats(&seen).as_slice() {
+            [(moved, Some(to_e2))] => (*moved, to_e2.clone()),
+            _ => panic!("not moved to an edge: {seen:?}"),
+        };
+        assert_ne!(moved, placement);
+        assert!(
+            crate::pool_keys::open(
+                &crate::pool_keys::ticket_key("the-secret-of-edge-two-0123456789"),
+                &to_e2.ticket
+            )
+            .is_ok(),
+            "sealed for e2"
+        );
+        assert_eq!(
+            told(&mut e1),
+            [CoreMsg::Revoke {
+                slot: e1_slot(&view),
+                core_ms: 0
+            }]
+        );
+        assert!(told(&mut e2).is_empty());
+        assert_eq!(assigned(&state, "e1"), (0, 0, 0));
+        assert_eq!(assigned(&state, "e2"), (1, 7500, 1));
+        // Past the rate, e2 fails it too: both avoided, e1 though the lighter, so here
+        state
+            .sessions
+            .get_mut(&bob_uid(&state))
+            .unwrap()
+            .edge_failed_rate = crate::state::RateLimiter::new(1.0, 0.5);
+        bob.send(&ClientMessage::EdgeFailed {
+            sharer_user_id: alice_uid,
+            placement: moved,
+        })
+        .await;
+        let seen = drained(&mut bob).await;
+        assert!(
+            matches!(watch_ats(&seen).as_slice(), [(_, None)]),
+            "not back here: {seen:?}"
+        );
+        assert_eq!(told(&mut e2).len(), 1, "revoked");
+        assert_eq!(assigned(&state, "e2"), (0, 0, 0));
+        assert_eq!(state.share_fans.get(&alice_uid).unwrap().local.len(), 1);
+        let avoided: Vec<String> = state
+            .sessions
+            .get(&bob_uid(&state))
+            .unwrap()
+            .edge_avoid
+            .iter()
+            .map(|(e, _)| e.clone())
+            .collect();
+        assert_eq!(avoided, ["e1", "e2"]);
+    }
+
+    pub(super) fn bob_uid(state: &ServerState) -> UserId {
+        *state.username_to_session.get("bob").unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_edge_failed_past_its_rate_or_for_an_older_placement_moves_nobody() {
+        let state = pool_state(0, 100, 1000);
+        let (_e1, mut e1) = edge(&state, "e1", roomy()).await;
+        let (_e2, _r2) = edge(&state, "e2", EdgeCaps::test(1000, 100, 16)).await;
+        let (_alice, alice_uid, room) = a_share(&state).await;
+        let mut bob = joined(&state, "bob", room).await;
+        let (stale, _) = watch_on_edge(&mut bob, alice_uid).await;
+        let (placement, _) = watch_on_edge(&mut bob, alice_uid).await;
+        told(&mut e1);
+        sending(&state, alice_uid);
+        bob.send(&ClientMessage::EdgeFailed {
+            sharer_user_id: alice_uid,
+            placement: stale,
+        })
+        .await;
+        assert!(
+            watch_ats(&drained(&mut bob).await).is_empty(),
+            "a late word about an older placement"
+        );
+        bob.send(&ClientMessage::EdgeFailed {
+            sharer_user_id: alice_uid,
+            placement,
+        })
+        .await;
+        assert!(
+            watch_ats(&drained(&mut bob).await).is_empty(),
+            "within 2 s of the last"
+        );
+        assert!(told(&mut e1).is_empty());
+        assert_eq!(assigned(&state, "e1").0, 1);
+        let counts = state.limits.take_counts();
+        assert_eq!(counts[&("edge failed", "stale placement")], 1);
+        assert_eq!(counts[&("edge failed", "over rate")], 1);
+    }
+
+    /// A share that sends nothing has nothing an edge could pass on: an edge is not blamed,
+    /// nor are its viewers moved onto this relay.
+    #[tokio::test]
+    async fn an_edge_failed_while_the_share_is_silent_neither_moves_nor_avoids() {
+        let state = pool_state(0, 100, 1000);
+        let (_e1, mut e1) = edge(&state, "e1", roomy()).await;
+        let (_alice, alice_uid, room) = a_share(&state).await;
+        let mut bob = joined(&state, "bob", room).await;
+        let (placement, _) = watch_on_edge(&mut bob, alice_uid).await;
+        bob.send(&ClientMessage::EdgeFailed {
+            sharer_user_id: alice_uid,
+            placement,
+        })
+        .await;
+        assert!(watch_ats(&drained(&mut bob).await).is_empty());
+        assert!(told(&mut e1).is_empty());
+        assert_eq!(assigned(&state, "e1"), (1, 7500, 1));
+        assert!(state
+            .sessions
+            .get(&bob_uid(&state))
+            .unwrap()
+            .edge_avoid
+            .is_empty());
+        assert_eq!(
+            state.limits.take_counts()[&("edge failed", "share silent")],
+            1
+        );
+    }
+
+    /// An edge's link ends: its viewers are seated again, here while this relay has room,
+    /// refused beyond, with why.
+    #[tokio::test]
+    async fn a_lost_edges_viewers_are_seated_here_within_the_caps_and_refused_beyond() {
+        let state = pool_state(0, 1, 1000);
+        let (e1_link, _e1) = edge(&state, "e1", roomy()).await;
+        let (mut alice, alice_uid, room) = a_share(&state).await;
+        let mut bob = joined(&state, "bob", room).await;
+        let mut carol = joined(&state, "carol", room).await;
+        watch_on_edge(&mut bob, alice_uid).await;
+        watch_on_edge(&mut carol, alice_uid).await;
+        state.share_tick();
+        drained(&mut alice).await;
+        state.edge_lost("e1", e1_link, "a test").await;
+        let mut outcomes = Vec::new();
+        for c in [&mut bob, &mut carol] {
+            let seen = drained(c).await;
+            outcomes.push(match (watch_ats(&seen).as_slice(), &seen[..]) {
+                ([(_, None)], _) => "here",
+                ([], [ServerMessage::StoppedWatchingScreenShare { reason }, ServerMessage::WatchRefused { reason: why, .. }]) => {
+                    assert_eq!(reason, "edge_lost");
+                    assert_eq!(why, crate::state::SHARE_FULL);
+                    "refused"
+                }
+                _ => panic!("{seen:?}"),
+            });
+        }
+        outcomes.sort();
+        assert_eq!(outcomes, ["here", "refused"]);
+        assert!(
+            state.pool.as_ref().unwrap().assigned("e1").is_none(),
+            "gone"
+        );
+        let channels = state.channels.read().await;
+        let share = &channels[&room].screen_shares[&alice_uid];
+        assert_eq!((share.viewers.len(), share.on_edge.len()), (1, 0));
+        drop(channels);
+        // The sharer hears of the one who went, within the second
+        state.share_tick();
+        assert!(drained(&mut alice)
+            .await
+            .iter()
+            .any(|m| matches!(m, ServerMessage::ViewerCountChanged { viewer_count: 1 })));
+    }
+
+    /// An edge that links again on a new connection takes over its name: the link before is
+    /// closed, and its viewers are seated again, on the new link where it has room.
+    #[tokio::test]
+    async fn a_second_hello_evicts_the_link_before_and_seats_its_viewers_again() {
+        let state = pool_state(0, 100, 1000);
+        let (old_link, mut old) = edge(&state, "e1", roomy()).await;
+        let (_alice, alice_uid, room) = a_share(&state).await;
+        let mut bob = joined(&state, "bob", room).await;
+        let (placement, _) = watch_on_edge(&mut bob, alice_uid).await;
+        let (new_link, _new) = edge(&state, "e1", roomy()).await;
+        assert_ne!(old_link, new_link);
+        assert!(old.recv().await.is_none(), "the old link's queue is closed");
+        let (moved, view) = match watch_ats(&drained(&mut bob).await).as_slice() {
+            [(moved, Some(view))] => (*moved, view.clone()),
+            other => panic!("{other:?}"),
+        };
+        assert_ne!(moved, placement);
+        let ticket =
+            crate::pool_keys::open(&crate::pool_keys::ticket_key(E1_SECRET), &view.ticket).unwrap();
+        assert_eq!(ticket.link, new_link);
+        assert_eq!(assigned(&state, "e1"), (1, 7500, 1));
+        // A word on the old link is not taken
+        assert!(crate::pool::on_edge_msg(
+            &state,
+            "e1",
+            old_link,
+            EdgeMsg::Subscribe { share: alice_uid }
+        )
+        .is_err());
+        // Nor does the old link's end move anybody
+        state.edge_lost("e1", old_link, "a test").await;
+        assert_eq!(assigned(&state, "e1"), (1, 7500, 1));
+    }
+
+    /// An edge costs this relay a work only within its rate: past two at once and one a
+    /// second per share it may carry (16 here), its asks are dropped and counted.
+    #[tokio::test]
+    async fn subscribes_and_unsubscribes_past_the_links_rate_are_ignored() {
+        let state = pool_state(0, 100, 1000);
+        let (link, _e1) = edge(&state, "e1", roomy()).await;
+        let (_alice, alice_uid, room) = a_share(&state).await;
+        let mut bob = joined(&state, "bob", room).await;
+        watch_on_edge(&mut bob, alice_uid).await;
+        for _ in 0..32 {
+            crate::pool::on_edge_msg(
+                &state,
+                "e1",
+                link,
+                EdgeMsg::Unsubscribe { share: alice_uid },
+            )
+            .unwrap();
+        }
+        state.limits.take_counts();
+        crate::pool::on_edge_msg(&state, "e1", link, EdgeMsg::Subscribe { share: alice_uid })
+            .unwrap();
+        assert!(
+            !state.pool.as_ref().unwrap().feeds("e1", alice_uid),
+            "past the burst"
+        );
+        assert_eq!(state.limits.take_counts()[&("edge", "over rate")], 1);
+        assert!(state.share_fans.get(&alice_uid).unwrap().feeds.is_empty());
+    }
+
+    /// An edge that takes as many new shares as it may at once, as when a lost edge's viewers
+    /// land on it, asks for each and for a keyframe of each: none of that is past its rate,
+    /// which would leave a share unfed there.
+    #[tokio::test]
+    async fn an_edge_may_ask_for_every_share_it_takes_at_once() {
+        let state = pool_state(0, 100, 1000);
+        let (link, _e1) = edge(&state, "e1", roomy()).await;
+        let pool = state.pool.as_ref().unwrap();
+        for share in 1..=16 {
+            pool.place(share, 2000, &[], true).expect("room for it");
+        }
+        for share in 1..=16 {
+            for msg in [
+                EdgeMsg::Subscribe { share },
+                EdgeMsg::KeyframeWanted { share },
+            ] {
+                crate::pool::on_edge_msg(&state, "e1", link, msg).unwrap();
+            }
+        }
+        assert!((1..=16).all(|share| pool.feeds("e1", share)));
+        assert!(!state
+            .limits
+            .take_counts()
+            .contains_key(&("edge", "over rate")));
+    }
+
+    /// Below `local_first`, a viewer this relay has no room for is not refused while an edge
+    /// that carries the share already could take it, at no more cost here.
+    #[tokio::test]
+    async fn a_viewer_this_relay_has_no_room_for_goes_to_an_edge_that_carries_the_share() {
+        // Room for four copies of 1080; e1 takes one share
+        let state = pool_state(1, 100, 30);
+        let (_e1, _rx) = edge(&state, "e1", EdgeCaps::test(1000, 8000, 1)).await;
+        let (_alice, alice_uid, room) = a_share(&state).await;
+        let mut carol = joined(&state, "carol", room).await;
+        carol
+            .send(&ClientMessage::StartScreenShare {
+                source: "portal".into(),
+                resolution: 1080,
+                codec: VideoCodec::H264,
+            })
+            .await;
+        drained(&mut carol).await;
+        let carol_uid = *state.username_to_session.get("carol").unwrap();
+        // Alice's first viewer here, her second on e1; then the first leaves
+        let mut bob = joined(&state, "bob", room).await;
+        assert!(watch_ats(&watch(&mut bob, alice_uid).await).is_empty());
+        let mut dan = joined(&state, "dan", room).await;
+        watch_on_edge(&mut dan, alice_uid).await;
+        bob.send(&ClientMessage::StopWatchingScreenShare).await;
+        drained(&mut bob).await;
+        // Carol's three take the rest of this relay's room
+        let mut carols = Vec::new();
+        for name in ["erin", "frank", "gina"] {
+            let mut c = joined(&state, name, room).await;
+            assert!(watch_ats(&watch(&mut c, carol_uid).await).is_empty());
+            carols.push(c);
+        }
+        // Alice has nobody here: Bob would be her first, but there is no room for him here
+        watch_on_edge(&mut bob, alice_uid).await;
+        assert_eq!(assigned(&state, "e1"), (2, 15_000, 1));
+    }
+
+    /// A feed of a share the edge has nobody placed for any more ends 10 s later; a viewer
+    /// placed there again in time keeps it.
+    #[tokio::test]
+    async fn a_feed_nobody_is_placed_for_ends_after_10_s() {
+        let state = pool_state(0, 100, 1000);
+        let (link, _e1) = edge(&state, "e1", roomy()).await;
+        let (_alice, alice_uid, room) = a_share(&state).await;
+        let mut bob = joined(&state, "bob", room).await;
+        watch_on_edge(&mut bob, alice_uid).await;
+        crate::pool::on_edge_msg(&state, "e1", link, EdgeMsg::Subscribe { share: alice_uid })
+            .unwrap();
+        bob.send(&ClientMessage::StopWatchingScreenShare).await;
+        drained(&mut bob).await;
+        let pool = state.pool.as_ref().unwrap();
+        pool.tick(&state, std::time::Instant::now() + Duration::from_secs(9));
+        assert!(pool.feeds("e1", alice_uid), "still within its 10 s");
+        pool.tick(&state, std::time::Instant::now() + Duration::from_secs(11));
+        assert!(!pool.feeds("e1", alice_uid));
+        assert!(state.share_fans.get(&alice_uid).unwrap().feeds.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_load_view_shows_the_edges_and_who_watches_from_them() {
+        let state = pool_state(0, 100, 1000);
+        let (link, _e1) = edge(&state, "e1", EdgeCaps::test(1, 8000, 16)).await;
+        let (_alice, alice_uid, room) = a_share(&state).await;
+        let mut bob = joined(&state, "bob", room).await;
+        watch_on_edge(&mut bob, alice_uid).await;
+        let mut carol = joined(&state, "carol", room).await;
+        watch(&mut carol, alice_uid).await;
+        crate::pool::on_edge_msg(
+            &state,
+            "e1",
+            link,
+            EdgeMsg::Load {
+                viewers: 1,
+                per_share: vec![(alice_uid, 1)],
+                egress_kbps: 6000,
+                frames_dropped: 3,
+                tickets_refused: 0,
+                cpu_secs: 5,
+                rss_mib: 40,
+            },
+        )
+        .unwrap();
+        let mut ann = connect(&state, "ann", IpAddr::V4(Ipv4Addr::LOCALHOST)).await;
+        ann.send(&ClientMessage::AdminLogin {
+            token: "test-admin-token".into(),
+        })
+        .await;
+        drained(&mut ann).await;
+        ann.send(&ClientMessage::AdminLoad).await;
+        let ServerMessage::AdminLoad { report } = ann
+            .expect("AdminLoad", |m| {
+                matches!(m, ServerMessage::AdminLoad { .. })
+            })
+            .await
+        else {
+            unreachable!()
+        };
+        assert_eq!(report.shares.len(), 1);
+        assert_eq!(
+            (report.shares[0].viewers, report.shares[0].on_edges),
+            (2, 1)
+        );
+        // Carol here, and one copy for e1
+        assert_eq!(report.video_kbps, 15_000);
+        let names: Vec<(&str, bool)> = report
+            .edges
+            .iter()
+            .map(|e| (e.name.as_str(), e.online))
+            .collect();
+        assert_eq!(names, [("e1", true), ("e2", false), ("e3", false)]);
+        let e1 = &report.edges[0];
+        assert_eq!(e1.address, "127.0.0.1:9991");
+        assert_eq!(
+            (e1.viewers, e1.max_viewers, e1.shares, e1.max_shares),
+            (1, 1, 1, 16)
+        );
+        assert_eq!(
+            (e1.kbps, e1.budget_kbps, e1.egress_kbps),
+            (7500, 8_000_000, 6000)
+        );
+        assert_eq!((e1.frames_dropped, e1.cpu_secs, e1.rss_mib), (3, 5, 40));
+        assert_eq!(e1.pool_version, voipc_protocol::pool::POOL_VERSION);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("Edge e1 carries 100%")),
+            "{:?}",
+            report.warnings
+        );
+    }
+}
+
+/// An edge is fed only a share this relay placed a viewer on it for: asking for any other
+/// gets it nothing (THREAT-MODEL, "An edge relay").
+#[tokio::test]
+async fn subscribe_without_a_placement_is_ignored() {
+    use edge_pool::*;
+    let state = pool_state(0, 100, 1000);
+    let (link, _e1) = edge(&state, "e1", roomy()).await;
+    let (mut alice, alice_uid, room) = a_share(&state).await;
+    crate::pool::on_edge_msg(&state, "e1", link, EdgeMsg::Subscribe { share: alice_uid }).unwrap();
+    let pool = state.pool.as_ref().unwrap();
+    assert!(!pool.feeds("e1", alice_uid));
+    assert_eq!(
+        state.limits.take_counts()[&("edge", "unbound subscribe")],
+        1
+    );
+    assert!(state.share_fans.get(&alice_uid).unwrap().feeds.is_empty());
+
+    // Once a viewer is placed there, the same ask is fed, and a keyframe asked for it
+    let mut bob = joined(&state, "bob", room).await;
+    watch_on_edge(&mut bob, alice_uid).await;
+    drained(&mut alice).await;
+    crate::pool::on_edge_msg(&state, "e1", link, EdgeMsg::Subscribe { share: alice_uid }).unwrap();
+    assert!(pool.feeds("e1", alice_uid));
+    assert!(drained(&mut alice)
+        .await
+        .iter()
+        .any(|m| matches!(m, ServerMessage::KeyframeRequested)));
+    let mut feed = pool.take_feed("e1", alice_uid).unwrap();
+    let packet = Bytes::from(
+        voipc_protocol::video::VideoPacket::encrypted_fragment(
+            true,
+            alice_uid,
+            1,
+            0,
+            1,
+            0,
+            1,
+            0x5EED,
+            vec![7; 100],
+        )
+        .to_bytes(),
+    );
+    crate::media::handle_packet(alice_uid, packet.clone(), &state).await;
+    assert_eq!(
+        feed.try_recv().unwrap(),
+        packet,
+        "the share's video goes to the edge"
+    );
+}
+
+/// A viewer whose edge fails it is moved off it, and that edge is avoided for it
+/// (THREAT-MODEL, "An edge relay").
+#[tokio::test]
+async fn edge_failed_moves_and_avoids() {
+    edge_pool::moves_and_avoids().await;
 }

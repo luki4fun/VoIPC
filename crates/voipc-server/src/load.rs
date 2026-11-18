@@ -1,13 +1,14 @@
 //! What the relay carries now, for its admin's Load view (protocol v25): who is here, the
 //! shares and the video they cost against `[media]`, memory, processor, the UDP socket's
-//! drops, the last minute's refusals, and plain warnings where a limit is near.
+//! drops, the last minute's refusals, and plain warnings where a limit is near. With
+//! `[pool]`, its media edges too (protocol v26).
 
 use voipc_protocol::types::{LoadReport, ShareLoad};
 
 use crate::state::ServerState;
 
 /// `(RSS in MiB, CPU seconds)` of this process, from /proc; zeros off Linux.
-fn own_usage() -> (u32, u64) {
+pub(crate) fn own_usage() -> (u32, u64) {
     let rss = std::fs::read_to_string("/proc/self/status")
         .ok()
         .and_then(|s| {
@@ -31,7 +32,7 @@ fn own_usage() -> (u32, u64) {
 
 pub async fn report(state: &ServerState) -> LoadReport {
     let media = &state.media;
-    let (lobby, mut shares, rooms_full) = {
+    let (lobby, mut shares, rooms_full, video_kbps) = {
         let channels = state.channels.read().await;
         let lobby = channels.get(&0).map_or(0, |c| c.members.len()) as u32;
         let mut shares = Vec::new();
@@ -47,6 +48,7 @@ pub async fn report(state: &ServerState) -> LoadReport {
                     viewers: share.viewers.len() as u32,
                     cap: media.share_viewers,
                     kbps: share.ceiling_kbps,
+                    on_edges: share.on_edge.len() as u32,
                 });
             }
         }
@@ -62,14 +64,12 @@ pub async fn report(state: &ServerState) -> LoadReport {
             })
             .map(|c| c.info.name.clone())
             .collect();
-        (lobby, shares, rooms_full)
+        // A viewer on an edge costs this relay nothing past the one copy that edge is sent
+        let video_kbps = crate::state::video_egress_kbps(&channels);
+        (lobby, shares, rooms_full, video_kbps)
     };
     shares.sort_by_key(|s| std::cmp::Reverse(s.viewers));
     let online = state.sessions.len() as u32;
-    let video_kbps: u64 = shares
-        .iter()
-        .map(|s| s.kbps as u64 * s.viewers as u64)
-        .sum();
     let video_budget_kbps = media.video_egress_mbit as u64 * 1000;
     let (rss_mib, cpu_secs) = own_usage();
     let last_minute = state.limits.last_minute();
@@ -81,10 +81,15 @@ pub async fn report(state: &ServerState) -> LoadReport {
             video_kbps * 100 / video_budget_kbps
         ));
     }
-    for s in shares.iter().filter(|s| s.cap > 0 && s.viewers >= s.cap) {
+    // The cap is of the viewers this relay serves itself: edges carry the rest
+    for s in shares
+        .iter()
+        .filter(|s| s.cap > 0 && s.viewers - s.on_edges >= s.cap)
+    {
         warnings.push(format!(
-            "{}'s share has {} viewers, the most it takes ([media] share_viewers).",
-            s.sharer, s.viewers
+            "{}'s share has {} viewers on this server, the most it takes ([media] share_viewers).",
+            s.sharer,
+            s.viewers - s.on_edges
         ));
     }
     for room in &rooms_full {
@@ -113,6 +118,23 @@ pub async fn report(state: &ServerState) -> LoadReport {
                 .into(),
         );
     }
+    let edges = match &state.pool {
+        Some(pool) => {
+            let (edges, said) = pool.report();
+            warnings.extend(said);
+            if last_minute
+                .iter()
+                .any(|l| l.starts_with("edge: feed dropped frames"))
+            {
+                warnings.push(
+                    "Feeds to edges dropped frames in the last minute: the way from this server to its edges is too slow for the shares they carry."
+                        .into(),
+                );
+            }
+            edges
+        }
+        None => Vec::new(),
+    };
     if state.sqlite_accounts && state.max_users > 10_000 {
         warnings.push(
             "Accounts are on SQLite, which signs people in one at a time: above 10,000 use Postgres."
@@ -133,5 +155,6 @@ pub async fn report(state: &ServerState) -> LoadReport {
         udp_dropped: crate::web::udp_drops(state.udp_port).unwrap_or(0),
         last_minute,
         warnings,
+        edges,
     }
 }

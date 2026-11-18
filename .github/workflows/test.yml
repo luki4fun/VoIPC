@@ -376,6 +376,14 @@ jobs:
         timeout-minutes: 10
         run: ./test-web.sh
         env: { BROWSER_ALICE: firefox, BROWSER_BOB: chromium, UI_TEST: '0' }
+      # A media edge (protocol 26): the relay sends bob, the share's first viewer, to an
+      # edge linked to it (`[pool] local_first = 0`), and alice's frames reach him through
+      # it. Chromium only: Firefox takes the same pinned certificates in its own lanes.
+      - name: Chromium through an edge
+        if: ${{ !cancelled() && matrix.part == 'lanes' }}
+        timeout-minutes: 10
+        run: ./test-web.sh
+        env: { BROWSER: chromium, EDGE: '1', UI_TEST: '0' }
       # The TCP fallback for servers whose UDP is blocked: the whole run over
       # the WebSocket tunnel, then a Firefox sharer on the tunnel (its
       # WebSocket must land on http/1.1, not the page's h2) against a

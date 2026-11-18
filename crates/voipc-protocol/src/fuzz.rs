@@ -3,13 +3,21 @@
 //! cargo-fuzz; the test below replays `fuzz/regressions/<name>/*` on stable,
 //! so an input that once crashed stays a test.
 
-use crate::{codec, video, voice, ws};
+use crate::{codec, pool, video, voice, ws};
 use bytes::BytesMut;
 
-/// Client and server messages, and the length-prefixed frames around them.
+/// Client and server messages, the edge pool's (1.15), and the length-prefixed frames
+/// around them.
 pub fn fuzz_codec(data: &[u8]) {
     let _ = codec::decode_client_msg(data);
     let _ = codec::decode_server_msg(data);
+    let _ = pool::decode_edge_msg(data);
+    let _ = pool::decode_core_msg(data);
+    let _ = pool::decode_viewer_msg(data);
+    let _ = pool::decode_edge_view_msg(data);
+    let _ = pool::decode_ticket_body(data);
+    let _ = pool::hello_version(data);
+    let _ = pool::refused_version(data);
     let mut buf = BytesMut::from(data);
     loop {
         let before = buf.len();

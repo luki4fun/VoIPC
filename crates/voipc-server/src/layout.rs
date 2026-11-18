@@ -1046,12 +1046,13 @@ async fn channel_gone(
             .get(&channel_id)
             .is_some_and(|c| c.members.is_empty())
         {
-            channels.remove(&channel_id);
+            // With any share still in it: its edges let it go, and its sharer may share again
+            state.remove_channel(&mut channels, channel_id);
             break;
         }
     }
     // However that went: everyone is about to be told it is gone
-    state.channels.write().await.remove(&channel_id);
+    state.remove_channel(&mut *state.channels.write().await, channel_id);
     state.routing.clear_channel(channel_id, []);
     tell_who_passes(
         state,

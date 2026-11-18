@@ -50,6 +50,9 @@ pub struct LoadReport {
     pub last_minute: Vec<String>,
     /// What the admin should look at, in plain words; empty when all is well.
     pub warnings: Vec<String>,
+    /// The media edges of `[pool]`, linked or not (protocol v26); empty without a pool, and
+    /// from a relay at 25, so the Load view shows no Edges table then.
+    pub edges: Vec<EdgeLoad>,
 }
 
 /// One screen share, for `LoadReport`.
@@ -57,11 +60,56 @@ pub struct LoadReport {
 pub struct ShareLoad {
     pub channel_id: ChannelId,
     pub sharer: String,
+    /// Everyone watching, those on edges included.
     pub viewers: u32,
-    /// The most one share may have (`[media] share_viewers`).
+    /// The most one share may have (`[media] share_viewers`), of the viewers the relay
+    /// serves itself.
     pub cap: u32,
     /// What it may send each viewer at its resolution.
     pub kbps: u32,
+    /// Of `viewers`, how many an edge serves (protocol v26).
+    pub on_edges: u32,
+}
+
+/// One media edge of `[pool]`, for `LoadReport` (protocol v26). The counts are what the
+/// relay assigned; `egress_kbps` to `rss_mib` are what the edge last reported, which is
+/// `report_age_secs` old.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct EdgeLoad {
+    pub name: String,
+    /// Where viewers reach it, `host:port`.
+    pub address: String,
+    pub online: bool,
+    /// The pool version it linked with, or last asked for when it was refused.
+    pub pool_version: u32,
+    pub viewers: u32,
+    pub max_viewers: u32,
+    pub shares: u32,
+    pub max_shares: u32,
+    /// Video assigned to it, counted at each share's resolution, and what it may send.
+    pub kbps: u64,
+    pub budget_kbps: u64,
+    /// What it says it sent.
+    pub egress_kbps: u64,
+    pub frames_dropped: u64,
+    pub cpu_secs: u64,
+    pub rss_mib: u32,
+    pub report_age_secs: u32,
+}
+
+/// Where a viewer fetches a share from a media edge (`ServerMessage::WatchAt`, protocol
+/// v26). The app connects to `https://{host}:{port}/voipc-view` (`pool::VIEW_PATH`),
+/// trusting only a certificate of these hashes, and shows the edge the ticket, which the
+/// relay sealed for that edge alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdgeView {
+    /// A DNS name or a bare IP literal: an IPv6 one has no brackets.
+    pub host: String,
+    pub port: u16,
+    /// SHA-256 of the edge's certificates, newest first, 1 to `pool::MAX_CERT_HASHES`.
+    pub cert_hashes: Vec<[u8; 32]>,
+    /// Opaque to the app, at most `pool::MAX_TICKET_BYTES`.
+    pub ticket: Vec<u8>,
 }
 
 /// The most `ClientMessage::LookupUsers` asks at once, ids, names and accounts together.

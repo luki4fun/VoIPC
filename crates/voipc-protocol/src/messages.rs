@@ -438,6 +438,17 @@ pub enum ClientMessage {
     WatchLobby { on: bool },
     /// What the relay carries now, for an admin: `ServerMessage::AdminLoad` answers.
     AdminLoad,
+
+    // ── The media edge pool (protocol v26) ──────────────────────────
+    /// The edge of the `WatchAt` numbered `placement` failed this viewer: no connection,
+    /// no `Ready`, the edge ended the link, or no whole frame came for 10 s. The relay
+    /// moves the viewer to another edge or back to itself with a new `WatchAt`. One that
+    /// names an older placement is ignored, so a late word about edge A never moves the
+    /// viewer off edge B.
+    EdgeFailed {
+        sharer_user_id: UserId,
+        placement: u64,
+    },
 }
 
 /// The client's side of an account sign-in, between `Authenticate` and
@@ -2365,6 +2376,21 @@ pub enum ServerMessage {
     },
     /// What `ClientMessage::AdminLoad` asked.
     AdminLoad { report: LoadReport },
+
+    // ── The media edge pool (protocol v26) ──────────────────────────
+    /// Where the share being watched comes from, when the relay places the viewer on an
+    /// edge (right after `WatchingScreenShare`) or moves it: `Some`, from that edge;
+    /// `None`, over this connection again, as it does without any `WatchAt`. `placement`
+    /// is new on every one, and `EdgeFailed` names it. One for a share the app is not
+    /// watching is ignored.
+    WatchAt {
+        sharer_user_id: UserId,
+        placement: u64,
+        edge: Option<EdgeView>,
+    },
+    /// To a sharer with more than 8 viewers, at most once a second, in place of each
+    /// viewer's `VideoLossReported`: how many of the `viewers` reported loss lately.
+    VideoLossSummary { reporters: u32, viewers: u32 },
 }
 
 /// A relay's refusal of `AccountRequest::KeyChallenge` for an account whose password is not a

@@ -13,6 +13,12 @@
 // packet exactly as it would travel as a datagram or video record. QUIC gets a
 // head start, then the two race. Encoding and decoding of the payloads is the
 // session's job either way.
+//
+// A viewer the relay placed on a media edge (protocol 26) also opens a second
+// WebTransport session, to the edge, for that share's frames alone
+// (`openEdgeView`): it shows the ticket the relay sent and gets the same video
+// streams and screen-audio datagrams as from the relay. The edge has no TCP
+// fallback.
 
 /** Same bound as voipc_protocol::codec::MAX_MSG_SIZE. */
 const MAX_MSG_SIZE = 65_536;
@@ -41,6 +47,10 @@ const KEY_RESERVE = 4;
  * finishes, and this is what that costs every connect.
  */
 const TCP_HEAD_START_MS = 2_000;
+/** Where an app fetches a share from a media edge (voipc_protocol::pool::VIEW_PATH). */
+const VIEW_PATH = "/voipc-view";
+/** Bound for each step of an edge connect: the handshake, then the hello and its Ready. */
+const EDGE_STEP_MS = 5_000;
 /** Control bytes per tunnel message (the server takes up to 64 KiB + the tag). */
 const TUNNEL_CONTROL_CHUNK = 16 * 1024;
 /**
@@ -91,6 +101,29 @@ export interface Transport {
   allowQuiet(ms: number): void;
   /** Flush queued control frames and close the session. onClosed is not called. */
   close(): Promise<void>;
+}
+
+/** What comes of an edge link (`openEdgeView`), from its Ready on. */
+export interface EdgeViewHandlers {
+  /** One raw video packet (0x13/0x14), as `TransportHandlers.onVideoPacket`. */
+  onVideoPacket(bytes: Uint8Array): void;
+  /** One raw media datagram, as `TransportHandlers.onDatagram`. */
+  onDatagram(bytes: Uint8Array): void;
+  /** The edge ended the link (its `Ended`, or a close); at most once, never after close(). */
+  onClosed(reason: string): void;
+}
+
+export interface EdgeViewLink {
+  /** Leave the edge; onClosed is not called. */
+  close(): void;
+}
+
+/** The pool messages a viewer speaks, from wasm (`WasmApi`): never written out here. */
+export interface EdgeViewCodec {
+  /** `ViewerMsg::Hello { ticket }`, with its length prefix. */
+  encodeViewerHello(ticket: Uint8Array): Uint8Array;
+  /** An `EdgeViewMsg` from its postcard bytes (no length prefix): `"Ready"` or `{ Ended: { reason } }`. */
+  decodeEdgeViewMsg(bytes: Uint8Array): unknown;
 }
 
 interface BridgeInfo {
@@ -179,13 +212,13 @@ function closeOpened(opened: Opened): void {
 /** The WebTransport handshake, retried once with a fresh certificate hash. */
 async function openQuic(urlHost: string, origin: string, info: BridgeInfo): Promise<WebTransport> {
   try {
-    return await openSession(urlHost, info);
+    return await openSession(urlHost, info.port, "/voipc", [info.hash], CONNECT_TIMEOUT_MS);
   } catch {
     // The bridge certificate rotates every 7 days: a hash fetched just before
     // a rotation is stale by the time the handshake runs. Refetch once.
     const fresh = await fetchBridgeInfo(origin);
     try {
-      return await openSession(urlHost, fresh);
+      return await openSession(urlHost, fresh.port, "/voipc", [fresh.hash], CONNECT_TIMEOUT_MS);
     } catch (e) {
       // Getting here means /wt.json came back over TCP, so the server is up and
       // reachable — only the UDP/QUIC path failed. The browser keeps the real
@@ -241,7 +274,7 @@ async function wrapSession(wt: WebTransport, handlers: TransportHandlers): Promi
     () => finish("Server closed connection"),
     (e) => finish(`Read error: ${message(e)}`),
   );
-  void readControl(bidi.readable, controlFramer(handlers, finish), armWatchdog, finish);
+  void readControl(bidi.readable, controlFramer(handlers.onControl, finish), armWatchdog, finish);
   void readDatagrams(wt.datagrams.readable, handlers);
   void readVideoStreams(wt.incomingUnidirectionalStreams, handlers);
   armWatchdog();
@@ -362,7 +395,7 @@ function wrapSocket(ws: WebSocket, handlers: TransportHandlers): Transport {
     clearTimeout(watchdog);
     watchdog = setTimeout(() => finish("Connection timed out (no data from server)"), idleMs);
   };
-  const pushControl = controlFramer(handlers, finish);
+  const pushControl = controlFramer(handlers.onControl, finish);
 
   ws.onmessage = (ev: MessageEvent<ArrayBuffer>) => {
     armWatchdog();
@@ -438,6 +471,101 @@ function wrapSocket(ws: WebSocket, handlers: TransportHandlers): Transport {
   };
 }
 
+/**
+ * Fetch a share from a media edge: a WebTransport session to its `/voipc-view`,
+ * trusting only a certificate of `hashes` (the relay named them with the edge),
+ * then the viewer's hello with `ticket`. Resolves at the edge's `Ready`; rejects
+ * when the handshake, the hello or the Ready fails or takes longer than its 5 s.
+ *
+ * From then on the edge's video streams and datagrams come as from the relay.
+ * The app sends it nothing more: keyframe asks and loss reports go to the
+ * relay. No watchdog here: what counts as a silent edge is the caller's
+ * (edge-view.ts), by whole decrypted frames rather than bytes.
+ */
+export async function openEdgeView(
+  host: string,
+  port: number,
+  hashes: ArrayLike<number>[],
+  ticket: ArrayLike<number>,
+  handlers: EdgeViewHandlers,
+  codec: EdgeViewCodec,
+): Promise<EdgeViewLink> {
+  const urlHost = host.includes(":") ? `[${host}]` : host;
+  // Copies: the decoded message is the relay's, and the hashes must be plain buffers
+  const pins = hashes.map((h) => Uint8Array.from(h));
+  const wt = await openSession(urlHost, port, VIEW_PATH, pins, EDGE_STEP_MS);
+
+  let closed = false;
+  let ready = false;
+  let answered: { resolve(): void; reject(e: Error): void } = { resolve() {}, reject() {} };
+  const readyAt = new Promise<void>((resolve, reject) => void (answered = { resolve, reject }));
+  // Nobody waits on it once the hello step has given up
+  readyAt.catch(() => {});
+
+  const finish = (reason: string) => {
+    if (closed) return;
+    closed = true;
+    try {
+      wt.close();
+    } catch {
+      // already closed
+    }
+    if (ready) handlers.onClosed(reason);
+    else answered.reject(new Error(reason));
+  };
+  const onFrame = (payload: Uint8Array) => {
+    if (closed) return;
+    let msg: unknown;
+    try {
+      msg = codec.decodeEdgeViewMsg(payload);
+    } catch {
+      return finish("The edge sent something this app cannot read");
+    }
+    if (msg === "Ready" && !ready) {
+      ready = true;
+      void readDatagrams(wt.datagrams.readable, handlers);
+      void readVideoStreams(wt.incomingUnidirectionalStreams, handlers);
+      answered.resolve();
+      return;
+    }
+    const ended = (msg as { Ended?: { reason?: unknown } } | null)?.Ended;
+    finish(ended ? `The edge ended the view: ${String(ended.reason)}` : "The edge said something out of turn");
+  };
+
+  wt.closed.then(
+    () => finish("The edge closed the connection"),
+    (e) => finish(`The edge's connection failed: ${message(e)}`),
+  );
+  try {
+    await withTimeout(
+      (async () => {
+        const bidi: WebTransportBidirectionalStream = await wt.createBidirectionalStream();
+        void readControl(bidi.readable, controlFramer(onFrame, finish), () => {}, finish, "The edge closed the view");
+        // Its send side stays open: an edge may take a finished stream for a viewer gone
+        const writer = (bidi.writable as WritableStream<Uint8Array>).getWriter();
+        await writer.write(codec.encodeViewerHello(Uint8Array.from(ticket)));
+        await readyAt;
+      })(),
+      EDGE_STEP_MS,
+      "Timed out waiting for the edge's Ready",
+    );
+  } catch (e) {
+    finish(message(e));
+    throw e;
+  }
+  return {
+    close() {
+      if (closed) return;
+      closed = true;
+      try {
+        wt.close();
+      } catch {
+        // already closed
+      }
+    },
+  };
+}
+
 async function fetchBridgeInfo(origin: string): Promise<BridgeInfo> {
   let res: Response;
   try {
@@ -465,14 +593,21 @@ async function fetchBridgeInfo(origin: string): Promise<BridgeInfo> {
   return { port, hash: hexToBytes(hash), tcp: tcp === true };
 }
 
-async function openSession(urlHost: string, info: BridgeInfo): Promise<WebTransport> {
-  const wt = new WebTransport(`https://${urlHost}:${info.port}/voipc`, {
-    serverCertificateHashes: [{ algorithm: "sha-256", value: info.hash }],
+/** A WebTransport session to `path`, trusting only a certificate of these hashes. */
+async function openSession(
+  urlHost: string,
+  port: number,
+  path: string,
+  hashes: Uint8Array<ArrayBuffer>[],
+  timeoutMs: number,
+): Promise<WebTransport> {
+  const wt = new WebTransport(`https://${urlHost}:${port}${path}`, {
+    serverCertificateHashes: hashes.map((value) => ({ algorithm: "sha-256", value })),
   });
   // A failed handshake also rejects `closed`; the caller attaches the real handler.
   wt.closed.catch(() => {});
   try {
-    await withTimeout(wt.ready, CONNECT_TIMEOUT_MS, "Timed out in WebTransport handshake");
+    await withTimeout(wt.ready, timeoutMs, "Timed out in WebTransport handshake");
   } catch (e) {
     wt.close();
     throw e;
@@ -482,7 +617,7 @@ async function openSession(urlHost: string, info: BridgeInfo): Promise<WebTransp
 
 /** Control-stream bytes in, whole control payloads out (u32 BE length prefix). */
 function controlFramer(
-  handlers: TransportHandlers,
+  onFrame: (payload: Uint8Array) => void,
   finish: (reason: string) => void,
 ): (chunk: Uint8Array) => void {
   let buf: Uint8Array = new Uint8Array(0);
@@ -496,7 +631,7 @@ function controlFramer(
         return;
       }
       if (buf.length - off < 4 + len) break;
-      handlers.onControl(buf.subarray(off + 4, off + 4 + len));
+      onFrame(buf.subarray(off + 4, off + 4 + len));
       off += 4 + len;
     }
     if (off > 0) buf = buf.slice(off);
@@ -508,13 +643,14 @@ async function readControl(
   pushControl: (chunk: Uint8Array) => void,
   armWatchdog: () => void,
   finish: (reason: string) => void,
+  closedReason = "Server closed connection",
 ): Promise<void> {
   const reader = (readable as ReadableStream<Uint8Array>).getReader();
   try {
     for (;;) {
       const { value, done } = await reader.read();
       if (done) {
-        finish("Server closed connection");
+        finish(closedReason);
         return;
       }
       armWatchdog();
@@ -525,7 +661,7 @@ async function readControl(
   }
 }
 
-async function readDatagrams(readable: ReadableStream, handlers: TransportHandlers): Promise<void> {
+async function readDatagrams(readable: ReadableStream, handlers: Pick<TransportHandlers, "onDatagram">): Promise<void> {
   const reader = (readable as ReadableStream<Uint8Array>).getReader();
   try {
     for (;;) {
@@ -538,7 +674,7 @@ async function readDatagrams(readable: ReadableStream, handlers: TransportHandle
   }
 }
 
-async function readVideoStreams(streams: ReadableStream, handlers: TransportHandlers): Promise<void> {
+async function readVideoStreams(streams: ReadableStream, handlers: Pick<TransportHandlers, "onVideoPacket">): Promise<void> {
   const reader = (streams as ReadableStream<ReadableStream<Uint8Array>>).getReader();
   try {
     for (;;) {
@@ -554,7 +690,10 @@ async function readVideoStreams(streams: ReadableStream, handlers: TransportHand
 
 /** Packets are handed on as they arrive: waiting for the frame's FIN would add
  *  its whole transmission time to the latency (voipc_protocol::video::RecordReader). */
-async function readVideoFrame(stream: ReadableStream<Uint8Array>, handlers: TransportHandlers): Promise<void> {
+async function readVideoFrame(
+  stream: ReadableStream<Uint8Array>,
+  handlers: Pick<TransportHandlers, "onVideoPacket">,
+): Promise<void> {
   const reader = stream.getReader();
   let pending: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
   let total = 0;

@@ -13,15 +13,16 @@ nobody checks, so a new one comes with its test.
 **1.x keeps:**
 - A relay admits a client exactly when their `PROTOCOL_VERSION` is equal (12 in 1.0, 13 in
   1.3, 14 in 1.4, 15 in 1.5, 16 in 1.7, 17 in 1.8, 18 in 1.9, 19 in 1.10, 21 in 1.11, 20 in its rc.1 only,
-  23 in 1.12, 22 in its rc.1 only, 24 in 1.13, 25 in 1.14). The app version is informational only.
+  23 in 1.12, 22 in its rc.1 only, 24 in 1.13, 25 in 1.14, 26 in 1.15). The app version is informational only.
 - **Since 1.6, an app talks to relays from its own protocol down to `OLDEST_RELAY_PROTOCOL`**
-  (`crates/voipc-protocol/src/compat.rs`; 12 in 1.6 to 1.14), never fewer than three protocols back.
+  (`crates/voipc-protocol/src/compat.rs`; 12 in 1.6 to 1.15), never fewer than three protocols back.
   It asks with its own; a relay of an older protocol refuses with its own (below), and the app
   connects again speaking that one. It shows a banner there, and holds back what that relay's
   other apps could not read:
 
-  | Relay | What a 1.14 app does not offer there |
+  | Relay | What a 1.15 app does not offer there |
   |---|---|
+  | 1.14 (25) | edges: viewers there are served by the relay itself |
   | 1.13 (24) | nothing held back: that relay sends the lobby whole, as it always did, and the app reads it so |
   | 1.12 (23) | dropping a device's old key when the device is remembered again: there it stays until the relay's 90-day sweep |
   | 1.12.0-rc.1 (22) | a restriction's parts: a voice-only mute during the new-member wait reads as a time-out there, until the wait ends |
@@ -53,6 +54,14 @@ nobody checks, so a new one comes with its test.
   - the start of `Authenticate` (`username`, `protocol_version`);
   - `AuthError`;
   - `Refused`, its variant index and its `u16` code.
+- **The media edge pool (relay ↔ edge, since 1.15) has a version of its own,** `POOL_VERSION` in
+  `crates/voipc-protocol/src/pool.rs` (1 in 1.15). A relay links only edges of its own pool version,
+  whatever their releases; a client protocol bump leaves it alone, and any change to the pool's
+  messages or its ticket bumps it. An edge of another pool version is refused and told which version
+  the relay speaks, and its viewers are served by the relay until it is updated: update the relay
+  first, then its edges ([OPERATING.md](OPERATING.md) §10b). Frozen for good, so either side can say
+  "wrong version": `EdgeMsg::Hello` is variant 0 and `CoreMsg::Refused` variant 1, each with
+  `pool_version` as its first field.
 
 **May change:** any other layout, but only together with a protocol bump, and only in a minor or
 major release, never in a patch. A bump adds the older shape of every message it changes to
@@ -65,6 +74,8 @@ out of servers that have not upgraded yet.
   `golden/v<N>.json`, and the frozen messages and the media packet headers against bytes
   written out in the test.
 - Any change with the same `PROTOCOL_VERSION` fails it.
+- The same for the pool: `pool_format_matches_pool_version` compares it against
+  `golden/pool-v<N>.json`, and `what_says_wrong_pool_version_never_changes` holds the frozen bytes.
 - `compat.rs`'s tests fail when a message's layout at an older protocol differs from today's
   and `RESHAPED` does not name it, and when an old shape there differs from its golden file.
 - The nightly `old-relays` job runs the released 1.0, 1.3, 1.4, 1.6, 1.7.0-rc.1, 1.11.0-rc.1
@@ -152,6 +163,12 @@ removes it) and `unclaimed_days` (90, 0 is never) in `[accounts]`. An older rela
 **What changed in 1.14:** `live_lobby` (2000) at the top; a new `[media]` section (`share_viewers`
 100, `video_egress_mbit` 1000, `voice_room` 250); `db_connections` (32) and
 `password_sign_ins_per_15min` (1000) in `[accounts]`. An older relay refuses each of them.
+
+**What changed in 1.15:** a new `[pool]` section (`edges` empty, so no edges and their path not served;
+`local_first` 8), and a new file `edge.toml` for the new `voipc-server -c edge.toml edge` role (its keys
+are in [OPERATING.md](OPERATING.md) §10b). With edges, `[media] share_viewers` caps the viewers the relay
+serves itself, and its edges carry the rest; without, it means what it did. An older relay refuses
+`[pool]`.
 
 **An older relay on a newer config:** it refuses the unknown key, never ignores it, so a relay
 cannot silently run without a setting it was given. The JSON files stay lenient: a rewrite of

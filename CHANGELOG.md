@@ -4,6 +4,45 @@ All notable changes to VoIPC are documented here.
 
 ## [Unreleased]
 
+Protocol 26 (1.15): a 1.15 relay admits only 1.15 apps, so update the apps first. A 1.15 app still talks to 1.14
+relays and older ones. Media edges speak a version of their own (pool 1): update a relay before its edges. No
+database migration.
+
+### Added
+- **Media edges for big screen shares** (`[pool]`, `voipc-server -c edge.toml edge`): a relay can hand the viewers of
+  a share past its first `local_first` (8) to edges, processes of the same binary on machines of their own, so a share
+  with thousands of viewers costs it one copy per edge instead of one per viewer. An edge links to the relay and
+  proves itself with a secret both hold. It has no page, accounts, files or channels, and sees which addresses watch
+  and how big the frames are, never a name, a channel or a key: the sharer's app seals every frame
+  (docs/THREAT-MODEL.md). Each viewer the relay places there gets the edge's address, the hash of its certificate and
+  a ticket good once, for that edge, for 30 s. A viewer whose edge sends no whole frame for 10 s is moved to another
+  edge or back to the relay, and so are the viewers of an edge that goes away, within its 6 s timeout. Viewers over
+  the TCP fallback stay on the relay. On this machine, all on loopback: 2000 HD viewers through two edges cost the
+  relay 0.04 of a core, where 1000 on the relay alone took 2.2 (both held to 4 CPUs); every frame came, the edge added
+  no latency measurable at 1000, and a killed edge's viewers had frames again 6.1 s later on the relay, 7.2 s on the
+  other edge. Three edges of 1000 on that one machine got only 73% of frames through: the machine's limit, and no measure
+  of edges on machines of their own. The
+  Load tab lists the edges, what each carries against its limits, and its last report. Setup and numbers in
+  OPERATING.md §10a and §10b.
+
+### Changed
+- **A sharer is told how many watch at most once a second**, the latest count, where every watch and stop sent one:
+  thousands of messages a second for a big share. The first viewer and the last one to go are still told at once:
+  the sharer's app starts and stops its capture by them, unless its own preview is open.
+- **Above 8 viewers, a sharer gets one loss summary a second** (`VideoLossSummary`): how many of its viewers lost
+  frames in the last 2 s, of how many, instead of each viewer's report. The app steps the share down on a majority, as
+  before. Up to 8 viewers each report comes as before.
+- **A viewer drops a frame it already put together, or an older one**, up to 1000 frames back: a frame that comes
+  twice, from the relay and from an edge across a move, or that an edge replays, is not shown again.
+- **With edges, `[media] share_viewers` is what the relay serves of a share itself**: its edges carry the rest, each
+  up to its own `max_viewers` and `egress_mbit`, and `video_egress_mbit` counts one copy for each edge fed.
+
+### Known
+- Watching through an edge was tested in Chromium (the `EDGE=1` lane of test-web.sh, in CI). Firefox, the desktop
+  apps and Android were not tried yet, nor an edge or a viewer on another machine.
+
+## [1.14.0] - not released yet
+
 Protocol 25 (1.14): a 1.14 relay admits only 1.14 apps, so update the apps first. A 1.14 app still talks
 to 1.13 relays and older ones.
 

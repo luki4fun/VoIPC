@@ -17,6 +17,7 @@ use voipc_crypto::file::FileError;
 use voipc_crypto::time::now_millis;
 use voipc_protocol::codec::{APP_VERSION, PROTOCOL_VERSION};
 use voipc_protocol::messages::ClientMessage;
+use voipc_protocol::pool::{self, ViewerMsg};
 use voipc_protocol::types::{PreKeyBundleData, UserInfo};
 use wasm_bindgen::prelude::*;
 
@@ -86,6 +87,25 @@ pub fn decode_server_msg(bytes: &[u8]) -> Result<JsValue, JsError> {
     let serializer =
         serde_wasm_bindgen::Serializer::new().serialize_large_number_types_as_bigints(true);
     Ok(msg.serialize(&serializer)?)
+}
+
+// ── Media edge pool ──────────────────────────────────────────────────────
+
+/// A viewer's hello to a media edge, with its length prefix: the first frame on the
+/// edge's `/voipc-view` stream. The ticket is `EdgeView.ticket`, as the relay sent it.
+/// Built here so the browser's bytes are the native app's.
+#[wasm_bindgen(js_name = encodeViewerHello)]
+pub fn encode_viewer_hello(ticket: Vec<u8>) -> Result<Vec<u8>, JsError> {
+    Ok(pool::encode_viewer_msg(&ViewerMsg::Hello { ticket })?)
+}
+
+/// A media edge's word to its viewer from its postcard bytes (no length prefix), as
+/// `decodeServerMsg` reads: `"Ready"` or `{ Ended: { reason } }`.
+#[wasm_bindgen(js_name = decodeEdgeViewMsg)]
+pub fn decode_edge_view_msg(bytes: &[u8]) -> Result<JsValue, JsError> {
+    Ok(serde_wasm_bindgen::to_value(&pool::decode_edge_view_msg(
+        bytes,
+    )?)?)
 }
 
 // ── Signal Protocol ──────────────────────────────────────────────────────
@@ -1113,5 +1133,50 @@ impl VideoAssembler {
 
     pub fn reset(&mut self) {
         self.core.reset();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use voipc_protocol::pool::EdgeViewMsg;
+
+    /// The browser's hello is the native app's, byte for byte, and the frozen bytes
+    /// tests/golden.rs and transport.test.ts pin.
+    #[test]
+    fn a_viewer_hello_from_wasm_is_the_native_one() {
+        for ticket in [vec![], vec![1, 2, 3], vec![0xff; pool::MAX_TICKET_BYTES]] {
+            assert_eq!(
+                encode_viewer_hello(ticket.clone()).unwrap(),
+                pool::encode_viewer_msg(&ViewerMsg::Hello { ticket }).unwrap()
+            );
+        }
+        assert_eq!(
+            encode_viewer_hello(vec![1, 2, 3]).unwrap(),
+            [0, 0, 0, 5, 0, 3, 1, 2, 3]
+        );
+    }
+
+    /// What `decodeEdgeViewMsg` reads is what an edge writes, in the externally tagged form
+    /// serde gives JS (serde_json stands in for serde_wasm_bindgen, which needs a browser).
+    #[test]
+    fn an_edge_answer_decodes_to_what_transport_ts_reads() {
+        for (msg, js) in [
+            (EdgeViewMsg::Ready, serde_json::json!("Ready")),
+            (
+                EdgeViewMsg::Ended {
+                    reason: "revoked".into(),
+                },
+                serde_json::json!({ "Ended": { "reason": "revoked" } }),
+            ),
+        ] {
+            let framed = pool::encode_edge_view_msg(&msg).unwrap();
+            let decoded = pool::decode_edge_view_msg(&framed[4..]).unwrap();
+            assert_eq!(decoded, msg);
+            assert_eq!(serde_json::to_value(&decoded).unwrap(), js);
+        }
+        // A length prefix is not part of what it reads
+        let framed = pool::encode_edge_view_msg(&EdgeViewMsg::Ready).unwrap();
+        assert!(pool::decode_edge_view_msg(&framed).is_err());
     }
 }

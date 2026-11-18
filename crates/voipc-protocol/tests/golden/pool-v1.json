@@ -1,0 +1,230 @@
+{
+  "CoreMsg": {
+    "ENUM": {
+      "0": {
+        "Welcome": {
+          "STRUCT": [
+            {
+              "link": "U64"
+            },
+            {
+              "core_ms": "U64"
+            }
+          ]
+        }
+      },
+      "1": {
+        "Refused": {
+          "STRUCT": [
+            {
+              "pool_version": "U32"
+            },
+            {
+              "reason": "STR"
+            }
+          ]
+        }
+      },
+      "2": {
+        "Revoke": {
+          "STRUCT": [
+            {
+              "slot": "U64"
+            },
+            {
+              "core_ms": "U64"
+            }
+          ]
+        }
+      },
+      "3": {
+        "ShareEnded": {
+          "STRUCT": [
+            {
+              "share": "U32"
+            },
+            {
+              "core_ms": "U64"
+            }
+          ]
+        }
+      }
+    }
+  },
+  "EdgeMsg": {
+    "ENUM": {
+      "0": {
+        "Hello": {
+          "STRUCT": [
+            {
+              "pool_version": "U32"
+            },
+            {
+              "name": "STR"
+            },
+            {
+              "proof": {
+                "TUPLEARRAY": {
+                  "CONTENT": "U8",
+                  "SIZE": 32
+                }
+              }
+            },
+            {
+              "public_host": "STR"
+            },
+            {
+              "public_port": "U16"
+            },
+            {
+              "cert_hashes": {
+                "SEQ": {
+                  "TUPLEARRAY": {
+                    "CONTENT": "U8",
+                    "SIZE": 32
+                  }
+                }
+              }
+            },
+            {
+              "max_viewers": "U32"
+            },
+            {
+              "egress_mbit": "U32"
+            },
+            {
+              "max_shares": "U32"
+            },
+            {
+              "version": "STR"
+            }
+          ]
+        }
+      },
+      "1": {
+        "Subscribe": {
+          "STRUCT": [
+            {
+              "share": "U32"
+            }
+          ]
+        }
+      },
+      "2": {
+        "Unsubscribe": {
+          "STRUCT": [
+            {
+              "share": "U32"
+            }
+          ]
+        }
+      },
+      "3": {
+        "KeyframeWanted": {
+          "STRUCT": [
+            {
+              "share": "U32"
+            }
+          ]
+        }
+      },
+      "4": {
+        "Load": {
+          "STRUCT": [
+            {
+              "viewers": "U32"
+            },
+            {
+              "per_share": {
+                "SEQ": {
+                  "TUPLEARRAY": {
+                    "CONTENT": "U32",
+                    "SIZE": 2
+                  }
+                }
+              }
+            },
+            {
+              "egress_kbps": "U64"
+            },
+            {
+              "frames_dropped": "U64"
+            },
+            {
+              "tickets_refused": "U32"
+            },
+            {
+              "cpu_secs": "U64"
+            },
+            {
+              "rss_mib": "U32"
+            }
+          ]
+        }
+      },
+      "5": {
+        "CertRotated": {
+          "STRUCT": [
+            {
+              "cert_hashes": {
+                "SEQ": {
+                  "TUPLEARRAY": {
+                    "CONTENT": "U8",
+                    "SIZE": 32
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    }
+  },
+  "EdgeViewMsg": {
+    "ENUM": {
+      "0": {
+        "Ready": "UNIT"
+      },
+      "1": {
+        "Ended": {
+          "STRUCT": [
+            {
+              "reason": "STR"
+            }
+          ]
+        }
+      }
+    }
+  },
+  "TicketBody": {
+    "STRUCT": [
+      {
+        "link": "U64"
+      },
+      {
+        "share": "U32"
+      },
+      {
+        "slot": "U64"
+      },
+      {
+        "expires_ms": "U64"
+      }
+    ]
+  },
+  "ViewerMsg": {
+    "ENUM": {
+      "0": {
+        "Hello": {
+          "STRUCT": [
+            {
+              "ticket": {
+                "SEQ": "U8"
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

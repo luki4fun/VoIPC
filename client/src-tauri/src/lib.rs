@@ -8,6 +8,7 @@ mod app_state;
 mod commands;
 mod config;
 mod crypto;
+mod edge_view;
 mod emote_sources;
 mod emotes;
 mod files;

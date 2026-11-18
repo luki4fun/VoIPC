@@ -103,10 +103,13 @@ pub const CONTROL_MSGS_PER_SEC: u32 = 50;
 /// v25: the lobby on a big relay, not sent whole — RequestLobbyPage/LookupUsers/WatchLobby,
 ///      ChannelCounts/LobbyPage/Users; the sender's account on EncryptedDirectChatMessage and
 ///      PokeReceived
+/// v26: the media edge pool — WatchAt (types::EdgeView) and EdgeFailed, LoadReport.edges
+///      (types::EdgeLoad), ShareLoad.on_edges; VideoLossSummary to a sharer past 8 viewers.
+///      Between a relay and its edges the pool has its own version, `pool::POOL_VERSION`
 ///
 /// A relay admits only its own protocol; an app speaks its own down to
 /// `compat::OLDEST_RELAY_PROTOCOL` (1.6).
-pub const PROTOCOL_VERSION: u32 = 25;
+pub const PROTOCOL_VERSION: u32 = 26;
 
 /// Application version, read from Cargo.toml at compile time.
 /// Single source of truth: workspace root `Cargo.toml` `[workspace.package] version`.

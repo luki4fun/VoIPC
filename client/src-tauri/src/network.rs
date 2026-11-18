@@ -17,6 +17,7 @@ use tracing::{debug, error, info, warn};
 use wtransport::error::SendDatagramError;
 use wtransport::{Connection, SendStream};
 
+use crate::edge_view::{self, EdgeCmd};
 use crate::transport::{Conn, DatagramIn, VideoIn};
 
 use voipc_crypto::media_keys::{MediaKey, MediaKeyRing};
@@ -379,6 +380,39 @@ pub async fn connect_to_server(
                 VideoIn::Tunnel(lanes.video_in.take().expect("taken once")),
             ),
         };
+    // The share being watched may come from a media edge the relay sends us to (1.15):
+    // its frames join the relay's in the receiver tasks, and the edge task watches the
+    // link by the frames that decrypt there.
+    let edge_view::Pipes {
+        out: edge_out,
+        gen: edge_gen,
+        video_in: edge_video_in,
+        datagrams_in: edge_datagrams_in,
+    } = edge_view::Pipes::new(watching_user_id_shared.clone());
+    let last_good_frame_ms = Arc::new(AtomicU64::new(0));
+    let (edge_cmd, edge_cmd_rx) = mpsc::channel::<EdgeCmd>(32);
+    let edge_handle = tokio::spawn(edge_view::run(
+        edge_cmd_rx,
+        edge_view::Ctx {
+            tunnel,
+            tcp_tx: tcp_tx.clone(),
+            out: edge_out,
+            gen: edge_gen,
+            watching: watching_user_id_shared.clone(),
+            last_good_frame_ms: last_good_frame_ms.clone(),
+            emit: Box::new({
+                let (app, server) = (app_handle.clone(), server.clone());
+                move |sharer, host, state| {
+                    emit_server(
+                        &app,
+                        &server,
+                        "edge-view",
+                        serde_json::json!({"sharer_user_id": sharer, "host": host, "state": state}),
+                    )
+                }
+            }),
+        },
+    ));
     let files = Arc::new(crate::files::Files::new(
         Box::new({
             let (app, server) = (app_handle.clone(), server.clone());
@@ -429,6 +463,7 @@ pub async fn connect_to_server(
         transmitting.clone(),
         account.clone(),
         files.clone(),
+        edge_cmd,
     ));
     let live_handle = (proto >= LIVE_PATH_SINCE).then(|| {
         tokio::spawn(live_task(
@@ -475,6 +510,7 @@ pub async fn connect_to_server(
 
     let udp_recv_handle = tokio::spawn(datagram_receiver_task(
         datagram_in,
+        edge_datagrams_in,
         tunnel,
         app_handle.clone(),
         mix_sources.clone(),
@@ -487,6 +523,8 @@ pub async fn connect_to_server(
     ));
     let video_recv_handle = tokio::spawn(video_stream_receiver_task(
         video_in,
+        edge_video_in,
+        last_good_frame_ms,
         video_decode_tx,
         current_media_key.clone(),
         current_channel_id.clone(),
@@ -585,6 +623,7 @@ pub async fn connect_to_server(
             mixer_handle,
             latency_handle,
             beacon_handle,
+            edge_handle,
         ]
         .into_iter()
         .chain(congestion_handle)
@@ -1299,6 +1338,7 @@ async fn control_reader_task<R: AsyncRead + Unpin>(
     transmitting: Arc<AtomicBool>,
     account: Option<Arc<crate::account::AccountLink>>,
     files: Arc<crate::files::Files>,
+    edge_cmd: mpsc::Sender<EdgeCmd>,
 ) {
     let mut inbound = Inbound::new(std::time::Instant::now());
     // What waits for the pages of pins (`voipc_crypto::waits_for_pins`), in order
@@ -1378,6 +1418,7 @@ async fn control_reader_task<R: AsyncRead + Unpin>(
                                 &voice_asked_at,
                                 &transmitting,
                                 account.as_deref(),
+                                &edge_cmd,
                             )
                             .await;
                             crate::account::check_seen(
@@ -1679,6 +1720,7 @@ async fn handle_server_message(
     voice_asked_at: &AtomicU64,
     transmitting: &Arc<AtomicBool>,
     account: Option<&crate::account::AccountLink>,
+    edge_cmd: &mpsc::Sender<EdgeCmd>,
 ) {
     // Everything a game hears about comes from the voice connection only: a
     // user id here means nothing on the server the game is playing on.
@@ -2621,6 +2663,10 @@ async fn handle_server_message(
             sharer_user_id,
             codec,
         } => {
+            // A watch starts over the session. When the relay puts us on an edge its
+            // `WatchAt` follows at once, a watch of the same share again included (it
+            // revoked the old ticket for a new one).
+            let _ = edge_cmd.send(EdgeCmd::Close).await;
             // Before the first fragment arrives: the decode task builds its
             // decoder from this and rebuilds it when the value changes.
             watching_codec.store(codec as u8, Ordering::Relaxed);
@@ -2639,6 +2685,7 @@ async fn handle_server_message(
             );
         }
         ServerMessage::StoppedWatchingScreenShare { reason } => {
+            let _ = edge_cmd.send(EdgeCmd::Close).await;
             crate::view_queue::native();
             emit_server(
                 app_handle,
@@ -3034,6 +3081,33 @@ async fn handle_server_message(
         | ServerMessage::EmoteList { .. }
         | ServerMessage::EmoteTicket { .. }
         | ServerMessage::EmoteError { .. } => {}
+        ServerMessage::WatchAt {
+            sharer_user_id,
+            placement,
+            edge,
+        } => {
+            // Only for the share we watch: an edge is dialled for nothing else
+            if watching_user_id_shared.load(Ordering::Relaxed) != sharer_user_id {
+                debug!(sharer_user_id, "WatchAt for a share not watched, ignoring");
+            } else {
+                let cmd = match edge {
+                    Some(view) => EdgeCmd::Open {
+                        sharer: sharer_user_id,
+                        placement,
+                        view,
+                    },
+                    None => EdgeCmd::Close,
+                };
+                let _ = edge_cmd.send(cmd).await;
+            }
+        }
+        ServerMessage::VideoLossSummary { reporters, viewers } => {
+            // In place of each viewer's report past 8 viewers: the same majority, counted
+            // by the relay
+            if loss_summary_steps_down(reporters, viewers, share_loss_ms, screenshare::epoch_ms()) {
+                info!(reporters, viewers, "most viewers report frame loss");
+            }
+        }
     }
 }
 
@@ -5270,6 +5344,22 @@ fn majority_reached(reporters: usize, viewers: u32) -> bool {
     reporters as u32 >= viewers.div_ceil(2).max(1)
 }
 
+/// A relay's loss summary for our share (`VideoLossSummary`, past 8 viewers, at most once
+/// a second): how many of its `viewers` reported loss lately. A majority steps the share
+/// down, as a majority of single reports does below that. Whether it did.
+fn loss_summary_steps_down(
+    reporters: u32,
+    viewers: u32,
+    share_loss_ms: &AtomicU64,
+    now: u64,
+) -> bool {
+    let due = majority_reached(reporters as usize, viewers);
+    if due {
+        share_loss_ms.store(now, Ordering::Relaxed);
+    }
+    due
+}
+
 /// One second of this connection's QUIC path statistics.
 #[derive(Clone, Copy, Default)]
 struct PathSample {
@@ -5367,10 +5457,12 @@ async fn latency_task(voice_tx: mpsc::Sender<Vec<u8>>, session_id: u32) {
 /// jitter buffers; also drives the speaking indicator, and turns the pong to
 /// our keepalive ping (0x04) into the latency display. Video arrives on its
 /// own (`video_stream_receiver_task`). `tunnel`: the link is the TCP fallback,
-/// which the latency display says.
+/// which the latency display says. `edge`: the watched share's screen audio when it
+/// comes from a media edge, which goes the same way as the relay's.
 #[allow(clippy::too_many_arguments)]
 async fn datagram_receiver_task(
     mut input: DatagramIn,
+    mut edge: edge_view::EdgeIn<bytes::Bytes>,
     tunnel: bool,
     app_handle: tauri::AppHandle,
     sources: MixSources,
@@ -5393,7 +5485,8 @@ async fn datagram_receiver_task(
 
     loop {
         tokio::select! {
-            received = input.recv() => {
+            // Cancel-safe, so the speaking sweep may win the race (edge_view::merged)
+            received = edge_view::merged(input.recv(), &mut edge) => {
                 let Some(datagram) = received else {
                     break;
                 };
@@ -5754,9 +5847,16 @@ const LOSS_REPORT_WINDOW: std::time::Duration = std::time::Duration::from_secs(2
 /// Decrypts, reassembles, hands complete frames to the decode task, requests a
 /// keyframe on loss and keeps asking while there is nothing clean to show, and
 /// reports the loss to the sharer every 2 s so it can lower its bitrate/fps.
+///
+/// `edge`: the watched share's records when they come from a media edge, put through
+/// the same assembler. Each whole frame of the watched share stamps
+/// `last_good_frame_ms`, the edge task's watchdog: every fragment of it decrypted, so
+/// an edge that forwards garbage or partial frames never stamps it.
 #[allow(clippy::too_many_arguments)]
 async fn video_stream_receiver_task(
     mut input: VideoIn,
+    mut edge: edge_view::EdgeIn<Vec<Vec<u8>>>,
+    last_good_frame_ms: Arc<AtomicU64>,
     video_decode_tx: mpsc::Sender<(Vec<u8>, bool, bool)>,
     media_key: Arc<std::sync::Mutex<MediaKeyRing>>,
     channel_id: Arc<AtomicU32>,
@@ -5795,7 +5895,7 @@ async fn video_stream_receiver_task(
         *last = std::time::Instant::now();
     };
 
-    while let Some(records) = input.next().await {
+    while let Some(records) = edge_view::merged(input.next(), &mut edge).await {
         for packet_bytes in records {
             let n = packet_bytes.len();
             if n < VIDEO_HEADER_SIZE {
@@ -5864,6 +5964,9 @@ async fn video_stream_receiver_task(
             }
 
             if let Some((frame_data, is_keyframe)) = result.frame {
+                if packet.session_id == watching_user_id.load(Ordering::Relaxed) {
+                    last_good_frame_ms.store(edge_view::now_ms(), Ordering::Relaxed);
+                }
                 screen_video_frames_received.fetch_add(1, Ordering::Relaxed);
                 window_received += 1;
                 if let Some((_, at)) = first_fragment.take() {
@@ -6882,6 +6985,99 @@ mod tests {
         assert!(!voice_ask_fresh(40_000, 40_000 + VOICE_ASK_TTL_MS), "stale");
         // A clock that stepped back is not an ask from the future
         assert!(voice_ask_fresh(40_000, 39_000));
+    }
+
+    /// Past 8 viewers the relay counts the reports itself: the same majority steps the
+    /// share down.
+    #[test]
+    fn a_loss_summary_of_a_majority_steps_the_share_down() {
+        let loss = AtomicU64::new(0);
+        assert!(!loss_summary_steps_down(3, 9, &loss, 1_000));
+        assert_eq!(loss.load(Ordering::Relaxed), 0);
+        assert!(loss_summary_steps_down(5, 9, &loss, 2_000));
+        assert_eq!(loss.load(Ordering::Relaxed), 2_000);
+        assert!(!loss_summary_steps_down(0, 1_000, &loss, 3_000));
+        assert_eq!(loss.load(Ordering::Relaxed), 2_000);
+    }
+
+    async fn until(what: &str, done: impl Fn() -> bool) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !done() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{what} within 5 s"));
+    }
+
+    /// The edge watchdog's stamp comes from a whole frame of the watched share that
+    /// decrypted, from the edge link in force: a frame that does not decrypt leaves it,
+    /// and one an older link queued never gets to the assembler.
+    #[tokio::test]
+    async fn only_a_frame_that_decrypts_feeds_the_edge_watchdog() {
+        const CHANNEL: u32 = 3;
+        const SHARER: u32 = 7;
+        let key = MediaKey::new(CHANNEL, 1, SHARER, [5; 32]);
+        let forged = MediaKey::new(CHANNEL, 1, SHARER, [6; 32]);
+        let frame = |frame_id: u32, key: &MediaKey| {
+            let aad = voipc_crypto::build_aad(CHANNEL, 0x14, SHARER);
+            let sealed =
+                voipc_crypto::media_encrypt(key, 11, frame_id, 0, &aad, b"a keyframe").unwrap();
+            VideoPacket::encrypted_fragment(true, SHARER, frame_id, 0, 1, 0, 1, 11, sealed)
+                .to_bytes()
+        };
+        let mut ring = MediaKeyRing::default();
+        assert!(ring.install(key.clone(), CHANNEL));
+        let watching = Arc::new(AtomicU32::new(SHARER));
+        let edge_view::Pipes {
+            out, gen, video_in, ..
+        } = edge_view::Pipes::new(watching.clone());
+        let stamp = Arc::new(AtomicU64::new(0));
+        let received = Arc::new(AtomicU32::new(0));
+        let bytes = Arc::new(AtomicU64::new(0));
+        let (_core, core_rx) = mpsc::channel(8);
+        let (decode_tx, _decode_rx) = mpsc::channel(8);
+        let (tx, _control) = mpsc::unbounded_channel();
+        tokio::spawn(video_stream_receiver_task(
+            VideoIn::Tunnel(core_rx),
+            video_in,
+            stamp.clone(),
+            decode_tx,
+            Arc::new(std::sync::Mutex::new(ring)),
+            Arc::new(AtomicU32::new(CHANNEL)),
+            received.clone(),
+            Arc::default(),
+            bytes.clone(),
+            ControlTx::new(tx, PROTOCOL_VERSION),
+            watching,
+            Arc::default(),
+        ));
+        gen.store(1, Ordering::Release);
+
+        out.video.send((1, vec![frame(1, &key)])).await.unwrap();
+        until("the first frame", || stamp.load(Ordering::Relaxed) > 0).await;
+        stamp.store(0, Ordering::Relaxed);
+
+        let before = bytes.load(Ordering::Relaxed);
+        out.video.send((1, vec![frame(2, &forged)])).await.unwrap();
+        until("the forged frame read", || {
+            bytes.load(Ordering::Relaxed) > before
+        })
+        .await;
+        assert_eq!(
+            stamp.load(Ordering::Relaxed),
+            0,
+            "a frame that does not decrypt"
+        );
+
+        out.video.send((0, vec![frame(3, &key)])).await.unwrap();
+        out.video.send((1, vec![frame(4, &key)])).await.unwrap();
+        until("the last frame", || stamp.load(Ordering::Relaxed) > 0).await;
+        assert_eq!(
+            received.load(Ordering::Relaxed),
+            2,
+            "frames 1 and 4: the older link's 3 never came in"
+        );
     }
 
     #[test]

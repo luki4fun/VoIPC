@@ -585,7 +585,41 @@ Screen shares (`share_load`, one HD share at 7.5 Mbit/s, 30 frames a second, vie
 | 500 over 5 shares | 4.2 Gbit/s | 32 | 4.5 cores; 2.3 with 4 threads | 0 |
 
 So a relay sends about 1,000 HD viewers before its network port is full, and its processor follows at about half a
-core per Gbit/s. `[media]` (§13) keeps it under what its port carries.
+core per Gbit/s. `[media]` (§13) keeps it under what its port carries, and media edges (§10b) carry the rest.
+
+Through media edges (1.15), measured 2026-11-18 on the same machine, everything on loopback: the relay held to 4 CPUs
+(`taskset -c 0-3`, so 4 threads), each edge to 4 of its own (2 physical cores; `max_viewers` 1000, `egress_mbit` 8000),
+`share_load` on the other 16, one HD share at 7.5 Mbit/s and 30 frames a second for 30 s, `local_first` 8, `rmem_max` at
+32 MiB. A Firefox tab took about one core beside it, on no CPU of its own. The 2,000 run was made once with one load
+generator and once split over two of 1,000, each on CPUs of its own: both got every frame, and no generator went above
+43% of its CPUs, so the tool was not the limit there. The 3,000 run was split over three.
+
+| Viewers | Relay CPU, RSS | Each edge's CPU, RSS | Generator CPU, of its CPUs | Frames whole | Latency p50 / p95 | Refused | Datagrams dropped |
+|---|---|---|---|---|---|---|---|
+| 1,000, the relay alone | 2.2 cores, 206 MiB; 8.9 Gbit/s out | – | 20% of 16 | 100% | 13 / 17 ms | 0 | 0 |
+| 1,000, 1 edge (992 on it) | 0.03 of a core, 160 MiB | 2.2 cores, 156 MiB | 20% of 16 | 100% | 13 / 17 ms through the edge, 0 / 1 ms on the relay | 0 | 0 |
+| 2,000, 2 edges, one generator | 0.04 of a core, 339 MiB | 2.5 cores, about 227 MiB | 41% of 16 | 100% | 16 / 22 ms | 0 | 0 |
+| 2,000, 2 edges, two generators | 0.04 of a core, 341 MiB | 2.5 cores, up to 460 and 397 MiB | 43% and 42% of 8 | 100% | 16 / 22 ms | 0 | 0 |
+| 3,000, 3 edges, three generators | 0.14 to 0.26 of a core, 584 MiB | 3.3 to 3.5 of its 4 CPUs, about 830 MiB | 61 to 74% of 5 or 6 | 73% | 175-186 / 397-417 ms | 0 | 210, 3,086 and 0 at the edges, 0 at the relay |
+
+(The relay's 0.04 with two generators is 0.18 counted over the first generator's window, which takes in the second's
+arrivals.) A `kill -9` of one edge, 15 s after every viewer was watching:
+
+| Setup | The relay saw it go | Where its viewers went | Refused | Last frame to the next, p50 / p95 / max |
+|---|---|---|---|---|
+| 2 edges, 1,000 viewers | after 6.03 s ("timed out") | 496 to the other edge | 0 | 7.17 / 7.18 / 7.19 s |
+| 1 edge, 1,000 viewers | after 6.01 s | 992 back to the relay, which then used 1.03 cores | 0 | 6.07 / 6.08 / 6.08 s |
+
+So with edges a big share costs the relay its feeds alone: 0.04 of a core for 2,000 viewers on two edges, where 1,000 on
+the relay alone took 2.2 cores. An edge costs what the relay alone would: 2.2 to 2.5 cores and 160 to 460 MiB for 1,000
+HD viewers. The extra hop costs nothing measurable here: 1,000 viewers through an edge saw 13 / 17 ms, as 1,000 on the
+relay alone did. In the 3,000 run only 73% of frames came whole, with 22.5 Gbit/s over loopback and each edge at about
+85% of its CPUs. Why is not proven: most likely this one machine carrying a relay, three edges and 3,000 viewers at
+once, but only edges and viewers on machines of their own can tell that apart from a limit of the edges.
+
+Not measured: edges and viewers on other machines and real networks (none were available here), more than one share
+through edges, and Firefox and the desktop and Android apps watching through an edge. Chromium is, in the `EDGE=1`
+lane of `test-web.sh`.
 
 Voice (`voice_load 1000 127.0.0.1:9987 90 --rooms 20 --speakers 3`): 20 rooms of 50 people, three talking in each,
 147,000 packets a second to listeners. Loss was 0.001% (packets in flight at the ends) and the socket dropped none.
@@ -615,6 +649,171 @@ target/release/examples/voice_load 1000 127.0.0.1:9987 90 --rooms 20 --speakers 
 target/release/examples/community_load frames
 target/release/examples/community_load crypto 2000
 ```
+
+With edges (`edge-core.toml` is `server.toml` with `[pool] edges = { e1 = "…" }`, `e1.toml` that edge's file, §10b),
+each process on CPUs of its own:
+
+```sh
+taskset -c 0-3 target/release/voipc-server -c edge-core.toml & relay=$!
+taskset -c 4-7 target/release/voipc-server -c e1.toml edge & edge=$!
+taskset -c 16-23 target/release/examples/share_load 1000 127.0.0.1:9987 "$relay" --edge-pids "$edge" --secs 34 &
+sleep 3   # the first one's share is up
+taskset -c 24-31 target/release/examples/share_load 1000 127.0.0.1:9987 "$relay" --edge-pids "$edge" --shares 0 --first 1000
+```
+
+## 10b. Big screen shares
+
+A relay sends each viewer of a share a copy of its own, so its network port is what a big share meets first: about 1,000
+HD viewers on 10 Gbit/s (§10a). Two things keep that in hand.
+
+**The caps, on every relay** (`[media]`, 1.14, §13):
+- `share_viewers` (100): the viewers of one share this relay serves itself.
+- `video_egress_mbit` (1000, a 1 Gbit port): the video it sends in all, counted at each share's resolution: 7.5 Mbit/s a
+  viewer at 1080p, 4 at 720p, 2 below. Give it what the port carries with room to spare for voice and the rest, about
+  8000 on a 10 Gbit port.
+- A viewer past either is told the share is full, or that the server is sending all the video it can, with a Retry.
+  Nothing else changes, and the sharer's own share goes on.
+
+**Media edges** (`[pool]`, 1.15) carry more. An edge is the same `voipc-server` binary, run as `voipc-server -c edge.toml
+edge`, best on a machine and a port of its own. It links to the relay over the relay's own UDP port, proves itself with a
+secret both hold, and forwards the shares the relay places viewers on: the relay sends it one copy of each, and it sends
+one to each viewer there.
+- **Who goes where.** The first `local_first` (8) viewers of each share stay on the relay, which is no farther away than
+  an edge. The next go to the edge with the most room, each up to its `max_viewers` and `egress_mbit`; one already
+  carrying that share is picked if it is close, which saves the relay a copy. The relay counts one copy per edge
+  against its `video_egress_mbit`. Where no edge has room, the relay serves the viewer itself, up to its `[media]` caps,
+  and refuses only past those; one of the first that the relay has no room for goes to an edge already carrying the
+  share, which costs the relay nothing more. A viewer on the TCP fallback always stays on the relay. With edges, `share_viewers` is
+  the relay's own part of a share, not the whole.
+- **What an edge has.** A UDP port for its viewers, and nothing else: no TCP port, page, accounts, files, emotes,
+  channels, bans or operator certificate. It makes a certificate of its own, renewed every 7 days, which viewers trust
+  by the hash the relay sends them, so an edge needs no DNS name or public certificate.
+- **What an edge sees.** The address of each viewer it serves, when they watch, and each frame's size and timing. Never
+  a name, a channel or a key: the sharer's app seals every frame ([THREAT-MODEL.md](THREAT-MODEL.md)). It does see each
+  share's sharer by session id, which is the sharer's user id: whoever runs an edge and also joins the relay (as a
+  guest, where guests may) can look that up to a name, and to the channel if they can see it. Still, run it where you
+  would run the relay. The relay logs each edge's address when it links (edges are infrastructure, not
+  users); an edge logs viewer addresses at `debug` only.
+- **When one goes away.** A stopped edge tells its viewers and the relay at once; a crashed or cut-off one the relay
+  notices within 6 s. Either way its viewers go to another edge or back to the relay at once, and only those nobody has
+  room for are refused (6.1 s back on the relay, 7.2 s on another edge, in §10a). A viewer whose edge sends no whole
+  frame for 10 s asks the relay to move it, and is not sent to that edge again for 60 s; while the share itself sends
+  nothing (its sharer's network stalls), nobody is moved. Nobody is moved back to an edge that returns.
+- **What edges do not carry:** voice (it never leaves the relay), and the sharer's upload. An edge is picked by its
+  room, not by where it or the viewer is.
+
+**How many a setup carries.** Estimates from §10a, not measured on separate machines: each machine with a 10 Gbit port
+used to about 80% (an edge's default `egress_mbit` of 8000), HD at 7.9 Mbit/s on the wire, so about 1,000 HD viewers
+a machine, and 5 big shares. The relay's `[media]` is raised to match (`share_viewers` 1000, `video_egress_mbit` 8000).
+With its defaults (100 a share, 1000 Mbit/s) the relay itself adds at most about 130 HD viewers in all, not 1,000, and
+its budget has to hold its feeds too: one copy per share per edge, the last column.
+
+| Setup | HD viewers | What the relay sends its edges |
+|---|---|---|
+| The relay alone | about 1,000 | 0 |
+| 1 edge | about 2,000 | 37 Mbit/s |
+| 3 edges | about 4,000 | 112 Mbit/s |
+| 10 edges | about 11,000 | 375 Mbit/s |
+
+An edge took 2.2 to 2.5 cores and 160 to 460 MiB per 1,000 HD viewers (§10a). A 720p share counts 4 Mbit/s a
+viewer and a smaller one 2, so an `egress_mbit` of 8000 has room for 2,000 or 4,000 of those: raise the edge's
+`max_viewers` (1000) to use it, if its processor keeps up. Smaller shares were not measured.
+
+**Setting one up:**
+1. Make a secret for the edge: `openssl rand -base64 32`. Each edge has its own.
+2. On the relay, in `server.toml`, then restart it:
+
+   ```toml
+   [pool]
+   local_first = 8                          # the first viewers of each share stay here
+   edges = { fra1 = "<that secret>" }       # name = secret, one per edge
+   ```
+
+   A name is 1 to 32 of `a-z`, `0-9` and `-`, and is what the Load tab shows; a secret has at least 32 characters.
+   `local_first` may not be above `[media] share_viewers`.
+3. On the edge's machine, `/etc/voipc/edge.toml`, every key with its default where it has one:
+
+   ```toml
+   core = "voice.example.org:9987"   # the relay's host and UDP port; an IPv6 address in brackets, as [2001:db8::1]:9987
+   # core_fingerprint = "AB:CD:…"    # see below; required when core is an IP address
+   name = "fra1"                     # its name in the relay's [pool] edges
+   secret = "<that secret>"          # and its secret there
+   host = "::"                       # the address viewers' QUIC is bound on
+   udp_port = 9987                   # where viewers connect
+   public = "fra1.example.org:9987"  # host:port viewers reach udp_port at; the relay sends it to them
+   max_viewers = 1000                # viewers at once
+   egress_mbit = 8000                # the video it may send; the relay places no more on it
+   max_shares = 16                   # shares it is fed at once, 1 to 64
+   max_connections_per_ip = 32       # at least 2
+   ```
+
+   The edge checks the file before it starts and names what is wrong. An unknown key stops it, `[update]` too: edges are
+   updated by hand.
+4. **Trusting the relay.** Unset, `core_fingerprint` leaves it to the public CAs: the relay's certificate must be issued
+   for `core`'s name, as a Let's Encrypt one is. Set it to what `voipc-server -c server.toml cert fingerprint` prints on
+   the relay (colons optional) when that certificate is self-signed or `core` is an IP address. It pins that one
+   certificate: after every renewal the edge cannot link (its log says so) until it has the new fingerprint, so do not
+   pin a certificate that renews by itself.
+5. **The secret stays in two files.** Keep both readable by the `voipc` user only:
+
+       useradd --system --no-create-home --shell /usr/sbin/nologin voipc   # if this machine has none
+       install -d -m 0755 /etc/voipc
+       install -o voipc -g voipc -m 0600 edge.toml /etc/voipc/edge.toml
+       chown voipc:voipc /etc/voipc/server.toml && chmod 0600 /etc/voipc/server.toml   # on the relay
+
+   Neither process logs a secret, and a printed config shows `<secret>`.
+6. **Network.** Open the edge's `udp_port` inbound: viewers connect there, over QUIC. The edge dials out to the relay's
+   UDP port, which is open already, so the relay needs no new rule. Behind NAT, forward that UDP port and put the outside
+   address in `public`. An edge asks for the same UDP buffers as a relay: set `rmem_max` and `wmem_max` as in §10a.
+7. **systemd:**
+
+   ```ini
+   # /etc/systemd/system/voipc-edge.service
+   [Unit]
+   Description=VoIPC media edge
+   After=network-online.target
+   Wants=network-online.target
+
+   [Service]
+   User=voipc
+   Group=voipc
+   ExecStart=/usr/local/bin/voipc-server -c /etc/voipc/edge.toml edge
+   UMask=0077
+   Restart=on-failure
+   # and every line of §3's unit from NoNewPrivileges=yes to LimitNOFILE=65536, as they are there
+
+   [Install]
+   WantedBy=multi-user.target
+   ```
+
+   `-c` goes before `edge`, as for every command. An edge writes nothing, so it needs no `StateDirectory` or
+   `WorkingDirectory`. `systemctl enable --now voipc-edge`, and `systemctl stop` tells its viewers before it goes.
+8. **Check it.** The relay logs `edge fra1 linked from <address> (pool v1, …)`, the edge `linked to the core at … as fra1`,
+   and the Load tab lists it as linked. Until it links, its viewers are served by the relay.
+
+**Running them.**
+- **The Load tab** (*Server admin*) lists every edge in `[pool]`, linked or not: its address and pool version, the
+  viewers and shares the relay gave it against its limits, the Mbit/s given and what it last said it sent, its processor
+  and memory, and how old its last report is, with frames it dropped. Each share says how many of its viewers are on
+  edges. It warns when an edge has been away for more than a minute, carries 90% of its viewers or its video, or when
+  feeds to edges dropped frames (the way from the relay to its edges is too slow). While an edge is not linked, it also
+  says when something naming itself that edge was refused for its pool version: unproven, since an edge of another pool
+  version cannot show its secret, so check that edge's own log.
+- **Logs.** The relay: `edge fra1 offline (why); N viewers moved, M refused` when one goes. The edge: its link going up
+  and down with the reason, and in a minute when anything happened one `last minute:` line: viewers, shares, Mbit/s,
+  frames dropped, tickets refused and why, and datagrams its socket dropped.
+- **Upgrading: the relay first, then its edges.** A relay and an edge talk when they speak the same pool version, whatever
+  their releases (1.15 speaks 1; both log it when they link); the client protocol has nothing to do with it. A relay
+  refuses an edge of another pool version, and says in its log and the Load tab which one to update. That edge logs an
+  error and asks again every minute, and until it is updated the viewers it would carry are served by the relay. Edges
+  do not update themselves: verify the new binary (§1), put it in place and restart them.
+- **Restarting the relay** ends every edge's link; they link again by themselves, at most 30 s after it is back, and
+  viewers come back as after any restart.
+- **Removing an edge, or one whose secret got out:** delete its line in `[pool] edges` and restart the relay. There is no
+  reload. A stolen secret lets its holder pose as that edge (which shuts the real one out) and get the shares the relay
+  places on it, still sealed, and send the apps of the viewers placed on it to any host and UDP port it names, as a
+  hostile relay could: one connection each, which shows that host their address.
+- **A new secret:** change it in both files, and restart both.
 
 ## 11. The file cache
 
@@ -720,7 +919,7 @@ dir = "emotes"             # kept across restarts; never [files] dir, nor inside
 The server listens on port **9987** by default: UDP for the QUIC endpoint every client
 connects to, TCP for the browser page. Configure it with a TOML file, which it reads only when
 started with `-c` (`voipc-server -c server.toml`; the `admin` and `db` commands need the same
-`-c server.toml`, before the command):
+`-c server.toml`, before the command, and a media edge reads a file of its own, `voipc-server -c edge.toml edge`, §10b):
 
 ```toml
 host = "::"               # Bind address — "::" serves IPv6 and IPv4 from one listener; "0.0.0.0" for IPv4 only
@@ -736,10 +935,14 @@ cert_path = "certs/server.crt"
 key_path = "certs/server.key"
 admin_token = "change-me"  # optional; unset = a random token is printed in the log at every start (with accounts, only while no account is admin)
 
-[media]                    # what screen shares and voice rooms may cost (1.14)
-share_viewers = 100        # viewers of one share; one more is told it is full
-video_egress_mbit = 1000   # video sent, all shares together, counted at each share's resolution (1080p 7.5, 720p 4, less 2 Mbit/s)
+[media]                    # what screen shares and voice rooms may cost (1.14, §10b)
+share_viewers = 100        # viewers of one share on this relay (its edges carry more); one more is told it is full
+video_egress_mbit = 1000   # video sent, all shares together, counted at each share's resolution (1080p 7.5, 720p 4, less 2 Mbit/s), one copy per edge fed
 voice_room = 250           # people in a voice room that names no limit (0: none); routed rooms keep none
+
+[pool]                     # media edges for big screen shares, none by default (1.15, §10b)
+local_first = 8            # the first viewers of each share stay on this relay; at most share_viewers
+# edges = { fra1 = "<openssl rand -base64 32>" }   # name = secret, as in that edge's edge.toml; keep this file 0600
 
 [files]                    # the encrypted file cache, on by default (§11 has every key)
 max_size_mb = 10           # largest file blob

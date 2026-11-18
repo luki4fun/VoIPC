@@ -12,7 +12,8 @@ import { emit as emitEvent } from "./events";
 import { getConfig } from "./config";
 import { loadWasm, wasm, type KeptPins, type KeptSessions, type LiveOut, type MediaKeys, type MessageRefs, type PreKeyBundleData, type Sealed, type SignalClient } from "./wasm";
 import { ACCOUNT_STEP_MS, AccountDriver, frameGoesOn, type AccountArgs, type AccountHost } from "./account";
-import { connect as openTransport, type Transport } from "./transport";
+import { connect as openTransport, openEdgeView, type Transport } from "./transport";
+import { EdgeView } from "./edge-view";
 import type { SessionContext } from "./types";
 import type { ChannelInfo } from "../../lib/types";
 import { parseHostPort } from "../../lib/invite";
@@ -97,6 +98,20 @@ function banRows(bans: unknown): unknown[] {
     created_at: Number(x.created_at),
     expires_in_secs: x.expires_in_secs == null ? null : Number(x.expires_in_secs),
   }));
+}
+
+/**
+ * A LoadReport for the Load tab, which does sums with it: its u64s arrive as
+ * BigInt (decodeServerMsg), and BigInt does not mix with numbers.
+ */
+function loadReport(report: Body): unknown {
+  const plain = (o: Body): Body =>
+    Object.fromEntries(Object.entries(o).map(([k, v]) => [k, typeof v === "bigint" ? Number(v) : v]));
+  return {
+    ...plain(report),
+    shares: (report.shares ?? []).map(plain),
+    edges: (report.edges ?? []).map(plain),
+  };
 }
 
 /** Milliseconds since the Unix epoch truncated to u32: the ping sequence. */
@@ -227,6 +242,8 @@ function attachVoice(s: Session): void {
 
 function detachVoice(): void {
   if (!voiceOwner) return;
+  // Its frames go to the media modules, which move or stop now
+  voiceOwner.closeEdge();
   voiceOwner = null;
   audio.detach();
   video.detach();
@@ -368,6 +385,8 @@ export class Session implements SessionContext, AccountHost {
   transport: Transport | null = null;
   /** The sharer we are watching (0 = none). */
   watchingUserId = 0;
+  /** The media edge the watched share comes from, when the relay placed us on one (protocol 26). */
+  private edge: EdgeView | null = null;
   /** The channel list as last received — the source of each channel's proximity mode. */
   private channels: ChannelInfo[] = [];
   /** A list too long for one frame, until its last. */
@@ -684,6 +703,7 @@ export class Session implements SessionContext, AccountHost {
     if (sessions.get(this.server) === this) sessions.delete(this.server);
     clearInterval(this.keepalive);
     clearInterval(this.liveClock);
+    this.closeEdge();
     this.files?.close();
     this.emotes?.close();
     if (voiceOwner === this) detachVoice();
@@ -1111,7 +1131,7 @@ export class Session implements SessionContext, AccountHost {
         this.emit("lobby-page", { rows: b.rows, next: b.next ?? null, total: b.total, sections: b.sections, prefix: b.prefix });
         break;
       case "AdminLoad":
-        this.emit("admin-load", b.report);
+        this.emit("admin-load", loadReport(b.report));
         break;
       case "WatchRefused":
         this.emit("watch-refused", { sharer_user_id: b.sharer_user_id, reason: b.reason });
@@ -1147,6 +1167,8 @@ export class Session implements SessionContext, AccountHost {
         this.emit("screenshare-stopped", { user_id: b.user_id });
         break;
       case "WatchingScreenShare":
+        // An edge of the share watched before is not this one's
+        if (this.edge && this.edge.sharer !== b.sharer_user_id) this.closeEdge();
         this.emit("watching-screenshare", { sharer_user_id: b.sharer_user_id, codec: b.codec });
         if (this === voiceOwner) {
           video
@@ -1155,8 +1177,12 @@ export class Session implements SessionContext, AccountHost {
         }
         break;
       case "StoppedWatchingScreenShare":
+        this.closeEdge();
         this.emit("stopped-watching-screenshare", { reason: b.reason });
         if (this === voiceOwner) video.stopWatching();
+        break;
+      case "WatchAt":
+        this.onWatchAt(b.sharer_user_id, b.placement, b.edge);
         break;
       case "ViewerCountChanged":
         this.emit("viewer-count-changed", { viewer_count: b.viewer_count });
@@ -1168,6 +1194,10 @@ export class Session implements SessionContext, AccountHost {
       case "VideoLossReported":
         // A viewer of our share lost frames: step the encoder down
         if (this === voiceOwner) share.onLossReport(b.frames_dropped);
+        break;
+      case "VideoLossSummary":
+        // Above 8 viewers, in place of each one's report: a majority steps it down
+        if (this === voiceOwner) share.onLossSummary(b.reporters, b.viewers);
         break;
       case "ScreenShareError":
         // A refused StartScreenShare (already sharing, not in voice) must also
@@ -1416,6 +1446,7 @@ export class Session implements SessionContext, AccountHost {
       this.signal.wantHistoryFrom(channelId, anonymous ? new Uint32Array() : this.historySources(users));
       if (this.watchingUserId !== 0) {
         this.watchingUserId = 0;
+        this.closeEdge();
         this.sendControl("StopWatchingScreenShare");
         this.emit("screen-share-force-stopped");
         if (this === voiceOwner) video.stopWatching();
@@ -1920,6 +1951,7 @@ export class Session implements SessionContext, AccountHost {
    */
   clearWatching(): void {
     this.watchingUserId = 0;
+    this.closeEdge();
   }
 
   /** We are about to ask this server for a voice seat; before the request, so its answer cannot beat it. */
@@ -1936,6 +1968,8 @@ export class Session implements SessionContext, AccountHost {
 
   watchScreenShare(sharerUserId: number): void {
     this.sendControl({ WatchScreenShare: { sharer_user_id: sharerUserId } });
+    // Watching the same share again keeps its edge until the relay's next WatchAt
+    if (sharerUserId !== this.watchingUserId) this.closeEdge();
     this.watchingUserId = sharerUserId;
   }
 
@@ -1951,6 +1985,51 @@ export class Session implements SessionContext, AccountHost {
     if (this.watchingUserId === 0) return;
     this.sendControl("StopWatchingScreenShare");
     this.watchingUserId = 0;
+    this.closeEdge();
+  }
+
+  /**
+   * `WatchAt` (protocol 26): the share we watch comes from this edge now, or
+   * over this connection again (`edge` undefined). Only the voice session
+   * watches, and one about a share we are not watching is late news.
+   */
+  private onWatchAt(sharerUserId: number, placement: bigint | number, edge: unknown): void {
+    if (this !== voiceOwner || sharerUserId === 0 || sharerUserId !== this.watchingUserId) return;
+    if (edge == null) this.closeEdge();
+    else this.edgeView().watchAt(sharerUserId, placement, edge);
+  }
+
+  /** Leave the share's edge, if we are on one: its frames stop reaching the viewer at once. */
+  closeEdge(): void {
+    this.edge?.close();
+  }
+
+  private edgeView(): EdgeView {
+    this.edge ??= new EdgeView({
+      open: (view, handlers) =>
+        openEdgeView(view.host, view.port, view.cert_hashes, view.ticket, handlers, wasm()),
+      edgeFailed: (sharerUserId, placement) =>
+        this.sendControl({ EdgeFailed: { sharer_user_id: sharerUserId, placement } }),
+      video: (bytes) => this.onEdgeVideo(bytes),
+      datagram: (bytes) => {
+        if (this === voiceOwner) audio.onScreenAudioPacket(bytes);
+      },
+      tunnel: () => this.transport?.tcp ?? false,
+      state: (e) => this.emit("edge-view", e),
+    });
+    return this.edge;
+  }
+
+  /**
+   * A record from the edge, into the viewer as one from the relay would go.
+   * Whether it completed a frame that decrypted is what the viewer counts as
+   * received: the edge's watchdog goes by that, not by bytes.
+   */
+  private onEdgeVideo(bytes: Uint8Array): boolean {
+    if (this !== voiceOwner) return false;
+    const before = video.getStats()[2];
+    video.onVideoPacket(bytes);
+    return video.getStats()[2] > before;
   }
 
   private sendPokeNow(targetUserId: number, message: string): void {

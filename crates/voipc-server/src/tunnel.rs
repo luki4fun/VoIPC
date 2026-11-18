@@ -48,7 +48,7 @@ use voipc_protocol::ws::{self, Decoder, Message};
 
 use crate::media;
 use crate::state::ServerState;
-use crate::web::{self, DatagramSink, SessionStart};
+use crate::web::{self, DatagramSink, KeyframeHook, SessionStart};
 
 /// Where the tunnel is, the WebTransport session's twin.
 const PATH: &str = "/voipc";
@@ -268,7 +268,8 @@ async fn run<S>(
         DatagramSink::Tunnel(datagram_tx),
         media_rx,
         video_tx,
-        state,
+        KeyframeHook::Core(state),
+        false,
     ));
 
     tokio::select! {

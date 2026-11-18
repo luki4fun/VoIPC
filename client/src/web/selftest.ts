@@ -239,6 +239,9 @@ export async function run(params: URLSearchParams): Promise<void> {
     "screenshare-started", "screenshare-stopped", "watching-screenshare",
     "stopped-watching-screenshare", "screenshare-error", "screenshare-frame",
     "viewer-count-changed",
+    // Where a share is watched from when the relay sends the viewer to a media edge
+    // (protocol 26): test-web.sh's EDGE lane looks for "ready" and no "failed"
+    "edge-view",
     "user-position", "proximity-mode", "channel-created", "channel-updated",
   ];
   // Every other event comes as {server, data}; the lines below log and read

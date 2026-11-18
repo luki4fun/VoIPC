@@ -529,6 +529,7 @@ pub const RESHAPED: &[(u32, Side, u32, &str)] = &[
         36,
         "PokeReceived without the sender's account",
     ),
+    (25, Side::Server, 90, "AdminLoad without edges"),
 ];
 
 /// How many messages each side had at a protocol: an index at or past it is
@@ -543,6 +544,7 @@ fn client_messages(proto: u32) -> u32 {
         19 => 54,
         20 => 55,
         21..=24 => 64,
+        25 => 68,
         _ => u32::MAX,
     }
 }
@@ -560,6 +562,7 @@ const EMOTE_TICKET: u32 = 57;
 const RESTRICTIONS: u32 = 68;
 const DIRECT_MESSAGE: u32 = 32;
 const POKE_RECEIVED: u32 = 36;
+const ADMIN_LOAD: u32 = 90;
 
 /// `encode_client_msg` for a relay at `proto`: the frames to send, one each
 /// so a sender's pacer counts them as the relay does (`EmoteRemove` of many
@@ -807,6 +810,10 @@ pub fn decode_server_msg_from(payload: &[u8], proto: u32) -> Result<ServerMessag
         }
         (DIRECT_MESSAGE, ..=24) => postcard::from_bytes::<Direct24>(rest)?.into(),
         (POKE_RECEIVED, ..=24) => postcard::from_bytes::<Poke24>(rest)?.into(),
+        // A struct variant of one field is that field's bytes; 90 is new at 25
+        (ADMIN_LOAD, 25) => ServerMessage::AdminLoad {
+            report: postcard::from_bytes::<LoadReport25>(rest)?.into(),
+        },
         (RESTRICTIONS, 19..=22) => ServerMessage::Restrictions {
             list: postcard::from_bytes::<Restrictions22>(rest)?
                 .list
@@ -887,6 +894,69 @@ impl From<Poke24> for ServerMessage {
             ciphertext: m.ciphertext,
             message_type: m.message_type,
             account: None,
+        }
+    }
+}
+
+/// The Load view of a relay at 25, which has no edges.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename = "LoadReport")]
+struct LoadReport25 {
+    online: u32,
+    max_users: u32,
+    in_rooms: u32,
+    lobby: u32,
+    live_lobby: u32,
+    shares: Vec<ShareLoad25>,
+    video_kbps: u64,
+    video_budget_kbps: u64,
+    rss_mib: u32,
+    cpu_secs: u64,
+    udp_dropped: u64,
+    last_minute: Vec<String>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename = "ShareLoad")]
+struct ShareLoad25 {
+    channel_id: ChannelId,
+    sharer: String,
+    viewers: u32,
+    cap: u32,
+    kbps: u32,
+}
+
+impl From<LoadReport25> for LoadReport {
+    fn from(r: LoadReport25) -> LoadReport {
+        LoadReport {
+            online: r.online,
+            max_users: r.max_users,
+            in_rooms: r.in_rooms,
+            lobby: r.lobby,
+            live_lobby: r.live_lobby,
+            shares: r.shares.into_iter().map(ShareLoad::from).collect(),
+            video_kbps: r.video_kbps,
+            video_budget_kbps: r.video_budget_kbps,
+            rss_mib: r.rss_mib,
+            cpu_secs: r.cpu_secs,
+            udp_dropped: r.udp_dropped,
+            last_minute: r.last_minute,
+            warnings: r.warnings,
+            edges: vec![],
+        }
+    }
+}
+
+impl From<ShareLoad25> for ShareLoad {
+    fn from(s: ShareLoad25) -> ShareLoad {
+        ShareLoad {
+            channel_id: s.channel_id,
+            sharer: s.sharer,
+            viewers: s.viewers,
+            cap: s.cap,
+            kbps: s.kbps,
+            on_edges: 0,
         }
     }
 }
@@ -1255,6 +1325,11 @@ mod tests {
                 "EmoteTicket",
                 variant(14, &["ServerMessage", "ENUM", "57", "EmoteTicket"]),
             ),
+            (
+                traced::<AdminLoad25>(),
+                "AdminLoad",
+                variant(25, &["ServerMessage", "ENUM", "90", "AdminLoad"]),
+            ),
         ];
         let cases = cases
             .into_iter()
@@ -1302,6 +1377,77 @@ mod tests {
             variant(14, &["ClientMessage", "ENUM", "46", "EmoteRemove"]),
             serde_json::json!({ "STRUCT": [{ "name": "STR" }] })
         );
+    }
+
+    /// `ServerMessage::AdminLoad` at 25 as the golden file has it, around the report. The
+    /// decode arm reads `LoadReport25` alone: one field's variant has that field's bytes.
+    #[derive(Serialize, Deserialize)]
+    #[serde(rename = "AdminLoad")]
+    struct AdminLoad25 {
+        report: LoadReport25,
+    }
+
+    #[test]
+    fn the_load_view_of_a_relay_at_25_has_no_edges() {
+        let report = LoadReport25 {
+            online: 3,
+            max_users: 10,
+            in_rooms: 2,
+            lobby: 1,
+            live_lobby: 500,
+            shares: vec![ShareLoad25 {
+                channel_id: 4,
+                sharer: "ann".into(),
+                viewers: 2,
+                cap: 32,
+                kbps: 7500,
+            }],
+            video_kbps: 15_000,
+            video_budget_kbps: 1_000_000,
+            rss_mib: 60,
+            cpu_secs: 9,
+            udp_dropped: 1,
+            last_minute: vec!["a".into()],
+            warnings: vec!["w".into()],
+        };
+        let payload = postcard::to_allocvec(&(ADMIN_LOAD, AdminLoad25 { report })).unwrap();
+        let ServerMessage::AdminLoad { report } = decode_server_msg_from(&payload, 25).unwrap()
+        else {
+            panic!("not AdminLoad");
+        };
+        assert!(report.edges.is_empty());
+        assert_eq!((report.online, report.udp_dropped), (3, 1));
+        assert_eq!(report.warnings, ["w"]);
+        assert_eq!(
+            report.shares,
+            [ShareLoad {
+                channel_id: 4,
+                sharer: "ann".into(),
+                viewers: 2,
+                cap: 32,
+                kbps: 7500,
+                on_edges: 0,
+            }]
+        );
+        // Today's comes through as it is
+        let edge = EdgeLoad {
+            name: "e1".into(),
+            online: true,
+            ..Default::default()
+        };
+        let msg = ServerMessage::AdminLoad {
+            report: LoadReport {
+                edges: vec![edge.clone()],
+                ..Default::default()
+            },
+        };
+        let bytes = encode_server_msg(&msg).unwrap();
+        let ServerMessage::AdminLoad { report } =
+            decode_server_msg_from(&bytes[4..], PROTOCOL_VERSION).unwrap()
+        else {
+            panic!("not AdminLoad");
+        };
+        assert_eq!(report.edges, [edge]);
     }
 
     /// The payloads of the frames, each checked to be exactly one frame.
@@ -1482,6 +1628,13 @@ mod tests {
                     offset: 0,
                 },
                 19,
+            ),
+            (
+                ClientMessage::EdgeFailed {
+                    sharer_user_id: 1,
+                    placement: 2,
+                },
+                25,
             ),
         ];
         for (msg, v) in cases {

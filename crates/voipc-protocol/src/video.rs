@@ -343,6 +343,19 @@ impl FrameAssembler {
 
         // New frame arrived — discard any incomplete previous frame
         if self.current_frame_id != Some(frame_id) {
+            // A frame at or within 1000 behind the last one completed comes too late, or
+            // twice: from the relay and an edge across a switch between them, or replayed
+            // by an edge. Its id is the sharer's nonce counter, which never goes back, so
+            // nothing the sharer sends is lost here. `current_frame_id` alone would not
+            // catch it, being cleared once a frame completes.
+            if let Some(last) = self.last_completed_frame_id {
+                if last.wrapping_sub(frame_id) < 1000 {
+                    return FragmentResult {
+                        frame: None,
+                        frame_dropped: false,
+                    };
+                }
+            }
             if let Some(cur) = self.current_frame_id {
                 // Wraparound-safe: treat frames within 1000 behind current as old
                 let behind = cur.wrapping_sub(frame_id);
@@ -889,6 +902,37 @@ mod tests {
         let r = assembler.add_fragment(&pkt);
         assert!(r.frame.is_none());
         assert!(!r.frame_dropped); // old frame ignored, not a drop
+    }
+
+    /// The floor: once frame 9 is shown, an older frame or 9 again (an edge's replay, or
+    /// the relay's copy across a switch) is not, and 10 is.
+    #[test]
+    fn a_frame_behind_the_last_completed_is_dropped() {
+        let mut assembler = FrameAssembler::new();
+        let frame =
+            |id: u32, key: bool| VideoPacket::fragment(key, 1, id, 0, 1, id * 100, vec![id as u8]);
+        assert!(assembler.add_fragment(&frame(9, true)).frame.is_some());
+
+        for late in [frame(7, false), frame(7, true), frame(9, true)] {
+            let r = assembler.add_fragment(&late);
+            assert!(r.frame.is_none(), "frame {}", late.frame_id);
+            assert!(!r.frame_dropped);
+        }
+        // Nor does an old frame of two fragments start being put together
+        let first = VideoPacket::fragment(false, 1, 8, 0, 2, 800, vec![1]);
+        let second = VideoPacket::fragment(false, 1, 8, 1, 2, 800, vec![2]);
+        assert!(assembler.add_fragment(&first).frame.is_none());
+        assert!(assembler.add_fragment(&second).frame.is_none());
+
+        let r = assembler.add_fragment(&frame(10, false));
+        assert_eq!(r.frame, Some((vec![10], false)));
+        assert!(!r.frame_dropped);
+        // The window is 1000 frames, as for `current_frame_id`: one further back passes,
+        // and shows stale content until the next keyframe (THREAT-MODEL, an edge's replay)
+        let mut assembler = FrameAssembler::new();
+        assert!(assembler.add_fragment(&frame(1500, true)).frame.is_some());
+        assert!(assembler.add_fragment(&frame(501, false)).frame.is_none());
+        assert!(assembler.add_fragment(&frame(500, false)).frame.is_some());
     }
 
     #[test]

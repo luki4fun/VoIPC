@@ -18,12 +18,14 @@
 
 use std::borrow::Cow;
 use std::convert::Infallible;
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use bytes::Bytes;
+use bytes::{BufMut as _, Bytes, BytesMut};
 use http_body_util::BodyExt as _;
 use http_body_util::Full;
 use hyper::body::Incoming;
@@ -35,9 +37,9 @@ use rust_embed::Embed;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
-use tokio::io::{AsyncWriteExt, DuplexStream};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt, DuplexStream};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_rustls::server::TlsStream;
 use tracing::{debug, info, warn};
@@ -51,6 +53,7 @@ use wtransport::{
     Connection, Endpoint, Identity, SendStream, ServerConfig as WtServerConfig, VarInt,
 };
 
+use voipc_protocol::pool::POOL_PATH;
 use voipc_protocol::types::SessionId;
 use voipc_protocol::video::{
     FrameGrouper, RecordReader, MAX_FRAGMENTS_PER_FRAME, VIDEO_HEADER_SIZE,
@@ -59,16 +62,20 @@ use voipc_protocol::video::{
 use crate::accounts::provider;
 use crate::config::ServerConfig;
 use crate::media;
+use crate::session::NoFrame;
 use crate::state::ServerState;
-use crate::{session, ConnLimits};
+use crate::{session, ConnLimits, PreSlot};
 
 /// TLS server name native clients send to receive the operator certificate
 /// instead of the browser-pinned one.
 pub const NATIVE_SNI: &str = "voipc-native";
 
+/// Where a client opens its session.
+const SESSION_PATH: &str = "/voipc";
+
 /// Largest per-frame video stream accepted from a sharer (a 1080p keyframe
 /// is well under 1 MiB).
-const MAX_FRAME_STREAM_BYTES: u64 = 8 * 1024 * 1024;
+pub(crate) const MAX_FRAME_STREAM_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Sent with every response. Scripts are the bundle's own (wasm needs
 /// `wasm-unsafe-eval`), `connect-src https:` lets the page fetch `/wt.json`
@@ -573,9 +580,11 @@ fn owned(status: StatusCode, body: Bytes) -> Response<Full<Bytes>> {
 // ── Certificate selection ───────────────────────────────────────────────
 
 /// Serves the operator certificate to native clients (by SNI) and the
-/// rotating self-signed one to everyone else.
+/// rotating self-signed one to everyone else. An edge has no operator
+/// certificate (`native` is `None`): everyone gets the rotating one, which
+/// the app pins by hash there as the browser does.
 struct CertPicker {
-    native: Arc<CertifiedKey>,
+    native: Option<Arc<CertifiedKey>>,
     browser: RwLock<Arc<CertifiedKey>>,
 }
 
@@ -587,15 +596,14 @@ impl std::fmt::Debug for CertPicker {
 
 impl ResolvesServerCert for CertPicker {
     fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        if hello.server_name() == Some(NATIVE_SNI) {
-            Some(self.native.clone())
-        } else {
-            Some(
+        match &self.native {
+            Some(native) if hello.server_name() == Some(NATIVE_SNI) => Some(native.clone()),
+            _ => Some(
                 self.browser
                     .read()
                     .unwrap_or_else(PoisonError::into_inner)
                     .clone(),
-            )
+            ),
         }
     }
 }
@@ -603,7 +611,7 @@ impl ResolvesServerCert for CertPicker {
 /// A fresh ECDSA P-256 certificate valid 14 days — what browsers require
 /// for hash-pinned certificates — as a rustls key plus the hash `/wt.json`
 /// publishes.
-fn browser_key(sans: &[String]) -> Result<(Arc<CertifiedKey>, Sha256Digest)> {
+pub(crate) fn browser_key(sans: &[String]) -> Result<(Arc<CertifiedKey>, Sha256Digest)> {
     let identity = Identity::self_signed(sans).context("failed to generate browser certificate")?;
     let cert = identity
         .certificate_chain()
@@ -629,14 +637,30 @@ fn certified_key(
 
 // ── QUIC endpoint ───────────────────────────────────────────────────────
 
-/// The QUIC endpoint all clients connect to.
+/// A QUIC endpoint: the relay's, which all clients connect to, or an edge's,
+/// which its viewers do (`Role`).
 pub struct WebTransport {
     endpoint: Endpoint<Server>,
     picker: Arc<CertPicker>,
     sans: Vec<String>,
     info: Arc<WtInfo>,
+    /// The browser certificate's SHA-256, then the one before it (`cert_hashes`).
+    hashes: watch::Sender<Vec<[u8; 32]>>,
     /// `SESSION_SETUP`; a test shortens it.
     setup_time: Duration,
+}
+
+/// What an endpoint is for, which sets what a peer may open and send on it.
+#[derive(Clone, Copy)]
+pub(crate) enum Role {
+    /// The relay's: every client's session, sharers' video in and viewers'
+    /// out.
+    Relay,
+    /// An edge's, for its viewers (`pool::VIEW_PATH`). A viewer sends its
+    /// ticket and nothing more, so it may open no more streams than HTTP/3
+    /// needs and has little room to fill.
+    #[allow(dead_code, reason = "the edge role (edge.rs) binds it")]
+    EdgeViewers,
 }
 
 /// How long a QUIC session may take from its first packet to an answered
@@ -645,15 +669,31 @@ pub struct WebTransport {
 const SESSION_SETUP: Duration = Duration::from_secs(10);
 
 impl WebTransport {
-    /// Bind on `host:udp_port`. `certs`/`key` is the operator identity
-    /// served to native clients; the browser certificate is generated here.
+    /// Bind the relay's endpoint on `host:udp_port`. `certs`/`key` is the
+    /// operator identity served to native clients; the browser certificate is
+    /// generated here.
     pub fn bind(
         config: &ServerConfig,
         certs: Vec<CertificateDer<'static>>,
         key: PrivateKeyDer<'static>,
     ) -> Result<Self> {
         let bind_addr = config.bind_addr(config.udp_port)?;
+        let mut web = Self::bind_with(bind_addr, Some((certs, key)), Role::Relay)?;
+        // Only the relay's page offers the tunnel
+        Arc::get_mut(&mut web.info)
+            .expect("nothing holds the page's info yet")
+            .tcp = config.tcp_fallback;
+        Ok(web)
+    }
 
+    /// Bind on `addr` as `role`. `native` is the operator identity served to
+    /// native clients (`NATIVE_SNI`); without one, everyone gets the browser
+    /// certificate, which is generated here.
+    pub(crate) fn bind_with(
+        bind_addr: SocketAddr,
+        native: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
+        role: Role,
+    ) -> Result<Self> {
         // Browsers pin the certificate by hash (serverCertificateHashes), the
         // SANs just keep it honest: the bind IP when it is a concrete one,
         // plus localhost.
@@ -664,7 +704,9 @@ impl WebTransport {
         sans.push("localhost".to_string());
 
         let (browser, cert_hash) = browser_key(&sans)?;
-        let native = certified_key(certs, key)
+        let native = native
+            .map(|(certs, key)| certified_key(certs, key))
+            .transpose()
             .context("invalid TLS certificate/key for the QUIC endpoint")?;
         let picker = Arc::new(CertPicker {
             native,
@@ -672,17 +714,18 @@ impl WebTransport {
         });
         let socket =
             udp_socket(bind_addr).with_context(|| format!("failed to bind QUIC on {bind_addr}"))?;
-        let endpoint = Endpoint::server(server_config(socket, picker.clone()))
+        let endpoint = Endpoint::server(server_config(socket, picker.clone(), role))
             .with_context(|| format!("failed to bind QUIC on {bind_addr}"))?;
 
         Ok(Self {
             endpoint,
             picker,
             sans,
+            hashes: watch::Sender::new(vec![*cert_hash.as_ref()]),
             info: Arc::new(WtInfo {
-                port: config.udp_port,
+                port: bind_addr.port(),
                 cert_hash: RwLock::new(cert_hash),
-                tcp: config.tcp_fallback,
+                tcp: false,
             }),
             setup_time: SESSION_SETUP,
         })
@@ -692,15 +735,31 @@ impl WebTransport {
         self.info.clone()
     }
 
+    /// The SHA-256 of the browser certificate, then of the one it replaced:
+    /// what an edge tells its core to send viewers (`EdgeMsg::CertRotated`).
+    /// Changes at each rotation.
+    #[allow(dead_code, reason = "the edge role (edge.rs) watches it")]
+    pub(crate) fn cert_hashes(&self) -> watch::Receiver<Vec<[u8; 32]>> {
+        self.hashes.subscribe()
+    }
+
     #[cfg(test)]
     fn local_addr(&self) -> std::io::Result<SocketAddr> {
         self.endpoint.local_addr()
     }
 
-    /// Accept sessions forever. The browser certificate is replaced every
-    /// 7 days (`VOIPC_WT_ROTATE_SECS` overrides the interval for testing);
-    /// running sessions keep their old one.
+    /// The relay's accept loop: `serve` with the relay's `Routes`.
     pub async fn run(self, state: Arc<ServerState>, limits: Arc<ConnLimits>) {
+        let routes = Arc::new(Routes::relay(&state));
+        self.serve(limits, routes).await;
+    }
+
+    /// Accept sessions forever, each on the route its path names. Every
+    /// connection holds one of `limits`' pre-authentication slots from its
+    /// first packet on, and hands it to its route. The browser certificate is
+    /// replaced every 7 days (`VOIPC_WT_ROTATE_SECS` overrides the interval
+    /// for testing); running sessions keep their old one.
+    pub(crate) async fn serve(self, limits: Arc<ConnLimits>, routes: Arc<Routes>) {
         let rotate_every = std::env::var("VOIPC_WT_ROTATE_SECS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
@@ -731,7 +790,11 @@ impl WebTransport {
                 incoming.retry();
                 continue;
             }
-            if crate::bans::refused_at_accept(&state, peer.ip()) {
+            if routes
+                .accept
+                .as_ref()
+                .is_some_and(|accept| !accept(peer.ip()))
+            {
                 limits.count("refused", "banned");
                 debug!(%peer, "refusing session: banned");
                 incoming.refuse();
@@ -746,10 +809,9 @@ impl WebTransport {
                 }
             };
 
-            let state = state.clone();
+            let (limits, routes) = (limits.clone(), routes.clone());
             let setup_time = self.setup_time;
             tokio::spawn(async move {
-                let _slot = slot;
                 // One deadline for the whole setup, the QUIC handshake and then
                 // the answer to the session request: a peer that lets the
                 // answer stall (no flow-control credit) would otherwise keep
@@ -760,25 +822,23 @@ impl WebTransport {
                         Ok(request) => request,
                         Err(e) => return Err(("QUIC handshake failed", e.to_string())),
                     };
-                    if request.path() != "/voipc" {
+                    let Some(route) = routes.find(request.path()).cloned() else {
                         request.not_found().await;
                         return Err(("unknown path", String::new()));
+                    };
+                    match request.accept().await {
+                        Ok(connection) => Ok((connection, route)),
+                        Err(e) => Err(("session accept failed", e.to_string())),
                     }
-                    request
-                        .accept()
-                        .await
-                        .map_err(|e| ("session accept failed", e.to_string()))
                 };
                 match tokio::time::timeout(setup_time, setup).await {
-                    Ok(Ok(connection)) => run_session(connection, state, peer).await,
+                    Ok(Ok((connection, route))) => route(connection, peer, slot).await,
                     Ok(Err((why, detail))) => {
-                        state.limits.count("setup failed", why);
+                        limits.count("setup failed", why);
                         debug!(%peer, "rejecting session: {why} {detail}");
                     }
                     Err(_) => {
-                        state
-                            .limits
-                            .count("setup failed", "session setup timed out");
+                        limits.count("setup failed", "session setup timed out");
                         debug!(%peer, "session setup timed out");
                     }
                 }
@@ -794,6 +854,7 @@ impl WebTransport {
                 return;
             }
         };
+        let hash: [u8; 32] = *cert_hash.as_ref();
         *self
             .picker
             .browser
@@ -804,7 +865,96 @@ impl WebTransport {
             .cert_hash
             .write()
             .unwrap_or_else(PoisonError::into_inner) = cert_hash;
+        // The new one first, then the one it replaced; an older one goes
+        self.hashes.send_modify(|hashes| {
+            let previous = hashes.first().copied();
+            *hashes = std::iter::once(hash).chain(previous).collect();
+        });
         info!("rotated browser certificate");
+    }
+}
+
+/// A session past its setup, handed to what serves its path: its connection,
+/// its peer, and its pre-authentication slot. The route holds the slot for as
+/// long as the connection should count in `ConnLimits`' pre pool, and drops it
+/// when that ends.
+pub(crate) type Route = Arc<
+    dyn Fn(Connection, SocketAddr, PreSlot) -> Pin<Box<dyn Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Whether an address may connect at all (`Routes::accept`).
+pub(crate) type AcceptFilter = Arc<dyn Fn(IpAddr) -> bool + Send + Sync>;
+
+/// What an endpoint serves (`WebTransport::serve`): who may connect, and the
+/// session paths it answers. Any other path is answered 404.
+pub(crate) struct Routes {
+    /// Asked of every address before anything is spent on it; `false` refuses
+    /// the connection, counted as a ban. The relay's is its ban list
+    /// (`bans::refused_at_accept`); an edge has none.
+    pub accept: Option<AcceptFilter>,
+    paths: Vec<(&'static str, Route)>,
+}
+
+impl Routes {
+    pub(crate) fn new(accept: Option<AcceptFilter>) -> Self {
+        Self {
+            accept,
+            paths: Vec::new(),
+        }
+    }
+
+    /// Serve sessions opened at `path` with `route`.
+    pub(crate) fn at<F, Fut>(mut self, path: &'static str, route: F) -> Self
+    where
+        F: Fn(Connection, SocketAddr, PreSlot) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let route: Route = Arc::new(
+            move |connection: Connection,
+                  peer: SocketAddr,
+                  slot: PreSlot|
+                  -> Pin<Box<dyn Future<Output = ()> + Send>> {
+                Box::pin(route(connection, peer, slot))
+            },
+        );
+        self.paths.push((path, route));
+        self
+    }
+
+    /// The relay's: its ban list at accept, client sessions, and the links of
+    /// its media edges while it has any (`pool::serves_edges`; without edges
+    /// that path is not found, as any other).
+    pub(crate) fn relay(state: &Arc<ServerState>) -> Self {
+        let bans = state.clone();
+        let sessions = state.clone();
+        let routes = Self::new(Some(Arc::new(move |ip| {
+            !crate::bans::refused_at_accept(&bans, ip)
+        })))
+        .at(SESSION_PATH, move |connection, peer, slot| {
+            let state = sessions.clone();
+            async move {
+                // Held for the session's life: signed in, it counts in the
+                // main pool instead (`promote`) and comes back here at the end
+                let _slot = slot;
+                run_session(connection, state, peer).await;
+            }
+        });
+        if !crate::pool::serves_edges(state) {
+            return routes;
+        }
+        let links = state.clone();
+        routes.at(POOL_PATH, move |connection, peer, slot| {
+            crate::pool::run_link(connection, links.clone(), peer, slot)
+        })
+    }
+
+    fn find(&self, path: &str) -> Option<&Route> {
+        self.paths
+            .iter()
+            .find(|(served, _)| *served == path)
+            .map(|(_, route)| route)
     }
 }
 
@@ -870,7 +1020,22 @@ fn udp_socket(addr: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
     Ok(socket.into())
 }
 
-fn server_config(socket: std::net::UdpSocket, picker: Arc<CertPicker>) -> WtServerConfig {
+/// An edge's viewer (`Role::EdgeViewers`) may open HTTP/3's three streams
+/// (control and the two QPACK ones) and one more; its ticket goes on a
+/// bidirectional stream.
+const VIEWER_UNI_STREAMS: u32 = 4;
+/// What a viewer may have in flight to an edge, across every stream: HTTP/3's
+/// settings, the session request and a ticket are a few hundred bytes.
+const VIEWER_RECEIVE_WINDOW: u32 = 64 * 1024;
+/// Datagrams a viewer sends an edge are never read, so quinn would hold the
+/// last of them for the connection's life: this little.
+const VIEWER_DATAGRAMS: usize = 16 * 1024;
+
+fn server_config(
+    socket: std::net::UdpSocket,
+    picker: Arc<CertPicker>,
+    role: Role,
+) -> WtServerConfig {
     let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
@@ -914,6 +1079,12 @@ fn server_config(socket: std::net::UdpSocket, picker: Arc<CertPicker>) -> WtServ
         .datagram_send_buffer_size(64 * 1024)
         .send_window(512 * 1024)
         .send_fairness(false);
+    if let Role::EdgeViewers = role {
+        transport
+            .max_concurrent_uni_streams(VIEWER_UNI_STREAMS.into())
+            .receive_window(VIEWER_RECEIVE_WINDOW.into())
+            .datagram_receive_buffer_size(Some(VIEWER_DATAGRAMS));
+    }
 
     let mut config = WtServerConfig::builder()
         .with_bind_socket(socket)
@@ -1020,7 +1191,8 @@ async fn run_session(connection: Connection, state: Arc<ServerState>, peer: Sock
         DatagramSink::Quic(connection.clone()),
         media_rx,
         video_tx,
-        state.clone(),
+        KeyframeHook::Core(state.clone()),
+        false,
     ));
     pumps.spawn(pump_video_streams(connection.clone(), video_rx));
     pumps.spawn(pump_media_in(connection.clone(), sid_rx, state));
@@ -1087,7 +1259,7 @@ const LINGER: Duration = Duration::from_secs(5);
 /// This QUIC connection's exporter (`voipc_crypto::bind`), which the client reads from its
 /// end of the same TLS session. None only if TLS failed to give one: every proof that
 /// needs it is then refused.
-fn quic_binding(connection: &Connection) -> Option<[u8; BIND_LEN]> {
+pub(crate) fn quic_binding(connection: &Connection) -> Option<[u8; BIND_LEN]> {
     let mut out = [0u8; BIND_LEN];
     connection
         .export_keying_material(&mut out, EXPORTER_LABEL, &[])
@@ -1205,20 +1377,45 @@ pub(crate) enum DatagramSink {
     Tunnel(mpsc::Sender<Bytes>),
 }
 
+/// Who `pump_media_out` asks for the keyframe that ends a drop.
+pub(crate) enum KeyframeHook {
+    /// A relay's viewer: the sharer, through its session, within the share's
+    /// budget (`session::relay_keyframe_request`).
+    Core(Arc<ServerState>),
+    /// An edge's viewer: the edge, which asks its core
+    /// (`EdgeMsg::KeyframeWanted`).
+    #[allow(dead_code, reason = "the edge role (edge.rs) makes it")]
+    Edge(Arc<dyn Fn(SessionId) + Send + Sync>),
+}
+
+impl KeyframeHook {
+    fn ask(&self, sharer: SessionId) {
+        match self {
+            Self::Core(state) => crate::session::relay_keyframe_request(state, sharer),
+            Self::Edge(ask) => ask(sharer),
+        }
+    }
+}
+
 /// Server → client media, read from the session's relay queue. Everything
 /// but video goes out as a datagram right here (neither sink ever blocks);
 /// video is queued for the stream writer a whole frame at a time and dropped
 /// whole when it does not fit (see `VideoAdmission`), so this loop never
-/// stalls on the transport. A drop asks the sharer for the keyframe that
-/// ends it.
+/// stalls on the transport. A drop asks `hook` for the keyframe that ends it.
+///
+/// `start_on_key`: hold every delta back until the first keyframe, as after a
+/// drop, for a queue that joins a share already running (an edge's feed, an
+/// edge's viewer), whose first deltas could not be decoded. Whoever joins
+/// asks for that keyframe itself, so this wait asks nobody.
 pub(crate) async fn pump_media_out(
     sink: DatagramSink,
     mut media_rx: mpsc::Receiver<Bytes>,
     video_tx: mpsc::Sender<Bytes>,
-    state: Arc<ServerState>,
+    hook: KeyframeHook,
+    start_on_key: bool,
 ) {
     let mut warned_oversize = false;
-    let mut admission = VideoAdmission::default();
+    let mut admission = VideoAdmission::new(start_on_key);
     while let Some(packet) = media_rx.recv().await {
         if packet.is_empty() {
             continue;
@@ -1235,7 +1432,7 @@ pub(crate) async fn pump_media_out(
                     if !dropping && admission.await_key {
                         let sharer =
                             u32::from_be_bytes([packet[1], packet[2], packet[3], packet[4]]);
-                        crate::session::relay_keyframe_request(&state, sharer).await;
+                        hook.ask(sharer);
                     }
                     continue;
                 }
@@ -1284,7 +1481,7 @@ pub(crate) async fn pump_media_out(
 /// also leave room for a whole keyframe, so the one that ends a drop is never
 /// refused for a queue the deltas filled.
 #[derive(Default)]
-struct VideoAdmission {
+pub(crate) struct VideoAdmission {
     /// (frame_id, admitted) of the frame being queued.
     current: Option<(u32, bool)>,
     /// A frame was refused: nothing decodes again before a keyframe.
@@ -1292,10 +1489,19 @@ struct VideoAdmission {
 }
 
 impl VideoAdmission {
+    /// `start_on_key`: refuse deltas until the first keyframe, as after a
+    /// refusal.
+    pub(crate) fn new(start_on_key: bool) -> Self {
+        Self {
+            current: None,
+            await_key: start_on_key,
+        }
+    }
+
     /// `room` is the free space in the queue, in fragments. Reads only
     /// `frame_id` (bytes 5..9) and `fragment_count` (byte 10), like
     /// `FrameGrouper`.
-    fn admit(&mut self, packet: &[u8], room: usize) -> bool {
+    pub(crate) fn admit(&mut self, packet: &[u8], room: usize) -> bool {
         if packet.len() < VIDEO_HEADER_SIZE {
             return false;
         }
@@ -1316,7 +1522,10 @@ impl VideoAdmission {
 
 /// Video fragments → one unidirectional stream per frame, each fragment
 /// prefixed with its u16-BE length (fragments exceed the datagram MTU).
-async fn pump_video_streams(connection: Connection, mut video_rx: mpsc::Receiver<Bytes>) {
+pub(crate) async fn pump_video_streams(
+    connection: Connection,
+    mut video_rx: mpsc::Receiver<Bytes>,
+) {
     let mut grouper = FrameGrouper::default();
     let mut stream: Option<SendStream> = None;
     while let Some(packet) = video_rx.recv().await {
@@ -1361,6 +1570,43 @@ async fn pump_video_streams(connection: Connection, mut video_rx: mpsc::Receiver
 async fn finish(stream: Option<SendStream>) {
     if let Some(mut stream) = stream {
         let _ = stream.shutdown().await;
+    }
+}
+
+/// The next frame on a stream of the pool's links (`pool::POOL_PATH`,
+/// `pool::VIEW_PATH`): a big-endian u32 length, then that many bytes, at most
+/// `max`. A longer one is `Malformed` before any of it is read. Reads no
+/// further than the frame's end and keeps what it read in `buf`, so a read
+/// dropped halfway (by a `select!` or a timeout) loses nothing: the next call
+/// on the same `buf` goes on from there. The caller bounds the wait.
+#[allow(
+    dead_code,
+    reason = "the pool (pool.rs) and the edge role (edge.rs) read with it"
+)]
+pub(crate) async fn read_frame<R: AsyncRead + Unpin>(
+    recv: &mut R,
+    buf: &mut BytesMut,
+    max: usize,
+) -> std::result::Result<Vec<u8>, NoFrame> {
+    loop {
+        let need = match buf.get(..4) {
+            None => 4 - buf.len(),
+            Some(head) => {
+                let len = u32::from_be_bytes(head.try_into().expect("4 bytes")) as usize;
+                if len > max {
+                    return Err(NoFrame::Malformed);
+                }
+                if buf.len() >= 4 + len {
+                    return Ok(buf.split_to(4 + len)[4..].to_vec());
+                }
+                4 + len - buf.len()
+            }
+        };
+        buf.reserve(need);
+        match recv.read_buf(&mut (&mut *buf).limit(need)).await {
+            Ok(0) | Err(_) => return Err(NoFrame::Closed),
+            Ok(_) => {}
+        }
     }
 }
 
@@ -1481,6 +1727,20 @@ mod tests {
         sni: &str,
         seen: Arc<Mutex<Option<[u8; 32]>>>,
     ) -> (Endpoint<Client>, Connection) {
+        let (endpoint, connection) = connect_to(addr, sni, SESSION_PATH, seen).await;
+        (endpoint, connection.unwrap())
+    }
+
+    /// `connect`, to a session at `path`, however that ends.
+    async fn connect_to(
+        addr: SocketAddr,
+        sni: &str,
+        path: &str,
+        seen: Arc<Mutex<Option<[u8; 32]>>>,
+    ) -> (
+        Endpoint<Client>,
+        std::result::Result<Connection, wtransport::error::ConnectingError>,
+    ) {
         let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
@@ -1498,11 +1758,10 @@ mod tests {
         let endpoint = Endpoint::client(config).unwrap();
         let connection = tokio::time::timeout(
             HANG,
-            endpoint.connect(format!("https://{sni}:{}/voipc", addr.port())),
+            endpoint.connect(format!("https://{sni}:{}{path}", addr.port())),
         )
         .await
-        .expect("handshake")
-        .unwrap();
+        .expect("the connect neither went through nor failed");
         (endpoint, connection)
     }
 
@@ -1954,6 +2213,332 @@ mod tests {
         })
         .await
         .expect("session removed");
+    }
+
+    /// The ban list is asked at accept, on the way through `serve`: nothing
+    /// else would notice the filter going missing, since the ban tests ask
+    /// `refused_at_accept` themselves.
+    #[tokio::test]
+    async fn a_banned_address_is_refused_at_accept_through_serve() {
+        let (web, state, _) = test_server();
+        let addr = web.local_addr().unwrap();
+        let limits = Arc::new(ConnLimits::from_config(&ServerConfig::default()));
+        tokio::spawn(web.run(state.clone(), limits.clone()));
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let key = crate::bans::Key::Addr(crate::bans::addr_key(&state, ip));
+        state.bans.insert(
+            key,
+            crate::bans::Ban {
+                id: 1,
+                label: "native".into(),
+                reason: "test".into(),
+                by: "server shell".into(),
+                created_at: crate::bans::now_secs(),
+                expires_at: None,
+                addr: None,
+                alias: None,
+            },
+        );
+
+        let (_endpoint, refused) = connect_to(addr, NATIVE_SNI, SESSION_PATH, Arc::default()).await;
+        assert!(refused.is_err(), "a banned address got a session");
+        let counts = limits.take_counts();
+        assert!(counts.get(&("refused", "banned")) >= Some(&1), "{counts:?}");
+        assert!(
+            !counts.contains_key(&("setup failed", "QUIC handshake failed")),
+            "it got as far as a handshake: {counts:?}"
+        );
+        assert!(state.sessions.is_empty());
+
+        // The same connect without the ban goes through
+        state.bans.remove(&key);
+        let (_endpoint, connection) = connect(addr, NATIVE_SNI, Arc::default()).await;
+        connection.close(VarInt::from_u32(0), b"");
+    }
+
+    /// An edge tells its core the hashes viewers may pin: the new certificate's
+    /// first, then the one it replaced, never an older one.
+    #[tokio::test]
+    async fn a_rotation_names_the_new_certificate_then_the_one_before() {
+        let (web, state, _) = test_server();
+        let addr = web.local_addr().unwrap();
+        let mut hashes = web.cert_hashes();
+        let served =
+            |web: &WebTransport| -> [u8; 32] { *web.info().cert_hash.read().unwrap().as_ref() };
+        let first = hashes.borrow_and_update().clone();
+        assert_eq!(first, [served(&web)]);
+
+        web.rotate_certificate();
+        assert!(hashes.has_changed().unwrap(), "the rotation told nobody");
+        let second = hashes.borrow_and_update().clone();
+        assert_eq!(second.len(), 2, "{second:?}");
+        assert_ne!(second[0], first[0]);
+        assert_eq!(second, [served(&web), first[0]]);
+
+        web.rotate_certificate();
+        let third = hashes.borrow_and_update().clone();
+        assert_eq!(third, [served(&web), second[0]]);
+
+        // And a browser is given the newest
+        tokio::spawn(web.run(
+            state,
+            Arc::new(ConnLimits::from_config(&ServerConfig::default())),
+        ));
+        let seen = Arc::new(Mutex::new(None));
+        let (_endpoint, connection) = connect(addr, "localhost", seen.clone()).await;
+        assert_eq!(seen.lock().unwrap().unwrap(), third[0]);
+        connection.close(VarInt::from_u32(0), b"");
+    }
+
+    #[tokio::test]
+    async fn an_edge_link_is_not_found_while_the_relay_has_no_edges() {
+        let (web, state, _) = test_server();
+        assert!(!crate::pool::serves_edges(&state));
+        let addr = web.local_addr().unwrap();
+        let limits = Arc::new(ConnLimits::from_config(&ServerConfig::default()));
+        tokio::spawn(web.run(state, limits.clone()));
+        let (_endpoint, link) = connect_to(addr, NATIVE_SNI, POOL_PATH, Arc::default()).await;
+        assert!(
+            matches!(
+                link,
+                Err(wtransport::error::ConnectingError::SessionRejected)
+            ),
+            "{:?}",
+            link.map(|_| ())
+        );
+        // Counted once the 404 is out, which the client may see first
+        let counted = tokio::time::timeout(HANG, async {
+            loop {
+                let counts = limits.take_counts();
+                if !counts.is_empty() {
+                    return counts;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("nothing was counted");
+        assert_eq!(
+            counted.into_iter().collect::<Vec<_>>(),
+            [(("setup failed", "unknown path"), 1)]
+        );
+    }
+
+    /// What an edge's viewer endpoint is made of: no operator certificate, no
+    /// ban list, and a route of its own that is handed the session and its
+    /// pre-authentication slot.
+    #[tokio::test]
+    async fn a_route_is_handed_its_session_and_its_slot() {
+        use std::sync::atomic::Ordering;
+        use voipc_protocol::pool::VIEW_PATH;
+
+        let web = WebTransport::bind_with("127.0.0.1:0".parse().unwrap(), None, Role::EdgeViewers)
+            .unwrap();
+        let addr = web.local_addr().unwrap();
+        let viewers_pin = web.cert_hashes().borrow()[0];
+        let limits = Arc::new(ConnLimits::new(64, 32));
+        let (handed_tx, mut handed) = mpsc::channel(1);
+        let routes = Routes::new(None).at(VIEW_PATH, move |connection, peer, slot| {
+            let handed = handed_tx.clone();
+            async move {
+                let _ = handed.send((connection, peer, slot)).await;
+            }
+        });
+        tokio::spawn(web.serve(limits.clone(), Arc::new(routes)));
+
+        // Without an operator certificate, the app's name gets the one viewers pin
+        let seen = Arc::new(Mutex::new(None));
+        let (_endpoint, connection) = connect_to(addr, NATIVE_SNI, VIEW_PATH, seen.clone()).await;
+        let connection = connection.unwrap();
+        assert_eq!(seen.lock().unwrap().unwrap(), viewers_pin);
+        let (_session, peer, slot) = tokio::time::timeout(HANG, handed.recv())
+            .await
+            .expect("the route was not called")
+            .unwrap();
+        assert_eq!(peer.ip(), IpAddr::from([127, 0, 0, 1]));
+        assert_eq!(limits.pre_total.load(Ordering::Relaxed), 1);
+        drop(slot);
+        assert_eq!(limits.pre_total.load(Ordering::Relaxed), 0);
+        connection.close(VarInt::from_u32(0), b"");
+
+        // A relay's paths are none of its business
+        for path in [SESSION_PATH, POOL_PATH] {
+            let (_endpoint, other) = connect_to(addr, "localhost", path, Arc::default()).await;
+            assert!(other.is_err(), "{path} was served");
+        }
+    }
+
+    fn fragment(key: bool, id: u32, index: u8, count: u8) -> Bytes {
+        VideoPacket::encrypted_fragment(key, 7, id, index, count, 0, 1, 0x5EED, vec![0; 16])
+            .to_bytes()
+            .into()
+    }
+
+    /// A whole frame of `count` fragments.
+    fn frame(key: bool, id: u32, count: u8) -> Vec<Bytes> {
+        (0..count).map(|i| fragment(key, id, i, count)).collect()
+    }
+
+    /// Runs `pump_media_out` over `packets` into a video queue of `room`
+    /// fragments, through a tunnel lane. What came out: each video fragment's
+    /// frame id, the datagrams, and whom the hook was asked for.
+    async fn pumped(
+        packets: Vec<Bytes>,
+        room: usize,
+        start_on_key: bool,
+    ) -> (Vec<u32>, Vec<Bytes>, Vec<SessionId>) {
+        let (media_tx, media_rx) = mpsc::channel(packets.len());
+        let (video_tx, mut video_rx) = mpsc::channel(room);
+        let (lane_tx, mut lane_rx) = mpsc::channel(16);
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let hook = {
+            let asked = asked.clone();
+            KeyframeHook::Edge(Arc::new(move |sharer| asked.lock().unwrap().push(sharer)))
+        };
+        for packet in packets {
+            media_tx.send(packet).await.unwrap();
+        }
+        drop(media_tx);
+        pump_media_out(
+            DatagramSink::Tunnel(lane_tx),
+            media_rx,
+            video_tx,
+            hook,
+            start_on_key,
+        )
+        .await;
+        let mut frames = Vec::new();
+        while let Ok(packet) = video_rx.try_recv() {
+            frames.push(u32::from_be_bytes(packet[5..9].try_into().unwrap()));
+        }
+        let mut datagrams = Vec::new();
+        while let Ok(packet) = lane_rx.try_recv() {
+            datagrams.push(packet);
+        }
+        let asked = asked.lock().unwrap().clone();
+        (frames, datagrams, asked)
+    }
+
+    #[tokio::test]
+    async fn a_pump_that_starts_on_a_key_lets_no_delta_through_before_one() {
+        let audio = Bytes::from_static(&[0x15, 0, 0, 0, 7, 1, 2, 3]);
+        let packets: Vec<Bytes> = [
+            frame(false, 1, 2),
+            vec![audio.clone()],
+            frame(true, 2, 2),
+            frame(false, 3, 1),
+        ]
+        .concat();
+
+        let (frames, datagrams, asked) = pumped(packets.clone(), 1024, true).await;
+        assert_eq!(frames, [2, 2, 3]);
+        assert_eq!(datagrams, [audio], "screen audio waits for nothing");
+        assert!(
+            asked.is_empty(),
+            "the wait at the start asked for a keyframe"
+        );
+
+        // The relay's own viewers start where they join, as before
+        let (frames, _, asked) = pumped(packets, 1024, false).await;
+        assert_eq!(frames, [1, 1, 2, 2, 3]);
+        assert!(asked.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_drop_asks_the_hook_for_one_keyframe() {
+        // Room for one delta and what a keyframe needs: the second delta does
+        // not fit, nor does anything after it until the keyframe
+        let room = 3 + MAX_FRAGMENTS_PER_FRAME;
+        let packets = [
+            frame(false, 1, 3),
+            frame(false, 2, 3),
+            frame(false, 3, 3),
+            frame(true, 4, 3),
+        ]
+        .concat();
+        let (frames, _, asked) = pumped(packets, room, false).await;
+        assert_eq!(frames, [1, 1, 1, 4, 4, 4]);
+        assert_eq!(
+            asked,
+            [7],
+            "one ask for the sharer, at the start of the drop"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_frame_is_read_whole_and_no_further() {
+        use voipc_protocol::pool::{
+            decode_viewer_msg, encode_edge_view_msg, encode_viewer_msg, EdgeViewMsg, ViewerMsg,
+        };
+        let hello = ViewerMsg::Hello {
+            ticket: vec![5; 70],
+        };
+        let (mut near, mut far) = tokio::io::duplex(4096);
+        far.write_all(
+            &[
+                encode_viewer_msg(&hello).unwrap(),
+                encode_edge_view_msg(&EdgeViewMsg::Ready).unwrap(),
+            ]
+            .concat(),
+        )
+        .await
+        .unwrap();
+        let mut buf = BytesMut::new();
+        let first = read_frame(&mut near, &mut buf, 512).await.ok().unwrap();
+        assert_eq!(decode_viewer_msg(&first).unwrap(), hello);
+        assert!(buf.is_empty(), "read past the frame's end: {buf:?}");
+        assert_eq!(
+            read_frame(&mut near, &mut buf, 512).await.ok(),
+            Some(vec![0])
+        );
+
+        // An empty frame is a frame; the end of the stream is no frame
+        far.write_all(&[0, 0, 0, 0]).await.unwrap();
+        assert_eq!(
+            read_frame(&mut near, &mut buf, 512).await.ok(),
+            Some(vec![])
+        );
+        drop(far);
+        assert!(matches!(
+            read_frame(&mut near, &mut buf, 512).await,
+            Err(NoFrame::Closed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_frame_longer_than_its_bound_is_refused_unread() {
+        let (mut near, mut far) = tokio::io::duplex(4096);
+        // Its length alone: refused without waiting for the rest
+        far.write_all(&513u32.to_be_bytes()).await.unwrap();
+        let mut buf = BytesMut::new();
+        let read = tokio::time::timeout(HANG, read_frame(&mut near, &mut buf, 512)).await;
+        assert!(matches!(read, Ok(Err(NoFrame::Malformed))));
+    }
+
+    #[tokio::test]
+    async fn a_frame_read_cut_off_halfway_goes_on_where_it_stopped() {
+        let (mut near, mut far) = tokio::io::duplex(4096);
+        let whole = [&10u32.to_be_bytes()[..], b"0123456789"].concat();
+        let mut buf = BytesMut::new();
+        far.write_all(&whole[..2]).await.unwrap();
+        let cut = tokio::time::timeout(
+            Duration::from_millis(50),
+            read_frame(&mut near, &mut buf, 64),
+        )
+        .await;
+        assert!(cut.is_err(), "a frame came from half a length");
+        far.write_all(&whole[2..9]).await.unwrap();
+        let cut = tokio::time::timeout(
+            Duration::from_millis(50),
+            read_frame(&mut near, &mut buf, 64),
+        )
+        .await;
+        assert!(cut.is_err(), "a frame came from half its bytes");
+        far.write_all(&whole[9..]).await.unwrap();
+        assert_eq!(
+            read_frame(&mut near, &mut buf, 64).await.ok(),
+            Some(b"0123456789".to_vec())
+        );
     }
 
     // ── Files on h2 ──────────────────────────────────────────────────────
