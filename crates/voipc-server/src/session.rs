@@ -4195,7 +4195,7 @@ async fn handle_gk(
 }
 
 /// A `KeyholdVolunteer{on}` held past its budget goes once a token is there, looked at each
-/// keepalive tick: the page that sent it is shown still (an `off` would have dropped it).
+/// keepalive tick: it is still the page's newest offer (an `off` would have dropped it).
 async fn gk_volunteer_late(state: &Arc<ServerState>, session_id: SessionId, tx: &ControlTx) {
     let held = state.sessions.get_mut(&session_id).and_then(|mut s| {
         if s.gk_volunteer_held.is_none() || !s.gk_volunteer_rate.try_consume() {

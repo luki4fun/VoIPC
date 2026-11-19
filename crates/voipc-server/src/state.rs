@@ -253,7 +253,8 @@ pub struct UserSession {
     /// while it waited for its key (writer.rs `flush`); a post refused here is lost to it.
     pub gk_post_rate: RateLimiter,
     /// `KeyholdVolunteer{on}`: 1 a minute after a burst of 4 (plan 1b). A browser offers
-    /// each time its page shows; past the budget its newest offer is held, not refused.
+    /// each time its page is shown or hidden or a call begins or ends (`BROWSER_BUSY`);
+    /// past the budget its newest offer is held, not refused.
     pub gk_volunteer_rate: RateLimiter,
     /// The newest `KeyholdVolunteer{on}` past its budget: it goes at the first keepalive
     /// tick with a token (`gk_volunteer_late`), unless an `off` came after it. Refused, the

@@ -914,14 +914,172 @@ fn an_epoch_in_puts_each_item_in_the_first_part_with_room_and_spreads_lists_in_o
 fn volunteers_rank_account_desktops_first_and_phones_never_hold_text_keys() {
     let g = Person::guest(1);
     let mut v = g.volunteer(gk::platform::DESKTOP);
-    assert_eq!(v.rank(GroupKind::Text), Some(2));
-    v.platform = gk::platform::BROWSER;
     assert_eq!(v.rank(GroupKind::Text), Some(3));
+    v.platform = gk::platform::BROWSER;
+    assert_eq!(v.rank(GroupKind::Text), Some(4));
+    v.platform = gk::platform::BROWSER_BUSY;
+    assert_eq!(v.rank(GroupKind::Text), Some(5));
     v.platform = gk::platform::PHONE;
     assert_eq!(v.rank(GroupKind::Text), None);
     v.m = MemberId::Account([1; 16]);
     v.platform = gk::platform::DESKTOP;
     assert_eq!(v.rank(GroupKind::Text), Some(0));
+    v.platform = gk::platform::BROWSER_BUSY;
+    assert_eq!(
+        v.rank(GroupKind::Text),
+        Some(2),
+        "below every account volunteer, above every guest"
+    );
+}
+
+/// Choice 31 (owner, 2026-11-19): a browser hidden or in a call (`BROWSER_BUSY`) holds
+/// text keys as the fallback. It starts a group and is asked when it is the only text
+/// volunteer; a desktop that comes online is promoted over two busy entries (the
+/// hand-over), and it or a shown browser entry is asked before them whatever its misses.
+#[test]
+fn a_busy_browser_is_asked_only_when_no_better_volunteer_is_online_and_hands_over() {
+    let text = GroupKind::Text;
+    // Account browsers: their connection pair (0x02), the account's entry
+    let browser = |sid: UserId| Person {
+        account: Some([sid as u8; 16]),
+        ..Person::guest(sid)
+    };
+    let (b1, b2, shown) = (browser(1), browser(2), browser(3));
+    let busy = |p: &Person| p.volunteer(gk::platform::BROWSER_BUSY);
+    let mut vols: HashMap<UserId, Volunteer> = [(1, busy(&b1))].into();
+    let first = crate::gk::holders::starter(text, &vols, false).map(|v| v.sid);
+    assert_eq!(first, Some(1), "the only volunteer starts the group");
+    let mut h = Holders::default();
+    h.set_to(vec![b1.entry()], |_| None);
+    assert_eq!(h.pick(text, &vols, &[], 1).map(|v| v.sid), Some(1));
+    vols.insert(2, busy(&b2));
+    assert_eq!(h.promotion(text, &vols, false, 10).map(|v| v.sid), Some(2));
+    h.set_to(vec![b1.entry(), b2.entry()], |_| None);
+    assert!(h.promotion(text, &vols, false, 10).is_none());
+
+    // A shown browser comes online: no hand-over (a busy one would not resign for it); an
+    // entry, it is asked first
+    vols.insert(3, shown.volunteer(gk::platform::BROWSER));
+    assert!(h.promotion(text, &vols, false, 10).is_none());
+    h.set_to(vec![b1.entry(), b2.entry(), shown.entry()], |_| None);
+    h.missed(&shown.wire().kx(), 2);
+    for t in 3..6 {
+        assert_eq!(h.pick(text, &vols, &[], t).map(|v| v.sid), Some(3));
+    }
+    let next = h.pick(text, &vols, &[3], 6).map(|v| v.sid);
+    assert!(
+        matches!(next, Some(1 | 2)),
+        "passed over, the due goes on to a busy one"
+    );
+
+    // A desktop likewise
+    vols.remove(&3);
+    let (desk, d) = desktop(4, [4; 16]);
+    vols.insert(4, d);
+    h.set_to(vec![b1.entry(), b2.entry()], |_| None);
+    assert_eq!(h.promotion(text, &vols, false, 10).map(|v| v.sid), Some(4));
+    h.set_to(vec![b1.entry(), b2.entry(), desk.entry()], |_| None);
+    h.missed(&desk.wire().kx(), 7);
+    assert_eq!(h.pick(text, &vols, &[], 8).map(|v| v.sid), Some(4));
+}
+
+/// Choice 31: tabs that each show while every entry is busy, then go busy themselves, are
+/// promoted only while fewer than two entries are online. A busy entry never resigns for a
+/// shown browser, so a hand-over among browsers would fill the set with connected tabs, and
+/// at eight an account desktop would find no room: it is promoted over the two.
+#[test]
+fn tabs_shown_and_hidden_in_turn_never_fill_the_set_and_a_desktop_still_gets_in() {
+    let text = GroupKind::Text;
+    let tabs: Vec<Person> = (1..=9)
+        .map(|sid: UserId| Person {
+            account: Some([sid as u8; 16]),
+            ..Person::guest(sid)
+        })
+        .collect();
+    let mut vols: HashMap<UserId, Volunteer> =
+        [(1, tabs[0].volunteer(gk::platform::BROWSER_BUSY))].into();
+    let mut h = Holders::default();
+    h.set_to(vec![tabs[0].entry()], |_| None);
+    for t in &tabs[1..] {
+        vols.insert(t.sid, t.volunteer(gk::platform::BROWSER));
+        if let Some(sid) = h.promotion(text, &vols, false, 10).map(|v| v.sid) {
+            let mut set = h.set.clone();
+            set.push(tabs[sid as usize - 1].entry());
+            h.set_to(set, |_| None);
+        }
+        vols.insert(t.sid, t.volunteer(gk::platform::BROWSER_BUSY));
+    }
+    assert_eq!(
+        h.set.len(),
+        2,
+        "promoted only while fewer than two were online"
+    );
+    let (_, d) = desktop(20, [20; 16]);
+    vols.insert(20, d);
+    assert_eq!(h.promotion(text, &vols, false, 10).map(|v| v.sid), Some(20));
+}
+
+/// Choice 31: on a relay without accounts a desktop is a guest. Two busy guest tabs hold
+/// the keys (the cap of two guests); a guest desktop that comes online first has the lower
+/// one removed, then is promoted. A shown guest tab is no hand-over: nothing goes for it.
+#[test]
+fn a_guest_desktop_takes_over_from_two_busy_guest_tabs_through_the_guests_cap() {
+    let text = GroupKind::Text;
+    let (t1, t2, desk, shown) = (
+        Person::guest(1),
+        Person::guest(2),
+        Person::guest(3),
+        Person::guest(4),
+    );
+    let mut h = Holders::default();
+    h.set_to(vec![t1.entry(), t2.entry()], |_| None);
+    let mut vols: HashMap<UserId, Volunteer> = [
+        (1, t1.volunteer(gk::platform::BROWSER)),
+        (2, t2.volunteer(gk::platform::BROWSER_BUSY)),
+        (4, shown.volunteer(gk::platform::BROWSER)),
+    ]
+    .into();
+    assert!(h.promotion(text, &vols, false, 10).is_none());
+    assert!(h.swap_out(text, &vols, false, 10).is_none(), "a shown tab");
+    vols.insert(1, t1.volunteer(gk::platform::BROWSER_BUSY));
+    assert!(h.swap_out(text, &vols, false, 10).is_none(), "no better");
+    vols.insert(3, desk.volunteer(gk::platform::DESKTOP));
+    assert!(
+        h.promotion(text, &vols, false, 10).is_none(),
+        "no third guest"
+    );
+    let out = h
+        .swap_out(text, &vols, false, 10)
+        .expect("a busy tab goes first");
+    let kept = [&t1, &t2]
+        .into_iter()
+        .find(|t| t.entry().kx != out.kx)
+        .expect("one of the two");
+    h.set_to(vec![kept.entry()], |_| None);
+    assert_eq!(h.promotion(text, &vols, false, 10).map(|v| v.sid), Some(3));
+    h.set_to(vec![kept.entry(), desk.entry()], |_| None);
+    assert!(h.promotion(text, &vols, false, 10).is_none());
+    assert!(h.swap_out(text, &vols, false, 10).is_none(), "settled");
+    assert_eq!(h.pick(text, &vols, &[], 1).map(|v| v.sid), Some(3));
+}
+
+/// A browser offers again at each change of its page (`BROWSER` ↔ `BROWSER_BUSY`): the
+/// group takes it as the same volunteer with its new rank.
+#[test]
+fn a_browsers_offer_again_changes_its_rank_and_adds_no_volunteer() {
+    let mut g = new_group(false);
+    let p = Person::guest(1);
+    g.follow(1, None);
+    let mut out = vec![];
+    for (platform, rank) in [
+        (gk::platform::BROWSER_BUSY, 5),
+        (gk::platform::BROWSER, 4),
+        (gk::platform::BROWSER_BUSY, 5),
+    ] {
+        g.volunteer(1, Some(p.volunteer(platform)), now_ms(), &mut out);
+        assert_eq!(g.vols.len(), 1);
+        assert_eq!(g.vols[&1].rank(GroupKind::Text), Some(rank));
+    }
 }
 
 #[test]
@@ -3324,7 +3482,7 @@ async fn keyholder_pairs_ranks_and_devices_outlive_a_restart() {
     assert_eq!(pair.endorsement.sig, k.endorsement.sig);
     assert_eq!(
         again.holders.rank.get(&kx),
-        Some(&2),
+        Some(&3),
         "a guest desktop's rank"
     );
     assert_eq!(

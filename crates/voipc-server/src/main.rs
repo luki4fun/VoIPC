@@ -26,6 +26,8 @@ mod gk;
 #[cfg(test)]
 mod gk_e2e_c3c;
 #[cfg(test)]
+mod gk_e2e_j7;
+#[cfg(test)]
 mod gk_e2e_k2;
 #[cfg(test)]
 mod gk_e2e_r2;

@@ -34,7 +34,8 @@ const KEEPALIVE_MS = 10_000;
 /** The live path's clock (`ChannelKeying::live_tick`). */
 const LIVE_TICK_MS = 1_000;
 /** A keyholder's build runs in steps this long, shorter in a call: the page thread
- *  paints and feeds the mic (plan 3b). */
+ *  paints and feeds the mic (plan 3b). Hidden too, where it holds text keys only as the
+ *  fallback (choice 31). */
 const GK_STEP_MS = 8;
 const GK_STEP_CALL_MS = 2;
 /** How often a keyholder's waiting upload looks at its transport (live.ts `DRAIN_POLL_MS`). */
@@ -1523,7 +1524,7 @@ export class Session implements SessionContext, AccountHost {
     this.gkBuilding = true;
     try {
       while (!this.ended) {
-        const out = this.signal.gkBuildStep(this.inCall() ? GK_STEP_CALL_MS : GK_STEP_MS);
+        const out = this.signal.gkBuildStep(this.inCall() || !pageVisible() ? GK_STEP_CALL_MS : GK_STEP_MS);
         if (!out) return;
         this.gkRun(() => out);
         await yieldTask();

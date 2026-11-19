@@ -30,15 +30,17 @@ pub struct Volunteer {
 }
 
 impl Volunteer {
-    /// Lower is better: account desktop, account browser, guest desktop, guest browser.
+    /// Lower is better: account desktop, account browser, account browser hidden or in a
+    /// call (`BROWSER_BUSY`, the fallback of choice 31), then the same three for guests.
     /// `None` where it may not hold this kind of group's keys (a phone in text). A voice
     /// room ranks nobody: it picks by user id (§5.9).
     pub fn rank(&self, kind: GroupKind) -> Option<u8> {
-        let guest = 2 * u8::from(self.m.is_conn());
+        let guest = 3 * u8::from(self.m.is_conn());
         match (kind, self.platform) {
             (GroupKind::Voice, _) => Some(0),
             (_, platform::DESKTOP) => Some(guest),
             (_, platform::BROWSER) => Some(guest + 1),
+            (_, platform::BROWSER_BUSY) => Some(guest + 2),
             _ => None,
         }
     }
@@ -64,7 +66,12 @@ impl Volunteer {
     }
 
     fn browser(&self) -> bool {
-        self.platform == platform::BROWSER
+        matches!(self.platform, platform::BROWSER | platform::BROWSER_BUSY)
+    }
+
+    /// A browser hidden or in a call: asked only when no other online entry is (choice 31).
+    fn busy(&self) -> bool {
+        self.platform == platform::BROWSER_BUSY
     }
 }
 
@@ -123,8 +130,16 @@ fn entry_rank(k: &Keyholder, recorded: Option<u8>) -> u8 {
     recorded.unwrap_or(match (k.origin, k.m.is_conn()) {
         (origin::DESKTOP, _) => 0,
         (_, false) => 1,
-        (_, true) => 2,
+        (_, true) => 3,
     })
+}
+
+/// A rank as the hand-over compares it: a browser hidden or in a call (2, 5) as the browser
+/// it is (1, 4). Busy only puts it last when a due is asked (`pick`): no rule has it resign
+/// for a shown browser of its kind, so a promotion over it would only grow the set, one
+/// connected tab at a time, until no desktop finds room (choice 31: desktops stay first).
+fn handed(rank: u8) -> u8 {
+    rank - u8::from(rank % 3 == 2)
 }
 
 impl Holders {
@@ -187,7 +202,7 @@ impl Holders {
     }
 
     /// Who a due goes to: an online entry not in `skip`, by fewest misses this hour, then
-    /// rank, then least recently asked.
+    /// rank, then least recently asked; a browser hidden or in a call only when no other is.
     pub fn pick<'a>(
         &mut self,
         kind: GroupKind,
@@ -205,6 +220,7 @@ impl Holders {
             .min_by_key(|v| {
                 let s = self.stats.get(&v.pair.kx()).cloned().unwrap_or_default();
                 (
+                    v.busy(),
                     s.count(),
                     v.rank(kind).unwrap_or(u8::MAX),
                     s.asked_ms,
@@ -289,7 +305,9 @@ impl Holders {
     }
 
     /// At eight entries a promotion first removes the one away longest (plan 2d): that
-    /// entry, when the set is full, one is away and a volunteer is wanted.
+    /// entry, when the set is full, one is away and a volunteer is wanted. Likewise a guest
+    /// handed over to at two guest entries first removes the guest ranked lowest (choice 31:
+    /// a desktop on a relay without accounts is a guest, and two busy tabs stay online).
     pub fn swap_out(
         &self,
         kind: GroupKind,
@@ -297,7 +315,19 @@ impl Holders {
         gated: bool,
         seats: usize,
     ) -> Option<HolderRef> {
-        if self.set.len() < MAX_KEYHOLDERS || self.wanted(kind, vols, gated, seats).is_none() {
+        let v = self.wanted(kind, vols, gated, seats)?;
+        if self.guests_full(kind, v) {
+            if !self.outranks_all(kind, vols, v) {
+                return None;
+            }
+            return self
+                .set
+                .iter()
+                .filter(|k| k.m.is_conn())
+                .max_by_key(|k| (self.rank_of(kind, vols, k), k.kx))
+                .map(HolderRef::of);
+        }
+        if self.set.len() < MAX_KEYHOLDERS {
             return None;
         }
         self.set
@@ -308,7 +338,7 @@ impl Holders {
     }
 
     /// The volunteer to promote, if the set wants one (plan 2d): while fewer than two are
-    /// online, or a hand-over, up to eight.
+    /// online, or a hand-over, up to eight and at most two guests.
     pub fn promotion<'a>(
         &self,
         kind: GroupKind,
@@ -320,6 +350,39 @@ impl Holders {
             return None;
         }
         self.wanted(kind, vols, gated, seats)
+            .filter(|v| !self.guests_full(kind, v))
+    }
+
+    /// A guest that would be a third guest entry of a text group.
+    fn guests_full(&self, kind: GroupKind, v: &Volunteer) -> bool {
+        kind == GroupKind::Text
+            && v.m.is_conn()
+            && self.set.iter().filter(|k| k.m.is_conn()).count() >= MAX_GUEST_KEYHOLDERS
+    }
+
+    /// An entry's rank: its online volunteer's, else the recorded one (`entry_rank`).
+    fn rank_of(&self, kind: GroupKind, vols: &HashMap<UserId, Volunteer>, k: &Keyholder) -> u8 {
+        vols.values()
+            .find(|v| v.pair.kx() == k.kx && v.m == k.m)
+            .and_then(|v| v.rank(kind))
+            .unwrap_or_else(|| entry_rank(k, self.rank.get(&k.kx).copied()))
+    }
+
+    /// The hand-over (text): every entry ranks below `v`.
+    fn outranks_all(
+        &self,
+        kind: GroupKind,
+        vols: &HashMap<UserId, Volunteer>,
+        v: &Volunteer,
+    ) -> bool {
+        let Some(rank) = v.rank(kind).map(handed) else {
+            return false;
+        };
+        kind == GroupKind::Text
+            && self
+                .set
+                .iter()
+                .all(|k| handed(self.rank_of(kind, vols, k)) > rank)
     }
 
     /// The best-ranked follower allowed to hold this group's keys that is no entry, when
@@ -336,24 +399,14 @@ impl Holders {
         if self.set.is_empty() {
             return None;
         }
-        let guests = self.set.iter().filter(|k| k.m.is_conn()).count();
         let best = allowed(kind, vols, gated, seats)
             .filter(|v| self.entry_of(v).is_none() && !self.set.iter().any(|k| k.kx == v.pair.kx()))
-            .filter(|v| !v.m.is_conn() || kind == GroupKind::Voice || guests < MAX_GUEST_KEYHOLDERS)
             .filter(|v| v.entry(kind).is_some())
             .min_by_key(|v| (v.rank(kind), v.sid))?;
         if self.online(vols).len() < KEYHOLDERS_ONLINE_MIN {
             return Some(best);
         }
-        let rank = best.rank(kind)?;
-        let below = |k: &Keyholder| {
-            let on = vols
-                .values()
-                .find(|v| v.pair.kx() == k.kx && v.m == k.m)
-                .and_then(|v| v.rank(kind));
-            on.unwrap_or_else(|| entry_rank(k, self.rank.get(&k.kx).copied())) > rank
-        };
-        (kind == GroupKind::Text && self.set.iter().all(below)).then_some(best)
+        self.outranks_all(kind, vols, best).then_some(best)
     }
 }
 

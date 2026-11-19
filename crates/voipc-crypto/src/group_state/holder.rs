@@ -705,6 +705,8 @@ pub(super) struct Duty {
     old: Option<Mine>,
     /// `KeyholdVolunteer{on}` went and no `{on: false}` since.
     offered: bool,
+    /// It went as a browser hidden or in a call (`BROWSER_BUSY`).
+    offered_busy: bool,
     /// This connection asked `KeyholdReplace`; and from when, by the ticks' clock (ms).
     replacing: Option<Option<u64>>,
     /// The relay's clock less this device's, seconds, at `GroupKeys`.
@@ -740,6 +742,12 @@ impl Duty {
 
     fn uses_desk(who: &Who) -> bool {
         who.platform == Platform::Desktop && who.account.is_some()
+    }
+
+    /// A browser whose page is hidden or in a call: it holds text keys only as the fallback
+    /// (choice 31), ranked below every other text volunteer of its kind.
+    fn busy(&self, who: &Who) -> bool {
+        who.platform == Platform::Browser && (!who.visible || self.in_call)
     }
 
     /// The desktop pair, made at its first need and replaced when the account's counter
@@ -812,18 +820,21 @@ impl Duty {
         if !who.on || !who.help || who.platform == Platform::Phone {
             return;
         }
-        if who.platform == Platform::Browser && (!who.visible || self.in_call) {
-            return;
-        }
         let Some(mine) = self.volunteer_pair(who, now) else {
             return;
         };
+        let busy = self.busy(who);
         out.send.push(ClientMessage::KeyholdVolunteer {
             on: true,
-            platform: who.platform.code(),
+            platform: if busy {
+                gk::platform::BROWSER_BUSY
+            } else {
+                who.platform.code()
+            },
             pair: Some(EndorsedPair::from(&mine.wire)),
         });
         self.offered = true;
+        self.offered_busy = busy;
         self.ask_replace(out);
     }
 
@@ -1107,20 +1118,18 @@ impl Duty {
             return Some((decline::CLOCK, "this device's clock is off the relay's"));
         }
         let gated = p.gated || m.head.as_ref().is_some_and(|h| h.header().gated);
-        if text && who.platform == Platform::Browser {
-            if !who.visible || self.in_call {
-                return Some((decline::NOT_READY, "the page is hidden or in a call"));
-            }
-            if m.head
+        // Hidden or in a call too: it builds in the host's short steps (choice 31)
+        if text
+            && who.platform == Platform::Browser
+            && m.head
                 .as_ref()
                 .is_some_and(|h| h.header().seats > BROWSER_MAX_SEATS)
-            {
-                resign(out);
-                return Some((
-                    decline::PLATFORM,
-                    "a browser holds no group past 10 000 seats",
-                ));
-            }
+        {
+            resign(out);
+            return Some((
+                decline::PLATFORM,
+                "a browser holds no group past 10 000 seats",
+            ));
         }
         if text && who.account.is_none() && gated {
             resign(out);
@@ -1914,8 +1923,9 @@ impl Duty {
         }
     }
 
-    /// The browser page was hidden or shown, or a call began or ended: a browser offers to
-    /// hold text keys only while shown and out of a call (3g).
+    /// The browser page was hidden or shown, or a call began or ended: a browser offers
+    /// again when that moved it between shown and out of a call (`BROWSER`) and hidden or in
+    /// a call (`BROWSER_BUSY`, the fallback of choice 31); the relay takes it as its new rank.
     pub(super) fn visibility(
         &mut self,
         who: &mut Who,
@@ -1924,16 +1934,13 @@ impl Duty {
         in_call: bool,
         out: &mut GkOut,
     ) {
+        who.visible = visible;
         self.in_call = in_call;
         if !who.on || who.platform != Platform::Browser {
             return;
         }
-        if visible && !in_call {
-            if !self.offered {
-                self.volunteer(who, crate::time::now_millis(), out);
-            }
-        } else {
-            self.unoffer(who, out);
+        if !self.offered || self.offered_busy != self.busy(who) {
+            self.volunteer(who, crate::time::now_millis(), out);
         }
     }
 
@@ -2692,7 +2699,7 @@ mod tests {
     }
 
     #[test]
-    fn a_due_is_declined_off_the_relays_clock_on_a_hidden_browser_and_for_an_old_counter() {
+    fn a_due_is_declined_off_the_relays_clock_and_for_an_old_counter() {
         let mut rig = Rig::new(None, Platform::Desktop);
         let (w, pair) = genesis(&mut rig);
         rig.duty.skew = KEYHOLDER_SKEW_SECS as i64 + 1;
@@ -2728,21 +2735,78 @@ mod tests {
         } else {
             assert_eq!(declined(&out), Some(decline::CANDIDATE));
         }
+    }
 
-        let mut browser = Rig::new(None, Platform::Browser);
-        let _ = browser.start();
-        let mut out = GkOut::default();
-        browser.duty.visibility(
-            &mut browser.who,
-            &mut browser.groups,
-            false,
-            false,
-            &mut out,
+    /// Choice 31 (owner, 2026-11-19): a browser hidden or in a call offers anyway, as the
+    /// fallback (`BROWSER_BUSY`), takes text dues and builds them in short steps; shown and
+    /// out of a call it offers again as `BROWSER`, which the relay ranks above it.
+    #[test]
+    fn a_busy_browser_offers_as_the_fallback_and_takes_a_text_due() {
+        fn offers(sent: &[ClientMessage]) -> Vec<u8> {
+            sent.iter()
+                .map(|m| match m {
+                    ClientMessage::KeyholdVolunteer {
+                        on: true, platform, ..
+                    } => *platform,
+                    other => panic!("not an offer: {other:?}"),
+                })
+                .collect()
+        }
+        fn page(rig: &mut Rig, visible: bool, in_call: bool) -> Vec<ClientMessage> {
+            let mut out = GkOut::default();
+            rig.duty
+                .visibility(&mut rig.who, &mut rig.groups, visible, in_call, &mut out);
+            out.send
+        }
+        let mut rig = Rig::new(None, Platform::Browser);
+        rig.who.visible = false;
+        assert_eq!(offers(&rig.start()), [gk::platform::BROWSER_BUSY]);
+        // Its Genesis, hidden; then in a call, a Join built in 2 ms steps
+        let (w, _) = genesis(&mut rig);
+        assert!(page(&mut rig, false, true).is_empty(), "still the fallback");
+        let people: Vec<world::Member> = (10..12).map(world::Member::account).collect();
+        let refs: Vec<&world::Member> = people.iter().collect();
+        let out = rig.due(
+            2,
+            piece(due_code::JOIN, &w.join_due(&refs), Some(&w), vec![]),
         );
-        assert_eq!(sent_kinds(&out.send), vec!["unvolunteer"]);
-        browser.who.visible = false;
-        let out = browser.due(1, DuePiece::default());
-        assert_eq!(declined(&out), Some(decline::NOT_READY));
+        assert_eq!(declined(&out), None);
+        let mut job = rig.duty.take_build().expect("a job, run off the lock");
+        let b = loop {
+            if let Some(b) = job.step(Duration::from_millis(2)) {
+                break b;
+            }
+        };
+        let mut c = GkCtx {
+            pins: &mut rig.pins,
+            now: rig.now,
+        };
+        let mut out = GkOut::default();
+        rig.duty
+            .built(&mut rig.who, &mut rig.groups, b, &mut c, &mut out);
+        assert_eq!(declined(&out), None);
+        let parts = rig.uploads();
+        assert!(
+            !parts.is_empty()
+                && parts
+                    .iter()
+                    .all(|m| matches!(m, ClientMessage::EpochCommit { .. })),
+            "its Join goes"
+        );
+        // Shown and out of a call: offered again, ranked as a browser; each change once
+        assert_eq!(
+            offers(&page(&mut rig, true, false)),
+            [gk::platform::BROWSER]
+        );
+        assert!(page(&mut rig, true, false).is_empty());
+        assert_eq!(
+            offers(&page(&mut rig, true, true)),
+            [gk::platform::BROWSER_BUSY]
+        );
+        // A desktop never offers as busy
+        let mut desk = Rig::new(None, Platform::Desktop);
+        assert_eq!(offers(&desk.start()), [gk::platform::DESKTOP]);
+        assert!(page(&mut desk, false, true).is_empty());
     }
 
     #[test]

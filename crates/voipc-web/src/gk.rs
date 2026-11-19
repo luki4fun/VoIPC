@@ -599,14 +599,12 @@ mod tests {
         core.gk_start(s).unwrap()
     }
 
-    fn volunteers(out: &Out) -> Vec<bool> {
+    /// Each `KeyholdVolunteer`'s `on` and `platform`.
+    fn volunteers(out: &Out) -> Vec<(bool, u8)> {
         out.send
             .iter()
             .filter_map(|m| match m {
-                ClientMessage::KeyholdVolunteer { on, platform, .. } => {
-                    assert_eq!(*platform, wire::platform::BROWSER);
-                    Some(*on)
-                }
+                ClientMessage::KeyholdVolunteer { on, platform, .. } => Some((*on, *platform)),
                 _ => None,
             })
             .collect()
@@ -754,17 +752,22 @@ mod tests {
     }
 
     #[test]
-    fn a_browser_offers_to_hold_text_keys_only_while_shown_and_out_of_a_call() {
+    fn a_browser_offers_as_a_browser_while_shown_and_out_of_a_call_else_as_the_fallback() {
+        const SHOWN: (bool, u8) = (true, wire::platform::BROWSER);
+        const BUSY: (bool, u8) = (true, wire::platform::BROWSER_BUSY);
         let mut core = SignalCore::new().unwrap();
-        assert!(volunteers(&start(&mut core, true)).is_empty(), "in a call");
-        assert_eq!(volunteers(&core.gk.visibility(true, false)), [true]);
-        assert_eq!(volunteers(&core.gk.visibility(false, false)), [false]);
+        assert_eq!(volunteers(&start(&mut core, true)), [BUSY], "in a call");
+        assert_eq!(volunteers(&core.gk.visibility(true, false)), [SHOWN]);
+        assert_eq!(volunteers(&core.gk.visibility(false, false)), [BUSY]);
         assert!(volunteers(&core.gk.visibility(false, true)).is_empty());
-        assert_eq!(volunteers(&core.gk.visibility(true, false)), [true]);
+        assert_eq!(volunteers(&core.gk.visibility(true, false)), [SHOWN]);
 
         let mut shown = SignalCore::new().unwrap();
-        assert_eq!(volunteers(&start(&mut shown, false)), [true]);
-        assert_eq!(volunteers(&shown.gk.set_volunteer(false)), [false]);
+        assert_eq!(volunteers(&start(&mut shown, false)), [SHOWN]);
+        assert_eq!(
+            volunteers(&shown.gk.set_volunteer(false)),
+            [(false, wire::platform::BROWSER)]
+        );
     }
 
     #[test]

@@ -529,8 +529,9 @@ pub enum ClientMessage {
     },
     /// A header past the relay's head, which this member holds.
     EpochFloorAhead { group: String, header: HeaderIn },
-    /// Offer to hold keys, or stop. `platform` is a `platform` code; `pair`: a desktop's
-    /// keyholder pair (0x03), or the connection's seat pair (0x02).
+    /// Offer to hold keys, or stop. `platform` is a `platform` code (a browser hidden or in
+    /// a call: `BROWSER_BUSY`, offered again at each change); `pair`: a desktop's keyholder
+    /// pair (0x03), or the connection's seat pair (0x02).
     KeyholdVolunteer {
         on: bool,
         platform: u8,

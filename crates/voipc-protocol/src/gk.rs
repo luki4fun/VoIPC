@@ -231,11 +231,15 @@ codes! {
 }
 
 codes! {
-    /// `KeyholdVolunteer.platform`.
+    /// `KeyholdVolunteer.platform`. `BROWSER_BUSY`: a browser whose page is hidden or in a
+    /// call (choice 31). It holds text keys only as the fallback, ranked below every other
+    /// text volunteer of its kind, and offers again with `BROWSER` or `BROWSER_BUSY` at each
+    /// change; the relay takes that as its new rank. An app without it sends `{on: false}`.
     platform {
         DESKTOP = 1,
         PHONE = 2,
         BROWSER = 3,
+        BROWSER_BUSY = 4,
     }
 }
 
@@ -2046,6 +2050,7 @@ mod tests {
             (platform::DESKTOP, 1),
             (platform::PHONE, 2),
             (platform::BROWSER, 3),
+            (platform::BROWSER_BUSY, 4),
             (join_refused::ENDORSEMENT, 0),
             (join_refused::PIN, 1),
             (join_refused::OLD_COUNTER, 2),
