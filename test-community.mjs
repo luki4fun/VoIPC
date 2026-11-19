@@ -20,7 +20,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { deflateSync } from "node:zlib";
-import { barrier, diagnose, loadPage, openTab, probe, seen, sentKind, sleep, startChromium, typeProviderCode, waitFor } from "./test-cdp.mjs";
+import { barrier, diagnose, framesRead, loadPage, openTab, probe, seen, sentKind, sentPost, sleep, startChromium, typeProviderCode, waitFor } from "./test-cdp.mjs";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.argv[2] ?? 49991);
@@ -31,6 +31,8 @@ const ORIGIN = `https://127.0.0.1:${PORT}`;
 const WORK = mkdtempSync(join(tmpdir(), "voipc-community-"));
 const TOKEN = "e2e-admin-token-0001";
 const PASSWORD = "correct-horse-battery-1";
+/** The relay's group key: on by default, off with GK=0 (test-web.sh's switch). */
+const GROUP_KEY = process.env.GK !== "0";
 const children = [];
 
 let failures = 0;
@@ -119,7 +121,8 @@ spawnSync(
 );
 writeFileSync(
   join(WORK, "server.toml"),
-  `host = "127.0.0.1"
+  // GK=0 (test-web.sh's switch): the relay with the group key off, on the old paths
+  `${GROUP_KEY ? "" : "group_key = false\n"}host = "127.0.0.1"
 tcp_port = ${PORT}
 udp_port = ${PORT}
 cert_path = "server.crt"
@@ -162,7 +165,8 @@ const browser = async (cdpPort) => {
   await startChromium({ chrome: CHROME, work: WORK, cdpPort, children });
   return cdpPort;
 };
-const newTab = (cdpPort) => openTab(cdpPort, { dom: true });
+// frames: the group key's frames, which `__voipc_heard` never names (heard, below)
+const newTab = (cdpPort) => openTab(cdpPort, { dom: true, frames: true });
 
 const setInput = (selector, value) =>
   `(() => { const el = document.querySelector(${JSON.stringify(selector)}); if (!el) return false;
@@ -588,18 +592,49 @@ async function lane() {
   const marked = (name) => `!!${rowOf(name)}?.querySelector(".sharing-history")`;
   await openChat(cat, "lobby-chat");
   await openChat(dee, "lobby-chat");
-  // A text channel, frame by frame: the first time these two meet. The post goes first, the
-  // reader opens the session, the key follows.
-  const heard = async (tab) => (await tab.evaluate(`window.__voipc_heard.splice(0)`)) ?? [];
+  // What a page took in since the last look: the session's frames by name, then the group key's,
+  // which go to its wasm side undecoded, from the frame recorder
+  const lastLook = new Map();
+  const heard = async (tab) => {
+    const [now, tags] = JSON.parse(await tab.evaluate(`JSON.stringify([Date.now(), window.__voipc_heard.splice(0)])`));
+    const keyed = (await framesRead(tab, lastLook.get(tab) ?? 0, now)).filter((n) => /^(GroupKeys|Epoch|KeyringIn|VoiceSeats)/.test(n));
+    lastLook.set(tab, now);
+    return [...(tags ?? []), ...keyed.map((n) => [n, undefined])];
+  };
   const tagsOf = (frames) => frames.map(([tag]) => tag);
-  await Promise.all([heard(cat), heard(dee), heard(ann)]);
+  // The live path's frames, which the group key does without: a post's own, a session's, a key's
+  const LIVE_KEYING = ["TextPost", "KeysOwed", "SessionAsked", "SessionHello", "TextKeyReceived"];
+  // And what a page sends on it, raw by index (test-cdp.mjs SENT_NAMES) or by name: a post
+  // (#27), a key check (#56), a session's opening and hello (#57, #58), keys handed (#59). With
+  // the key on the relay drops these in a text channel and says so once a connection, to no
+  // group, so no frame a reader takes would show one: only the sender's own record does.
+  const LIVE_SENT = ["#27", "#56", "#57", "#58", "#59", "SendEncryptedChannelMessage", "KeyCheck", "OpenSessions", "SessionHello", "DistributeSenderKeys"];
+  /** What a page sent since its `__voipc_said` was last emptied, by name (raw frames "#N"). */
+  const sentBy = async (tab) =>
+    ((await tab.evaluate(`JSON.stringify(window.__voipc_said.splice(0))`).then(JSON.parse, () => [])) ?? [])
+      .flatMap((m) => (typeof m === "string" ? [m] : m && typeof m === "object" ? Object.keys(m) : []));
+  const liveSent = (...lists) => lists.flat().filter((k) => LIVE_SENT.includes(k));
+  // A text channel, frame by frame: the first time these two meet. Under the group key (the
+  // relay's default) the post comes under the channel's epoch key, which the relay hands out:
+  // nobody opens a session or owes a key for it. Off it (GK=0), the post goes first, the reader
+  // opens the session, the key follows.
+  await Promise.all([heard(cat), heard(dee), heard(ann), sentBy(cat), sentBy(dee)]);
   await say(dee, "for whoever comes later");
   await waitFor(cat, lastMessage("for whoever comes later"), 60_000);
   const reader = tagsOf(await heard(cat));
   const writer = tagsOf(await heard(dee));
-  check("a post comes ahead of its key", reader.includes("TextPost") && reader.indexOf("TextPost") < reader.indexOf("TextKeyReceived"), reader.join(" "));
-  check("and the reader is who opens the session", reader.includes("SessionAsked") && reader.indexOf("SessionAsked") < reader.indexOf("TextKeyReceived"), reader.join(" "));
-  check("the writer asks whom it owes, and hears the hello", writer.includes("KeysOwed") && writer.includes("SessionHello"), writer.join(" "));
+  const [wrote, read] = [await sentBy(dee), await sentBy(cat)];
+  if (GROUP_KEY) {
+    check("a post comes under the group key", reader.includes("EpochPostIn"), reader.join(" "));
+    check("and nobody opens a session or hands a key for it", !reader.some((t) => LIVE_KEYING.includes(t)), reader.join(" "));
+    check("the writer is owed nobody's key", !writer.some((t) => LIVE_KEYING.includes(t)), writer.join(" "));
+    check("the writer sent it as EpochPost, and neither page sent a frame of the live path", wrote.includes("#75") && liveSent(wrote, read).length === 0, `writer: ${wrote.join(" ")} | reader: ${read.join(" ")}`);
+  } else {
+    check("a post comes ahead of its key", reader.includes("TextPost") && reader.indexOf("TextPost") < reader.indexOf("TextKeyReceived"), reader.join(" "));
+    check("and the reader is who opens the session", reader.includes("SessionAsked") && reader.indexOf("SessionAsked") < reader.indexOf("TextKeyReceived"), reader.join(" "));
+    check("the writer asks whom it owes, and hears the hello", writer.includes("KeysOwed") && writer.includes("SessionHello"), writer.join(" "));
+    check("the writer sent it on the live path", wrote.includes("#27"), `writer: ${wrote.join(" ")}`);
+  }
   check("no frame of the old way reaches anyone", ![...reader, ...writer].some((t) => ["EncryptedChannelChatMessage", "SenderKeyReceived"].includes(t)), [...reader, ...writer].join(" "));
 
   // On, without the privilege: nothing changes, and the switch says why
@@ -834,22 +869,37 @@ async function lane() {
   check("the rows there still shown", await seen(cat, lastMessage("before the cut")), await cat.evaluate(`document.querySelector(".messages")?.innerText.slice(-200) ?? ""`));
   check("the drop is said once, and the toast goes at the reconnect", await seen(cat, `![...document.querySelectorAll(".toast")].some((t) => t.textContent.includes("Connection lost"))`), await cat.evaluate(`[...document.querySelectorAll(".toast")].map((t) => t.textContent).join(" | ")`));
   await sleep(1500);
-  await heard(dee);
+  await Promise.all([heard(dee), sentBy(cat), sentBy(dee)]);
   await say(cat, "after the cut");
   check("and is read", await seen(dee, lastMessage("after the cut"), 60_000), await dee.evaluate(`document.querySelector(".messages")?.innerText.slice(-300) ?? ""`));
   const afterCut = tagsOf(await heard(dee));
-  check("on a session kept from before: a key, and no one asked to open", afterCut.includes("TextKeyReceived") && !afterCut.includes("SessionAsked"), afterCut.join(" "));
+  const [cutWrote, cutRead] = [await sentBy(cat), await sentBy(dee)];
+  if (GROUP_KEY) {
+    check("under the group key still, and no one asked to open", afterCut.includes("EpochPostIn") && !afterCut.some((t) => LIVE_KEYING.includes(t)), afterCut.join(" "));
+    check("sent as EpochPost, and no frame of the live path from either page", cutWrote.includes("#75") && liveSent(cutWrote, cutRead).length === 0, `writer: ${cutWrote.join(" ")} | reader: ${cutRead.join(" ")}`);
+  } else {
+    check("on a session kept from before: a key, and no one asked to open", afterCut.includes("TextKeyReceived") && !afterCut.includes("SessionAsked"), afterCut.join(" "));
+  }
 
-  // A reader that reloads has no session any more: the wrap fails, one reset, a new one.
+  // A reader that reloads has no session any more: the wrap fails, one reset, a new one. Under
+  // the group key it fetches the channel's keys from the relay again.
   await dee.send("Page.reload");
   await waitFor(dee, `window.__voipc_heard?.some(([tag]) => tag === "TextJoined")`, 60_000);
   await openChat(dee, "lobby-chat");
   // Past the writer's check of two seconds ago, or this post is one the log brings
   await sleep(2500);
+  await sentBy(cat);
   await say(cat, "after the reload");
   check("a reader back from a reload reads on", await seen(dee, lastMessage("after the reload"), 60_000), await dee.evaluate(`document.querySelector(".messages")?.innerText.slice(-300) ?? ""`));
   const afterReload = tagsOf(await heard(dee));
-  check("by opening a new session", afterReload.includes("SessionAsked"), afterReload.join(" "));
+  // The reader's record starts at its reload: all it sent since
+  const [reloadWrote, reloadRead] = [await sentBy(cat), await sentBy(dee)];
+  if (GROUP_KEY) {
+    check("by taking the channel's keys again, with no session opened", afterReload.includes("EpochIn") && afterReload.includes("EpochPostIn") && !afterReload.some((t) => LIVE_KEYING.includes(t)), afterReload.join(" "));
+    check("and no frame of the live path left either page since the reload", reloadWrote.includes("#75") && liveSent(reloadWrote, reloadRead).length === 0, `writer: ${reloadWrote.join(" ")} | reader: ${reloadRead.join(" ")}`);
+  } else {
+    check("by opening a new session", afterReload.includes("SessionAsked"), afterReload.join(" "));
+  }
 
   // Written while away, and nobody to ask: a ring on the row, and opening it clears it.
   await openChat(newcomerTab, "side-a");
@@ -880,15 +930,26 @@ async function lane() {
   await sleep(2500);
   await say(cat, "only the two of us");
   check("the post reaches the other", await seen(dee, lastMessage("only the two of us"), 60_000));
-  const namedLine = `[...document.querySelectorAll(".history-marker")].some((m) => m.textContent.includes("deedee can now read what you write here"))`;
-  check("the writer's app names who it handed a key", await seen(cat, namedLine), await cat.evaluate(`document.querySelector(".messages")?.innerText.slice(-300) ?? ""`));
+  // Under the group key the writer hands nobody a key: a keyholder seats her through the relay,
+  // and only a gated group's writers are shown new readers (GROUP-KEY.md §11, claim 5). Off it
+  // (GK=0), the writer's app names whom it handed its key.
+  const handedLine = `[...document.querySelectorAll(".history-marker")].filter((m) => m.textContent.includes("can now read what you write here"))`;
+  const readersLine = `[...document.querySelectorAll(".gk-line")].filter((m) => m.textContent.includes("New readers in"))`;
+  const gkLinesOf = (tab) => tab.evaluate(`[...document.querySelectorAll(".gk-line")].map((m) => m.textContent.trim()).join(" | ")`);
+  if (!GROUP_KEY) {
+    check("the writer's app names who it handed a key", await seen(cat, `${handedLine}.some((m) => m.textContent.includes("deedee"))`), await cat.evaluate(`document.querySelector(".messages")?.innerText.slice(-300) ?? ""`));
+  }
   await sleep(2500);
   await say(cat, "and again");
   await waitFor(dee, lastMessage("and again"), 60_000);
   // Its key check came back before it went out, and she has it: past the barrier whatever she,
   // or the relay, had for cathy has reached her
   check("past deedee and cathy's barrier", await barrier(SERVER, dee, cat));
-  check("once", (await cat.evaluate(`[...document.querySelectorAll(".history-marker")].filter((m) => m.textContent.includes("can now read what you write here")).length`)) === 1);
+  if (GROUP_KEY) {
+    check("no word of a key handed, nor of new readers: the channel is not gated", (await cat.evaluate(`${handedLine}.length + ${readersLine}.length`)) === 0, await gkLinesOf(cat));
+  } else {
+    check("once", (await cat.evaluate(`${handedLine}.length`)) === 1);
+  }
   await openChat(dee, "lobby-chat");
   await say(cat, "a dot on the row");
   const dungeonRowOf = byText(".channel-list.modern .channels.text .channel", "dungeon");
@@ -1090,16 +1151,19 @@ async function lane() {
   // holds side-c quiet for her
   await waitFor(held, sentKind("SetQuiet"));
   check("past paula's quiet barrier", await barrier(SERVER, held));
-  await held.evaluate(`window.__voipc_heard?.splice(0); 0`);
+  // heard, not a splice of `__voipc_heard` alone: the group key's frames since her reload
+  // (side-c's post above among them) are read from the recorder by time
+  await heard(held);
   await said(cat);
   await say(cat, "while it slept");
   // The post goes after the writer's key check: once it is out, the barrier holds what the
   // relay would have passed on
-  // `SendEncryptedChannelMessage` is ClientMessage #27 (golden), and goes as a raw frame
-  await waitFor(cat, sentKind("#27"));
+  // `EpochPost` (#75) under the group key, `SendEncryptedChannelMessage` (#27) off it: raw frames
+  await waitFor(cat, sentPost);
   check("past cat and held's barrier", await barrier(SERVER, cat, held));
   const asleep = tagsOf(await heard(held));
-  check("kept: a channel asleep is sent no post", !asleep.includes("TextPost"), asleep.join(" "));
+  // TextPost off the group key, EpochPostIn under it
+  check("kept: a channel asleep is sent no post", !asleep.some((t) => t === "TextPost" || t === "EpochPostIn"), asleep.join(" "));
   await openChat(held, "side-c");
   check("kept: opening it reads what was written there", await seen(held, lastMessage("while it slept"), 30_000), await messagesOf(held));
   await quietMode(held, "off");
@@ -1255,7 +1319,7 @@ async function lane() {
 
   // A channel list past one frame: the reconnect goes by all of it, to a channel near its end.
   const longPort = PORT + 150;
-  writeFileSync(join(WORK, "long.toml"), `host = "127.0.0.1"\ntcp_port = ${longPort}\nudp_port = ${longPort}\ncert_path = "server.crt"\nkey_path = "server.key"\n`);
+  writeFileSync(join(WORK, "long.toml"), `${GROUP_KEY ? "" : "group_key = false\n"}host = "127.0.0.1"\ntcp_port = ${longPort}\nudp_port = ${longPort}\ncert_path = "server.crt"\nkey_path = "server.key"\n`);
   writeFileSync(join(WORK, "long.json"), JSON.stringify(Array.from({ length: 450 }, (_, i) => ({ name: `room-${i}`, description: "d".repeat(200), text: true }))));
   const longRelay = spawn(join(ROOT, "target/release/voipc-server"), ["-c", "long.toml", "--channels", "long.json"], { cwd: WORK, stdio: ["ignore", relayLog, "inherit"] });
   children.push(longRelay);

@@ -127,6 +127,28 @@ export async function run(params: URLSearchParams): Promise<void> {
   log(spatialMismatch === null ? "spatial ok" : "spatial mismatch", spatialMismatch ?? undefined);
 
   window.addEventListener("error", (e) => log("error", { message: e.message }));
+  // test-web.sh hides a keyholder's page through DevTools: when it was hidden and shown again,
+  // and once a timer of its own came a second or more late, as a hidden page's are clamped
+  // (after a grace, and not while it plays sound): from then on its duty runs under the clamp
+  let hiddenRun = 0;
+  document.addEventListener("visibilitychange", () => {
+    log("page-visibility", { state: document.visibilityState });
+    if (document.visibilityState !== "hidden") return;
+    const run = ++hiddenRun;
+    const hiddenAt = performance.now();
+    let last = hiddenAt;
+    const look = () => {
+      if (run !== hiddenRun || document.visibilityState !== "hidden") return;
+      const now = performance.now();
+      if (now - last >= 900) {
+        log("page-timers-clamped", { late_ms: Math.round(now - last - 50), hidden_ms: Math.round(now - hiddenAt) });
+        return;
+      }
+      last = now;
+      setTimeout(look, 50);
+    };
+    setTimeout(look, 50);
+  });
   window.addEventListener("unhandledrejection", (e) => log("error", { message: String(e.reason) }));
 
   let channels: ChannelInfo[] = [];
@@ -243,6 +265,9 @@ export async function run(params: URLSearchParams): Promise<void> {
     // (protocol 26): test-web.sh's EDGE lane looks for "ready" and no "failed"
     "edge-view",
     "user-position", "proximity-mode", "channel-created", "channel-updated",
+    // The group key's lines (stores/gk.ts `gkListeners`): who holds a channel's keys, a post
+    // held or dropped, new readers, a new generation, a warning
+    "gk-state", "gk-post-dropped", "gk-readers", "gk-keyholders", "gk-anew", "gk-warning",
   ];
   // Every other event comes as {server, data}; the lines below log and read
   // `data`, so what test-web.sh greps for is what it always was.

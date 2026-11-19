@@ -43,7 +43,7 @@ fn names_refuse_invisible_and_reordering_characters() {
 /// exactly how the session bridge feeds it.
 #[tokio::test]
 async fn authenticates_over_duplex() {
-    let config = ServerConfig::default();
+    let config = legacy_config();
     let state = Arc::new(ServerState::new(
         &config,
         ServerSettings::default(),
@@ -182,9 +182,18 @@ impl Client {
     }
 }
 
+/// The relay with the group key off (`group_key`'s default is on): the paths before it, which
+/// the tests written for them hold to. `mod group_key` and `mod kept_group_key` have it on.
+fn legacy_config() -> ServerConfig {
+    ServerConfig {
+        group_key: false,
+        ..ServerConfig::default()
+    }
+}
+
 fn admin_state() -> Arc<ServerState> {
     Arc::new(ServerState::new(
-        &ServerConfig::default(),
+        &legacy_config(),
         ServerSettings::default(),
         Vec::new(),
         "test-admin-token".into(),
@@ -2170,7 +2179,7 @@ async fn keys_to_many_members_pass_while_a_flood_at_one_is_capped() {
     // than the per-frame control budget — which would then be the thing
     // this test measured.
     let state = Arc::new(ServerState::new(
-        &ServerConfig::default(),
+        &legacy_config(),
         ServerSettings {
             max_channels: 4,
             ..ServerSettings::default()
@@ -5893,6 +5902,8 @@ async fn relay_with_log() -> (Arc<ServerState>, TempDb, String) {
     let mut config = ServerConfig::default();
     config.accounts.mode = AccountsMode::Optional;
     config.accounts.registration = RegistrationMode::Open;
+    // The kept path before the group key (0010 chains), as `relay_state_then`
+    config.group_key = false;
     let db = TempDb(std::env::temp_dir().join(format!(
         "voipc-relay-{}.db",
         hex::encode(rand::random::<[u8; 8]>())
@@ -5998,6 +6009,19 @@ fn readers(events: &[voipc_crypto::sync::Event]) -> Vec<(Vec<String>, bool)> {
 
 fn say(id: &str, text: &str) -> Vec<u8> {
     voipc_crypto::envelope::envelope(id, text, None)
+}
+
+/// The channel-log tests here and the layouts' restarts are the kept path before the group key
+/// (0010 chains): they hold to it whatever `group_key`'s default is (plan part 7, K2), and
+/// passing on with the key on would no longer test it. `mod kept_group_key` has it on.
+#[tokio::test]
+async fn the_kept_log_tests_run_with_the_group_key_off() {
+    let (state, _db, _) = relay_with_log().await;
+    assert!(!state.gk.on, "relay_with_log");
+    let (state, db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+    assert!(!state.gk.on, "relay_state");
+    let state = layouts::restart(&db, Vec::new()).await;
+    assert!(!state.gk.on, "layouts::restart");
 }
 
 #[tokio::test]
@@ -23826,6 +23850,8 @@ mod layouts {
         let mut config = ServerConfig::default();
         config.accounts.mode = AccountsMode::Optional;
         config.accounts.registration = RegistrationMode::Open;
+        // As `relay_state` started it: the key off
+        config.group_key = false;
         let store = l4f_accounts::store::Store::connect(&format!("sqlite://{}", db.0.display()))
             .await
             .unwrap();
@@ -41379,7 +41405,7 @@ mod group_key {
     #[tokio::test]
     async fn with_the_key_off_the_old_paths_work_and_the_keys_messages_go_nowhere() {
         let state = Arc::new(ServerState::new(
-            &ServerConfig::default(),
+            &legacy_config(),
             ServerSettings::default(),
             vec![crate::channels::ChannelEntry {
                 name: "lounge".into(),

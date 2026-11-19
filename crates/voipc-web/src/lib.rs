@@ -10,6 +10,7 @@ pub mod account;
 #[cfg(any(test, fuzzing))]
 pub mod fuzz;
 pub mod gk;
+pub mod gk_bench;
 pub mod media;
 pub mod signal;
 
@@ -726,6 +727,13 @@ pub struct KeptGk {
 #[wasm_bindgen(js_name = isGkFrame)]
 pub fn is_gk_frame(payload: &[u8]) -> bool {
     gk::is_gk_frame(payload)
+}
+
+/// A keyholder's build costs (tools/gk-wasm-bench.mjs): one bench step as JSON. Only a build
+/// made with `VOIPC_GK_BENCH` set runs it; in any other it throws and carries no bench code.
+#[wasm_bindgen(js_name = gkBench)]
+pub fn gk_bench(op: &str, arg: u32, budget_ms: f64) -> Result<String, JsError> {
+    gk_bench::run(op, arg, budget_ms).map_err(|e| JsError::new(&e))
 }
 
 /// `gk::Out` for the page: `{ seen: { user_id, account, name }[], send: Uint8Array[], emit:

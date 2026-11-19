@@ -29,8 +29,14 @@
 # it, and bob, the share's first viewer, is sent there. He must report the edge ready, never
 # failed, and decode alice's frames, which then came through the edge.
 #
-# GK=1 runs the relays with the group key on (group_key = true): text channels, and voice
-# rooms whose group the relay builds, take their keys from it instead of the old paths.
+# The relays run with the group key on (group_key's default): text channels and voice
+# rooms take their keys from it, and the run checks a text post and a voice join under it.
+# With alice in Chromium her page is hidden (DevTools: a blank tab of her own browser in
+# front of it) from before bob comes until he has read her in the text channel: she made the
+# voice room and the text channel, so she holds their keys, as a browser hidden or in a call
+# does when nobody else can, and both of bob's joins must land. Whether her timers were clamped
+# meanwhile is said (in a call they are not), and who held the keys.
+# GK=0 runs the relays with the key off (group_key = false): the old paths, still tested.
 #
 # UI_TEST=0 skips test-ui.mjs. It drives its own Chromium and reads none of the
 # settings above, so CI runs it only where the network differs.
@@ -144,9 +150,14 @@ for t in "$TRANSPORT_ALICE" "$TRANSPORT_BOB"; do
     *) die "unknown transport '$t' (quic or tcp)" ;;
   esac
 done
+GK="${GK:-1}"
+case "$GK" in
+  0 | 1) ;;
+  *) die "unknown GK '$GK' (1, the group key on, or 0, off)" ;;
+esac
 # The query parameter that puts a side on the TCP fallback
 via() { [ "$1" = tcp ] && echo "&transport=tcp" || true; }
-echo "browsers: alice=$BROWSER_ALICE over $TRANSPORT_ALICE, bob=$BROWSER_BOB over $TRANSPORT_BOB"
+echo "browsers: alice=$BROWSER_ALICE over $TRANSPORT_ALICE, bob=$BROWSER_BOB over $TRANSPORT_BOB; group key $([ "$GK" = 0 ] && echo off || echo on)"
 SERVER="${SERVER:-target/release/voipc-server}"
 [ -x "$SERVER" ] || die "$SERVER missing — run VOIPC_SELFTEST=1 npm run web first"
 grep -qs SELFTEST client/dist-web/assets/*.js ||
@@ -196,6 +207,22 @@ open_in_chrome() { # cdp-port url
     setTimeout(() => process.exit(1), 30000);
   ' "$1" "$2" || echo "warning: the browser on $1 did not take its page"
 }
+# A page hidden and shown again, as a tab behind another is: through DevTools a blank tab
+# opens in front of it (hide), and goes again with the page brought back to the front (show)
+page_cover() { # cdp-port hide|show
+  node --input-type=module -e '
+    const [port, what] = process.argv.slice(1);
+    const at = `http://127.0.0.1:${port}/json`;
+    const tabs = await (await fetch(`${at}/list`)).json();
+    if (what === "hide") {
+      await fetch(`${at}/new?about:blank`, { method: "PUT" });
+    } else {
+      for (const t of tabs) if (t.type === "page" && t.url === "about:blank") await fetch(`${at}/close/${t.id}`);
+      const page = tabs.find((t) => t.type === "page" && t.url.includes("selftest=1"));
+      if (page) await fetch(`${at}/activate/${page.id}`);
+    }
+  ' "$1" "$2" || echo "warning: the browser on $1 did not $2 the page"
+}
 [ "$BROWSER_ALICE" = firefox ] || boot_chrome alice "$WORK/alice.log"
 [ "$BROWSER_BOB" = firefox ] || boot_chrome bob "$WORK/bob.log"
 
@@ -237,8 +264,8 @@ key_path = "server.key"
 [files]
 cache_mins = 1
 TOML
-# GK=1: the group key, a top-level key, so before any table
-if [ "${GK:-}" = 1 ]; then sed -i '1i group_key = true' "$WORK/server.toml"; fi
+# GK=0: the group key off, a top-level key, so before any table
+if [ "$GK" = 0 ]; then sed -i '1i group_key = false' "$WORK/server.toml"; fi
 # EDGE=1: edge e1 may link, and takes a share's viewers from the first on
 EDGE_PORT=$((TCP_PORT + 3))
 EDGE_SECRET="e2e-edge-secret-of-at-least-32-chars"
@@ -289,7 +316,7 @@ TCP_PORT2=$((TCP_PORT + 1))
 mkdir -p "$WORK/s2"
 cp "$WORK/server.crt" "$WORK/server.key" "$WORK/s2/"
 printf 'cert_path = "server.crt"\nkey_path = "server.key"\n' > "$WORK/s2/server.toml"
-if [ "${GK:-}" = 1 ]; then sed -i '1i group_key = true' "$WORK/s2/server.toml"; fi
+if [ "$GK" = 0 ]; then sed -i '1i group_key = false' "$WORK/s2/server.toml"; fi
 (cd "$WORK/s2" && exec "$SCRIPT_DIR/$SERVER" --config server.toml --host 127.0.0.1 --tcp-port "$TCP_PORT2" --udp-port "$TCP_PORT2" \
   --cert server.crt --key server.key --tcp-fallback > "$WORK/server2.log" 2>&1) &
 for _ in $(seq 1 50); do
@@ -309,7 +336,7 @@ key_path = "server.key"
 mode = "optional"
 registration = "open"
 TOML
-if [ "${GK:-}" = 1 ]; then sed -i '1i group_key = true' "$WORK/s3/server.toml"; fi
+if [ "$GK" = 0 ]; then sed -i '1i group_key = false' "$WORK/s3/server.toml"; fi
 # One persistent text channel everyone lands in: its log is what the accounts
 # lane reads back after its writer's reader was away.
 cat > "$WORK/s3/channels.json" <<'CHANNELS'
@@ -401,10 +428,36 @@ for _ in $(seq 1 900); do
 done
 grep -q 'SELFTEST early-chat-sent' "$WORK/alice.log" ||
   echo "warning: alice never reported her first message — bob starts anyway, expect a history failure"
+# The group key on and alice in Chromium: her page hidden before bob comes (the header).
+# Not in the capped-link lane, which measures what her share sends.
+hide_alice=0
+if [ "$GK" = 1 ] && [ "$BROWSER_ALICE" = chromium ] && [ "${EXPECT_LADDER:-}" != 1 ]; then
+  hide_alice=1
+  page_cover "${chrome_cdp[alice]}" hide
+  for _ in $(seq 1 300); do
+    grep -qa 'SELFTEST page-visibility.*hidden' "$WORK/alice.log" && break
+    sleep 0.1
+  done
+  grep -qa 'SELFTEST page-visibility.*hidden' "$WORK/alice.log" ||
+    echo "warning: alice's page never said it was hidden — bob starts anyway"
+fi
 start_page bob listener "&textchannel=e2e-text&dm=alice&expect_kick=1&watch=1$SHARE_PARAMS&pos=-3,0,0$(via "$TRANSPORT_BOB")#channel=e2e" \
   "$WORK/bob.log" "$BROWSER_BOB"
 
 deadline=$(( $(date +%s) + DURATION / 1000 + 30 ))
+# Her page comes back once bob holds the voice room's keys and has read her in the text
+# channel: both of his joins landed while it was hidden. Or once his run is over.
+joined_hidden=0
+if [ "$hide_alice" = 1 ]; then
+  until grep -qa 'media-key-installed' "$WORK/bob.log" &&
+    grep -qa 'event channel-chat-message.*text hello from alice' "$WORK/bob.log"; do
+    if grep -qa 'SELFTEST done' "$WORK/bob.log" || [ "$(date +%s)" -ge "$deadline" ]; then break; fi
+    sleep 0.2
+  done
+  if grep -qa 'media-key-installed' "$WORK/bob.log" &&
+    grep -qa 'event channel-chat-message.*text hello from alice' "$WORK/bob.log"; then joined_hidden=1; fi
+  page_cover "${chrome_cdp[alice]}" show
+fi
 until grep -q "SELFTEST done" "$WORK/alice.log" && grep -q "SELFTEST done" "$WORK/bob.log"; do
   [ "$(date +%s)" -lt "$deadline" ] || { echo "timeout waiting for the self-tests"; break; }
   sleep 1
@@ -424,6 +477,15 @@ fail=0
 check() { # description file pattern
   if grep -q "$3" "$2"; then echo "PASS $1"; else echo "FAIL $1" | tee -a "$WORK/fails.txt"; fail=1; fi
 }
+# The voice room's id and the text channel's, as alice made them: a check of a channel's
+# messages reads that channel's alone ("hello from alice" is also in "text hello from alice")
+channel_of() { # name
+  grep -oh "\"channel_id\":[0-9]*,\"name\":\"$1\"" "$WORK/alice.txt" "$WORK/bob.txt" | head -1 | grep -o '[0-9]*' | head -1 || true
+}
+room_id=$(channel_of e2e)
+text_id=$(channel_of e2e-text)
+in_room="\"channel_id\":${room_id:-none},"
+in_text="\"channel_id\":${text_id:-none},"
 check "alice connected"                 "$WORK/alice.txt" 'SELFTEST connected'
 check "bob connected"                   "$WORK/bob.txt"   'SELFTEST connected'
 check "alice got a media key"           "$WORK/alice.txt" 'media-key-installed'
@@ -441,8 +503,8 @@ check "alice placed bob from his beacon" "$WORK/alice.txt" 'event user-position.
 # spatial test's synthetic voice going through the real mixer
 check "alice ran the spatial test"      "$WORK/alice.txt" 'spatial-test-started.*"mode":"3d"'
 check "alice's mixer played the test"   "$WORK/alice.txt" 'voice-stats.*played.*:[1-9]'
-check "bob read alice's channel message" "$WORK/bob.txt"  'channel-chat-message.*hello from alice'
-check "alice read bob's channel message" "$WORK/alice.txt" 'channel-chat-message.*hello from bob'
+check "bob read alice's channel message" "$WORK/bob.txt"  "channel-chat-message.*$in_room.*\"content\":\"hello from alice\""
+check "alice read bob's channel message" "$WORK/alice.txt" "channel-chat-message.*$in_room.*\"content\":\"hello from bob\""
 check "bob read alice's DM"             "$WORK/bob.txt"   'direct-chat-message.*dm from alice'
 check "alice read bob's DM"             "$WORK/alice.txt" 'direct-chat-message.*dm from bob'
 # Files (protocol 13): over HTTPS beside the session, sealed in a worker
@@ -454,15 +516,54 @@ fi
 # because he beat alice to it also logs source":"invite", and then quietly fails
 # the history check three lines down instead of this one.
 check "bob joined via the invite link"  "$WORK/bob.txt"   'channel-requested.*"existing":true.*"source":"invite"'
-check "bob received channel history"    "$WORK/bob.txt"   'channel-history-received.*early from alice'
+check "bob received channel history"    "$WORK/bob.txt"   "channel-history-received.*$in_room.*\"content\":\"early from alice\""
 # The text channel: bob subscribes to it long after the two already hold a
 # pairwise session, which is where the group key used to go missing. Every one
 # of these failed together when it did.
 check "bob joined the text channel"     "$WORK/bob.txt"   'text-channel-joined'
 check "bob read alice's text message"   "$WORK/bob.txt"   'text-channel-read.*text hello from alice'
-check "bob received the text history"   "$WORK/bob.txt"   'channel-history-received.*text early from alice'
+check "bob received the text history"   "$WORK/bob.txt"   "channel-history-received.*$in_text.*\"content\":\"text early from alice\""
 check "alice read bob's first text line" "$WORK/alice.txt" 'text-channel-read.*text first from bob'
 check "alice read bob's text message"   "$WORK/alice.txt" 'text-channel-read.*text hello from bob'
+# The group key (stores/gk.ts's events, which only it sends): who held each channel's keys,
+# as bob last heard; no post of either side held back and given up, and no key refused. Off,
+# none of its lines at all.
+keyholders() { # channel-id
+  grep -h "event gk-keyholders {\"channel_id\":$1," "$WORK/bob.txt" | tail -1 |
+    grep -o '"name":"[^"]*","online":[a-z]*' | sed 's/"name":"\([^"]*\)","online":true/\1/; s/"name":"\([^"]*\)","online":false/\1 (away)/' |
+    paste -sd, - || true
+}
+if [ "$GK" = 1 ]; then
+  # The voice join and the text posts above went under the key: its lines for those channels
+  check "bob's voice join went under the group key" "$WORK/bob.txt" "event gk-keyholders {$in_room"
+  check "alice wrote in the text channel under it" "$WORK/alice.txt" "event gk-state {$in_text\"state\":\"ok\""
+  check "bob read and wrote there under it"  "$WORK/bob.txt"   "event gk-state {$in_text\"state\":\"ok\""
+  echo "--- keyholders as bob last heard: voice room ${room_id:-?}: $(keyholders "${room_id:-none}" | grep . || echo none said), text channel ${text_id:-?}: $(keyholders "${text_id:-none}" | grep . || echo none said)"
+  if [ "$hide_alice" = 1 ]; then
+    check "alice's page was hidden before bob came" "$WORK/alice.txt" 'SELFTEST page-visibility.*"state":"hidden"'
+    # Measured, and said: a page in a call keeps its timers on time (Chrome clamps a hidden page's
+    # only once it has been silent a while; alice's came 11 s after she left the room), so this
+    # is choice 31's fallback, not the clamp. A keyholder's parts going out without timer
+    # polling is live-gk.test.ts's; a hidden keyholder in no call is in no lane yet.
+    clamp=$(grep -ah 'SELFTEST page-timers-clamped' "$WORK/alice.txt" | head -1 | grep -o '{.*}' || true)
+    echo "--- alice's timers while hidden: ${clamp:+clamped $clamp}${clamp:-on time (in a call: not clamped)}"
+    if [ "$joined_hidden" = 1 ]; then
+      echo "PASS bob joined the room and the text channel while alice's page was hidden"
+    else
+      echo "FAIL bob's joins did not both land while alice's page was hidden" | tee -a "$WORK/fails.txt"; fail=1
+    fi
+    check "alice's page was shown again"    "$WORK/alice.txt" 'SELFTEST page-visibility.*"state":"visible"'
+  else
+    echo "--- alice's page stays shown: $([ "$BROWSER_ALICE" = chromium ] && echo "the capped-link lane" || echo "no DevTools in Firefox")"
+  fi
+  if grep -q 'event gk-post-dropped\|event gk-state.*"state":"refused"' "$WORK/alice.txt" "$WORK/bob.txt"; then
+    echo "FAIL the group key dropped a post or refused one:" | tee -a "$WORK/fails.txt"
+    grep -h 'event gk-post-dropped\|event gk-state.*"state":"refused"' "$WORK/alice.txt" "$WORK/bob.txt" | tee -a "$WORK/fails.txt"; fail=1
+  fi
+elif grep -q 'SELFTEST event gk-' "$WORK/alice.txt" "$WORK/bob.txt"; then
+  echo "FAIL a group-key line with the key off:" | tee -a "$WORK/fails.txt"
+  grep -h 'SELFTEST event gk-' "$WORK/alice.txt" "$WORK/bob.txt" | head -5 | tee -a "$WORK/fails.txt"; fail=1
+fi
 if grep -q 'decryption failed' "$WORK/alice.txt" "$WORK/bob.txt"; then
   echo "FAIL a message could not be decrypted:" | tee -a "$WORK/fails.txt"
   grep -h 'decryption failed' "$WORK/alice.txt" "$WORK/bob.txt" | tee -a "$WORK/fails.txt"; fail=1

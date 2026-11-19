@@ -23,7 +23,7 @@ import { mkdirSync, mkdtempSync, openSync, rmSync, writeFileSync } from "node:fs
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { barrier, frameSummary, loadPage, openTab, probe, seen, sentKind, sleep, startChromium, waitFor } from "./test-cdp.mjs";
+import { barrier, frameSummary, loadPage, openTab, probe, seen, sentKind, sentPost, sleep, startChromium, waitFor } from "./test-cdp.mjs";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.argv[2] ?? 49992);
@@ -66,7 +66,8 @@ spawnSync(
 );
 writeFileSync(
   join(WORK, "server.toml"),
-  `host = "127.0.0.1"
+  // GK=0 (test-web.sh's switch): the relay with the group key off, on the old paths
+  `${process.env.GK === "0" ? "group_key = false\n" : ""}host = "127.0.0.1"
 tcp_port = ${PORT}
 udp_port = ${PORT}
 cert_path = "server.crt"
@@ -1021,8 +1022,8 @@ async function lane() {
     await waitFor(tab, `document.querySelector(".react-item")`);
     await tab.evaluate(`window.__voipc_said.splice(0); 0`);
     await tab.evaluate(`document.querySelector(".react-item").click()`);
-    // The event is written out before its post goes, a raw #27 after the key check
-    await waitFor(tab, sentKind("#27"));
+    // The event is written out before its post goes, raw (sentPost) after the key check
+    await waitFor(tab, sentPost);
     await tab.evaluate(`JSON.stringify = window.__stringify; 0`);
   };
   await sendsHide(ivy, "something fine");

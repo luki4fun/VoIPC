@@ -76,8 +76,9 @@ pub struct ServerConfig {
 
     /// The group epoch key for text channels and voice rooms (docs/GROUP-KEY.md), read at
     /// start: on, the relay keys every group that way and refuses the old paths; off, it
-    /// keeps them and refuses the key's messages. Off until the key is whole.
-    #[serde(default)]
+    /// keeps them and refuses the key's messages, and still serves the history the key
+    /// kept, read-only. On by default; `group_key = false` turns it off.
+    #[serde(default = "default_group_key")]
     pub group_key: bool,
 
     /// Path to TLS certificate file (PEM).
@@ -606,6 +607,10 @@ fn default_live_lobby() -> u32 {
     2000
 }
 
+fn default_group_key() -> bool {
+    true
+}
+
 /// `text` read as a TOML file of `T` (server.toml, edge.toml), or what is wrong with it:
 /// where, and toml's word for why. Never the line itself, which toml's own message quotes:
 /// a mistyped `secret` in edge.toml, or an `admin_token` or `[pool] edges` line here, would
@@ -636,7 +641,7 @@ impl Default for ServerConfig {
             max_connections_per_ip: default_max_connections_per_ip(),
             live_lobby: default_live_lobby(),
             tcp_fallback: false,
-            group_key: false,
+            group_key: default_group_key(),
             cert_path: "certs/server.crt".into(),
             key_path: "certs/server.key".into(),
             admin_token: None,
@@ -700,7 +705,7 @@ mod tests {
         assert_eq!(config.max_users, 64);
         assert_eq!(config.max_connections_per_ip, 32);
         assert!(!config.tcp_fallback, "the TCP fallback is opt-in");
-        assert!(!config.group_key, "the group key is off until it is whole");
+        assert!(config.group_key, "the group key is on by default");
     }
 
     #[test]
@@ -724,11 +729,14 @@ mod tests {
         let config: ServerConfig =
             toml::from_str("tcp_fallback = true\ncert_path = \"c\"\nkey_path = \"k\"").unwrap();
         assert!(config.tcp_fallback);
-        assert!(!config.group_key);
+        assert!(
+            config.group_key,
+            "a file that does not name it gets the default"
+        );
 
         let config: ServerConfig =
-            toml::from_str("group_key = true\ncert_path = \"c\"\nkey_path = \"k\"").unwrap();
-        assert!(config.group_key);
+            toml::from_str("group_key = false\ncert_path = \"c\"\nkey_path = \"k\"").unwrap();
+        assert!(!config.group_key, "the switch still turns it off");
     }
 
     #[test]
