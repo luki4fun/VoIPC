@@ -1915,6 +1915,8 @@ async function chatLane() {
   const ROOM = `talk-${n}`;
   const ann = await connect(`ui-ann-${n}`);
   const ben = await connect(`ui-ben-${n}`);
+  // What each page sends from here: the room's keying, below (V4)
+  for (const tab of [ann, ben]) await tab.evaluate(`window.__roomFrom = window.__voipc_said.length; 0`);
   await ann.evaluate(click('button[title="Create channel"]'));
   await waitFor(ann, `document.querySelector(".create-form")`);
   await ann.evaluate(setInput(".create-form input[type=text]", ROOM));
@@ -2000,6 +2002,27 @@ async function chatLane() {
   await ben.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
   check("and Enter sends both lines as one message", await arrived(ann, "line two") &&
     (await ann.evaluate(`${rowWith("line two")}?.querySelector(".msg-content br") !== null`)));
+
+  // ── The room's keys: under the group key no old-path key frame leaves either page (V4) ──
+  // Both made the room, joined it and wrote in it. Under the key its media keys and its chat's
+  // come from the room's epoch key, one welcome in all (GROUP-KEY.md §5.9): no bundle asked of
+  // the other, no sender or media key handed over, no old post, key check or session opening
+  // (live path, #56-#59); each post went as EpochPost (#75). With the key off (GK=0) the old
+  // path keys the room member to member: the control that the frames are seen at all.
+  const OLD_KEYING = ["RequestPreKeyBundle", "DistributeSenderKey", "DistributeMediaKey", "SendEncryptedChannelMessage", "#27", "#56", "#57", "#58", "#59"];
+  const roomSaid = async (tab) => JSON.parse(await tab.evaluate(
+    `JSON.stringify(window.__voipc_said.slice(window.__roomFrom).map((m) => typeof m === "string" ? m : Object.keys(m ?? {})[0]))`));
+  for (const [who, tab] of [["ann", ann], ["ben", ben]]) {
+    const sent = await roomSaid(tab);
+    const old = sent.filter((t) => OLD_KEYING.includes(t));
+    if (process.env.GK !== "0") {
+      check(`under the group key ${who} sends no old-path key frame in a voice room, and posts under the key`,
+        old.length === 0 && sent.includes("#75"), JSON.stringify(old.length ? old : sent));
+    } else {
+      check(`with the key off (GK=0) ${who} keys the room the old way`,
+        sent.includes("DistributeSenderKey") && sent.includes("SendEncryptedChannelMessage"), JSON.stringify(sent));
+    }
+  }
 
   // ── A reply, from the row's own tool ──
   check("a message's Reply tool is reached with a real pointer", await useTool(ben, "bold move", "Reply"));
@@ -2197,15 +2220,58 @@ async function chatLane() {
     `[...document.querySelectorAll(".search-pane .result")].some((e) => e.querySelector(".result-conv")?.textContent.includes(${JSON.stringify(ROOM)}))`));
   await ann.evaluate(`document.querySelector(".search-pane .search-close")?.click()`);
 
-  // ── A message far past what the box takes is cut where it arrives (D-7) ──
-  // Only a modified client sends one; the reader keeps 16 KiB of it. Last
-  // here: a row that long changes where the others sit
+  // ── A message past 16 KiB is stopped before it goes (owner, 2026-11-19) ──
+  // The relay refuses a post over 16 KiB as it goes, everywhere, voice rooms too, so the
+  // composer counts a post as it would go (chat-rules.ts tooLongToSend: the text as the
+  // envelope's JSON writes it, and POST_WRAP_BYTES around it) and stops one past it, the words
+  // kept in the box. (The box takes 2000 characters as typed; these are set past that, as a
+  // paste around it would be.) Last here: a row that long changes where the others sit
   await openChannel(ann, ROOM);
   await waitFor(ann, `${titleIs(ROOM)} && !document.querySelector(".search-pane")`);
+  const postSent = `(${sentKind("#75")} || ${sentKind("#27")} || ${sentKind("SendEncryptedChannelMessage")})`;
+  await ann.evaluate(`window.__voipc_said.splice(0); window.__toasts.length = 0; 0`);
   await say(ann, `long${"z".repeat(20_000)}`);
-  check("a message past 16 KiB arrives cut to 16 KiB", (await arrived(ben, "longzzz")) &&
-    (await ben.evaluate(`${rowWith("longzzz")}?.querySelector(".msg-content")?.textContent.trim().length === 16 * 1024`)),
-    String(await ben.evaluate(`${rowWith("longzzz")}?.querySelector(".msg-content")?.textContent.trim().length`)));
+  // chat-rules.ts POST_WRAP_BYTES; a plain text's JSON is the text and its two quotes
+  const WRAP = 1280;
+  const asSent = (chars) => Math.ceil(((chars + 2 + WRAP) / 1024) * 10) / 10;
+  const tooLong = `document.querySelector(".chat-main .too-long")?.textContent ?? ""`;
+  const stopped = await seen(ann, `(${tooLong}).includes("this is ${asSent(20_004)} KiB") && (${tooLong}).includes("at most 16 KiB")`, 10_000);
+  check("a message past 16 KiB is stopped before it goes, and the composer says why",
+    stopped && (await ann.evaluate(`document.querySelector(".chat-main .input-bar .chat-input").value.startsWith("longzzz")`)),
+    await ann.evaluate(tooLong));
+  check("and nothing of it went", (await barrier(SERVER, ann, ben)) && !(await ann.evaluate(postSent)) &&
+    !(await ann.evaluate(`!!${rowWith("longzzz")}`)) && !(await ben.evaluate(`!!${rowWith("longzzz")}`)),
+    JSON.stringify(await ann.evaluate(`window.__voipc_said.map((m) => typeof m === "string" ? m : Object.keys(m ?? {})[0])`)));
+  // The longest post it lets by goes and arrives whole, the key on or off: none it lets by is
+  // refused after its own row showed it sent. One character more is stopped
+  const edge = `edge${"z".repeat(16 * 1024 - WRAP - 2 - 4)}`;
+  await ann.evaluate(setInput(".chat-main .input-bar .chat-input", `${edge}z`));
+  check("one byte past what goes is stopped too",
+    await seen(ann, `!!document.querySelector(".chat-main .too-long") && !!document.querySelector(".chat-main .send-btn")?.disabled`, 10_000),
+    await ann.evaluate(tooLong));
+  await ann.evaluate(setInput(".chat-main .input-bar .chat-input", edge));
+  check("cut to what goes, the line goes and Send is back",
+    await seen(ann, `!document.querySelector(".chat-main .too-long") && !document.querySelector(".chat-main .send-btn")?.disabled`, 10_000));
+  await say(ann, edge);
+  const notSent = `[...window.__toasts, ...[...document.querySelectorAll(".chat-main .gk-line")].map((e) => e.textContent)].filter((t) => t.includes("one message holds at most 16 KiB"))`;
+  check("the longest post the composer lets by arrives whole", (await arrived(ben, "edgezzz")) &&
+    (await ben.evaluate(`${rowWith("edgezzz")}?.querySelector(".msg-content")?.textContent.trim().length === ${edge.length}`)),
+    String(await ben.evaluate(`${rowWith("edgezzz")}?.querySelector(".msg-content")?.textContent.trim().length`)));
+  check("and nothing refused it", (await barrier(SERVER, ann, ben)) && (await ann.evaluate(`${notSent}.length === 0`)),
+    JSON.stringify(await ann.evaluate(notSent)));
+  // A modified client's post past 16 KiB (`__voipc_invoke`, past the composer) is refused by
+  // the relay, in a voice room too with the key off, and the writer is told plainly: as a toast
+  // (`ChannelError`), or under the key, when the post started a chain, as the room's key line
+  await ann.evaluate(`window.__voipc_said.splice(0); window.__toasts.length = 0; 0`);
+  await ann.evaluate(`window.__voipc_invoke("send_channel_message", { server: ${JSON.stringify(SERVER)}, content: "big" + "z".repeat(20000) }).then(() => 0, () => 0)`);
+  const told = await seen(ann, `${notSent}.some((t) => t.includes("not sent"))`, 15_000);
+  check("a post the relay refuses as too large is said so plainly", told && (await ann.evaluate(postSent)),
+    JSON.stringify(await ann.evaluate(`window.__toasts`)));
+  check("and it reached nobody", (await barrier(SERVER, ann, ben)) && !(await ben.evaluate(`!!${rowWith("bigzzz")}`)));
+  // Waved off: an error toast sits over the rows the next checks point at, and a pointer
+  // over it holds it there
+  await ann.evaluate(`[...document.querySelectorAll(".toast")].filter((t) => t.textContent.includes("16 KiB")).forEach((t) => t.querySelector(".toast-close")?.click()); 0`);
+  await waitFor(ann, `![...document.querySelectorAll(".toast-message")].some((t) => t.textContent.includes("16 KiB"))`, 10_000);
 
   // The channel's own settings, from its row's gear: `set` runs in the dialog
   const settings = async (set) => {
@@ -2481,6 +2547,8 @@ async function chatLane() {
   await say(ann, "hi dee");
   const annEntry = `[...document.querySelectorAll(".dm-entry")].find((e) => e.textContent.includes("ui-fa-${n}"))`;
   await probe(dee, annEntry, 15_000);
+  // dee's id, as ann's direct message went to it (for a modified client's message below)
+  const deeId = await ann.evaluate(`[...window.__voipc_said].reverse().find((m) => m?.SendEncryptedDirectMessage)?.SendEncryptedDirectMessage.target_user_id ?? null`);
   // dee goes to a room of its own, then reads the conversation there
   await dee.evaluate(click('button[title="Create channel"]'));
   await probe(dee, `document.querySelector(".create-form")`, 20_000);
@@ -2576,6 +2644,17 @@ async function chatLane() {
   check("in a direct message too, its sender sends it again once the relay let go", await waitFor(dee,
     `${rowWith("load me once the relay let go")}?.querySelector(".file-card img")?.naturalWidth > 0`, 45_000).then(() => true, () => false),
     await dee.evaluate(`${rowWith("load me once the relay let go")}?.querySelector(".file-card")?.textContent ?? "no card"`));
+
+  // ── What a reader keeps of a direct message past 16 KiB (D-7) ──
+  // The relay holds a channel's post to 16 KiB, but takes a direct message up to 60 KiB, so a
+  // modified client's (`__voipc_invoke`, past the composer) can carry more: dee keeps 16 KiB of
+  // it, live, where it arrives. Last for dee: a row that long changes where the others sit
+  const longSent = deeId !== null && (await ann.evaluate(`window.__voipc_invoke("send_direct_message",
+    { server: ${JSON.stringify(SERVER)}, targetUserId: ${deeId}, content: "dmlong" + "z".repeat(20000) }).then(() => true, (e) => String(e))`));
+  const keptLength = `${rowWith("dmlongzzz")}?.querySelector(".msg-content")?.textContent.trim().length`;
+  check("a direct message past 16 KiB from a modified client is kept cut to 16 KiB where it arrives", longSent === true &&
+    (await waitFor(dee, `${keptLength} === 16 * 1024`, 15_000).then(() => true, () => false)),
+    `sent: ${longSent}, kept: ${await dee.evaluate(String(keptLength))}`);
 
   await shareSwitch(ann, false);
 
@@ -3241,12 +3320,23 @@ async function accountsLane() {
   await sayIn(back, inKept);
   // A pause for it to spread, not a check: its yes or no is not used
   await probe(two, `[...document.querySelectorAll(".msg-content")].some((e) => e.textContent.includes(${JSON.stringify(inKept)}))`, 3_000);
-  const told = await waitFor(
-    back,
-    `[...document.querySelectorAll(".history-marker")].some((e) => e.textContent.includes("can be read by") && e.textContent.includes(${JSON.stringify(acctB)}))`,
-    15_000,
-  ).then(() => true, () => false);
-  check("the writer is told who can read what it keeps", told, await markers(back));
+  // With the key off (GK=0) the writer's app hands its kept chain to each reader and names
+  // them (.history-marker). Under the group key the copy goes under the epoch, so no reader is
+  // handed anything: only a gated group's writers are shown new readers, as the key's own line
+  // (.gk-line "New readers in", GROUP-KEY.md §4.4 rule 4, §11 claim 5), and "kept" is not
+  // gated. The positive case is the community lane's gated side-c.
+  const keptReaders = `[...document.querySelectorAll(".history-marker")].some((e) => e.textContent.includes("can be read by") && e.textContent.includes(${JSON.stringify(acctB)}))`;
+  const gkReaders = `[...document.querySelectorAll(".gk-line")].filter((e) => e.textContent.includes("New readers in")).length`;
+  if (process.env.GK === "0") {
+    const told = await waitFor(back, keptReaders, 15_000).then(() => true, () => false);
+    check("the writer is told who can read what it keeps", told, await markers(back));
+  } else {
+    // Past their barrier what either page sent or was sent of the post is in
+    await barrier(SERVER3, back, two);
+    const gkLine = await back.evaluate(`[...document.querySelectorAll(".gk-line")].map((e) => e.textContent.trim()).join(" | ")`);
+    check("under the key the writer is named no reader of a channel that is not gated",
+      !(await back.evaluate(keptReaders)) && (await back.evaluate(gkReaders)) === 0, `${await markers(back)} / ${gkLine}`);
+  }
   await sleep(1500); // their copies are filed
   check("a reload of a remembered account signs back in by itself", await reload(back), await back.evaluate(`document.body.innerText.slice(0, 200)`));
   const listedAgain = await waitFor(back, dmRowOf(acctB), 15_000).then(() => true, () => false);

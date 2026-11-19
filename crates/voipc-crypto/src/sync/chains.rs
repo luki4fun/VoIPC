@@ -1940,6 +1940,14 @@ impl AccountSync {
         due.iter().flat_map(|conv| self.advance(conv)).collect()
     }
 
+    /// The group epoch (generation, epoch) of `conv`'s gk chain start now out, if one is.
+    pub(super) fn gk_start_out(&self, conv: &str) -> Option<(Id, u32)> {
+        match self.writers.get(conv)?.frames.front()? {
+            AccountRequest::EpochChainStart { gen, gk_epoch, .. } => Some((*gen, *gk_epoch)),
+            _ => None,
+        }
+    }
+
     /// `conv`'s writer was refused, not for now: it starts over at the next post.
     pub(super) fn writer_refused(&mut self, conv: &str, what: &str) {
         let mut w = self.writers.remove(conv).unwrap_or_default();

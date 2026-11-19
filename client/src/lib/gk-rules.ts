@@ -5,6 +5,8 @@
 // or a voice room's bare name.
 // Pure, for gk-rules.test.ts.
 
+import { TOO_LARGE_REASON } from "./chat-rules.ts";
+
 /** `gk-state`. `why`: for "refused" the server's reason; for "held" the check that stopped the
  *  post ("guest", "pin", or "old_counter" with `name` the account whose old key was listed); for
  *  "late" `WAITING` while a post of ours waits, else "". */
@@ -174,6 +176,10 @@ const WARNINGS: Record<string, (place: string, n: number) => string> = {
 /** What becomes of our posts here, if anything is to be said: one line at most. */
 function postLine(place: string, ch: GkChannel): GkLine | null {
   const s = ch.state;
+  // A post past 16 KiB (one that started a kept chain is refused so): the post's, not the keys'
+  if (s?.state === "refused" && s.why === TOO_LARGE_REASON) {
+    return { key: "state", line: `Your message to ${place} was not sent: one message holds at most 16 KiB.`, wait: false };
+  }
   if (s?.state === "refused") {
     return { key: "state", line: `The server refused ${place}'s keys: ${s.why.replace(/\.$/, "")}.`, wait: false };
   }

@@ -6,7 +6,8 @@ import assert from "node:assert/strict";
 import { get } from "svelte/store";
 
 const { invoked } = await import("./node-stores.mjs");
-const { afterLookup, lobby, lobbyPage, lookedUp, lookUpNames, moreLobby, searchLobby, searchNames } = await import("./lobby.ts");
+const { afterLookup, lobby, LOBBY_RETRY_MS, lobbyPage, lookedUp, lookUpNames, moreLobby, resetLobby, searchLobby, searchNames, watchLobby } =
+  await import("./lobby.ts");
 const { channelRosters, onlineById, setCounts } = await import("./rosters.ts");
 const { channels } = await import("./channels.ts");
 const { olderRelay } = await import("./relay.ts");
@@ -41,6 +42,89 @@ test("pages are asked one at a time, on from where the last ended, and not past 
   moreLobby(s);
   assert.equal(asked("request_lobby_page").length, 2, "the end");
   assert.ok(onlineById(s).has(3), "a page's people are who this client knows to be online");
+});
+
+test("a page refused while the link is down is asked again after a pause, not in a loop that starves the page", async () => {
+  const s = server();
+  (globalThis as any).__answer = (command: string) => {
+    if (command === "request_lobby_page") throw new Error("not connected");
+  };
+  // The member list's first-page effect: ask whenever nothing is on its way
+  const stop = lobby.of(s).subscribe((l) => {
+    if (!l.asked && !l.done && l.next === null && l.total === 0) moreLobby(s);
+  });
+  try {
+    for (let i = 0; i < 50; i++) await Promise.resolve();
+    assert.equal(asked("request_lobby_page").length, 1, "one ask, then a pause");
+    mock.timers.tick(LOBBY_RETRY_MS);
+    for (let i = 0; i < 50; i++) await Promise.resolve();
+    assert.equal(asked("request_lobby_page").length, 2, "asked again after the pause");
+    // A fresh start (the lobby's rows went) asks at once; the old refusal's pause frees nothing
+    delete (globalThis as any).__answer;
+    searchLobby(s, "");
+    assert.equal(asked("request_lobby_page").length, 3);
+    mock.timers.tick(LOBBY_RETRY_MS);
+    moreLobby(s);
+    assert.equal(asked("request_lobby_page").length, 3, "the fresh ask is still on its way");
+  } finally {
+    stop();
+    delete (globalThis as any).__answer;
+  }
+});
+
+test("a lobby list on screen is watched by each new session: a page that loads signed in, a reconnect", async () => {
+  const s = server();
+  const watches = () => asked("watch_lobby").filter((a) => a.server === s);
+  // The list shows before the session is up (a reload of a remembered account): refused
+  let up = false;
+  (globalThis as any).__answer = (command: string) => {
+    if (command === "watch_lobby" && !up) throw new Error("not connected");
+  };
+  try {
+    watchLobby(s, true);
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+    assert.equal(watches().length, 1, "refused, and not asked again at once");
+    mock.timers.tick(LOBBY_RETRY_MS);
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+    assert.equal(watches().length, 2, "asked again after the pause");
+    up = true;
+    mock.timers.tick(LOBBY_RETRY_MS);
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+    assert.equal(watches().length, 3, "and taken");
+    mock.timers.tick(LOBBY_RETRY_MS * 3);
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+    assert.equal(watches().length, 3, "once taken, not again");
+    // A reconnect: the relay forgot the old session's watch; the new one's lobby list (App.svelte
+    // `resetLobby`) is its first word, and it is watched from there, a turn later (the list comes
+    // in the read that signed the session in, before the backend lists it)
+    resetLobby(s);
+    assert.equal(watches().length, 3, "not in the same turn");
+    mock.timers.tick(0);
+    assert.deepEqual(watches().at(-1), { server: s, on: true });
+    assert.equal(watches().length, 4);
+    // A page that loads signed in: refused at the list's first showing, then the session's list
+    // asks a turn later, not a whole pause later, and the pause's ask does not come on top
+    up = false;
+    watchLobby(s, true);
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+    up = true;
+    resetLobby(s);
+    mock.timers.tick(0);
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+    assert.equal(watches().length, 6, "refused, then taken a turn after the session's list");
+    mock.timers.tick(LOBBY_RETRY_MS * 3);
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+    assert.equal(watches().length, 6);
+    // Off screen: a new session is not asked to watch, and a refused "off" is not asked again
+    up = false;
+    watchLobby(s, false);
+    resetLobby(s);
+    mock.timers.tick(LOBBY_RETRY_MS * 3);
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+    assert.deepEqual(watches().slice(6), [{ server: s, on: false }]);
+  } finally {
+    delete (globalThis as any).__answer;
+  }
 });
 
 test("a search starts over with its prefix", () => {

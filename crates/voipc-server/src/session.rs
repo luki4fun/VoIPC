@@ -49,9 +49,15 @@ const MAX_KEM_KEY_BYTES: usize = 1569;
 /// asked for more (`PreKeysLow`). Once per crossing, so it cannot be used to
 /// make a client spin.
 const PREKEYS_LOW: usize = 10;
-/// A post on the live path, at most: all the client will show of one, and all a kept copy
-/// of it may be (`accounts/log.rs`). One goes to everyone online, whatever it weighs.
+/// A post at most, on every path (`post_fits`, `handle_epoch_post`): all the client will show
+/// of one, and all a kept copy of it may be (`accounts/log.rs`). One goes to everyone online,
+/// whatever it weighs.
 const MAX_TEXT_POST: usize = crate::accounts::log::MAX_ENTRY;
+/// What a post past `MAX_TEXT_POST` is refused as, on every path: a text channel's, a voice
+/// room's, and under the group key (owner, 2026-11-19). Words of its own, so the app tells it
+/// from `relayable`'s "message too large", which any frame past what the relay passes on
+/// gets (a history hand-off, a key), and says it plainly (chat-rules.ts `TOO_LARGE_REASON`).
+const POST_TOO_LARGE: &str = "post too large: one message holds at most 16 KiB";
 /// The longest direct message echoed to its sender.
 const MAX_DM_ECHO: usize = 1024;
 /// What channels may fill one list's frame, less what goes around them.
@@ -882,6 +888,19 @@ async fn relayable(ciphertext: &[u8], tx: &ControlTx) -> bool {
     false
 }
 
+/// Whether a channel post is within `MAX_TEXT_POST`, a text channel's or a voice room's
+/// (owner, 2026-11-19: with the key off a voice room's took up to `MAX_RELAY_CIPHERTEXT`, and
+/// only a reader's cut held it), else the writer is told `POST_TOO_LARGE`. Under `relayable`'s
+/// cap, so it stands for that one here.
+async fn post_fits(ciphertext: &[u8], tx: &ControlTx) -> bool {
+    const _: () = assert!(MAX_TEXT_POST <= MAX_RELAY_CIPHERTEXT);
+    if ciphertext.len() <= MAX_TEXT_POST {
+        return true;
+    }
+    channel_error(tx, POST_TOO_LARGE).await;
+    false
+}
+
 /// Spend one of this session's `state_change_rate` tokens, or say no.
 ///
 /// Every message that has to ask is a flag the server keeps about the sender
@@ -1673,7 +1692,7 @@ async fn handle_message(
         } => {
             if !legacy_refused(state, session_id, channel_id, tx).await
                 && !room_refused(state, session_id, channel_id, tx).await
-                && relayable(&ciphertext, tx).await
+                && post_fits(&ciphertext, tx).await
             {
                 let allowed = state.spend(session_id, |s| &mut s.chat_rate);
                 if !allowed {
@@ -4082,12 +4101,9 @@ async fn handle_encrypted_channel_message(
         return Ok(());
     }
 
+    // Its size is held at the door, a voice room's too (`post_fits`)
     let text = state.is_text_channel(channel_id).await;
     if text {
-        if ciphertext.len() > MAX_TEXT_POST {
-            channel_error(tx, "message too large").await;
-            return Ok(());
-        }
         let bytes = ciphertext.len() as f64;
         let budget = state
             .sessions
@@ -4296,7 +4312,7 @@ async fn handle_epoch_post(
         return epoch_refused(tx, &post, refused_why::OFF, "");
     }
     if post.ciphertext.len() > MAX_TEXT_POST.min(MAX_RELAY_CIPHERTEXT) {
-        return rule_refused(tx, &post, refused_why::TOO_LARGE, "message too large").await;
+        return rule_refused(tx, &post, refused_why::TOO_LARGE, POST_TOO_LARGE).await;
     }
     let bytes = post.ciphertext.len() as f64;
     let Some(budget) = state

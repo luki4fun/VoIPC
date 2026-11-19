@@ -16,6 +16,7 @@ import {
   type GkChannel,
   type GkState,
 } from "./gk-rules.ts";
+import { TOO_LARGE_REASON } from "./chat-rules.ts";
 
 const state = (s: GkState["state"], why = "", name?: string): GkState => ({ channel_id: 7, state: s, why, name });
 const lines = (ch: GkChannel) => gkLines("#general", ch).map((l) => l.line);
@@ -52,6 +53,14 @@ test("a drop stays told until the keys are well or another post waits", () => {
 test("a refusal is told with the server's reason, over any drop it caused", () => {
   const refused = withDropped(withState(emptyGk(), state("refused", "pin.")), { channel_id: 7, why: "refused" });
   assert.deepEqual(gkLines("#general", refused), [{ key: "state", line: "The server refused #general's keys: pin.", wait: false }]);
+  // A post past 16 KiB is the post's refusal, not the keys' (owner, 2026-11-19)
+  const tooLarge = withDropped(withState(emptyGk(), state("refused", TOO_LARGE_REASON)), { channel_id: 7, why: "refused" });
+  assert.deepEqual(gkLines("#general", tooLarge), [
+    { key: "state", line: "Your message to #general was not sent: one message holds at most 16 KiB.", wait: false },
+  ]);
+  // Only that one: other words are the relay's own
+  const other = withDropped(withState(emptyGk(), state("refused", "message too large")), { channel_id: 7, why: "refused" });
+  assert.deepEqual(gkLines("#general", other), [{ key: "state", line: "The server refused #general's keys: message too large.", wait: false }]);
 });
 
 test("a held post says which reader stopped it", () => {

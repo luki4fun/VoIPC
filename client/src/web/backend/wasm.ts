@@ -122,6 +122,8 @@ export interface SignalClient {
   /** A channel we are in: a text channel we follow, or the voice room we stand in. */
   gkTrack(channelId: number, text: boolean, log: string, anonymous: boolean, hideMembers: boolean, viewerAdmin: boolean): GkOut;
   gkUntrack(channelId: number): GkOut;
+  /** `TextJoined` refused this channel: posts that waited for it are dropped, told why. */
+  gkJoinRefused(channelId: number): GkOut;
   /** A frame `isGkFrame` named, as its postcard bytes. */
   gkFrame(payload: Uint8Array): GkOut;
   /** A post of ours under its message id; with the channel's `log` its kept copy goes once it does. */

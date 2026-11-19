@@ -33985,7 +33985,9 @@ mod live_path {
         .await;
         let seen = drained(&mut ann).await;
         assert!(
-            seen.iter().any(|m| matches!(m, ServerMessage::ChannelError { reason } if reason == "message too large")),
+            seen.iter().any(
+                |m| matches!(m, ServerMessage::ChannelError { reason } if reason == POST_TOO_LARGE)
+            ),
             "{seen:?}"
         );
         assert_eq!(posts(&drained(&mut bob).await), 0);
@@ -41978,5 +41980,261 @@ mod kept_group_key {
             ask(&mut c, list).await,
             AccountReply::SelfRows { rows, next: None } if rows.is_empty()
         ));
+    }
+}
+
+/// One post's size, wherever it goes (owner, 2026-11-19): at most `MAX_TEXT_POST` sealed, in
+/// a text channel, a voice room and under the key alike, refused as `POST_TOO_LARGE`; and the
+/// composer's own count (chat-rules.ts `tooLongToSend`) never lets one by that is refused.
+mod post_cap {
+    use super::*;
+    use crate::gk_e2e_r2::{gk_state, lounge_group, Conn, LOUNGE};
+    use voipc_crypto::envelope::{envelope_with, Extras, FileRef};
+    use voipc_protocol::gk::{refused_what, refused_why};
+
+    /// chat-rules.ts `POST_WRAP_BYTES`, which chat-rules.test.ts asserts the same: what the
+    /// composer counts around a post's text (its JSON string), whatever goes with it.
+    const POST_WRAP_BYTES: usize = 1280;
+    /// chat-rules.ts `FILE_WRAP_BYTES`: what it counts on top for a file going with it.
+    const FILE_WRAP_BYTES: usize = 2560;
+
+    /// All `c` is sent before a ping comes back.
+    async fn drained(c: &mut Client) -> Vec<ServerMessage> {
+        let stamp: u64 = rand::random();
+        c.send(&ClientMessage::Ping { timestamp: stamp }).await;
+        let mut seen = Vec::new();
+        loop {
+            match c.next().await.expect("the connection stays") {
+                ServerMessage::Pong { timestamp } if timestamp == stamp => return seen,
+                m => seen.push(m),
+            }
+        }
+    }
+
+    fn errors(seen: &[ServerMessage]) -> Vec<String> {
+        seen.iter()
+            .filter_map(|m| match m {
+                ServerMessage::ChannelError { reason } => Some(reason.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn room_posts(seen: &[ServerMessage]) -> Vec<usize> {
+        seen.iter()
+            .filter_map(|m| match m {
+                ServerMessage::EncryptedChannelChatMessage { ciphertext, .. } => {
+                    Some(ciphertext.len())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// With the key off a voice room's chat took up to `MAX_RELAY_CIPHERTEXT`: what the app
+    /// cuts a reader's copy to was all that held it, and the composer's stop was not the
+    /// relay's. Now it is held to 16 KiB like a text channel's, and refused in the same words.
+    #[tokio::test]
+    async fn a_voice_rooms_post_is_held_to_16_kib_like_a_text_channels() {
+        let state = admin_state();
+        let mut ann = connect_with_bundle(&state, "ann", test_bundle(20)).await.0;
+        let mut bob = connect_with_bundle(&state, "bob", test_bundle(20)).await.0;
+        let room = create(&mut ann, "room", false).await;
+        bob.send(&ClientMessage::JoinChannel {
+            channel_id: room,
+            password: None,
+        })
+        .await;
+        settled(&mut bob).await;
+        drained(&mut ann).await;
+        drained(&mut bob).await;
+        for len in [MAX_TEXT_POST + 1, 20_000, MAX_RELAY_CIPHERTEXT] {
+            ann.send(&ClientMessage::SendEncryptedChannelMessage {
+                channel_id: room,
+                ciphertext: vec![0; len],
+            })
+            .await;
+            assert_eq!(
+                errors(&drained(&mut ann).await),
+                vec![POST_TOO_LARGE.to_string()],
+                "{len} bytes"
+            );
+        }
+        assert_eq!(room_posts(&drained(&mut bob).await), Vec::<usize>::new());
+        // 16 KiB itself goes
+        ann.send(&ClientMessage::SendEncryptedChannelMessage {
+            channel_id: room,
+            ciphertext: vec![0; MAX_TEXT_POST],
+        })
+        .await;
+        assert!(errors(&drained(&mut ann).await).is_empty());
+        assert_eq!(room_posts(&drained(&mut bob).await), vec![MAX_TEXT_POST]);
+    }
+
+    /// A text channel's post past 16 KiB, whatever it weighs past that, is the same refusal.
+    #[tokio::test]
+    async fn a_text_channels_post_past_16_kib_is_refused_as_a_post() {
+        let state = admin_state();
+        let mut ann = connect_with_bundle(&state, "ann", test_bundle(20)).await.0;
+        let lounge = create(&mut ann, "lounge", true).await;
+        drained(&mut ann).await;
+        for len in [MAX_TEXT_POST + 1, MAX_RELAY_CIPHERTEXT + 1] {
+            ann.send(&ClientMessage::SendEncryptedChannelMessage {
+                channel_id: lounge,
+                ciphertext: vec![0; len],
+            })
+            .await;
+            assert_eq!(
+                errors(&drained(&mut ann).await),
+                vec![POST_TOO_LARGE.to_string()],
+                "{len} bytes"
+            );
+        }
+    }
+
+    /// Under the key: with a blob as `EpochRefused{POST, TOO_LARGE}` and the words in its
+    /// detail, without as the old path refuses, in the same words.
+    #[tokio::test]
+    async fn a_key_post_past_16_kib_is_refused_as_a_post_with_or_without_a_blob() {
+        let state = gk_state();
+        let ik = voipc_crypto::generate_identity_key_pair();
+        let mut ann = Conn::open(&state, "ann", &ik).await;
+        ann.follow().await;
+        let group = lounge_group(&state, &ann.run).await;
+        ann.settled().await;
+        for blob in [None, Some(vec![1; 64])] {
+            ann.send(&ClientMessage::EpochPost {
+                channel_id: LOUNGE,
+                group: group.clone(),
+                gen: [0; 16],
+                epoch: 1,
+                blob: blob.clone(),
+                ciphertext: vec![0; MAX_TEXT_POST + 1],
+            })
+            .await;
+            let seen = ann.settled().await;
+            let told: Vec<String> = seen
+                .iter()
+                .filter_map(|m| match m {
+                    ServerMessage::ChannelError { reason } => Some(reason.clone()),
+                    ServerMessage::EpochRefused {
+                        what, why, detail, ..
+                    } if *what == refused_what::POST && *why == refused_why::TOO_LARGE => {
+                        Some(format!("refused: {detail}"))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let want = match blob {
+                None => POST_TOO_LARGE.to_string(),
+                Some(_) => format!("refused: {POST_TOO_LARGE}"),
+            };
+            assert_eq!(told, vec![want], "{seen:?}");
+        }
+    }
+
+    /// The control for the app's words: a frame past what the relay passes on keeps its own
+    /// refusal, "message too large", which is not a post's (a history hand-off here: one the
+    /// app checked before Signal's overhead was added comes back so).
+    #[tokio::test]
+    async fn a_frame_past_what_the_relay_passes_on_keeps_its_own_words() {
+        let state = admin_state();
+        let mut ann = connect_with_bundle(&state, "ann", test_bundle(20)).await.0;
+        let (mut bob, bob_id) = connect_with_bundle(&state, "bob", test_bundle(20)).await;
+        let room = create(&mut ann, "room", false).await;
+        bob.send(&ClientMessage::JoinChannel {
+            channel_id: room,
+            password: None,
+        })
+        .await;
+        settled(&mut bob).await;
+        drained(&mut ann).await;
+        ann.send(&ClientMessage::SendChannelHistory {
+            channel_id: room,
+            target_user_id: bob_id,
+            ciphertext: vec![0; MAX_RELAY_CIPHERTEXT + 1],
+            message_type: 2,
+        })
+        .await;
+        let told = errors(&drained(&mut ann).await);
+        assert_eq!(told, vec!["message too large".to_string()]);
+        assert_ne!(told[0], POST_TOO_LARGE);
+    }
+
+    /// The composer's count: the longest text it lets by, with the most that can go around
+    /// it (a timer, a reply and a thread whose ids are 64 control characters, six bytes each
+    /// as JSON; with a file, the largest card a file may have), sealed every way a post is,
+    /// is never past the relay's cap. Under the key: `gen ‖ epoch ‖ D_e` (52 bytes) and a
+    /// sender key message (at most 115 bytes more: a version, the distribution id, the chain
+    /// id and iteration, CBC's padding, a signature), 167 in all; the old path the same less
+    /// the 52; a kept copy, a log entry (105).
+    #[tokio::test]
+    async fn the_composers_count_lets_by_no_post_any_wrapping_takes_past_the_cap() {
+        let id = voipc_crypto::new_message_id();
+        let hostile = "\u{1}".repeat(voipc_crypto::envelope::MAX_MESSAGE_ID);
+        let around = Extras {
+            reply: Some(hostile.clone()),
+            thread: Some(hostile),
+            ..Extras::default()
+        };
+        let file = FileRef {
+            hash: "a".repeat(64),
+            key: "b".repeat(64),
+            size: voipc_crypto::file::MAX_FILE_PLAIN,
+            z: false,
+            name: "\u{1F600}".repeat(voipc_crypto::envelope::MAX_FILE_NAME),
+            mime: Some(format!("a/{}", "b".repeat(125))),
+            w: Some(voipc_crypto::envelope::MAX_FILE_SIDE),
+            h: Some(voipc_crypto::envelope::MAX_FILE_SIDE),
+            dur: Some(voipc_crypto::envelope::MAX_FILE_DUR),
+            px: Some("A".repeat(voipc_crypto::envelope::PREVIEW_BYTES / 3 * 4)),
+        };
+        let with_file = Extras {
+            file: Some(file),
+            ..around.clone()
+        };
+        let ttl = Some(voipc_crypto::MAX_MESSAGE_TTL_SECS);
+        let log_key = voipc_crypto::log::LogKey::generate();
+        for (extras, wrap) in [
+            (&around, POST_WRAP_BYTES),
+            (&with_file, POST_WRAP_BYTES + FILE_WRAP_BYTES),
+        ] {
+            // Its JSON string and `wrap` are 16 KiB: the most `tooLongToSend` lets by
+            let text = "z".repeat(MAX_TEXT_POST - wrap - 2);
+            let envelope = envelope_with(&id, &text, ttl, extras);
+            // Random chain ids: a larger one is a longer varint
+            for _ in 0..32 {
+                let mut st =
+                    voipc_crypto::SignalStores::new(&voipc_crypto::generate_identity_key_pair(), 1);
+                voipc_crypto::group::create_distribution_message(&mut st, 1, 7)
+                    .await
+                    .unwrap();
+                let key = [&[0u8; 52][..], &envelope].concat();
+                for plain in [&key, &envelope] {
+                    let ct = voipc_crypto::group::encrypt_group_message(&mut st, 1, 7, plain)
+                        .await
+                        .unwrap();
+                    assert!(
+                        ct.len() <= MAX_TEXT_POST.min(MAX_RELAY_CIPHERTEXT),
+                        "{} sealed past the cap, wrap {wrap}",
+                        ct.len()
+                    );
+                }
+            }
+            let kept = voipc_crypto::log::seal_entry(
+                &[7; 32],
+                "c:x",
+                &[1; 16],
+                1,
+                &log_key,
+                &envelope,
+                u64::MAX,
+            );
+            assert!(
+                kept.len() <= crate::accounts::log::MAX_ENTRY,
+                "{}",
+                kept.len()
+            );
+        }
     }
 }

@@ -232,6 +232,7 @@
     messageRefs,
     notificationBody,
     receivedText,
+    channelErrorText,
   } from "./lib/chat-rules.js";
   import { LAYOUT_PICKER_VERSION } from "./lib/ui-prefs.js";
   import { stopTransmit, voiceMode, vadThreshold } from "./lib/stores/voice.js";
@@ -1637,7 +1638,8 @@
       }),
 
       listenServer<{ reason: string }>("channel-error", (server, data) => {
-        addNotification(`${fromServer(server)}${data.reason}`, "error");
+        // A post past 16 KiB, said plainly (one the composer never let by: a forward, say)
+        addNotification(`${fromServer(server)}${channelErrorText(data.reason)}`, "error");
       }),
 
       listenServer<ChannelLayout>("channel-layout", (server, layout) => {

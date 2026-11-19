@@ -31,6 +31,7 @@ use crate::sync::{higher_counter, Counter};
 
 pub use crate::sync::Pending;
 
+mod copies;
 mod holder;
 mod kept;
 mod member;
@@ -43,6 +44,7 @@ mod writer;
 #[cfg(test)]
 mod tests;
 
+pub use copies::{Copies, Early, EarlyPost, KeptCopy, EARLY_WAIT_MS, JOIN_REFUSED, SETTLE_MS};
 pub use holder::{BuildJob, Built, HolderKeep};
 pub use kept::PastEpoch;
 

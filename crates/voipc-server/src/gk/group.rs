@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use dashmap::DashMap;
-use tracing::warn;
+use tracing::{debug, warn};
 use voipc_crypto::group_key::build::kx_tag;
 use voipc_crypto::group_key::commit::{
     validate, Applied, Commit, Due, DueKind, Exit, GroupView, HeadView as CommitHead, HolderRef,
@@ -804,6 +804,7 @@ impl GroupState {
             head_seed,
         };
         self.next_due += 1;
+        debug!(group = %self.id, due = d.id, kind = ?d.due.kind, to = d.sid, joins = d.due.joiners.len(), exits = d.due.exits.len(), "a due asked");
         self.send_due(&d, out);
         self.dues.push(d);
     }
@@ -1239,6 +1240,7 @@ impl GroupState {
     /// Misses due `at`: its keyholder is passed over, the due is asked again.
     fn miss(&mut self, at: usize, now: u64) {
         let d = self.dues.remove(at);
+        debug!(group = %self.id, due = d.id, kind = ?d.due.kind, by = d.sid, late_ms = now.saturating_sub(d.deadline), "a due missed");
         self.holders.missed(&d.by.kx, now);
         self.missed_total += 1;
         let n = self.missed_total;
@@ -1850,6 +1852,7 @@ impl GroupState {
             return;
         };
         let d = self.dues.remove(at);
+        debug!(group = %self.id, due, kind = ?d.due.kind, by = sid, why, "a due declined");
         if why != gk::decline::CANDIDATE {
             self.holders.declined(&d.by.kx, now);
         }

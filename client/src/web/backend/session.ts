@@ -175,7 +175,7 @@ export function sessionOrSigningIn(server: string): Session | null {
 
 // A test build's way to hand a session a frame no honest relay sends (test-provider.mjs),
 // to see which frames came and what went, and to cut a link (test-community.mjs).
-const heard: [string, number | undefined][] = [];
+const heard: [string, number | string | undefined][] = [];
 const said: unknown[] = [];
 /** A test build's barriers: a Ping's timestamp, and what its Pong resolves. */
 const barriers = new Map<number, () => void>();
@@ -842,7 +842,8 @@ export class Session implements SessionContext, AccountHost {
     if (!frameGoesOn(msg, this.signedIn, this.account?.midPairing ?? false)) return;
     if (__SELFTEST__) {
       const [tag, b] = typeof msg === "string" ? [msg, null] : Object.entries(msg as Record<string, Body>)[0];
-      heard.push([tag, b?.channel_id ?? b?.user?.channel_id]);
+      // `GroupKeys` with whether the relay runs the key: a lane run with GK=0 checks it took
+      heard.push([tag, tag === "GroupKeys" ? (b?.on ? "on" : "off") : (b?.channel_id ?? b?.user?.channel_id)]);
     }
     if (this.signedIn && this.signal.liveHoldsFrame(payload)) {
       if (this.pinHeld.length >= wasm().pinHeldMost()) this.pinHeld.shift();
@@ -1306,7 +1307,11 @@ export class Session implements SessionContext, AccountHost {
       case "TextJoined":
         // The text channels we follow: the group key tracks them
         for (const [channelId] of b.joined as [number, ...unknown[]][]) this.gkFollowed.add(channelId);
-        for (const channelId of b.refused as number[]) this.gkFollowed.delete(channelId);
+        for (const channelId of b.refused as number[]) {
+          this.gkFollowed.delete(channelId);
+          // Posts that waited for it to be tracked are dropped, told why
+          if (gkPosts(this.gkPath)) this.gkRun(() => this.signal.gkJoinRefused(channelId));
+        }
         this.liveFrame(payload);
         this.gkTrackAll();
         break;

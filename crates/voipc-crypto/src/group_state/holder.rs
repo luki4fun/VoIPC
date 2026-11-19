@@ -28,7 +28,7 @@ use super::{
 };
 use crate::group_key::build::{
     self, build_genesis, build_join, build_opening, build_regenesis, build_seed_welcomes, kx_tag,
-    plan_opening, BucketNow, Holding, Lists, OpeningAsk, Replacing, RowBases, Start,
+    plan_opening, BucketNow, Holding, ListSeat, Lists, OpeningAsk, Replacing, RowBases, Start,
 };
 use crate::group_key::commit::{
     self, list_order, validate, Candidate, Due, DueKind, Exit, GroupView, HeadView, HolderRef,
@@ -39,9 +39,10 @@ use crate::group_key::timers::{
     OLD_KEYS_SECS, PIECE_MAX_BYTES, SEED_WELCOMES_A_FRAME,
 };
 use crate::group_key::{
-    check_carried, counter_flagged, keyholder_set_digest, open_keyring_welcome, take_keyring, wire,
-    Endorsement, Group, GroupKind, Keyholder, Keyring, Kind, Me, MemberId, Origin, Pool, SeatPair,
-    SeatPublic, SeatRef, SeedRolls, Seen, SignedHeader, Version, CLOCK_SLACK, MAX_KEYHOLDERS,
+    check_carried, counter_flagged, keyholder_set_digest, list_digest, open_keyring_welcome,
+    take_keyring, wire, Endorsement, Group, GroupKind, Keyholder, Keyring, KeyringBucket, Kind, Me,
+    MemberId, Origin, Pool, SeatPair, SeatPublic, SeatRef, SeedRolls, Seen, SignedHeader, Version,
+    CLOCK_SLACK, MAX_KEYHOLDERS,
 };
 
 /// A KeyholdReplace is done once no tracked group names the old pair this long after it
@@ -397,26 +398,39 @@ impl Task {
 
     /// The validator over this device's own view (plan 2c): the head and keyring it built
     /// on, the lists it fetched (a version whose list it did not need shows by its leaf
-    /// alone), each seat's seed as the due said.
+    /// alone), each seat's seed as the due said. A bucket the commit drops or re-versions
+    /// is read from its list, one its keyring names: by its leaf alone it would hide the
+    /// seats a drop takes (rules 8 and 10).
     fn check(&self, b: &build::Built) -> Result<(), String> {
         let anew = matches!(self.due.kind, DueKind::Genesis | DueKind::Regenesis);
-        let leaves: Vec<Listed> = match (&self.ring, anew) {
-            (Some(ring), false) => ring
-                .buckets
-                .iter()
-                .map(|kb| {
-                    let mut seats: Vec<SeatRef> = self
-                        .lists
-                        .get(&kb.version())
-                        .map(|l| l.iter().map(|x| x.seat).collect())
-                        .unwrap_or_default();
-                    list_order(&mut seats);
-                    Listed {
+        let leaves: Vec<Listed> = match (&self.ring, &self.head, anew) {
+            (Some(ring), Some(head), false) => {
+                let g = Group::new(self.kind, &self.id, head.header().gen)
+                    .map_err(|e| e.to_string())?;
+                let changed: HashSet<u64> = b
+                    .commit
+                    .drops
+                    .iter()
+                    .copied()
+                    .chain(b.commit.versions.iter().map(|vo| vo.b))
+                    .collect();
+                let mut leaves = Vec::with_capacity(ring.buckets.len());
+                for kb in &ring.buckets {
+                    let seats = match self.lists.get(&kb.version()) {
+                        Some(l) => listed(&g, kb, l)
+                            .ok_or("own check: a list the keyring does not name")?,
+                        None if changed.contains(&kb.b) => {
+                            return Err("own check: no list of a bucket the commit changes".into())
+                        }
+                        None => vec![],
+                    };
+                    leaves.push(Listed {
                         leaf: kb.leaf(),
                         seats,
-                    }
-                })
-                .collect(),
+                    });
+                }
+                leaves
+            }
             _ => vec![],
         };
         let joiners: HashSet<SeatRef> = self.due.joiners.iter().map(|j| j.seat).collect();
@@ -911,9 +925,23 @@ impl Duty {
                     return;
                 };
                 if *gen == hold.lists_gen {
+                    // Only a list the keyring names: one of the right shape is still the
+                    // relay's word
+                    let g = Group::new(m.t.kind, &m.t.group, *gen).ok();
                     for l in lists.iter().filter(|l| l.check().is_ok()) {
                         let (v, seats) = wire::list(l.clone());
-                        hold.lists.insert(v, seats);
+                        let named = match (&g, &hold.ring) {
+                            (Some(g), Some(r)) => r
+                                .ring
+                                .buckets
+                                .iter()
+                                .find(|kb| kb.version() == v)
+                                .is_some_and(|kb| listed(g, kb, &seats).is_some()),
+                            _ => false,
+                        };
+                        if named {
+                            hold.lists.insert(v, seats);
+                        }
                     }
                 }
                 if !more {
@@ -1323,8 +1351,8 @@ impl Duty {
         let mut new = None;
         match due.kind {
             DueKind::Genesis | DueKind::Regenesis => {
-                let own = self.own_seat(who, kind);
-                if due.joiners.len() != 1 || Some(due.joiners[0].seat) != own {
+                let own = Self::own_seats(who, kind);
+                if due.joiners.len() != 1 || !own.contains(&due.joiners[0].seat) {
                     return Err(not_ready("a new start seats this device's own seat only"));
                 }
                 due.volunteer = Some(Candidate {
@@ -1461,20 +1489,29 @@ impl Duty {
         Ok((task, due_id, attempt))
     }
 
-    /// This device's own seat in a group of `kind`: the account's seat keys in text, else
-    /// the connection's pair (as the relay seats a volunteer, gk/session.rs `volunteer`).
-    fn own_seat(&self, who: &Who, kind: GroupKind) -> Option<SeatRef> {
+    /// This device's own seat in a group of `kind`, as the relay may name it (gk/session.rs
+    /// `volunteer`, gk/voice.rs `room_seat_m`): the account's seat keys in text, else the
+    /// connection's pair. A signed-in member's voice seat is named by its account, or by its
+    /// connection in an anonymous room that is not gated (open choice 11); the relay names
+    /// it by the room's flags, which this app may learn late, so either name of the
+    /// connection's pair is its own seat (as `seat_keys::mine` takes a welcome to either).
+    fn own_seats(who: &Who, kind: GroupKind) -> Vec<SeatRef> {
         match (who.account, kind) {
-            (Some(a), GroupKind::Text) => Some(
-                who.seat_keys
-                    .as_ref()?
-                    .pair
-                    .public()
-                    .seat(MemberId::Account(a)),
-            ),
+            (Some(a), GroupKind::Text) => who
+                .seat_keys
+                .iter()
+                .map(|k| k.pair.public().seat(MemberId::Account(a)))
+                .collect(),
             (a, _) => {
-                let m = a.map_or(MemberId::Conn(who.user_id), MemberId::Account);
-                Some(who.conn.pair()?.public().seat(m))
+                let Some(keys) = who.conn.pair().map(SeatPair::public) else {
+                    return vec![];
+                };
+                let conn = MemberId::Conn(who.user_id);
+                a.map(MemberId::Account)
+                    .into_iter()
+                    .chain([conn])
+                    .map(|m| keys.seat(m))
+                    .collect()
             }
         }
     }
@@ -1959,7 +1996,9 @@ impl Duty {
 }
 
 /// The lists an opening on `ring` needs (`plan_opening`, as `build_opening` plans it at the
-/// same time); a Join, a new start and a welcome page need none.
+/// same time); a Join, a new start and a welcome page need none. An opening also asks the
+/// lists of the buckets it drops: it may drop only the seats its exits name (`validate`
+/// rules 8 and 10), and its own check (`Task::check`) sees a bucket's seats only in its list.
 fn lists_needed(ring: &Keyring, p: &DuePiece, now: u64) -> Vec<Version> {
     let kind = match DueKind::from_code(p.kind) {
         Some(DueKind::Join | DueKind::Genesis | DueKind::Regenesis) | None => return vec![],
@@ -1981,7 +2020,25 @@ fn lists_needed(ring: &Keyring, p: &DuePiece, now: u64) -> Vec<Version> {
             exits: exits.get(&kb.b).map_or(0, |x| x.len() as u16),
         })
         .collect();
-    plan_opening(kind.header_kind(), &buckets, kind == DueKind::Refresh, now).lists_needed(&buckets)
+    let plan = plan_opening(kind.header_kind(), &buckets, kind == DueKind::Refresh, now);
+    let mut needed = plan.lists_needed(&buckets);
+    needed.extend(
+        buckets
+            .iter()
+            .zip(&plan.steps)
+            .filter(|(_, s)| **s == build::Step::Drop)
+            .map(|(b, _)| Version { b: b.b, v: b.v }),
+    );
+    needed
+}
+
+/// The seats of keyring bucket `kb` in list order, when `list` is the one it names (its
+/// digest and its count, as `build_opening` checks a list it builds from).
+fn listed(g: &Group, kb: &KeyringBucket, list: &[ListSeat]) -> Option<Vec<SeatRef>> {
+    let mut seats: Vec<SeatRef> = list.iter().map(|l| l.seat).collect();
+    list_order(&mut seats);
+    (seats.len() == usize::from(kb.seats) && list_digest(g, kb.version(), &seats) == kb.list)
+        .then_some(seats)
 }
 
 /// Our commit was taken: its keyring, `KRK` and rolls are the group's now.
@@ -3374,6 +3431,377 @@ mod tests {
         rig.now = w.now * 1000;
         assert_eq!(rig.tick().events, vec![]);
         assert!(rig.duty.keep.unnamed.is_empty());
+    }
+
+    /// T1e B (J8H): in an anonymous voice room that is not gated the relay seats a
+    /// signed-in member by its connection (open choice 11, gk/voice.rs `room_seat_m`). Its
+    /// Genesis due names that seat; the device takes it as its own seat, builds, and the
+    /// relay takes the commit. It declined every such due before (`NOT_READY`, "a new start
+    /// seats this device's own seat only"), and the room never had keys.
+    #[test]
+    fn a_signed_in_device_starts_an_anonymous_voice_room_seated_by_its_connection() {
+        let a = [5; 16];
+        let mut rig = Rig::new(Some(a), Platform::Desktop);
+        let _ = rig.start();
+        let me = MemberId::Account(a);
+        let seat_m = MemberId::Conn(U);
+        let ep = seat_keys::conn_pair(&mut rig.who, rig.now).unwrap();
+        let pair = wire::pair(&ep, GkMember::Conn(U)).unwrap();
+        let mut m = Member::new(
+            GkTrack {
+                group: world::VOICE_ID.into(),
+                kind: GroupKind::Voice,
+                anonymous: true,
+                ..track()
+            },
+            None,
+        );
+        m.voice_seats.insert(U, pair.keys.seat(seat_m).into());
+        rig.groups.insert(world::VOICE_ID.into(), m);
+        let due = Due {
+            joiners: vec![Joiner {
+                seat: pair.keys.seat(seat_m),
+                ik: raw(&rig.who.identity),
+                keys: pair.keys.clone(),
+                endorsement: pair.endorsement.clone(),
+                returning: false,
+            }],
+            volunteer: Some(Candidate {
+                m: me,
+                ik: raw(&rig.who.identity),
+                pair: pair.clone(),
+            }),
+            ..Due::of(DueKind::Genesis, false)
+        };
+        let voice_due = |id: u64, d: &Due| ServerMessage::EpochDue {
+            group: world::VOICE_ID.into(),
+            due: id,
+            part: 0,
+            last: true,
+            piece: Box::new(piece(due_code::GENESIS, d, None, vec![])),
+        };
+
+        // A seat is its keys and its name: another device's keys under its own connection,
+        // under this device's connection or under this account, and this device's keys under
+        // another connection, are no start of this one's
+        let other = world::Member::conn(U + 1).joiner();
+        let named = |keys: &Joiner, m: MemberId, endorsed: MemberId| Joiner {
+            seat: keys.keys.seat(m),
+            endorsement: Endorsement {
+                m: endorsed,
+                ..keys.endorsement.clone()
+            },
+            ..keys.clone()
+        };
+        let mine = due.joiners[0].clone();
+        let not_mine = [
+            ("another device's", other.clone()),
+            (
+                "another device's keys by this connection",
+                named(&other, seat_m, seat_m),
+            ),
+            (
+                "another device's keys by this account",
+                named(&other, me, MemberId::Conn(U + 1)),
+            ),
+            (
+                "this device's keys by another connection",
+                named(&mine, MemberId::Conn(U + 1), MemberId::Conn(U + 1)),
+            ),
+        ];
+        for (id, (what, j)) in (1..).zip(not_mine) {
+            let mut theirs = due.clone();
+            theirs.joiners = vec![j];
+            let out = rig.frame(voice_due(id, &theirs));
+            assert_eq!(declined(&out), Some(decline::NOT_READY), "{what}");
+            assert_eq!(
+                decline_detail(&out).as_deref(),
+                Some("a new start seats this device's own seat only"),
+                "{what}"
+            );
+        }
+
+        let out = rig.frame(voice_due(5, &due));
+        assert!(out.build_ready, "{:?}", out.send);
+        let c = rig.commit();
+        let by = HolderRef {
+            m: me,
+            kx: pair.kx(),
+        };
+        let ap = World::check_start(
+            GroupKind::Voice,
+            world::VOICE_ID,
+            false,
+            &due,
+            by,
+            &c,
+            T0,
+            &[U],
+        )
+        .unwrap_or_else(|bad| panic!("{bad}"));
+        let h = ap.header.header();
+        assert_eq!(h.keyholders[0].m, me, "the entry names the account");
+        assert_eq!(h.keyholders[0].u, Some(U));
+        assert_eq!(
+            ap.seated.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            vec![pair.keys.seat(seat_m)],
+            "seated by its connection"
+        );
+    }
+
+    /// T1e C (J8H): a KeyholdersAdd drops the buckets its exits empty (§5.3), and rule 8 lets
+    /// it drop only those. The keyholder's own check saw a bucket by its leaf alone when its
+    /// build needed no list of it, so a promotion that carried the exit of a one-seat
+    /// bucket's only seat (a gate turning on, the connection seats going) failed its own
+    /// rule 8 and was declined: the exits never landed. It asks the dropped buckets' lists
+    /// too now, and the relay takes the commit.
+    #[test]
+    fn a_promotion_carrying_the_exit_that_empties_a_bucket_drops_it_and_is_taken() {
+        let mut rig = Rig::new(None, Platform::Desktop);
+        let (mut w, pair) = genesis(&mut rig);
+        let by = HolderRef {
+            m: MemberId::Conn(U),
+            kx: pair.kx(),
+        };
+        // A lone joiner in a bucket of its own, then three more in another
+        let lone = world::Member::account(10);
+        let join = w.join_due(&[&lone]);
+        rig.due(2, piece(due_code::JOIN, &join, Some(&w), vec![]));
+        let c = rig.commit();
+        assert_eq!(land(&mut rig, &mut w, &join, by, &c).seated, 1);
+        let people: Vec<world::Member> = (11..14).map(world::Member::account).collect();
+        let refs: Vec<&world::Member> = people.iter().collect();
+        let join = w.join_due(&refs);
+        rig.due(3, piece(due_code::JOIN, &join, Some(&w), vec![]));
+        let c = rig.commit();
+        assert_eq!(land(&mut rig, &mut w, &join, by, &c).seated, 3);
+        let lone_b = w.bucket_of(&lone.seat);
+        let buckets = w.leaves.len();
+
+        // The promotion carries the lone seat's exit
+        let cand = world::Holder::desktop(9);
+        let mut promote = w.exits(&[lone.seat], DueKind::Promote);
+        promote.candidate = Some(cand.candidate());
+        let own: EndorsedPair = (&pair).into();
+        let out = rig.due(4, piece(due_code::PROMOTE, &promote, Some(&w), vec![own]));
+        let asked: Vec<(u64, u64)> = out
+            .send
+            .iter()
+            .filter_map(|m| match m {
+                ClientMessage::EpochListsWanted { versions, .. } => Some(versions.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        rig.frame(lists_for(&w, &out.send).expect("lists asked"));
+        let c = rig.commit();
+        assert!(
+            asked.iter().any(|(b, _)| *b == lone_b),
+            "the dropped bucket's list is asked: {asked:?}"
+        );
+        let a = land(&mut rig, &mut w, &promote, by, &c);
+        let h = a.header.header();
+        assert_eq!(h.kind, Kind::KeyholdersAdd);
+        assert_eq!(h.keyholders.len(), 2);
+        assert_eq!(a.removed, vec![lone.seat]);
+        assert_eq!(w.leaves.len(), buckets - 1, "the emptied bucket is dropped");
+        assert!(w.leaves.iter().all(|l| l.leaf.b != lone_b));
+    }
+
+    /// A keyholder of `TEXT_ID` whose keyring holds, next to its own, a bucket of two
+    /// accounts' seats: the world, its pair, the two, and that bucket.
+    fn two_seat_bucket(rig: &mut Rig) -> (World, Pair, [world::Member; 2], u64) {
+        let (mut w, pair) = genesis(rig);
+        let by = HolderRef {
+            m: MemberId::Conn(U),
+            kx: pair.kx(),
+        };
+        let s = [world::Member::account(10), world::Member::account(11)];
+        let join = w.join_due(&[&s[0], &s[1]]);
+        rig.due(2, piece(due_code::JOIN, &join, Some(&w), vec![]));
+        let c = rig.commit();
+        assert_eq!(land(rig, &mut w, &join, by, &c).seated, 2);
+        let b = w.bucket_of(&s[0].seat);
+        assert_eq!(w.bucket_of(&s[1].seat), b, "one bucket of two");
+        (w, pair, s, b)
+    }
+
+    /// A due of `kind` carrying `gone`'s exit and `made_up`'s, both from bucket `b`: two
+    /// exits count that two-seat bucket empty, though its other seat stays.
+    fn exits_with_a_made_up_one(
+        w: &mut World,
+        gone: &world::Member,
+        made_up: &world::Member,
+        b: u64,
+        kind: DueKind,
+    ) -> Due {
+        let mut due = w.exits(&[gone.seat], kind);
+        w.seq += 1;
+        due.exits.push(Exit {
+            seq: w.seq,
+            seat: made_up.seat,
+            b,
+        });
+        due.exits_upto = w.seq;
+        due
+    }
+
+    /// The versions `sent` asked the lists of.
+    fn lists_asked(sent: &[ClientMessage]) -> Vec<(u64, u64)> {
+        sent.iter()
+            .filter_map(|m| match m {
+                ClientMessage::EpochListsWanted { versions, .. } => Some(versions.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    /// `lists`, with bucket `b`'s list made of `seats` (each with its own key, in list order):
+    /// a list of the right shape, as a relay may send it.
+    fn forge_list(lists: ServerMessage, b: u64, seats: &[&world::Member]) -> ServerMessage {
+        let ServerMessage::EpochLists {
+            group,
+            gen,
+            mut lists,
+            more,
+        } = lists
+        else {
+            panic!("not lists");
+        };
+        let mut forged: Vec<gk::ListSeat> = seats
+            .iter()
+            .map(|m| gk::ListSeat {
+                seat: m.seat.into(),
+                dh: m.joiner().keys.dh_bytes().to_vec(),
+            })
+            .collect();
+        forged.sort_by_key(|s| s.seat);
+        let l = lists
+            .iter_mut()
+            .find(|l| l.b == b)
+            .expect("the bucket's list asked");
+        l.seats = forged;
+        assert!(l.check().is_ok(), "a list of the right shape");
+        ServerMessage::EpochLists {
+            group,
+            gen,
+            lists,
+            more,
+        }
+    }
+
+    /// What the decline in `out` said, if one went.
+    fn decline_detail(out: &GkOut) -> Option<String> {
+        out.send.iter().find_map(|m| match m {
+            ClientMessage::EpochDecline { detail, .. } => Some(detail.clone()),
+            _ => None,
+        })
+    }
+
+    /// J8H review: a KeyholdersAdd reads the buckets it drops through their lists (rule 8
+    /// and 10 in its own check). A relay that made up an exit in a two-seat bucket counts it
+    /// empty; if it then sent that bucket's list with the made-up seat in place of the one
+    /// that stays, a list of the right shape that its keyring does not name, the keyholder
+    /// signed a commit dropping the staying seat, which `removed` never names. A list the
+    /// keyring does not name is not taken now; the true list shows the staying seat, and the
+    /// own check refuses its drop (rule 10).
+    #[test]
+    fn a_promotion_drops_no_seat_its_exits_do_not_name_whatever_list_the_relay_sends() {
+        let mut rig = Rig::new(None, Platform::Desktop);
+        let (mut w, pair, s, b) = two_seat_bucket(&mut rig);
+        let x = world::Member::account(12);
+        let own: EndorsedPair = (&pair).into();
+        let cand = world::Holder::desktop(9);
+
+        // The made-up list
+        let mut promote = exits_with_a_made_up_one(&mut w, &s[0], &x, b, DueKind::Promote);
+        promote.candidate = Some(cand.candidate());
+        let out = rig.due(
+            3,
+            piece(due_code::PROMOTE, &promote, Some(&w), vec![own.clone()]),
+        );
+        assert!(
+            lists_asked(&out.send).iter().any(|(ab, _)| *ab == b),
+            "the dropped bucket's list is asked"
+        );
+        let lists = lists_for(&w, &out.send).expect("lists asked");
+        let mut out = rig.frame(forge_list(lists, b, &[&s[0], &x]));
+        let jobs = rig.jobs();
+        out.send.extend(jobs.send);
+        assert!(
+            rig.uploads().is_empty(),
+            "no commit went: {:?}",
+            sent_kinds(&out.send)
+        );
+        assert_eq!(declined(&out), Some(decline::NOT_READY), "{:?}", out.send);
+        assert_eq!(
+            decline_detail(&out).as_deref(),
+            Some("the relay did not send a list the build needs"),
+            "the made-up list is not taken"
+        );
+
+        // The true list, the same made-up exit
+        let mut promote = exits_with_a_made_up_one(&mut w, &s[0], &x, b, DueKind::Promote);
+        promote.candidate = Some(cand.candidate());
+        let out = rig.due(4, piece(due_code::PROMOTE, &promote, Some(&w), vec![own]));
+        let mut out = match lists_for(&w, &out.send) {
+            Some(lists) => rig.frame(lists),
+            None => out,
+        };
+        let jobs = rig.jobs();
+        out.send.extend(jobs.send);
+        assert!(rig.uploads().is_empty(), "no commit went");
+        let why = decline_detail(&out).expect("declined");
+        assert!(why.contains("rule 10"), "{why}");
+    }
+
+    /// J8H review: a Fresh (an exit due), a KeyholdersRemove or a KeyholdersReplace drops a
+    /// bucket its exits count empty, and its own check saw a dropped bucket by its leaf
+    /// alone: a relay that made up an exit in a two-seat bucket got a commit dropping the
+    /// seat that stays, never named in `removed`. Every opening asks the lists of the buckets
+    /// it drops now, so the own check sees that seat and refuses (rule 10); an honest drop
+    /// is still taken.
+    #[test]
+    fn an_opening_asks_the_list_of_each_bucket_it_drops_and_drops_no_seat_no_exit_names() {
+        let mut rig = Rig::new(None, Platform::Desktop);
+        let (mut w, pair, s, b) = two_seat_bucket(&mut rig);
+        let by = HolderRef {
+            m: MemberId::Conn(U),
+            kx: pair.kx(),
+        };
+        let x = world::Member::account(12);
+
+        let fresh = exits_with_a_made_up_one(&mut w, &s[0], &x, b, DueKind::Exits);
+        let out = rig.due(3, piece(due_code::EXITS, &fresh, Some(&w), vec![]));
+        let asked = lists_asked(&out.send);
+        let mut out = match lists_for(&w, &out.send) {
+            Some(lists) => rig.frame(lists),
+            None => out,
+        };
+        let jobs = rig.jobs();
+        out.send.extend(jobs.send);
+        assert!(
+            asked.iter().any(|(ab, _)| *ab == b),
+            "the dropped bucket's list is asked: {asked:?}"
+        );
+        assert!(rig.uploads().is_empty(), "no commit went");
+        let why = decline_detail(&out).expect("declined");
+        assert!(why.contains("rule 10"), "{why}");
+
+        // Both seats go: the bucket is dropped, and the relay takes it
+        let honest = w.exits(&[s[0].seat, s[1].seat], DueKind::Exits);
+        let out = rig.due(4, piece(due_code::EXITS, &honest, Some(&w), vec![]));
+        if let Some(lists) = lists_for(&w, &out.send) {
+            rig.frame(lists);
+        }
+        let c = rig.commit();
+        let a = land(&mut rig, &mut w, &honest, by, &c);
+        assert_eq!(a.removed.len(), 2);
+        assert!(
+            w.leaves.iter().all(|l| l.leaf.b != b),
+            "the bucket is dropped"
+        );
     }
 
     #[test]

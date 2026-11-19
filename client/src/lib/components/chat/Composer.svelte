@@ -14,6 +14,7 @@
   import Emote from "./Emote.svelte";
   import EmotePicker from "./EmotePicker.svelte";
   import { drawsAsOne } from "../../emoji-support.js";
+  import { tooLongToSend } from "../../chat-rules.js";
 
   interface Props {
     placeholder: string;
@@ -109,6 +110,9 @@
     const content = text.trim();
     // Kept in the input rather than sent to be refused
     if (held) return;
+    // Stopped here, counted as the post it would be, so the relay never refuses one this let
+    // by after it was shown as sent: `tooLong` says why
+    if (tooLong) return;
     if (staged.some((f) => !f.op) && onsendfile && !sending) {
       text = "";
       // Pressed again: what failed is tried again
@@ -140,6 +144,9 @@
     error: string | null;
   }
   let staged = $state<Staged[]>([]);
+  /** Why what is typed cannot go as one message (past 16 KiB as it goes, with the file it is
+   *  the caption of), said above the box until it can. */
+  const tooLong = $derived(tooLongToSend(text.trim(), !!onsendfile && staged.some((f) => !f.op)));
   let nextKey = 0;
   /** A batch is going out. */
   let sending = $state(false);
@@ -440,6 +447,9 @@
     </button>
   </div>
 {/if}
+{#if tooLong}
+  <div class="too-long" role="alert">{tooLong}</div>
+{/if}
 {#if staged.length > 0}
   <ul class="file-chips" aria-label="Files to send">
     {#each staged as f (f.key)}
@@ -584,7 +594,7 @@
   {#if held}
     <button class="send-btn" type="submit" onpointerdown={keepField} disabled title={held.title}>{held.label}</button>
   {:else}
-    <button class="send-btn" type="submit" onpointerdown={keepField} disabled={!text.trim() && (sending || !staged.some((f) => !f.op))}>Send</button>
+    <button class="send-btn" type="submit" onpointerdown={keepField} disabled={!!tooLong || (!text.trim() && (sending || !staged.some((f) => !f.op)))}>Send</button>
   {/if}
 </form>
 
@@ -675,6 +685,14 @@
     gap: 8px;
     padding: 8px 12px;
     border-top: 1px solid var(--border);
+  }
+
+  .too-long {
+    padding: 4px 12px;
+    border-top: 1px solid var(--border);
+    background: var(--bg-tertiary);
+    color: var(--danger);
+    font-size: var(--fs-sm);
   }
 
   .reply-bar {

@@ -28,6 +28,14 @@ mod gk_e2e_c3c;
 #[cfg(test)]
 mod gk_e2e_j7;
 #[cfg(test)]
+mod gk_e2e_j8f;
+#[cfg(test)]
+mod gk_e2e_j8h;
+#[cfg(test)]
+mod gk_e2e_j8k;
+#[cfg(test)]
+mod gk_e2e_j8r;
+#[cfg(test)]
 mod gk_e2e_k2;
 #[cfg(test)]
 mod gk_e2e_r2;

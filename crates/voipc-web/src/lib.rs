@@ -625,6 +625,12 @@ impl SignalClient {
         gk_out(self.core.gk.untrack(channel_id))
     }
 
+    /// `TextJoined` refused `channel_id`: posts that waited for it are dropped, told why.
+    #[wasm_bindgen(js_name = gkJoinRefused)]
+    pub fn gk_join_refused(&mut self, channel_id: u32) -> Result<JsValue, JsError> {
+        gk_out(self.core.gk.join_refused(channel_id))
+    }
+
     /// A frame `isGkFrame` named, as its postcard bytes: `GkOut`.
     #[wasm_bindgen(js_name = gkFrame)]
     pub fn gk_frame(&mut self, payload: &[u8]) -> Result<JsValue, JsError> {

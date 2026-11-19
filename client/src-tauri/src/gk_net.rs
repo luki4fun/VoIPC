@@ -3,9 +3,11 @@
 //! hands back (`GkOut`) is carried out here. Frames are sent, `gk-*` events emitted (U1's
 //! contract, `GkEvent::to_wire`), posts shown, voice keys installed into the connection's
 //! `MediaKeyRing`, floors kept in the vault and in `gk_local.bin`, and the kept copy of a
-//! post filed under the epoch it went under. A keyholder's builds run on a blocking thread
-//! off the connection's lock (`take_build` → `BuildJob::step` → `built`), and its uploads go
-//! out one frame at a time, yielding to voice (`gk_task`, beside `live_task`).
+//! post filed under the epoch it went under (`group_state::Copies`, the browser's rule too).
+//! A post to a channel whose group is not tracked yet waits for it (`group_state::Early`).
+//! A keyholder's builds run on a blocking thread off the connection's lock (`take_build` →
+//! `BuildJob::step` → `built`), and its uploads go out one frame at a time, yielding to voice
+//! (`gk_task`, beside `live_task`).
 //!
 //! Which path a connection takes is the frame after `Authenticated`'s to say: `GroupKeys`
 //! (protocol 26) starts the group key, with `on: false` only for reading kept history; any
@@ -25,15 +27,13 @@ use tauri::Manager;
 use tokio::sync::Notify;
 use tracing::warn;
 use voipc_crypto::account_session::Actions;
-use voipc_crypto::group_key::timers::HOLD_MS;
 use voipc_crypto::group_key::{GroupKind, MemberId, SeatKeys};
 use voipc_crypto::group_state::{
-    group_id, GkCtx, GkEpoch, GkNames, GkOut, GkStart, GkTrack, GroupKeying, LocalGk, MemoryPins,
-    OpenedPost, PastEpoch, Platform, VaultFloor,
+    group_id, Copies, Early, EarlyPost, GkCtx, GkEpoch, GkNames, GkOut, GkPins, GkStart, GkTrack,
+    GroupKeying, KeptCopy, LocalGk, MemoryPins, OpenedPost, PastEpoch, Platform, VaultFloor,
 };
 use voipc_crypto::media_keys::MediaKeyRing;
 use voipc_crypto::SignalStores;
-use voipc_protocol::gk::{refused_what, refused_why};
 use voipc_protocol::messages::{ClientMessage, ServerMessage};
 use voipc_protocol::types::{ChannelInfo, UserInfo};
 
@@ -47,12 +47,6 @@ use crate::network::{emit_server, ControlTx};
 const SAVE_WITHIN_MS: u64 = 250;
 /// A build's slice of work per step (`BuildJob::step`).
 const BUILD_STEP: Duration = Duration::from_millis(50);
-/// A post of ours waits for its `released` this long at most (it is given up at `HOLD_MS`).
-const KEPT_WAIT_MS: u64 = 2 * HOLD_MS;
-/// The relay refuses a post within a round trip; one out this long and not refused went out
-/// under its epoch. Far inside the `HOLD_MS` the relay still starts a kept chain under an
-/// epoch after the next one opened.
-const SETTLE_MS: u64 = 10_000;
 
 #[cfg(target_os = "android")]
 const PLATFORM: Platform = Platform::Phone;
@@ -72,102 +66,6 @@ pub enum Path {
     Kept,
     /// `GroupKeys { on: true }`: channel chat under the group key.
     On,
-}
-
-/// A post of ours whose kept copy is filed once it went out, under its epoch.
-struct KeptPost {
-    channel_id: u32,
-    log: String,
-    envelope: Vec<u8>,
-    sent_at: u64,
-    ttl_secs: Option<u32>,
-    went: Option<Went>,
-}
-
-/// When a post last went out (`released`), in which order, under what, and whether it
-/// started a chain.
-struct Went {
-    ep: GkEpoch,
-    at: u64,
-    order: u64,
-    blob: bool,
-}
-
-/// Our posts' kept copies (C4): each filed once, under the epoch it went out under, and
-/// only once no refusal can still come for it (`SETTLE_MS`). A refusal names no post: at
-/// `OLD_EPOCH` and `RATE` what went in that channel goes again, and its next `released`
-/// says under what; a refusal for good drops what the group key drops (`drop_refused`: the
-/// latest that started a chain, else the latest).
-#[derive(Default)]
-struct Copies {
-    posts: HashMap<[u8; 16], KeptPost>,
-    sends: u64,
-}
-
-impl Copies {
-    fn wait(&mut self, post_id: [u8; 16], post: KeptPost) {
-        self.posts.insert(post_id, post);
-    }
-
-    /// `released`: out under `ep`, again if it went before.
-    fn went(&mut self, post_id: &[u8; 16], ep: GkEpoch, blob: bool, now: u64) {
-        if let Some(p) = self.posts.get_mut(post_id) {
-            self.sends += 1;
-            p.went = Some(Went {
-                ep,
-                at: now,
-                order: self.sends,
-                blob,
-            });
-        }
-    }
-
-    /// `EpochRefused{POST, why}` in `channel_id`.
-    fn refused(&mut self, channel_id: u32, why: u8) {
-        let out = self
-            .posts
-            .iter_mut()
-            .filter(|(_, p)| p.channel_id == channel_id && p.went.is_some());
-        if matches!(why, refused_why::OLD_EPOCH | refused_why::RATE) {
-            for (_, p) in out {
-                p.went = None;
-            }
-            return;
-        }
-        let dropped = out
-            .max_by_key(|(_, p)| p.went.as_ref().map(|w| (w.blob, w.order)))
-            .map(|(id, _)| *id);
-        if let Some(id) = dropped {
-            self.posts.remove(&id);
-        }
-    }
-
-    /// The copies to file now, in the order their posts went, each with its epoch (`all`:
-    /// whatever went, at the end). One whose post never went is given up with it.
-    fn due(&mut self, now: u64, all: bool) -> Vec<(KeptPost, GkEpoch)> {
-        self.posts
-            .retain(|_, p| p.went.is_some() || now.saturating_sub(p.sent_at) < KEPT_WAIT_MS);
-        let ids: Vec<[u8; 16]> = self
-            .posts
-            .iter()
-            .filter(|(_, p)| {
-                p.went
-                    .as_ref()
-                    .is_some_and(|w| all || now >= w.at.saturating_add(SETTLE_MS))
-            })
-            .map(|(id, _)| *id)
-            .collect();
-        let mut due: Vec<(KeptPost, Went)> = ids
-            .iter()
-            .filter_map(|id| self.posts.remove(id))
-            .filter_map(|mut p| {
-                let w = p.went.take()?;
-                Some((p, w))
-            })
-            .collect();
-        due.sort_by_key(|(_, w)| w.order);
-        due.into_iter().map(|(p, w)| (p, w.ep)).collect()
-    }
 }
 
 /// Who goes by what here, as the rosters said (`GkNames`): names as sent, tag and all.
@@ -228,8 +126,10 @@ pub struct GkNet {
     roster: Roster,
     /// The channels tracked, with their kind and group.
     tracked: HashMap<u32, (GroupKind, String)>,
-    /// Our posts' kept copies, by post id, until they are filed.
+    /// Our posts' kept copies, until they are filed (the browser's rule too).
     copies: Copies,
+    /// Our posts to channels not tracked yet (their join not answered).
+    early: Early,
     /// Seat keys settled before the start: `GkStart::seat_keys`.
     seat_keys: Option<SeatKeys>,
     /// The floors moved since this, unsaved (ms).
@@ -307,9 +207,90 @@ impl GkNet {
         self.keying.track(t, vault)
     }
 
+    /// Out of a channel: its held posts are given up, and those that waited for it to be
+    /// tracked.
     fn untrack(&mut self, channel_id: u32) -> Option<GkOut> {
-        self.tracked.remove(&channel_id)?;
-        Some(self.keying.untrack(channel_id))
+        let early = self.early.gone(channel_id);
+        match self.tracked.remove(&channel_id) {
+            Some(_) => Some(then(self.keying.untrack(channel_id), early)),
+            None => (!early.events.is_empty()).then_some(early),
+        }
+    }
+
+    /// The relay did not let us into `channel_id` (`TextJoined.refused`): what waited for it
+    /// is dropped, the refusal told first.
+    fn join_refused(&mut self, channel_id: u32) -> GkOut {
+        let refused = self.early.refused(channel_id);
+        match self.untrack(channel_id) {
+            Some(out) => then(refused, out),
+            None => refused,
+        }
+    }
+
+    /// A post of ours in `channel_id`: to the group key, or, while the channel is not
+    /// tracked (its join not answered), held for it. `pins`: the account's book, else the
+    /// guest's.
+    fn post(
+        &mut self,
+        st: &mut SignalStores,
+        pins: Option<&mut dyn GkPins>,
+        channel_id: u32,
+        post: EarlyPost,
+        now: u64,
+    ) -> GkOut {
+        if !self.tracked.contains_key(&channel_id) {
+            return self.early.hold(channel_id, post, now);
+        }
+        self.send(st, pins, channel_id, vec![post], now)
+    }
+
+    /// `channel_id` is tracked now: the posts that waited for it go.
+    fn tracked_now(
+        &mut self,
+        st: &mut SignalStores,
+        pins: Option<&mut dyn GkPins>,
+        channel_id: u32,
+        now: u64,
+    ) -> GkOut {
+        let posts = self.early.take(channel_id);
+        if posts.is_empty() {
+            return GkOut::default();
+        }
+        self.send(st, pins, channel_id, posts, now)
+    }
+
+    /// Posts to the group key, in order, each kept copy waiting for the epoch its post goes
+    /// out under.
+    fn send(
+        &mut self,
+        st: &mut SignalStores,
+        pins: Option<&mut dyn GkPins>,
+        channel_id: u32,
+        posts: Vec<EarlyPost>,
+        now: u64,
+    ) -> GkOut {
+        let GkNet {
+            keying,
+            guest,
+            copies,
+            ..
+        } = self;
+        let pins: &mut dyn GkPins = match pins {
+            Some(p) => p,
+            None => guest,
+        };
+        let mut out = GkOut::default();
+        for p in posts {
+            if let Some(copy) = p.copy {
+                copies.wait(p.post_id, copy, now);
+            }
+            let c = GkCtx {
+                pins: &mut *pins,
+                now,
+            };
+            out = then(out, keying.post(st, channel_id, p.post_id, &p.envelope, c));
+        }
+        out
     }
 
     fn groups(&self) -> Vec<String> {
@@ -331,18 +312,6 @@ impl GkNet {
             local.counters = self.guest.counters.clone();
         }
         Some((scope, local))
-    }
-
-    /// `EpochRefused{POST}`: what it says of our copies in that group's channel.
-    fn post_refused(&mut self, group: &str, why: u8) {
-        let channel = self
-            .tracked
-            .iter()
-            .find(|(_, (_, g))| g == group)
-            .map(|(c, _)| *c);
-        if let Some(channel_id) = channel {
-            self.copies.refused(channel_id, why);
-        }
     }
 }
 
@@ -419,6 +388,30 @@ fn on_keying(
     };
     if out.local_dirty {
         dirty_since.get_or_insert(now);
+    }
+    Some(out)
+}
+
+/// `f` on this connection's `GkNet`, with the stores and the account's book (`None`: a
+/// guest's, `GkNet::guest`), under the connection's lock (held by the caller). `None`: no
+/// stores.
+fn on_net(
+    conn: &GkLink,
+    sig: &mut SignalState,
+    f: impl FnOnce(&mut GkNet, &mut SignalStores, Option<&mut dyn GkPins>, u64) -> GkOut,
+) -> Option<GkOut> {
+    let SignalState { stores, gk, .. } = sig;
+    let stores = stores.as_mut()?;
+    let now = voipc_crypto::time::now_millis();
+    let out = match &conn.account {
+        Some(link) => {
+            let mut session = link.session();
+            f(gk, stores, Some(session.gk_pins()), now)
+        }
+        None => f(gk, stores, None, now),
+    };
+    if out.local_dirty {
+        gk.dirty(now);
     }
     Some(out)
 }
@@ -532,6 +525,11 @@ fn under_head(m: &ClientMessage) -> bool {
 }
 
 fn gk_out(conn: &GkLink, out: GkOut, todo: &mut VecDeque<Work>) {
+    // Each post's send noted before it goes, so its refusal never comes first
+    if !out.released.is_empty() {
+        let now = voipc_crypto::time::now_millis();
+        conn.lock().gk.copies.sent(&out, now);
+    }
     let GkOut {
         send,
         posts,
@@ -541,7 +539,7 @@ fn gk_out(conn: &GkLink, out: GkOut, todo: &mut VecDeque<Work>) {
         voice,
         past_ready,
         self_rows,
-        released,
+        released: _,
         build_ready,
         seat_keys_wanted,
     } = out;
@@ -550,23 +548,6 @@ fn gk_out(conn: &GkLink, out: GkOut, todo: &mut VecDeque<Work>) {
     }
     if send.iter().any(under_head) {
         save(conn);
-    }
-    // Each post's send noted before it goes, so its refusal never comes first. The
-    // `EpochPost`s and `released` go in the same order, one for one.
-    if !released.is_empty() {
-        let blobs: Vec<bool> = send
-            .iter()
-            .filter_map(|m| match m {
-                ClientMessage::EpochPost { blob, .. } => Some(blob.is_some()),
-                _ => None,
-            })
-            .collect();
-        let now = voipc_crypto::time::now_millis();
-        let mut sig = conn.lock();
-        for (i, (_, post_id, ep)) in released.into_iter().enumerate() {
-            let blob = blobs.get(i).copied().unwrap_or(false);
-            sig.gk.copies.went(&post_id, ep, blob, now);
-        }
     }
     for m in &send {
         let _ = conn.tcp_tx.send(m);
@@ -742,8 +723,9 @@ fn save(conn: &GkLink) {
     }
 }
 
-/// Our posts' kept copies, each under the epoch it went out under (C4).
-async fn file(conn: &GkLink, copies: Vec<(KeptPost, GkEpoch)>) {
+/// Our posts' kept copies, each under the epoch it went out under (C4), or offered again
+/// under the head (`Copies::file`).
+async fn file(conn: &GkLink, copies: Vec<(KeptCopy, GkEpoch)>) {
     let Some(link) = &conn.account else {
         return;
     };
@@ -844,15 +826,8 @@ pub(crate) async fn frame(conn: &GkLink, msg: &ServerMessage) {
         if !sig.gk.started {
             return;
         }
-        if let ServerMessage::EpochRefused {
-            group,
-            what: refused_what::POST,
-            why,
-            ..
-        } = msg
-        {
-            sig.gk.post_refused(group, *why);
-        }
+        // A post's refusal to the copies before the group key sends it again
+        sig.gk.copies.refused(msg);
     }
     if let Some(out) = with_gk(conn, |k, st, c| k.frame(st, msg, c)) {
         carry_out(conn, out).await;
@@ -874,7 +849,8 @@ pub(crate) fn user_gone(conn: &GkLink, user_id: u32) {
 }
 
 /// Tracks `channel_id` as a group of `kind`, if this connection keys such channels and the
-/// list knows it. The account's vault floor for a stored group comes along.
+/// list knows it. The account's vault floor for a stored group comes along, and the posts
+/// that waited for it go.
 fn track_channel(conn: &GkLink, sig: &mut SignalState, channel_id: u32, kind: GroupKind) -> GkOut {
     if !sig.gk.wants(kind) {
         return GkOut::default();
@@ -890,7 +866,11 @@ fn track_channel(conn: &GkLink, sig: &mut SignalState, channel_id: u32, kind: Gr
         Some(link) if kind == GroupKind::Text => link.session().gk_floor(&t.group),
         _ => VaultFloor::None,
     };
-    sig.gk.track(t, vault)
+    let out = sig.gk.track(t, vault);
+    let posts = on_net(conn, sig, |net, st, pins, now| {
+        net.tracked_now(st, pins, channel_id, now)
+    });
+    then(out, posts.unwrap_or_default())
 }
 
 /// `TextJoined`: the text channels this connection is in now, and those refused.
@@ -899,7 +879,7 @@ pub(crate) async fn text_joined(conn: &GkLink, joined: &[(u32, bool, bool, u64)]
         let mut sig = conn.lock();
         let gone = refused
             .iter()
-            .filter_map(|c| sig.gk.untrack(*c))
+            .map(|c| sig.gk.join_refused(*c))
             .collect::<Vec<_>>();
         let mut outs = gone;
         for (channel_id, ..) in joined {
@@ -972,35 +952,28 @@ pub(crate) async fn room_changed(conn: &GkLink, old: u32, new: u32) {
 
 /// A post of ours in `channel_id` under the group key. `kept`: its log's copy, filed under
 /// the epoch it goes under once it does (`GkOut::released`, C4), with when it was written
-/// and its timer.
+/// and its timer. A channel whose group is not tracked yet (its join not answered) holds it
+/// until it is (`Early`).
 pub(crate) async fn post(
     conn: &GkLink,
     channel_id: u32,
     envelope: &[u8],
     kept: Option<(String, u64, Option<u32>)>,
 ) -> Result<(), String> {
-    // A channel whose group is not tracked yet (its join not answered): nothing could open it
-    if !conn.lock().gk.tracked.contains_key(&channel_id) {
-        let told = json!({ "channel_id": channel_id, "why": "late" });
-        emit_server(&conn.app, &conn.server, "gk-post-dropped", told);
-        return Ok(());
-    }
-    let post_id: [u8; 16] = rand::random();
-    if let Some((log, sent_at, ttl_secs)) = kept {
-        conn.lock().gk.copies.wait(
-            post_id,
-            KeptPost {
-                channel_id,
-                log,
-                envelope: envelope.to_vec(),
-                sent_at,
-                ttl_secs,
-                went: None,
-            },
-        );
-    }
-    let out = with_gk(conn, |k, st, c| {
-        k.post(st, channel_id, post_id, envelope, c)
+    let post = EarlyPost {
+        post_id: rand::random(),
+        envelope: envelope.to_vec(),
+        copy: kept.map(|(log, sent_at, ttl_secs)| KeptCopy {
+            log,
+            envelope: envelope.to_vec(),
+            sent_at,
+            ttl_secs,
+        }),
+    };
+    let out = tokio::task::block_in_place(|| {
+        on_net(conn, &mut conn.lock(), |net, st, pins, now| {
+            net.post(st, pins, channel_id, post, now)
+        })
     })
     .ok_or("E2E encryption not initialized")?;
     carry_out(conn, out).await;
@@ -1031,9 +1004,9 @@ pub(crate) async fn end(conn: &GkLink) {
             return;
         }
         sig.gk.started = false;
-        let rest = sig.gk.copies.due(voipc_crypto::time::now_millis(), true);
-        sig.gk.copies = Copies::default();
-        (sig.gk.keying.end(), rest)
+        let rest = sig.gk.copies.end();
+        let early = sig.gk.early.end();
+        (then(sig.gk.keying.end(), early), rest)
     };
     carry_out(conn, out).await;
     file(conn, rest).await;
@@ -1096,7 +1069,15 @@ async fn tick(conn: &GkLink) {
     let (out, due) = {
         let mut sig = conn.lock();
         let now = voipc_crypto::time::now_millis();
-        (sig.gk.keying.past_asks(), sig.gk.copies.due(now, false))
+        let GkNet {
+            keying,
+            copies,
+            early,
+            ..
+        } = &mut sig.gk;
+        let out = then(keying.past_asks(), early.tick(now));
+        let due = copies.file(now, |group| keying.current_epoch(group));
+        (out, due)
     };
     carry_out(conn, out).await;
     file(conn, due).await;
@@ -1157,6 +1138,7 @@ async fn uploads(conn: &GkLink) -> bool {
 mod tests {
     use super::*;
     use voipc_crypto::group_state::GkEvent;
+    use voipc_protocol::gk::{refused_what, refused_why};
 
     fn group_keys(on: bool, run: [u8; 16]) -> ServerMessage {
         ServerMessage::GroupKeys {
@@ -1295,77 +1277,88 @@ mod tests {
         assert!(net.groups().is_empty());
     }
 
-    const T0: u64 = 1_700_000_000_000;
-
-    fn epoch(epoch: u32) -> GkEpoch {
-        GkEpoch {
-            group: "c:77".into(),
-            gen: [1; 16],
-            epoch,
-            d_e: [epoch as u8; 32],
-            ck: [0; 32].into(),
+    fn early(id: u8) -> EarlyPost {
+        EarlyPost {
+            post_id: [id; 16],
+            envelope: voipc_crypto::envelope::envelope(&format!("m{id}"), "hi", None),
+            copy: Some(KeptCopy {
+                log: "c:77".into(),
+                envelope: vec![id],
+                sent_at: 1,
+                ttl_secs: None,
+            }),
         }
     }
 
-    fn copy(channel_id: u32, id: u8) -> KeptPost {
-        KeptPost {
-            channel_id,
-            log: "c:77".into(),
-            envelope: vec![id],
-            sent_at: T0,
-            ttl_secs: None,
-            went: None,
-        }
+    fn dropped(out: &GkOut) -> usize {
+        out.events
+            .iter()
+            .filter(|e| matches!(e, GkEvent::PostDropped { .. }))
+            .count()
     }
 
-    fn filed(due: Vec<(KeptPost, GkEpoch)>) -> Vec<(u8, u32)> {
-        due.into_iter()
-            .map(|(p, ep)| (p.envelope[0], ep.epoch))
-            .collect()
-    }
-
+    /// G (J8F): a post sent before its channel's group is tracked (its `TextJoined` not in
+    /// yet) is not dropped at once as "late": it waits, and goes to the group key once the
+    /// channel is tracked, its kept copy with it. One to a channel the relay does not let us
+    /// into is dropped then, the refusal told first.
     #[test]
-    fn a_post_sent_again_after_old_epoch_is_kept_once_under_the_epoch_it_went_again_under() {
-        let mut c = Copies::default();
-        c.wait([1; 16], copy(7, 1));
-        c.went(&[1; 16], epoch(4), true, T0);
-        assert!(
-            c.due(T0 + SETTLE_MS - 1, false).is_empty(),
-            "a refusal may still come"
-        );
-        // The head moved past epoch 4: refused, and sent again under the head
-        c.refused(7, refused_why::OLD_EPOCH);
-        assert!(
-            c.due(T0 + SETTLE_MS, false).is_empty(),
-            "it has not gone yet"
-        );
-        c.went(&[1; 16], epoch(5), true, T0 + 2_000);
-        assert_eq!(filed(c.due(T0 + 2_000 + SETTLE_MS, false)), vec![(1, 5)]);
-        // Sent again once more (another post's refusal): kept once all the same
-        c.went(&[1; 16], epoch(6), true, T0 + 3_000);
-        assert!(c.due(T0 + 60_000, true).is_empty());
-    }
-
-    #[test]
-    fn a_post_refused_for_good_is_never_kept_and_another_channels_are_untouched() {
-        let mut c = Copies::default();
-        for (channel_id, id) in [(7, 1), (7, 2), (8, 3)] {
-            c.wait([id; 16], copy(channel_id, id));
-        }
-        // 1 started a chain in channel 7, 2 went on it; 3 started one in channel 8
-        c.went(&[1; 16], epoch(4), true, T0);
-        c.went(&[2; 16], epoch(4), false, T0 + 10);
-        c.went(&[3; 16], epoch(4), true, T0 + 20);
-        // The relay refused channel 7's blob: the group key drops 1, so its copy goes too
-        c.refused(7, refused_why::THIRD_BLOB);
+    fn a_post_before_its_channel_is_tracked_goes_to_the_group_key_once_it_is() {
+        use voipc_crypto::group_state::{GkState, JOIN_REFUSED};
+        let mut net = started(group_keys(true, [1; 16]), [1; 16]);
+        let identity = voipc_crypto::generate_identity_key_pair();
+        let mut stores = SignalStores::new(&identity, 5);
+        let now = voipc_crypto::time::now_millis();
+        let out = net.post(&mut stores, None, 7, early(1), now);
+        assert_eq!(dropped(&out), 0, "not dropped: {:?}", out.events);
+        assert!(out.send.is_empty());
         assert_eq!(
-            filed(c.due(T0 + 20 + SETTLE_MS, false)),
-            vec![(2, 4), (3, 4)]
+            out.events,
+            [GkEvent::State {
+                channel_id: 7,
+                state: GkState::Late { waiting: true }
+            }]
         );
-        // One that never went is given up with its post
-        c.wait([4; 16], copy(7, 4));
-        assert!(c.due(T0 + KEPT_WAIT_MS, true).is_empty());
-        assert!(c.posts.is_empty());
+        // Tracked: the post goes to the group key, which holds it for the channel's keys
+        let t = net.track_of(&channel(7, true, "c:77"), GroupKind::Text);
+        let _ = net.track(t, VaultFloor::None);
+        let out = net.tracked_now(&mut stores, None, 7, now);
+        assert_eq!(dropped(&out), 0);
+        assert!(
+            out.events.contains(&GkEvent::State {
+                channel_id: 7,
+                state: GkState::Late { waiting: true }
+            }),
+            "the group key holds it: {:?}",
+            out.events
+        );
+        assert!(net.tracked_now(&mut stores, None, 7, now).events.is_empty());
+        assert_eq!(
+            net.copies.went_under(&[1; 16]),
+            Some(None),
+            "its copy waits"
+        );
+        // The group key has it: it gives it up at `HOLD_MS` with no keys
+        let c = GkCtx {
+            pins: &mut net.guest,
+            now: now + voipc_crypto::group_key::timers::HOLD_MS,
+        };
+        assert_eq!(dropped(&net.keying.tick(&mut stores, c)), 1);
+        // A channel that does not let us in
+        let _ = net.post(&mut stores, None, 8, early(2), now);
+        let out = net.join_refused(8);
+        assert_eq!(
+            out.events,
+            [
+                GkEvent::State {
+                    channel_id: 8,
+                    state: GkState::Refused(JOIN_REFUSED.into())
+                },
+                GkEvent::PostDropped {
+                    channel_id: 8,
+                    why: voipc_crypto::group_state::Dropped::Refused
+                }
+            ]
+        );
     }
 
     #[test]

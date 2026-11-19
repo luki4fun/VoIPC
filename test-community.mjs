@@ -923,6 +923,25 @@ async function lane() {
     await waitFor(tab, `document.querySelector(".input-bar .chat-input")`);
   };
   await joinByHand(cat, "dungeon");
+  // The clamped case (choice 31's fallback, fix-T1.md finding 3): under the key cathy alone
+  // holds dungeon's keys, in no call, and her page goes behind a blank tab of her own browser:
+  // hidden, its timers clamped to a second. deedee's join lands all the same, by cathy's own
+  // commit (EpochCommit, #70), and deedee reads what cathy writes while hidden.
+  let cover = null;
+  if (GROUP_KEY) {
+    const keysHeld = `document.querySelector(".user-list.modern .keys-held")?.textContent.trim() ?? ""`;
+    check("cathy alone holds dungeon's keys", await seen(cat, `/^Keys held by cathy\\S*$/.test(${keysHeld})`), await cat.evaluate(keysHeld));
+    cover = await fetch(`http://127.0.0.1:${three}/json/new?about:blank`, { method: "PUT" }).then((r) => r.json());
+    // The longest a 50 ms timer waited past its time, while hidden: 900 ms and more is the clamp
+    await cat.evaluate(`(() => { window.__clampGap = 0; let last = performance.now();
+      const look = () => { const now = performance.now(); window.__clampGap = Math.max(window.__clampGap, Math.round(now - last - 50));
+        last = now; if (document.visibilityState === "hidden") setTimeout(look, 50); };
+      setTimeout(look, 50); })()`);
+    const hidden = `({ state: document.visibilityState, late_ms: window.__clampGap })`;
+    check("her page is hidden, its timers clamped", await seen(cat, `document.visibilityState === "hidden" && window.__clampGap >= 900`, 60_000),
+      JSON.stringify(await cat.evaluate(hidden)));
+    await cat.evaluate(`window.__voipc_said.splice(0); 0`);
+  }
   await joinByHand(dee, "dungeon");
   const namesList = `document.querySelector(".user-list.modern .users")?.innerText ?? ""`;
   check("a click on Join brings the list with it", await seen(dee, `(${namesList}).includes("cathy")`), await dee.evaluate(namesList));
@@ -930,6 +949,14 @@ async function lane() {
   await sleep(2500);
   await say(cat, "only the two of us");
   check("the post reaches the other", await seen(dee, lastMessage("only the two of us"), 60_000));
+  if (cover) {
+    const catSaid = await cat.evaluate(`JSON.stringify(window.__voipc_said.map((m) => typeof m === "string" ? m : Object.keys(m ?? {})[0]))`);
+    check("her join landed by cathy's commit, made while her page was hidden",
+      (await cat.evaluate(`document.visibilityState === "hidden"`)) && JSON.parse(catSaid).includes("#70"), catSaid);
+    await fetch(`http://127.0.0.1:${three}/json/close/${cover.id}`);
+    await cat.activate();
+    check("and cathy's page is shown again", await seen(cat, `document.visibilityState === "visible"`, 10_000));
+  }
   // Under the group key the writer hands nobody a key: a keyholder seats her through the relay,
   // and only a gated group's writers are shown new readers (GROUP-KEY.md §11, claim 5). Off it
   // (GK=0), the writer's app names whom it handed its key.
@@ -1247,6 +1274,16 @@ async function lane() {
   await held.evaluate(`window.__toasts.length = 0; 0`);
   await say(held, "won it back");
   check("what she writes reaches the channel", await seen(cat, lastMessage("won it back"), 60_000), await messagesOf(cat));
+  // The key's readers line (U1's .gk-line), in a gated group: paula came back by a Join, so the
+  // next post of a writer seated before her folds her name, and that writer's app shows it
+  // (GROUP-KEY.md §4.4 rule 4, §11 claim 5). With the key off (GK=0) there is no such line.
+  await openChat(cat, "side-c");
+  await say(cat, "welcome back");
+  await waitFor(held, lastMessage("welcome back"), 60_000);
+  if (GROUP_KEY) {
+    check("a gated channel's writer is shown who reads it now", await seen(cat,
+      `[...document.querySelectorAll(".gk-line")].some((e) => e.textContent.includes("New readers in #side-c") && e.textContent.includes("paula"))`), await gkLinesOf(cat));
+  }
   await sleep(2500);
   check("and it is kept: no word that it is not", !(await held.evaluate(`window.__toasts.some((t) => t.includes("not kept") || t.includes("could not be read"))`)), JSON.stringify(await held.evaluate(`window.__toasts`)));
   await held.send("Page.reload");

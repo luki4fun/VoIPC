@@ -46,6 +46,17 @@ ring = { version = "0.17", features = ["wasm32_unknown_unknown_js"] }
 [profile.release]
 opt-level = "s"
 
+# Kyber (libcrux) at full speed: a browser keyholder's page blocks for half as long on Joins and
+# seed pages, for ~38 KB more on the wire (owner, choice 28; numbers in tools/gk-wasm-bench.mjs)
+[profile.release.package.libcrux-ml-kem]
+opt-level = 3
+[profile.release.package.libcrux-sha3]
+opt-level = 3
+[profile.release.package.libcrux-intrinsics]
+opt-level = 3
+[profile.release.package.libcrux-secrets]
+opt-level = 3
+
 # fuzz/ builds this crate with --cfg fuzzing (src/fuzz.rs)
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }

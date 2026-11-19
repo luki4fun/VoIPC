@@ -257,13 +257,62 @@ function keptId(v: unknown): string | undefined {
 
 /**
  * The most of a message's text kept where it arrives (D-7): 16 KiB of UTF-8.
- * Twice that is about what a relay passes, and nothing the composer writes
- * comes near it (2000 characters); past `MAX_MARKUP_CHARS` it is drawn as
- * plain text anyway. Applied at every receive point: live, stored, and an
- * edit's new text.
+ * The relay holds a channel's post to 16 KiB sealed (`MAX_POST_BYTES`), but a
+ * direct message to 60 KiB, so a modified client's longer one is cut here;
+ * nothing the composer writes comes near it (2000 characters as typed); past
+ * `MAX_MARKUP_CHARS` it is drawn as plain text anyway. Applied at every
+ * receive point: live, stored, and an edit's new text.
  */
 export const MAX_RECEIVED_BYTES = 16 * 1024;
 const receivedBuf = new Uint8Array(MAX_RECEIVED_BYTES);
+
+/**
+ * The most one message may be as it goes (owner, 2026-11-19): 16 KiB, sealed. The relay
+ * refuses a post past it everywhere, a text channel's, a voice room's and under the group
+ * key, as `TOO_LARGE_REASON`; the composer stops one first and says why (`tooLongToSend`).
+ */
+export const MAX_POST_BYTES = MAX_RECEIVED_BYTES;
+
+/**
+ * What `tooLongToSend` counts around a post's text, at most, whatever goes with it: the
+ * envelope (its id, a timer, a reply and a thread, each id up to 64 characters of any kind)
+ * and its sealing (167 bytes under the group key, less on the old path or as a kept copy).
+ * 1027 bytes at worst; session_tests.rs `post_cap` seals that worst case and asserts it fits.
+ */
+export const POST_WRAP_BYTES = 1280;
+/** What it counts on top when a file goes with the text: the largest card a file may have
+ *  (a 255-character name, a type, the sides, a length, a 16×16 preview), 2414 bytes at worst. */
+export const FILE_WRAP_BYTES = 2560;
+
+/**
+ * Why `text` cannot go as one message, or null when it can. Counted as the post it would be,
+ * so none it lets by is refused: the text as the envelope's JSON writes it (a quote two bytes,
+ * a control character six), and `POST_WRAP_BYTES` around it, `FILE_WRAP_BYTES` more with a file.
+ */
+export function tooLongToSend(text: string, withFile = false): string | null {
+  const wrap = POST_WRAP_BYTES + (withFile ? FILE_WRAP_BYTES : 0);
+  // A UTF-16 unit is at most six bytes as JSON writes it, and the quotes are two
+  if (text.length * 6 + 2 + wrap <= MAX_POST_BYTES) return null;
+  const bytes = new TextEncoder().encode(JSON.stringify(text)).length + wrap;
+  if (bytes <= MAX_POST_BYTES) return null;
+  const kib = Math.ceil((bytes / 1024) * 10) / 10;
+  return `Too long to send: as a message this is ${kib} KiB, and one message holds at most 16 KiB. Shorten it, or send it as a file.`;
+}
+
+/**
+ * The relay's words for a post past 16 KiB, on every path (session.rs `POST_TOO_LARGE`): a
+ * `ChannelError`, or a refused key post's detail. Not its "message too large", which any
+ * frame past what it passes on gets (a history hand-off, a key): no message of the user's.
+ */
+export const TOO_LARGE_REASON = "post too large: one message holds at most 16 KiB";
+
+/** What the app says for `TOO_LARGE_REASON`. */
+export const TOO_LARGE_TOLD = "Your message was not sent: one message holds at most 16 KiB.";
+
+/** What a `ChannelError` is told as: the relay's words, a post past 16 KiB's plainly. */
+export function channelErrorText(reason: string): string {
+  return reason === TOO_LARGE_REASON ? TOO_LARGE_TOLD : reason;
+}
 
 /** `text`, cut to `MAX_RECEIVED_BYTES` at a character's edge. */
 export function receivedText(text: string): string {

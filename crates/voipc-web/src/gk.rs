@@ -1,8 +1,9 @@
 //! The group epoch key in the browser (plan 3i): the desktop app's own
 //! `voipc_crypto::group_state::GroupKeying`, with what the page holds around it: the
 //! account's book and floors (through `AccountLink`), the roster its events name people
-//! from, the kept copy of a post that went, and the voice keys for `MediaKeys`. Plain Rust,
-//! host-testable; lib.rs wraps it for JS.
+//! from, the kept copy of a post that went (`group_state::Copies`, the desktop's rule too),
+//! posts to a channel not tracked yet (`group_state::Early`), and the voice keys for
+//! `MediaKeys`. Plain Rust, host-testable; lib.rs wraps it for JS.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -11,11 +12,11 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use voipc_crypto::account_session::{AccountSession, Actions};
-use voipc_crypto::group_key::timers::HOLD_MS;
 use voipc_crypto::group_key::{GroupKind, MemberId};
 use voipc_crypto::group_state::{
-    group_id, BuildJob, GkCtx, GkNames, GkOut, GkPins, GkStart, GkTrack, GroupKeying, LocalGk,
-    MemoryPins, OpenedPost, PastEpoch, Platform, VaultFloor, VoiceKeys,
+    group_id, BuildJob, Copies, Early, EarlyPost, GkCtx, GkEpoch, GkNames, GkOut, GkPins, GkStart,
+    GkTrack, GroupKeying, KeptCopy, LocalGk, MemoryPins, OpenedPost, PastEpoch, Platform,
+    VaultFloor, VoiceKeys,
 };
 use voipc_crypto::time::now_millis;
 use voipc_crypto::{MediaKeyRing, SignalStores};
@@ -110,15 +111,6 @@ pub struct Out {
     pub held: bool,
 }
 
-/// A post of ours with a channel log, until it goes (`GkOut::released`): its kept copy is
-/// filed under the epoch it went under (C4).
-struct KeptPost {
-    log: String,
-    envelope: Vec<u8>,
-    ttl_secs: Option<u32>,
-    at: u64,
-}
-
 /// One connection's group keys in the browser.
 #[derive(Default)]
 pub struct Gk {
@@ -133,7 +125,10 @@ pub struct Gk {
     tracked: HashMap<u32, String>,
     job: Option<BuildJob>,
     voice: Vec<VoiceKeys>,
-    kept: HashMap<[u8; 16], KeptPost>,
+    /// Our posts' kept copies, until they are filed (C4).
+    copies: Copies,
+    /// Our posts to channels not tracked yet (their join not answered).
+    early: Early,
 }
 
 /// A connection's start (`GroupKeys`), with the page's state.
@@ -242,8 +237,24 @@ impl Gk {
         out
     }
 
+    /// Out of a channel: its held posts are given up, and those that waited for it to be
+    /// tracked.
     pub fn untrack(&mut self, channel_id: u32) -> Out {
         let mut out = Out::default();
+        self.tracked.remove(&channel_id);
+        let o = self.keying.untrack(channel_id);
+        self.take(o, &mut out);
+        let o = self.early.gone(channel_id);
+        self.take(o, &mut out);
+        out
+    }
+
+    /// The relay did not let us into `channel_id` (`TextJoined.refused`): what waited for it
+    /// is dropped, the refusal told first.
+    pub fn join_refused(&mut self, channel_id: u32) -> Out {
+        let mut out = Out::default();
+        let o = self.early.refused(channel_id);
+        self.take(o, &mut out);
         self.tracked.remove(&channel_id);
         let o = self.keying.untrack(channel_id);
         self.take(o, &mut out);
@@ -254,11 +265,14 @@ impl Gk {
     pub fn frame(&mut self, st: &mut SignalStores, payload: &[u8]) -> anyhow::Result<Out> {
         let mut out = Out::default();
         let msg = voipc_protocol::codec::decode_server_msg(payload)?;
+        self.early_out(st, &mut out);
         if let ServerMessage::EpochReseated { n, left } = msg {
             if let Some(a) = self.with_session(|s| s.gk_reseated(n, left)) {
                 self.actions(a, &mut out);
             }
         } else {
+            // A post's refusal to the copies before the group key sends it again
+            self.copies.refused(&msg);
             let o = self.call(|k, c| k.frame(st, &msg, c));
             self.take(o, &mut out);
         }
@@ -267,7 +281,8 @@ impl Gk {
     }
 
     /// A post of ours (`post_id`: its message id). With a channel log its kept copy is
-    /// filed once it goes, under the epoch it goes under.
+    /// filed once it went, under the epoch it went under (`Copies`). A channel whose group is
+    /// not tracked yet (its join not answered) holds it until it is (`Early`).
     pub fn post(
         &mut self,
         st: &mut SignalStores,
@@ -278,25 +293,72 @@ impl Gk {
         ttl_secs: Option<u32>,
     ) -> Out {
         let mut out = Out::default();
-        // A channel not tracked (its join not answered, or refused): nothing could open it
+        let now = now_millis();
+        let copy = (self.account.is_some() && !log.is_empty()).then(|| KeptCopy {
+            log,
+            envelope: envelope.clone(),
+            sent_at: now,
+            ttl_secs,
+        });
+        let post = EarlyPost {
+            post_id,
+            envelope,
+            copy,
+        };
         if !self.tracked.contains_key(&channel_id) {
-            let why = json!({ "channel_id": channel_id, "why": "late" });
-            out.emit.push(("gk-post-dropped".to_string(), why));
+            let o = self.early.hold(channel_id, post, now);
+            self.take(o, &mut out);
             return out;
         }
-        if self.account.is_some() && !log.is_empty() {
-            let kept = KeptPost {
-                log,
-                envelope: envelope.clone(),
-                ttl_secs,
-                at: now_millis(),
-            };
-            self.kept.insert(post_id, kept);
-        }
-        let o = self.call(|k, c| k.post(st, channel_id, post_id, &envelope, c));
-        self.take(o, &mut out);
+        self.early_out(st, &mut out);
+        self.send(st, channel_id, vec![post], &mut out);
         self.settle(&mut out);
         out
+    }
+
+    /// Posts to the group key, in order, each kept copy waiting for the epoch its post goes
+    /// out under.
+    fn send(
+        &mut self,
+        st: &mut SignalStores,
+        channel_id: u32,
+        posts: Vec<EarlyPost>,
+        out: &mut Out,
+    ) {
+        for p in posts {
+            if let Some(copy) = p.copy {
+                self.copies.wait(p.post_id, copy, now_millis());
+            }
+            let o = self.call(|k, c| k.post(st, channel_id, p.post_id, &p.envelope, c));
+            self.take(o, out);
+        }
+    }
+
+    /// The posts that waited for their channel, now tracked, go to the group key: at the
+    /// first call with the stores after `track`, before anything else (the answer to the
+    /// track's fetch, a post, a tick).
+    fn early_out(&mut self, st: &mut SignalStores, out: &mut Out) {
+        if self.early.is_empty() {
+            return;
+        }
+        let mut channels: Vec<u32> = self.tracked.keys().copied().collect();
+        channels.sort_unstable();
+        for channel_id in channels {
+            let posts = self.early.take(channel_id);
+            self.send(st, channel_id, posts, out);
+        }
+    }
+
+    /// Our posts' kept copies to the account, each under the epoch to file it under.
+    fn file(&mut self, copies: Vec<(KeptCopy, GkEpoch)>, out: &mut Out) {
+        for (k, ep) in copies {
+            let a = self.with_session(|s| {
+                s.outgoing_channel_gk(&k.log, k.envelope, k.sent_at, k.ttl_secs, ep)
+            });
+            if let Some(a) = a {
+                self.actions(a, out);
+            }
+        }
     }
 
     /// Every second: what waits goes again, what waited too long is given up, and the past
@@ -307,12 +369,16 @@ impl Gk {
             return out;
         }
         let now = now_millis();
-        self.kept
-            .retain(|_, k| now < k.at.saturating_add(2 * HOLD_MS));
+        self.early_out(st, &mut out);
+        let o = self.early.tick(now);
+        self.take(o, &mut out);
         let o = self.call(|k, c| k.tick(st, c));
         self.take(o, &mut out);
         let o = self.keying.past_asks();
         self.take(o, &mut out);
+        let keying = &self.keying;
+        let due = self.copies.file(now, |group| keying.current_epoch(group));
+        self.file(due, &mut out);
         self.settle(&mut out);
         out
     }
@@ -377,17 +443,21 @@ impl Gk {
         took
     }
 
-    /// The connection ended: posts still held are given up.
+    /// The connection ended: posts still held are given up, and those that waited for their
+    /// channel; the copies of posts that went are filed as they stand.
     pub fn end(&mut self) -> Out {
         let mut out = Out::default();
+        let o = self.early.end();
+        self.take(o, &mut out);
         if !self.started {
             return out;
         }
         let o = self.keying.end();
         self.take(o, &mut out);
+        let rest = self.copies.end();
+        self.file(rest, &mut out);
         self.started = false;
         self.tracked.clear();
-        self.kept.clear();
         self.job = None;
         self.voice.clear();
         out
@@ -419,7 +489,9 @@ impl Gk {
     }
 
     /// What a call handed back: frames and events out, the account's parts to the account.
+    /// The posts that went are noted before their frames go (`Copies::sent`).
     fn take(&mut self, o: GkOut, out: &mut Out) {
+        self.copies.sent(&o, now_millis());
         let GkOut {
             send,
             posts,
@@ -428,7 +500,6 @@ impl Gk {
             voice,
             past_ready,
             self_rows,
-            released,
             build_ready,
             seat_keys_wanted,
             ..
@@ -447,7 +518,6 @@ impl Gk {
         out.voice |= !voice.is_empty();
         self.voice.extend(voice);
         out.build |= build_ready;
-        let kept = &mut self.kept;
         let done = self.account.as_ref().and_then(|link| {
             let mut session = link.session.borrow_mut();
             let s = session.as_mut()?;
@@ -460,11 +530,6 @@ impl Gk {
             }
             if seat_keys_wanted {
                 done.push(s.seat_keys_wanted());
-            }
-            for (_, post_id, ep) in released {
-                if let Some(k) = kept.remove(&post_id) {
-                    done.push(s.outgoing_channel_gk(&k.log, k.envelope, k.at, k.ttl_secs, ep));
-                }
             }
             Some(done)
         });
@@ -838,7 +903,11 @@ mod tests {
             .send
             .iter()
             .any(|m| matches!(m, ClientMessage::EpochPost { .. })));
-        assert!(core.gk.kept.is_empty(), "a guest files no kept copy");
+        assert_eq!(
+            core.gk.copies.went_under(&[9; 16]),
+            None,
+            "a guest files no kept copy"
+        );
     }
 
     #[test]
@@ -897,26 +966,117 @@ mod tests {
         assert_eq!(v["timestamp"], 77);
     }
 
+    fn named<'a>(out: &'a Out, name: &str) -> Vec<&'a Value> {
+        out.emit
+            .iter()
+            .filter(|(n, _)| n == name)
+            .map(|(_, v)| v)
+            .collect()
+    }
+
+    /// G (J8F): a post sent before its channel's group is tracked (its `TextJoined` not in
+    /// yet, or before `GroupKeys`) is not dropped at once as "late": it waits, and goes to
+    /// the group key at the first call after the channel is tracked. The group key holds it
+    /// then for the channel's keys (and gives it up when the channel is left).
     #[test]
-    fn a_post_to_a_channel_the_group_key_does_not_track_is_dropped_and_says_so() {
-        let dropped = |out: &Out| {
-            assert!(out.send.is_empty());
-            assert_eq!(
-                out.emit,
-                [(
-                    "gk-post-dropped".to_string(),
-                    json!({ "channel_id": TEXT, "why": "late" })
-                )]
-            );
-        };
+    fn a_post_before_its_channel_is_tracked_waits_and_goes_to_the_group_key_once_it_is() {
         let mut core = SignalCore::new().unwrap();
-        dropped(&core.gk_post(TEXT, [9; 16], b"hi".to_vec(), String::new(), None));
+        let out = core.gk_post(TEXT, [8; 16], b"early".to_vec(), "c:abc".into(), None);
+        assert!(named(&out, "gk-post-dropped").is_empty(), "{:?}", out.emit);
         start(&mut core, false);
-        // Its join not answered yet, or refused
-        dropped(&core.gk_post(TEXT, [9; 16], b"hi".to_vec(), "c:abc".into(), None));
+        let out = core.gk_post(TEXT, [9; 16], b"hi".to_vec(), "c:abc".into(), None);
+        assert!(named(&out, "gk-post-dropped").is_empty(), "{:?}", out.emit);
+        assert_eq!(
+            named(&out, "gk-state"),
+            [&json!({ "channel_id": TEXT, "state": "late", "why": "waiting" })]
+        );
+        assert!(out.send.is_empty());
         core.gk.track(TEXT, true, "c:abc", false, false, false);
-        core.gk.untrack(TEXT);
-        dropped(&core.gk_post(TEXT, [9; 16], b"hi".to_vec(), "c:abc".into(), None));
+        let out = core.gk_tick();
+        assert!(named(&out, "gk-post-dropped").is_empty(), "{:?}", out.emit);
+        assert!(core.gk.early.is_empty(), "both went to the group key");
+        // The group key holds them: leaving the channel gives both up
+        let out = core.gk.untrack(TEXT);
+        assert_eq!(
+            named(&out, "gk-post-dropped"),
+            [&json!({ "channel_id": TEXT, "why": "late" }); 2]
+        );
+    }
+
+    /// G: a post to a channel the relay does not let us into is dropped then, the refusal
+    /// told first; one to a channel left before it was tracked is given up.
+    #[test]
+    fn a_post_to_a_channel_whose_join_is_refused_is_dropped_and_says_why() {
+        let mut core = SignalCore::new().unwrap();
+        start(&mut core, false);
+        core.gk_post(TEXT, [9; 16], b"hi".to_vec(), String::new(), None);
+        let out = core.gk.join_refused(TEXT);
+        assert_eq!(
+            named(&out, "gk-state"),
+            [&json!({
+                "channel_id": TEXT,
+                "state": "refused",
+                "why": voipc_crypto::group_state::JOIN_REFUSED
+            })]
+        );
+        assert_eq!(
+            named(&out, "gk-post-dropped"),
+            [&json!({ "channel_id": TEXT, "why": "refused" })]
+        );
+        assert!(core.gk.join_refused(TEXT).emit.is_empty(), "said once");
+        core.gk_post(ROOM, [7; 16], b"hi".to_vec(), String::new(), None);
+        assert_eq!(
+            named(&core.gk.untrack(ROOM), "gk-post-dropped"),
+            [&json!({ "channel_id": ROOM, "why": "late" })]
+        );
+    }
+
+    /// T1e D (J8F): the browser files a post's kept copy by the desktop's rule
+    /// (`group_state::Copies`), not at its first `released`: the copy waits for its post to
+    /// settle, and a refusal as `OLD_EPOCH` sends it waiting for the post's next send.
+    #[test]
+    fn a_kept_copy_waits_for_its_post_to_settle_and_old_epoch_rearms_it() {
+        let mut core = SignalCore::new().unwrap();
+        core.gk.account = Some(Rc::new(AccountLink::default()));
+        start(&mut core, false);
+        core.gk.track(TEXT, true, "c:abc", false, false, false);
+        core.gk_post(TEXT, [9; 16], b"hi".to_vec(), "c:abc".into(), None);
+        assert_eq!(core.gk.copies.went_under(&[9; 16]), Some(None));
+        let ep = GkEpoch {
+            group: "c:abc".into(),
+            gen: [1; 16],
+            epoch: 4,
+            d_e: [4; 32],
+            ck: [0; 32].into(),
+        };
+        let went = GkOut {
+            send: vec![ClientMessage::EpochPost {
+                channel_id: TEXT,
+                group: "c:abc".into(),
+                gen: [1; 16],
+                epoch: 4,
+                blob: Some(vec![1]),
+                ciphertext: vec![2],
+            }],
+            released: vec![(TEXT, [9; 16], ep)],
+            ..GkOut::default()
+        };
+        let mut out = Out::default();
+        core.gk.take(went, &mut out);
+        assert_eq!(
+            core.gk.copies.went_under(&[9; 16]),
+            Some(Some(4)),
+            "not filed at the release"
+        );
+        let refused = ServerMessage::EpochRefused {
+            group: "c:abc".into(),
+            what: wire::refused_what::POST,
+            why: wire::refused_why::OLD_EPOCH,
+            detail: String::new(),
+        };
+        core.gk_frame(&postcard::to_allocvec(&refused).unwrap())
+            .unwrap();
+        assert_eq!(core.gk.copies.went_under(&[9; 16]), Some(None));
     }
 
     #[test]

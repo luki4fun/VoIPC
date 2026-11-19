@@ -5,11 +5,12 @@
 //! `AccountRequest` through `accounts::handle_request`, the group key's messages through
 //! `Groups::handle`, `EpochPost` through the group key's checks and a fan-out to the
 //! channel's followers. Each account runs the app's two halves on one connection: K1's
-//! `AccountSync` and C3b's `GroupKeying`, glued as N1 glues them, kept copies included
-//! (gk_net.rs `Copies`: each filed once, under the epoch its latest `released` names, once no
-//! refusal came for it), or as W2 files them where a test says so (voipc-web gk.rs `take`:
-//! at the first `released`). Neither app's own crate builds here, so their filing rules are
-//! copied (`Filing`). The keyholder is `gk_e2e_tests.rs`'s guest on a task of its own.
+//! `AccountSync` and C3b's `GroupKeying`, glued as both apps glue them, kept copies included:
+//! `group_state::Copies` (J8F), the one filing rule the desktop (gk_net.rs) and the browser
+//! (voipc-web gk.rs) both use, each copy filed once, under the epoch its latest `released`
+//! names, once no refusal came for it, and offered again under the head when the relay refused
+//! that epoch's chain start as gone. The keyholder is `gk_e2e_tests.rs`'s guest on a task of
+//! its own.
 //!
 //! The third runs a voice room through the relay's real session path (`handle_connection`
 //! over a duplex, as `gk_e2e_v2.rs` serves it), every member an app of its own whose
@@ -25,8 +26,8 @@ use voipc_crypto::account::{SignedIn, Vault};
 use voipc_crypto::envelope::{envelope, open_envelope};
 use voipc_crypto::group_key::{Endorsement, GroupKind, MemberId, Origin, SeatKeys};
 use voipc_crypto::group_state::{
-    group_id, GkCtx, GkEpoch, GkOut, GkStart, GkTrack, GroupKeying, MemoryPins, OpenedPost,
-    PastEpoch, Platform, VaultFloor,
+    group_id, Copies, GkCtx, GkOut, GkStart, GkTrack, GroupKeying, KeptCopy, MemoryPins,
+    OpenedPost, PastEpoch, Platform, VaultFloor,
 };
 use voipc_crypto::log::LogKey;
 use voipc_crypto::sync::{AccountSync, Event, LogMemory, Prefs, ITEM_LOGKEY};
@@ -51,27 +52,12 @@ use crate::state::{RateLimiter, ServerState};
 const CHAN: ChannelId = 9;
 const CONV: &str = "c:t1hall";
 
-/// The settle of N1's rule in these tests: a post's kept copy is filed once no refusal came
-/// for it this long. A second, as the relay here refuses a post in the step it takes it. It
-/// is not N1's 10 s (`N1_SETTLE_MS`): a copy that waits that long can outlast two openings,
-/// and the relay then refuses its chain; see
-/// `e2e_t1_a_kept_copy_whose_post_two_openings_follow_within_n1s_settle_is_kept`.
-const KEPT_SETTLE_MS: u64 = 1_000;
+/// The apps' settle (`group_state::SETTLE_MS`): a post's kept copy is filed once no refusal
+/// came for it this long.
+const KEPT_SETTLE_MS: u64 = voipc_crypto::group_state::SETTLE_MS;
 
-/// N1's real settle, gk_net.rs `SETTLE_MS`.
+/// N1's settle before J8F (gk_net.rs `SETTLE_MS`, 10 s), which two openings could outlast.
 const N1_SETTLE_MS: u64 = 10_000;
-
-/// How an app files its posts' kept copies.
-#[derive(Clone, Copy)]
-enum Filing {
-    /// N1 (gk_net.rs `Copies`): once, under the epoch its latest `released` named, this long
-    /// after it with no refusal; `EpochRefused{POST, OLD_EPOCH | RATE}` sends it waiting for
-    /// its next `released`.
-    Native(u64),
-    /// W2 (voipc-web gk.rs `take`, :464-467): at its first `released`, under that epoch;
-    /// refusals never reach the copies.
-    Browser,
-}
 
 fn wall_ms() -> u64 {
     SystemTime::now()
@@ -85,14 +71,6 @@ fn raw(ik: &IdentityKeyPair) -> [u8; 32] {
 }
 
 // ── An account's app ──────────────────────────────────────────────────────
-
-/// N1's kept copy of one post of ours (gk_net.rs `KeptPost`).
-struct KeptCopy {
-    envelope: Vec<u8>,
-    sent_at: u64,
-    /// Its latest `released`: under what, when, in which order.
-    went: Option<(GkEpoch, u64, u64)>,
-}
 
 /// One account's app on one connection.
 struct Person {
@@ -111,42 +89,23 @@ struct Person {
     online: bool,
     /// Frames to it are in flight: it takes none, what it sends still goes.
     held: bool,
-    copies: HashMap<[u8; 16], KeptCopy>,
-    sends: u64,
+    /// Its posts' kept copies, by the apps' one rule.
+    copies: Copies,
     /// The seat keys its `GroupKeying` started with: their public KEM key.
     started_with: Option<Vec<u8>>,
     /// Past epochs the relay said it does not keep (`EpochRefused{FETCH, NOT_STORED}`).
     not_stored: usize,
     /// Everything it sent, in order.
     sent: Vec<ClientMessage>,
-    filing: Filing,
     /// What `AccountSync` said was not kept (`Event::NotKept`).
     not_kept: Vec<String>,
 }
 
 impl Person {
     fn took(&mut self, out: GkOut, now: u64) {
-        let mut at_once = vec![];
-        for (_, post_id, ep) in out.released {
-            match self.filing {
-                // Each post's send noted before it goes, so its refusal never comes first (N1)
-                Filing::Native(_) => {
-                    if let Some(c) = self.copies.get_mut(&post_id) {
-                        self.sends += 1;
-                        c.went = Some((ep, now, self.sends));
-                    }
-                }
-                Filing::Browser => at_once.extend(self.copies.remove(&post_id).map(|c| (c, ep))),
-            }
-        }
+        // Each post's send noted before it goes, so its refusal never comes first
+        self.copies.sent(&out, now);
         self.out.extend(out.send);
-        // W2: filed with the call that sent the post, after its frames
-        for (c, ep) in at_once {
-            let kept = self
-                .sync
-                .send_channel_gk(CONV, c.envelope, c.sent_at, None, ep);
-            self.out.extend(kept);
-        }
         if !out.self_rows.is_empty() {
             let rows = self.sync.gk_self_rows(out.self_rows);
             self.out.extend(rows);
@@ -182,26 +141,16 @@ impl Person {
                 self.out.extend(out);
             }
             f => {
-                // N1 (gk_net.rs `frame`): a post's refusal goes to the copies before the
-                // group key takes it, so what it sends again is noted after. At `OLD_EPOCH`
-                // and `RATE` what went waits for its next `released`; nothing here is
-                // refused for good (the tests check `post_refusals`)
-                match f {
-                    ServerMessage::EpochRefused {
-                        what: refused_what::POST,
-                        why: refused_why::OLD_EPOCH | refused_why::RATE,
-                        ..
-                    } if matches!(self.filing, Filing::Native(_)) => {
-                        for c in self.copies.values_mut() {
-                            c.went = None;
-                        }
-                    }
-                    ServerMessage::EpochRefused {
-                        what: refused_what::FETCH,
-                        why: refused_why::NOT_STORED,
-                        ..
-                    } => self.not_stored += 1,
-                    _ => {}
+                // As both apps do: a post's refusal goes to the copies before the group key
+                // takes it, so what it sends again is noted after
+                self.copies.refused(f);
+                if let ServerMessage::EpochRefused {
+                    what: refused_what::FETCH,
+                    why: refused_why::NOT_STORED,
+                    ..
+                } = f
+                {
+                    self.not_stored += 1;
                 }
                 let c = GkCtx {
                     pins: &mut self.pins,
@@ -248,27 +197,16 @@ impl Person {
         self.took(out, now);
     }
 
-    /// N1's copies that settled, filed in the order their posts went, each under the epoch
-    /// its latest `released` named (`AccountSync::send_channel_gk`).
+    /// The copies `Copies::file` hands back, each filed under its epoch, as both apps file
+    /// them (`AccountSync::send_channel_gk`): those whose post settled, in the order their
+    /// posts went, and those offered again under the head.
     fn file(&mut self, now: u64) {
-        let Filing::Native(settle) = self.filing else {
-            return;
-        };
-        let mut due: Vec<([u8; 16], u64)> = self
-            .copies
-            .iter()
-            .filter_map(|(id, c)| {
-                let (_, at, order) = c.went.as_ref()?;
-                (now >= at + settle).then_some((*id, *order))
-            })
-            .collect();
-        due.sort_by_key(|d| d.1);
-        for (id, _) in due {
-            let c = self.copies.remove(&id).expect("due");
-            let (ep, _, _) = c.went.expect("it went");
+        let keying = &self.keying;
+        let due = self.copies.file(now, |group| keying.current_epoch(group));
+        for (c, ep) in due {
             let kept = self
                 .sync
-                .send_channel_gk(CONV, c.envelope, c.sent_at, None, ep);
+                .send_channel_gk(&c.log, c.envelope, c.sent_at, c.ttl_secs, ep);
             self.out.extend(kept);
         }
     }
@@ -293,14 +231,13 @@ impl Person {
     /// A post in the channel, its kept copy waiting for the epoch it goes under.
     fn post(&mut self, id: u8, text: &str, now: u64) {
         let env = envelope(&format!("t1-{id}"), text, None);
-        self.copies.insert(
-            [id; 16],
-            KeptCopy {
-                envelope: env.clone(),
-                sent_at: now,
-                went: None,
-            },
-        );
+        let copy = KeptCopy {
+            log: CONV.into(),
+            envelope: env.clone(),
+            sent_at: now,
+            ttl_secs: None,
+        };
+        self.copies.wait([id; 16], copy, now);
         let c = GkCtx {
             pins: &mut self.pins,
             now,
@@ -690,12 +627,10 @@ impl World {
             texts: vec![],
             online: true,
             held: false,
-            copies: HashMap::new(),
-            sends: 0,
+            copies: Copies::default(),
             started_with: None,
             not_stored: 0,
             sent: vec![],
-            filing: Filing::Native(KEPT_SETTLE_MS),
             not_kept: vec![],
         });
         self.people.len() - 1
@@ -1027,8 +962,8 @@ async fn opened_past_the_join(w: &mut World, ann: usize, crowd: usize) -> Vec<([
 /// `released` (N1), is filed once, under Y: one `EpochChainStart` (a chain lives inside one
 /// epoch) and one `LogAppend` on it, none under X; the copy of the post before, filed under
 /// X already, is not filed again though that post went again too (with the live-only one
-/// before it). A reader back with only its vault reads both, each once. This is N1's filing
-/// rule; the browser's (W2) loses such a copy, see
+/// before it). A reader back with only its vault reads both, each once. Both apps file by
+/// this rule (`group_state::Copies`, J8F); see also
 /// `e2e_t1_a_browsers_first_post_in_an_epoch_refused_as_old_is_kept_under_the_head`.
 #[tokio::test]
 async fn e2e_t1_a_post_refused_as_old_epoch_is_kept_once_under_the_epoch_it_went_again_under() {
@@ -1186,12 +1121,11 @@ async fn e2e_t1_an_account_on_a_relay_with_the_key_off_reads_kept_history_with_i
 /// after the epoch it wrote in, 2f), the relay answers `EpochRefused{POST, OLD_EPOCH}` and
 /// the post goes again under the head Y. Its copy is kept once, under Y, and nothing is
 /// lost (`NotKept`).
-async fn first_post_in_an_old_epoch(filing: Filing) {
+async fn first_post_in_an_old_epoch() {
     let mut w = World::new().await;
     let ann = w.person("ann").await;
     let _bob = w.person("bob").await;
     let crowd = opened_past_the_join(&mut w, ann, 3).await;
-    w.people[ann].filing = filing;
     let x = w.people[ann].epoch().unwrap();
     w.people[ann].held = true;
     for &(_, sid) in &crowd[1..] {
@@ -1236,49 +1170,44 @@ async fn first_post_in_an_old_epoch(filing: Filing) {
     assert_eq!((w.chains_at(x).await, w.chains_at(y).await), (0, 1));
 }
 
-/// Found by T1e fix, open (RV of T1e): `first_post_in_an_old_epoch` as the browser files.
-/// W2 files a post's kept copy at its first `released` (voipc-web gk.rs:464-467, part 16's
-/// "`outgoing_channel_gk` on every `released`"), which C3b sends with the post, before the
-/// relay's verdict (writer.rs:279), and its copies never hear `EpochRefused{POST}`. So the
-/// copy goes as `EpochChainStart` under X, which the relay refuses ("That epoch's key is gone
-/// here", accounts/log.rs:2147-2213: the head, or the one before within `HOLD_MS`), K1 drops
-/// it with `NotKept`, and the post's next `released`, under Y, finds no copy (K1 would drop a
-/// second filing anyway, sync.rs:1377). The post is live for everyone and missing from kept
-/// history. A writer who already has a chain in X files on it instead (an append is not
-/// checked against the head), under the epoch the relay refused. N1's rule passes the same
-/// test (`Filing::Native`). Un-ignore once the browser files as N1 does.
+/// Found by T1e fix, fixed by J8F: `first_post_in_an_old_epoch` as the browser files. W2
+/// filed a post's kept copy at its first `released` (voipc-web gk.rs `take`), which C3b sends
+/// with the post, before the relay's verdict (writer.rs `send`), and its copies never heard
+/// `EpochRefused{POST}`. So the copy went as `EpochChainStart` under X, which the relay refuses
+/// ("That epoch's key is gone here", accounts/log.rs `chain_start`: the head, or the one
+/// before within `HOLD_MS`), K1 dropped it with `NotKept`, and the post's next `released`,
+/// under Y, found no copy. Now the browser files by the desktop's rule, `group_state::Copies`,
+/// which this harness runs: once, under the epoch the post finally went out under, once no
+/// refusal came for it.
 #[tokio::test]
-#[ignore = "T1e finding: the browser files a kept copy at the first released, so a post refused as OLD_EPOCH loses it"]
 async fn e2e_t1_a_browsers_first_post_in_an_epoch_refused_as_old_is_kept_under_the_head() {
-    first_post_in_an_old_epoch(Filing::Browser).await;
+    first_post_in_an_old_epoch().await;
 }
 
-/// Found by T1e fix, open (RV of T1e): N1 files a kept copy `SETTLE_MS` (10 s) after its
-/// post's `released` (gk_net.rs:52-55, `Copies::due` :147-158), assuming the relay still
-/// starts a chain under the epoch for `HOLD_MS` after the next one opened. It does, but only
-/// for the head's predecessor (accounts/log.rs:2147-2213: the head, or head - 1 while the
-/// head's opening is younger than `HOLD_MS`): two openings inside the settle (2 s apart at
-/// least, `EPOCH_MIN_GAP`; an exit batch or a gate makes them), or a post under head - 1 in
-/// the last 10 s of its window (`post_ok`, gk/snapshot.rs:55-60), and the chain start is
-/// refused, K1 drops the copy with `NotKept`, and nothing files it again. Here ann's first
-/// kept post in X is taken under the head, then two log leaves open two epochs before the
-/// settle runs out. Filed at once (plan 3b) the same copy is kept. Un-ignore once a copy
-/// whose post went is kept whatever opens during the settle.
+/// Found by T1e fix, fixed by J8F: N1 filed a kept copy 10 s (`N1_SETTLE_MS`) after its post's
+/// `released`, assuming the relay still starts a chain under the epoch for `HOLD_MS` after the
+/// next one opened. It does, but only for the head's predecessor (accounts/log.rs
+/// `chain_start`: the head, or head - 1 while the head's opening is younger than `HOLD_MS`):
+/// two openings inside the settle (2 s apart at least, `EPOCH_MIN_GAP`; an exit batch or a
+/// gate makes them), or a post under head - 1 in the last 10 s of its window, and the chain
+/// start was refused, K1 dropped the copy with `NotKept`, and nothing filed it again. Here
+/// ann's first kept post in X is taken under the head, then two log leaves open two epochs
+/// within N1's old settle. The apps' settle (`group_state::SETTLE_MS`) is shorter than
+/// `EPOCH_MIN_GAP`, so the copy meets X still open; one that does not is filed again under the
+/// head (`gk_e2e_j8f`).
 #[tokio::test]
-#[ignore = "T1e finding: N1's 10 s settle outlasts the relay's window for a kept chain under the epoch a post went under"]
 async fn e2e_t1_a_kept_copy_whose_post_two_openings_follow_within_n1s_settle_is_kept() {
-    two_openings_after_a_post(N1_SETTLE_MS).await;
+    two_openings_after_a_post().await;
 }
 
-/// ann's first kept post in X goes under the head, and two openings follow at once; the app
-/// files its copy `settle` ms after the post went (N1's rule otherwise). The copy is kept once,
-/// under X, and nothing is lost.
-async fn two_openings_after_a_post(settle: u64) {
+/// ann's first kept post in X goes under the head, and two openings follow at once, within
+/// N1's old settle; the app files its copy by the apps' rule. The copy is kept once, under X,
+/// and nothing is lost.
+async fn two_openings_after_a_post() {
     let mut w = World::new().await;
     let ann = w.person("ann").await;
     let _bob = w.person("bob").await;
     let crowd = opened_past_the_join(&mut w, ann, 3).await;
-    w.people[ann].filing = Filing::Native(settle);
     let x = w.people[ann].epoch().unwrap();
     assert_eq!(w.head(), x, "ann holds the head");
     let mark = w.people[ann].sent.len();
@@ -1295,19 +1224,13 @@ async fn two_openings_after_a_post(settle: u64) {
     let y = w.head();
     assert!(y >= x + 2, "two openings: {x} -> {y}");
     assert!(w.post_refusals.is_empty(), "the post was taken");
-    if settle > 0 {
-        let took = w.now() - t0;
-        assert!(
-            took < settle,
-            "both openings came within the settle ({took} ms)"
-        );
-        assert!(
-            w.people[ann].chain_starts(mark).is_empty(),
-            "its copy waits"
-        );
-    }
+    let took = w.now() - t0;
+    assert!(
+        took < N1_SETTLE_MS,
+        "both openings came within N1's old settle ({took} ms)"
+    );
     let done = w
-        .until(settle + 20_000, |w| {
+        .until(N1_SETTLE_MS + 20_000, |w| {
             !w.people[ann].appends(mark).is_empty() || !w.people[ann].not_kept.is_empty()
         })
         .await;
@@ -1324,16 +1247,83 @@ async fn two_openings_after_a_post(settle: u64) {
     assert_eq!(w.kept().await, 1);
 }
 
-/// Found by T1e, open: a kept post made in the epoch its readers were seated in by a Join
-/// (header `j` > 0), after that Join. Each reader opened it live, under the `CK` the Join
-/// gave it (§5.10: "a reader opens it from its seat at epoch `e`"), but on a new device the
-/// relay answers its past epoch `EpochRefused{FETCH, NOT_STORED}`: a past epoch is taken only
-/// at its opening header (C1 `past.rs` `take_past`, relay `gk/store.rs` `past`, K1
-/// `kept.rs`), whose leaves hold no seat a later Join added. Here ann and bob are seated by
-/// the first Join after the Genesis. Un-ignore once seats joined after an opening read that
-/// epoch's kept posts.
+/// J8F (`gk_e2e_j8f`): a kept copy filed only after its epoch's window for a chain start
+/// closed is not lost. ann's post is taken under X; then her app takes and files nothing (its
+/// frames in flight, the app asleep) while two openings go by, so its copy, settled, is filed
+/// under X at last, and the relay refuses that chain start as gone. K1 lets the copy go, and
+/// `Copies` offers it again under the head ann holds by then: it is kept once, under that
+/// head, and a reader seated there reads it.
+pub(super) async fn a_copy_filed_after_its_epochs_window_is_kept_under_the_head() {
+    let mut w = World::new().await;
+    let ann = w.person("ann").await;
+    let bob = w.person("bob").await;
+    let crowd = opened_past_the_join(&mut w, ann, 3).await;
+    let x = w.people[ann].epoch().unwrap();
+    assert_eq!(w.head(), x, "ann holds the head");
+    let mark = w.people[ann].sent.len();
+    let now = w.now();
+    w.people[ann].post(1, "late copy", now);
+    w.step().await;
+    assert_eq!(w.people[ann].posts(mark), vec![x], "the post went under X");
+    w.people[ann].held = true;
+    for &(_, sid) in &crowd[1..] {
+        let before = w.head();
+        w.leave_log(sid).await;
+        let opened = w.until(20_000, |w| w.head() > before).await;
+        assert!(opened, "a log leave opened an epoch");
+    }
+    let y = w.head();
+    assert!(y >= x + 2, "two openings: {x} -> {y}");
+    assert!(w.post_refusals.is_empty(), "the post was taken under X");
+    assert!(
+        w.people[ann].chain_starts(mark).is_empty(),
+        "its copy waits"
+    );
+    w.people[ann].held = false;
+    let done = w
+        .until(20_000, |w| {
+            !w.people[ann].appends(mark).is_empty() || !w.people[ann].not_kept.is_empty()
+        })
+        .await;
+    assert!(done, "its copy filed, or given up");
+    // Past the settle again, with nothing in flight: nothing else is filed
+    let quiet = w.now() + 3 * KEPT_SETTLE_MS;
+    w.until(5 * KEPT_SETTLE_MS, |w| w.now() >= quiet).await;
+    let p = &w.people[ann];
+    assert_eq!(p.not_kept, Vec::<String>::new(), "no kept copy lost");
+    let starts = p.chain_starts(mark);
+    let at: Vec<u32> = starts.iter().map(|s| s.1).collect();
+    assert_eq!(at.len(), 2, "refused under X, then filed again: {at:?}");
+    assert_eq!(at[0], x, "first under the epoch its post went under");
+    let again = at[1];
+    assert!(
+        again > x && again <= y,
+        "again under the head ann holds: {at:?}, head {y}"
+    );
+    assert_eq!(p.appends(mark), vec![starts[1].0], "one entry, on it");
+    assert_eq!(w.kept().await, 1);
+    assert_eq!((w.chains_at(x).await, w.chains_at(again).await), (0, 1));
+    // bob comes back with nothing but his vault, and reads it
+    w.reconnect(bob).await;
+    w.read(bob);
+    let read = w.until(30_000, |w| !w.people[bob].texts.is_empty()).await;
+    assert!(
+        read,
+        "read {:?}, not stored {}",
+        w.people[bob].texts, w.people[bob].not_stored
+    );
+    assert_eq!(w.people[bob].texts, ["late copy"]);
+}
+
+/// Found by T1e, fixed by J8K: a kept post made in the epoch its readers were seated in by a
+/// Join (header `j` > 0), after that Join. Each reader opened it live, under the `CK` the Join
+/// gave it (§5.10: "a reader opens it from its seat at epoch `e`"), and on a new device it
+/// reads it kept too: the relay answers such a seat's past epoch at the epoch's last Join with
+/// the opening (`gk/store.rs` `past`), which the app takes as that epoch's (C1 `past.rs`
+/// `take_past_at`, K1 `kept.rs`); it was answered `EpochRefused{FETCH, NOT_STORED}`, a past
+/// epoch being taken only at its opening header, whose leaves hold no seat a later Join
+/// added. Here ann and bob are seated by Joins after the Genesis. More in `gk_e2e_j8k.rs`.
 #[tokio::test]
-#[ignore = "T1e finding: a past epoch is answered at its opening only, so seats a Join added later in it read none of its kept posts"]
 async fn e2e_t1_kept_posts_of_the_epoch_a_member_was_joined_in_open_on_its_new_device() {
     let mut w = World::new().await;
     let ann = w.person("ann").await;
@@ -1798,8 +1788,9 @@ impl Room {
 /// open it under the account. After the opening that ungates the head the naming follows
 /// the ungated rule of an anonymous room: by the connection, with no account behind the
 /// pseudonym. (The room turns anonymous while gated, its seats named by their accounts all
-/// along: an anonymous room of signed-in members alone does not start, and one whose guest
-/// keyholder a gate evicts stalls; see the two ignored tests below.)
+/// along. Two T1e tests below cover the other cases: an anonymous room of signed-in members
+/// alone starts, its seats named by their connections, and one whose guest keyholder a gate
+/// evicts settles.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_t1_a_rooms_post_under_a_gated_head_after_its_gate_came_off_is_named_by_that_epochs_gate(
 ) {
@@ -1901,15 +1892,15 @@ async fn e2e_t1_a_rooms_post_under_a_gated_head_after_its_gate_came_off_is_named
     }
 }
 
-/// Found by T1e, open: a gate on an anonymous voice room whose keyholder is a guest. The
-/// gate evicts the guest (gates.rs `gate_changed`); the relay then asks the one keyholder
+/// Found by T1e, fixed by J8H: a gate on an anonymous voice room whose keyholder is a guest.
+/// The gate evicts the guest (gates.rs `gate_changed`); the relay then asks the one keyholder
 /// left a Join of the account seats, the guest's Remove, the seed welcomes, and a PROMOTE
-/// due carrying the connection seats' exits, whose commit the keyholder's own check refuses
-/// ("rule 8: a KeyholdersAdd drops only buckets its exits empty", voipc-crypto
-/// group_key/commit.rs). It declines; the exits never commit, the room keeps one keyholder,
-/// and its members stop hearing each other. Un-ignore once that due commits.
+/// due carrying the connection seats' exits. That KeyholdersAdd drops the one-seat buckets
+/// those exits empty, which rule 8 allows; the keyholder's own check saw a bucket whose list
+/// its build did not need by its leaf alone, so it refused its own commit ("rule 8: a
+/// KeyholdersAdd drops only buckets its exits empty") and the room stalled. The duty now asks
+/// a KeyholdersAdd's dropped buckets' lists too (holder.rs `lists_needed`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "T1e finding: a PROMOTE due after a gate evicts a guest keyholder fails the keyholder's own rule 8 check"]
 async fn e2e_t1_a_gate_on_an_anonymous_room_whose_keyholder_is_a_guest_settles() {
     let mut r = Room::new(true);
     r.join(None).await;
@@ -1931,15 +1922,14 @@ async fn e2e_t1_a_gate_on_an_anonymous_room_whose_keyholder_is_a_guest_settles()
     );
 }
 
-/// Found by T1e, open: an anonymous voice room that is not gated, whose members are all
-/// signed in (a relay where accounts are required), gets no keys. The relay seats a signed-in
-/// member there by its connection (`room_seat_m`, V2's contract), so the Genesis it asks a
-/// volunteer for seats `Conn(u)`; the volunteer's app takes its own seat to be its account's
-/// (holder.rs `own_seat`) and declines every new start (`NOT_READY`, "a new start seats this
-/// device's own seat only"). No Genesis, no voice. Un-ignore once the keyholder names its own
-/// voice seat by the room's rule.
+/// Found by T1e, fixed by J8H: an anonymous voice room that is not gated, whose members are
+/// all signed in (a relay where accounts are required), got no keys. The relay seats a
+/// signed-in member there by its connection (`room_seat_m`, open choice 11), so the Genesis
+/// it asks a volunteer for seats `Conn(u)`; the volunteer's app took its own seat to be its
+/// account's and declined every new start (`NOT_READY`, "a new start seats this device's own
+/// seat only"). No Genesis, no voice. The keyholder now takes either name of its
+/// connection's pair as its own voice seat (holder.rs `own_seats`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "T1e finding: holder.rs own_seat names a signed-in keyholder's seat by its account in an anonymous room"]
 async fn e2e_t1_an_anonymous_room_of_signed_in_members_alone_starts_its_keys() {
     let mut r = Room::new(true);
     for a in [0xa1, 0xb2, 0xc3] {
@@ -1951,4 +1941,19 @@ async fn e2e_t1_an_anonymous_room_of_signed_in_members_alone_starts_its_keys() {
         "the room settled: {}",
         r.show()
     );
+    // Every seat the rosters named is a connection's: no account behind a pseudonym
+    for d in &r.devices {
+        for f in &d.log {
+            if let ServerMessage::VoiceSeats { piece, .. } = f {
+                for (u, seat) in &piece.seats {
+                    assert_eq!(
+                        seat.m,
+                        GkMember::Conn(*u),
+                        "app {} was told {u}'s seat",
+                        d.sid
+                    );
+                }
+            }
+        }
+    }
 }

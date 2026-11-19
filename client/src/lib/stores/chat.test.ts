@@ -267,3 +267,31 @@ test("a line at the top of a full channel pushes out the oldest, never the newes
   assert.equal(after.at(-1)!.content, `m${MAX_MESSAGES - 1}`, "the newest row stays");
   assert.equal(after[1].content, "m1", "the oldest went");
 });
+
+// ── What a reader keeps of a long message (D-7) ───────────────────────────────
+
+test("a message's text past 16 KiB is kept cut to 16 KiB on every way in to the store (D-7)", () => {
+  // The relay holds a channel post to 16 KiB sealed, but a direct message or a member's
+  // hand-off to 60 KiB: a modified client's longer text is cut here, live, stored, handed
+  // on, and as an edit's new text
+  const long = `long${"z".repeat(20_000)}`;
+  const cut = 16 * 1024;
+  freshRoom();
+  reset(false);
+  addChannelMessage(S, ROOM, spam("live", { content: long }));
+  fileStoredChannelMessage(S, ROOM, spam("stored", { content: long }));
+  mergeChannelHistory(S, ROOM, [spam("handed", { content: long })], "ann");
+  addChannelMessage(S, ROOM, spam("edited", { content: "short" }));
+  applyChannelEvent(S, ROOM, { event: { kind: "edit", target: "edited" }, by: { user_id: 9, username: "dan", account: "dd".repeat(16) }, at: Date.now(), content: long }, false);
+  const lengths = Object.fromEntries(
+    roomRows()
+      .filter((m: { id?: string }) => m.id)
+      .map((m: { id?: string; content: string }) => [m.id, m.content.length]),
+  );
+  // A hand-off keeps less still (`sanitizeHistory`): at most is what this is about
+  assert.ok(lengths.handed > 0 && lengths.handed <= cut, String(lengths.handed));
+  assert.deepEqual({ ...lengths, handed: cut }, { live: cut, stored: cut, handed: cut, edited: cut });
+  addDmMessage(S, ME, 5, "bobby", ME, message(long, 10));
+  fileStoredDm(S, stored(long, 11), own, undefined, undefined);
+  assert.deepEqual(texts().map((t: string) => t.length), [cut, cut]);
+});

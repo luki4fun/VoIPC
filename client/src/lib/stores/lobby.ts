@@ -32,13 +32,24 @@ export const lobby = scoped<LobbyPages>(() => fresh());
 /** The rank `sections` gives those under no sectioned group. */
 export const REST_SECTION = 65535;
 
+/** How long a page the backend refused (the link is down, mid-reconnect) stays "on its way".
+ *  Not at once: the member list asks again whenever nothing is, and a refusal comes back as a
+ *  microtask, so the two would pass control back and forth and never let the page run. */
+export const LOBBY_RETRY_MS = 2_000;
+/** Each server's latest ask: a refusal frees only its own, not one asked after a reset. */
+const lastAsk = new Map<string, number>();
+
 /** The next page, unless one is on its way or there is none. */
 export function moreLobby(server: string): void {
   const now = get(lobby.peek(server));
   if (!lazyHere(server) || now.asked || now.done) return;
+  const ask = (lastAsk.get(server) ?? 0) + 1;
+  lastAsk.set(server, ask);
   lobby.of(server).update((l) => ({ ...l, asked: true }));
   invoke("request_lobby_page", { server, after: now.next, prefix: now.prefix }).catch(() =>
-    lobby.of(server).update((l) => ({ ...l, asked: false })),
+    setTimeout(() => {
+      if (lastAsk.get(server) === ask) lobby.of(server).update((l) => ({ ...l, asked: false }));
+    }, LOBBY_RETRY_MS),
   );
 }
 
@@ -49,9 +60,22 @@ export function searchLobby(server: string, prefix: string): void {
   moreLobby(server);
 }
 
-/** The lobby's rows went (a `user-list` for it says only our own since 25): start again. */
+/** The lobby's rows went (a `user-list` for it says only our own since 25): start again. That
+ *  list is a new session's first word, so a lobby list on screen is watched again from it: the
+ *  relay forgot the old session's watch, and a page that loads signed in asked before it had one.
+ *  A turn later: the list comes in the same read as `Authenticated`, before the backend lists the
+ *  session that read it. */
 export function resetLobby(server: string): void {
   lobby.of(server).set(fresh());
+  if (!watched.get(server)) return;
+  clearTimeout(watchAgain.get(server));
+  watchAgain.set(
+    server,
+    setTimeout(() => {
+      watchAgain.delete(server);
+      if (watched.get(server)) askWatch(server, true);
+    }, 0),
+  );
 }
 
 /** What `lobby-page` brought. A page for a prefix asked before another came is let in: its
@@ -161,9 +185,32 @@ export function lookUpNames(server: string, names: string[]): void {
   }
 }
 
+/** Whether each server's lobby list is on screen, for the next session to be told (`resetLobby`). */
+const watched = new Map<string, boolean>();
+/** A refused watch's next ask, per server. */
+const watchAgain = new Map<string, ReturnType<typeof setTimeout>>();
+
+/** Tell the relay. A watch refused (no session yet: a page that loads signed in shows its list
+ *  first; or the link is down) is asked again after `LOBBY_RETRY_MS` while the list is on
+ *  screen. Without it the relay names no join or leave there, and the list keeps whoever left. */
+function askWatch(server: string, on: boolean): void {
+  if (!lazyHere(server)) return;
+  invoke("watch_lobby", { server, on }).catch(() => {
+    if (!on || watchAgain.has(server)) return;
+    watchAgain.set(
+      server,
+      setTimeout(() => {
+        watchAgain.delete(server);
+        if (watched.get(server)) askWatch(server, true);
+      }, LOBBY_RETRY_MS),
+    );
+  });
+}
+
 /** The lobby's list is on screen, or not. */
 export function watchLobby(server: string, on: boolean): void {
-  if (lazyHere(server)) invoke("watch_lobby", { server, on }).catch(() => {});
+  watched.set(server, on);
+  askWatch(server, on);
 }
 
 /** Who these are, if online: one ask, at most 64 in all. A relay before 25 holds the lobby whole. */

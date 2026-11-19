@@ -73,7 +73,8 @@ spawnSync(
 );
 writeFileSync(
   join(WORK, "server.toml"),
-  `host = "127.0.0.1"
+  // GK=0 (test-web.sh's switch): the relay with the group key off, on the old paths
+  `${process.env.GK === "0" ? "group_key = false\n" : ""}host = "127.0.0.1"
 tcp_port = ${PORT}
 udp_port = ${PORT}
 cert_path = "server.crt"
@@ -300,6 +301,10 @@ async function lane() {
   await settle(a);
   check("and it shows no key a second time", !(await a.evaluate(`!!document.querySelector('${dialogOf("recovery")}')`)));
   check("and the account is in, by the name chosen", (await a.evaluate(`document.body.innerText`)).includes("deedee"));
+  // GK=0 (test-web.sh's switch) reaches this lane's relay too: what it said at the sign-in
+  const keyAsked = process.env.GK === "0" ? "off" : "on";
+  const keySaid = await a.evaluate(`String(window.__voipc_heard.find(([tag]) => tag === "GroupKeys")?.[1] ?? "not said")`);
+  check(`the relay runs the group key ${keyAsked}, as the run asked`, keySaid === keyAsked, keySaid);
   await seen(a, deviceKept);
   check("this browser is remembered, with no password", (await devices(a)) === 1);
 

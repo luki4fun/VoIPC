@@ -6,16 +6,25 @@
 //! inline with its budget's `RATE` refusal of a whole frame (R2 `gk_budget`): one `EpochIn`
 //! sequence with `past` set, or one `EpochRefused{FETCH, NOT_STORED}` (`Kept::not_stored`).
 //! In the `EpochIn` (`kh` and `chain` are not read):
-//! - `head` (or `opening`): the past epoch's opening header;
+//! - `head`: the header whose bucket root holds our seat's leaf then (§5.10 "from its seat
+//!   at epoch `e`"): the past epoch's opening header, or for a seat a Join added after it,
+//!   the epoch's last Join header, with `opening` then the epoch's opening header (C1
+//!   `take_past_at`). An answer with no `head` has its opening header in `opening`;
 //! - `walk`: the keyholder headers from the one `have.kh` names back to the one the past
-//!   header names, newest first, without the first (C1 `PastIn::khs`); empty with no `have`,
-//!   or for another generation: the header is then taken on the binding alone;
-//! - `leaf` and `path`: our seat's leaf then, in the past header's bucket root;
+//!   epoch's opening names, newest first, without the first (C1 `PastIn::khs`); with no
+//!   `have`, or for another generation, the header is taken on the binding alone, and
+//!   `walk` is empty, or for a Join under an opening that sets no keyholders, holds the
+//!   header the opening names (the Join's signer is checked against it);
+//! - `leaf` and `path`: our seat's leaf then, in the `head`'s bucket root;
 //! - `seal`: that epoch's `CK` sealed to the leaf's version;
 //! - `seat`: how our seat reaches `BK` of the leaf's version, a welcome or a row to its base
 //!   under seed `s`, then the ratchets (only steps for a base this connection holds);
 //! - `seed_welcome`: `s_m` of seed `s` for a row, from a seed roll;
 //! - `self_rows`: the account's self-row of that seat and seed, and its history rows there.
+//!
+//! On the binding alone only our own `BK` counts (C1 `PastBk`, §5.10): by a row under the
+//! self-row's `s_m` or a history row's `RB`, or by a welcome whose `s_m` is the self-row's.
+//! A welcome or seed welcome alone binds only a sender the relay names (`bk_of`).
 //!
 //! Whatever does not come is given up by the reader (`AccountSync`).
 
@@ -27,7 +36,7 @@ use zeroize::Zeroizing;
 
 use super::member::Member;
 use super::{seat_keys, GkCtx, GkEpoch, GkOut, Who};
-use crate::group_key::past::{take_past, PastIn};
+use crate::group_key::past::{anchors, take_past_at, PastBk, PastIn};
 use crate::group_key::{
     check_form, history_row, open_history_row, open_seat_welcome, open_seed_welcome, open_self_row,
     ratchet, self_row, Group, GroupKind, HistoryEntry, Holder, Leaf, Me, MemberId, Path, Refusal,
@@ -328,8 +337,9 @@ impl Kept {
     }
 }
 
-/// A past answer's `CK`, by C1's `take_past`, as the epoch asked for, walked back from
-/// `anchor` (or on the binding alone).
+/// A past answer's `CK`, by C1's `take_past_at`, as the epoch asked for, walked back from
+/// `anchor` (or on the binding alone): at its opening header, or at a Join of it with the
+/// opening.
 fn take(
     who: &Who,
     m: &Member,
@@ -342,8 +352,12 @@ fn take(
         h.check().map_err(|_| bad("a header of the wrong size"))?;
         check_form(&h.body, &h.sig, GroupKind::Text, group)
     };
-    let opening = p.head.as_ref().map(|l| &l.header).or(p.opening.as_ref());
-    let header = form(opening.ok_or(bad("no opening header"))?)?;
+    // `head` and, with a Join there, `opening`; or the opening alone
+    let (header, opening) = match (&p.head, &p.opening) {
+        (Some(head), opening) => (form(&head.header)?, opening.as_ref().map(form).transpose()?),
+        (None, Some(opening)) => (form(opening)?, None),
+        (None, None) => return Err(bad("no opening header")),
+    };
     if (header.header().gen, header.header().epoch) != (past.gen, past.epoch) {
         return Err(bad("not the epoch asked for"));
     }
@@ -360,7 +374,18 @@ fn take(
     let leaf = Leaf::try_from(*leaf).map_err(|_| bad("leaf"))?;
     let path = Path::from(path.clone());
     let g = Group::new(GroupKind::Text, group, past.gen).map_err(|_| bad("group"))?;
-    let bk = bk_of(who, m, &g, &leaf, p).ok_or(bad("no key of the leaf's version"))?;
+    // On the binding alone, only a `BK` the relay could not have chosen
+    let anchored = anchors(anchor, &header, opening.as_ref());
+    let (bk, own) = bk_of(who, m, &g, &leaf, p, !anchored).ok_or(bad(if anchored {
+        "no key of the leaf's version"
+    } else {
+        "no key of the leaf's version of our own"
+    }))?;
+    let bk = if own {
+        PastBk::Own(&bk)
+    } else {
+        PastBk::Relayed(&bk)
+    };
     let pin = PastIn {
         header: &header,
         khs: &khs,
@@ -368,7 +393,7 @@ fn take(
         path: &path,
         seal,
     };
-    let pe = take_past(GroupKind::Text, group, anchor, &pin, &bk)?;
+    let pe = take_past_at(GroupKind::Text, group, anchor, &pin, opening.as_ref(), bk)?;
     if (pe.group.gen(), pe.epoch.e) != (past.gen, past.epoch) {
         return Err(bad("not the epoch asked for"));
     }
@@ -381,18 +406,24 @@ fn take(
     })
 }
 
-/// `BK` of the leaf's version: held this run in the floor's generation, else from the
-/// answer's keying, a welcome to one of our seats or a row (`row_key`), and its ratchets.
+/// `BK` of the leaf's version, and whether it is the device's own (C1 `PastBk`): held this
+/// run in the floor's generation, else from the answer's keying, a welcome to one of our
+/// seats or a row (`row_key`), and its ratchets. A welcome binds no more than its sender,
+/// whom the relay names: it is our own only where its `s_m` is our self-row's (`self_s_m`).
+/// With `own_only` (no anchor reaches the header, §5.10) only our own is given: the key
+/// held this run is not, since a welcome a live answer brought keys it before its `confirm`
+/// is checked (`Member::key_in`).
 fn bk_of(
     who: &Who,
     m: &Member,
     g: &Group,
     leaf: &Leaf,
     p: &InPiece,
-) -> Option<Zeroizing<[u8; 32]>> {
-    let same_gen = m.floor.as_ref().is_some_and(|f| f.gen == g.gen());
+    own_only: bool,
+) -> Option<(Zeroizing<[u8; 32]>, bool)> {
+    let same_gen = m.floor.as_ref().is_some_and(|f| f.gen == g.gen()) && !own_only;
     if let Some(bk) = m.bks.get(&(leaf.b, leaf.v)).filter(|_| same_gen) {
-        return Some(bk.clone());
+        return Some((bk.clone(), false));
     }
     let sk = p.seat.as_ref().filter(|sk| sk.b == leaf.b)?;
     sk.check().ok()?;
@@ -402,13 +433,18 @@ fn bk_of(
         v: sk.base_v,
     };
     let seats = seat_keys::mine(who, GroupKind::Text);
-    let mut bk = match (&sk.welcome, &sk.row) {
-        (Some(w), _) => seats
-            .iter()
-            .find_map(|me| open_seat_welcome(g, sk.s, base, me, &from, w).ok())
-            .map(|(_, bk)| bk)?,
-        (None, Some(row)) => row_key(who, &seats, g, sk.s, &from, base, row, p)?,
-        (None, None) if same_gen => m.bks.get(&(sk.b, sk.base_v))?.clone(),
+    let welcomed = sk.welcome.as_ref().and_then(|w| {
+        let (seat, s_m, bk) = seats.iter().find_map(|me| {
+            let (s_m, bk) = open_seat_welcome(g, sk.s, base, me, &from, w).ok()?;
+            Some((me.keys.public().seat(me.m), s_m, bk))
+        })?;
+        let own = self_s_m(who, g, sk.s, &seat, p).is_some_and(|ours| same_secret(&ours, &s_m));
+        (own || !own_only).then_some((bk, own))
+    });
+    let (mut bk, own) = match (welcomed, &sk.row) {
+        (Some(got), _) => got,
+        (None, Some(row)) => row_key(who, &seats, g, sk.s, &from, base, row, p, own_only)?,
+        (None, None) if same_gen => (m.bks.get(&(sk.b, sk.base_v))?.clone(), false),
         (None, None) => return None,
     };
     let mut v = sk.base_v;
@@ -416,13 +452,53 @@ fn bk_of(
         bk = ratchet(g, step.e, Version { b: sk.b, v }, step.to, &bk);
         v = step.to;
     }
-    (v == leaf.v).then_some(bk)
+    (v == leaf.v).then_some((bk, own))
+}
+
+/// `s_m` of our seat `seat` under seed `s` from the account's self-row in the answer, under
+/// the self key or the old one while a rotation keeps it: only the account's devices seal
+/// one, once a key under it passed `confirm` (`Member::write_self_row`).
+fn self_s_m(
+    who: &Who,
+    g: &Group,
+    s: u32,
+    seat: &SeatRef,
+    p: &InPiece,
+) -> Option<Zeroizing<[u8; 32]>> {
+    let account = who.account?;
+    let keys = who.seat_keys.as_ref()?;
+    if seat.m != MemberId::Account(account) {
+        return None;
+    }
+    let self_keys = std::iter::once(keys.self_key()).chain(keys.old.as_ref().map(|o| o.self_key()));
+    let rows: Vec<&SelfRowIn> = p
+        .self_rows
+        .iter()
+        .filter(|r| {
+            r.kind == gk::self_row::SELF_ROW
+                && r.group == g.id()
+                && r.gen == g.gen()
+                && r.seed == s
+                && (r.sk, r.sx) == (seat.tag_sk, seat.tag_sx)
+                && r.check().is_ok()
+        })
+        .collect();
+    self_keys
+        .flat_map(|key| rows.iter().map(move |r| (key, r)))
+        .find_map(|(key, r)| open_self_row(g, s, seat, key, &r.sealed).ok())
+}
+
+/// Equality of two secrets in time that does not depend on where they differ.
+fn same_secret(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// A row to one of our seats, opened by the row base `s_m` gives: from a seed welcome to it
 /// (a seed roll), or for the account's seats by its rows (§3.11), a self-row's `s_m` with
 /// that seat's private parts while this device holds them, or a history row once they are
-/// gone. Rows are under the self key, or the old one while a rotation keeps it.
+/// gone. Rows are under the self key, or the old one while a rotation keeps it. With the
+/// key, whether it is our own: by a self-row or history row it is; by a seed welcome, whose
+/// maker the relay names, it is not, and with `own_only` that one is not tried.
 #[allow(clippy::too_many_arguments)]
 fn row_key(
     who: &Who,
@@ -433,11 +509,12 @@ fn row_key(
     base: Version,
     row: &[u8],
     p: &InPiece,
-) -> Option<Zeroizing<[u8; 32]>> {
+    own_only: bool,
+) -> Option<(Zeroizing<[u8; 32]>, bool)> {
     let sw = p
         .seed_welcome
         .as_ref()
-        .filter(|w| w.s == s && w.check().is_ok());
+        .filter(|w| !own_only && w.s == s && w.check().is_ok());
     if let Some(sw) = sw {
         let maker = Holder::from_raw(sw.from.m.into(), &sw.from.kx).ok()?;
         let bk = seats.iter().find_map(|me| {
@@ -447,8 +524,8 @@ fn row_key(
                 .open_row(base, row)
                 .ok()
         });
-        if bk.is_some() {
-            return bk;
+        if let Some(bk) = bk {
+            return Some((bk, false));
         }
     }
     let account = who.account?;
@@ -483,7 +560,7 @@ fn row_key(
                     .map(|e| RowBase::from_secret(g, s, seat.m, e.k, &e.rb))
             };
             if let Some(bk) = rb.and_then(|rb| rb.open_row(base, row).ok()) {
-                return Some(bk);
+                return Some((bk, true));
             }
         }
     }
@@ -1051,10 +1128,12 @@ mod tests {
         ));
     }
 
-    /// R1b sends the seed welcome with a row to our seat after a seed roll: the row opens by
-    /// it with no self-row, and does not without it.
+    /// R1b sends the seed welcome with a row to our seat after a seed roll: where the walk
+    /// from the device's anchor reaches the epoch, the row opens by it with no self-row, and
+    /// does not without it. On the binding alone it does not: the relay names the seed
+    /// welcome's maker (J8K review), so only a self-row's `s_m` is our own there.
     #[test]
-    fn a_row_opens_by_the_seed_welcome_its_answer_carries() {
+    fn a_row_opens_by_the_seed_welcome_its_answer_carries_where_an_anchor_reaches_the_epoch() {
         let keys = SeatKeys::generate(1, T0);
         let c = case(&keys);
         let (s, s_m) = s_m(&c, &keys);
@@ -1067,21 +1146,32 @@ mod tests {
             keys: &public,
         };
         let bytes = seed_welcome(&c.w.g, s, &holder.me(), &to, &s_m).unwrap();
-        let read = |p: gk::InPiece| {
+        assert_eq!(c.past.header.kh(), c.w.kh.d(), "the set the device holds");
+        let read = |p: gk::InPiece, anchored: bool| {
             let mut d = Device::new(c.ik, seat_keys::copy(&keys));
+            if anchored {
+                // A floor at the past epoch's opening, with the keyholder header it names
+                let m = d.keying.groups.get_mut(TEXT_ID).unwrap();
+                m.floor = Some(crate::group_key::Floor::after(None, &c.past.header, T0));
+                m.kh = Some(c.w.kh.clone());
+            }
             d.keying.past_epoch(TEXT_ID, gen, e);
             d.keying.past_asks();
             assert_eq!(d.take(p).past_ready.len(), 1);
             matches!(d.keying.past_epoch(TEXT_ID, gen, e), PastEpoch::Ready(_))
         };
-        assert!(!read(answer(&c, Vec::new())), "the control: no s_m, no key");
+        assert!(
+            !read(answer(&c, Vec::new()), true),
+            "the control: no s_m, no key"
+        );
         let mut p = answer(&c, Vec::new());
         p.seed_welcome = Some(gk::SeedWelcomeIn {
             s,
             from: holder.by().into(),
             bytes,
         });
-        assert!(read(p));
+        assert!(read(p.clone(), true));
+        assert!(!read(p, false), "on the binding alone, no seed welcome");
     }
 
     /// C1 leaves it to the caller (P1): an answer whose header is another epoch's than the
@@ -1297,5 +1387,380 @@ mod tests {
             PastEpoch::Ready(_)
         ));
         assert!(d.not_stored().past_ready.is_empty(), "the second send's");
+    }
+
+    /// T1e A, §5.10 "a reader opens it from its seat at epoch `e`": a seat a Join added
+    /// after the epoch's opening (the Genesis here) is in no opening's root. The relay
+    /// answers at the epoch's last Join with the opening (R1b `store::past`), and a fresh
+    /// device takes the epoch's key from its welcome there, whose `s_m` is its account's
+    /// self-row's; without the opening, or with a Join in its place, nothing is taken, nor
+    /// by the welcome with no self-row to show it is ours (J8K review).
+    #[test]
+    fn a_past_epoch_a_join_seated_us_in_is_taken_at_its_last_join_with_its_opening() {
+        let keys = SeatKeys::generate(1, T0);
+        let mut w = World::text(true, false);
+        let genesis = w.head.clone();
+        let ik = IdentityKeyPair::generate(&mut crate::rng());
+        let mine = joiner(&ik, A, &keys);
+        let seat = mine.seat;
+        let due = Due {
+            joiners: vec![mine],
+            ..w.due(DueKind::Join)
+        };
+        let joined = w.build_join(&due, None).unwrap();
+        w.step(&due, &joined);
+        let last = w.join(&[&crate::group_key::build::world::Member::account(8)]);
+        assert_eq!(
+            (last.header.header().epoch, last.header.header().join),
+            (1, 2)
+        );
+        let x = joined
+            .commit
+            .welcomes
+            .iter()
+            .find(|x| x.seat == seat)
+            .unwrap();
+        let leaves: Vec<Leaf> = w.leaves.iter().map(|l| l.leaf).collect();
+        let i = leaves
+            .iter()
+            .position(|l| (l.b, l.v) == (x.b, x.v))
+            .unwrap();
+        let seal = joined
+            .commit
+            .seals
+            .iter()
+            .find(|s| (s.b, s.v) == (x.b, x.v))
+            .unwrap();
+        let gen = w.g.gen();
+        // The account's self-row of that seat and seed, as its device that took the
+        // welcome live wrote it (`Member::write_self_row`)
+        let me = Me {
+            m: MemberId::Account(A),
+            keys: &keys.pair,
+        };
+        let at = Version { b: x.b, v: x.v };
+        let (s_m, _) =
+            open_seat_welcome(&w.g, x.s, at, &me, &w.holders[0].holder(), &x.bytes).unwrap();
+        let rows = vec![gk::SelfRowIn {
+            group: TEXT_ID.into(),
+            gen,
+            seed: x.s,
+            sk: seat.tag_sk,
+            sx: seat.tag_sx,
+            kind: gk::self_row::SELF_ROW,
+            sealed: self_row(&w.g, x.s, &seat, keys.self_key(), &s_m),
+        }];
+        let answer_with =
+            |opening: Option<&SignedHeader>, self_rows: Vec<gk::SelfRowIn>| gk::InPiece {
+                head: Some(gk::WalkLinkIn {
+                    header: header_in(&last.header),
+                    parent: None,
+                }),
+                opening: opening.map(header_in),
+                leaf: Some(leaves[i].into()),
+                path: Some(inclusion_path(&leaves, i).unwrap().try_into().unwrap()),
+                seal: Some(seal.bytes.clone()),
+                seat: Some(gk::SeatKeying {
+                    b: x.b,
+                    base_v: x.v,
+                    s: x.s,
+                    from: w.holders[0].by().into(),
+                    welcome: Some(x.bytes.clone()),
+                    row: None,
+                    ratchets: vec![],
+                }),
+                self_rows,
+                past: Some(gk::EpochRef { gen, epoch: 1 }),
+                ..Default::default()
+            };
+        let answer = |opening: Option<&SignedHeader>| answer_with(opening, rows.clone());
+        let read = |p: gk::InPiece| {
+            let mut d = Device::new(ik, seat_keys::copy(&keys));
+            d.keying.past_epoch(TEXT_ID, gen, 1);
+            d.keying.past_asks();
+            assert_eq!(d.take(p).past_ready.len(), 1);
+            match d.keying.past_epoch(TEXT_ID, gen, 1) {
+                PastEpoch::Ready(k) => Some((k.ck, k.d_e)),
+                _ => None,
+            }
+        };
+        assert!(read(answer(None)).is_none(), "the control: no opening");
+        assert!(
+            read(answer(Some(&joined.header))).is_none(),
+            "a Join is no opening"
+        );
+        let (ck, d_e) = read(answer(Some(&genesis))).expect("taken");
+        assert_eq!((*ck, d_e), (*joined.ck, genesis.d()));
+        assert!(
+            read(answer_with(Some(&genesis), Vec::new())).is_none(),
+            "on the binding alone, a welcome no self-row shows ours"
+        );
+    }
+
+    /// J8K review: a welcome binds its sender, and with no anchor the relay names the
+    /// sender. A relay that makes its own keyholder pair, seats our account's published
+    /// seat keys under a `BK` of its choosing (a seat welcome; or a seed welcome and a row),
+    /// and forges the epoch's header around a `CK` of its choosing (an opening of its own;
+    /// or an opening naming it a keyholder with a Join it signs) hands a fresh device no key.
+    /// On the binding alone a past epoch is taken only under the device's own `BK` (§5.10):
+    /// a row under the `s_m` of its self-row, or its history row's, or a welcome whose `s_m`
+    /// is the self-row's. The genuine answer, with that self-row, is taken.
+    #[test]
+    fn a_fresh_device_takes_no_past_epoch_on_a_welcome_from_a_keyholder_the_relay_made() {
+        use crate::group_key::build::world::{Holder, Member};
+        use crate::group_key::{confirm, seal, seat_welcome, Epoch};
+        let keys = SeatKeys::generate(1, T0);
+        let mut c = case(&keys);
+        let (s, s_m) = s_m(&c, &keys);
+        let row = self_row(&c.w.g, s, &c.seat, keys.self_key(), &s_m);
+        let rows = vec![self_row_of(&c, &c.seat, s, gk::self_row::SELF_ROW, row)];
+        let (ik, gen, g) = (c.ik, c.w.g.gen(), c.w.g.clone());
+        let past = c.past.header.clone();
+        let e = past.header().epoch;
+        let real = answer(&c, rows);
+        let read = |p: gk::InPiece| {
+            let mut d = Device::new(ik, seat_keys::copy(&keys));
+            d.keying.past_epoch(TEXT_ID, gen, e);
+            d.keying.past_asks();
+            assert_eq!(d.take(p).past_ready.len(), 1);
+            match d.keying.past_epoch(TEXT_ID, gen, e) {
+                PastEpoch::Ready(k) => Some(*k.ck),
+                _ => None,
+            }
+        };
+        assert_eq!(read(real.clone()), Some(*c.past.ck), "the control: genuine");
+        // The relay's own keyholder pair, named a keyholder by an opening it signs
+        let promoted = c.w.promote(Holder::desktop(9)).header;
+        let join = c.w.join(&[&Member::account(41)]).header;
+        let relay = c.w.holders.last().unwrap();
+        let (bk, ck) = ([0x5a; 32], [0xa5; 32]);
+        let leaf = Leaf::try_from(real.leaf.unwrap()).unwrap();
+        let at = Version {
+            b: leaf.b,
+            v: leaf.v,
+        };
+        let sign = |h: crate::group_key::HeaderV1| SignedHeader::sign(h, &relay.ik).unwrap();
+        let own_opening = sign({
+            let mut h = past.header().clone();
+            h.signer = relay.m;
+            h.confirm = confirm(&g, e, 0, &ck);
+            h
+        });
+        let named = sign({
+            let mut h = promoted.header().clone();
+            h.epoch = e;
+            h.signer = relay.m;
+            h.bucket_root = past.header().bucket_root;
+            h.buckets = past.header().buckets;
+            h.confirm = confirm(&g, e, 0, &ck);
+            h
+        });
+        assert!(named
+            .header()
+            .keyholders
+            .contains(&relay.entry(GroupKind::Text)));
+        let signed_join = sign({
+            let o = named.header();
+            let mut h = join.header().clone();
+            h.epoch = e;
+            h.epoch_parent = named.d();
+            h.kh_parent = named.kh();
+            h.signer = relay.m;
+            (h.gated, h.seed, h.seed_floor, h.exits_upto) =
+                (o.gated, o.seed, o.seed_floor, o.exits_upto);
+            h.bucket_root = past.header().bucket_root;
+            h.buckets = past.header().buckets;
+            h.confirm = confirm(&g, e, h.join, &ck);
+            h
+        });
+        // Our account's seat keys, as the relay publishes them
+        let public = keys.pair.public();
+        let to = Them {
+            m: MemberId::Account(A),
+            keys: &public,
+        };
+        let welcome = seat_welcome(&g, s, at, &relay.me(), &to, &[0x33; 32], &bk).unwrap();
+        let by_welcome = gk::SeatKeying {
+            b: at.b,
+            base_v: at.v,
+            s,
+            from: relay.by().into(),
+            welcome: Some(welcome),
+            row: None,
+            ratchets: vec![],
+        };
+        let relay_s_m = [0x44; 32];
+        let by_row = gk::SeatKeying {
+            welcome: None,
+            row: Some(
+                RowBase::keyholder_side(&g, s, &relay.me(), &to, &relay_s_m)
+                    .unwrap()
+                    .row(at, &bk),
+            ),
+            ..by_welcome.clone()
+        };
+        let seed = gk::SeedWelcomeIn {
+            s,
+            from: relay.by().into(),
+            bytes: seed_welcome(&g, s, &relay.me(), &to, &relay_s_m).unwrap(),
+        };
+        let forge = |head: &SignedHeader, opening: Option<&SignedHeader>, seat: &gk::SeatKeying| {
+            let d_e = opening.unwrap_or(head).d();
+            gk::InPiece {
+                head: Some(gk::WalkLinkIn {
+                    header: header_in(head),
+                    parent: None,
+                }),
+                opening: opening.map(header_in),
+                seal: Some(seal(&g, &Epoch { e, d_e }, at, &bk, &ck)),
+                seat: Some(seat.clone()),
+                ..real.clone()
+            }
+        };
+        let mut seed_row = forge(&own_opening, None, &by_row);
+        seed_row.seed_welcome = Some(seed);
+        let taken: Vec<(&str, [u8; 32])> = [
+            (
+                "an opening, a seat welcome",
+                forge(&own_opening, None, &by_welcome),
+            ),
+            ("an opening, a seed welcome and a row", seed_row),
+            (
+                "a Join it signs, under an opening naming it a keyholder",
+                forge(&signed_join, Some(&named), &by_welcome),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(what, p)| read(p).map(|k| (what, k)))
+        .collect();
+        assert_eq!(taken, vec![], "no key of the relay's taken");
+    }
+
+    /// J8K review, left to `member.rs` (not this slice's file): the binding alone trusts the
+    /// account's self-row to hold an `s_m` a key passed `confirm` under. `Member::key_in`
+    /// writes one for the `s_m` of whatever seat keying came with an answer whose head key it
+    /// holds, though no key came through that keying: a relay that rides a welcome of its own
+    /// pair, under a seed number of its choosing, on a real push of the next Join gets its
+    /// `s_m` sealed as the account's (then a fresh device's past read under that seed counts
+    /// the relay's welcome as its own).
+    #[test]
+    #[ignore = "J8K review: member.rs key_in writes a self-row for an s_m no key came through"]
+    fn no_self_row_is_written_for_an_s_m_no_confirmed_key_came_through() {
+        use crate::group_key::build::world::{Holder, Member};
+        use crate::group_key::{open_self_row, seat_welcome};
+        let mut w = World::text(true, false);
+        let genesis = w.head.clone();
+        let keys = SeatKeys::generate(1, T0);
+        let ik = IdentityKeyPair::generate(&mut crate::rng());
+        let mine = joiner(&ik, A, &keys);
+        let seat = mine.seat;
+        let due = Due {
+            joiners: vec![mine],
+            ..w.due(DueKind::Join)
+        };
+        let joined = w.build_join(&due, None).unwrap();
+        w.step(&due, &joined);
+        let x = joined
+            .commit
+            .welcomes
+            .iter()
+            .find(|x| x.seat == seat)
+            .unwrap();
+        let leaves: Vec<Leaf> = w.leaves.iter().map(|l| l.leaf).collect();
+        let i = leaves
+            .iter()
+            .position(|l| (l.b, l.v) == (x.b, x.v))
+            .unwrap();
+        let link = |h: &SignedHeader| gk::WalkLinkIn {
+            header: header_in(h),
+            parent: None,
+        };
+        let mut d = Device::new(ik, seat_keys::copy(&keys));
+        let take = |d: &mut Device, piece: gk::InPiece, now: u64| {
+            let msg = ServerMessage::EpochIn {
+                group: TEXT_ID.into(),
+                part: 0,
+                last: true,
+                piece: Box::new(piece),
+            };
+            let c = GkCtx {
+                pins: &mut d.pins,
+                now: now * 1000,
+            };
+            d.keying.frame(&mut d.st, &msg, c)
+        };
+        // Seated by the Join: its welcome opens, `confirm` passes, the self-row for seed `s`
+        let out = take(
+            &mut d,
+            gk::InPiece {
+                walk: vec![link(&genesis)],
+                head: Some(link(&w.head)),
+                opening: Some(header_in(&w.kh)),
+                leaf: Some(leaves[i].into()),
+                path: Some(inclusion_path(&leaves, i).unwrap().try_into().unwrap()),
+                seal: joined
+                    .commit
+                    .seals
+                    .iter()
+                    .find(|s| (s.b, s.v) == (x.b, x.v))
+                    .map(|s| s.bytes.clone()),
+                seat: Some(gk::SeatKeying {
+                    b: x.b,
+                    base_v: x.v,
+                    s: x.s,
+                    from: w.holders[0].by().into(),
+                    welcome: Some(x.bytes.clone()),
+                    row: None,
+                    ratchets: vec![],
+                }),
+                ..Default::default()
+            },
+            w.now,
+        );
+        assert!(d.keying.current_epoch(TEXT_ID).is_some(), "seated");
+        assert_eq!(out.self_rows.len(), 1, "the self-row for seed s");
+        // The next Join, pushed, with a welcome of the relay's own pair under seed s + 1
+        w.join(&[&Member::account(8)]);
+        let relay = Holder::desktop(9);
+        let public = keys.pair.public();
+        let to = Them {
+            m: MemberId::Account(A),
+            keys: &public,
+        };
+        let at = Version { b: x.b, v: x.v };
+        let s2 = x.s + 1;
+        let forged = seat_welcome(&w.g, s2, at, &relay.me(), &to, &[0x33; 32], &[0x5a; 32]);
+        let out = take(
+            &mut d,
+            gk::InPiece {
+                head: Some(link(&w.head)),
+                pushed: true,
+                seat: Some(gk::SeatKeying {
+                    b: x.b,
+                    base_v: x.v,
+                    s: s2,
+                    from: relay.by().into(),
+                    welcome: Some(forged.unwrap()),
+                    row: None,
+                    ratchets: vec![],
+                }),
+                ..Default::default()
+            },
+            w.now,
+        );
+        assert_eq!(
+            d.keying.current_epoch(TEXT_ID).map(|e| e.epoch),
+            Some(w.head.header().epoch),
+            "the push is taken"
+        );
+        let sealed: Vec<(u32, bool)> = out
+            .self_rows
+            .iter()
+            .map(|r| {
+                let s_m = open_self_row(&w.g, r.seed, &seat, keys.self_key(), &r.sealed).unwrap();
+                (r.seed, *s_m == [0x33; 32])
+            })
+            .collect();
+        assert_eq!(sealed, vec![], "no self-row for the relay's s_m");
     }
 }

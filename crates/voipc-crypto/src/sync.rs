@@ -86,6 +86,12 @@ const MOST_PENDING: usize = 65_536;
 
 /// How the relay says its budget ran out for now (`accounts.rs`).
 const SLOW_DOWN: &str = "slow down";
+/// How the relay refuses a gk chain start under an epoch it no longer starts one under: the
+/// head, or the one before for `HOLD_MS` after the head opened (accounts/log.rs).
+const GK_GONE: &str = "epoch's key is gone here";
+/// A copy whose gk chain start was refused so waits this long to be filed again under a newer
+/// head (`group_state::Copies` offers it at its next tick), else it is told lost.
+const GK_GONE_WAIT_MS: u64 = crate::group_key::timers::HOLD_MS;
 /// The protocol from which a relay may keep channel entries on gk chains (part 4): read by
 /// their seals, whether the relay's group key is on or off now.
 const GROUP_KEY_SINCE: u32 = 26;
@@ -608,6 +614,11 @@ pub struct AccountSync {
     /// The posts last kept by `send_channel_gk`, by their envelope's digest: one the group
     /// key lets out again (a resend after `OLD_EPOCH` or `RATE`) is kept once.
     gk_filed: VecDeque<[u8; 32]>,
+    /// Posts whose gk chain start the relay refused as gone (`GK_GONE`), by digest, until when
+    /// (ms) they wait to be filed again under a newer head, and the relay's words.
+    gk_gone: VecDeque<([u8; 32], u64, String)>,
+    /// Posts filed again after that: a second such refusal is told at once.
+    gk_again: VecDeque<[u8; 32]>,
     /// Per channel log, our chains and buckets as far as they were read back.
     writers: HashMap<String, chains::Writer>,
     /// The asks of `writers` not answered yet, in order, each with its request's name: a
@@ -842,6 +853,8 @@ impl AccountSync {
             gk_chains: false,
             gk_reads: Default::default(),
             gk_filed: VecDeque::new(),
+            gk_gone: VecDeque::new(),
+            gk_again: VecDeque::new(),
             writers: HashMap::new(),
             writer_asks: VecDeque::new(),
             wraps_asked: VecDeque::new(),
@@ -1374,10 +1387,19 @@ impl AccountSync {
         if !self.prefs.cloud || !self.on_chains(conv) || ep.group != conv || stored.is_err() {
             return Vec::new();
         }
-        // Each post once, under the epoch it first went under (plan 3b)
+        // Each post once (plan 3b): under the epoch its post went out under, or, when the
+        // relay refused that epoch's chain start as gone, under the head it is offered at
+        // again (`group_state::Copies`). One filed is never filed twice
         let filed: [u8; 32] = sha2::Sha256::digest(&envelope).into();
         if self.gk_filed.contains(&filed) {
             return Vec::new();
+        }
+        if let Some(at) = self.gk_gone.iter().position(|g| g.0 == filed) {
+            self.gk_gone.remove(at);
+            if self.gk_again.len() >= GK_FILED_MOST {
+                self.gk_again.pop_front();
+            }
+            self.gk_again.push_back(filed);
         }
         if self.gk_filed.len() >= GK_FILED_MOST {
             self.gk_filed.pop_front();
@@ -1397,6 +1419,59 @@ impl AccountSync {
         });
         out.extend(self.flush());
         out
+    }
+
+    /// The relay refused the gk chain start of `conv` under `at` (generation, epoch) as gone:
+    /// the posts waiting for that chain wait to be filed again under a newer head, each once
+    /// (`send_channel_gk`); one filed again so before is lost now. Out of the outbox, with the
+    /// posts of `conv` under other epochs: whether any is lost, and those.
+    fn gk_gone_out(
+        &mut self,
+        conv: &str,
+        at: ([u8; 16], u32),
+        reason: &str,
+    ) -> (bool, Vec<Outgoing>) {
+        let until = crate::time::now_millis().saturating_add(GK_GONE_WAIT_MS);
+        let mut lost = false;
+        let mut rest = Vec::new();
+        let mut keep = Vec::new();
+        for o in std::mem::take(&mut self.outbox) {
+            let Some(ep) = o.gk.as_ref().filter(|_| o.conv == conv) else {
+                keep.push(o);
+                continue;
+            };
+            if (ep.gen, ep.epoch) != at {
+                rest.push(o);
+                continue;
+            }
+            let filed: [u8; 32] = sha2::Sha256::digest(&o.envelope).into();
+            if self.gk_again.contains(&filed) {
+                lost = true;
+                continue;
+            }
+            self.gk_filed.retain(|f| *f != filed);
+            self.gk_gone.push_back((filed, until, reason.to_string()));
+        }
+        self.outbox = keep;
+        (lost, rest)
+    }
+
+    /// Posts refused as gone that were not filed again in time are told lost, once.
+    fn gk_gone_tick(&mut self, now: u64) {
+        let mut told = None;
+        while self.gk_gone.front().is_some_and(|g| now >= g.1) {
+            let (filed, _, reason) = self.gk_gone.pop_front().expect("one");
+            // Offered again after this it is not filed
+            if self.gk_filed.len() >= GK_FILED_MOST {
+                self.gk_filed.pop_front();
+            }
+            self.gk_filed.push_back(filed);
+            told.get_or_insert(reason);
+        }
+        if let Some(reason) = told {
+            self.copy_refused = true;
+            self.later.push(Event::NotKept { reason });
+        }
     }
 
     /// We are in a channel with a log: keep it (once a run), and read what it
@@ -1689,6 +1764,7 @@ impl AccountSync {
         out.extend(self.answer());
         out.extend(self.pins_tick(crate::time::now_millis()));
         out.extend(self.gk_tick(crate::time::now_millis() / 1000));
+        self.gk_gone_tick(crate::time::now_millis());
         let mut all = std::mem::take(&mut self.later);
         all.extend(events);
         (out, all)
@@ -2300,10 +2376,28 @@ impl AccountSync {
                             .find(|(what, _)| what == request)
                             .map(|(_, conv)| conv.clone());
                         if let Some(conv) = conv {
+                            let gone = (request == "EpochChainStart" && reason.contains(GK_GONE))
+                                .then(|| self.gk_start_out(&conv))
+                                .flatten();
                             if for_now {
                                 // What it holds stays, and the next tick goes on
                                 self.held = true;
                                 self.writer_held(&conv, request);
+                            } else if let Some(at) = gone {
+                                // Its epoch is gone here: its posts wait to be filed again
+                                // under a newer head, those of other epochs go on, and the
+                                // writer starts over
+                                let (lost, rest) = self.gk_gone_out(&conv, at, reason);
+                                let posts = self.outbox.iter().any(|o| o.conv == conv);
+                                self.writer_refused(&conv, request);
+                                self.outbox.extend(rest);
+                                if posts || lost {
+                                    self.copy_refused = true;
+                                    events.push(Event::NotKept {
+                                        reason: reason.clone(),
+                                    });
+                                }
+                                out.extend(self.flush());
                             } else if self.join_asks.contains(&conv) {
                                 // Refused ahead of a seat on its way: goes on the same, for
                                 // a round or two if that answer was lost
@@ -5176,6 +5270,89 @@ mod tests {
             other.group = "c:elsewhere".into();
             assert!(s
                 .send_channel_gk(CONV, envelope("m4", "x", None), 4, None, other)
+                .is_empty());
+        }
+
+        fn gone(s: &mut AccountSync) -> (Vec<ClientMessage>, Vec<Event>) {
+            let r = AccountReply::Error {
+                request: "EpochChainStart".into(),
+                reason: "That epoch's key is gone here; the next post starts anew.".into(),
+            };
+            reply(s, r)
+        }
+
+        fn not_kept(events: &[Event]) -> bool {
+            events.iter().any(|e| matches!(e, Event::NotKept { .. }))
+        }
+
+        /// T1e D/E (J8F): a gk chain start the relay refuses as gone (its epoch is no longer
+        /// the head, nor the one before within `HOLD_MS`) loses no post. The post waits to be
+        /// filed again under the newer head the host offers it at (`group_state::Copies`),
+        /// once; a post under another epoch goes on; a second such refusal of the same post,
+        /// or no offer within `GK_GONE_WAIT_MS`, says it is not kept.
+        #[test]
+        fn a_gk_chain_start_refused_as_gone_is_filed_again_under_a_newer_head_once() {
+            let me = account(1);
+            let mut s = gk_sync(&me);
+            let one = envelope("m1", "one", None);
+            s.send_channel_gk(CONV, one.clone(), 1, None, epoch_of(4));
+            reply(&mut s, AccountReply::LogJoined { conv: CONV.into() });
+            let (out, _) = reply(&mut s, own_chains(Some(600), Vec::new()));
+            chain_start(&out, 4);
+            // A post under the next epoch waits behind that start
+            let two = envelope("m2", "two", None);
+            assert!(s
+                .send_channel_gk(CONV, two.clone(), 2, None, epoch_of(5))
+                .is_empty());
+            let (out, events) = gone(&mut s);
+            assert!(!not_kept(&events), "{events:?}");
+            // The writer starts over: the post under 5 goes on its own chain
+            assert_eq!(sent(&out, "OwnChains").len(), 1, "{out:?}");
+            let (out, _) = reply(&mut s, own_chains(Some(600), Vec::new()));
+            let (five, ..) = chain_start(&out, 5);
+            assert_eq!(appended(&stored_at(&mut s, five)).0, five);
+            // Offered again under the head, it is filed there, once
+            let out = s.send_channel_gk(CONV, one.clone(), 1, None, epoch_of(6));
+            let (six, ..) = chain_start(&out, 6);
+            let (at, ct) = appended(&stored_at(&mut s, six));
+            assert_eq!(at, six);
+            assert!(!ct.is_empty());
+            assert!(s
+                .send_channel_gk(CONV, one.clone(), 1, None, epoch_of(7))
+                .is_empty());
+            let (_, events) = s.tick();
+            assert!(!not_kept(&events), "{events:?}");
+            // Refused as gone a second time: told at once
+            let three = envelope("m3", "three", None);
+            let out = s.send_channel_gk(CONV, three.clone(), 3, None, epoch_of(8));
+            chain_start(&out, 8);
+            assert!(!not_kept(&gone(&mut s).1));
+            let out = s.send_channel_gk(CONV, three.clone(), 3, None, epoch_of(9));
+            let (out, _) = match sent(&out, "OwnChains").len() {
+                0 => (out, vec![]),
+                _ => reply(&mut s, own_chains(Some(600), Vec::new())),
+            };
+            chain_start(&out, 9);
+            assert!(not_kept(&gone(&mut s).1), "lost the second time");
+            assert!(s
+                .send_channel_gk(CONV, three, 3, None, epoch_of(10))
+                .is_empty());
+            // Not offered again in time: told when the wait is over, and not filed after
+            let four = envelope("m4", "four", None);
+            let out = s.send_channel_gk(CONV, four.clone(), 4, None, epoch_of(11));
+            let (out, _) = match sent(&out, "OwnChains").len() {
+                0 => (out, vec![]),
+                _ => reply(&mut s, own_chains(Some(600), Vec::new())),
+            };
+            chain_start(&out, 11);
+            assert!(!not_kept(&gone(&mut s).1));
+            let now = crate::time::now_millis();
+            s.gk_gone_tick(now + GK_GONE_WAIT_MS - 1_000);
+            assert!(!not_kept(&s.later), "still waits");
+            s.gk_gone_tick(now + GK_GONE_WAIT_MS + 1_000);
+            assert!(not_kept(&std::mem::take(&mut s.later)));
+            assert!(s
+                .send_channel_gk(CONV, four, 4, None, epoch_of(12))
                 .is_empty());
         }
 

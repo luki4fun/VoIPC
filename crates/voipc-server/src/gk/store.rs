@@ -22,7 +22,7 @@ use voipc_protocol::gk::{
 use super::due::{Exits, Leaving};
 use super::group::{GroupState, Head, Seat, Taken};
 use super::names::{starts_names, Kept};
-use super::snapshot::{link, Ver};
+use super::snapshot::{header_in, link, Ver};
 use crate::accounts::gk as db;
 
 /// Dispatch over the two backends, as accounts.rs's `db!` (which this module cannot see).
@@ -1309,7 +1309,8 @@ pub async fn is_member(store: &Db, conv: &str, account: &[u8; 16]) -> Result<boo
 
 // ── Kept history (C4, plan 2d "`at` entries") ─────────────────────────────
 
-/// A leaf a past epoch's opening committed to, with its version's base and when it was made.
+/// A leaf a past epoch's header committed to, with its version's base and when it was made.
+#[derive(Clone, Copy)]
 struct PastLeaf {
     leaf: Leaf,
     base_v: u64,
@@ -1324,16 +1325,16 @@ fn pool_of(x: i16) -> Option<Pool> {
     }
 }
 
-/// The leaves the opening `sh` committed to, and their tree: an opening seals every current
-/// version and a Join only those it made, so the seals of the one commit at that epoch
-/// whose versions make the header's bucket root are the opening's.
-async fn opening_leaves(
+/// Every version sealed at epoch `epoch` of generation `gen` (none of a pending commit's),
+/// by the commit that sealed it: the opening's every current version then, each Join's
+/// the versions it made.
+async fn epoch_seals(
     store: &Db,
     grp: &str,
-    sh: &SignedHeader,
-) -> Result<Option<(Vec<PastLeaf>, BucketTree)>> {
+    gen: &[u8; 16],
+    epoch: u32,
+) -> Result<HashMap<i64, Vec<PastLeaf>>> {
     type T = (i64, i64, i16, Option<i64>, i64, i64, Vec<u8>, i64, i64);
-    let h = sh.header();
     let rows: Vec<T> = on!(store, pool => {
         sqlx::query_as(
             "SELECT l.b, l.v, l.pool, l.via, l.base_v, l.epoch_made, l.digest,
@@ -1344,8 +1345,8 @@ async fn opening_leaves(
              AND NOT EXISTS (SELECT 1 FROM voipc_gk_pending p WHERE p.grp = s.grp AND p.commit_id = s.commit_id)",
         )
         .bind(grp)
-        .bind(&h.gen[..])
-        .bind(i64::from(h.epoch))
+        .bind(&gen[..])
+        .bind(i64::from(epoch))
         .fetch_all(pool)
         .await?
     });
@@ -1371,19 +1372,54 @@ async fn opening_leaves(
             made: u32::try_from(made).unwrap_or(0),
         });
     }
-    for (_, mut leaves) in by {
-        if leaves.len() != h.buckets as usize {
-            continue;
-        }
-        leaves.sort_by_key(|l| l.leaf.b);
-        let flat: Vec<Leaf> = leaves.iter().map(|l| l.leaf).collect();
-        if let Ok(tree) = BucketTree::new(&flat) {
-            if tree.root() == h.bucket_root {
-                return Ok(Some((leaves, tree)));
-            }
-        }
+    Ok(by)
+}
+
+/// `leaves` as the tree of header `sh`, when they are its bucket root's.
+fn tree_of(mut leaves: Vec<PastLeaf>, sh: &SignedHeader) -> Option<(Vec<PastLeaf>, BucketTree)> {
+    let h = sh.header();
+    if leaves.len() != h.buckets as usize {
+        return None;
     }
-    Ok(None)
+    leaves.sort_by_key(|l| l.leaf.b);
+    let flat: Vec<Leaf> = leaves.iter().map(|l| l.leaf).collect();
+    let tree = BucketTree::new(&flat).ok()?;
+    (tree.root() == h.bucket_root).then_some((leaves, tree))
+}
+
+/// The leaves the opening `sh` committed to, and their tree: an opening seals every current
+/// version and a Join only those it made, so the seals of the one commit at that epoch
+/// whose versions make the header's bucket root are the opening's.
+fn opening_leaves(
+    by: &HashMap<i64, Vec<PastLeaf>>,
+    sh: &SignedHeader,
+) -> Option<(Vec<PastLeaf>, BucketTree)> {
+    by.values().find_map(|leaves| tree_of(leaves.clone(), sh))
+}
+
+/// The leaves the epoch's last Join `sh` committed to, and their tree: every version sealed
+/// at its epoch. Its opening sealed every version current then, each Join after it the new
+/// buckets it made, and no version of an epoch is replaced within it (§5.3), so the last
+/// Join's bucket root covers them all.
+fn join_leaves(
+    by: &HashMap<i64, Vec<PastLeaf>>,
+    sh: &SignedHeader,
+) -> Option<(Vec<PastLeaf>, BucketTree)> {
+    tree_of(by.values().flatten().copied().collect(), sh)
+}
+
+/// A Regenesis's parent, which the relay keeps with it (§4.4); `None` for any other kind.
+async fn regenesis_parent(
+    store: &Db,
+    grp: &str,
+    sh: &SignedHeader,
+) -> Result<Option<SignedHeader>> {
+    if sh.header().kind != Kind::Regenesis {
+        return Ok(None);
+    }
+    Ok(db::header(store, grp, &sh.header().parent)
+        .await?
+        .and_then(|h| SignedHeader::decode(&h.body, &h.sig, GroupKind::Text, grp).ok()))
 }
 
 /// The welcomes (seat) and rows to any seat of `m` in generation `gen`, by version.
@@ -1445,13 +1481,17 @@ async fn member_bases(
     Ok(out)
 }
 
-/// One `at` entry's answer (plan 2d, C4): the epoch's opening header (with a Regenesis's
-/// parent), the keyholder links back from `anchor` (the member's floor's `kh`) to the one
-/// the opening names when `anchor` is a keyholder header at or after it, the member's leaf,
-/// path and seal then, its keying (the welcome or row of its version then, or of the
-/// version it ratcheted from, with the steps), the seed welcome under that row's seed if
-/// one is kept, and its self-rows and history rows for that seed. `None` when the opening,
-/// its versions or any seat of `m` in them is not kept.
+/// One `at` entry's answer (plan 2d, C4): the header whose bucket root holds the member's
+/// leaf then (§5.10 "a reader opens it from its seat at epoch `e`") in `head`: the epoch's
+/// opening header (with a Regenesis's parent), or, for a seat a Join added after it (T1e A),
+/// the epoch's last Join with the opening in `opening`. Then the keyholder links back from
+/// `anchor` (the member's floor's `kh`) to the one the opening names when `anchor` is a
+/// keyholder header at or after it (with no such anchor, for a Join under an opening that
+/// sets no keyholders, that one header, so the Join's signer is checked against the set
+/// the opening names), the member's leaf, path and seal then, its keying (the welcome or
+/// row of its version then, or of the version it ratcheted from, with the steps), the seed
+/// welcome under that row's seed if one is kept, and its self-rows and history rows for
+/// that seed. `None` when the opening, its versions or any seat of `m` in them is not kept.
 pub async fn past(
     store: &Db,
     grp: &str,
@@ -1467,20 +1507,42 @@ pub async fn past(
         return Ok(None);
     };
     let h = sh.header();
-    let parent = match h.kind {
-        Kind::Regenesis => db::header(store, grp, &h.parent)
-            .await?
-            .and_then(|x| decode(&x)),
-        _ => None,
+    let bases = member_bases(store, grp, &at.gen, &m).await?;
+    let mine = |leaves: &[PastLeaf]| {
+        leaves
+            .iter()
+            .position(|l| bases.contains_key(&(l.leaf.b, l.base_v)))
     };
-    let Some((leaves, tree)) = opening_leaves(store, grp, &sh).await? else {
+    // At the opening when it sealed to a seat of `m`, else at the epoch's last Join. Read
+    // twice at most: a Join of the head epoch stored between the two reads
+    let mut found = None;
+    for _ in 0..2 {
+        let by = epoch_seals(store, grp, &at.gen, at.epoch).await?;
+        if let Some((leaves, tree)) = opening_leaves(&by, &sh) {
+            if let Some(i) = mine(&leaves) {
+                found = Some((None, leaves, tree, i));
+                break;
+            }
+        }
+        let Some(last) = db::epoch_last(store, grp, &at.gen, at.epoch)
+            .await?
+            .and_then(|x| decode(&x))
+            .filter(|j| j.header().kind == Kind::Join && j.header().epoch_parent == sh.d())
+        else {
+            break;
+        };
+        if let Some((leaves, tree)) = join_leaves(&by, &last) {
+            if let Some(i) = mine(&leaves) {
+                found = Some((Some(last), leaves, tree, i));
+            }
+            break;
+        }
+    }
+    let Some((join, leaves, tree, i)) = found else {
         return Ok(None);
     };
-    let bases = member_bases(store, grp, &at.gen, &m).await?;
-    let Some((l, (seat, base))) = leaves
-        .iter()
-        .find_map(|l| bases.get(&(l.leaf.b, l.base_v)).map(|x| (l, x)))
-    else {
+    let l = &leaves[i];
+    let Some((seat, base)) = bases.get(&(l.leaf.b, l.base_v)) else {
         return Ok(None);
     };
     let Some(seal) = db::seal(store, grp, &at.gen, at.epoch, l.leaf.b, l.leaf.v).await? else {
@@ -1535,36 +1597,52 @@ pub async fn past(
     };
     // Keyholder links back from the anchor, newest first, to the one the opening names
     let mut walk = vec![];
-    if let Some(a) = anchor {
-        let ah = db::header(store, grp, &a).await?.and_then(|x| decode(&x));
-        if let Some(ah) = ah.filter(|x| {
-            let x = x.header();
-            x.gen == h.gen && x.kind.sets_keyholders() && (h.epoch <= x.epoch || sh.kh() == a)
-        }) {
-            let target = sh.kh();
-            let mut cur = ah;
-            while cur.d() != target && walk.len() < MAX_WALK {
-                let want = cur.header().kh_parent;
-                let Some(next) = db::header(store, grp, &want)
-                    .await?
-                    .and_then(|x| decode(&x))
-                else {
-                    break;
-                };
-                let p = match next.header().kind {
-                    Kind::Regenesis => db::header(store, grp, &next.header().parent)
-                        .await?
-                        .and_then(|x| decode(&x)),
-                    _ => None,
-                };
-                walk.push(link(&next, p.as_ref()));
-                cur = next;
-            }
+    let walked = match anchor {
+        Some(a) => {
+            let ah = db::header(store, grp, &a).await?.and_then(|x| decode(&x));
+            ah.filter(|x| {
+                let x = x.header();
+                x.gen == h.gen && x.kind.sets_keyholders() && (h.epoch <= x.epoch || sh.kh() == a)
+            })
+        }
+        None => None,
+    };
+    if let Some(ah) = walked {
+        let target = sh.kh();
+        let mut cur = ah;
+        while cur.d() != target && walk.len() < MAX_WALK {
+            let want = cur.header().kh_parent;
+            let Some(next) = db::header(store, grp, &want)
+                .await?
+                .and_then(|x| decode(&x))
+            else {
+                break;
+            };
+            let p = regenesis_parent(store, grp, &next).await?;
+            walk.push(link(&next, p.as_ref()));
+            cur = next;
+        }
+    } else if join.is_some() && !h.kind.sets_keyholders() {
+        // Taken on the binding alone: the set the opening names, for the Join's signer
+        if let Some(set) = db::header(store, grp, &h.kh_parent)
+            .await?
+            .and_then(|x| decode(&x))
+        {
+            let p = regenesis_parent(store, grp, &set).await?;
+            walk.push(link(&set, p.as_ref()));
         }
     }
+    let (head, opening) = match join {
+        Some(j) => (link(&j, None), Some(header_in(&sh))),
+        None => (
+            link(&sh, regenesis_parent(store, grp, &sh).await?.as_ref()),
+            None,
+        ),
+    };
     Ok(Some(InPiece {
         walk,
-        head: Some(link(&sh, parent.as_ref())),
+        head: Some(head),
+        opening,
         leaf: Some(LeafIn::from(l.leaf)),
         path: tree
             .path_of(l.leaf.b)
@@ -1870,8 +1948,10 @@ pub(crate) async fn sweep_stale(store: &Db, grp: &str) -> Result<u64> {
 
 /// The headers §4.4 keeps, the rest taken: of the head's generation the last 64, the head
 /// epoch's, every keyholder-setting one, each Regenesis's parent, the last seed raise's, and
-/// the openings kept chains reference; of an older generation, while kept chains reference
-/// its epochs, those openings, its keyholder headers and Regenesis parents (C4).
+/// the openings kept chains reference with each such epoch's last Join (a kept read of a
+/// seat a Join added is answered there, `past`); of an older generation, while kept chains
+/// reference its epochs, those openings and last Joins, its keyholder headers and Regenesis
+/// parents (C4).
 async fn sweep_headers(store: &Db, grp: &str) -> Result<u64> {
     type M = (Vec<u8>, Vec<u8>, i64, i64, i16, i64);
     let metas: Vec<M> = on!(store, pool => {
@@ -1901,13 +1981,20 @@ async fn sweep_headers(store: &Db, grp: &str) -> Result<u64> {
     recent.sort_unstable();
     let last64: HashSet<(i64, i64)> = recent.iter().rev().take(64).copied().collect();
     let referenced: HashSet<&Vec<u8>> = refs.iter().map(|(g, _)| g).collect();
+    // Each referenced epoch's last header kept: its last Join, or its opening
+    let mut last_j: HashMap<(&Vec<u8>, i64), i64> = HashMap::new();
+    for (_, gen, epoch, j, ..) in &metas {
+        let at = last_j.entry((gen, *epoch)).or_insert(*j);
+        *at = (*at).max(*j);
+    }
     let mut keep: HashSet<Vec<u8>> = HashSet::new();
     for (d, gen, epoch, j, kind, time) in &metas {
         let kind = usize::try_from(*kind)
             .ok()
             .and_then(|i| KINDS.get(i).copied());
         let kh = kind.is_some_and(|k| k.sets_keyholders());
-        let opening_ref = *j == 0 && refs.contains(&(gen.clone(), *epoch));
+        let opening_ref = (*j == 0 || last_j.get(&(gen, *epoch)) == Some(j))
+            && refs.contains(&(gen.clone(), *epoch));
         let kept = if *gen == head_gen {
             last64.contains(&(*epoch, *j))
                 || *epoch == i64::from(row.head.epoch)

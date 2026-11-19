@@ -1423,6 +1423,23 @@ pub async fn opening(store: &Store, grp: &str, gen: &Gen, epoch: u32) -> Result<
     row.map(header_of).transpose()
 }
 
+/// The last header kept of an epoch: its last Join, or its opening when none followed (a
+/// past epoch's last Join holds every version sealed at that epoch, C4).
+pub async fn epoch_last(store: &Store, grp: &str, gen: &Gen, epoch: u32) -> Result<Option<Header>> {
+    let row: Option<HeaderTuple> = db!(store, pool => {
+        sqlx::query_as(
+            "SELECT d, gen, epoch, j, kind, time, body, sig, keep FROM voipc_gk_headers
+             WHERE grp = $1 AND gen = $2 AND epoch = $3 ORDER BY j DESC LIMIT 1",
+        )
+        .bind(grp)
+        .bind(&gen[..])
+        .bind(i64::from(epoch))
+        .fetch_optional(pool)
+        .await?
+    });
+    row.map(header_of).transpose()
+}
+
 #[cfg(test)]
 pub async fn set_keep(store: &Store, grp: &str, d: &Digest, keep: u32) -> Result<bool> {
     Ok(db!(store, pool => {
@@ -3647,6 +3664,49 @@ mod tests {
             let landed = list(store, GRP, &GEN, B1, V2).await.unwrap().unwrap();
             let made = put_lists(store, GRP, later, &GEN, &[landed]).await;
             assert_eq!(made.unwrap(), Some((B1, V2)));
+        }
+    }
+
+    /// A kept read of a seat a Join added (T1e A) is answered at its epoch's last Join: the
+    /// last header kept of an epoch is its last Join, or its opening while none followed.
+    #[tokio::test]
+    async fn an_epochs_last_header_is_its_last_join_or_its_opening() {
+        let dbs = databases().await;
+        for store in &dbs.stores {
+            open(store).await;
+            genesis(store, &[]).await;
+            let last = |e| async move { epoch_last(store, GRP, &GEN, e).await.unwrap() };
+            assert_eq!(last(1).await.map(|h| (h.d, h.j)), Some(([1; 32], 0)));
+            assert_eq!(last(2).await, None);
+            let mut was = [1u8; 32];
+            for (d, epoch, j, kind) in [
+                (2u8, 1, 1, Kind::Join),
+                (3, 1, 2, Kind::Join),
+                (4, 2, 0, Kind::Fresh),
+            ] {
+                let c = begin_commit(store, GRP).await.unwrap();
+                let hs = [header_at(d, GEN, epoch, j, kind)];
+                let mv = HeadMove {
+                    was: Some(was),
+                    headers: &hs,
+                    ..Default::default()
+                };
+                let h = head(d, GEN, epoch, j);
+                assert_eq!(
+                    move_head(store, GRP, c, &h, &mv).await.unwrap(),
+                    Moved::Done
+                );
+                was = [d; 32];
+            }
+            let j2 = last(1).await.unwrap();
+            assert_eq!((j2.d, j2.j, j2.kind), ([3; 32], 2, Kind::Join));
+            let o = last(2).await.unwrap();
+            assert_eq!((o.d, o.j, o.kind), ([4; 32], 0, Kind::Fresh));
+            assert_eq!(
+                opening(store, GRP, &GEN, 1).await.unwrap().map(|h| h.d),
+                Some([1; 32])
+            );
+            assert_eq!(epoch_last(store, GRP, &[9; 16], 1).await.unwrap(), None);
         }
     }
 

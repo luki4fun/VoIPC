@@ -181,8 +181,12 @@ impl Groups {
                 }
             }
             ClientMessage::EpochDecline {
-                group, due, why, ..
+                group,
+                due,
+                why,
+                detail,
             } => {
+                tracing::debug!(%group, due, why, %detail, user_id = sid, "a keyholder declined");
                 self.post(&group, Msg::Decline { sid, due, why }, SMALL, true);
             }
             ClientMessage::EpochListsWanted {

@@ -229,8 +229,9 @@ pub struct Handle {
     /// connection always is, since a new connection holds no `BK` whatever its floor (a
     /// restart, a second device of the account), then only when the version moved.
     keyed: DashSet<UserId>,
-    /// One sequence at a time to this group's sessions (part 13).
-    send: Mutex<()>,
+    /// One sequence at a time to this group's sessions (part 13): shared with the handle
+    /// that follows this one (`successor`).
+    send: Arc<Mutex<()>>,
     /// Told when the group is retired (its id moved, its conversation purged).
     stop: tokio::sync::Notify,
     store: Arc<Store>,
@@ -261,7 +262,7 @@ impl Handle {
             asked: DashSet::new(),
             kh_sent: DashMap::new(),
             keyed: DashSet::new(),
-            send: Mutex::new(()),
+            send: Arc::default(),
             stop: tokio::sync::Notify::new(),
             store,
             stats: Mutex::new(GroupLoad {
@@ -276,6 +277,124 @@ impl Handle {
         });
         (h, rx)
     }
+
+    /// The handle that names this group once this one's inbox closed with messages in it
+    /// (`stop_idle`), read by the same actor: what is read outside the actor as this one
+    /// showed it, the send lock this one's, an inbox of its own. This one's snapshot goes
+    /// (under the send lock), so an answer built from it outside the actor is not queued
+    /// after the actor publishes on the new one (`deliver_from`).
+    fn successor(&self) -> (Arc<Handle>, Inbox) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let _one = self.send.lock().unwrap_or_else(|e| e.into_inner());
+        let h = Arc::new(Handle {
+            id: self.id.clone(),
+            kind: self.kind,
+            tx,
+            inbox: AtomicUsize::new(0),
+            head: RwLock::new(*self.head.read().unwrap_or_else(|e| e.into_inner())),
+            snap: RwLock::new(self.snap.write().unwrap_or_else(|e| e.into_inner()).take()),
+            seated: self.seated.clone(),
+            keyholders: self.keyholders.clone(),
+            asked: self.asked.clone(),
+            kh_sent: self.kh_sent.clone(),
+            keyed: self.keyed.clone(),
+            send: self.send.clone(),
+            stop: tokio::sync::Notify::new(),
+            store: self.store.clone(),
+            stats: Mutex::new(self.stats.lock().unwrap_or_else(|e| e.into_inner()).clone()),
+            warnings: Mutex::new(
+                self.warnings
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone(),
+            ),
+        });
+        (h, rx)
+    }
+}
+
+/// A message for group `id`'s actor that must land: started if it was not, sent again where
+/// the map names the group now when the handle it was sent to had closed (`stop_idle`), each
+/// try one lookup and one send. `false` only past `SEND_TRIES` closed handles in a row.
+fn send_live(
+    shared: &Arc<Shared>,
+    id: &str,
+    kind: GroupKind,
+    channel: ChannelId,
+    msg: Msg,
+) -> bool {
+    let mut msg = msg;
+    for _ in 0..SEND_TRIES {
+        let h = start(shared, id, kind, channel);
+        #[cfg(test)]
+        shared.stop_between(&h);
+        match h.tx.send((msg, 0)) {
+            Ok(()) => return true,
+            Err(mpsc::error::SendError((m, _))) => msg = m,
+        }
+    }
+    warn!(
+        group = id,
+        "a message to a group whose actor kept stopping was dropped"
+    );
+    false
+}
+
+/// A message for group `id`'s actor while it lives, sent again where the map names the group
+/// now when the handle it was sent to had closed (`stop_idle`). `false` with no actor live.
+fn send_current(shared: &Shared, id: &str, msg: Msg) -> bool {
+    let mut msg = msg;
+    for _ in 0..SEND_TRIES {
+        let Some(h) = shared.map.get(id).map(|h| h.clone()) else {
+            return false;
+        };
+        match h.tx.send((msg, 0)) {
+            Ok(()) => return true,
+            Err(mpsc::error::SendError((m, _))) => msg = m,
+        }
+    }
+    false
+}
+
+/// Lookups a message to a group is tried with: each failed one met a handle whose actor
+/// stopped or moved on to a new handle between its lookup and its send.
+const SEND_TRIES: usize = 8;
+
+/// An idle actor stops (`actor`), under its map entry's lock so that no lookup finds the
+/// handle meanwhile: its inbox is closed, so a send to it from here on fails and the sender
+/// looks again (`post`, `send_live`), and what was queued before that is drained, sends under
+/// way included. With nothing queued the entry goes and the actor ends (`None`). A message
+/// that came in during its last turn is never dropped with the inbox: the entry names a
+/// successor handle with the drained messages queued first, and the same actor reads it on,
+/// so one actor runs the group and its state stays. A group retired meanwhile (`retire`)
+/// stops with what was sent to it.
+fn stop_idle(shared: &Shared, h: &Arc<Handle>, rx: &mut Inbox) -> Option<(Arc<Handle>, Inbox)> {
+    use dashmap::mapref::entry::Entry;
+    let mut e = match shared.map.entry(h.id.clone()) {
+        Entry::Occupied(e) if Arc::ptr_eq(e.get(), h) => e,
+        _ => return None,
+    };
+    rx.close();
+    let mut left = vec![];
+    loop {
+        match rx.try_recv() {
+            Ok(m) => left.push(m),
+            Err(mpsc::error::TryRecvError::Disconnected) => break,
+            // A send counted before the close and not yet in the queue: in it in a moment
+            Err(mpsc::error::TryRecvError::Empty) => std::thread::yield_now(),
+        }
+    }
+    if left.is_empty() {
+        e.remove();
+        return None;
+    }
+    let (next, next_rx) = h.successor();
+    for (m, charge) in left {
+        next.inbox.fetch_add(charge, Ordering::Relaxed);
+        let _ = next.tx.send((m, charge));
+    }
+    e.insert(next.clone());
+    Some((next, next_rx))
 }
 
 /// The live group `id`, its actor started if it was not (a stored group whose channel
@@ -344,7 +463,21 @@ pub struct Shared {
     moved_back: DashSet<String>,
     /// The channels whose gate is on, as `on_gate` last told: a group's start reads its own.
     gated: DashSet<ChannelId>,
+    /// Tests: how long an actor idles before it stops (`ACTOR_IDLE_MS` else).
+    #[cfg(test)]
+    idle_ms: std::sync::atomic::AtomicU64,
+    /// Tests: a gate the next idle stop waits at: told when it is reached, then let go.
+    #[cfg(test)]
+    idle_gate: Mutex<Option<IdleGate>>,
+    /// Tests: the next hook's post lets the gated actor stop between its lookup and its
+    /// send, with this `go`.
+    #[cfg(test)]
+    stop_between: Mutex<Option<Arc<tokio::sync::Notify>>>,
 }
+
+/// Tests: `(reached, go)` of an idle stop's gate.
+#[cfg(test)]
+type IdleGate = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
 
 /// A rotation's progress: counter `n`, the new seat, the groups still to seat it.
 pub struct Reseat {
@@ -383,6 +516,17 @@ impl Shared {
 }
 
 impl Shared {
+    /// How long an actor idles before it stops.
+    #[cfg(not(test))]
+    fn idle_ms(&self) -> u64 {
+        ACTOR_IDLE_MS
+    }
+
+    #[cfg(test)]
+    fn idle_ms(&self) -> u64 {
+        self.idle_ms.load(Ordering::Relaxed)
+    }
+
     /// Charges `bytes` of commit parts to `sid`'s lane; `false` past its cap.
     fn lane_take(&self, sid: UserId, bytes: usize) -> bool {
         let mut q = self.lane.entry(sid).or_default();
@@ -448,6 +592,12 @@ impl Groups {
                 db_bytes: DashMap::new(),
                 moved_back: DashSet::new(),
                 gated: DashSet::new(),
+                #[cfg(test)]
+                idle_ms: std::sync::atomic::AtomicU64::new(ACTOR_IDLE_MS),
+                #[cfg(test)]
+                idle_gate: Mutex::default(),
+                #[cfg(test)]
+                stop_between: Mutex::default(),
             }),
             by_channel: DashMap::new(),
             follows: DashMap::new(),
@@ -513,26 +663,35 @@ impl Groups {
         self.shared.map.get(id).map(|h| h.clone())
     }
 
-    /// The live group `id`, its actor started if it was not.
-    fn live(&self, id: &str, kind: GroupKind, channel: ChannelId) -> Arc<Handle> {
-        start(&self.shared, id, kind, channel)
+    /// Queues `msg` for group `id`'s actor, started if it was not: a hook's message, which
+    /// must land (`send_live`).
+    fn post_live(&self, id: &str, kind: GroupKind, channel: ChannelId, msg: Msg) {
+        send_live(&self.shared, id, kind, channel, msg);
     }
 
-    /// Queues `msg` for group `id`'s actor; `false` when its inbox is full (`RATE`).
+    /// Queues `msg` for group `id`'s live actor; `false` with none, or when its inbox is
+    /// full (`RATE`). A handle whose actor stopped between the lookup and the send refused
+    /// it (`stop_idle`): the map names its successor then, or no group.
     fn post(&self, id: &str, msg: Msg, bytes: usize, lane: bool) -> bool {
-        let Some(h) = self.get(id) else {
-            return false;
-        };
-        if !lane && h.inbox.load(Ordering::Relaxed) + bytes > INBOX_MAX_BYTES {
-            return false;
+        let mut msg = msg;
+        for _ in 0..SEND_TRIES {
+            let Some(h) = self.get(id) else {
+                return false;
+            };
+            if !lane && h.inbox.load(Ordering::Relaxed) + bytes > INBOX_MAX_BYTES {
+                return false;
+            }
+            let charge = if lane { 0 } else { bytes };
+            h.inbox.fetch_add(charge, Ordering::Relaxed);
+            match h.tx.send((msg, charge)) {
+                Ok(()) => return true,
+                Err(mpsc::error::SendError((m, _))) => {
+                    h.inbox.fetch_sub(charge, Ordering::Relaxed);
+                    msg = m;
+                }
+            }
         }
-        let charge = if lane { 0 } else { bytes };
-        h.inbox.fetch_add(charge, Ordering::Relaxed);
-        if h.tx.send((msg, charge)).is_err() {
-            h.inbox.fetch_sub(charge, Ordering::Relaxed);
-            return false;
-        }
-        true
+        false
     }
 
     fn send_now(&self, sid: UserId, msg: ServerMessage) {
@@ -589,7 +748,6 @@ impl Groups {
         if let Some(a) = account {
             self.shared.accounts.insert(sid, a);
         }
-        let _ = self.live(group, kind, channel);
         self.follows
             .entry(sid)
             .or_default()
@@ -599,7 +757,7 @@ impl Groups {
             account,
             anonymous,
         };
-        self.post(group, msg, 0, true);
+        self.post_live(group, kind, channel, msg);
         if let Some(v) = self.vols.get(&sid).map(|v| v.clone()) {
             let device = self.shared.devices.get(&sid).map(|d| d.clone());
             let msg = Msg::Volunteer {
@@ -607,7 +765,7 @@ impl Groups {
                 v: Some(v),
                 device,
             };
-            self.post(group, msg, 0, true);
+            self.post_live(group, kind, channel, msg);
         }
     }
 
@@ -729,8 +887,12 @@ impl Groups {
             return;
         };
         let channel = self.channel_of(&id);
-        let _ = self.live(&id, GroupKind::Text, channel);
-        self.post(&id, Msg::Eager { joiner, account }, 0, true);
+        self.post_live(
+            &id,
+            GroupKind::Text,
+            channel,
+            Msg::Eager { joiner, account },
+        );
     }
 
     /// Every seat of `account` in a stored conversation's group exits.
@@ -740,8 +902,12 @@ impl Groups {
         }
         let id = stored_id(conv);
         let channel = self.channel_of(&id);
-        let _ = self.live(&id, GroupKind::Text, channel);
-        self.post(&id, Msg::AccountExit { account, cause }, 0, true);
+        self.post_live(
+            &id,
+            GroupKind::Text,
+            channel,
+            Msg::AccountExit { account, cause },
+        );
     }
 
     /// A ban, identity reset or account deletion: its seats exit everywhere, online or not,
@@ -768,8 +934,12 @@ impl Groups {
         }
         for id in ids {
             let channel = self.channel_of(&id);
-            let _ = self.live(&id, store_kind(&id), channel);
-            self.post(&id, Msg::AccountExit { account, cause }, 0, true);
+            self.post_live(
+                &id,
+                store_kind(&id),
+                channel,
+                Msg::AccountExit { account, cause },
+            );
         }
     }
 
@@ -823,25 +993,16 @@ impl Groups {
         }
         for id in &groups {
             let channel = self.channel_of(id);
-            let _ = self.live(id, GroupKind::Text, channel);
-            self.post(
-                id,
-                Msg::AccountExit {
-                    account,
-                    cause: group::cause::ROTATION,
-                },
-                0,
-                true,
-            );
-            self.post(
-                id,
-                Msg::Eager {
-                    joiner: joiner.clone(),
-                    account,
-                },
-                0,
-                true,
-            );
+            let exit = Msg::AccountExit {
+                account,
+                cause: group::cause::ROTATION,
+            };
+            self.post_live(id, GroupKind::Text, channel, exit);
+            let eager = Msg::Eager {
+                joiner: joiner.clone(),
+                account,
+            };
+            self.post_live(id, GroupKind::Text, channel, eager);
         }
         // Its keyholder entries are measured against this counter from now (removal after
         // seven days below it, plan 2d): every live group, and each stored one it holds keys of
@@ -853,8 +1014,8 @@ impl Groups {
         }
         for id in kh {
             let channel = self.channel_of(&id);
-            let _ = self.live(&id, store_kind(&id), channel);
-            self.post(&id, Msg::Counter { account, n, since }, 0, true);
+            let msg = Msg::Counter { account, n, since };
+            self.post_live(&id, store_kind(&id), channel, msg);
         }
         // Eager seats in every stored group of its conversations it has no seat in (plan 2d:
         // an account's first `SeatKeysPublish`), a page of conversations at a time
@@ -884,16 +1045,11 @@ impl Groups {
                     continue;
                 }
                 let channel = self.channel_of(&id);
-                let _ = self.live(&id, GroupKind::Text, channel);
-                self.post(
-                    &id,
-                    Msg::Eager {
-                        joiner: joiner.clone(),
-                        account,
-                    },
-                    0,
-                    true,
-                );
+                let eager = Msg::Eager {
+                    joiner: joiner.clone(),
+                    account,
+                };
+                self.post_live(&id, GroupKind::Text, channel, eager);
             }
             if n_page < EAGER_PAGE as usize {
                 break;
@@ -917,12 +1073,11 @@ impl Groups {
         }
         for id in ids {
             let channel = self.channel_of(&id);
-            let _ = self.live(&id, store_kind(&id), channel);
             let msg = Msg::DeviceRemoved {
                 account,
                 device: device.to_vec(),
             };
-            self.post(&id, msg, 0, true);
+            self.post_live(&id, store_kind(&id), channel, msg);
         }
     }
 
@@ -1215,7 +1370,7 @@ fn took(shared: &Shared, h: &Handle, sid: UserId, seat: &SeatRef, s: Sent) {
         h.keyed.insert(sid);
     }
     if s.behind {
-        let _ = h.tx.send((Msg::SeedWanted { seat: *seat }, 0));
+        send_current(shared, &h.id, Msg::SeedWanted { seat: *seat });
     }
     if let Some(x) = s.seed {
         h.store.seed_sent(seat, x);
@@ -1295,7 +1450,7 @@ async fn answer(
 
 async fn actor(
     shared: Arc<Shared>,
-    h: Arc<Handle>,
+    mut h: Arc<Handle>,
     mut rx: mpsc::UnboundedReceiver<(Msg, usize)>,
     mut g: GroupState,
 ) {
@@ -1321,7 +1476,7 @@ async fn actor(
     let mut ticked = 0;
     loop {
         let wake = g.wake(ticked);
-        let idle_at = idle_since.map(|t| t + ACTOR_IDLE_MS);
+        let idle_at = idle_since.map(|t| t + shared.idle_ms());
         let next = [wake, idle_at].into_iter().flatten().min();
         let msg = tokio::select! {
             _ = h.stop.notified() => return,
@@ -1405,9 +1560,14 @@ async fn actor(
         answer_all(&shared, &h, answers).await;
         if g.idle() {
             let since = *idle_since.get_or_insert(now);
-            if now >= since + ACTOR_IDLE_MS {
-                shared.map.remove_if(&h.id, |_, x| Arc::ptr_eq(x, &h));
-                return;
+            // What is queued is read first: the stop takes only what came in meanwhile
+            if now >= since + shared.idle_ms() && rx.is_empty() {
+                #[cfg(test)]
+                shared.at_idle_gate().await;
+                let Some((next, next_rx)) = stop_idle(&shared, &h, &mut rx) else {
+                    return;
+                };
+                (h, rx) = (next, next_rx);
             }
         } else {
             idle_since = None;
@@ -1543,11 +1703,11 @@ const EAGER_PAGE: u32 = 256;
 /// log with published seat keys is queued eagerly, online or not (plan 2d "Eager seats"),
 /// since they never send `LogJoin` again. Read a page at a time off the actor, at most
 /// `kept_seats`, each page queued to it.
-fn eager_all(h: &Handle, kept_seats: usize) {
+fn eager_all(shared: &Arc<Shared>, h: &Handle, kept_seats: usize) {
     let Store::Db(db) = &*h.store else {
         return;
     };
-    let (db, tx, conv) = (db.clone(), h.tx.clone(), h.id.clone());
+    let (db, shared, conv) = (db.clone(), Arc::downgrade(shared), h.id.clone());
     tokio::spawn(async move {
         let mut after: Option<[u8; 16]> = None;
         let mut queued = 0;
@@ -1563,7 +1723,12 @@ fn eager_all(h: &Handle, kept_seats: usize) {
             let full = page.len() == EAGER_PAGE as usize;
             queued += page.len();
             after = page.last().map(|(a, _)| *a);
-            if page.is_empty() || tx.send((Msg::EagerMany(page), 0)).is_err() || !full {
+            // To the group's actor whichever handle names it now (`stop_idle`)
+            let sent = !page.is_empty()
+                && shared
+                    .upgrade()
+                    .is_some_and(|s| send_current(&s, &conv, Msg::EagerMany(page)));
+            if !sent || !full {
                 return;
             }
         }
@@ -1572,7 +1737,7 @@ fn eager_all(h: &Handle, kept_seats: usize) {
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_msg(
-    shared: &Shared,
+    shared: &Arc<Shared>,
     h: &Handle,
     g: &mut GroupState,
     m: Msg,
@@ -1652,7 +1817,7 @@ async fn handle_msg(
                         shared.reseat_done(&h.id, s);
                     }
                     if anew && g.stored {
-                        eager_all(h, g.kept_seats);
+                        eager_all(shared, h, g.kept_seats);
                     }
                 }
                 Err(Fail::Check(d)) => {
@@ -1841,8 +2006,7 @@ async fn sweep(shared: &Arc<Shared>, now: u64, daily: bool) {
             let before = now.saturating_sub(SEAT_EXPIRY_SECS * 1000);
             match store::expired(&db.db, &grp, before).await {
                 Ok(seats) if !seats.is_empty() => {
-                    let h = start(shared, &grp, GroupKind::Text, 0);
-                    let _ = h.tx.send((Msg::Expire(seats), 0));
+                    send_live(shared, &grp, GroupKind::Text, 0, Msg::Expire(seats));
                 }
                 Ok(_) => {}
                 Err(e) => warn!(group = %grp, "reading expired seats failed: {e}"),
@@ -1852,7 +2016,57 @@ async fn sweep(shared: &Arc<Shared>, now: u64, daily: bool) {
 }
 
 #[cfg(test)]
+impl Shared {
+    /// The idle stop's gate, once: `reached` told, then it waits for `go`.
+    async fn at_idle_gate(&self) {
+        let gate = self.idle_gate.lock().unwrap().take();
+        if let Some((reached, go)) = gate {
+            reached.notify_one();
+            go.notified().await;
+        }
+    }
+
+    /// `stop_between`: the gated actor of `h` is let go and waited for until its handle is
+    /// out of the map (a multi-thread runtime runs it meanwhile).
+    fn stop_between(&self, h: &Arc<Handle>) {
+        let Some(go) = self.stop_between.lock().unwrap().take() else {
+            return;
+        };
+        go.notify_one();
+        for _ in 0..10_000 {
+            if !self
+                .map
+                .get(&h.id)
+                .is_some_and(|x| Arc::ptr_eq(x.value(), h))
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("the gated actor never stopped");
+    }
+}
+
+#[cfg(test)]
 impl Groups {
+    /// Actors stop after `ms` idle.
+    pub fn idle_ms_for_test(&self, ms: u64) {
+        self.shared.idle_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// The next idle stop waits at a gate: `(reached, go)`.
+    pub fn gate_idle_stop_for_test(&self) -> IdleGate {
+        let gate: IdleGate = (Arc::default(), Arc::default());
+        *self.shared.idle_gate.lock().unwrap() = Some(gate.clone());
+        gate
+    }
+
+    /// The next hook's post lets the gated actor go (`go` of its gate) between its lookup of
+    /// the group and its send, and waits until that actor is out of the map.
+    pub fn stop_between_for_test(&self, go: Arc<tokio::sync::Notify>) {
+        *self.shared.stop_between.lock().unwrap() = Some(go);
+    }
+
     /// One sweep now, as the timer runs it.
     pub async fn sweep_for_test(&self, daily: bool) {
         sweep(&self.shared, self.now(), daily).await;
