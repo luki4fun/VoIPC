@@ -486,8 +486,11 @@ pub async fn set_help_hold_keys(
 ///
 /// The automatic ask happens once per channel entry; this is the user asking
 /// again — after clearing a channel by accident, or because somebody who was
-/// offline then is here now. Only members we hold a live session with are
-/// asked, because only they can answer.
+/// offline then is here now. In a text channel on the live path, and in a
+/// voice room under the group key, the ask goes sealed and opens the session
+/// it needs; elsewhere, and under the new-member wait, only members we hold a
+/// live session with are asked, because only they can answer
+/// (`network::ask_history`).
 #[tauri::command]
 pub async fn request_channel_history(
     state: State<'_, AppState>,
@@ -518,54 +521,11 @@ pub async fn request_channel_history(
     if anonymous {
         return Err("an anonymous channel shares no history".into());
     }
-    let live = text && tcp_tx.proto() >= LIVE_PATH_SINCE;
-    let now = crypto::now_ms();
-    // Sealed: the relay sees "R wrote to S", not for which channel. It goes when a session
-    // both ends hold is up, opened for it if need be. Under the new-member wait a direct
-    // message is refused, so there the plain frames below ask whoever already has a session.
-    if live && !signal.lock().map_err(|e| e.to_string())?.direct_held {
-        let mut sig = signal.lock().map_err(|e| e.to_string())?;
-        let asked = sig
-            .channels
-            .live_ask_history(channel_id, &target_user_ids, now);
-        if asked.is_empty() {
-            return Err("nobody here can share that history yet".into());
-        }
-        sig.live_wake.notify_one();
-        return Ok(asked);
-    }
-    let targets: Vec<u32> = {
-        let sig = signal.lock().map_err(|e| e.to_string())?;
-        // A pairwise session is all an answer needs — history travels over that,
-        // not over the channel's group key. Asking for the group key here would
-        // block the one repair a member has when keying went wrong.
-        let reachable: Vec<u32> = target_user_ids
-            .into_iter()
-            .filter(|uid| sig.established_sessions.contains(uid))
-            .collect();
-        voipc_crypto::pick_history_sources(&reachable)
-            .into_iter()
-            .collect()
-    };
-    if targets.is_empty() {
+    let asked = network::ask_history(&signal, &tcp_tx, channel_id, &target_user_ids, text).await?;
+    if asked.is_empty() {
         return Err("nobody here can share that history yet".into());
     }
-    for target_user_id in &targets {
-        if live {
-            let mut sig = signal.lock().map_err(|e| e.to_string())?;
-            sig.channels
-                .live_note_asked(channel_id, *target_user_id, now);
-        }
-        network::send_tcp_message(
-            &tcp_tx,
-            &ClientMessage::RequestChannelHistory {
-                channel_id,
-                target_user_id: *target_user_id,
-            },
-        )
-        .await?;
-    }
-    Ok(targets)
+    Ok(asked)
 }
 
 /// Change a channel's other options (creator, or an admin for a channel from

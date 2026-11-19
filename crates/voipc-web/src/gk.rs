@@ -784,6 +784,30 @@ mod tests {
         );
     }
 
+    /// What `GkOut.voice` handed out goes into the ring of the room we stand in, once: keys
+    /// of a room we left are dropped, not kept for the next.
+    #[test]
+    fn voice_keys_go_into_the_ring_of_the_room_we_stand_in_once() {
+        let keys = |channel_id: u32| VoiceKeys {
+            channel_id,
+            group: format!("r:{}:{channel_id}", voipc_protocol::conv::hex(&RUN)),
+            gen: [1; 16],
+            epochs: vec![(1, [1; 32], [2; 32].into())],
+            own: (MemberId::Conn(7), [7; 8]),
+            seats: vec![(7, MemberId::Conn(7), [7; 8])],
+            switch_at: 0,
+            new_generation: true,
+        };
+        let (mut gk, mut ring) = (Gk::default(), MediaKeyRing::default());
+        gk.voice.extend([keys(ROOM + 1), keys(ROOM)]);
+        assert!(gk.voice_into(&mut ring, ROOM));
+        assert!(ring.has_channel(ROOM) && ring.current().is_some_and(|k| k.key_id == 1));
+        assert!(!gk.voice_into(&mut ring, ROOM), "once");
+        gk.voice.push(keys(ROOM + 1));
+        assert!(!gk.voice_into(&mut ring, ROOM));
+        assert!(gk.voice.is_empty() && ring.has_channel(ROOM));
+    }
+
     #[test]
     fn nothing_is_tracked_before_group_keys() {
         let mut core = SignalCore::new().unwrap();

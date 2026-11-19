@@ -78,12 +78,12 @@ fn signal_pairwise_and_group_round_trip() {
 
 #[test]
 fn voice_packet_round_trip() {
-    let keys = ring(7, 3);
+    let mut keys = ring(7, 3);
     let opus = [0x11u8, 0x22, 0x33, 0x44, 0x55];
     let packet = media::build_voice_packet(&keys, 42, 10, &opus).unwrap();
     assert_eq!(packet[0], 0x05);
 
-    let info = media::parse_voice_packet(Some(&keys), 7, &packet).unwrap();
+    let info = media::parse_voice_packet(Some(&mut keys), 7, &packet).unwrap();
     assert_eq!(info.packet_type, 0x05);
     assert_eq!(info.session_id, 42);
     assert_eq!(info.sequence, 10);
@@ -91,10 +91,10 @@ fn voice_packet_round_trip() {
 
     // Encrypted voice needs the key, and another key fails authentication.
     assert!(media::parse_voice_packet(None, 7, &packet).is_err());
-    let other = ring(7, 3);
-    assert!(media::parse_voice_packet(Some(&other), 7, &packet).is_err());
+    let mut other = ring(7, 3);
+    assert!(media::parse_voice_packet(Some(&mut other), 7, &packet).is_err());
     // A generation we no longer hold is refused rather than guessed at.
-    assert!(media::parse_voice_packet(Some(&ring(7, 4)), 7, &packet).is_err());
+    assert!(media::parse_voice_packet(Some(&mut ring(7, 4)), 7, &packet).is_err());
 
     // EOT and ping are header only and need no key.
     let eot = media::parse_voice_packet(None, 7, &media::build_eot_packet(42, 11)).unwrap();
@@ -109,26 +109,26 @@ fn voice_packet_round_trip() {
 
 #[test]
 fn position_packet_round_trip() {
-    let keys = ring(7, 3);
+    let mut keys = ring(7, 3);
     let packet = media::build_position_packet(&keys, 42, 5, 1.5, -2.25, 0.75).unwrap();
     assert_eq!(packet[0], 0x06);
     assert_eq!(packet.len(), voipc_protocol::voice::POSITION_PACKET_SIZE);
 
-    let info = media::parse_position_packet(&keys, 7, &packet).unwrap();
+    let info = media::parse_position_packet(&mut keys, 7, &packet).unwrap();
     assert_eq!(info.session_id, 42);
     assert_eq!((info.x, info.y, info.z), (1.5, -2.25, 0.75));
 
     // Wrong key fails authentication, and a voice packet is not a position
-    let other = ring(7, 3);
-    assert!(media::parse_position_packet(&other, 7, &packet).is_err());
+    let mut other = ring(7, 3);
+    assert!(media::parse_position_packet(&mut other, 7, &packet).is_err());
     let voice = media::build_voice_packet(&keys, 42, 10, &[1, 2, 3]).unwrap();
-    assert!(media::parse_position_packet(&keys, 7, &voice).is_err());
-    assert!(media::parse_voice_packet(Some(&keys), 7, &packet).is_err());
+    assert!(media::parse_position_packet(&mut keys, 7, &voice).is_err());
+    assert!(media::parse_voice_packet(Some(&mut keys), 7, &packet).is_err());
 }
 
 #[test]
 fn screen_audio_round_trip() {
-    let keys = ring(7, 0);
+    let mut keys = ring(7, 0);
     let key = keys.current().unwrap();
     let opus = [9u8; 40];
     let aad = build_aad(7, 0x15, 8);
@@ -137,7 +137,7 @@ fn screen_audio_round_trip() {
     let packet = ScreenShareAudioPacket::new_encrypted(8, 100, 2500, key.key_id, stream, encrypted)
         .to_bytes();
 
-    let info = media::parse_screen_audio_packet(&keys, 7, &packet).unwrap();
+    let info = media::parse_screen_audio_packet(&mut keys, 7, &packet).unwrap();
     assert_eq!(
         (info.session_id, info.sequence, info.timestamp),
         (8, 100, 2500)
@@ -146,12 +146,12 @@ fn screen_audio_round_trip() {
 
     // Plaintext screen audio is refused.
     let plain = ScreenShareAudioPacket::new(8, 101, 2520, opus.to_vec()).to_bytes();
-    assert!(media::parse_screen_audio_packet(&keys, 7, &plain).is_err());
+    assert!(media::parse_screen_audio_packet(&mut keys, 7, &plain).is_err());
 }
 
 #[test]
 fn video_fragments_reassemble() {
-    let keys = ring(7, 0);
+    let mut keys = ring(7, 0);
     let key = keys.current().unwrap();
     let stream = keys.stream_id();
     let frame: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
@@ -198,27 +198,27 @@ fn video_fragments_reassemble() {
     let mut assembler = VideoAssemblerCore::new();
     let (last, rest) = packets.split_last().unwrap();
     for packet in rest {
-        let r = assembler.push(&keys, 7, packet).unwrap();
+        let r = assembler.push(&mut keys, 7, packet).unwrap();
         assert!(r.frame.is_none());
         assert!(r.is_keyframe);
         assert!(!r.frame_dropped);
     }
-    let r = assembler.push(&keys, 7, last).unwrap();
+    let r = assembler.push(&mut keys, 7, last).unwrap();
     assert_eq!(r.frame.as_deref(), Some(&frame[..]));
     assert!(r.is_keyframe);
     assert_eq!(r.timestamp, timestamp);
     assert!(!r.frame_dropped);
 
     // A wrong key fails authentication instead of feeding garbage to the decoder.
-    let other = ring(7, 0);
-    assert!(assembler.push(&other, 7, &packets[0]).is_err());
+    let mut other = ring(7, 0);
+    assert!(assembler.push(&mut other, 7, &packets[0]).is_err());
 }
 
 /// A browser sharer's frame stream must come apart exactly like the native
 /// sharer's: `stream_records` splits it, the assembler puts the frame back.
 #[test]
 fn video_frame_stream_round_trip() {
-    let keys = ring(7, 2);
+    let mut keys = ring(7, 2);
     let frame: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
     let (session_id, frame_id, timestamp) = (9, 4, 777);
 
@@ -234,9 +234,13 @@ fn video_frame_stream_round_trip() {
     let mut assembler = VideoAssemblerCore::new();
     let (last, rest) = records.split_last().unwrap();
     for record in rest {
-        assert!(assembler.push(&keys, 7, record).unwrap().frame.is_none());
+        assert!(assembler
+            .push(&mut keys, 7, record)
+            .unwrap()
+            .frame
+            .is_none());
     }
-    let r = assembler.push(&keys, 7, last).unwrap();
+    let r = assembler.push(&mut keys, 7, last).unwrap();
     assert_eq!(r.frame.as_deref(), Some(&frame[..]));
     assert!(r.is_keyframe);
     assert_eq!(r.timestamp, timestamp);
@@ -255,7 +259,7 @@ fn video_frame_stream_round_trip() {
     let records = stream_records(&stream);
     assert_eq!(records.len(), 1);
     assert_eq!(records[0][0], 0x13);
-    let r = assembler.push(&keys, 7, records[0]).unwrap();
+    let r = assembler.push(&mut keys, 7, records[0]).unwrap();
     assert_eq!(r.frame.as_deref(), Some(&delta[..]));
     assert!(!r.is_keyframe);
 
@@ -271,12 +275,12 @@ fn video_frame_stream_round_trip() {
 /// clients use.
 #[test]
 fn screen_audio_packet_round_trip() {
-    let keys = ring(7, 5);
+    let mut keys = ring(7, 5);
     let opus = [3u8; 60];
     let packet = media::build_screen_audio_packet(&keys, 8, 101, 2540, &opus).unwrap();
     assert_eq!(packet[0], 0x15);
 
-    let info = media::parse_screen_audio_packet(&keys, 7, &packet).unwrap();
+    let info = media::parse_screen_audio_packet(&mut keys, 7, &packet).unwrap();
     assert_eq!(
         (info.session_id, info.sequence, info.timestamp),
         (8, 101, 2540)
@@ -284,8 +288,8 @@ fn screen_audio_packet_round_trip() {
     assert_eq!(info.opus, opus);
 
     // Another key fails authentication instead of playing noise
-    let other = ring(7, 5);
-    assert!(media::parse_screen_audio_packet(&other, 7, &packet).is_err());
+    let mut other = ring(7, 5);
+    assert!(media::parse_screen_audio_packet(&mut other, 7, &packet).is_err());
 }
 
 /// The browser's voice packets must decrypt with the native receive path, and
@@ -296,7 +300,7 @@ fn screen_audio_packet_round_trip() {
 #[test]
 fn voice_interoperates_with_the_native_client() {
     let channel_id = 7;
-    let keys = ring(channel_id, 0);
+    let mut keys = ring(channel_id, 0);
     let key = keys.current().unwrap();
     let stream = keys.stream_id();
     let opus: Vec<u8> = (0..80u8).collect();
@@ -348,7 +352,7 @@ fn voice_interoperates_with_the_native_client() {
         session_id, sequence, key.key_id, stream, encrypted,
     )
     .to_bytes();
-    let info = media::parse_voice_packet(Some(&keys), channel_id, &native).unwrap();
+    let info = media::parse_voice_packet(Some(&mut keys), channel_id, &native).unwrap();
     assert_eq!(info.opus.as_deref(), Some(&opus[..]));
     assert_eq!(info.sequence, sequence);
 }

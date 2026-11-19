@@ -3,9 +3,14 @@
 //! shared crates; this file only mirrors the native client's send and receive
 //! paths (client/src-tauri/src/network.rs) so both ends agree byte for byte.
 //! Plaintext media types are never produced and are rejected on receive.
+//!
+//! A received packet's key is looked up by its sender (`MediaKeyRing::get_for`): in a room
+//! under the group epoch key each sender has its own, derived from the seat the room's roster
+//! gives its session id and its stream id (spec §3.10); otherwise it is the room's, by the
+//! generation the packet names, as before.
 
 use anyhow::{bail, Context};
-use voipc_crypto::{build_aad, media_decrypt, media_encrypt, MediaKeyRing};
+use voipc_crypto::{build_aad, media_decrypt, media_encrypt, MediaKey, MediaKeyRing};
 use voipc_protocol::video::{
     fragment_frame, FrameAssembler, ScreenShareAudioPacket, VideoPacket, VideoPacketType,
     MAX_ENCRYPTED_VIDEO_PAYLOAD_SIZE, MAX_FRAGMENTS_PER_FRAME,
@@ -50,10 +55,24 @@ pub struct VoiceInfo {
     pub opus: Option<Vec<u8>>,
 }
 
+/// The key a received packet names: its sender's (`session_id`, `stream`) under the group key,
+/// else the room's; by the generation `key_id` names either way, so a rotation does not drop
+/// what was already in flight.
+fn key_for(
+    keys: &mut MediaKeyRing,
+    channel_id: u32,
+    session_id: u32,
+    stream: u32,
+    key_id: u16,
+) -> anyhow::Result<&MediaKey> {
+    keys.get_for(channel_id, session_id, stream, key_id)
+        .context("no media key for that generation")
+}
+
 /// Parses a voice-family packet. 0x02 (EOT), 0x03 (ping) and 0x04 (pong) are
 /// header only; 0x05 is decrypted with `key`. Plaintext voice is rejected.
 pub fn parse_voice_packet(
-    keys: Option<&MediaKeyRing>,
+    keys: Option<&mut MediaKeyRing>,
     channel_id: u32,
     bytes: &[u8],
 ) -> anyhow::Result<VoiceInfo> {
@@ -61,11 +80,13 @@ pub fn parse_voice_packet(
     let opus = match packet.packet_type {
         VoicePacketType::EncryptedOpusVoice => {
             let keys = keys.context("encrypted voice but no media key")?;
-            // By the key generation the packet names, so a rotation does not
-            // drop what was already in flight.
-            let key = keys
-                .get(channel_id, packet.key_id)
-                .context("no media key for that generation")?;
+            let key = key_for(
+                keys,
+                channel_id,
+                packet.session_id,
+                packet.stream_id,
+                packet.key_id,
+            )?;
             let aad = build_aad(key.channel_id, ENCRYPTED_VOICE, packet.session_id);
             Some(media_decrypt(
                 key,
@@ -116,7 +137,7 @@ pub struct PositionInfo {
 
 /// Decrypts a position beacon (0x06); any other packet type is an error.
 pub fn parse_position_packet(
-    keys: &MediaKeyRing,
+    keys: &mut MediaKeyRing,
     channel_id: u32,
     bytes: &[u8],
 ) -> anyhow::Result<PositionInfo> {
@@ -124,9 +145,13 @@ pub fn parse_position_packet(
     if packet.packet_type != VoicePacketType::Position {
         bail!("not a position packet");
     }
-    let key = keys
-        .get(channel_id, packet.key_id)
-        .context("no media key for that generation")?;
+    let key = key_for(
+        keys,
+        channel_id,
+        packet.session_id,
+        packet.stream_id,
+        packet.key_id,
+    )?;
     let aad = build_aad(key.channel_id, POSITION, packet.session_id);
     let plaintext = media_decrypt(
         key,
@@ -237,7 +262,7 @@ pub struct ScreenAudioInfo {
 
 /// Parses and decrypts an encrypted screen-share audio packet (0x15).
 pub fn parse_screen_audio_packet(
-    keys: &MediaKeyRing,
+    keys: &mut MediaKeyRing,
     channel_id: u32,
     bytes: &[u8],
 ) -> anyhow::Result<ScreenAudioInfo> {
@@ -245,9 +270,13 @@ pub fn parse_screen_audio_packet(
     if !packet.encrypted {
         bail!("plaintext screen audio packet rejected");
     }
-    let key = keys
-        .get(channel_id, packet.key_id)
-        .context("no media key for that generation")?;
+    let key = key_for(
+        keys,
+        channel_id,
+        packet.session_id,
+        packet.stream_id,
+        packet.key_id,
+    )?;
     let aad = build_aad(key.channel_id, ENCRYPTED_SCREEN_AUDIO, packet.session_id);
     let opus = media_decrypt(
         key,
@@ -292,7 +321,7 @@ impl VideoAssemblerCore {
 
     pub fn push(
         &mut self,
-        keys: &MediaKeyRing,
+        keys: &mut MediaKeyRing,
         channel_id: u32,
         bytes: &[u8],
     ) -> anyhow::Result<VideoPush> {
@@ -312,9 +341,13 @@ impl VideoAssemblerCore {
         // Nonce: the sender's own stream id, frame id as the sequence,
         // fragment index as the extra; the AAD binds the channel and the exact
         // packet type byte.
-        let key = keys
-            .get(channel_id, packet.key_id)
-            .context("no media key for that generation")?;
+        let key = key_for(
+            keys,
+            channel_id,
+            packet.session_id,
+            packet.stream_id,
+            packet.key_id,
+        )?;
         let aad = build_aad(key.channel_id, packet_type as u8, packet.session_id);
         packet.payload = media_decrypt(
             key,
@@ -346,5 +379,100 @@ impl VideoAssemblerCore {
     pub fn reset(&mut self) {
         self.assembler.reset();
         self.current_session = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use voipc_crypto::group_key::MemberId;
+    use voipc_crypto::group_state::VoiceKeys;
+    use voipc_protocol::video::stream_records;
+
+    const ROOM: u32 = 7;
+
+    /// User `own`'s ring in a room under the group key, as `gkVoiceInto` fills it: one
+    /// epoch, users 1, 2 and 3 seated by their connections' pairs.
+    fn seated(own: u32) -> MediaKeyRing {
+        let seat = |u: u32| (u, MemberId::Conn(u), [u as u8; 8]);
+        let keys = VoiceKeys {
+            channel_id: ROOM,
+            group: format!("r:{}:{ROOM}", "ab".repeat(16)),
+            gen: [1; 16],
+            epochs: vec![(1, [1; 32], [2; 32].into())],
+            own: (MemberId::Conn(own), [own as u8; 8]),
+            seats: (1..=3).map(seat).collect(),
+            switch_at: 0,
+            new_generation: true,
+        };
+        let mut ring = MediaKeyRing::default();
+        assert!(ring.install_gk(&keys, ROOM));
+        ring
+    }
+
+    /// Every kind of packet alice (user 1) sends, as the page builds them.
+    fn sent_by(alice: &MediaKeyRing) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
+        (
+            build_voice_packet(alice, 1, 10, b"voice").unwrap(),
+            build_position_packet(alice, 1, 11, 1.0, 2.0, 3.0).unwrap(),
+            build_screen_audio_packet(alice, 1, 12, 40, b"share audio").unwrap(),
+            build_video_frame_stream(alice, 1, 13, 50, true, &[9; 3000]).unwrap(),
+        )
+    }
+
+    /// Whether `ring` opens every one of them.
+    fn opens_all(ring: &mut MediaKeyRing, packets: &(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)) -> bool {
+        let (voice, position, audio, video) = packets;
+        let mut assembler = VideoAssemblerCore::new();
+        let frame = stream_records(video)
+            .into_iter()
+            .map(|r| assembler.push(ring, ROOM, r).ok().and_then(|p| p.frame))
+            .last()
+            .flatten();
+        parse_voice_packet(Some(ring), ROOM, voice)
+            .is_ok_and(|v| v.opus.as_deref() == Some(b"voice"))
+            && parse_position_packet(ring, ROOM, position).is_ok_and(|p| (p.x, p.z) == (1.0, 3.0))
+            && parse_screen_audio_packet(ring, ROOM, audio).is_ok_and(|a| a.opus == b"share audio")
+            && frame.is_some_and(|f| f == [9; 3000])
+    }
+
+    /// Spec §3.10: under the group key a receiver opens voice, beacons, share audio and video
+    /// with the key it derives for the sender, from the seat the roster gives the packet's
+    /// session id and its stream id. A sender the roster does not seat opens nothing.
+    #[test]
+    fn under_the_group_key_each_packet_opens_with_its_senders_own_key() {
+        let alice = seated(1);
+        let packets = sent_by(&alice);
+        assert!(opens_all(&mut seated(2), &packets));
+        assert!(opens_all(&mut seated(3), &packets));
+
+        // Carol holds the epoch key, but nobody's roster seats her
+        let mut carol = seated(4);
+        let not_seated = sent_by(&carol);
+        let mut bob = seated(2);
+        let (voice, ..) = &not_seated;
+        assert!(parse_voice_packet(Some(&mut bob), ROOM, voice).is_err());
+        assert!(!opens_all(&mut bob, &not_seated));
+        assert!(
+            opens_all(&mut carol, &packets),
+            "while she holds the room's epoch key"
+        );
+    }
+
+    /// With no group key (no `GroupKeys`, or the switch off) a packet opens with the room's
+    /// key by its generation, as before; and a ring under the group key opens no packet of
+    /// the old kind.
+    #[test]
+    fn outside_the_group_key_packets_open_with_the_rooms_key_as_before() {
+        let old = |key_id| {
+            let mut ring = MediaKeyRing::default();
+            assert!(ring.install(MediaKey::new(ROOM, key_id, 1, [5; 32]), ROOM));
+            ring
+        };
+        let packets = sent_by(&old(3));
+        assert!(opens_all(&mut old(3), &packets));
+        assert!(!opens_all(&mut old(4), &packets), "another generation");
+        assert!(!opens_all(&mut seated(2), &packets));
+        assert!(!opens_all(&mut old(1), &sent_by(&seated(1))));
     }
 }

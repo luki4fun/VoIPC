@@ -8,16 +8,59 @@ import type { ProximityMode } from "../../lib/spatial";
 /** Codec of a screen share, as the protocol names it (voipc-protocol types.rs). */
 export type VideoCodec = "H264" | "H265" | "Vp8" | "Vp9";
 
+/**
+ * Whether a channel is a voice room whose keys come from the group key (plan part 5): on a
+ * relay whose group key is on (`gkPosts`), any room that is not a text channel. None of the
+ * old key paths runs there, out or in — no media key minted or handed over
+ * (`DistributeMediaKey`), no sender key (`DistributeSenderKey`), nothing taken from either:
+ * the relay refuses them, and a key taken from them is one nobody else in the room holds.
+ */
+export function gkVoiceRoom(gkOn: boolean, text: boolean): boolean {
+  return gkOn && !text;
+}
+
+/**
+ * Whether a roster of the room we stand in gets its members asked for pre-key bundles (`asks`:
+ * live.ts `asksBundles`). Under the group key no key goes over a session there, and the history
+ * ask opens its own (`historyAskSealed`): N bundle asks and N session set-ups per join would
+ * only queue ahead of the keyholder's frames, which have deadlines.
+ */
+export function roomAsksBundles(asks: boolean, gkRoom: boolean): boolean {
+  return asks && !gkRoom;
+}
+
+/**
+ * Whether a history ask goes sealed, as a direct message the live path sends, opening a session
+ * for it (plan 2k: the history hand-off, DM path). In a text channel, and in a voice room under
+ * the group key: no sender key arrives there, which is what the old ask waited for, and no
+ * bundle was asked at the join. The new-member wait refuses a direct message: then plain frames
+ * ask whoever already has a session.
+ */
+export function historyAskSealed(text: boolean, gkRoom: boolean, directHeld: boolean): boolean {
+  return (text || gkRoom) && !directHeld;
+}
+
+/**
+ * Whether entering `channelId` asks its sharers for history at once, sealed (`askHistory`): a
+ * voice room under the group key, where no sender key arrives to start the old ask. Never the
+ * lobby (channel 0): the old ask never ran there, and the native app skips it too.
+ */
+export function entryAsksHistory(gkRoom: boolean, channelId: number): boolean {
+  return gkRoom && channelId !== 0;
+}
+
 /** What the media modules may use from the voice session. */
 export interface SessionContext {
   readonly sessionId: number;
   /** Current channel id (0 = not in voice, where no media is allowed). */
   readonly channelId: number;
-  /** Installed media key for the current channel, or null while waiting. */
   /**
    * The channel's media keys: the generation we encrypt with and the one
    * before it. Always present — `hasChannel(channelId)` is what says whether
-   * we can send yet.
+   * we can send yet. In a room under the group key (`gkVoiceRoom`) the ring is
+   * in its group-key mode: ours and every sender's own key come from the room's
+   * epoch key, and the packet exports look a received packet's key up by its
+   * sender's session id and stream id.
    */
   readonly mediaKeys: MediaKeys;
   /** Monotonic per-connection voice sequence (never restarts within a session). */

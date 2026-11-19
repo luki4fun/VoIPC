@@ -590,13 +590,9 @@ fn gk_out(conn: &GkLink, out: GkOut, todo: &mut VecDeque<Work>) {
     }
     if !voice.is_empty() {
         let own = conn.channel_id.load(Ordering::Relaxed);
-        let mut ring = conn
-            .media_key
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        for keys in &voice {
-            ring.install_gk(keys, own);
-        }
+        install_voice(&conn.media_key, &voice, own, |payload| {
+            emit_server(&conn.app, &conn.server, "media-key-installed", payload);
+        });
     }
     if build_ready {
         conn.wake();
@@ -623,6 +619,30 @@ fn gk_out(conn: &GkLink, out: GkOut, todo: &mut VecDeque<Work>) {
     }
     for (group, gen, epoch) in past_ready {
         past(conn, link, &group, gen, epoch, todo);
+    }
+}
+
+/// The room's voice keys from its epoch key into the ring (`MediaKeyRing::install_gk`), and,
+/// once the ring's lock is let go, `media-key-installed` said once if it took any, as a key a
+/// member handed over says it (`install_media_key`): the "waiting for the channel's key" line
+/// the voice thread raised after 2 s goes when the keys come. The voice thread's own take-back
+/// (`network::key_news`) may say it again; the front end ignores the second.
+fn install_voice(
+    ring: &std::sync::Mutex<MediaKeyRing>,
+    voice: &[voipc_crypto::group_state::VoiceKeys],
+    own: u32,
+    emit: impl FnOnce(serde_json::Value),
+) {
+    let key_id = {
+        let mut ring = ring.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut took = false;
+        for keys in voice {
+            took |= ring.install_gk(keys, own);
+        }
+        took.then(|| ring.current().map_or(0, |k| k.key_id))
+    };
+    if let Some(key_id) = key_id {
+        emit(json!({ "channel_id": own, "key_id": key_id }));
     }
 }
 
@@ -1397,5 +1417,35 @@ mod tests {
                 "the pair the relay holds, not a new one"
             );
         }
+    }
+
+    /// V3's gap: the room's keys from its epoch key say `media-key-installed`, once for what
+    /// one `GkOut` hands over and with the ring's lock let go, so the "waiting for the
+    /// channel's key" line the voice thread raised goes when they come. Keys the ring does not
+    /// take (another room's) say nothing.
+    #[test]
+    fn voice_keys_the_ring_takes_say_media_key_installed_once() {
+        use crate::network::tests::{voice_keys, Epoch, ROOM};
+        let e1: Epoch = (1, rand::random(), rand::random());
+        let ring = std::sync::Mutex::new(MediaKeyRing::default());
+        // A welcome and a roster update in one out
+        let keys = [
+            voice_keys(1, &[e1], &[1, 2]),
+            voice_keys(1, &[e1], &[1, 2, 3]),
+        ];
+        let mut said = Vec::new();
+        install_voice(&ring, &keys, ROOM, |payload| {
+            assert!(ring.try_lock().is_ok(), "told with the ring's lock let go");
+            said.push(payload);
+        });
+        assert_eq!(said, [json!({ "channel_id": ROOM, "key_id": 1 })]);
+        assert!(
+            ring.lock().unwrap().current().is_some(),
+            "and the ring took them"
+        );
+
+        said.clear();
+        install_voice(&ring, &keys, ROOM + 1, |payload| said.push(payload));
+        assert!(said.is_empty(), "another room's keys: {said:?}");
     }
 }

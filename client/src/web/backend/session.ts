@@ -14,7 +14,7 @@ import { loadWasm, wasm, type GkOut, type KeptGk, type KeptPins, type KeptSessio
 import { ACCOUNT_STEP_MS, AccountDriver, frameGoesOn, type AccountArgs, type AccountHost } from "./account";
 import { connect as openTransport, openEdgeView, type Transport } from "./transport";
 import { EdgeView } from "./edge-view";
-import type { SessionContext } from "./types";
+import { entryAsksHistory, gkVoiceRoom, historyAskSealed, roomAsksBundles, type SessionContext } from "./types";
 import type { ChannelInfo } from "../../lib/types";
 import { parseHostPort } from "../../lib/invite";
 import type { ProximityMode } from "../../lib/spatial";
@@ -1094,7 +1094,7 @@ export class Session implements SessionContext, AccountHost {
         // Somebody joined the room we stand in: a key dance to do. A text channel's key
         // goes to who a check named, never because a relay said someone joined.
         if (b.user.user_id !== this.userId && asksBundles(b.user.channel_id, this.channelId)) {
-          this.requestPrekeyBundlesForUsers([b.user]);
+          if (roomAsksBundles(true, this.gkRoom(b.user.channel_id))) this.requestPrekeyBundlesForUsers([b.user]);
           this.signal.addMember(b.user.channel_id, b.user.user_id);
           if (this.establishedSessions.has(b.user.user_id)) {
             this.distributeSenderKeyToUser(b.user.channel_id, b.user.user_id);
@@ -1508,7 +1508,11 @@ export class Session implements SessionContext, AccountHost {
     // which marks a replay and writes the cursors: any call of it carries them (account.rs
     // `out`), and an empty roster is the one that says nothing else
     if (out.held) this.account?.noteRoster(this, []);
-    if (out.voice) this.signal.gkVoiceInto(this.mediaKeys, this.channelId);
+    // The room's keys, from its epoch key: `media-key-installed` as for a key a member handed
+    // over, so the UI's "waiting for the key" line goes
+    if (out.voice && this.signal.gkVoiceInto(this.mediaKeys, this.channelId)) {
+      this.emit("media-key-installed", { channel_id: this.channelId, key_id: this.mediaKeys.keyId ?? 0 });
+    }
     if (out.build) void this.gkBuild();
     this.gkPump.wake();
   }
@@ -1547,6 +1551,12 @@ export class Session implements SessionContext, AccountHost {
       this.gkTracked.add(c.channel_id);
       this.gkRun(() => this.signal.gkTrack(c.channel_id, c.text, c.log ?? "", c.anonymous, c.hide_members, this.isAdmin));
     }
+  }
+
+  /** A voice room whose keys come from the group key: none of the old key paths runs for it,
+   *  out or in (types.ts `gkVoiceRoom`). */
+  private gkRoom(channelId: number): boolean {
+    return gkVoiceRoom(gkPosts(this.gkPath), this.isTextChannel(channelId));
   }
 
   /** What the account's own calls said for the group key. */
@@ -1621,7 +1631,11 @@ export class Session implements SessionContext, AccountHost {
       this.mediaKeys.clear();
       this.signal.resetChannel(this.userId, channelId);
       const anonymous = this.channels.find((c) => c.channel_id === channelId)?.anonymous;
-      this.signal.wantHistoryFrom(channelId, anonymous ? new Uint32Array() : this.historySources(users));
+      const sources = anonymous ? new Uint32Array() : this.historySources(users);
+      // The old path asks each sharer once its sender key arrives; under the group key none
+      // does, so the ask goes now, the DM way (`askHistory`)
+      if (entryAsksHistory(this.gkRoom(channelId), channelId)) this.askHistory(channelId, [...sources]);
+      else this.signal.wantHistoryFrom(channelId, sources);
       if (this.watchingUserId !== 0) {
         this.watchingUserId = 0;
         this.closeEdge();
@@ -1649,7 +1663,7 @@ export class Session implements SessionContext, AccountHost {
 
     // Only a room has a key dance to do; General's list costs nothing, and anyone in it
     // gets a session when there is something to say to them.
-    if (asksBundles(channelId, channelId)) this.requestPrekeyBundlesForUsers(users);
+    if (roomAsksBundles(asksBundles(channelId, channelId), this.gkRoom(channelId))) this.requestPrekeyBundlesForUsers(users);
 
     // Media keys never touch the server: the first member generates one,
     // everyone else receives it from a member over a pairwise Signal session
@@ -1713,6 +1727,7 @@ export class Session implements SessionContext, AccountHost {
   }
 
   private distributeSenderKeyToUser(channelId: number, targetUserId: number): void {
+    if (this.gkRoom(channelId)) return;
     // The server relays a distribution only between two members of the channel
     // it names and drops the rest; recording one of those as distributed makes
     // reciprocation skip a member who never received anything.
@@ -1739,7 +1754,8 @@ export class Session implements SessionContext, AccountHost {
 
   /** Send our media key for `channelId` over the pairwise session, if we hold one. */
   private distributeMediaKeyToUser(channelId: number, targetUserId: number): void {
-    if (!this.mediaKeys.hasChannel(channelId)) return;
+    // Under the group key the ring's key is our own, from the room's epoch key: never handed over
+    if (this.gkRoom(channelId) || !this.mediaKeys.hasChannel(channelId)) return;
     const bytes = this.mediaKeys.toBytes();
     if (!bytes) return;
     try {
@@ -1759,6 +1775,7 @@ export class Session implements SessionContext, AccountHost {
 
   /** Mint a generation of our own and tell the UI, if it superseded. */
   private mintMediaKey(channelId: number, keyId: number): boolean {
+    if (this.gkRoom(channelId)) return false;
     try {
       if (!this.mediaKeys.generate(channelId, keyId, this.userId)) return false;
     } catch (e) {
@@ -1794,6 +1811,7 @@ export class Session implements SessionContext, AccountHost {
 
   /** Install a member's media key if it supersedes what we hold for the channel we are in. */
   private onMediaKeyReceived(channelId: number, fromUserId: number, ciphertext: Uint8Array, messageType: number): void {
+    if (this.gkRoom(channelId)) return;
     // The same check the sender key makes, and for a bigger prize: this is the
     // key our microphone encrypts under. The server relays a media key only
     // between two members of the channel it names — but the server is the
@@ -1828,6 +1846,7 @@ export class Session implements SessionContext, AccountHost {
 
   /** Decrypt pairwise, process the distribution, reciprocate, drain queued channel messages. */
   private onSenderKeyReceived(channelId: number, fromUserId: number, ciphertext: Uint8Array, messageType: number): void {
+    if (this.gkRoom(channelId)) return;
     // The mirror of the check distributeSenderKeyToUser makes outbound. The
     // server relays a distribution only between two members — but the server
     // is the adversary here, and without this a stranger with a colluding
@@ -2348,14 +2367,20 @@ export class Session implements SessionContext, AccountHost {
    */
   requestChannelHistory(channelId: number, targetUserIds: number[]): number[] {
     if (this.channels.find((c) => c.channel_id === channelId)?.anonymous) throw new Error("an anonymous channel shares no history");
+    const asked = this.askHistory(channelId, targetUserIds);
+    if (asked.length === 0) throw new Error("nobody here can share that history yet");
+    return asked;
+  }
+
+  /** Ask a few of `targetUserIds` for a channel's recent chat. Who was asked. */
+  private askHistory(channelId: number, targetUserIds: number[]): number[] {
     const text = this.isTextChannel(channelId);
     // Sealed: the relay sees "R wrote to S", not for which channel. It goes when a session
     // both ends hold is up, opened for it if need be. Under the new-member wait a direct
     // message is refused, so there the plain frames below ask whoever already has a session.
-    if (text && !this.directHeld) {
+    if (historyAskSealed(text, this.gkRoom(channelId), this.directHeld)) {
       const asked = this.signal.liveAskHistory(channelId, Uint32Array.from(targetUserIds));
-      if (asked.length === 0) throw new Error("nobody here can share that history yet");
-      this.live.wake();
+      if (asked.length > 0) this.live.wake();
       return [...asked];
     }
     // A pairwise session is all an answer needs — history travels over that,
@@ -2363,7 +2388,6 @@ export class Session implements SessionContext, AccountHost {
     // would block the one repair a member has when keying went wrong.
     const reachable = Uint32Array.from(targetUserIds.filter((uid) => this.establishedSessions.has(uid)));
     const targets = wasm().pickHistorySources(reachable);
-    if (targets.length === 0) throw new Error("nobody here can share that history yet");
     for (const target_user_id of targets) {
       if (text) this.signal.liveNoteAsked(channelId, target_user_id);
       this.sendControl({ RequestChannelHistory: { channel_id: channelId, target_user_id } });

@@ -1399,3 +1399,84 @@ mod picker_tests {
         assert!(one_colour(&dim, 64, 36));
     }
 }
+
+#[cfg(all(test, not(target_os = "android")))]
+mod group_key_tests {
+    use super::*;
+    use crate::network::tests::{voice_keys, Epoch, ROOM};
+    use voipc_crypto::MediaKeyRing;
+
+    /// Whether a screen-audio packet opens under `ring`, read as the datagram receiver
+    /// reads one (`ScreenShareAudioPacket::from_bytes`, then `open_media`).
+    fn opens(ring: &std::sync::Mutex<MediaKeyRing>, bytes: &[u8]) -> bool {
+        let p = ScreenShareAudioPacket::from_bytes(bytes).unwrap();
+        let opened = crate::network::open_media(
+            &mut ring.lock().unwrap(),
+            ROOM,
+            0x15,
+            p.session_id,
+            p.stream_id,
+            p.key_id,
+            (p.sequence, 0),
+            &p.opus_data,
+        );
+        p.encrypted && opened.is_some_and(|o| o.is_ok())
+    }
+
+    /// Plan part 5: a share's audio goes under its sharer's own key from the room's epoch
+    /// key, with no change to the share's send site (`current()`, the ring's stream). Every
+    /// member the roster seats opens it; after a leave the share goes on under the next
+    /// epoch, which the leaver cannot open.
+    #[test]
+    fn under_the_group_key_a_shares_audio_opens_for_the_room_and_not_for_a_leaver() {
+        let e1: Epoch = (1, rand::random(), rand::random());
+        let e2: Epoch = (2, rand::random(), rand::random());
+        let rings: Vec<Arc<std::sync::Mutex<MediaKeyRing>>> =
+            (0..3).map(|_| Arc::default()).collect();
+        let take = |sid: u32, epochs: &[Epoch], roster: &[u32]| {
+            let keys = voice_keys(sid, epochs, roster);
+            let ring = &rings[sid as usize - 1];
+            assert!(ring.lock().unwrap().install_gk(&keys, ROOM));
+        };
+        for sid in 1..=3 {
+            take(sid, &[e1], &[1, 2, 3]);
+        }
+        let (audio_tx, mut audio_rx) = mpsc::channel(8);
+        let mut share = AudioProcessor {
+            encoder: Some(
+                voipc_audio::encoder::Encoder::new_screen_audio(SCREEN_AUDIO_BITRATE).unwrap(),
+            ),
+            accumulator: Vec::new(),
+            sequence: 0,
+            session_id: 1,
+            start_time: Instant::now(),
+            audio_tx,
+            active: Arc::new(AtomicBool::new(true)),
+            audio_enabled: Arc::new(AtomicBool::new(true)),
+            packet_count: Arc::default(),
+            sample_rate: 48_000,
+            channels: 1,
+            media_key: rings[0].clone(),
+            channel_id: Arc::new(AtomicU32::new(ROOM)),
+            resampler: None,
+            mono_buf: Vec::new(),
+            viewers: Arc::new(AtomicU32::new(2)),
+        };
+        let tone: Vec<u8> = (0..SCREEN_AUDIO_FRAME_SIZE)
+            .flat_map(|i| ((i as f32 / 8.0).sin() * 0.25).to_ne_bytes())
+            .collect();
+
+        share.process(&tone);
+        let first = audio_rx.try_recv().unwrap();
+        assert!(opens(&rings[1], &first) && opens(&rings[2], &first));
+
+        // Member 3 leaves: the opening's epoch reaches the sharer and member 2 only
+        take(1, &[e1, e2], &[1, 2]);
+        take(2, &[e1, e2], &[1, 2]);
+        share.process(&tone);
+        let next = audio_rx.try_recv().unwrap();
+        assert_eq!(ScreenShareAudioPacket::from_bytes(&next).unwrap().key_id, 2);
+        assert!(opens(&rings[1], &next), "the room hears the share go on");
+        assert!(!opens(&rings[2], &next), "the leaver does not");
+    }
+}

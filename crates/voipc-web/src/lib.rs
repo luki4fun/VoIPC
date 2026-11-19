@@ -1065,6 +1065,10 @@ fn file_error(e: FileError) -> JsValue {
 ///
 /// A ring rather than one key because a member leaving re-keys the channel, and
 /// a packet already in flight still names the generation before.
+///
+/// In a room under the group epoch key (`SignalClient.gkVoiceInto`) nothing is minted or
+/// handed out: ours and every sender's own come from the room's epoch key, and the packet
+/// exports below look a received packet's key up by its sender (`MediaKeyRing::get_for`).
 #[wasm_bindgen]
 pub struct MediaKeys {
     inner: voipc_crypto::MediaKeyRing,
@@ -1177,14 +1181,15 @@ pub fn parse_voice_header(data: &[u8]) -> Result<JsValue, JsError> {
 }
 
 /// `{ packet_type, session_id, sequence, opus }` from an encrypted voice
-/// packet (0x05) decrypted with `key`; any other type is an error.
+/// packet (0x05) decrypted with its sender's key; any other type is an error.
 #[wasm_bindgen(js_name = decryptVoicePacket)]
 pub fn decrypt_voice_packet(
-    keys: &MediaKeys,
+    keys: &mut MediaKeys,
     channel_id: u32,
     data: &[u8],
 ) -> Result<JsValue, JsError> {
-    let info = media::parse_voice_packet(Some(&keys.inner), channel_id, data).map_err(js_err)?;
+    let info =
+        media::parse_voice_packet(Some(&mut keys.inner), channel_id, data).map_err(js_err)?;
     if info.opus.is_none() {
         return Err(JsError::new("not an encrypted voice packet"));
     }
@@ -1204,14 +1209,14 @@ pub fn build_position_packet(
     media::build_position_packet(&keys.inner, session_id, sequence, x, y, z).map_err(js_err)
 }
 
-/// `{ session_id, x, y, z }` from a position beacon decrypted with `key`.
+/// `{ session_id, x, y, z }` from a position beacon decrypted with its sender's key.
 #[wasm_bindgen(js_name = decryptPositionPacket)]
 pub fn decrypt_position_packet(
-    keys: &MediaKeys,
+    keys: &mut MediaKeys,
     channel_id: u32,
     data: &[u8],
 ) -> Result<JsValue, JsError> {
-    let info = media::parse_position_packet(&keys.inner, channel_id, data).map_err(js_err)?;
+    let info = media::parse_position_packet(&mut keys.inner, channel_id, data).map_err(js_err)?;
     Ok(js_object(&[
         ("session_id", JsValue::from(info.session_id)),
         ("x", JsValue::from(info.x)),
@@ -1273,11 +1278,12 @@ pub fn build_video_frame_stream(
 /// audio packet (0x15).
 #[wasm_bindgen(js_name = parseScreenAudioPacket)]
 pub fn parse_screen_audio_packet(
-    keys: &MediaKeys,
+    keys: &mut MediaKeys,
     channel_id: u32,
     data: &[u8],
 ) -> Result<JsValue, JsError> {
-    let info = media::parse_screen_audio_packet(&keys.inner, channel_id, data).map_err(js_err)?;
+    let info =
+        media::parse_screen_audio_packet(&mut keys.inner, channel_id, data).map_err(js_err)?;
     Ok(js_object(&[
         ("session_id", JsValue::from(info.session_id)),
         ("sequence", JsValue::from(info.sequence)),
@@ -1303,13 +1309,13 @@ impl VideoAssembler {
     /// `{ frame?: Uint8Array, is_keyframe, timestamp, frame_dropped }`.
     pub fn push(
         &mut self,
-        keys: &MediaKeys,
+        keys: &mut MediaKeys,
         channel_id: u32,
         data: &[u8],
     ) -> Result<JsValue, JsError> {
         let result = self
             .core
-            .push(&keys.inner, channel_id, data)
+            .push(&mut keys.inner, channel_id, data)
             .map_err(js_err)?;
         let mut fields = vec![
             ("is_keyframe", JsValue::from_bool(result.is_keyframe)),
