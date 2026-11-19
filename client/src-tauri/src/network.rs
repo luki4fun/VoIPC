@@ -236,9 +236,17 @@ pub async fn connect_to_server(
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .remove(&key);
+                let kept_gk = state
+                    .kept_gk
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&key);
                 let mut session = link.session();
                 if let Some(kept) = kept {
                     session.adopt_pins(kept);
+                }
+                if let Some(kept) = kept_gk {
+                    session.adopt_gk(kept);
                 }
                 // No key job until what it checks against is here
                 if !session.pins_in() {
@@ -440,6 +448,18 @@ pub async fn connect_to_server(
         tcp_rx,
         tcp_tx.queued.clone(),
     ));
+    let gk = crate::gk_net::GkLink {
+        app: app_handle.clone(),
+        server: server.clone(),
+        signal: signal.clone(),
+        tcp_tx: tcp_tx.clone(),
+        account: account.clone(),
+        media_key: current_media_key.clone(),
+        channel_id: current_channel_id.clone(),
+        channels: channels_snapshot.clone(),
+        is_voice: is_voice.clone(),
+    };
+    let gk_handle = tokio::spawn(crate::gk_net::gk_task(gk.clone()));
     let reader_handle = tokio::spawn(control_reader_task(
         control_recv,
         buf,
@@ -464,6 +484,7 @@ pub async fn connect_to_server(
         account.clone(),
         files.clone(),
         edge_cmd,
+        gk.clone(),
     ));
     let live_handle = (proto >= LIVE_PATH_SINCE).then(|| {
         tokio::spawn(live_task(
@@ -477,12 +498,7 @@ pub async fn connect_to_server(
     });
     if let Some(link) = &account {
         crate::account::after_connect(&app_handle, &address, link, &tcp_tx).await;
-        tokio::spawn(crate::account::tick_task(
-            app_handle.clone(),
-            address.clone(),
-            link.clone(),
-            tcp_tx.clone(),
-        ));
+        tokio::spawn(crate::account::tick_task(gk.clone(), link.clone()));
     }
     let video_decode_handle = tokio::task::spawn_blocking({
         let app_handle = app_handle.clone();
@@ -624,6 +640,7 @@ pub async fn connect_to_server(
             latency_handle,
             beacon_handle,
             edge_handle,
+            gk_handle,
         ]
         .into_iter()
         .chain(congestion_handle)
@@ -711,6 +728,8 @@ pub async fn teardown(
     }
     tell_undelivered(app, server, &connection);
     keep_sessions(state, server, &connection);
+    // Held posts are given up and told, a keyholder resigns, the floors are kept
+    crate::gk_net::end(&crate::gk_net::GkLink::of(app, server, &connection)).await;
 
     // Stop any ongoing voice and screen capture. Bounded, as `stop_capture`
     // is: a wedged device must not hang the disconnect — and with it, through
@@ -826,6 +845,13 @@ fn keep_sessions(state: &AppState, server: &str, connection: &ActiveConnection) 
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert((server.to_string(), account), pins);
+    }
+    if let Some(floors) = link.session().keep_gk() {
+        state
+            .kept_gk
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert((server.to_string(), account), floors);
     }
 }
 
@@ -1110,6 +1136,13 @@ async fn guest_sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
                     if let Some(accounts) = accounts {
                         emit_server(app_handle, address, "relay-accounts", accounts);
                     }
+                    // What a guest keeps of the group key goes by the address it dialled: the
+                    // relay id a relay names to a guest is its own word
+                    signal
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .gk
+                        .set_scope((address.to_string(), None));
                     return Ok((user_id, session_id, files, emotes, may_share));
                 }
                 ServerMessage::AuthError { reason } => {
@@ -1339,6 +1372,7 @@ async fn control_reader_task<R: AsyncRead + Unpin>(
     account: Option<Arc<crate::account::AccountLink>>,
     files: Arc<crate::files::Files>,
     edge_cmd: mpsc::Sender<EdgeCmd>,
+    gk: crate::gk_net::GkLink,
 ) {
     let mut inbound = Inbound::new(std::time::Instant::now());
     // What waits for the pages of pins (`voipc_crypto::waits_for_pins`), in order
@@ -1370,7 +1404,15 @@ async fn control_reader_task<R: AsyncRead + Unpin>(
 
         loop {
             match try_decode_frame(&mut buf) {
-                Ok(Some(payload)) => match decode_server_msg_from(&payload, tcp_tx.proto()) {
+                Ok(Some(payload)) => match decode_server_msg_from(&payload, tcp_tx.proto())
+                    // The frame after `Authenticated` says whether this relay keys groups
+                    .inspect(|msg| {
+                        signal
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .gk
+                            .first_frame(msg)
+                    }) {
                     Ok(_) if !inbound.take(std::time::Instant::now()) => {
                         warn!("server sent more than the inbound budget; disconnecting");
                         emit_server(
@@ -1419,6 +1461,7 @@ async fn control_reader_task<R: AsyncRead + Unpin>(
                                 &transmitting,
                                 account.as_deref(),
                                 &edge_cmd,
+                                &gk,
                             )
                             .await;
                             crate::account::check_seen(
@@ -1721,6 +1764,7 @@ async fn handle_server_message(
     transmitting: &Arc<AtomicBool>,
     account: Option<&crate::account::AccountLink>,
     edge_cmd: &mpsc::Sender<EdgeCmd>,
+    gk: &crate::gk_net::GkLink,
 ) {
     // Everything a game hears about comes from the voice connection only: a
     // user id here means nothing on the server the game is playing on.
@@ -1742,6 +1786,7 @@ async fn handle_server_message(
         let a = link.session().note_roster(seen);
         crate::account::run(app_handle, server, tcp_tx, a).await;
     }
+    crate::gk_net::note_roster(gk, seen);
     // A bare id in `KeysOwed` goes by these, and a first sight is checked against the pins
     if live && !seen.is_empty() {
         let first = with_keys(signal, |stores, keying| keying.live_note_rows(stores, seen));
@@ -1886,6 +1931,7 @@ async fn handle_server_message(
                 is_voice,
             );
             emit_server(app_handle, server, "channel-list", &channels);
+            crate::gk_net::channels_changed(gk).await;
         }
         // A list too long for one frame. The front end hears it at its end, whole, so a reader
         // of `channel-list` needs to know of no frames.
@@ -1906,6 +1952,7 @@ async fn handle_server_message(
                     is_voice,
                 );
                 emit_server(app_handle, server, "channel-list", &whole);
+                crate::gk_net::channels_changed(gk).await;
             }
         }
         ServerMessage::UserList { channel_id, users } => {
@@ -2080,6 +2127,7 @@ async fn handle_server_message(
                     sig.channels.want_history_from(channel_id, sources);
                 }
                 info!(old_ch, channel_id, "channel changed via UserList");
+                crate::gk_net::room_changed(gk, old_ch, channel_id).await;
 
                 // Stop screen share and watching on channel change
                 if screen_share_active.swap(false, Ordering::Relaxed) {
@@ -2260,6 +2308,7 @@ async fn handle_server_message(
                 // Out of the channel's log too: the relay took us out of it
                 // (1.0, D10), and a rejoin keeps it again
                 if user_id == own_user_id {
+                    crate::gk_net::untrack(gk, channel_id).await;
                     if let Some(link) = account {
                         let log = channels_snapshot
                             .lock()
@@ -2285,6 +2334,7 @@ async fn handle_server_message(
                 return;
             }
 
+            crate::gk_net::user_gone(gk, user_id);
             // Clean up E2E state for departing user
             let left_our_room;
             {
@@ -2426,6 +2476,7 @@ async fn handle_server_message(
                 } = &mut *sig;
                 channels.forget_channel(stores.as_mut(), own, channel_id);
             }
+            crate::gk_net::untrack(gk, channel_id).await;
             emit_server(
                 app_handle,
                 server,
@@ -2461,6 +2512,7 @@ async fn handle_server_message(
                 is_voice,
             );
             emit_server(app_handle, server, "channel-updated", &channel);
+            crate::gk_net::channels_changed(gk).await;
         }
         ServerMessage::Kicked { channel_id, reason } => {
             emit_server(
@@ -2993,6 +3045,15 @@ async fn handle_server_message(
                 channels_snapshot,
             )
             .await;
+            match &msg {
+                ServerMessage::TextJoined { joined, refused } => {
+                    crate::gk_net::text_joined(gk, joined, refused).await
+                }
+                ServerMessage::Evicted { channel_id, .. } => {
+                    crate::gk_net::untrack(gk, *channel_id).await
+                }
+                _ => {}
+            }
         }
         ServerMessage::AdminBansPaged {
             search,
@@ -3051,7 +3112,7 @@ async fn handle_server_message(
         }
         ServerMessage::Account(reply) => match account {
             Some(link) => {
-                crate::account::on_reply(app_handle, server, link, tcp_tx, reply).await;
+                crate::account::on_reply(gk, link, reply).await;
                 // The pages of pins came in: the key jobs that waited for them
                 if link.session().take_pins_in() {
                     let own_channel = channel_id_store.load(Ordering::Relaxed);
@@ -3081,9 +3142,11 @@ async fn handle_server_message(
         | ServerMessage::EmoteList { .. }
         | ServerMessage::EmoteTicket { .. }
         | ServerMessage::EmoteError { .. } => {}
-        // The group key: nothing takes it yet (N1 routes it)
-        ServerMessage::GroupKeys { .. }
-        | ServerMessage::EpochIn { .. }
+        // The group key (protocol 26): `gk_net` takes it
+        ServerMessage::GroupKeys { on, run, clock } => {
+            crate::gk_net::group_keys(gk, on, run, clock).await;
+        }
+        ServerMessage::EpochIn { .. }
         | ServerMessage::EpochWait { .. }
         | ServerMessage::EpochDue { .. }
         | ServerMessage::EpochStale { .. }
@@ -3095,7 +3158,7 @@ async fn handle_server_message(
         | ServerMessage::EpochNamesIn { .. }
         | ServerMessage::EpochRefused { .. }
         | ServerMessage::VoiceSeats { .. }
-        | ServerMessage::EpochReseated { .. } => {}
+        | ServerMessage::EpochReseated { .. } => crate::gk_net::frame(gk, &msg).await,
         ServerMessage::WatchAt {
             sharer_user_id,
             placement,

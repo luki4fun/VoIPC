@@ -1672,6 +1672,7 @@ async fn handle_message(
             ciphertext,
         } => {
             if !legacy_refused(state, session_id, channel_id, tx).await
+                && !room_refused(state, session_id, channel_id, tx).await
                 && relayable(&ciphertext, tx).await
             {
                 let allowed = state.spend(session_id, |s| &mut s.chat_rate);
@@ -1691,7 +1692,8 @@ async fn handle_message(
             distribution_message,
             message_type,
         } => {
-            if relayable(&distribution_message, tx).await
+            if !room_refused(state, session_id, channel_id, tx).await
+                && relayable(&distribution_message, tx).await
                 && may_relay_key(state, session_id, user_id, channel_id, target_user_id).await
             {
                 handle_distribute_sender_key(
@@ -1711,7 +1713,8 @@ async fn handle_message(
             encrypted_media_key,
             message_type,
         } => {
-            if relayable(&encrypted_media_key, tx).await
+            if !room_refused(state, session_id, channel_id, tx).await
+                && relayable(&encrypted_media_key, tx).await
                 && may_relay_key(state, session_id, user_id, channel_id, target_user_id).await
             {
                 handle_distribute_media_key(
@@ -4280,7 +4283,7 @@ struct GkPost {
 /// carries a blob (which the group's task stores before the post goes) or this
 /// connection's last post still waits on one, in a task behind that one: the connection's
 /// posts keep their order and its other frames are read meanwhile (2a). The budgets bound
-/// what waits so. Voice rooms are not here yet (V2).
+/// what waits so. A voice room's chat comes here too, under the room's group (plan part 5).
 async fn handle_epoch_post(
     state: &Arc<ServerState>,
     user_id: UserId,
@@ -4370,18 +4373,24 @@ async fn finish_epoch_post(
     tx: &ControlTx,
 ) {
     use voipc_protocol::gk::{refused_why, GkMember};
-    // The group the channel has now: one that moved (`hide_members`) is not this one
+    // The group the channel has now: one that moved (`hide_members`) is not this one. A
+    // voice room's is its room's, with whether it is anonymous
     let here = state
         .channels
         .read()
         .await
         .get(&post.channel_id)
-        .filter(|c| c.info.text)
-        .map(|c| state.gk_id(c));
-    if here.as_deref() != Some(post.group.as_str()) {
-        let reason = "that channel's key changed, send it again";
-        return rule_refused(tx, &post, refused_why::NOT_MEMBER, reason).await;
-    }
+        .map(|c| match c.info.text {
+            true => (state.gk_id(c), None),
+            false => (state.gk.room_id(c.info.channel_id), Some(c.info.anonymous)),
+        });
+    let room = match here {
+        Some((id, room)) if id == post.group => room,
+        _ => {
+            let reason = "that channel's key changed, send it again";
+            return rule_refused(tx, &post, refused_why::NOT_MEMBER, reason).await;
+        }
+    };
     use crate::state::PostStamp;
     let channel_id = post.channel_id;
     let rules = move |stamp| state.post_rules(session_id, user_id, channel_id, stamp);
@@ -4403,6 +4412,12 @@ async fn finish_epoch_post(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
+    // A voice room's writer is named by the post's epoch, gated or not, as its app names it
+    // (writer.rs `writer_m`): the channel's gate now leads the head's by an opening
+    if let Some(anonymous) = room {
+        let by_connection = anonymous && !state.gk.room_gated(&post.group, &gen, epoch);
+        return room_post(state, user_id, session_id, post, by_connection, timestamp).await;
+    }
     let readers: Vec<ControlTx> = {
         let channels = state.channels.read().await;
         let Some(channel) = channels.get(&channel_id) else {
@@ -4453,21 +4468,122 @@ async fn finish_epoch_post(
     }
 }
 
+/// A voice room's `EpochPostIn` (plan part 5): to every other member of the room, each under
+/// the name it may see (a pseudonym in an anonymous room, but to admins). `by_connection`: an
+/// anonymous room that is not gated, whose seats are named by the connection (open choice
+/// 11): the writer is its connection there, and the post names no account, admin or
+/// moderator.
+async fn room_post(
+    state: &ServerState,
+    user_id: UserId,
+    session_id: SessionId,
+    post: GkPost,
+    by_connection: bool,
+    timestamp: u64,
+) {
+    use voipc_protocol::gk::GkMember;
+    let GkPost {
+        channel_id,
+        group,
+        gen,
+        epoch,
+        blob,
+        ciphertext,
+    } = post;
+    let Some(who) = state
+        .sessions
+        .get(&session_id)
+        .map(|s| (s.account_id(), s.is_admin, s.powers.has(Powers::CHANNELS)))
+    else {
+        return;
+    };
+    let (account, is_admin, is_moderator) = match by_connection {
+        true => (None, false, false),
+        false => who,
+    };
+    let writer = account.map_or(GkMember::Conn(user_id), GkMember::Account);
+    let (real, alias) = state.names_of_in(channel_id, user_id).await;
+    let readers: Vec<UserId> = state
+        .channels
+        .read()
+        .await
+        .get(&channel_id)
+        .map(|c| {
+            c.members
+                .iter()
+                .copied()
+                .filter(|u| *u != user_id)
+                .collect()
+        })
+        .unwrap_or_default();
+    for uid in readers {
+        let Some(s) = state.sessions.get(&uid) else {
+            continue;
+        };
+        let msg = ServerMessage::EpochPostIn {
+            channel_id,
+            group: group.clone(),
+            gen,
+            epoch,
+            user_id,
+            username: crate::state::pick_name(&real, &alias, s.is_admin),
+            account,
+            is_admin,
+            is_moderator,
+            writer,
+            blob: blob.clone(),
+            ciphertext: ciphertext.clone(),
+            timestamp,
+        };
+        let _ = send_msg(&s.control_tx, &msg);
+    }
+}
+
 /// A text channel's old key path with the group key on (plan 2k): `KeyCheck`,
 /// `OpenSessions`, `DistributeSenderKeys` and `SendEncryptedChannelMessage` would reach nobody
-/// there, so they are dropped, and the app is told once a connection. Voice rooms keep theirs
-/// until their group is built (V2); a room's kept log stays on its own path either way (open
-/// choice 26). Whether it was refused.
+/// there, so they are dropped, and the app is told once a connection (`room_refused` for voice
+/// rooms). Whether it was refused.
 async fn legacy_refused(
     state: &ServerState,
     session_id: SessionId,
     channel_id: ChannelId,
     tx: &ControlTx,
 ) -> bool {
-    use voipc_protocol::gk::{refused_what, refused_why};
     if !state.gk.on || !state.is_text_channel(channel_id).await {
         return false;
     }
+    legacy_told(state, session_id, tx);
+    true
+}
+
+/// A voice room's old key path with the group key on (plan 2k): its keys come from the
+/// room's epoch key and its chat goes by `EpochPost`, so `DistributeMediaKey`,
+/// `DistributeSenderKey` and `SendEncryptedChannelMessage` there are dropped, and the app is
+/// told once a connection. A room's kept log stays on its own path (open choice 26: the
+/// accounts requests, not these). Whether it was refused.
+async fn room_refused(
+    state: &ServerState,
+    session_id: SessionId,
+    channel_id: ChannelId,
+    tx: &ControlTx,
+) -> bool {
+    let room = channel_id != 0
+        && state
+            .channels
+            .read()
+            .await
+            .get(&channel_id)
+            .is_some_and(|c| !c.info.text);
+    if !state.gk.on || !room {
+        return false;
+    }
+    legacy_told(state, session_id, tx);
+    true
+}
+
+/// `EpochRefused{LEGACY, LEGACY_PATH}`, once a connection.
+fn legacy_told(state: &ServerState, session_id: SessionId, tx: &ControlTx) {
+    use voipc_protocol::gk::{refused_what, refused_why};
     let first = state
         .sessions
         .get_mut(&session_id)
@@ -4483,7 +4599,6 @@ async fn legacy_refused(
             },
         );
     }
-    true
 }
 
 /// A post on the live path: to whoever its writer has been told of, so a key is always ahead

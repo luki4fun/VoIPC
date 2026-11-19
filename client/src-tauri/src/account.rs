@@ -597,6 +597,12 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
                 }
                 Step::ResetDone => {
                     info!(server, "account password reset with the recovery key");
+                    // The seat keys rotate at the next sign-in that reaches the group key (3e)
+                    state
+                        .gk_rotate
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .insert((server.to_string(), name.clone()));
                     return Err(RESET_DONE.into());
                 }
                 // Only the browser stretches outside the machine
@@ -658,6 +664,7 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
     };
 
     let signed = machine.finish()?;
+    let relay_id = signed.relay_id;
     if known_here != Some(signed.relay_id) {
         let mut cfg = state.config();
         cfg.relay_ids
@@ -689,6 +696,12 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
     if let Some(id) = held {
         session.set_held_device(id);
     }
+    // What this device keeps of the group key here: by the relay this account is on
+    signal
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .gk
+        .set_scope((hex(&relay_id), Some(session.account_id())));
     // Nothing to send yet (the sync's first asks wait for `after_connect`);
     // the front end hears it signed in, its choices along with it.
     for (name, payload) in started.emit {
@@ -825,22 +838,17 @@ pub async fn save_pins(
 }
 
 /// `AccountSession::tick` every couple of seconds, for as long as the
-/// connection lasts.
-pub async fn tick_task(
-    app: tauri::AppHandle,
-    server: String,
-    link: std::sync::Arc<AccountLink>,
-    tcp_tx: crate::network::ControlTx,
-) {
+/// connection lasts. Its group key news goes to the connection's keying.
+pub async fn tick_task(gk: crate::gk_net::GkLink, link: std::sync::Arc<AccountLink>) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         interval.tick().await;
-        if tcp_tx.is_closed() {
+        if gk.tcp_tx.is_closed() {
             return;
         }
         let a = link.session().tick();
-        run(&app, &server, &tcp_tx, a).await;
+        crate::gk_net::account_news(&gk, a).await;
     }
 }
 
@@ -879,14 +887,10 @@ pub async fn check_seen(
     }
 }
 
-/// An `AccountReply` on an account connection.
-pub async fn on_reply(
-    app: &tauri::AppHandle,
-    server: &str,
-    link: &AccountLink,
-    tcp_tx: &crate::network::ControlTx,
-    reply: AccountReply,
-) {
+/// An `AccountReply` on an account connection. What it brings the group key (seat keys,
+/// vault floors, past epochs' asks) goes to the connection's keying.
+pub async fn on_reply(gk: &crate::gk_net::GkLink, link: &AccountLink, reply: AccountReply) {
+    let server = &*gk.server;
     if let AccountReply::Error { request, reason } = &reply {
         if request.starts_with("Device") {
             warn!(server, "could not remember this device: {reason}");
@@ -894,11 +898,11 @@ pub async fn on_reply(
     }
     // A run's frames are answered 8 times a second, in numbers a page cannot hold
     #[cfg(not(target_os = "android"))]
-    let Some(reply) = app.state::<AppState>().import.on_reply(server, reply) else {
+    let Some(reply) = gk.app.state::<AppState>().import.on_reply(server, reply) else {
         return;
     };
     let a = link.session().on_reply(&reply);
-    run(app, server, tcp_tx, a).await;
+    crate::gk_net::account_news(gk, a).await;
 }
 
 // ── Commands ──────────────────────────────────────────────────────────────

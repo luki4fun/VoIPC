@@ -32,6 +32,8 @@ mod gk_e2e_r2;
 #[cfg(test)]
 mod gk_e2e_tests;
 #[cfg(test)]
+mod gk_e2e_v2;
+#[cfg(test)]
 mod gk_tests;
 mod layout;
 mod load;

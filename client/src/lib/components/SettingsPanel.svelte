@@ -1299,6 +1299,7 @@
               invoke("set_config_bool", { key: "help_hold_keys", value: enabled }).catch((err: any) => {
                 addNotification(`Failed to save setting: ${err}`, "error");
               });
+              invoke("set_help_hold_keys", { enabled }).catch(() => {});
             }}
           />
           <span class="toggle-label">Help hold keys for text channels</span>

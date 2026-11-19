@@ -31,13 +31,14 @@ pub struct Volunteer {
 
 impl Volunteer {
     /// Lower is better: account desktop, account browser, guest desktop, guest browser.
-    /// `None` where it may not hold this kind of group's keys (a phone in text).
+    /// `None` where it may not hold this kind of group's keys (a phone in text). A voice
+    /// room ranks nobody: it picks by user id (§5.9).
     pub fn rank(&self, kind: GroupKind) -> Option<u8> {
         let guest = 2 * u8::from(self.m.is_conn());
         match (kind, self.platform) {
+            (GroupKind::Voice, _) => Some(0),
             (_, platform::DESKTOP) => Some(guest),
             (_, platform::BROWSER) => Some(guest + 1),
-            (GroupKind::Voice, platform::PHONE) => Some(guest + 1),
             _ => None,
         }
     }
@@ -338,7 +339,7 @@ impl Holders {
         let guests = self.set.iter().filter(|k| k.m.is_conn()).count();
         let best = allowed(kind, vols, gated, seats)
             .filter(|v| self.entry_of(v).is_none() && !self.set.iter().any(|k| k.kx == v.pair.kx()))
-            .filter(|v| !v.m.is_conn() || guests < MAX_GUEST_KEYHOLDERS)
+            .filter(|v| !v.m.is_conn() || kind == GroupKind::Voice || guests < MAX_GUEST_KEYHOLDERS)
             .filter(|v| v.entry(kind).is_some())
             .min_by_key(|v| (v.rank(kind), v.sid))?;
         if self.online(vols).len() < KEYHOLDERS_ONLINE_MIN {
@@ -358,7 +359,8 @@ impl Holders {
 
 /// The volunteers allowed to hold a group's keys (plan 2d): phones never in text;
 /// browsers only with no account desktop online and at most 10 000 seats; guests only in
-/// an open group with no account volunteer online.
+/// an open group with no account volunteer online. In a voice room every member may (its
+/// volunteers are its members, voice.rs `room_seat`).
 pub fn allowed(
     kind: GroupKind,
     vols: &HashMap<UserId, Volunteer>,
@@ -372,9 +374,10 @@ pub fn allowed(
         .values()
         .any(|v| !v.m.is_conn() && v.rank(kind).is_some());
     vols.values().filter(move |v| {
-        v.rank(kind).is_some()
-            && (!v.browser() || (!desktop && seats <= BROWSER_MAX_SEATS as usize))
-            && (!v.m.is_conn() || (!gated && !account))
+        kind == GroupKind::Voice
+            || (v.rank(kind).is_some()
+                && (!v.browser() || (!desktop && seats <= BROWSER_MAX_SEATS as usize))
+                && (!v.m.is_conn() || (!gated && !account)))
     })
 }
 

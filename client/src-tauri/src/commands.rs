@@ -460,6 +460,28 @@ pub async fn set_history_sharing(state: State<'_, AppState>, enabled: bool) -> R
     Ok(())
 }
 
+/// "Help hold keys for text channels" switched: every open connection offers to hold
+/// keys, or stops (`GroupKeying::set_volunteer`). The setting itself is saved by
+/// `set_config_bool`; the next connection reads it from there.
+#[tauri::command]
+pub async fn set_help_hold_keys(
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+    enabled: bool,
+) -> Result<(), String> {
+    let links: Vec<crate::gk_net::GkLink> = state
+        .connections
+        .read()
+        .await
+        .iter()
+        .map(|(server, c)| crate::gk_net::GkLink::of(&app_handle, server, c))
+        .collect();
+    for link in &links {
+        crate::gk_net::set_volunteer(link, enabled).await;
+    }
+    Ok(())
+}
+
 /// Ask named members for a channel's recent chat.
 ///
 /// The automatic ask happens once per channel entry; this is the user asking
@@ -865,7 +887,7 @@ pub async fn send_channel_message(
     fwd: Option<serde_json::Value>,
     event: Option<serde_json::Value>,
 ) -> Result<(), String> {
-    let (user_id, username, current_channel_id, tcp_tx, signal, account, channels) = {
+    let (user_id, username, current_channel_id, tcp_tx, signal, account, channels, gk) = {
         let conns = state.connections.read().await;
         let connection = conn(&conns, &server)?;
         (
@@ -878,6 +900,7 @@ pub async fn send_channel_message(
             connection.signal.clone(),
             connection.account.clone(),
             connection.channels.clone(),
+            crate::gk_net::GkLink::of(&app_handle, &server, connection),
         )
     };
     let channel_id = channel_id.unwrap_or(current_channel_id);
@@ -886,17 +909,23 @@ pub async fn send_channel_message(
         return Err("Chat is not available in the lobby".into());
     }
 
+    let text = channels
+        .lock()
+        .ok()
+        .is_some_and(|c| c.iter().any(|ch| ch.channel_id == channel_id && ch.text));
     // On the live path a text channel's keys follow the post (`ChannelKeying::live_post`).
-    let live = tcp_tx.proto() >= LIVE_PATH_SINCE
-        && channels
-            .lock()
-            .ok()
-            .is_some_and(|c| c.iter().any(|ch| ch.channel_id == channel_id && ch.text));
+    let live = tcp_tx.proto() >= LIVE_PATH_SINCE && text;
+    // Under the group key every channel's chat is a post under its epoch (`GroupKeying::post`)
+    let group_key = signal
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .gk
+        .on();
 
     // Somebody left this channel since we last wrote in it: mint a new sender
     // key and hand it to the members still here, so the leaver's copy of the
     // chain cannot read what follows.
-    if !live {
+    if !live && !group_key {
         network::rotate_sender_key_if_stale(channel_id, user_id, &signal, &tcp_tx).await;
     }
 
@@ -907,25 +936,55 @@ pub async fn send_channel_message(
     let payload = crypto::envelope_with(&message_id, &content, ttl_secs, &extras);
 
     // A channel with a log keeps it for its members too (cloud copies on),
-    // whether or not anybody is here to read it now.
-    if let Some(link) = &account {
-        let log = channels
-            .lock()
-            .ok()
-            .and_then(|c| {
-                c.iter()
-                    .find(|ch| ch.channel_id == channel_id)
-                    .map(|ch| ch.log.clone())
-            })
-            .unwrap_or_default();
+    // whether or not anybody is here to read it now. Under the group key a text
+    // channel's copy waits for the post to go out, under the epoch it goes under
+    // (`GkOut::released`); a voice room's log stays on its old chains (open choice 26).
+    let log = channels
+        .lock()
+        .ok()
+        .and_then(|c| {
+            c.iter()
+                .find(|ch| ch.channel_id == channel_id)
+                .map(|ch| ch.log.clone())
+        })
+        .unwrap_or_default();
+    let now = crypto::now_ms();
+    let kept_later = group_key && text && account.is_some() && !log.is_empty();
+    if let Some(link) = account.as_ref().filter(|_| !kept_later) {
         let a = link
             .session()
-            .outgoing_channel(&log, payload.clone(), crypto::now_ms(), ttl_secs);
+            .outgoing_channel(&log, payload.clone(), now, ttl_secs);
         crate::account::run(&app_handle, &server, &tcp_tx, a).await;
     }
 
+    if group_key {
+        let kept = kept_later.then_some((log, now, ttl_secs));
+        crate::gk_net::post(&gk, channel_id, &payload, kept).await?;
+        // Their own row shows it as sent; `gk-post-dropped` says so if it could not go.
+        network::emit_server(
+            &app_handle,
+            &server,
+            "channel-chat-message",
+            serde_json::json!({
+                "channel_id": channel_id,
+                "user_id": user_id,
+                "username": username,
+                "content": content,
+                "timestamp": now,
+                "message_id": message_id,
+                "ttl_secs": ttl_secs,
+                "reply_to": extras.reply,
+                "thread": extras.thread,
+                "file": extras.file,
+                "fwd": extras.fwd,
+                "event": extras.event,
+                "encrypted": true,
+            }),
+        );
+        return Ok(());
+    }
+
     if live {
-        let now = crypto::now_ms();
         let out = with_keys(&signal, |stores, keying| {
             keying.live_post(stores, channel_id, payload, now)
         })

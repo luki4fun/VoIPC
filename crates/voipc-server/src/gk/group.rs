@@ -162,6 +162,9 @@ pub struct Member {
     pub have: Option<FloorRef>,
     /// The last exit `seq` it was told as a writer: `EpochExit` goes once per exit.
     pub told: u64,
+    /// A voice room's member that was sent the whole roster (`VoiceSeats`): each change
+    /// goes to it from then on.
+    pub roster: bool,
 }
 
 /// What a fetch asks, as the caller resolved it.
@@ -207,6 +210,9 @@ pub struct GroupState {
     pub stored: bool,
     /// The channel's gate as the relay holds it; the head's may lag (plan 2d).
     pub gate: bool,
+    /// A voice room's `anonymous` flag, as its last join found it: it names the seats taken
+    /// from then on (voice.rs `room_seat_m`).
+    pub anonymous: bool,
     pub head: Option<Head>,
     pub gens: Vec<[u8; 16]>,
     pub gen_time: u64,
@@ -275,6 +281,7 @@ impl GroupState {
             kind,
             stored,
             gate: false,
+            anonymous: false,
             head: None,
             gens: vec![],
             gen_time: 0,
@@ -384,7 +391,7 @@ impl GroupState {
         self.head.as_ref().map(|h| h.sh.header().gen)
     }
 
-    fn head_gated(&self) -> bool {
+    pub(super) fn head_gated(&self) -> bool {
         self.head.as_ref().is_some_and(|h| h.sh.header().gated)
     }
 
@@ -397,26 +404,33 @@ impl GroupState {
 
     /// A session leaves the group (unfollow, kick, disconnect): its seat exits when no
     /// other session holds it, but going offline is no exit for an account's text seat
-    /// (§5.4); a due it was asked goes to another keyholder.
+    /// (§5.4); a due it was asked goes to another keyholder. A voice room's members hear it
+    /// left, and a voice keyholder's leave closes the exit batch at once, so its removal
+    /// carries its seat's exit (§5.9).
     pub fn leave(&mut self, sid: UserId, cause: u8, now: u64, out: &mut Vec<Out>) {
         let Some(m) = self.members.remove(&sid) else {
             return;
         };
+        let voice = self.kind == GroupKind::Voice;
+        let keyholder = voice && self.is_keyholder(sid);
+        let rostered = voice && self.vols.contains_key(&sid);
         self.vols.remove(&sid);
         if let Some((p, _)) = self.open.remove(&sid) {
             self.caps.charge(sid, p.held(), 0);
         }
-        self.joins.drop_sid(sid);
-        let stored = self.stored;
-        self.joins
-            .queue
-            .retain(|w| !w.sids.is_empty() || (stored && w.account.is_some()));
+        self.joins.leave(sid, self.stored);
         if let Some(seat) = m.seat {
             let offline =
                 cause == cause::DISCONNECT && !seat.m.is_conn() && self.kind == GroupKind::Text;
             if !offline && !self.members.values().any(|o| o.seat == Some(seat)) {
                 self.exit(seat, cause, now, out);
             }
+        }
+        if rostered {
+            self.room_gone(sid, out);
+        }
+        if keyholder {
+            self.exits.close(self.head_gated());
         }
         if let Some(i) = self.dues.iter().position(|d| d.sid == sid) {
             self.dues.remove(i);
@@ -486,12 +500,18 @@ impl GroupState {
                 .map(|j| j.seat)
                 .filter(|s| s.m.account() == Some(*account)),
         );
+        // Its sessions' seats, whatever they are named by: a voice seat in an anonymous room
+        // that is not gated is its connection's (open choice 11)
+        seats.extend(
+            self.members
+                .values()
+                .filter(|m| m.account.as_ref() == Some(account))
+                .filter_map(|m| m.seat),
+        );
         for s in seats {
             self.exit(s, cause, now, out);
         }
-        self.joins
-            .queue
-            .retain(|w| w.account.as_ref() != Some(account));
+        self.joins.retain(|w| w.account.as_ref() != Some(account));
         self.rejoins.retain(|w| w.account.as_ref() != Some(account));
         for m in self.members.values_mut() {
             if m.account.as_ref() == Some(account) {
@@ -504,9 +524,7 @@ impl GroupState {
     /// A seat enters the open exit batch; writers of the epoch hear of it at once (1f.6).
     /// A seat a due out is seating exits once that lands.
     pub fn exit(&mut self, seat: SeatRef, cause: u8, now: u64, out: &mut Vec<Out>) {
-        if self.joins.has(&seat) {
-            self.joins.queue.retain(|w| w.joiner.seat != seat);
-        }
+        self.joins.take(&seat);
         if !self.seats.contains_key(&seat) {
             let seating = self
                 .dues
@@ -541,9 +559,10 @@ impl GroupState {
         }
     }
 
-    /// A session's `KeyholdVolunteer`, or its end (`None`).
+    /// A session's `KeyholdVolunteer`, or its end (`None`). A voice room takes none: every
+    /// member offers its seat's pair by its fetch (voice.rs `room_seat`).
     pub fn volunteer(&mut self, sid: UserId, v: Option<Volunteer>, now: u64, out: &mut Vec<Out>) {
-        if !self.members.contains_key(&sid) {
+        if !self.members.contains_key(&sid) || self.kind == GroupKind::Voice {
             return;
         }
         match v {
@@ -598,11 +617,12 @@ impl GroupState {
             self.wait(out, sid, wait::NO_SEAT_KEYS, "");
             return Fetched::Not;
         };
-        let member = match m.account {
-            Some(a) => MemberId::Account(a),
-            None => MemberId::Conn(sid),
+        let seat = match self.kind {
+            GroupKind::Voice => self.room_seat(sid, m.account, &pair, ik, now, out),
+            GroupKind::Text => pair
+                .keys
+                .seat(m.account.map_or(MemberId::Conn(sid), MemberId::Account)),
         };
-        let seat = pair.keys.seat(member);
         if let Some(mm) = self.members.get_mut(&sid) {
             mm.seat = Some(seat);
         }
@@ -651,13 +671,7 @@ impl GroupState {
             return;
         }
         // At most `kept_seats` eager seats wait (plan 2d), however many sources queue them
-        let eager = self
-            .joins
-            .queue
-            .iter()
-            .filter(|w| w.sids.is_empty())
-            .count();
-        if eager >= self.kept_seats && !self.joins.has(&joiner.seat) {
+        if self.joins.eager() >= self.kept_seats && !self.joins.has(&joiner.seat) {
             return;
         }
         self.joins.add(
@@ -744,7 +758,12 @@ impl GroupState {
             remove: d.due.remove.map(Into::into),
             gated: d.due.gated,
             roll_due,
-            seed_seats: vec![],
+            // A voice Remove rolls the seed in its own commit (§5.6): the seats behind get
+            // their seed welcomes in it
+            seed_seats: match (self.kind, d.due.remove) {
+                (GroupKind::Voice, Some(_)) => self.room_seed_seats(&d.held),
+                _ => vec![],
+            },
             finish: d.held.is_empty(),
             pairs,
             held: d.held.iter().map(|(s, n)| ((*s).into(), *n)).collect(),
@@ -801,7 +820,7 @@ impl GroupState {
             return;
         }
         self.retry_at = None;
-        let wanted = !self.joins.queue.is_empty() || self.members.values().any(|m| m.waiting);
+        let wanted = !self.joins.is_empty() || self.members.values().any(|m| m.waiting);
         if self.head.is_none() || self.new_gen {
             self.ask_start(Kind::Genesis, wanted, now, out);
             return;
@@ -945,11 +964,14 @@ impl GroupState {
                     None,
                 ));
             }
-            if let Some(v) = self
-                .holders
-                .promotion(self.kind, &self.vols, self.opening_gated(), seats)
-                .cloned()
-            {
+            let promote = match self.kind {
+                GroupKind::Voice => self.room_candidate(),
+                GroupKind::Text => self
+                    .holders
+                    .promotion(self.kind, &self.vols, self.opening_gated(), seats)
+                    .cloned(),
+            };
+            if let Some(v) = promote {
                 let seated = self
                     .members
                     .get(&v.sid)
@@ -1187,6 +1209,10 @@ impl GroupState {
                 .then(|| d.held.get(s).copied().unwrap_or(d.head_seed))
         };
         let used = |v: u64| self.used_v.contains(&v);
+        let roster = match self.kind {
+            GroupKind::Voice => self.room_roster(),
+            GroupKind::Text => vec![],
+        };
         let head = self.head.as_ref().map(|h| CommitHead {
             head: &h.sh,
             kh: &h.kh,
@@ -1204,7 +1230,7 @@ impl GroupState {
             known_gens: &self.gens,
             used_v: &used,
             now: now / 1000,
-            roster: &[],
+            roster: &roster,
             no_keyholder_since: self.no_keyholder_since.map(|t| t / 1000),
         };
         validate(&view, c)
@@ -1383,7 +1409,8 @@ impl GroupState {
             due.due.joiners.iter().map(|j| (j.seat, j)).collect();
         for (s, v) in &a.seated {
             if let Some(j) = joiners.get(s) {
-                if s.m.is_conn() {
+                // A voice seat is its connection's pair, an account's too
+                if s.m.is_conn() || self.kind == GroupKind::Voice {
                     let pair = Pair {
                         keys: j.keys.clone(),
                         endorsement: j.endorsement.clone(),
@@ -1554,9 +1581,6 @@ impl GroupState {
             .iter()
             .map(|v| v.sid)
             .collect();
-        for sid in &holders {
-            self.pushed(out, *sid, piece.clone());
-        }
         // A member's push carries its leaf, path and seal, and its keying when this header
         // made its version (a re-key by rows, a ratchet): the pushed header moves its floor,
         // so a later fetch from there would never be told the version moved (3f)
@@ -1577,9 +1601,26 @@ impl GroupState {
             }
             p
         };
+        // A voice keyholder is a member who hears the room too: its push carries its seal
+        // as well, so it moves to the new epoch with the others, not a fetch later (§5.9)
+        for sid in &holders {
+            let p = match self.kind {
+                GroupKind::Voice => InPiece {
+                    chain: piece.chain.clone(),
+                    ..piece_for(sid)
+                },
+                GroupKind::Text => piece.clone(),
+            };
+            self.pushed(out, *sid, p);
+        }
         let mut pushed: Vec<(UserId, InPiece)> = vec![];
         if h.kind.opens_epoch() {
-            for sid in writers.iter().filter(|s| !holders.contains(s)) {
+            // A voice room's every member takes an opening at once, writer or not (§5.9)
+            let to = match self.kind {
+                GroupKind::Voice => self.seated_sids().into_iter().map(|(s, _)| s).collect(),
+                GroupKind::Text => writers.clone(),
+            };
+            for sid in to.iter().filter(|s| !holders.contains(s)) {
                 pushed.push((*sid, piece_for(sid)));
             }
         }
@@ -1608,7 +1649,12 @@ impl GroupState {
                 joins: vec![header_in(&sh)],
                 ..NamesPiece::default()
             };
-            for sid in &writers {
+            // A gated voice room's every member folds each Join's names (§5.9)
+            let to = match self.kind {
+                GroupKind::Voice => self.seated_sids().into_iter().map(|(s, _)| s).collect(),
+                GroupKind::Text => writers.clone(),
+            };
+            for sid in &to {
                 out.push(Out(*sid, push::names_in(&self.id, p.clone())));
             }
         }
@@ -1646,7 +1692,17 @@ impl GroupState {
                 answer.push((*sid, seated.contains(&seat) && h.kind == Kind::Join));
             }
         }
-        // A new start unseats everyone else: they fetch again and are queued
+        // A voice room's new start seats every member whose pair the relay holds, with no
+        // fetch (§5.9); in a text group it unseats everyone else: they fetch again and are
+        // queued
+        if h.kind.starts_anew() && self.kind == GroupKind::Voice {
+            self.room_reseat(now, out);
+        }
+        // A gate's end opened the head: an anonymous room's signed-in members sit by their
+        // connection again (voice.rs `room_seat_m`)
+        if self.kind == GroupKind::Voice && was_gated && !h.gated {
+            self.room_rename(cause::GATE, now, out);
+        }
         if h.kind.starts_anew() {
             for m in self.members.values_mut() {
                 if m.seat
@@ -1923,8 +1979,14 @@ impl GroupState {
         let Some(seat) = m.seat else {
             return Err(refused_why::NOT_MEMBER);
         };
+        // Kept under the writer its post names (a voice room's by the post's epoch, as its
+        // app names it), which readers ask it by
+        let by = match self.kind {
+            GroupKind::Voice => self.room_writer(sid, m.account, &gen, epoch),
+            GroupKind::Text => seat.m,
+        };
         let w = GkWriter {
-            m: seat.m.into(),
+            m: by.into(),
             u: sid,
         };
         let kept = self.blobs.entry((epoch, w)).or_default();
@@ -2050,6 +2112,11 @@ impl GroupState {
     /// go before `DUE_GATE`; off, the next opening clears it.
     pub fn set_gate(&mut self, gated: bool, now: u64, out: &mut Vec<Out>) {
         self.gate = gated;
+        // A voice room's signed-in members sit by their connection while it is anonymous and
+        // open: gated, each takes its account's seat in the open group first (voice.rs)
+        if self.kind == GroupKind::Voice {
+            self.room_rename(cause::GATE, now, out);
+        }
         if gated {
             let conns: Vec<SeatRef> = self
                 .seats
@@ -2415,7 +2482,7 @@ impl GroupState {
             + self.seals.len() * 120
             + (self.recent.len() + self.khs.len()) * 1200
             + self.members.len() * 160
-            + (self.joins.queue.len() + self.rejoins.len() + self.conn_keys.len()) * 1400;
+            + (self.joins.len() + self.rejoins.len() + self.conn_keys.len()) * 1400;
         n as u64
     }
 
@@ -2443,7 +2510,7 @@ impl GroupState {
         self.members.is_empty()
             && self.dues.is_empty()
             && self.open.is_empty()
-            && self.joins.queue.is_empty()
+            && self.joins.is_empty()
             && self.rejoins.is_empty()
             && (forced.is_empty() || forced.len() >= self.holders.set.len())
     }

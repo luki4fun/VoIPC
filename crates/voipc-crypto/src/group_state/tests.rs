@@ -1500,9 +1500,46 @@ fn a_fetch_refused_for_now_is_asked_again_and_tells_no_refusal() {
         w.now,
     );
     assert!(no_refusal(&out) && out.send.is_empty());
-    let out = d.tick(t + CHECK_WAIT_MS);
+    let out = d.tick(t + 2 * CHECK_WAIT_MS);
     assert!(no_refusal(&out));
-    assert_eq!(fetches(&out), 1, "asked again at the fetch pace");
+    assert_eq!(fetches(&out), 1, "asked again at the fetch pace, jittered");
+}
+
+/// L1 (50k reconnect): a member whose fetch a full inbox refused `RATE` asked again only
+/// once a post waited, so the members not seated waited for the first post and then all
+/// fetched at once. One with no key of the head asks again after its pause, a post waiting
+/// or not, each at its own time within `CHECK_WAIT_MS` of the pace; a seated one does not.
+#[test]
+fn a_member_refused_rate_with_no_key_asks_again_after_its_own_pause_a_seated_one_not() {
+    let s = crate::time::now_millis() / 1000;
+    let base = s * 1000;
+    let mut firsts = std::collections::HashSet::new();
+    for u in 20..28 {
+        let mut d = Device::guest(u);
+        assert_eq!(
+            fetches(&d.track(TEXT_ID, GroupKind::Text, VaultFloor::None)),
+            1
+        );
+        let rate = refused(gk::refused_what::FETCH, gk::refused_why::RATE);
+        assert_eq!(fetches(&d.frame(&rate, s)), 0);
+        assert_eq!(fetches(&d.tick(base + CHECK_WAIT_MS - 1)), 0, "not before");
+        let first = (0..=40)
+            .map(|i| base + CHECK_WAIT_MS + i * CHECK_WAIT_MS / 40)
+            .find(|t| fetches(&d.tick(*t)) == 1)
+            .expect("asked again with nothing waiting");
+        firsts.insert(first);
+    }
+    assert!(firsts.len() > 1, "each at its own time: {firsts:?}");
+    let mut w = World::text(false, false);
+    let mut d = seated_guest(&mut w, 30);
+    assert!(d.keying.current_epoch(TEXT_ID).is_some());
+    let rate = refused(gk::refused_what::FETCH, gk::refused_why::RATE);
+    assert_eq!(fetches(&d.frame(&rate, w.now)), 0);
+    assert_eq!(
+        fetches(&d.tick(w.now * 1000 + 2 * CHECK_WAIT_MS)),
+        0,
+        "seated"
+    );
 }
 
 /// Finding: a missing `kh` made the member fetch again at once on every answer that lacked

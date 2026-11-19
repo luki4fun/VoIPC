@@ -10,6 +10,11 @@ publish = false
 name = "voipc-server"
 path = "src/main.rs"
 
+# Its unit tests (the smoke check's lines) run with the crate's tests
+[[example]]
+name = "group_load"
+test = true
+
 [dependencies]
 voipc-protocol = { workspace = true }
 tokio = { workspace = true }

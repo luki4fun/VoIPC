@@ -82,6 +82,8 @@ enum Msg {
     Follow {
         sid: UserId,
         account: Option<[u8; 16]>,
+        /// A voice room's `anonymous` flag as this join found it (`room_seat_m`).
+        anonymous: bool,
     },
     Leave {
         sid: UserId,
@@ -160,6 +162,10 @@ enum Msg {
     },
     Gate {
         gated: bool,
+    },
+    /// A voice room's `anonymous` flag changed.
+    Anonymous {
+        anonymous: bool,
     },
     /// A seed-welcome page's welcomes (`EpochWelcomes`).
     Welcomes {
@@ -554,7 +560,8 @@ impl Groups {
         self.shared.conns.insert(sid, tx);
     }
 
-    /// A session follows a text channel (or joins a room, V2): it may fetch its group.
+    /// A session follows a text channel: it may fetch its group (a voice room's join is
+    /// `on_room_join`).
     pub fn on_follow(
         &self,
         channel: ChannelId,
@@ -562,6 +569,18 @@ impl Groups {
         kind: GroupKind,
         sid: UserId,
         account: Option<[u8; 16]>,
+    ) {
+        self.follow_in(channel, group, kind, sid, account, false);
+    }
+
+    fn follow_in(
+        &self,
+        channel: ChannelId,
+        group: &str,
+        kind: GroupKind,
+        sid: UserId,
+        account: Option<[u8; 16]>,
+        anonymous: bool,
     ) {
         if !self.on {
             return;
@@ -575,7 +594,12 @@ impl Groups {
             .entry(sid)
             .or_default()
             .insert(group.to_string());
-        self.post(group, Msg::Follow { sid, account }, 0, true);
+        let msg = Msg::Follow {
+            sid,
+            account,
+            anonymous,
+        };
+        self.post(group, msg, 0, true);
         if let Some(v) = self.vols.get(&sid).map(|v| v.clone()) {
             let device = self.shared.devices.get(&sid).map(|d| d.clone());
             let msg = Msg::Volunteer {
@@ -1140,7 +1164,7 @@ fn publish(h: &Handle, g: &GroupState, now: u64) {
         } else {
             (now.saturating_sub(g.last_commit) / 1000) as u32
         };
-        s.joins_waiting = g.joins.queue.len() as u32;
+        s.joins_waiting = g.joins.len() as u32;
         s.exits_waiting = g.exits.waiting() as u32;
         s.missed_deadlines = g.missed_total;
         s.mem_bytes = g.mem_bytes() + h.store.mem_bytes();
@@ -1331,7 +1355,9 @@ async fn actor(
             ) => Some(*sid),
             _ => None,
         };
-        let all = matches!(msg, Some(Msg::AccountExit { .. }));
+        // Many sessions' seats may move: an account's exit, a voice room's seats named anew
+        let named = (g.anonymous, g.gate);
+        let mut all = matches!(msg, Some(Msg::AccountExit { .. }));
         match msg {
             None => {
                 g.tick(now, &mut out);
@@ -1339,6 +1365,7 @@ async fn actor(
             }
             Some(m) => handle_msg(&shared, &h, &mut g, m, now, &mut out, &mut answers).await,
         }
+        all |= (g.anonymous, g.gate) != named;
         if g.exits.next != exits_from {
             h.store.exits_entered(&h.id, &g, exits_from, now).await;
         }
@@ -1407,12 +1434,18 @@ fn holders_now(g: &GroupState) -> (Vec<[u8; 32]>, Vec<[u8; 32]>) {
 type PageKeys = (Vec<(SeatRef, [u8; 32], Pair)>, Vec<(SeatRef, u8)>);
 
 /// The identity keys and pairs of `seats` a seed-welcome page asks: an account seat's from
-/// its published seat keys (`voipc_gk_seatkeys`), a connection seat's from its join. A seat
-/// whose keys are not found, or make another seat (rotated since), is gone (cause
-/// `ROTATION`): it can never take this seed, so it exits and the roll can end (plan 2d).
+/// its published seat keys (`voipc_gk_seatkeys`), a connection seat's and every voice seat's
+/// from its join. A seat whose keys are not found, or make another seat (rotated since), is
+/// gone (cause `ROTATION`): it can never take this seed, so it exits and the roll can end
+/// (plan 2d).
 /// When the database read fails nobody is gone: the account seats wait for the next page.
 async fn page_keys(shared: &Shared, g: &GroupState, seats: &[SeatRef]) -> PageKeys {
-    let accounts: Vec<[u8; 16]> = seats.iter().filter_map(|s| s.m.account()).collect();
+    // A voice seat is its connection's pair, an account's too: its keys are its join's
+    let voice = g.kind == GroupKind::Voice;
+    let accounts: Vec<[u8; 16]> = match voice {
+        true => vec![],
+        false => seats.iter().filter_map(|s| s.m.account()).collect(),
+    };
     let mut read = true;
     let found = match shared.db.get() {
         Some(db) if !accounts.is_empty() => match store::seat_kems(&db.db, &accounts).await {
@@ -1428,6 +1461,7 @@ async fn page_keys(shared: &Shared, g: &GroupState, seats: &[SeatRef]) -> PageKe
     let (mut keyed, mut gone) = (vec![], vec![]);
     for s in seats {
         let keys = match s.m.account() {
+            Some(_) if voice => g.conn_keys.get(s),
             Some(_) if !read => continue,
             Some(a) => found.get(&a),
             None => g.conn_keys.get(s),
@@ -1547,7 +1581,16 @@ async fn handle_msg(
     answers: &mut Vec<(UserId, SeatRef, Option<FloorRef>, bool)>,
 ) {
     match m {
-        Msg::Follow { sid, account } => g.follow(sid, account),
+        Msg::Follow {
+            sid,
+            account,
+            anonymous,
+        } => {
+            if g.kind == GroupKind::Voice {
+                g.room_anonymous(anonymous, now, out);
+            }
+            g.follow(sid, account)
+        }
         Msg::Leave { sid, cause } => {
             h.kh_sent.remove(&sid);
             h.keyed.remove(&sid);
@@ -1672,6 +1715,7 @@ async fn handle_msg(
         } => g.names(sid, &from, &to, removals, out),
         Msg::FloorAhead { sid, header } => g.floor_ahead(sid, &header, now, out),
         Msg::Gate { gated } => g.set_gate(gated, now, out),
+        Msg::Anonymous { anonymous } => g.room_anonymous(anonymous, now, out),
         Msg::Welcomes {
             sid,
             due,

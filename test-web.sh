@@ -29,6 +29,9 @@
 # it, and bob, the share's first viewer, is sent there. He must report the edge ready, never
 # failed, and decode alice's frames, which then came through the edge.
 #
+# GK=1 runs the relays with the group key on (group_key = true): text channels, and voice
+# rooms whose group the relay builds, take their keys from it instead of the old paths.
+#
 # UI_TEST=0 skips test-ui.mjs. It drives its own Chromium and reads none of the
 # settings above, so CI runs it only where the network differs.
 #
@@ -234,6 +237,8 @@ key_path = "server.key"
 [files]
 cache_mins = 1
 TOML
+# GK=1: the group key, a top-level key, so before any table
+if [ "${GK:-}" = 1 ]; then sed -i '1i group_key = true' "$WORK/server.toml"; fi
 # EDGE=1: edge e1 may link, and takes a share's viewers from the first on
 EDGE_PORT=$((TCP_PORT + 3))
 EDGE_SECRET="e2e-edge-secret-of-at-least-32-chars"
@@ -283,7 +288,9 @@ fi
 TCP_PORT2=$((TCP_PORT + 1))
 mkdir -p "$WORK/s2"
 cp "$WORK/server.crt" "$WORK/server.key" "$WORK/s2/"
-(cd "$WORK/s2" && exec "$SCRIPT_DIR/$SERVER" --host 127.0.0.1 --tcp-port "$TCP_PORT2" --udp-port "$TCP_PORT2" \
+printf 'cert_path = "server.crt"\nkey_path = "server.key"\n' > "$WORK/s2/server.toml"
+if [ "${GK:-}" = 1 ]; then sed -i '1i group_key = true' "$WORK/s2/server.toml"; fi
+(cd "$WORK/s2" && exec "$SCRIPT_DIR/$SERVER" --config server.toml --host 127.0.0.1 --tcp-port "$TCP_PORT2" --udp-port "$TCP_PORT2" \
   --cert server.crt --key server.key --tcp-fallback > "$WORK/server2.log" 2>&1) &
 for _ in $(seq 1 50); do
   curl -sk --http2-prior-knowledge "https://127.0.0.1:$TCP_PORT2/wt.json" 2>/dev/null | grep -q '"hash"' && break
@@ -302,6 +309,7 @@ key_path = "server.key"
 mode = "optional"
 registration = "open"
 TOML
+if [ "${GK:-}" = 1 ]; then sed -i '1i group_key = true' "$WORK/s3/server.toml"; fi
 # One persistent text channel everyone lands in: its log is what the accounts
 # lane reads back after its writer's reader was away.
 cat > "$WORK/s3/channels.json" <<'CHANNELS'

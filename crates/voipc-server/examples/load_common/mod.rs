@@ -6,6 +6,7 @@
 
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -53,7 +54,22 @@ pub async fn connect_with(
 ) -> Result<Connected, Error> {
     // quinn's log lines (its connection drivers start inside this) name the client
     use tracing::Instrument;
-    connect_inner(index, server, keys, false)
+    let (identity, bundle) = keys.map_or((None, None), |(i, b)| (Some(i), Some(b)));
+    connect_inner(index, server, None, identity, bundle, false)
+        .instrument(tracing::info_span!("client", index))
+        .await
+}
+
+/// Connects as guest `name` (with its tag) holding identity key `identity` and no pre-key
+/// bundle, as a client of the group key: its seat is a pair that key endorsed.
+pub async fn connect_named(
+    index: usize,
+    server: &str,
+    name: &str,
+    identity: Vec<u8>,
+) -> Result<Connected, Error> {
+    use tracing::Instrument;
+    connect_inner(index, server, Some(name), Some(identity), None, false)
         .instrument(tracing::info_span!("client", index))
         .await
 }
@@ -67,7 +83,7 @@ pub async fn connect_account(index: usize, server: &str) -> Result<Connected, Er
     use tracing::Instrument;
     let started = std::time::Instant::now();
     for attempt in 1u32.. {
-        match connect_inner(index, server, None, true)
+        match connect_inner(index, server, None, None, None, true)
             .instrument(tracing::info_span!("client", index))
             .await
         {
@@ -153,7 +169,9 @@ fn account_keys(index: usize) -> (Vec<u8>, PreKeyBundleData) {
 async fn connect_inner(
     index: usize,
     server: &str,
-    keys: Option<(Vec<u8>, PreKeyBundleData)>,
+    name: Option<&str>,
+    identity_key: Option<Vec<u8>>,
+    prekey_bundle: Option<PreKeyBundleData>,
     device: bool,
 ) -> Result<Connected, Error> {
     // The server caps connections per IP (DoS guard), so spread the load
@@ -177,15 +195,15 @@ async fn connect_inner(
         let (device_id, pkcs8, _) = load_device(index);
         let auth = ClientMessage::Authenticate {
             // With a tag: a relay with accounts wants one on a guest's name
-            username: if device {
-                format!("acct{index}")
-            } else {
-                format!("load{index}#0001")
+            username: match name {
+                Some(n) => n.to_string(),
+                None if device => format!("acct{index}"),
+                None => format!("load{index}#0001"),
             },
             protocol_version: proto,
             app_version: APP_VERSION.to_string(),
-            identity_key: keys.as_ref().map(|k| k.0.clone()),
-            prekey_bundle: keys.as_ref().map(|k| k.1.clone()),
+            identity_key: identity_key.clone(),
+            prekey_bundle: prekey_bundle.clone(),
             account: device.then(|| AccountStart::DeviceKey {
                 device_id: device_id.to_vec(),
             }),
@@ -323,8 +341,20 @@ pub async fn next_message<R: AsyncRead + Unpin>(
     buf: &mut bytes::BytesMut,
     proto: u32,
 ) -> Result<ServerMessage, Error> {
+    static UNCOUNTED: AtomicU64 = AtomicU64::new(0);
+    next_counted(recv, buf, proto, &UNCOUNTED).await
+}
+
+/// `next_message`, adding each frame's payload bytes to `bytes`.
+pub async fn next_counted<R: AsyncRead + Unpin>(
+    recv: &mut R,
+    buf: &mut bytes::BytesMut,
+    proto: u32,
+    bytes: &AtomicU64,
+) -> Result<ServerMessage, Error> {
     loop {
         if let Some(payload) = try_decode_frame(buf)? {
+            bytes.fetch_add(payload.len() as u64, Ordering::Relaxed);
             return Ok(decode_server_msg_from(&payload, proto)?);
         }
         if recv.read_buf(buf).await? == 0 {

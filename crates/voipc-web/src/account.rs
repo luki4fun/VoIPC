@@ -3,13 +3,17 @@
 //! as postcard payloads without the length prefix, the bytes the transport
 //! carries, so nothing is converted to JS and back on the way.
 
+use std::cell::{Cell, RefCell, RefMut};
+use std::rc::Rc;
+
 use serde::Deserialize;
 
 use voipc_crypto::account::{
     normalize_name, password_ok, recovery_parse, DeviceKey, Method, SignIn, SignedIn, Step,
     Zeroizing, KDF_ROUNDS,
 };
-use voipc_crypto::account_session::{AccountSession as Session, Actions};
+use voipc_crypto::account_session::{AccountSession as Session, Actions, Remembered};
+use voipc_crypto::group_key::SeatKeys;
 use voipc_crypto::sync::{KeptPins as Kept, LogMemory, Prefs};
 use voipc_protocol::codec::{decode_server_msg, APP_VERSION, PROTOCOL_VERSION};
 use voipc_protocol::conv::unhex16;
@@ -100,6 +104,10 @@ pub struct AccountSignIn {
     first: Vec<u8>,
     /// After `finish`, until `startSync` takes it.
     signed: Option<SignedIn>,
+    /// The session this sign-in starts, as its Signal client's group keys see it.
+    link: Rc<AccountLink>,
+    /// A reset with the recovery key: the account's name.
+    reset: Option<String>,
 }
 
 #[wasm_bindgen]
@@ -118,6 +126,7 @@ impl AccountSignIn {
         } else {
             normalize_name(name).map_err(JsError::new)?
         };
+        let reset = matches!(method, MethodJs::Reset { .. }).then(|| name.clone());
         let method = match method {
             MethodJs::Provider { ticket, invite } => Method::Provider { ticket, invite },
             MethodJs::Login { password } => Method::Password {
@@ -165,6 +174,8 @@ impl AccountSignIn {
             machine: Some(machine),
             first: bytes(&first),
             signed: None,
+            link: Rc::default(),
+            reset,
         })
     }
 
@@ -218,7 +229,14 @@ impl AccountSignIn {
             .machine
             .as_mut()
             .ok_or_else(|| JsError::new("the sign-in is over"))?;
-        Ok(steps(m.on_message(&msg).map_err(|e| JsError::new(&e))?))
+        let out = m.on_message(&msg).map_err(|e| JsError::new(&e))?;
+        // A reset has had the relay's id since its challenge
+        if let (Some(name), Some(relay)) = (self.reset.as_ref(), m.relay_id()) {
+            if out.iter().any(|s| matches!(s, Step::ResetDone)) {
+                reset_done(relay, name.clone());
+            }
+        }
+        Ok(steps(out))
     }
 
     /// The accounts this browser remembers on this relay, as `[name, dek]`: a relay
@@ -274,11 +292,12 @@ impl AccountSignIn {
     pub fn provider_recovery(&mut self, key: &str) -> Result<js_sys::Array, JsError> {
         let key =
             Zeroizing::new(recovery_parse(key).ok_or_else(|| JsError::new(NOT_A_RECOVERY_KEY))?);
-        Ok(steps(
-            self.m_mut()?
-                .provider_recovery(&key)
-                .map_err(|e| JsError::new(&e))?,
-        ))
+        let out = self
+            .m_mut()?
+            .provider_recovery(&key)
+            .map_err(|e| JsError::new(&e))?;
+        self.link.rotate.set(true);
+        Ok(steps(out))
     }
 
     /// From the ask until the person's answer: the relay's words stay off the screen.
@@ -323,9 +342,9 @@ impl AccountSignIn {
             .m()?
             .identity()
             .ok_or_else(|| JsError::new("no identity yet"))?;
-        Ok(crate::SignalClient {
-            core: crate::signal::SignalCore::with_identity(identity).map_err(crate::js_err)?,
-        })
+        let mut core = crate::signal::SignalCore::with_identity(identity).map_err(crate::js_err)?;
+        core.gk.account = Some(self.link.clone());
+        Ok(crate::SignalClient { core })
     }
 
     /// The `Keys` payload, from `SignalClient.bundle().prekey_bundle`.
@@ -382,6 +401,11 @@ impl AccountSignIn {
         let memory: LogMemory = memory
             .and_then(|c| serde_json::from_str(&c).ok())
             .unwrap_or_default();
+        // A sign-in with the recovery key rotates as a reset does: the group key, once on
+        if self.link.rotate.take() {
+            reset_done(signed.relay_id, signed.name.clone());
+        }
+        *self.link.whose.borrow_mut() = Some((signed.relay_id, signed.name.clone()));
         let (session, started) = Session::start(
             signed,
             &info,
@@ -390,9 +414,14 @@ impl AccountSignIn {
             password_based,
             PROTOCOL_VERSION,
         );
+        *self.link.session.borrow_mut() = Some(session);
+        let session = AccountSession {
+            link: self.link.clone(),
+        };
+        let started = session.out(started)?;
         let o = js_sys::Object::new();
-        let _ = js_sys::Reflect::set(&o, &"session".into(), &AccountSession { session }.into());
-        let _ = js_sys::Reflect::set(&o, &"actions".into(), &actions(started)?);
+        let _ = js_sys::Reflect::set(&o, &"session".into(), &session.into());
+        let _ = js_sys::Reflect::set(&o, &"actions".into(), &started);
         Ok(o.into())
     }
 }
@@ -544,7 +573,135 @@ pub struct KeptPins {
 /// client runs too, for what follows a sign-in.
 #[wasm_bindgen]
 pub struct AccountSession {
-    session: Session,
+    link: Rc<AccountLink>,
+}
+
+/// The account session, shared by the page's `AccountSession` and the group keys of the
+/// connection it signed in on (gk.rs), which check against its book and keep its floors.
+/// One thread, so a `RefCell` each.
+#[derive(Default)]
+pub struct AccountLink {
+    pub(crate) session: RefCell<Option<Session>>,
+    /// What account actions said for the group key, until gk.rs takes it.
+    pub(crate) news: RefCell<GkNews>,
+    /// What account actions from the group key's calls hold for the page, until the page's
+    /// next call of the account carries it (`AccountSession::out`).
+    pub(crate) held: RefCell<Held>,
+    /// The sign-in used the recovery key: at `startSession` it counts as a reset (`RESET`).
+    pub(crate) rotate: Cell<bool>,
+    /// The relay id and account this sign-in reached (`startSession`): what `RESET` goes by.
+    pub(crate) whose: RefCell<Option<([u8; 16], String)>>,
+}
+
+impl AccountLink {
+    /// Whether this account's seat keys rotate now: the recovery key reset it on this relay in
+    /// this page, and nothing rotated them since. Once.
+    pub(crate) fn take_reset(&self) -> bool {
+        let Some(whose) = self.whose.borrow().clone() else {
+            return false;
+        };
+        RESET.with(|r| {
+            let mut r = r.borrow_mut();
+            let at = r.iter().position(|w| *w == whose);
+            at.map(|at| r.remove(at)).is_some()
+        })
+    }
+}
+
+/// What account actions from the group key's calls hold for the page: events (a kept read's
+/// stored messages), the read cursors, remembering this browser. account.ts `run` takes them
+/// with the page's next call of the account, which marks a replay and writes the cursors.
+#[derive(Default)]
+pub(crate) struct Held {
+    emit: Vec<(&'static str, serde_json::Value)>,
+    memory: Option<(String, LogMemory)>,
+    memory_named: bool,
+    remember: Option<Remembered>,
+}
+
+impl Held {
+    /// Out of `a`, until `give`. The newest memory is the whole of it.
+    pub(crate) fn park(&mut self, a: &mut Actions) {
+        self.emit.append(&mut a.emit);
+        if let Some(m) = a.memory.take() {
+            self.memory = Some(m);
+        }
+        self.memory_named |= std::mem::take(&mut a.memory_named);
+        if let Some(r) = a.remember.take() {
+            self.remember = Some(r);
+        }
+    }
+
+    /// Into `a`, ahead of what it says itself: what was held came first.
+    pub(crate) fn give(&mut self, a: &mut Actions) {
+        let held = std::mem::take(self);
+        a.emit.splice(0..0, held.emit);
+        a.memory = a.memory.take().or(held.memory);
+        a.memory_named |= held.memory_named;
+        a.remember = a.remember.take().or(held.remember);
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.emit.is_empty()
+            && self.memory.is_none()
+            && !self.memory_named
+            && self.remember.is_none()
+    }
+}
+
+/// What `Actions` say for the group key (`seat_keys`, `gk_floors`, `gk_past`), until the
+/// connection's group keys take it: the page's own calls leave it here.
+#[derive(Default)]
+pub(crate) struct GkNews {
+    pub(crate) seat_keys: Option<SeatKeys>,
+    pub(crate) floors: bool,
+    pub(crate) past: Vec<(String, [u8; 16], u32)>,
+}
+
+impl GkNews {
+    pub(crate) fn take_from(&mut self, a: &mut Actions) {
+        if let Some(keys) = a.seat_keys.take() {
+            self.seat_keys = Some(keys);
+        }
+        self.floors |= std::mem::take(&mut a.gk_floors);
+        self.past.append(&mut a.gk_past);
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.seat_keys.is_none() && !self.floors && self.past.is_empty()
+    }
+}
+
+thread_local! {
+    /// Accounts, by relay id and name, whose password the recovery key reset in this page:
+    /// their next sign-in to that relay with the group key on rotates the seat keys (§5.11).
+    static RESET: RefCell<Vec<([u8; 16], String)>> = const { RefCell::new(Vec::new()) };
+}
+
+pub(crate) fn reset_done(relay: [u8; 16], name: String) {
+    RESET.with(|r| {
+        let mut r = r.borrow_mut();
+        if !r.iter().any(|(id, n)| *id == relay && *n == name) {
+            r.push((relay, name));
+        }
+    });
+}
+
+impl AccountSession {
+    fn s(&self) -> RefMut<'_, Session> {
+        RefMut::map(self.link.session.borrow_mut(), |s| {
+            s.as_mut()
+                .expect("a session is started before it is handed out")
+        })
+    }
+
+    /// The actions for the page, with what the group key's calls held for it; what they say
+    /// for the group key stays for gk.rs.
+    fn out(&self, mut a: Actions) -> Result<JsValue, JsError> {
+        self.link.news.borrow_mut().take_from(&mut a);
+        self.link.held.borrow_mut().give(&mut a);
+        actions(a)
+    }
 }
 
 #[wasm_bindgen]
@@ -553,51 +710,51 @@ impl AccountSession {
     /// `afterConnect`: remembered again, it drops the key that one named.
     #[wasm_bindgen(js_name = setHeldDevice)]
     pub fn set_held_device(&mut self, device_id: Vec<u8>) {
-        self.session.set_held_device(device_id);
+        self.s().set_held_device(device_id);
     }
 
     /// Once the session is listed: the sync's first asks, then the
     /// second-factor setup a role waits for, or remembering this browser.
     #[wasm_bindgen(js_name = afterConnect)]
     pub fn after_connect(&mut self) -> Result<JsValue, JsError> {
-        actions(self.session.after_connect())
+        self.out(self.s().after_connect())
     }
 
     /// Every couple of seconds while connected: reads refused for now go on.
     pub fn tick(&mut self) -> Result<JsValue, JsError> {
-        actions(self.session.tick())
+        self.out(self.s().tick())
     }
 
     /// The person agreed to look at `account-pair-look`.
     #[wasm_bindgen(js_name = pairLook)]
     pub fn pair_look(&mut self, pair: f64) -> Result<JsValue, JsError> {
-        actions(self.session.pair_look(pair as u64))
+        self.out(self.s().pair_look(pair as u64))
     }
 
     /// What the person typed at `account-pair-ask`: the session compares it.
     #[wasm_bindgen(js_name = pairAnswer)]
     pub fn pair_answer(&mut self, pair: f64, code: &str) -> Result<JsValue, JsError> {
-        actions(self.session.pair_answer(pair as u64, code))
+        self.out(self.s().pair_answer(pair as u64, code))
     }
 
     /// The person said no, at `account-pair-look` or `account-pair-ask`.
     #[wasm_bindgen(js_name = pairDecline)]
     pub fn pair_decline(&mut self, pair: f64) -> Result<JsValue, JsError> {
-        actions(self.session.pair_decline(pair as u64))
+        self.out(self.s().pair_decline(pair as u64))
     }
 
     /// A decoded `AccountReply`.
     #[wasm_bindgen(js_name = onReply)]
     pub fn on_reply(&mut self, reply: JsValue) -> Result<JsValue, JsError> {
         let reply: AccountReply = serde_wasm_bindgen::from_value(reply)?;
-        actions(self.session.on_reply(&reply))
+        self.out(self.s().on_reply(&reply))
     }
 
     /// The `users` of a `UserList`, `UserJoined` or `ChannelUsers`, for the pins.
     #[wasm_bindgen(js_name = noteRoster)]
     pub fn note_roster(&mut self, users: JsValue) -> Result<JsValue, JsError> {
         let users: Vec<UserInfo> = serde_wasm_bindgen::from_value(users)?;
-        actions(self.session.note_roster(&users))
+        self.out(self.s().note_roster(&users))
     }
 
     /// One person a live frame named, as a row of a roster does.
@@ -609,20 +766,20 @@ impl AccountSession {
         name: &str,
     ) -> Result<JsValue, JsError> {
         let account = account.map(|a| array16(&a, "an account id")).transpose()?;
-        actions(self.session.note_person(user_id, account, name))
+        self.out(self.s().note_person(user_id, account, name))
     }
 
     /// The account this session is of: what kept sessions go by.
     #[wasm_bindgen(js_name = accountId)]
     pub fn account_id(&self) -> Vec<u8> {
-        self.session.account_id().to_vec()
+        self.s().account_id().to_vec()
     }
 
     /// The `takers` of a `ReportTakers`, for the pins.
     #[wasm_bindgen(js_name = noteTakers)]
     pub fn note_takers(&mut self, takers: JsValue) -> Result<(), JsError> {
         let takers: Vec<ReportTaker> = serde_wasm_bindgen::from_value(takers)?;
-        self.session.note_takers(&takers);
+        self.s().note_takers(&takers);
         Ok(())
     }
 
@@ -630,7 +787,7 @@ impl AccountSession {
     /// opened: `SignalClient.takeSeen`), against the pins.
     #[wasm_bindgen(js_name = checkIdentity)]
     pub fn check_identity(&mut self, user_id: u32, key: &[u8]) -> Result<JsValue, JsError> {
-        actions(self.session.check_identity(user_id, key))
+        self.out(self.s().check_identity(user_id, key))
     }
 
     #[wasm_bindgen(js_name = outgoingDm)]
@@ -641,8 +798,8 @@ impl AccountSession {
         sent_at: f64,
         ttl_secs: Option<u32>,
     ) -> Result<JsValue, JsError> {
-        actions(
-            self.session
+        self.out(
+            self.s()
                 .outgoing_dm(user_id, envelope.to_vec(), sent_at as u64, ttl_secs),
         )
     }
@@ -658,7 +815,7 @@ impl AccountSession {
         once: bool,
     ) -> Result<JsValue, JsError> {
         let a = self
-            .session
+            .s()
             .kept_dm(
                 account_hex,
                 envelope.to_vec(),
@@ -667,7 +824,7 @@ impl AccountSession {
                 once,
             )
             .map_err(|e| JsError::new(&e))?;
-        actions(a)
+        self.out(a)
     }
 
     #[wasm_bindgen(js_name = outgoingChannel)]
@@ -678,99 +835,99 @@ impl AccountSession {
         sent_at: f64,
         ttl_secs: Option<u32>,
     ) -> Result<JsValue, JsError> {
-        actions(
-            self.session
+        self.out(
+            self.s()
                 .outgoing_channel(log, envelope.to_vec(), sent_at as u64, ttl_secs),
         )
     }
 
     /// In a channel with log `conv`: keep it, and read what it kept.
     pub fn enter(&mut self, conv: &str) -> Result<JsValue, JsError> {
-        actions(self.session.enter(conv))
+        self.out(self.s().enter(conv))
     }
 
     /// A channel that slept came on screen: read what was kept meanwhile.
     #[wasm_bindgen(js_name = readNow)]
     pub fn read_now(&mut self, conv: &str) -> Result<JsValue, JsError> {
-        actions(self.session.read_now(conv))
+        self.out(self.s().read_now(conv))
     }
 
     /// In these channels' logs, newly followed: keep them in one frame, and read them.
     #[wasm_bindgen(js_name = enterMany)]
     pub fn enter_many(&mut self, convs: Vec<String>) -> Result<JsValue, JsError> {
-        actions(self.session.enter_many(&convs))
+        self.out(self.s().enter_many(&convs))
     }
 
     /// Takes over what an earlier connection of this account kept, before `pinsIn`.
     #[wasm_bindgen(js_name = adoptPins)]
     pub fn adopt_pins(&mut self, kept: KeptPins) {
-        self.session.adopt_pins(kept.inner);
+        self.s().adopt_pins(kept.inner);
     }
 
     /// What this connection hands to the next.
     #[wasm_bindgen(js_name = keepPins)]
     pub fn keep_pins(&self) -> Option<KeptPins> {
-        self.session.keep_pins().map(|inner| KeptPins { inner })
+        self.s().keep_pins().map(|inner| KeptPins { inner })
     }
 
     /// Whether the pages of pins are in. If not, the page holds the key jobs.
     #[wasm_bindgen(js_name = pinsIn)]
     pub fn pins_in(&mut self) -> bool {
-        self.session.pins_in()
+        self.s().pins_in()
     }
 
     /// Once, when pages that were out have come in: the key jobs go on.
     #[wasm_bindgen(js_name = takePinsIn)]
     pub fn take_pins_in(&mut self) -> bool {
-        self.session.take_pins_in()
+        self.s().take_pins_in()
     }
 
     /// Whatever pins were not saved yet, now: the person is leaving.
     #[wasm_bindgen(js_name = flushPins)]
     pub fn flush_pins(&mut self) -> Result<JsValue, JsError> {
-        actions(self.session.flush_pins())
+        self.out(self.s().flush_pins())
     }
 
     #[wasm_bindgen(js_name = pinsSaved)]
     pub fn pins_saved(&self) -> bool {
-        self.session.pins_saved()
+        self.s().pins_saved()
     }
 
     /// A direct message came from `userId`: their pin keeps the half open channels cannot fill.
     #[wasm_bindgen(js_name = noteDirect)]
     pub fn note_direct(&mut self, user_id: u32) {
-        self.session.note_direct(user_id);
+        self.s().note_direct(user_id);
     }
 
     /// Accounts met in a gated channel (`LiveOut.gated_people`): the same.
     #[wasm_bindgen(js_name = noteGatedPeople)]
     pub fn note_gated_people(&mut self, accounts: JsValue) -> Result<(), JsError> {
         let accounts: Vec<[u8; 16]> = serde_wasm_bindgen::from_value(accounts)?;
-        self.session.note_gated_people(&accounts);
+        self.s().note_gated_people(&accounts);
         Ok(())
     }
 
     /// A channel log with a gate: who is met in it counts the same.
     #[wasm_bindgen(js_name = noteGatedLog)]
     pub fn note_gated_log(&mut self, conv: &str) {
-        self.session.note_gated_log(conv);
+        self.s().note_gated_log(conv);
     }
 
     /// The person opened `userId`'s safety number: their pin is kept, and goes now.
     pub fn verified(&mut self, user_id: u32) -> Result<JsValue, JsError> {
-        actions(self.session.verified(user_id))
+        self.out(self.s().verified(user_id))
     }
 
     /// `userId` left channel log `conv`, or was put out of it (`MemberGone`).
     #[wasm_bindgen(js_name = memberGone)]
     pub fn member_gone(&mut self, conv: &str, user_id: u32) {
-        self.session.member_gone(conv, user_id);
+        self.s().member_gone(conv, user_id);
     }
 
     /// Delete what this account wrote to the stored logs, in `conv` or
     /// (null) everywhere.
     pub fn purge(&mut self, conv: Option<String>) -> Result<JsValue, JsError> {
-        actions(self.session.purge(conv.as_deref()))
+        self.out(self.s().purge(conv.as_deref()))
     }
 
     /// Delete this account, from its stretched password (`kdfSalt`).
@@ -782,8 +939,8 @@ impl AccountSession {
         recovery_code: Option<String>,
     ) -> Result<JsValue, JsError> {
         let master = master32(master)?;
-        actions(
-            self.session
+        self.out(
+            self.s()
                 .delete_account(master.as_ref(), totp, recovery_code),
         )
     }
@@ -800,8 +957,8 @@ impl AccountSession {
     ) -> Result<JsValue, JsError> {
         let kind = serde_wasm_bindgen::from_value(kind)?;
         let master = master32(master)?;
-        actions(
-            self.session
+        self.out(
+            self.s()
                 .provider_start(kind, link, master.as_ref(), totp, recovery_code),
         )
     }
@@ -816,26 +973,26 @@ impl AccountSession {
     ) -> Result<JsValue, JsError> {
         let kind = serde_wasm_bindgen::from_value(kind)?;
         let master = master32(master)?;
-        actions(
-            self.session
+        self.out(
+            self.s()
                 .provider_unlink(kind, master.as_ref(), totp, recovery_code),
         )
     }
 
     /// Out of channel log `conv`; with `tell`, asks the relay to take us out.
     pub fn leave(&mut self, conv: &str, tell: bool) -> Result<JsValue, JsError> {
-        actions(self.session.leave(conv, tell))
+        self.out(self.s().leave(conv, tell))
     }
 
     #[wasm_bindgen(js_name = keptFor)]
     pub fn kept_for(&self, user_id: u32) -> bool {
-        self.session.kept_for(user_id)
+        self.s().kept_for(user_id)
     }
 
     /// Whether a list has said which account `user_id` is.
     #[wasm_bindgen(js_name = isAccount)]
     pub fn is_account(&self, user_id: u32) -> bool {
-        self.session.account_of(user_id).is_some()
+        self.s().account_of(user_id).is_some()
     }
 
     /// Throws why there is none (not an account, never seen, a key changed).
@@ -846,30 +1003,30 @@ impl AccountSession {
         own_key: &[u8],
         live: Option<Vec<u8>>,
     ) -> Result<String, JsError> {
-        self.session
+        self.s()
             .safety_number(user_id, own_key, live.as_deref())
             .map_err(|e| JsError::new(&e))
     }
 
     pub fn cloud(&self) -> bool {
-        self.session.prefs().cloud
+        self.s().prefs().cloud
     }
 
     pub fn asked(&self) -> bool {
-        self.session.prefs().asked
+        self.s().prefs().asked
     }
 
     #[wasm_bindgen(js_name = setPrefs)]
     pub fn set_prefs(&mut self, cloud: bool, asked: bool) -> Result<JsValue, JsError> {
-        actions(self.session.set_prefs(Prefs { cloud, asked }))
+        self.out(self.s().set_prefs(Prefs { cloud, asked }))
     }
 
     /// Block or unblock the person `key` names; throws why the list could not
     /// be kept (`AccountSession::set_block`).
     #[wasm_bindgen(js_name = setBlocked)]
     pub fn set_blocked(&mut self, key: &str, label: &str, on: bool) -> Result<JsValue, JsError> {
-        actions(
-            self.session
+        self.out(
+            self.s()
                 .set_block(key, label, on)
                 .map_err(|e| JsError::new(&e))?,
         )
@@ -877,18 +1034,18 @@ impl AccountSession {
 
     #[wasm_bindgen(js_name = setShare)]
     pub fn set_share(&mut self, share: bool) {
-        self.session.set_share(share);
+        self.s().set_share(share);
     }
 
     #[wasm_bindgen(js_name = mayShare)]
     pub fn may_share(&self) -> bool {
-        self.session.may_share()
+        self.s().may_share()
     }
 
     /// The PBKDF2 salt for this account's passwords.
     #[wasm_bindgen(js_name = kdfSalt)]
     pub fn kdf_salt(&self) -> String {
-        self.session.kdf_salt()
+        self.s().kdf_salt()
     }
 
     /// A new password, from the stretched old and new ones (`kdfSalt`), and
@@ -905,7 +1062,7 @@ impl AccountSession {
             m.try_into()
                 .map_err(|_| JsError::new("a stretched password is not 32 bytes"))
         };
-        actions(self.session.password_change(
+        self.out(self.s().password_change(
             &m32(old_master)?,
             &m32(new_master)?,
             totp,
@@ -925,9 +1082,9 @@ impl AccountSession {
     ) -> Result<JsValue, JsError> {
         let master = master32(master)?;
         let (a, key) = self
-            .session
+            .s()
             .recovery_key_new(master.as_ref(), totp, recovery_code);
-        let out = actions(a)?;
+        let out = self.out(a)?;
         js_sys::Reflect::set(&out, &JsValue::from_str("key"), &JsValue::from_str(&key))
             .map_err(|_| JsError::new("could not hand the key over"))?;
         Ok(out)
@@ -954,4 +1111,71 @@ pub fn qr_svg(text: &str) -> Option<String> {
 #[wasm_bindgen(js_name = normalizeAccountName)]
 pub fn normalize_account_name(raw: &str) -> Result<String, JsError> {
     normalize_name(raw).map_err(JsError::new)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn what_account_actions_say_for_the_group_key_waits_for_the_connection() {
+        let mut a = Actions {
+            seat_keys: Some(SeatKeys::generate(1, 1_800_000_000)),
+            gk_floors: true,
+            gk_past: vec![("c:a".into(), [1; 16], 4)],
+            ..Actions::default()
+        };
+        let mut news = GkNews::default();
+        assert!(news.is_empty());
+        news.take_from(&mut a);
+        assert_eq!(news.seat_keys.as_ref().map(|k| k.n), Some(1));
+        assert!(news.floors && news.past.len() == 1);
+        assert!(a.seat_keys.is_none() && !a.gk_floors && a.gk_past.is_empty());
+        let mut later = Actions {
+            gk_past: vec![("c:a".into(), [1; 16], 5)],
+            ..Actions::default()
+        };
+        news.take_from(&mut later);
+        assert_eq!(news.past.len(), 2, "nothing taken is lost");
+        assert_eq!(news.seat_keys.as_ref().map(|k| k.n), Some(1));
+    }
+
+    #[test]
+    fn a_reset_rotates_at_the_next_sign_in_to_its_own_relay_once() {
+        let link = |relay: [u8; 16]| {
+            let l = AccountLink::default();
+            *l.whose.borrow_mut() = Some((relay, "alice".into()));
+            l
+        };
+        let (here, elsewhere) = (link([1; 16]), link([2; 16]));
+        assert!(!here.take_reset());
+        reset_done([1; 16], "alice".into());
+        assert!(!elsewhere.take_reset(), "the same name on another relay");
+        assert!(!AccountLink::default().take_reset(), "a link not signed in");
+        assert!(here.take_reset());
+        assert!(!here.take_reset(), "once");
+    }
+
+    #[test]
+    fn the_newest_memory_held_is_the_whole_of_it() {
+        let memory = |key: &str| Some((key.to_string(), LogMemory::default()));
+        let mut held = Held::default();
+        held.park(&mut Actions {
+            memory: memory("old"),
+            ..Actions::default()
+        });
+        let mut own = Actions {
+            memory: memory("new"),
+            ..Actions::default()
+        };
+        held.give(&mut own);
+        assert_eq!(own.memory.map(|m| m.0).as_deref(), Some("new"));
+        let mut none = Actions::default();
+        held.park(&mut Actions {
+            memory: memory("old"),
+            ..Actions::default()
+        });
+        held.give(&mut none);
+        assert_eq!(none.memory.map(|m| m.0).as_deref(), Some("old"));
+    }
 }

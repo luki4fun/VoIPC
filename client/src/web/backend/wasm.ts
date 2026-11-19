@@ -115,8 +115,61 @@ export interface SignalClient {
   /** The connection ends: the posts that waited, per channel. */
   liveEnd(): { channel_id: number; expired: number }[];
 
+  // The group epoch key (voipc_crypto::group_state, plan 3i), written once for both
+  // backends: the page sends and emits what `GkOut` says, as network.rs does.
+  /** `GroupKeys`: `on`, its 16-byte `run`, its `clock` (seconds); `kept`, taken over. */
+  gkStart(on: boolean, run: Uint8Array, clock: number, help: boolean, visible: boolean, inCall: boolean, kept?: KeptGk | null): GkOut;
+  /** A channel we are in: a text channel we follow, or the voice room we stand in. */
+  gkTrack(channelId: number, text: boolean, log: string, anonymous: boolean, hideMembers: boolean, viewerAdmin: boolean): GkOut;
+  gkUntrack(channelId: number): GkOut;
+  /** A frame `isGkFrame` named, as its postcard bytes. */
+  gkFrame(payload: Uint8Array): GkOut;
+  /** A post of ours under its message id; with the channel's `log` its kept copy goes once it does. */
+  gkPost(channelId: number, messageId: string, envelope: Uint8Array, log: string, ttlSecs?: number | null): GkOut;
+  /** Each second. */
+  gkTick(): GkOut;
+  /** After the account's own calls: what they said for the group key. */
+  gkNews(): GkOut;
+  /** The keyholder's next upload's postcard bytes. */
+  gkNextFrame(inCall: boolean): Uint8Array | undefined;
+  /** One step of the keyholder's build; undefined when none waits. */
+  gkBuildStep(budgetMs: number): GkOut | undefined;
+  /** "Help hold keys", switched live. */
+  gkSetVolunteer(on: boolean): GkOut;
+  /** The page shown or hidden, a call begun or ended. */
+  gkVisibility(visible: boolean, inCall: boolean): GkOut;
+  /** `GkOut.voice`: the room's keys into `keys`. Whether it took any. */
+  gkVoiceInto(keys: MediaKeys, ownChannel: number): boolean;
+  /** `UserLeft`, for the names the group key's events carry. */
+  gkUserLeft(userId: number, channelId: number): void;
+  /** The connection ends: the posts given up. */
+  gkEnd(): GkOut;
+  /** What the next connection to this relay takes over: before `free`. */
+  gkKeep(): KeptGk | undefined;
+
   free(): void;
   [Symbol.dispose](): void;
+}
+
+/** What the page does after a call of the group key (voipc-web gk.rs `Out`). */
+export interface GkOut {
+  /** Who posted, for the pins first: the live path's `seen`. */
+  seen: { user_id: number; account: number[] | null; name: string }[];
+  /** Postcard bytes of each frame to send. */
+  send: Uint8Array[];
+  /** Front-end events (`gk-*`, `channel-chat-message`), to emit as they are. */
+  emit: { name: string; payload: unknown }[];
+  /** Voice keys wait: `gkVoiceInto`. */
+  voice: boolean;
+  /** A keyholder's build waits: `gkBuildStep`. */
+  build: boolean;
+  /** The account holds events or read cursors for the page: its next call carries them. */
+  held: boolean;
+}
+
+/** The group key's floors, between one connection to a relay and its next in this page. */
+export interface KeptGk {
+  free(): void;
 }
 
 /** What the page does after a call on the live path (voipc_crypto::LiveOut). */
@@ -522,6 +575,8 @@ export interface WasmApi {
   pickHistorySources(sharers: Uint32Array): Uint32Array;
   /** Control messages a second one connection may send (we stay under it). */
   controlMsgsPerSec(): number;
+  /** Whether a server frame's postcard bytes are the group key's: `gkFrame` takes it undecoded. */
+  isGkFrame(payload: Uint8Array): boolean;
   pinHeldMost(): number;
   /** A fresh message id: 16 random bytes, hex. */
   newMessageId(): string;
@@ -652,6 +707,7 @@ export async function loadWasm(): Promise<WasmApi> {
     maxRelayCiphertext: () => mod.maxRelayCiphertext(),
     pickHistorySources: (s) => mod.pickHistorySources(s),
     controlMsgsPerSec: () => mod.controlMsgsPerSec(),
+    isGkFrame: (p) => mod.isGkFrame(p),
     pinHeldMost: () => mod.pinHeldMost(),
     newMessageId: () => mod.newMessageId(),
     envelope: (id, text, ttlSecs, refs) =>

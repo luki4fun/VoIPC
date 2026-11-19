@@ -2032,11 +2032,14 @@ impl ServerState {
 
         // Update the session's channel_id, and whether they may speak in it:
         // under this lock, so no voice gets past before it is known
+        let mut account = None;
         if let Some(mut session) = self.sessions.get_mut(&session_id) {
             session.channel_id = channel_id;
             let listen = !crate::gates::passes(&session, &speakers);
             crate::gates::mark(&mut session.listen_only, channel_id, listen);
+            account = session.account_id();
         }
+        self.gk_room_join(channel, user_id, account);
         // A voice room is one at a time. The caller leaves the old one first
         // (and tells its members); this is for a move that landed in between,
         // a kick's to General, which would otherwise leave them in both.
@@ -2045,6 +2048,7 @@ impl ServerState {
                 if old.members.remove(&user_id) {
                     old.info.user_count = old.members.len() as u32;
                     old.pseudonyms.remove(&user_id);
+                    self.gk_room_leave(old, user_id, gk_cause::LEAVE);
                 }
             }
         }
@@ -2227,6 +2231,31 @@ impl ServerState {
         }
         self.gk
             .on_follow(channel_id, &id, GroupKind::Text, user_id, account);
+    }
+
+    /// A member of a voice room follows its group from its join on (plan part 5), the
+    /// channel's gate told first as `gk_follow` tells it. The lobby carries no voice.
+    fn gk_room_join(&self, channel: &Channel, user_id: UserId, account: Option<[u8; 16]>) {
+        let channel_id = channel.info.channel_id;
+        if !self.gk.on || channel.info.text || channel_id == 0 {
+            return;
+        }
+        if self.gk.gated(channel_id) != channel.gated() {
+            self.gk.on_gate(channel_id, channel.gated());
+        }
+        self.gk
+            .on_room_join(channel_id, user_id, account, channel.info.anonymous);
+    }
+
+    /// Out of a voice room, already taken out of its members: its seat exits, with `cause`,
+    /// and the room's group goes once nobody is left in it.
+    fn gk_room_leave(&self, channel: &Channel, user_id: UserId, cause: u8) {
+        if !self.gk.on || channel.info.text {
+            return;
+        }
+        let empty = channel.members.is_empty();
+        self.gk
+            .on_room_leave(channel.info.channel_id, user_id, cause, empty);
     }
 
     /// Takes followed channels whole or quiet. Going quiet is no exit: nobody rotates, and
@@ -2474,6 +2503,7 @@ impl ServerState {
             return None;
         }
         channel.info.user_count = channel.members.len() as u32;
+        self.gk_room_leave(channel, user_id, gk_cause::LEAVE);
         // Coming back means a new pseudonym, which is the point
         channel.pseudonyms.remove(&user_id);
         // Whatever they asked to hear belonged to this channel. `join_channel`
@@ -2510,7 +2540,9 @@ impl ServerState {
         // Remove from channel
         let mut channels = self.channels.write().await;
         if let Some(channel) = channels.get_mut(&session.channel_id) {
-            channel.members.remove(&session.user_id);
+            if channel.members.remove(&session.user_id) {
+                self.gk_room_leave(channel, session.user_id, gk_cause::DISCONNECT);
+            }
             channel.info.user_count = channel.members.len() as u32;
         }
         // Unanswered invites would otherwise pin the user_id in every
@@ -2708,9 +2740,12 @@ impl ServerState {
         // nobody: a delete takes its followers out in bulk (layout's, with no word to the
         // group), a purged conversation's rows must not be written back, and an `r:` id
         // comes back with the channel id. Its name for the group and its gate go with it: an
-        // id made again starts open
-        if self.gk.on && gone.info.text {
-            let id = self.gk_id(&gone);
+        // id made again starts open. So does a voice room's
+        if self.gk.on {
+            let id = match gone.info.text {
+                true => self.gk_id(&gone),
+                false => self.gk.room_id(channel_id),
+            };
             self.gk.on_channel_gone(channel_id, &id);
         }
     }
@@ -2929,6 +2964,10 @@ impl ServerState {
                         channel.pseudonyms.insert(uid, name);
                     }
                 }
+                // A voice room's seats are named anew (open choice 11)
+                if !channel.info.text {
+                    self.gk.on_room_anonymous(channel_id, v);
+                }
             }
         }
         // ponytail: a log switched off this way keeps its stored members and
@@ -3095,14 +3134,17 @@ impl ServerState {
         if let Some(first) = channel.follow.remove(target_id) {
             self.exit_due(channel_id, &channel.follow, first);
         }
+        // Requester 0 is the relay putting out who lost the gate (`session::evict`)
+        let cause = if requester_id == 0 {
+            gk_cause::GATE
+        } else {
+            gk_cause::KICK
+        };
         if channel.info.text {
-            // Requester 0 is the relay putting out who lost the gate (`session::evict`)
-            let cause = if requester_id == 0 {
-                gk_cause::GATE
-            } else {
-                gk_cause::KICK
-            };
             self.gk.on_kick(channel_id, target_id, cause);
+        } else {
+            // A voice kick to the lobby: out of the room, into no group
+            self.gk_room_leave(channel, target_id, cause);
         }
 
         let target_session_id = self

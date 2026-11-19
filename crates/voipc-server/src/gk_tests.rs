@@ -24,7 +24,7 @@ use voipc_protocol::messages::ServerMessage;
 use voipc_protocol::types::UserId;
 use zeroize::Zeroizing;
 
-use crate::gk::due::{exit_cap, Exits, EXIT_BATCH_MAX};
+use crate::gk::due::{exit_cap, Exits, Joins, Waiting, EXIT_BATCH_MAX};
 use crate::gk::group::{cause, Fetch, Fetched, GroupState, OpenCaps, Out};
 use crate::gk::holders::{Holders, Volunteer};
 use crate::gk::push;
@@ -308,7 +308,7 @@ async fn land(
 }
 
 fn group_of(g: &GroupState) -> Group {
-    Group::new(GroupKind::Text, ID, g.gen().unwrap()).unwrap()
+    Group::new(g.kind, ID, g.gen().unwrap()).unwrap()
 }
 
 fn lists(g: &GroupState) -> Lists {
@@ -2974,8 +2974,168 @@ fn an_idle_group_keeps_its_eager_joins_and_queues_at_most_kept_seats() {
     let (a, b) = (Person::account(2, [2; 16]), Person::account(3, [3; 16]));
     g.eager(a.joiner(), [2; 16], now, &mut out);
     g.eager(b.joiner(), [3; 16], now, &mut out);
-    assert_eq!(g.joins.queue.len(), 1, "kept_seats");
+    assert_eq!(g.joins.len(), 1, "kept_seats");
     assert!(!g.idle(), "the actor stays while an eager seat waits");
+}
+
+/// Joiner `i` of one person's keys: as many seats as wanted, without a key pair each.
+fn nth_joiner(p: &Person, i: u32) -> Joiner {
+    let mut j = p.joiner();
+    let mut a = [0xe0; 16];
+    a[12..].copy_from_slice(&i.to_be_bytes());
+    j.seat.m = MemberId::Account(a);
+    j
+}
+
+/// The queue knows each seat's place and how many joiners no session waits for, through
+/// every way a joiner comes, merges, loses its sessions and goes.
+#[test]
+fn the_join_queue_counts_its_eager_seats_through_merges_drops_and_takes() {
+    let p = Person::account(2, [2; 16]);
+    let waiting = |i: u32, sids: Vec<UserId>| Waiting {
+        joiner: nth_joiner(&p, i),
+        sids,
+        account: Some([2; 16]),
+    };
+    let mut q = Joins::default();
+    for i in 0..4 {
+        q.add(waiting(i, vec![]), 1);
+    }
+    q.add(waiting(4, vec![7]), 1);
+    assert_eq!((q.len(), q.eager()), (5, 4));
+    q.add(waiting(0, vec![8]), 2);
+    assert_eq!(
+        (q.len(), q.eager()),
+        (5, 3),
+        "a session waits for seat 0 now"
+    );
+    q.add(waiting(1, vec![]), 2);
+    assert_eq!((q.len(), q.eager()), (5, 3), "queued once");
+    q.drop_sid(8);
+    assert_eq!(q.eager(), 4, "seat 0 is eager again");
+    q.take(&nth_joiner(&p, 2).seat);
+    assert!(!q.has(&nth_joiner(&p, 2).seat));
+    assert_eq!((q.len(), q.eager()), (4, 3));
+    q.retain(|w| !w.sids.is_empty());
+    assert_eq!((q.len(), q.eager()), (1, 0));
+    assert!(q.has(&nth_joiner(&p, 4).seat) && !q.has(&nth_joiner(&p, 0).seat));
+    for i in 10..300 {
+        q.add(waiting(i, vec![]), 3);
+    }
+    let batch: Vec<SeatRef> = q.batch().iter().map(|w| w.joiner.seat).collect();
+    assert_eq!(batch.len(), 256);
+    assert_eq!(batch[0], nth_joiner(&p, 4).seat, "in arrival order");
+    assert_eq!(batch[1], nth_joiner(&p, 10).seat);
+    q.done(&batch, 4);
+    assert_eq!((q.len(), q.eager()), (35, 35));
+    assert_eq!(q.batch()[0].joiner.seat, nth_joiner(&p, 265).seat);
+    assert_eq!(q.first_ms, Some(4));
+}
+
+/// 100k eager seats (an account's first seat keys, `kept_seats` 0) queue without a walk of
+/// the queue per seat: that took about 19 s of one relay worker, and a Join due missed its
+/// deadline. A queue walked per seat takes minutes here, even in a release build.
+#[test]
+fn a_hundred_thousand_eager_seats_queue_without_a_walk_of_the_queue_each() {
+    let mut g = new_group(true);
+    g.kept_seats = usize::MAX;
+    let p = Person::account(2, [2; 16]);
+    let joiners: Vec<Joiner> = (0..100_000).map(|i| nth_joiner(&p, i)).collect();
+    let mut out = vec![];
+    let now = now_ms();
+    let t = std::time::Instant::now();
+    for j in joiners {
+        let a = j.seat.m.account().unwrap();
+        g.eager(j, a, now, &mut out);
+    }
+    let took = t.elapsed();
+    assert_eq!((g.joins.len(), g.joins.eager()), (100_000, 100_000));
+    assert!(
+        took < std::time::Duration::from_secs(20),
+        "{took:?} for 100k eager seats"
+    );
+}
+
+/// A leave takes the session off each joiner it waits for; then every joiner no session
+/// waits for goes, the session's or not, but an account's in a stored group, whose eager
+/// seat stays. The rest keep their order and the eager count holds.
+#[test]
+fn a_leave_drops_the_joiners_no_session_waits_for_but_a_stored_groups_account_seats() {
+    let p = Person::account(2, [2; 16]);
+    let waiting = |i: u32, sids: Vec<UserId>, account: bool| Waiting {
+        joiner: nth_joiner(&p, i),
+        sids,
+        account: account.then_some([2; 16]),
+    };
+    let queued = |q: &Joins| -> Vec<SeatRef> { q.batch().iter().map(|w| w.joiner.seat).collect() };
+    let seats =
+        |is: &[u32]| -> Vec<SeatRef> { is.iter().map(|i| nth_joiner(&p, *i).seat).collect() };
+    for stored in [true, false] {
+        let mut q = Joins::default();
+        q.add(waiting(0, vec![], true), 1);
+        q.add(waiting(1, vec![7], true), 1);
+        q.add(waiting(2, vec![7, 8], false), 1);
+        q.add(waiting(3, vec![7], false), 1);
+        q.add(waiting(4, vec![], false), 1);
+        q.add(waiting(5, vec![9], true), 1);
+        q.leave(7, stored);
+        let (left, eager) = if stored {
+            (seats(&[0, 1, 2, 5]), 2)
+        } else {
+            (seats(&[2, 5]), 0)
+        };
+        assert_eq!((queued(&q), q.eager()), (left, eager), "stored {stored}");
+        assert!(!q.has(&nth_joiner(&p, 3).seat) && !q.has(&nth_joiner(&p, 4).seat));
+        q.leave(8, stored);
+        q.leave(9, stored);
+        let (left, eager) = if stored {
+            (seats(&[0, 1, 5]), 3)
+        } else {
+            (vec![], 0)
+        };
+        assert_eq!((queued(&q), q.eager()), (left, eager), "stored {stored}");
+        q.add(waiting(3, vec![10], false), 2);
+        assert!(
+            q.has(&nth_joiner(&p, 3).seat),
+            "a seat gone may queue again"
+        );
+        q.leave(10, stored);
+        assert!(!q.has(&nth_joiner(&p, 3).seat));
+    }
+}
+
+/// A mass disconnect beside a long eager queue: 50k sessions leave a stored group whose
+/// queue holds 50k eager seats beside their own joiners, without a walk of the queue per
+/// leave. Two walks a leave took minutes here, and a Join due missed its deadline behind
+/// them.
+#[test]
+fn fifty_thousand_leaves_beside_a_long_eager_queue_walk_no_queue_each() {
+    let p = Person::account(2, [2; 16]);
+    let mut q = Joins::default();
+    for i in 0..100_000u32 {
+        let sids = if i % 2 == 0 { vec![] } else { vec![i] };
+        let joiner = nth_joiner(&p, i);
+        let account = joiner.seat.m.account();
+        q.add(
+            Waiting {
+                joiner,
+                sids,
+                account,
+            },
+            1,
+        );
+    }
+    assert_eq!((q.len(), q.eager()), (100_000, 50_000));
+    let t = std::time::Instant::now();
+    for sid in (1..100_000).step_by(2) {
+        q.leave(sid, true);
+    }
+    let took = t.elapsed();
+    assert_eq!((q.len(), q.eager()), (100_000, 100_000));
+    assert!(
+        took < std::time::Duration::from_secs(20),
+        "{took:?} for 50k leaves"
+    );
 }
 
 #[tokio::test]
@@ -4314,4 +4474,663 @@ async fn a_dues_deadline_starts_when_it_goes_out_not_before_the_relays_own_store
         )),
         "timed out 4 s after it went out"
     );
+}
+
+// ── Voice rooms (V2, plan part 5) ─────────────────────────────────────────
+
+use crate::gk::voice::seats_frames;
+use voipc_protocol::gk::VoiceSeatsPiece;
+
+fn voice_group() -> GroupState {
+    GroupState::new(
+        ID.into(),
+        GroupKind::Voice,
+        false,
+        Arc::new(OpenCaps::default()),
+    )
+}
+
+impl Person {
+    /// A signed-in member in a voice room: its connection's pair (0x02), endorsed by the
+    /// account's identity naming the connection.
+    fn voice_account(sid: UserId, a: [u8; 16]) -> Person {
+        Person {
+            account: Some(a),
+            ..Person::guest(sid)
+        }
+    }
+
+    fn voice_entry(&self) -> Keyholder {
+        self.wire()
+            .entry(GroupKind::Voice, self.m(), raw(&self.ik))
+            .unwrap()
+    }
+}
+
+/// The `VoiceSeats` `out` sends `sid`, each sequence merged as a member takes it.
+fn rosters(out: &[Out], sid: UserId) -> Vec<VoiceSeatsPiece> {
+    let mut parts: Parts<(), VoiceSeatsPiece> = Parts::new(Seq::VoiceSeats);
+    let mut whole = vec![];
+    for f in out.iter().filter(|o| o.0 == sid).flat_map(|o| &o.1) {
+        if let ServerMessage::VoiceSeats {
+            part, last, piece, ..
+        } = f
+        {
+            let bytes = push::len(f);
+            if let Part::Whole((), ps) = parts.take((), *part, *last, piece.clone(), bytes).part {
+                let mut p = VoiceSeatsPiece {
+                    whole: ps[0].whole,
+                    ..VoiceSeatsPiece::default()
+                };
+                for q in ps {
+                    p.seats.extend(q.seats);
+                    p.gone.extend(q.gone);
+                }
+                whole.push(p);
+            }
+        }
+    }
+    whole
+}
+
+/// The keyholder among `ks` a due in `out` went to, with the due.
+fn asked<'a>(out: &[Out], ks: &[&'a Person]) -> Option<(&'a Person, u64, DuePiece)> {
+    ks.iter()
+        .find_map(|k| dues(out, k.sid).pop().map(|(d, p)| (*k, d, p)))
+}
+
+/// The voice Genesis `piece` asks of `k`, with its connection pair.
+fn voice_genesis(k: &Person, piece: &DuePiece, now: u64) -> Built {
+    let joiner = Joiner::try_from(&piece.joins[0]).unwrap();
+    let st = Start {
+        kind: GroupKind::Voice,
+        id: ID,
+        me: k.me(),
+        ik: &k.ik,
+        entry: k.voice_entry(),
+        joiners: &[&joiner],
+        gated: piece.gated,
+        stored: false,
+        now: now / 1000,
+    };
+    build_genesis(&st, &mut RowBases::new()).unwrap()
+}
+
+/// `k` builds the Join or opening `piece` asks; the commit lands. What the keyholders hold
+/// moves with it (one keyring for the set).
+async fn voice_commit(
+    g: &mut GroupState,
+    store: &Store,
+    k: &Person,
+    h: &mut Holds,
+    (due, piece): (u64, DuePiece),
+    now: u64,
+) -> Vec<Out> {
+    let b = match piece.kind {
+        gk::due::JOIN => join(g, k, h, &piece, now),
+        _ => opening(g, k, h, &piece, now),
+    };
+    let mut out = vec![];
+    let t = send(g, k.sid, due, &b, now, &mut out).expect("taken");
+    land(g, store, t, now, &mut out).await;
+    h.took(b);
+    out
+}
+
+/// A voice room of guests `sids` (lowest first), each following and fetching in turn: the
+/// first starts it, one Join seats the rest, and the next lowest is promoted.
+async fn voice_room(store: &Store, sids: &[UserId]) -> (GroupState, Vec<Person>, Holds, u64) {
+    let people: Vec<Person> = sids.iter().map(|s| Person::guest(*s)).collect();
+    voice_room_of(store, people, false).await
+}
+
+/// `voice_room` of `people` (lowest first), the room `anonymous` or not.
+async fn voice_room_of(
+    store: &Store,
+    people: Vec<Person>,
+    anonymous: bool,
+) -> (GroupState, Vec<Person>, Holds, u64) {
+    let mut g = voice_group();
+    g.anonymous = anonymous;
+    let sids: Vec<UserId> = people.iter().map(|p| p.sid).collect();
+    let mut now = now_ms();
+    let mut out = vec![];
+    for p in &people {
+        g.follow(p.sid, p.account);
+        assert_eq!(g.fetch(p.sid, p.fetch(), now, &mut out), Fetched::Not);
+    }
+    let k = &people[0];
+    let (due, piece) = dues(&out, k.sid).pop().expect("a Genesis due");
+    assert_eq!(piece.kind, gk::due::GENESIS);
+    let b = voice_genesis(k, &piece, now);
+    let mut out = vec![];
+    let t = send(&mut g, k.sid, due, &b, now, &mut out).expect("taken");
+    land(&mut g, store, t, now, &mut out).await;
+    let mut h = Holds {
+        ring: b.ring,
+        krk: b.krk,
+        cache: RowBases::new(),
+    };
+    now += 2_000;
+    let mut out = vec![];
+    g.tick(now, &mut out);
+    let join = dues(&out, k.sid).pop().expect("a Join due");
+    assert_eq!(join.1.kind, gk::due::JOIN);
+    let out = voice_commit(&mut g, store, k, &mut h, join, now).await;
+    let promote = dues(&out, k.sid).pop().expect("then a promotion");
+    assert_eq!(promote.1.kind, gk::due::PROMOTE);
+    let named = promote.1.promote.as_ref().map(|c| c.m);
+    assert_eq!(named, Some(people[1].m().into()), "the next lowest");
+    voice_commit(&mut g, store, k, &mut h, promote, now).await;
+    let us: Vec<Option<u32>> = g.holders.set.iter().map(|e| e.u).collect();
+    assert_eq!(us, vec![Some(sids[0]), Some(sids[1])]);
+    (g, people, h, now)
+}
+
+/// A voice seat is the member's connection pair, named by its account, or by the connection
+/// for a guest and in an anonymous room that is not gated (open choice 11). The fetcher is
+/// told the whole roster, its own seat in it; each member who has the roster, the new seat.
+#[test]
+fn a_voice_seat_is_named_by_the_account_but_by_the_connection_in_an_open_anonymous_room() {
+    for (anonymous, gate, by_account) in [
+        (false, false, true),
+        (true, false, false),
+        (true, true, true),
+    ] {
+        let mut g = voice_group();
+        (g.anonymous, g.gate) = (anonymous, gate);
+        let people = [
+            Person::voice_account(2, [2; 16]),
+            Person::voice_account(5, [5; 16]),
+        ];
+        let seat = |p: &Person| {
+            let m = match by_account {
+                true => p.m(),
+                false => MemberId::Conn(p.sid),
+            };
+            p.pair.public().seat(m)
+        };
+        let now = now_ms();
+        let mut out = vec![];
+        for p in &people {
+            g.follow(p.sid, p.account);
+            out.clear();
+            g.fetch(p.sid, p.fetch(), now, &mut out);
+            assert_eq!(g.members[&p.sid].seat, Some(seat(p)));
+        }
+        let all: Vec<(UserId, gk::GkSeat)> =
+            people.iter().map(|p| (p.sid, seat(p).into())).collect();
+        let whole = rosters(&out, 5);
+        assert_eq!(whole.len(), 1);
+        assert!(whole[0].whole);
+        assert_eq!(whole[0].seats, all, "every seat, its own among them");
+        let one = VoiceSeatsPiece {
+            seats: vec![all[1]],
+            ..VoiceSeatsPiece::default()
+        };
+        assert_eq!(
+            rosters(&out, 2),
+            vec![one],
+            "the new seat to who has the roster"
+        );
+    }
+}
+
+/// Any member holds a voice room's keys, whatever its platform or its "Help hold keys": the
+/// relay takes no `KeyholdVolunteer` there, and starts the room with the lowest user id that
+/// has its seat at hand, a phone's too. Text still ranks desktops first.
+#[test]
+fn a_voice_room_starts_with_its_lowest_user_id_on_any_platform_and_takes_no_volunteer() {
+    let people: Vec<Person> = [6, 3, 4].into_iter().map(Person::guest).collect();
+    let platforms = [
+        gk::platform::DESKTOP,
+        gk::platform::PHONE,
+        gk::platform::BROWSER,
+    ];
+    let vols: HashMap<UserId, Volunteer> = people
+        .iter()
+        .zip(platforms)
+        .map(|(p, platform)| (p.sid, p.volunteer(platform)))
+        .collect();
+    let first = |kind| crate::gk::holders::starter(kind, &vols, false).map(|v| v.sid);
+    assert_eq!(first(GroupKind::Voice), Some(3));
+    assert_eq!(first(GroupKind::Text), Some(6));
+    let mut g = voice_group();
+    g.follow(3, None);
+    let mut out = vec![];
+    g.volunteer(
+        3,
+        Some(people[1].volunteer(gk::platform::PHONE)),
+        now_ms(),
+        &mut out,
+    );
+    assert!(
+        g.vols.is_empty() && out.is_empty(),
+        "its fetch offers its seat's pair"
+    );
+}
+
+/// With fewer than two keyholders online the lowest seated member that holds none is
+/// promoted (`voice_room` checks it); a later joiner with a lower user id displaces nobody.
+#[tokio::test]
+async fn a_later_voice_joiner_with_a_lower_user_id_displaces_no_keyholder() {
+    let store = Store::memory();
+    let (mut g, people, mut h, mut now) = voice_room(&store, &[2, 3, 4]).await;
+    let late = Person::guest(1);
+    g.follow(1, None);
+    let mut out = vec![];
+    g.fetch(1, late.fetch(), now, &mut out);
+    now += 300;
+    let mut out = vec![];
+    g.tick(now, &mut out);
+    let ks = [&people[0], &people[1]];
+    let (k, due, piece) = asked(&out, &ks).expect("its Join");
+    assert_eq!(piece.kind, gk::due::JOIN);
+    let out = voice_commit(&mut g, &store, k, &mut h, (due, piece), now).await;
+    now += 5_000;
+    let mut more = vec![];
+    g.tick(now, &mut more);
+    assert!(asked(&out, &ks).is_none() && asked(&more, &ks).is_none());
+    let us: Vec<Option<u32>> = g.holders.set.iter().map(|e| e.u).collect();
+    assert_eq!(us, vec![Some(2), Some(3)]);
+}
+
+/// A voice keyholder that leaves is removed at once (§5.9): its leave closes the exit batch
+/// with no 2 s wait, the other keyholder is asked a Remove carrying its seat's exit, and
+/// that commit rolls the seed.
+#[tokio::test]
+async fn a_voice_keyholders_leave_is_a_remove_asked_at_once_that_rolls_the_seed() {
+    let store = Store::memory();
+    let (mut g, people, mut h, mut now) = voice_room(&store, &[2, 3, 4]).await;
+    let seed = g.head.as_ref().unwrap().sh.header().seed;
+    now += 2_000;
+    let mut out = vec![];
+    g.leave(3, cause::LEAVE, now, &mut out);
+    let (due, piece) = dues(&out, 2).pop().expect("a due at once");
+    assert_eq!(piece.kind, gk::due::REMOVE);
+    assert_eq!(piece.remove.map(|r| r.m), Some(gk::GkMember::Conn(3)));
+    let exits: Vec<SeatRef> = piece.exits.iter().map(|x| Exit::from(*x).seat).collect();
+    assert_eq!(exits, vec![people[1].seat()], "its seat's exit rides along");
+    voice_commit(&mut g, &store, &people[0], &mut h, (due, piece), now).await;
+    let head = g.head.as_ref().unwrap().sh.header().clone();
+    assert_eq!((head.kind, head.seed), (Kind::KeyholdersRemove, seed + 1));
+    assert_eq!(g.holders.set.len(), 1);
+    assert!(!g.seats.contains_key(&people[1].seat()));
+}
+
+/// Every voice seat exits when its session ends, an account's too: going offline keeps an
+/// account's text seat, never its voice seat (part 15).
+#[tokio::test]
+async fn every_voice_seat_exits_at_disconnect_an_accounts_too() {
+    let store = Store::memory();
+    let (mut g, people, mut h, mut now) = voice_room(&store, &[2, 3]).await;
+    let a = Person::voice_account(5, [5; 16]);
+    g.follow(5, a.account);
+    let mut out = vec![];
+    g.fetch(5, a.fetch(), now, &mut out);
+    now += 300;
+    let mut out = vec![];
+    g.tick(now, &mut out);
+    let ks = [&people[0], &people[1]];
+    let (k, due, piece) = asked(&out, &ks).expect("its Join");
+    voice_commit(&mut g, &store, k, &mut h, (due, piece), now).await;
+    assert!(g.seats.contains_key(&a.seat()));
+    let mut out = vec![];
+    g.leave(5, cause::DISCONNECT, now, &mut out);
+    assert_eq!(g.exits.waiting(), 1);
+    assert_eq!(
+        rosters(&out, 2),
+        vec![VoiceSeatsPiece {
+            gone: vec![5],
+            ..VoiceSeatsPiece::default()
+        }],
+        "the members hear it left"
+    );
+}
+
+/// Both keyholders gone: the lowest user id left is asked a Genesis at once, and the relay
+/// queues every other member whose pair it holds for the new generation, so nobody has to
+/// fetch (part 5).
+#[tokio::test]
+async fn with_both_voice_keyholders_gone_the_lowest_left_starts_anew_and_every_member_is_queued() {
+    let store = Store::memory();
+    let (mut g, people, _, mut now) = voice_room(&store, &[2, 3, 4, 5]).await;
+    let gen = g.gen();
+    now += 2_000;
+    let mut out = vec![];
+    g.leave(2, cause::LEAVE, now, &mut out);
+    let mut out = vec![];
+    g.leave(3, cause::DISCONNECT, now, &mut out);
+    let (due, piece) = dues(&out, 4).pop().expect("a Genesis of the lowest left");
+    assert_eq!(piece.kind, gk::due::GENESIS);
+    assert!(dues(&out, 5).is_empty());
+    let b = voice_genesis(&people[2], &piece, now);
+    let mut out = vec![];
+    let t = send(&mut g, 4, due, &b, now, &mut out).expect("taken");
+    land(&mut g, &store, t, now, &mut out).await;
+    assert_ne!(g.gen(), gen, "a new generation");
+    assert!(g.joins.has(&people[3].seat()), "queued with no fetch");
+    now += 300;
+    let mut out = vec![];
+    g.tick(now, &mut out);
+    let (_, piece) = dues(&out, 4).pop().expect("its Join");
+    let joined: Vec<SeatRef> = piece
+        .joins
+        .iter()
+        .map(|j| Joiner::try_from(j).unwrap().seat)
+        .collect();
+    assert_eq!(joined, vec![people[3].seat()]);
+}
+
+/// An opening in a voice room reaches every seated member, writer or not, and each
+/// keyholder as a member too: each push carries its seal, so nobody fetches to move.
+#[tokio::test]
+async fn a_voice_opening_reaches_every_member_and_keyholder_with_its_seal() {
+    let store = Store::memory();
+    let (mut g, people, mut h, mut now) = voice_room(&store, &[2, 3, 4, 5]).await;
+    now += 2_000;
+    let mut out = vec![];
+    g.leave(5, cause::LEAVE, now, &mut out);
+    now += 2_000;
+    let mut out = vec![];
+    g.tick(now, &mut out);
+    let ks = [&people[0], &people[1]];
+    let (k, due, piece) = asked(&out, &ks).expect("the exit's opening");
+    assert_eq!(piece.kind, gk::due::EXITS);
+    let out = voice_commit(&mut g, &store, k, &mut h, (due, piece), now).await;
+    for sid in [2, 3, 4] {
+        let p = ins(&out, sid).pop().expect("a push");
+        assert!(p.pushed && p.head.is_some() && p.seal.is_some(), "{sid}");
+    }
+    assert!(ins(&out, 5).is_empty());
+}
+
+/// `VoiceSeats` goes in parts of at most `VOICE_SEATS_PER_FRAME` entries, each a frame the
+/// codec takes, `whole` on the first and `last` on the last: a routed room of 300 is told in
+/// one frame, and a roster of any size comes back whole.
+#[test]
+fn voice_seats_go_in_frames_the_codec_takes_whatever_the_rooms_size() {
+    let seat = |u: UserId| {
+        let s = SeatRef {
+            m: MemberId::Account([u as u8; 16]),
+            tag_sk: [1; 8],
+            tag_sx: [2; 8],
+        };
+        (u, gk::GkSeat::from(s))
+    };
+    for (n, gone, frames) in [(300, 0, 1), (2_500, 10, 4)] {
+        let piece = VoiceSeatsPiece {
+            seats: (1..=n).map(seat).collect(),
+            gone: (n + 1..=n + gone).collect(),
+            whole: true,
+        };
+        let out = vec![Out(9, seats_frames(ID, piece.clone()))];
+        assert_eq!(out[0].1.len(), frames, "{n} seats");
+        for (i, f) in out[0].1.iter().enumerate() {
+            let ServerMessage::VoiceSeats {
+                channel_id,
+                part,
+                last,
+                piece,
+                ..
+            } = f
+            else {
+                panic!("VoiceSeats only");
+            };
+            assert_eq!((*channel_id, *part as usize), (7, i));
+            assert_eq!((piece.whole, *last), (i == 0, i + 1 == frames));
+            let bytes = voipc_protocol::codec::encode_server_msg(f).unwrap().len();
+            assert!(bytes <= voipc_protocol::codec::MAX_MSG_SIZE as usize);
+        }
+        assert_eq!(rosters(&out, 9), vec![piece]);
+    }
+}
+
+/// A voice room's group starts at its first join, under the room's `r:` id, and goes with
+/// its keyring when the room empties; the lobby has none.
+#[tokio::test]
+async fn a_voice_rooms_group_goes_when_the_room_empties_and_the_lobby_has_none() {
+    let groups = Groups::new(true);
+    groups.on_room_join(0, 1, None, false);
+    assert!(groups.stats().is_empty(), "no voice in the lobby");
+    groups.on_room_join(7, 1, None, false);
+    groups.on_room_join(7, 2, Some([2; 16]), false);
+    let rooms = groups.stats();
+    assert_eq!(rooms.len(), 1);
+    assert_eq!(rooms[0].kind, gk::group_kind::VOICE);
+    assert!(groups.room_id(7).starts_with("r:"));
+    groups.on_room_leave(7, 1, cause::LEAVE, false);
+    assert_eq!(groups.stats().len(), 1);
+    groups.on_room_leave(7, 2, cause::KICK, true);
+    assert!(groups.stats().is_empty());
+}
+
+/// After a gate on: the three dues that follow (the Join of the renamed seats once its batch
+/// closes, the exits' opening, the gated opening one epoch gap later), each landed; their
+/// kinds.
+async fn gate_dues(
+    g: &mut GroupState,
+    store: &Store,
+    ks: &[&Person],
+    h: &mut Holds,
+    now: &mut u64,
+) -> Vec<u8> {
+    let mut kinds = vec![];
+    let mut next = None;
+    use voipc_crypto::group_key::timers::EPOCH_MIN_GAP_MS;
+    for wait in [300, 2_000, EPOCH_MIN_GAP_MS] {
+        *now += wait;
+        let mut out = vec![];
+        g.tick(*now, &mut out);
+        let (k, due, piece) = next.take().or_else(|| asked(&out, ks)).expect("a due");
+        kinds.push(piece.kind);
+        let out = voice_commit(g, store, k, h, (due, piece), *now).await;
+        next = asked(&out, ks);
+    }
+    kinds
+}
+
+/// The seat of `p`'s pair named by its connection.
+fn conn_seat(p: &Person) -> SeatRef {
+    p.pair.public().seat(MemberId::Conn(p.sid))
+}
+
+/// Signed-in members `sids`, each its own account.
+fn voice_accounts(sids: &[UserId]) -> Vec<Person> {
+    sids.iter()
+        .map(|s| Person::voice_account(*s, [*s as u8; 16]))
+        .collect()
+}
+
+/// A ban (or reset) exits every seat of the account, its voice seat named by its connection
+/// in an anonymous room that is not gated among them: its sessions' seats, not only seats
+/// named by the account, so the eject's leave after it finds a seat already gone.
+#[tokio::test]
+async fn a_banned_accounts_voice_seat_exits_though_its_connection_names_it() {
+    let store = Store::memory();
+    let (mut g, people, mut h, mut now) = voice_room(&store, &[2, 3]).await;
+    g.anonymous = true;
+    let a = Person::voice_account(5, [5; 16]);
+    g.follow(5, a.account);
+    let mut out = vec![];
+    g.fetch(5, a.fetch(), now, &mut out);
+    now += 300;
+    let mut out = vec![];
+    g.tick(now, &mut out);
+    let ks = [&people[0], &people[1]];
+    let (k, due, piece) = asked(&out, &ks).expect("its Join");
+    voice_commit(&mut g, &store, k, &mut h, (due, piece), now).await;
+    assert!(
+        g.seats.contains_key(&conn_seat(&a)),
+        "seated by its connection"
+    );
+    let mut out = vec![];
+    g.account_exit(&[5; 16], cause::BAN, now, &mut out);
+    assert!(g.exits.has(&conn_seat(&a)), "the ban exits it");
+    g.leave(5, cause::DISCONNECT, now, &mut out);
+    assert_eq!(g.exits.waiting(), 1);
+}
+
+/// A voice room turned anonymous names its signed-in members' seats by their connections at
+/// once: each account seat exits and its pair is queued under the connection, every member
+/// hears the new seats, and a newcomer's roster names no account (open choice 11).
+#[tokio::test]
+async fn an_anonymous_flip_names_every_voice_seat_by_its_connection_before_a_newcomer_looks() {
+    let store = Store::memory();
+    let (mut g, people, mut h, mut now) =
+        voice_room_of(&store, voice_accounts(&[2, 3, 4]), false).await;
+    let mut out = vec![];
+    g.room_anonymous(true, now, &mut out);
+    for p in &people {
+        assert!(g.exits.has(&p.seat()), "{}'s account seat exits", p.sid);
+        assert!(
+            g.joins.has(&conn_seat(p)),
+            "{}'s connection seat waits",
+            p.sid
+        );
+        let told: Vec<(UserId, gk::GkSeat)> = rosters(&out, p.sid)
+            .into_iter()
+            .flat_map(|r| r.seats)
+            .collect();
+        let want: Vec<(UserId, gk::GkSeat)> = people
+            .iter()
+            .map(|q| (q.sid, conn_seat(q).into()))
+            .collect();
+        assert_eq!(told, want, "{} hears every new seat", p.sid);
+    }
+    let late = Person::voice_account(9, [9; 16]);
+    g.follow(9, late.account);
+    let mut out = vec![];
+    g.fetch(9, late.fetch(), now, &mut out);
+    let whole = rosters(&out, 9);
+    assert!(whole[0].whole);
+    assert!(
+        whole[0]
+            .seats
+            .iter()
+            .all(|(u, s)| s.m == gk::GkMember::Conn(*u)),
+        "no account behind a pseudonym"
+    );
+    now += 300;
+    let mut out = vec![];
+    g.tick(now, &mut out);
+    let ks = [&people[0], &people[1]];
+    let (k, due, piece) = asked(&out, &ks).expect("the Join of the new seats");
+    assert_eq!(piece.kind, gk::due::JOIN);
+    voice_commit(&mut g, &store, k, &mut h, (due, piece), now).await;
+    for p in &people {
+        assert!(g.seats.contains_key(&conn_seat(p)));
+    }
+}
+
+/// A gate on an anonymous voice room keeps every signed-in member in it: each connection
+/// seat is swapped for its account's in the open group, so the members still take each
+/// opening, and the gated opening finds no connection seat. Once the gate is off, the seats
+/// stay the accounts' while the head is gated and go back to the connections at the opening
+/// that opens it.
+#[tokio::test]
+async fn a_gate_on_an_anonymous_voice_room_seats_its_members_by_account_until_the_head_opens() {
+    let store = Store::memory();
+    let (mut g, people, mut h, mut now) =
+        voice_room_of(&store, voice_accounts(&[2, 3, 4]), true).await;
+    for p in &people {
+        assert!(g.seats.contains_key(&conn_seat(p)));
+    }
+    let ks = [&people[0], &people[1]];
+    let mut out = vec![];
+    g.set_gate(true, now, &mut out);
+    for p in &people {
+        assert!(
+            g.exits.has(&conn_seat(p)),
+            "{}'s connection seat exits",
+            p.sid
+        );
+        assert!(g.joins.has(&p.seat()), "{}'s account seat waits", p.sid);
+    }
+    // The Join of the account seats, the exits' opening, then the gated one
+    let kinds = gate_dues(&mut g, &store, &ks, &mut h, &mut now).await;
+    assert_eq!(kinds, vec![gk::due::JOIN, gk::due::EXITS, gk::due::GATE]);
+    let head = g.head.as_ref().unwrap().sh.header().clone();
+    assert!(head.gated);
+    for p in &people {
+        assert!(
+            g.seats.contains_key(&p.seat()),
+            "{} sits by its account",
+            p.sid
+        );
+    }
+    let mut out = vec![];
+    g.set_gate(false, now, &mut out);
+    assert!(g.joins.is_empty(), "a gated head seats no connection");
+    // The next opening opens the head: the connections' seats wait again
+    now += 2_000;
+    let mut out = vec![];
+    g.leave(4, cause::LEAVE, now, &mut out);
+    now += 2_000;
+    let mut out = vec![];
+    g.tick(now, &mut out);
+    let (k, due, piece) = asked(&out, &ks).expect("the exit's opening");
+    assert!(!piece.gated);
+    voice_commit(&mut g, &store, k, &mut h, (due, piece), now).await;
+    for p in &people[..2] {
+        assert!(
+            g.joins.has(&conn_seat(p)),
+            "{} by its connection again",
+            p.sid
+        );
+    }
+}
+
+/// A post in a voice room names its writer as the writer's app does, by the gate of the
+/// post's epoch, not of the channel now: the blob is kept under that name, which readers ask
+/// it by. Gate on, the head still open: by the connection; under the gated head: by the
+/// account, and by the connection for the epoch before.
+#[tokio::test]
+async fn a_voice_posts_writer_is_named_by_its_epochs_gate_not_the_channels() {
+    let store = Store::memory();
+    let (mut g, people, mut h, mut now) =
+        voice_room_of(&store, voice_accounts(&[2, 3, 4]), true).await;
+    let a = &people[2];
+    let gen = g.gen().unwrap();
+    let mut out = vec![];
+    g.set_gate(true, now, &mut out);
+    let open = g.head.as_ref().unwrap().sh.header().epoch;
+    let kept = |g: &GroupState, epoch: u32, m: MemberId| {
+        let w = gk::GkWriter {
+            m: m.into(),
+            u: a.sid,
+        };
+        g.blobs.contains_key(&(epoch, w))
+    };
+    assert_eq!(
+        g.post_blob(a.sid, gen, open, vec![1; 32], now, &mut out),
+        Ok(())
+    );
+    assert!(
+        kept(&g, open, MemberId::Conn(a.sid)),
+        "the head is open still"
+    );
+    let ks = [&people[0], &people[1]];
+    gate_dues(&mut g, &store, &ks, &mut h, &mut now).await;
+    let gated = g.head.as_ref().unwrap().sh.header().clone();
+    assert!(gated.gated);
+    let account = a.account;
+    assert_eq!(g.room_writer(a.sid, account, &gen, gated.epoch), a.m());
+    assert_eq!(
+        g.room_writer(a.sid, account, &gen, gated.epoch - 1),
+        MemberId::Conn(a.sid),
+        "the epoch before the gated opening"
+    );
+    let mut out = vec![];
+    g.set_gate(false, now, &mut out);
+    assert_eq!(
+        g.room_writer(a.sid, account, &gen, gated.epoch),
+        a.m(),
+        "the gate is off, its epoch still gated"
+    );
+    assert_eq!(
+        g.post_blob(a.sid, gen, gated.epoch, vec![2; 32], now, &mut out),
+        Ok(())
+    );
+    assert!(kept(&g, gated.epoch, a.m()));
 }

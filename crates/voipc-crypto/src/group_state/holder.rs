@@ -625,6 +625,10 @@ fn joiner_why(
             Some(highest) => Err(EndorsementBad::OldCounter { n: e.n, highest }),
             None => Ok(()),
         },
+        // A voice seat named by its connection is a guest's or, in an anonymous room, a
+        // signed-in member's (§11.8: its pair carries the account's counter); no account is
+        // named to hold that counter to, so it is taken as it comes and raises nothing
+        None if kind == GroupKind::Voice => Ok(()),
         _ => take_endorsement(c.pins, account, e, at),
     };
     match taken {
@@ -3017,6 +3021,60 @@ mod tests {
             true,
         );
         assert_eq!(why(&joiner(1, T0), &mut c), Some(join_refused::OLD_COUNTER));
+    }
+
+    /// §11.8, plan 16: in an anonymous room a signed-in member's voice seat is named by its
+    /// connection, and its 0x02 pair carries the account's counter: seated as it comes, with
+    /// every other check kept. A text seat named by a connection is a guest's, counter 0.
+    #[test]
+    fn a_voice_seat_named_by_its_connection_is_seated_with_its_accounts_counter() {
+        let u = 21;
+        let ik = IdentityKeyPair::generate(&mut crate::rng());
+        let joiner = |n: u32, signed_for: u32| {
+            let keys = SeatPair::generate().public();
+            let e = Endorsement::sign(
+                &ik,
+                Origin::Connection,
+                MemberId::Conn(signed_for),
+                n,
+                T0,
+                &keys,
+            )
+            .unwrap();
+            Joiner {
+                seat: keys.seat(MemberId::Conn(u)),
+                ik: raw(&ik),
+                keys,
+                endorsement: e,
+                returning: false,
+            }
+        };
+        let mut pins = MemoryPins::default();
+        let mut c = GkCtx {
+            pins: &mut pins,
+            now: (T0 + 7200) * 1000,
+        };
+        let why = |kind: GroupKind, j: &Joiner, c: &mut GkCtx<'_>| {
+            joiner_why(kind, false, j, T0 + 7200, c, &HashSet::new())
+        };
+        assert_eq!(why(GroupKind::Voice, &joiner(3, u), &mut c), None);
+        assert_eq!(
+            why(GroupKind::Voice, &joiner(0, u), &mut c),
+            None,
+            "a guest"
+        );
+        let other = joiner(3, u + 1);
+        assert_eq!(
+            why(GroupKind::Voice, &other, &mut c),
+            Some(join_refused::ENDORSEMENT),
+            "another connection's pair"
+        );
+        assert_eq!(
+            why(GroupKind::Text, &joiner(3, u), &mut c),
+            Some(join_refused::ENDORSEMENT),
+            "a text guest's counter is 0"
+        );
+        assert_eq!(why(GroupKind::Text, &joiner(0, u), &mut c), None);
     }
 
     #[test]

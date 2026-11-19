@@ -12,6 +12,8 @@ mod edge_view;
 mod emote_sources;
 mod emotes;
 mod files;
+mod gk_local;
+mod gk_net;
 mod global_keys;
 mod import;
 mod media;
@@ -447,6 +449,7 @@ pub fn run() {
             files::set_file_cache_mb,
             files::save_file,
             commands::set_history_sharing,
+            commands::set_help_hold_keys,
             commands::request_channel_history,
             commands::start_transmit,
             commands::stop_transmit,

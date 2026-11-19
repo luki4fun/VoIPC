@@ -2740,9 +2740,14 @@ impl AccountSync {
 
     /// `GroupKeys` came: whether this relay uses the group key. The floor pages are read once
     /// the pins are in; the seat keys are made at this first need, rotated when 30 days old,
-    /// or else published as they are.
+    /// or else published as they are. With it off, the seat keys the vault keeps still go to
+    /// `GroupKeying` (kept history opens under them, 3i); none is made, rotated or published.
     pub fn gk_on(&mut self, on: bool) -> Vec<ClientMessage> {
-        if !on || self.gk.on {
+        if !on {
+            self.gk.handover |= self.gk.keys.is_some() && !self.gk.unsettled;
+            return Vec::new();
+        }
+        if self.gk.on {
             return Vec::new();
         }
         self.gk.on = true;
@@ -4813,6 +4818,29 @@ mod tests {
             };
             assert_eq!(published(&out).map(|(n, _)| n), Some(n), "{age}");
         }
+    }
+
+    /// 3i: with the group key off, the seat keys the vault keeps still go to `GroupKeying`
+    /// (kept reads open under them), as they are: none is made, rotated or published.
+    #[test]
+    fn seat_keys_the_vault_keeps_are_handed_over_with_the_key_off_and_nothing_goes_out() {
+        let me = account(1);
+        let now = crate::time::now_millis() / 1000;
+        let keys = SeatKeys::generate(3, now - 31 * 24 * 60 * 60);
+        let items = [(ITEM_SEAT_KEM, 1, keys.to_bytes().to_vec())];
+        let (mut s, _) = start_with_items(&me, &items, LogMemory::default());
+        assert!(s.gk_on(false).is_empty(), "no put, no publish");
+        let got = s.take_seat_keys().expect("handed over");
+        assert_eq!((got.n, got.made), (keys.n, keys.made), "not rotated");
+        assert!(s.take_seat_keys().is_none(), "once");
+        let later = s.gk_tick(now);
+        assert!(
+            published(&later).is_none() && sent(&later, "VaultPut").is_empty(),
+            "nor later"
+        );
+        let mut fresh = sync_for(&me);
+        assert!(fresh.gk_on(false).is_empty());
+        assert!(fresh.take_seat_keys().is_none(), "none made");
     }
 
     /// 3e: a second rotation while the old keys are kept waits for them to go (`rotate` would

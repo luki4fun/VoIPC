@@ -9,6 +9,7 @@
 pub mod account;
 #[cfg(any(test, fuzzing))]
 pub mod fuzz;
+pub mod gk;
 pub mod media;
 pub mod signal;
 
@@ -16,6 +17,7 @@ use serde::Serialize;
 use voipc_crypto::file::FileError;
 use voipc_crypto::time::now_millis;
 use voipc_protocol::codec::{APP_VERSION, PROTOCOL_VERSION};
+use voipc_protocol::conv::unhex16;
 use voipc_protocol::messages::ClientMessage;
 use voipc_protocol::pool::{self, ViewerMsg};
 use voipc_protocol::types::{PreKeyBundleData, UserInfo};
@@ -564,6 +566,195 @@ impl SignalClient {
     pub fn live_answer_job(&mut self, channel_id: u32, go: bool) -> Result<JsValue, JsError> {
         live_out(self.core.live_answer_job(channel_id, go, now_millis()))
     }
+
+    // ── The group epoch key (`gk`, plan 3i) ──────────────────────────────
+    //
+    // `voipc_crypto::group_state`, written once for both backends: session.ts sends and
+    // emits what `GkOut` says, as network.rs does. Frames cross as postcard bytes.
+
+    /// `GroupKeys`: `GkOut`. `run` is its 16 bytes, `clock` its seconds; `kept`: what an
+    /// earlier connection to this relay kept in this page.
+    #[wasm_bindgen(js_name = gkStart)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gk_start(
+        &mut self,
+        on: bool,
+        run: &[u8],
+        clock: f64,
+        help: bool,
+        visible: bool,
+        in_call: bool,
+        kept: Option<KeptGk>,
+    ) -> Result<JsValue, JsError> {
+        let run: [u8; 16] = run
+            .try_into()
+            .map_err(|_| JsError::new("a relay run is 16 bytes"))?;
+        let start = gk::Start {
+            on,
+            run,
+            clock: clock as u64,
+            help,
+            visible,
+            in_call,
+            local: kept.map(|k| k.local),
+        };
+        gk_out(self.core.gk_start(start).map_err(js_err)?)
+    }
+
+    /// A channel we are in, followed or stood in: `GkOut`.
+    #[wasm_bindgen(js_name = gkTrack)]
+    pub fn gk_track(
+        &mut self,
+        channel_id: u32,
+        text: bool,
+        log: &str,
+        anonymous: bool,
+        hide_members: bool,
+        viewer_admin: bool,
+    ) -> Result<JsValue, JsError> {
+        gk_out(
+            self.core
+                .gk
+                .track(channel_id, text, log, anonymous, hide_members, viewer_admin),
+        )
+    }
+
+    #[wasm_bindgen(js_name = gkUntrack)]
+    pub fn gk_untrack(&mut self, channel_id: u32) -> Result<JsValue, JsError> {
+        gk_out(self.core.gk.untrack(channel_id))
+    }
+
+    /// A frame `isGkFrame` named, as its postcard bytes: `GkOut`.
+    #[wasm_bindgen(js_name = gkFrame)]
+    pub fn gk_frame(&mut self, payload: &[u8]) -> Result<JsValue, JsError> {
+        gk_out(self.core.gk_frame(payload).map_err(js_err)?)
+    }
+
+    /// A post of ours, as `envelope` packed it, under its message id (hex): `GkOut`. With
+    /// `log` (the channel's, "" for none) its kept copy is filed once it goes.
+    #[wasm_bindgen(js_name = gkPost)]
+    pub fn gk_post(
+        &mut self,
+        channel_id: u32,
+        message_id: &str,
+        envelope: Vec<u8>,
+        log: String,
+        ttl_secs: Option<u32>,
+    ) -> Result<JsValue, JsError> {
+        let post_id =
+            unhex16(message_id).ok_or_else(|| JsError::new("a message id is 32 hex digits"))?;
+        gk_out(
+            self.core
+                .gk_post(channel_id, post_id, envelope, log, ttl_secs),
+        )
+    }
+
+    /// Each second: `GkOut`.
+    #[wasm_bindgen(js_name = gkTick)]
+    pub fn gk_tick(&mut self) -> Result<JsValue, JsError> {
+        gk_out(self.core.gk_tick())
+    }
+
+    /// After the account's own calls: what they said for the group key, as `GkOut`.
+    #[wasm_bindgen(js_name = gkNews)]
+    pub fn gk_news(&mut self) -> Result<JsValue, JsError> {
+        gk_out(self.core.gk.news())
+    }
+
+    /// The keyholder's next upload's postcard bytes.
+    #[wasm_bindgen(js_name = gkNextFrame)]
+    pub fn gk_next_frame(&mut self, in_call: bool) -> Option<Vec<u8>> {
+        self.core.gk.next_frame(in_call)
+    }
+
+    /// One step of the keyholder's build, at most `budget_ms`: `GkOut`, or undefined when
+    /// no build waits.
+    #[wasm_bindgen(js_name = gkBuildStep)]
+    pub fn gk_build_step(&mut self, budget_ms: f64) -> Result<JsValue, JsError> {
+        match self.core.gk.build_step(budget_ms) {
+            Some(out) => gk_out(out),
+            None => Ok(JsValue::UNDEFINED),
+        }
+    }
+
+    /// "Help hold keys", switched live: `GkOut`.
+    #[wasm_bindgen(js_name = gkSetVolunteer)]
+    pub fn gk_set_volunteer(&mut self, on: bool) -> Result<JsValue, JsError> {
+        gk_out(self.core.gk.set_volunteer(on))
+    }
+
+    /// The page shown or hidden, a call begun or ended: `GkOut`.
+    #[wasm_bindgen(js_name = gkVisibility)]
+    pub fn gk_visibility(&mut self, visible: bool, in_call: bool) -> Result<JsValue, JsError> {
+        gk_out(self.core.gk.visibility(visible, in_call))
+    }
+
+    /// `GkOut.voice`: the room's keys into `keys` (its group-key mode). Whether it took any.
+    #[wasm_bindgen(js_name = gkVoiceInto)]
+    pub fn gk_voice_into(&mut self, keys: &mut MediaKeys, own_channel: u32) -> bool {
+        self.core.gk.voice_into(&mut keys.inner, own_channel)
+    }
+
+    /// `UserLeft`, for the names the group key's events carry.
+    #[wasm_bindgen(js_name = gkUserLeft)]
+    pub fn gk_user_left(&mut self, user_id: u32, channel_id: u32) {
+        self.core.gk.roster.left(user_id, channel_id);
+    }
+
+    /// The connection ends: `GkOut` (the posts given up).
+    #[wasm_bindgen(js_name = gkEnd)]
+    pub fn gk_end(&mut self) -> Result<JsValue, JsError> {
+        gk_out(self.core.gk.end())
+    }
+
+    /// What the next connection to this relay takes over, in this page: before `free`.
+    #[wasm_bindgen(js_name = gkKeep)]
+    pub fn gk_keep(&self) -> Option<KeptGk> {
+        self.core.gk.keep().map(|local| KeptGk { local })
+    }
+}
+
+/// The group key's floors, between one connection to a relay and its next in this page
+/// (plan 3d: the browser keeps floors for the page's life, signed in or not).
+#[wasm_bindgen]
+pub struct KeptGk {
+    local: voipc_crypto::group_state::LocalGk,
+}
+
+/// Whether a server frame (its postcard bytes) is one of the group key's: `gkFrame` takes
+/// it as it is, undecoded.
+#[wasm_bindgen(js_name = isGkFrame)]
+pub fn is_gk_frame(payload: &[u8]) -> bool {
+    gk::is_gk_frame(payload)
+}
+
+/// `gk::Out` for the page: `{ seen: { user_id, account, name }[], send: Uint8Array[], emit:
+/// { name, payload }[], voice: boolean, build: boolean, held: boolean }`.
+fn gk_out(out: gk::Out) -> Result<JsValue, JsError> {
+    let send = js_sys::Array::new();
+    for frame in &out.send {
+        send.push(&uint8array(&postcard::to_allocvec(frame)?));
+    }
+    let emit: Vec<_> = out
+        .emit
+        .iter()
+        .map(|(name, payload)| serde_json::json!({ "name": name, "payload": payload }))
+        .collect();
+    let seen: Vec<_> = out
+        .seen
+        .iter()
+        .map(|(user_id, account, name)| {
+            serde_json::json!({ "user_id": user_id, "account": account, "name": name })
+        })
+        .collect();
+    Ok(js_object(&[
+        ("seen", plain(&serde_json::Value::Array(seen))?),
+        ("send", send.into()),
+        ("emit", plain(&serde_json::Value::Array(emit))?),
+        ("voice", JsValue::from_bool(out.voice)),
+        ("build", JsValue::from_bool(out.build)),
+        ("held", JsValue::from_bool(out.held)),
+    ]))
 }
 
 /// Sessions with accounts, between one connection of an account to a server and its next.

@@ -1007,6 +1007,11 @@ const handlers: Record<string, Handler> = {
       c.ui_prefs = prefs as Record<string, unknown>;
     });
   },
+  // "Help hold keys", live on every open connection (the browser keeps no switch of it)
+  set_help_hold_keys: ({ enabled }) => {
+    const on = bool(enabled, "enabled");
+    for (const s of session.allSessions()) s.gkSetVolunteer(on);
+  },
   set_config_bool: ({ key, value }) => {
     const enabled = bool(value, "value");
     updateConfig((c) => {

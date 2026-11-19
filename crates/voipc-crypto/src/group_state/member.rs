@@ -97,6 +97,9 @@ pub(super) struct Member {
     /// missing after the answer that should have brought it. `tick` asks again then while a
     /// post waits.
     retry_at: Option<u64>,
+    /// The last fetch was refused `RATE`: `tick` asks again once its pause is over while no
+    /// key of the head is held, whether or not a post waits.
+    rate_paced: bool,
     /// When the last fetch for a missing `kh` went (ms).
     need_kh_at: Option<u64>,
     /// The relay asked for the connection's seat pair (`NO_SEAT_KEYS`).
@@ -169,6 +172,7 @@ impl Member {
             waiting: None,
             fetching: None,
             retry_at: None,
+            rate_paced: false,
             need_kh_at: None,
             seat_owed: false,
             wait: None,
@@ -309,6 +313,7 @@ impl Member {
         }
         self.fetching = Some(now);
         self.retry_at = None;
+        self.rate_paced = false;
         let have = self.floor.as_ref().map(|f| gk::FloorRef {
             gen: f.gen,
             epoch: f.epoch,
@@ -344,11 +349,14 @@ impl Member {
             self.tell(GkState::Late { waiting }, out);
         }
         // Asked again once its pause is over, while a post of ours or one to read waits; a
-        // voice room always waits for its keys (V1)
+        // voice room always waits for its keys (V1), and so does a member refused `RATE`
+        // with no key of the head (not seated, or its keying lost): else it waited for the
+        // next post, and every member the relay paced then fetched at once
         let again = self.retry_at.is_some_and(|t| c.now >= t)
             && (!self.writer.is_empty()
                 || self.reader.waiting()
-                || self.t.kind == GroupKind::Voice);
+                || self.t.kind == GroupKind::Voice
+                || (self.rate_paced && self.current_key().is_none()));
         if unanswered || old || again {
             self.fetch(who, c.now, out);
         }
@@ -505,9 +513,13 @@ impl Member {
                     });
                 }
             }
+            // Paced at the fetch pace plus up to as long again, drawn by this device: the
+            // members one full inbox refused do not come back together
             (gk::refused_what::FETCH, gk::refused_why::RATE) => {
                 self.fetching = None;
-                self.retry_at = Some(c.now.saturating_add(CHECK_WAIT_MS));
+                self.rate_paced = true;
+                let jitter = rand::Rng::random_range(&mut crate::rng(), 0..CHECK_WAIT_MS);
+                self.retry_at = Some(c.now.saturating_add(CHECK_WAIT_MS + jitter));
             }
             (gk::refused_what::FETCH, gk::refused_why::NOT_STORED) => {
                 tracing::debug!(group = %self.t.group, "past epochs refused");

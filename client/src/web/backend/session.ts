@@ -10,7 +10,7 @@
 
 import { emit as emitEvent } from "./events";
 import { getConfig } from "./config";
-import { loadWasm, wasm, type KeptPins, type KeptSessions, type LiveOut, type MediaKeys, type MessageRefs, type PreKeyBundleData, type Sealed, type SignalClient } from "./wasm";
+import { loadWasm, wasm, type GkOut, type KeptGk, type KeptPins, type KeptSessions, type LiveOut, type MediaKeys, type MessageRefs, type PreKeyBundleData, type Sealed, type SignalClient } from "./wasm";
 import { ACCOUNT_STEP_MS, AccountDriver, frameGoesOn, type AccountArgs, type AccountHost } from "./account";
 import { connect as openTransport, openEdgeView, type Transport } from "./transport";
 import { EdgeView } from "./edge-view";
@@ -25,7 +25,7 @@ import { Files, originOf, sanitizeImage } from "./files";
 import { Emotes, emoteLimitsOf } from "./emotes";
 import { motionOf } from "./media";
 import { postsMarks } from "./posts-marks";
-import { asksBundles, ChannelListParts, KeptByAccount, LivePump } from "./live";
+import { asksBundles, ChannelListParts, GkPump, gkPathAfter, gkPosts, gkRuns, KeptByAccount, LivePump, ReadyClock, yieldTask, type GkPath } from "./live";
 
 /** Bound for the authentication response (network.rs CONNECT_TIMEOUT). */
 const AUTH_TIMEOUT_MS = 10_000;
@@ -33,6 +33,12 @@ const AUTH_TIMEOUT_MS = 10_000;
 const KEEPALIVE_MS = 10_000;
 /** The live path's clock (`ChannelKeying::live_tick`). */
 const LIVE_TICK_MS = 1_000;
+/** A keyholder's build runs in steps this long, shorter in a call: the page thread
+ *  paints and feeds the mic (plan 3b). */
+const GK_STEP_MS = 8;
+const GK_STEP_CALL_MS = 2;
+/** How often a keyholder's waiting upload looks at its transport (live.ts `DRAIN_POLL_MS`). */
+const GK_UPLOAD_LOOK_MS = 5;
 /** Queued chat messages older than this are dropped instead of sent. */
 const PENDING_MESSAGE_TTL_MS = 60_000;
 /** voipc_protocol::voice::VOICE_HEADER_SIZE */
@@ -111,6 +117,7 @@ function loadReport(report: Body): unknown {
     ...plain(report),
     shares: (report.shares ?? []).map(plain),
     edges: (report.edges ?? []).map(plain),
+    groups: (report.groups ?? []).map(plain),
   };
 }
 
@@ -124,6 +131,18 @@ const sessions = new Map<string, Session>();
 /** What an account's last connection to a server kept for its next. */
 const keptSessions = new KeptByAccount<KeptSessions>();
 const keptPins = new KeptByAccount<KeptPins>();
+/** The group key's floors, for the next connection to a relay in this page (plan 3d), by
+ *  account ("" for a guest): kept for the page's life, signed in or not. */
+const keptGk = new KeptByAccount<KeptGk>();
+/** The page's one clock for keyholders' uploads, a worker's: a hidden tab clamps its own
+ *  timers to a second or more, and a voice keyholder keeps its duty there (plan 3g). */
+let uploadTicks: Worker | undefined;
+const uploadClock = new ReadyClock((tick) => {
+  uploadTicks ??= new Worker(new URL("./worklets/tick-worker.js", import.meta.url), { type: "module" });
+  uploadTicks.onmessage = tick;
+  uploadTicks.postMessage({ type: "start", intervalMs: GK_UPLOAD_LOOK_MS });
+  return () => uploadTicks?.postMessage({ type: "stop" });
+});
 /** On mobile data, as the front end last said. */
 let metered = false;
 /**
@@ -231,6 +250,18 @@ export function setMetered(on: boolean): void {
   for (const s of sessions.values()) s.signal.liveSetMetered(on);
 }
 
+/** Whether the page is shown. */
+function pageVisible(): boolean {
+  return globalThis.document?.visibilityState !== "hidden";
+}
+
+/** The page shown or hidden, a call begun or ended: every connection's offer to hold text
+ *  keys follows (plan 3g, choice 31). */
+function gkPageState(): void {
+  for (const s of sessions.values()) s.gkPageState();
+}
+globalThis.document?.addEventListener("visibilitychange", gkPageState);
+
 /** Hand the media modules to `s`, detaching them from the previous owner. */
 function attachVoice(s: Session): void {
   detachVoice();
@@ -265,6 +296,7 @@ function takeVoice(s: Session): void {
   // Moved before the leave: detaching stops a share of ours there, and a
   // StopScreenShare that arrives after the leave is answered with an error.
   attachVoice(s);
+  gkPageState();
   // ponytail: sent once, no retry. A server that refuses the leave keeps us
   // listed in its room, but our audio there is already closed here; the join
   // budget (channel_budget + 4, refilling 2/s) makes a refusal unlikely.
@@ -471,6 +503,22 @@ export class Session implements SessionContext, AccountHost {
     checked: () => this.checkSeen(),
     over: () => this.ended,
   });
+  /** Whether this relay uses the group key, as far as it said (live.ts `gkPathAfter`). */
+  private gkPath: GkPath = "none";
+  /** Text channels we follow (`TextJoined`), and the channels the group key tracks. */
+  private readonly gkFollowed = new Set<number>();
+  private readonly gkTracked = new Set<number>();
+  /** We are an admin here: names in a room that hides its members are shown to us. */
+  private isAdmin = false;
+  private gkBuilding = false;
+  /** A keyholder's uploads (live.ts). */
+  private readonly gkPump = new GkPump({
+    nextFrame: (inCall) => this.signal.gkNextFrame(inCall),
+    send: (frame) => this.sendRaw(frame),
+    writable: () => uploadClock.until(() => this.controlWritten()),
+    inCall: () => this.inCall(),
+    over: () => this.ended,
+  });
   /** The new-member wait holds our direct messages, so a sealed ask would be refused:
    *  history is asked by the plain frames meanwhile. */
   private directHeld = false;
@@ -573,6 +621,15 @@ export class Session implements SessionContext, AccountHost {
     if (__SELFTEST__) said.push({ [`#${payload[0]}`]: null });
     this.controlQueue.push(payload);
     this.drainControl();
+  }
+
+  /** Whether the control queue is out and written, past what voice still goes behind (the
+   *  transport's `controlBacklog`), or never will be. Looked at on the upload clock, which
+   *  lets the pacer out too: its own timer is clamped in a hidden tab. */
+  private controlWritten(): boolean {
+    if (this.ended || !this.transport) return true;
+    this.drainControl();
+    return this.controlQueue.length === 0 && this.transport.controlBacklog() === 0;
   }
 
   replaceSignal(client: SignalClient): void {
@@ -706,7 +763,10 @@ export class Session implements SessionContext, AccountHost {
     this.closeEdge();
     this.files?.close();
     this.emotes?.close();
-    if (voiceOwner === this) detachVoice();
+    if (voiceOwner === this) {
+      detachVoice();
+      gkPageState();
+    }
     if (sendDisconnect && this.transport) {
       // Whatever was still waiting for the pacer is moot now, and the goodbye
       // is not: it goes out ahead of the queue, and past the pacer too — over
@@ -724,6 +784,10 @@ export class Session implements SessionContext, AccountHost {
     this.controlTimer = undefined;
     this.controlQueue.length = 0;
     if (this.transport) await this.transport.close();
+    // Held posts are given up, and the floors stay for the next connection to this relay
+    if (gkRuns(this.gkPath)) this.gkRun(() => this.signal.gkEnd());
+    const floors = this.signedIn ? this.signal.gkKeep() : undefined;
+    if (floors) keptGk.put(this.server, this.account?.accountHex() ?? "", floors);
     this.mediaKeys.free();
     // Posts that waited showed as sent. By name: the page has forgotten this connection's ids
     for (const { channel_id, expired } of this.signal.liveEnd()) {
@@ -762,6 +826,11 @@ export class Session implements SessionContext, AccountHost {
 
   onControl(payload: Uint8Array): void {
     this.account?.onPayload(this, payload);
+    // The group key's frames go to it undecoded: a part of 56 KiB is never a JS array
+    if (this.signedIn && gkRuns(this.gkPath) && wasm().isGkFrame(payload)) {
+      this.gkRun(() => this.signal.gkFrame(payload));
+      return;
+    }
     let msg: unknown;
     try {
       msg = wasm().decodeServerMsg(payload);
@@ -852,6 +921,7 @@ export class Session implements SessionContext, AccountHost {
       if (entries.length !== 1) return;
       [tag, b] = entries[0];
     }
+    this.gkPath = gkPathAfter(this.gkPath, tag, b.on);
 
     switch (tag) {
       case "Authenticated":
@@ -907,6 +977,17 @@ export class Session implements SessionContext, AccountHost {
         this.signedIn = true;
         this.auth?.resolve();
         break;
+      case "GroupKeys": {
+        // Right after Authenticated: whether this relay uses the group key (plan 3i)
+        if (!gkRuns(this.gkPath)) break;
+        const kept = keptGk.take(this.server, this.account?.accountHex() ?? "");
+        const help = getConfig().help_hold_keys ?? true;
+        this.gkRun(() =>
+          this.signal.gkStart(b.on, Uint8Array.from(b.run), Number(b.clock), help, pageVisible(), this.inCall(), kept),
+        );
+        this.gkTrackAll();
+        break;
+      }
       case "AuthStep":
         // The account sign-in reads these from the raw payload (onControl);
         // a guest only ever gets this one. connect.ts looks for the words.
@@ -916,6 +997,7 @@ export class Session implements SessionContext, AccountHost {
         break;
       case "Account":
         this.account?.onReply(this, b);
+        this.gkNews();
         // The pages of pins came in: the key jobs that waited for them, then the rest
         if (this.account?.takePinsIn()) {
           this.runLive(this.signal.livePinsIn(this.channelId));
@@ -985,6 +1067,7 @@ export class Session implements SessionContext, AccountHost {
         // Our own copy: the emitted array ends up in the UI's store
         this.channels = [...b.channels];
         this.emit("channel-list", b.channels);
+        this.gkTrackAll();
         break;
       // A list too long for one frame. The front end hears it at its end, whole, so a reader
       // of `channel-list` needs to know of no frames.
@@ -993,6 +1076,7 @@ export class Session implements SessionContext, AccountHost {
         if (whole) {
           this.channels = [...whole];
           this.emit("channel-list", whole);
+          this.gkTrackAll();
         }
         break;
       }
@@ -1028,6 +1112,7 @@ export class Session implements SessionContext, AccountHost {
         break;
       case "UserLeft": {
         const uid: number = b.user_id;
+        this.signal.gkUserLeft(uid, b.channel_id);
         // Leaving a text channel is not leaving the server: the person is
         // still online and still someone we DM. Only that channel's keys go.
         if (this.isTextChannel(b.channel_id)) {
@@ -1041,6 +1126,8 @@ export class Session implements SessionContext, AccountHost {
             // (1.0, D10), and a rejoin keeps it again
             const log = this.channels.find((c) => c.channel_id === b.channel_id)?.log;
             if (log) this.account?.leave(this, log, false);
+            this.gkFollowed.delete(b.channel_id);
+            this.gkTrackAll();
           }
           this.emit("user-left", { user_id: uid, channel_id: b.channel_id });
           break;
@@ -1100,6 +1187,8 @@ export class Session implements SessionContext, AccountHost {
       case "ChannelDeleted":
         this.channels = this.channels.filter((c) => c.channel_id !== b.channel_id);
         this.signal.forgetChannel(this.userId, b.channel_id);
+        this.gkFollowed.delete(b.channel_id);
+        this.gkTrackAll();
         this.emit("channel-deleted", { channel_id: b.channel_id });
         break;
       case "ChannelError":
@@ -1111,6 +1200,7 @@ export class Session implements SessionContext, AccountHost {
         // the voice session: a background server would switch off the spatial
         // audio of the call we are actually in.
         if (this === voiceOwner) audio.setProximityMode(this.proximityOf(this.channelId));
+        this.gkTrackAll();
         this.emit("channel-updated", b.channel);
         break;
       case "Kicked":
@@ -1212,8 +1302,14 @@ export class Session implements SessionContext, AccountHost {
         break;
       // The live path's frames: `ChannelKeying` says what each comes to. During a key job
       // `PreKeysLow` waits for its end: a refill per 50 hellos is a fifth on top of its upload.
-      case "PreKeysLow":
       case "TextJoined":
+        // The text channels we follow: the group key tracks them
+        for (const [channelId] of b.joined as [number, ...unknown[]][]) this.gkFollowed.add(channelId);
+        for (const channelId of b.refused as number[]) this.gkFollowed.delete(channelId);
+        this.liveFrame(payload);
+        this.gkTrackAll();
+        break;
+      case "PreKeysLow":
       case "KeysOwed":
       case "SessionAsked":
       case "SessionHello":
@@ -1288,6 +1384,10 @@ export class Session implements SessionContext, AccountHost {
         break;
       case "AdminStatus":
         this.emit("admin-status", { user_id: b.user_id, is_admin: b.is_admin, own: b.user_id === this.userId });
+        if (b.user_id === this.userId && b.is_admin !== this.isAdmin) {
+          this.isAdmin = b.is_admin;
+          this.gkTrackAll();
+        }
         break;
       case "AdminError":
         this.emit("admin-error", { reason: b.reason });
@@ -1384,6 +1484,84 @@ export class Session implements SessionContext, AccountHost {
     } catch (e) {
       console.warn("the live path's tick failed:", e);
     }
+    if (gkRuns(this.gkPath)) this.gkRun(() => this.signal.gkTick());
+  }
+
+  // ── The group epoch key (plan 3i): `voipc_crypto::group_state` through gk.rs ──
+
+  /** What a call of the group key asked for (network.rs `run_gk_frame`): its frames and
+   *  events, the voice keys into this connection's ring, a keyholder's build and uploads. */
+  private gkRun(call: () => GkOut | undefined): void {
+    let out: GkOut | undefined;
+    try {
+      out = call();
+    } catch (e) {
+      console.warn("the group key:", e);
+      return;
+    }
+    if (!out) return;
+    // Who posted, against the pins first (`runLive`)
+    for (const s of out.seen) this.account?.notePerson(this, s.user_id, s.account, s.name);
+    for (const frame of out.send) this.sendRaw(frame);
+    for (const { name, payload } of out.emit) this.emit(name, payload);
+    // A kept read's stored messages and the read cursors go through the account's own run,
+    // which marks a replay and writes the cursors: any call of it carries them (account.rs
+    // `out`), and an empty roster is the one that says nothing else
+    if (out.held) this.account?.noteRoster(this, []);
+    if (out.voice) this.signal.gkVoiceInto(this.mediaKeys, this.channelId);
+    if (out.build) void this.gkBuild();
+    this.gkPump.wake();
+  }
+
+  /** A keyholder's build, in steps with the page yielded between them (plan 3b). */
+  private async gkBuild(): Promise<void> {
+    if (this.gkBuilding) return;
+    this.gkBuilding = true;
+    try {
+      while (!this.ended) {
+        const out = this.signal.gkBuildStep(this.inCall() ? GK_STEP_CALL_MS : GK_STEP_MS);
+        if (!out) return;
+        this.gkRun(() => out);
+        await yieldTask();
+      }
+    } catch (e) {
+      console.warn("a keyholder's build stopped:", e);
+    } finally {
+      this.gkBuilding = false;
+    }
+  }
+
+  /** The channels the group key tracks: the text channels we follow and the room we stand
+   *  in, each as the list last said. The same channel again keeps its keys. */
+  private gkTrackAll(): void {
+    if (!gkRuns(this.gkPath)) return;
+    const want = new Set(this.gkFollowed);
+    if (this.channelId !== 0) want.add(this.channelId);
+    for (const channelId of [...this.gkTracked]) {
+      if (want.has(channelId) && this.channels.some((c) => c.channel_id === channelId)) continue;
+      this.gkTracked.delete(channelId);
+      this.gkRun(() => this.signal.gkUntrack(channelId));
+    }
+    for (const c of this.channels) {
+      if (!want.has(c.channel_id)) continue;
+      this.gkTracked.add(c.channel_id);
+      this.gkRun(() => this.signal.gkTrack(c.channel_id, c.text, c.log ?? "", c.anonymous, c.hide_members, this.isAdmin));
+    }
+  }
+
+  /** What the account's own calls said for the group key. */
+  private gkNews(): void {
+    if (this.account && gkRuns(this.gkPath)) this.gkRun(() => this.signal.gkNews());
+  }
+
+  /** The page shown or hidden, a call begun or ended (plan 3g). */
+  gkPageState(): void {
+    if (gkRuns(this.gkPath)) this.gkRun(() => this.signal.gkVisibility(pageVisible(), this.inCall()));
+  }
+
+  /** "Help hold keys", switched while connected. */
+  gkSetVolunteer(on: boolean): void {
+    if (gkRuns(this.gkPath)) this.gkRun(() => this.signal.gkSetVolunteer(on));
   }
 
   /** The members of a roster worth asking for recent chat: the ones who say
@@ -1464,7 +1642,10 @@ export class Session implements SessionContext, AccountHost {
     if (channelId === 0 && this === voiceOwner) {
       void audio.stopTransmit();
       detachVoice();
+      gkPageState();
     }
+    // The room's group key from the confirmed change on, whoever started it (plan part 5)
+    this.gkTrackAll();
 
     // Only a room has a key dance to do; General's list costs nothing, and anyone in it
     // gets a session when there is something to say to them.
@@ -2094,16 +2275,20 @@ export class Session implements SessionContext, AccountHost {
   /** Sender-key encrypted channel message; queued until a sender key was distributed. */
   sendChannelMessage(content: string, channelId = this.channelId, ttlSecs?: number, refs?: MessageRefs): void {
     if (channelId === 0) throw new Error("Chat is not available in the lobby");
+    // Under the group key a text channel's posts and a voice room's chat both go through it
+    const text = this.isTextChannel(channelId);
+    const gk = gkPosts(this.gkPath) && (text || channelId === this.channelId);
 
-    this.rotateSenderKeyIfStale(channelId);
+    if (!gk) this.rotateSenderKeyIfStale(channelId);
 
     // The id travels inside the ciphertext, so our own echo and every
     // receiver's copy file the message under the same one.
     const messageId = wasm().newMessageId();
     // A channel with a log keeps it for its members too (cloud copies on),
-    // whether or not anybody is here to read it now.
+    // whether or not anybody is here to read it now. Under the group key a text channel's
+    // copy goes once the post does, under its epoch; a voice room's log keeps its own path.
     const log = this.channels.find((c) => c.channel_id === channelId)?.log;
-    if (log) this.account?.outgoingChannel(this, log, wasm().envelope(messageId, content, ttlSecs, refs), ttlSecs);
+    if (log && !(gk && text)) this.account?.outgoingChannel(this, log, wasm().envelope(messageId, content, ttlSecs, refs), ttlSecs);
     const event = {
       channel_id: channelId,
       user_id: this.userId,
@@ -2118,10 +2303,17 @@ export class Session implements SessionContext, AccountHost {
       fwd: refs?.fwd ?? null,
       event: refs?.event ?? null,
     };
+    // Shown as sent: what the group key cannot send it says (`gk-state`, `gk-post-dropped`)
+    if (gk) {
+      const envelope = wasm().envelope(messageId, content, ttlSecs, refs);
+      this.gkRun(() => this.signal.gkPost(channelId, messageId, envelope, text ? (log ?? "") : "", ttlSecs ?? null));
+      this.emit("channel-chat-message", { ...event, encrypted: true });
+      return;
+    }
     // In a text channel the keys follow the post (`ChannelKeying::live_post`). Our own row
     // shows it as sent: the check and the keys are the app's to do, and
     // `channel-undelivered` says so if they cannot be.
-    if (this.isTextChannel(channelId)) {
+    if (text) {
       this.runLive(this.signal.livePost(channelId, wasm().envelope(messageId, content, ttlSecs, refs)));
       this.emit("channel-chat-message", { ...event, encrypted: true });
       return;
