@@ -2259,19 +2259,22 @@ async function chatLane() {
     String(await ben.evaluate(`${rowWith("edgezzz")}?.querySelector(".msg-content")?.textContent.trim().length`)));
   check("and nothing refused it", (await barrier(SERVER, ann, ben)) && (await ann.evaluate(`${notSent}.length === 0`)),
     JSON.stringify(await ann.evaluate(notSent)));
-  // A modified client's post past 16 KiB (`__voipc_invoke`, past the composer) is refused by
-  // the relay, in a voice room too with the key off, and the writer is told plainly: as a toast
-  // (`ChannelError`), or under the key, when the post started a chain, as the room's key line
+  // A post past 16 KiB that gets past the composer (a forward of a long message, a sticker:
+  // the composer counts only what is typed; `__voipc_invoke` stands in for one here) never
+  // goes: the app seals it, sees it past what the relay takes, and keeps it, kept copy and all
+  // (the group key's own rule, `EarlyPost::fits`; with the key off, a voice room's too). The
+  // relay's refusal would name no message, and the writer's row would stay shown as sent: its
+  // row says it was not sent instead, the key on or off (item J9W-1)
   await ann.evaluate(`window.__voipc_said.splice(0); window.__toasts.length = 0; 0`);
   await ann.evaluate(`window.__voipc_invoke("send_channel_message", { server: ${JSON.stringify(SERVER)}, content: "big" + "z".repeat(20000) }).then(() => 0, () => 0)`);
-  const told = await seen(ann, `${notSent}.some((t) => t.includes("not sent"))`, 15_000);
-  check("a post the relay refuses as too large is said so plainly", told && (await ann.evaluate(postSent)),
-    JSON.stringify(await ann.evaluate(`window.__toasts`)));
+  const notSentMark = `${rowWith("bigzzz")}?.querySelector(".not-sent")?.textContent ?? ""`;
+  check("a post past 16 KiB that gets past the composer is never sent, and its row says so",
+    (await seen(ann, `(${notSentMark}).includes("Not sent") && (${notSentMark}).includes("16 KiB")`, 15_000)) &&
+      (await barrier(SERVER, ann)) && !(await ann.evaluate(postSent)),
+    JSON.stringify([await ann.evaluate(notSentMark), await ann.evaluate(`window.__voipc_said.map((m) => typeof m === "string" ? m : Object.keys(m ?? {})[0])`)]));
   check("and it reached nobody", (await barrier(SERVER, ann, ben)) && !(await ben.evaluate(`!!${rowWith("bigzzz")}`)));
-  // Waved off: an error toast sits over the rows the next checks point at, and a pointer
-  // over it holds it there
-  await ann.evaluate(`[...document.querySelectorAll(".toast")].filter((t) => t.textContent.includes("16 KiB")).forEach((t) => t.querySelector(".toast-close")?.click()); 0`);
-  await waitFor(ann, `![...document.querySelectorAll(".toast-message")].some((t) => t.textContent.includes("16 KiB"))`, 10_000);
+  check("and nothing else said it: no toast, no key line", (await ann.evaluate(`${notSent}.length === 0`)),
+    JSON.stringify(await ann.evaluate(notSent)));
 
   // The channel's own settings, from its row's gear: `set` runs in the dialog
   const settings = async (set) => {

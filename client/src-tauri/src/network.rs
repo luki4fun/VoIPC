@@ -3176,7 +3176,8 @@ async fn handle_server_message(
         | ServerMessage::EpochNamesIn { .. }
         | ServerMessage::EpochRefused { .. }
         | ServerMessage::VoiceSeats { .. }
-        | ServerMessage::EpochReseated { .. } => crate::gk_net::frame(gk, &msg).await,
+        | ServerMessage::EpochReseated { .. }
+        | ServerMessage::EpochPostTaken { .. } => crate::gk_net::frame(gk, &msg).await,
         ServerMessage::WatchAt {
             sharer_user_id,
             placement,
@@ -4395,6 +4396,15 @@ async fn drain_pending_channel_messages(
             .map_err(|e| format!("group encrypt: {e}"));
 
         match result {
+            // Past what the relay takes: it would refuse it naming no message, so its row,
+            // shown as pending, is marked not sent here (the browser's `sendChannelCiphertext`)
+            Ok(ciphertext)
+                if ciphertext.len() > voipc_crypto::group_state::EarlyPost::MAX_SEALED =>
+            {
+                warn!(channel_id, "queued channel msg too large, not sent");
+                let said = crate::gk_net::not_sent_said(channel_id, Some(id));
+                emit_server(app_handle, server, "channel-not-sent", said);
+            }
             Ok(ciphertext) => {
                 let msg = ClientMessage::SendEncryptedChannelMessage {
                     channel_id,

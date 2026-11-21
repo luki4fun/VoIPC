@@ -8,6 +8,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
+use voipc_crypto::group_key::wire::post_digest;
 use voipc_protocol::codec::{
     decode_client_msg, encode_server_msg, try_decode_frame, APP_VERSION, MAX_RELAY_CIPHERTEXT,
     PROTOCOL_VERSION,
@@ -4380,7 +4381,9 @@ async fn rule_refused(tx: &ControlTx, post: &GkPost, why: u8, reason: &str) {
 /// The rest of an `EpochPost` past its budgets: the live path's rules (`post_rules`), then
 /// the group key's (`post_check`: the epoch, a blob stored before the post goes), then
 /// `EpochPostIn` to everyone following whole, the same bytes to each. At `OLD_EPOCH` and
-/// `RATE` the app sends it again, so slow mode's clock starts only once a post goes.
+/// `RATE` the app sends it again, so slow mode's clock starts only once a post goes. A post
+/// taken is told to its writer (`EpochPostTaken`, `post_taken`), which files its kept copy
+/// then; a refused one never is.
 async fn finish_epoch_post(
     state: &Arc<ServerState>,
     user_id: UserId,
@@ -4428,11 +4431,16 @@ async fn finish_epoch_post(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
+    // What its writer is told once it went
+    let taken = (post.group.clone(), post_digest(&post.ciphertext));
     // A voice room's writer is named by the post's epoch, gated or not, as its app names it
     // (writer.rs `writer_m`): the channel's gate now leads the head's by an opening
     if let Some(anonymous) = room {
         let by_connection = anonymous && !state.gk.room_gated(&post.group, &gen, epoch);
-        return room_post(state, user_id, session_id, post, by_connection, timestamp).await;
+        if room_post(state, user_id, session_id, post, by_connection, timestamp).await {
+            post_taken(tx, taken);
+        }
+        return;
     }
     let readers: Vec<ControlTx> = {
         let channels = state.channels.read().await;
@@ -4482,13 +4490,21 @@ async fn finish_epoch_post(
             let _ = tx.try_send(data.clone());
         }
     }
+    post_taken(tx, taken);
+}
+
+/// `EpochPostTaken` to the writer: its post in `group`, named by `post_digest` of its
+/// ciphertext, went to the channel's readers. The gk e2e harnesses that stand in for this
+/// path tell a post taken with it too.
+pub(crate) fn post_taken(tx: &ControlTx, (group, post): (String, [u8; 16])) {
+    let _ = send_msg(tx, &ServerMessage::EpochPostTaken { group, post });
 }
 
 /// A voice room's `EpochPostIn` (plan part 5): to every other member of the room, each under
 /// the name it may see (a pseudonym in an anonymous room, but to admins). `by_connection`: an
 /// anonymous room that is not gated, whose seats are named by the connection (open choice
 /// 11): the writer is its connection there, and the post names no account, admin or
-/// moderator.
+/// moderator. Whether it went (the writer's session is still here).
 async fn room_post(
     state: &ServerState,
     user_id: UserId,
@@ -4496,7 +4512,7 @@ async fn room_post(
     post: GkPost,
     by_connection: bool,
     timestamp: u64,
-) {
+) -> bool {
     use voipc_protocol::gk::GkMember;
     let GkPost {
         channel_id,
@@ -4511,7 +4527,7 @@ async fn room_post(
         .get(&session_id)
         .map(|s| (s.account_id(), s.is_admin, s.powers.has(Powers::CHANNELS)))
     else {
-        return;
+        return false;
     };
     let (account, is_admin, is_moderator) = match by_connection {
         true => (None, false, false),
@@ -4553,6 +4569,7 @@ async fn room_post(
         };
         let _ = send_msg(&s.control_tx, &msg);
     }
+    true
 }
 
 /// A text channel's old key path with the group key on (plan 2k): `KeyCheck`,

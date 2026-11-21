@@ -13,8 +13,9 @@
 //! with accounts, every `AccountRequest` through `accounts::handle_request`, the group key's
 //! messages through `Groups::handle`, `EpochPost` through the group key's checks and a fan-out
 //! to the channel's followers; each account K1's `AccountSync` and C3b's `GroupKeying` on one
-//! connection, glued as N1 glues them (kept copies filed after N1's settle, shortened here as
-//! T1e shortens it); the keyholder `gk_e2e_tests.rs`'s guest on a task of its own. Runs on
+//! connection, glued as N1 glues them (a post's kept copy filed under its latest `released`
+//! as the relay's `EpochPostTaken` for that send comes, J9, which the post path here sends as
+//! session.rs does); the keyholder `gk_e2e_tests.rs`'s guest on a task of its own. Runs on
 //! Postgres with `VOIPC_TEST_POSTGRES` set (`scratch_db`).
 
 use std::collections::{HashMap, VecDeque};
@@ -25,6 +26,7 @@ use l4f_accounts::model::{AccountId, NewUser};
 use l4f_accounts::store::Store;
 use voipc_crypto::account::{SignedIn, Vault};
 use voipc_crypto::envelope::{envelope, open_envelope};
+use voipc_crypto::group_key::wire::post_digest;
 use voipc_crypto::group_key::{Endorsement, GroupKind, MemberId, Origin, SeatKeys, SignedHeader};
 use voipc_crypto::group_state::{
     GkCtx, GkEpoch, GkOut, GkStart, GkTrack, GroupKeying, MemoryPins, PastEpoch, Platform,
@@ -47,10 +49,6 @@ use crate::state::{RateLimiter, ServerState};
 
 const CHAN: ChannelId = 9;
 const CONV: &str = "c:j8khall";
-
-/// N1's settle as `gk_e2e_t1.rs` shortens it: a post's kept copy is filed once no refusal came
-/// for it this long.
-const KEPT_SETTLE_MS: u64 = 1_000;
 
 fn wall_ms() -> u64 {
     std::time::SystemTime::now()
@@ -79,8 +77,9 @@ struct Answer {
 struct KeptCopy {
     envelope: Vec<u8>,
     sent_at: u64,
-    /// Its latest `released`: under what, when, in which order.
-    went: Option<(GkEpoch, u64, u64)>,
+    /// Its latest `released`: under what, and `post_digest` of the bytes it went as (what its
+    /// `EpochPostTaken` names).
+    went: Option<(GkEpoch, [u8; 16])>,
 }
 
 /// One account's app on one connection.
@@ -99,7 +98,6 @@ struct Person {
     texts: Vec<String>,
     online: bool,
     copies: HashMap<[u8; 16], KeptCopy>,
-    sends: u64,
     /// Past epochs the relay said it does not keep (`EpochRefused{FETCH, NOT_STORED}`).
     not_stored: usize,
     /// The past answers it took in, as they reached it.
@@ -113,11 +111,18 @@ struct Person {
 }
 
 impl Person {
-    fn took(&mut self, out: GkOut, now: u64) {
+    fn took(&mut self, out: GkOut) {
+        // The `EpochPost`s and `released` go one for one (`group_state::Copies::sent`)
+        let mut posts = out.send.iter().filter_map(|m| match m {
+            ClientMessage::EpochPost { ciphertext, .. } => Some(post_digest(ciphertext)),
+            _ => None,
+        });
         for (_, post_id, ep) in out.released {
+            let Some(post) = posts.next() else {
+                break;
+            };
             if let Some(c) = self.copies.get_mut(&post_id) {
-                self.sends += 1;
-                c.went = Some((ep, now, self.sends));
+                c.went = Some((ep, post));
             }
         }
         self.out.extend(out.send);
@@ -181,6 +186,23 @@ impl Person {
                 let out = self.sync.gk_reseated(*n, *left);
                 self.out.extend(out);
             }
+            ServerMessage::EpochPostTaken { group, post } => {
+                // As the apps do (`group_state::Copies::taken`): the relay took a post of
+                // ours, its copy is filed now, under the epoch that send went under
+                let id = self
+                    .copies
+                    .iter()
+                    .find(|(_, c)| c.went.as_ref().is_some_and(|w| w.1 == *post))
+                    .map(|(id, _)| *id)
+                    .filter(|_| group == CONV);
+                if let Some(c) = id.and_then(|id| self.copies.remove(&id)) {
+                    let (ep, _) = c.went.expect("it went");
+                    let kept = self
+                        .sync
+                        .send_channel_gk(CONV, c.envelope, c.sent_at, None, ep);
+                    self.out.extend(kept);
+                }
+            }
             f => {
                 match f {
                     // N1: what went waits for its next `released`
@@ -211,7 +233,7 @@ impl Person {
                     now,
                 };
                 let out = self.keying.frame(&mut self.st, &f, c);
-                self.took(out, now);
+                self.took(out);
             }
         }
     }
@@ -225,12 +247,12 @@ impl Person {
             now,
         };
         let out = self.keying.tick(&mut self.st, c);
-        self.took(out, now);
+        self.took(out);
     }
 
     /// N1/W2's glue for a kept read: each past epoch `AccountSync` names goes to
     /// `GroupKeying::past_epoch`; what it has is handed back, what it asked for waits.
-    fn pasts(&mut self, now: u64) {
+    fn pasts(&mut self) {
         let new = self.sync.take_gk_past();
         self.past.extend(new);
         for (group, gen, epoch) in std::mem::take(&mut self.past) {
@@ -248,29 +270,7 @@ impl Person {
             }
         }
         let out = self.keying.past_asks();
-        self.took(out, now);
-    }
-
-    /// N1's copies that settled, filed in the order their posts went, each under the epoch
-    /// its latest `released` named.
-    fn file(&mut self, now: u64) {
-        let mut due: Vec<([u8; 16], u64)> = self
-            .copies
-            .iter()
-            .filter_map(|(id, c)| {
-                let (_, at, order) = c.went.as_ref()?;
-                (now >= at + KEPT_SETTLE_MS).then_some((*id, *order))
-            })
-            .collect();
-        due.sort_by_key(|d| d.1);
-        for (id, _) in due {
-            let c = self.copies.remove(&id).expect("due");
-            let (ep, _, _) = c.went.expect("it went");
-            let kept = self
-                .sync
-                .send_channel_gk(CONV, c.envelope, c.sent_at, None, ep);
-            self.out.extend(kept);
-        }
+        self.took(out);
     }
 
     /// The head epoch it holds `CK` of.
@@ -294,7 +294,7 @@ impl Person {
             now,
         };
         let out = self.keying.post(&mut self.st, CHAN, [id; 16], &env, c);
-        self.took(out, now);
+        self.took(out);
     }
 
     /// Its kept read is done: every past epoch it asked for was answered.
@@ -540,11 +540,20 @@ impl World {
                         return;
                     }
                 };
+                let ServerMessage::EpochPostIn {
+                    group, ciphertext, ..
+                } = &msg
+                else {
+                    unreachable!()
+                };
+                let taken = (group.clone(), post_digest(ciphertext));
                 for f in self.followers.clone() {
                     if f != sid {
                         let _ = crate::session::send_msg(&self.queues[&f].0, &msg);
                     }
                 }
+                // As session.rs does once a post went: its writer is told
+                crate::session::post_taken(&tx, taken);
             }
             m => self.state.gk.handle(&self.state, sid, m, &tx).await,
         }
@@ -628,7 +637,6 @@ impl World {
             texts: vec![],
             online: true,
             copies: HashMap::new(),
-            sends: 0,
             not_stored: 0,
             answers: vec![],
             tamper: None,
@@ -676,7 +684,7 @@ impl World {
             },
             VaultFloor::None,
         );
-        p.took(out, now);
+        p.took(out);
         let (sid, a) = (p.sid, p.a);
         self.follow(sid, Some(a));
     }
@@ -820,8 +828,7 @@ impl World {
             if tick {
                 p.tick(now);
             }
-            p.pasts(now);
-            p.file(now);
+            p.pasts();
             let out: Vec<ClientMessage> = self.people[i].out.drain(..).collect();
             for m in out {
                 self.send(sid, m).await;

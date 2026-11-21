@@ -30,14 +30,17 @@ use super::keyring::{keyring_hash_next, keyring_hash_start};
 use super::keys::{tag, Endorsement, Origin, SeatPublic};
 use super::merkle::{list_digest, seat_record, Leaf, Pool, Via, BUCKET_SEATS};
 use super::rules::{
-    check_form, check_gated, check_keyholder_change, check_link, check_roll, check_signer,
-    check_time, check_versions, check_voice_keyholders, replaced_entry, row_seed, Refusal, RowSeed,
-    SeedRolls,
+    check_form, check_gated, check_keyholder_change, check_link, check_link_under, check_roll,
+    check_signer, check_time, check_versions, check_voice_keyholders, regenesis_wait,
+    replaced_entry, row_seed, Refusal, RowSeed, SeedRolls,
 };
 use super::timers::{COMMIT_MAX_BYTES, JOIN_BATCH_MAX, MAX_GUEST_KEYHOLDERS, REFRESH_SLICE};
 use super::tree::BucketTree;
 use super::welcome::{SEAT_WELCOME_BYTES, SMALL_WELCOME_BYTES};
-use super::{REGENESIS_WAIT, ROW_BYTES};
+use super::{CLOCK_SLACK, REGENESIS_WAIT, ROW_BYTES};
+
+/// Rule 5's words for a Regenesis dated more than `CLOCK_SLACK` before the relay's clock.
+pub const BACKDATED: &str = "a Regenesis dated further back than the clock slack";
 
 /// The relay holds no pins: a signer is checked against the set alone.
 const NO_PINS: &dyn Fn(&[u8; 16]) -> Option<[u8; 32]> = &|_| None;
@@ -320,7 +323,8 @@ pub struct GroupView<'a> {
     pub now: u64,
     /// Voice: the user ids in the room.
     pub roster: &'a [u32],
-    /// Since when no keyholder has been online (a Regenesis waits an hour).
+    /// Since when no keyholder has been online: a Regenesis waits an hour, or 2 minutes
+    /// after a set of connection entries alone (`rules::regenesis_wait`).
     pub no_keyholder_since: Option<u64>,
 }
 
@@ -605,13 +609,28 @@ pub fn validate(view: &GroupView, c: &Commit) -> Result<Applied, Bad> {
             return bad(4, "a Genesis starts a generation this group never had");
         }
     } else if let Some(hv) = head {
-        check_link(hv.head, &sh).map_err(link_refusal)?;
-        if h.kind == Kind::Regenesis
-            && !view
+        // A Regenesis waits what the head's set allows ("Fast new start",
+        // `regenesis_wait`): after the parent's `time`, as members check it
+        // (`check_link_under`), and with no keyholder online that long
+        if h.kind == Kind::Regenesis {
+            check_link_under(hv.head, &sh, hv.kh).map_err(link_refusal)?;
+            let wait = regenesis_wait(hv.kh.header(), h.time);
+            let hour = wait >= REGENESIS_WAIT;
+            if !view
                 .no_keyholder_since
-                .is_some_and(|t| view.now >= t.saturating_add(REGENESIS_WAIT))
-        {
-            return bad(4, "a Regenesis only after an hour with no keyholder online");
+                .is_some_and(|t| view.now >= t.saturating_add(wait))
+            {
+                return bad(
+                    4,
+                    if hour {
+                        "a Regenesis only after an hour with no keyholder online"
+                    } else {
+                        "a Regenesis only after two minutes with no keyholder online"
+                    },
+                );
+            }
+        } else {
+            check_link(hv.head, &sh).map_err(link_refusal)?;
         }
     }
 
@@ -653,6 +672,11 @@ pub fn validate(view: &GroupView, c: &Commit) -> Result<Applied, Bad> {
     check_time(h, view.now).map_err(|r| refused(5, r))?;
     if ph.is_some_and(|p| h.time < p.time) {
         return bad(5, "earlier than its parent");
+    }
+    // A Regenesis starts the set whose churn hour counts from its `time` (`regenesis_wait`):
+    // dated further back than the slack, the next fast new start would come minutes on
+    if h.kind == Kind::Regenesis && h.time.saturating_add(CLOCK_SLACK) < view.now {
+        return bad(5, BACKDATED);
     }
 
     // 6: gated, as the header says it.
@@ -1569,6 +1593,185 @@ mod tests {
         w.no_keyholder_since = None;
         assert_eq!(rule(w.check(&due, vol.by(), &b.commit)), 4);
         w.no_keyholder_since = Some(w.now - 3600);
+        assert_eq!(rule(w.check(&due, vol.by(), &b.commit)), 0);
+    }
+
+    /// "Fast new start" (owner, 2026-11-19), written out in seconds so the old rule (an hour
+    /// whatever the set) fails it.
+    const FAST: u64 = 2 * 60;
+
+    fn regenesis_due(w: &World, vol: &Holder) -> Due {
+        Due {
+            joiners: vec![vol.seat.joiner()],
+            volunteer: Some(vol.candidate()),
+            ..w.due(DueKind::Regenesis)
+        }
+    }
+
+    fn rule_detail(r: Result<Applied, Bad>) -> Option<(u8, String)> {
+        r.err().map(|b| (b.rule, b.detail))
+    }
+
+    fn refuse(why: &'static str) -> Option<crate::group_key::build::BuildError> {
+        Some(crate::group_key::build::BuildError::Refuse(why))
+    }
+
+    const SOON: &str = r#"Generation("a Regenesis comes two minutes after its parent")"#;
+    const HOUR: &str = r#"Generation("a Regenesis comes an hour after its parent")"#;
+
+    /// Under a set of connection entries alone (a browser's or a guest's pair) the volunteer
+    /// builds a Regenesis 2 minutes after its parent and the relay takes it once no keyholder
+    /// was online that long; neither a second sooner.
+    #[test]
+    fn a_regenesis_over_connection_entries_alone_is_built_and_taken_two_minutes_on() {
+        let mut w = World::start(GroupKind::Text, TEXT_ID, true, false, Holder::conn(3));
+        w.join(&refs(&accounts(10, 5)));
+        let vol = Holder::conn(9);
+        let due = regenesis_due(&w, &vol);
+        let head = w.head.clone();
+        let start =
+            |w: &World| World::build_start(&vol, w.kind, w.id, true, &due, w.now, Some(&head));
+        w.now = head.header().time + FAST - 1;
+        assert_eq!(
+            start(&w).err(),
+            refuse("a Regenesis waits two minutes after its parent")
+        );
+        w.now += 1;
+        let b = start(&w).unwrap();
+        w.no_keyholder_since = Some(w.now - FAST + 1);
+        assert_eq!(
+            rule_detail(w.check(&due, vol.by(), &b.commit)),
+            Some((
+                4,
+                "a Regenesis only after two minutes with no keyholder online".into()
+            ))
+        );
+        w.no_keyholder_since = Some(w.now - FAST);
+        assert_eq!(rule(w.check(&due, vol.by(), &b.commit)), 0);
+        // Dated a second sooner (a volunteer whose clock lags): refused, as members refuse it
+        let mut early = b.commit.clone();
+        resign(&w, &mut early, &vol, |h| h.time -= 1);
+        assert_eq!(
+            rule_detail(w.check(&due, vol.by(), &early)),
+            Some((4, SOON.into()))
+        );
+        w.holders = vec![vol];
+        w.step(&due, &b);
+        assert_eq!(w.head.header().kind, Kind::Regenesis);
+    }
+
+    /// A set with a desktop's pair keeps the hour. The builder refuses on its own where it
+    /// sees the set (the head sets keyholders); under any other head it does not see it, and
+    /// the volunteer's own check (this validator, over the keyholder header it holds) and the
+    /// relay refuse what it made.
+    #[test]
+    fn a_regenesis_over_a_set_with_a_desktop_entry_is_taken_only_after_the_hour() {
+        let mut w = World::start(GroupKind::Text, TEXT_ID, true, false, Holder::conn(3));
+        w.join(&refs(&accounts(10, 5)));
+        w.promote(Holder::desktop(5));
+        assert_eq!(w.head.header().kind, Kind::KeyholdersAdd);
+        let vol = Holder::conn(9);
+        let due = regenesis_due(&w, &vol);
+        let head = w.head.clone();
+        w.now = head.header().time + FAST;
+        assert_eq!(
+            World::build_start(&vol, w.kind, w.id, true, &due, w.now, Some(&head)).err(),
+            refuse("a Regenesis waits an hour after its parent")
+        );
+
+        w.join(&refs(&accounts(30, 2)));
+        let due = regenesis_due(&w, &vol);
+        let head = w.head.clone();
+        assert_eq!(head.header().kind, Kind::Join);
+        w.now = head.header().time + FAST;
+        let b = World::build_start(&vol, w.kind, w.id, true, &due, w.now, Some(&head)).unwrap();
+        w.no_keyholder_since = Some(w.now - 2 * REGENESIS_WAIT);
+        assert_eq!(
+            rule_detail(w.check(&due, vol.by(), &b.commit)),
+            Some((4, HOUR.into()))
+        );
+        w.now = head.header().time + REGENESIS_WAIT;
+        let b = World::build_start(&vol, w.kind, w.id, true, &due, w.now, Some(&head)).unwrap();
+        w.no_keyholder_since = Some(w.now - REGENESIS_WAIT + 1);
+        assert_eq!(
+            rule_detail(w.check(&due, vol.by(), &b.commit)),
+            Some((
+                4,
+                "a Regenesis only after an hour with no keyholder online".into()
+            ))
+        );
+        w.no_keyholder_since = Some(w.now - REGENESIS_WAIT);
+        assert_eq!(rule(w.check(&due, vol.by(), &b.commit)), 0);
+    }
+
+    /// The churn bound at the relay: the set a Regenesis started keeps the hour for an hour
+    /// after it, whatever head the next one is built on; then 2 minutes again.
+    #[test]
+    fn a_set_a_regenesis_started_is_started_anew_again_only_an_hour_on() {
+        let mut w = World::start(GroupKind::Text, TEXT_ID, true, false, Holder::conn(3));
+        w.join(&refs(&accounts(10, 5)));
+        let vol = Holder::conn(9);
+        let due = regenesis_due(&w, &vol);
+        let head = w.head.clone();
+        w.now = head.header().time + FAST;
+        let b = World::build_start(&vol, w.kind, w.id, true, &due, w.now, Some(&head)).unwrap();
+        w.no_keyholder_since = Some(w.now - FAST);
+        w.holders = vec![vol];
+        w.step(&due, &b);
+        let r1 = w.head.header().time;
+
+        // The page goes again: over the Regenesis itself, the builder sees the set
+        let vol2 = Holder::conn(11);
+        let due = regenesis_due(&w, &vol2);
+        let head = w.head.clone();
+        w.now = r1 + FAST;
+        assert_eq!(
+            World::build_start(&vol2, w.kind, w.id, true, &due, w.now, Some(&head)).err(),
+            refuse("a Regenesis waits an hour after its parent")
+        );
+        // Over a Join under it, it does not; the relay refuses it
+        w.join(&refs(&accounts(40, 2)));
+        let due = regenesis_due(&w, &vol2);
+        let head = w.head.clone();
+        w.now = head.header().time + FAST;
+        let b = World::build_start(&vol2, w.kind, w.id, true, &due, w.now, Some(&head)).unwrap();
+        w.no_keyholder_since = Some(w.now - FAST);
+        assert_eq!(
+            rule_detail(w.check(&due, vol2.by(), &b.commit)),
+            Some((4, HOUR.into()))
+        );
+        // An hour after the first, 2 minutes after its parent and with nobody online: taken
+        w.now = r1 + REGENESIS_WAIT;
+        assert!(w.now >= head.header().time + FAST);
+        let b = World::build_start(&vol2, w.kind, w.id, true, &due, w.now, Some(&head)).unwrap();
+        w.no_keyholder_since = Some(w.now - FAST);
+        assert_eq!(rule(w.check(&due, vol2.by(), &b.commit)), 0);
+    }
+
+    /// A volunteer that dates its Regenesis back to its parent's 2 minutes would start the
+    /// churn hour (`REGENESIS_FAST_GAP`) from then, and the next fast new start could come
+    /// minutes on: the relay takes a Regenesis dated at most `CLOCK_SLACK` back (J9 review).
+    #[test]
+    fn a_regenesis_dated_further_back_than_the_clock_slack_is_refused() {
+        let mut w = World::start(GroupKind::Text, TEXT_ID, true, false, Holder::conn(3));
+        w.join(&refs(&accounts(10, 5)));
+        let vol = Holder::conn(9);
+        let due = regenesis_due(&w, &vol);
+        let head = w.head.clone();
+        w.now = head.header().time + REGENESIS_WAIT;
+        let b = World::build_start(&vol, w.kind, w.id, true, &due, w.now, Some(&head)).unwrap();
+        w.no_keyholder_since = Some(w.now - FAST);
+        let mut back = b.commit.clone();
+        let t = head.header().time + FAST;
+        resign(&w, &mut back, &vol, |h| h.time = t);
+        assert_eq!(
+            rule_detail(w.check(&due, vol.by(), &back)),
+            Some((5, BACKDATED.into()))
+        );
+        let mut edge = b.commit.clone();
+        let t = w.now - CLOCK_SLACK;
+        resign(&w, &mut edge, &vol, |h| h.time = t);
+        assert_eq!(rule(w.check(&due, vol.by(), &edge)), 0);
         assert_eq!(rule(w.check(&due, vol.by(), &b.commit)), 0);
     }
 

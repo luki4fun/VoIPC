@@ -79,9 +79,10 @@ pub use merkle::{
 };
 pub use rules::{
     check_above, check_added, check_counters, check_form, check_gated, check_keyholder_change,
-    check_link, check_new_generation, check_on_floor, check_regenesis, check_roll, check_signer,
-    check_time, check_versions, check_voice_keyholders, check_walk, counter_flagged,
-    epoch_bound_ok, fold_names, names_may_be_gone, replaced_entry, row_seed, Clock, Counters,
+    check_link, check_link_under, check_new_generation, check_on_floor, check_on_floor_under,
+    check_regenesis, check_regenesis_under, check_roll, check_signer, check_time, check_versions,
+    check_voice_keyholders, check_walk, connection_only, counter_flagged, epoch_bound_ok,
+    fold_names, names_may_be_gone, regenesis_wait, replaced_entry, row_seed, Clock, Counters,
     Floor, Fold, Held, Known, NamesFloor, NamesFrom, PinThen, Pins, PinsAt, Refusal, RowSeed,
     SeedRolls, Seen, Shown, Swap, WalkLink, WalkTo, Walked, Warning, NAMES_KEPT, ROLL_GAP,
     SEED_MAX_AGE,
@@ -131,6 +132,16 @@ pub const CLOCK_SLACK: u64 = 10 * 60;
 pub const EPOCH_MIN_GAP: u64 = 2;
 /// How long no keyholder must have been online before a Regenesis (§4.3).
 pub const REGENESIS_WAIT: u64 = 60 * 60;
+/// "Fast new start" (owner, 2026-11-19): a Regenesis waits this long instead
+/// when every entry of the keyholder set in force is a connection entry
+/// (origin 0x02, a browser's or a guest's pair, which goes with its
+/// connection and never comes back online), within `REGENESIS_FAST_GAP`'s
+/// bound (`rules::regenesis_wait`). Every Regenesis waits at least this long.
+pub const REGENESIS_FAST_WAIT: u64 = 2 * 60;
+/// The churn bound of the fast wait: a set of connection entries that a
+/// Regenesis itself started less than this long before keeps the full hour,
+/// so connections that drop again and again start anew at most once an hour.
+pub const REGENESIS_FAST_GAP: u64 = REGENESIS_WAIT;
 /// A device that took a header this recently follows the group live (§5.7).
 pub const LIVE_WINDOW: u64 = 10 * 60;
 /// The longest keyholder chain a member walks (§4.4 rule 3).

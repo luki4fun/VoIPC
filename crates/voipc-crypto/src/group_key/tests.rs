@@ -2020,6 +2020,365 @@ fn a_regenesis_before_an_hour_after_its_parent_is_refused() {
     assert!(check_regenesis(Some(&floor), live, &on_time, &parent).is_err());
 }
 
+// ── "Fast new start" (owner, 2026-11-19) ──────────────────────────────────
+//
+// A keyholder set of connection entries alone (0x02: a browser's or a guest's pair, gone with
+// its connection) lets a Regenesis come 2 minutes after its parent instead of the hour. The
+// tests write the 2 minutes out (`FAST`), so the old rule (an hour whatever the set) fails them.
+
+/// The fast wait, written out.
+const FAST: u64 = 2 * 60;
+
+/// A Regenesis by volunteer `vol` over `parent`, dated `time`.
+fn regen_by(vol: &Party, parent: &SignedHeader, time: u64) -> SignedHeader {
+    let mut h = next(parent, Kind::Regenesis, time);
+    h.keyholders = vec![vol.entry()];
+    h.signer = vol.m;
+    signed(Some(parent), h, vol)
+}
+
+/// A text group whose only keyholder is browser `b`'s connection pair: its Genesis at `T0`
+/// and a Fresh a minute on. `vol` is another connection that volunteers.
+struct ConnHeld {
+    b: Party,
+    vol: Party,
+    gen: SignedHeader,
+    fresh: SignedHeader,
+}
+
+fn conn_held() -> ConnHeld {
+    let b = Party::new(MemberId::Conn(7));
+    let gen = signed(None, genesis_of(&b, &text(), T0, false), &b);
+    let fresh = signed(Some(&gen), next(&gen, Kind::Fresh, T0 + 60), &b);
+    ConnHeld {
+        b,
+        vol: Party::new(MemberId::Conn(9)),
+        gen,
+        fresh,
+    }
+}
+
+fn link_of<'a>(header: &'a SignedHeader, parent: Option<&'a SignedHeader>) -> WalkLink<'a> {
+    WalkLink { header, parent }
+}
+
+/// Every way a member takes a Regenesis over a set of connection entries alone: as a
+/// newcomer walking from the Genesis, walking to its floor, as the start of its walk on
+/// trust, and holding the parent or only its floor with the set beside it. Each takes it 2
+/// minutes after its parent, and none a second sooner.
+#[test]
+fn a_regenesis_over_connection_entries_alone_is_taken_two_minutes_after_its_parent() {
+    let ConnHeld {
+        vol, gen, fresh, ..
+    } = conn_held();
+    assert_eq!(gen.header().keyholders[0].origin, Origin::Connection as u8);
+    let p_time = fresh.header().time;
+    let early = regen_by(&vol, &fresh, p_time + FAST - 1);
+    let on_time = regen_by(&vol, &fresh, p_time + FAST);
+    let now = clock(p_time + FAST + 5);
+    let soon = Refusal::Generation("a Regenesis comes two minutes after its parent");
+    let floor_gen = Floor::after(None, &gen, T0);
+    let floor = Floor::after(Some(&floor_gen), &fresh, T0);
+
+    // A newcomer: no floor, walked from the Genesis
+    let newcomer = |r: &SignedHeader| {
+        check_walk(
+            WalkTo::Start { floor: None },
+            &[link_of(&gen, None)],
+            link_of(r, Some(&fresh)),
+            now,
+            NO_PINS,
+        )
+    };
+    assert!(newcomer(&on_time).is_ok());
+    assert_eq!(newcomer(&early).err(), Some(soon.clone()));
+
+    // A member whose floor is the Genesis, walking to the Regenesis over the Fresh
+    let walker = |r: &SignedHeader| {
+        check_walk(
+            WalkTo::Floor {
+                floor: &floor_gen,
+                kh: &gen,
+            },
+            &[],
+            link_of(r, Some(&fresh)),
+            now,
+            NO_PINS,
+        )
+    };
+    assert!(walker(&on_time).is_ok());
+    assert_eq!(walker(&early).err(), Some(soon.clone()));
+
+    // A newcomer whose walk starts at the Regenesis (the relay walks a device with no floor
+    // back to its newest Regenesis): it takes it on trust, after the shortest wait still
+    let after = signed(
+        Some(&on_time),
+        next(&on_time, Kind::Join, p_time + FAST + 3),
+        &vol,
+    );
+    let early_after = signed(
+        Some(&early),
+        next(&early, Kind::Join, p_time + FAST + 3),
+        &vol,
+    );
+    let started = |r: &SignedHeader, head: &SignedHeader| {
+        check_walk(
+            WalkTo::Start { floor: None },
+            &[link_of(r, Some(&fresh))],
+            link_of(head, None),
+            now,
+            NO_PINS,
+        )
+    };
+    assert!(started(&on_time, &after).is_ok());
+    assert_eq!(started(&early, &early_after).err(), Some(soon.clone()));
+
+    // Holding the parent, or only the floor, with the set beside it
+    assert_eq!(check_link_under(&fresh, &on_time, &gen), Ok(vec![]));
+    assert_eq!(
+        check_link_under(&fresh, &early, &gen).err(),
+        Some(soon.clone())
+    );
+    assert_eq!(check_on_floor_under(&floor, &on_time, &gen), Ok(vec![]));
+    assert_eq!(
+        check_on_floor_under(&floor, &early, &gen).err(),
+        Some(soon.clone())
+    );
+    assert!(check_regenesis_under(Some(&floor), now, &on_time, &fresh, &gen).is_ok());
+    assert!(check_regenesis_under(None, now, &on_time, &fresh, &gen).is_ok());
+    assert_eq!(
+        check_regenesis_under(Some(&floor), now, &early, &fresh, &gen).err(),
+        Some(soon)
+    );
+
+    // A parent that sets keyholders is the set itself: seen without being handed over
+    let over_gen = regen_by(&vol, &gen, T0 + FAST);
+    assert_eq!(check_link(&gen, &over_gen), Ok(vec![]));
+    assert!(check_regenesis(Some(&floor_gen), now, &over_gen, &gen).is_ok());
+    assert!(check_link(&gen, &regen_by(&vol, &gen, T0 + FAST - 1)).is_err());
+}
+
+/// One entry that is not a connection's (here a desktop's pair, 0x03) keeps the hour for the
+/// whole set, whoever shows the set and however the member reaches the Regenesis. Only a
+/// device with no floor whose walk starts at the Regenesis takes it sooner: the set before is
+/// never shown to it, and it takes a Genesis of any age on trust the same way (§5.7).
+#[test]
+fn a_regenesis_over_a_set_with_a_desktop_entry_waits_the_hour() {
+    let ConnHeld { b, vol, gen, .. } = conn_held();
+    let d = Party::new(acct(3));
+    let mut add = next(&gen, Kind::KeyholdersAdd, T0 + 30);
+    add.keyholders = vec![b.entry(), d.entry()];
+    let add = signed(Some(&gen), add, &b);
+    assert!(!connection_only(&add.header().keyholders));
+    let fresh = signed(Some(&add), next(&add, Kind::Fresh, T0 + 60), &b);
+    let p_time = fresh.header().time;
+    let fast = regen_by(&vol, &fresh, p_time + FAST);
+    let late = regen_by(&vol, &fresh, p_time + REGENESIS_WAIT - 1);
+    let hour = regen_by(&vol, &fresh, p_time + REGENESIS_WAIT);
+    let now = clock(p_time + REGENESIS_WAIT + 5);
+    let refused = Some(Refusal::Generation(
+        "a Regenesis comes an hour after its parent",
+    ));
+    let floor_add = Floor::after(Some(&Floor::after(None, &gen, T0)), &add, T0);
+    let floor = Floor::after(Some(&floor_add), &fresh, T0);
+    for r in [&fast, &late] {
+        let newcomer = check_walk(
+            WalkTo::Start { floor: None },
+            &[link_of(&add, None), link_of(&gen, None)],
+            link_of(r, Some(&fresh)),
+            now,
+            NO_PINS,
+        );
+        assert_eq!(newcomer.err(), refused.clone());
+        let walker = check_walk(
+            WalkTo::Floor {
+                floor: &floor_add,
+                kh: &add,
+            },
+            &[],
+            link_of(r, Some(&fresh)),
+            now,
+            NO_PINS,
+        );
+        assert_eq!(walker.err(), refused.clone());
+        assert_eq!(check_link(&fresh, r).err(), refused.clone());
+        assert_eq!(check_link_under(&fresh, r, &add).err(), refused.clone());
+        assert_eq!(check_on_floor(&floor, r).err(), refused.clone());
+        assert_eq!(check_on_floor_under(&floor, r, &add).err(), refused.clone());
+        assert!(check_regenesis(Some(&floor), now, r, &fresh).is_err());
+        assert!(check_regenesis(None, now, r, &fresh).is_err());
+        assert!(check_regenesis_under(Some(&floor), now, r, &fresh, &add).is_err());
+        assert!(check_regenesis_under(None, now, r, &fresh, &add).is_err());
+    }
+    assert_eq!(check_link_under(&fresh, &hour, &add), Ok(vec![]));
+    assert_eq!(check_on_floor_under(&floor, &hour, &add), Ok(vec![]));
+    assert!(check_regenesis_under(Some(&floor), now, &hour, &fresh, &add).is_ok());
+
+    // A set of desktops alone, and one connection beside them: the hour either way
+    assert_eq!(regenesis_wait(add.header(), p_time), REGENESIS_WAIT);
+    assert_eq!(regenesis_wait(gen.header(), p_time), FAST);
+    let desktop = signed(None, genesis_of(&d, &text(), T0, false), &d);
+    assert_eq!(regenesis_wait(desktop.header(), p_time), REGENESIS_WAIT);
+
+    // The trust start: with no floor and the Regenesis where its walk begins
+    let after = signed(
+        Some(&fast),
+        next(&fast, Kind::Join, p_time + FAST + 3),
+        &vol,
+    );
+    let started = check_walk(
+        WalkTo::Start { floor: None },
+        &[link_of(&fast, Some(&fresh))],
+        link_of(&after, None),
+        clock(p_time + FAST + 5),
+        NO_PINS,
+    );
+    assert!(started.is_ok(), "on trust, as a Genesis of any age");
+}
+
+/// A member that holds only its floor (a restarted app, or one whose last header was pushed)
+/// holds the keyholder header the floor names beside it (§5.7, `LocalFloor.kh`). With it, it
+/// takes the fast Regenesis; without it, it waits the hour. No other header passes for the
+/// set: one the floor or the Regenesis does not name is refused, so a relay cannot shorten the
+/// hour of a set with a desktop entry by showing a set of connections in its place.
+#[test]
+fn a_member_holding_only_its_floor_takes_a_fast_regenesis_under_the_set_it_holds() {
+    let ConnHeld { b, vol, gen, fresh } = conn_held();
+    let p_time = fresh.header().time;
+    let r = regen_by(&vol, &fresh, p_time + FAST);
+    let now = clock(p_time + FAST + 5);
+    let floor = Floor::after(Some(&Floor::after(None, &gen, T0)), &fresh, T0);
+    let hour = Some(Refusal::Generation(
+        "a Regenesis comes an hour after its parent",
+    ));
+    let not_the_set = Some(Refusal::Chain("kh_parent is not the set in force"));
+
+    // Without the set: the hour (what a member that does not hand it over checks)
+    assert_eq!(check_on_floor(&floor, &r).err(), hour.clone());
+    assert_eq!(check_regenesis(Some(&floor), now, &r, &fresh).err(), hour);
+    // With it: 2 minutes
+    assert_eq!(check_on_floor_under(&floor, &r, &gen), Ok(vec![]));
+    assert!(check_regenesis_under(Some(&floor), now, &r, &fresh, &gen).is_ok());
+
+    // Another group of connections alone, its Genesis shown as the set: refused
+    let other = signed(None, genesis_of(&b, &text(), T0 + 1, false), &b);
+    assert_eq!(
+        check_on_floor_under(&floor, &r, &other).err(),
+        not_the_set.clone()
+    );
+    assert_eq!(
+        check_link_under(&fresh, &r, &other).err(),
+        not_the_set.clone()
+    );
+    assert_eq!(
+        check_regenesis_under(Some(&floor), now, &r, &fresh, &other).err(),
+        not_the_set.clone()
+    );
+    // The parent, which sets no keyholders, shown as the set: refused
+    assert_eq!(
+        check_regenesis_under(Some(&floor), now, &r, &fresh, &fresh).err(),
+        not_the_set.clone()
+    );
+
+    // A set with a desktop entry, and a set of connections shown in its place
+    let d = Party::new(acct(3));
+    let mut add = next(&gen, Kind::KeyholdersAdd, T0 + 30);
+    add.keyholders = vec![b.entry(), d.entry()];
+    let add = signed(Some(&gen), add, &b);
+    let fresh2 = signed(Some(&add), next(&add, Kind::Fresh, T0 + 60), &b);
+    let floor2 = Floor::after(Some(&Floor::after(None, &add, T0)), &fresh2, T0);
+    let r2 = regen_by(&vol, &fresh2, p_time + FAST);
+    for shown in [&gen, &other] {
+        assert_eq!(
+            check_on_floor_under(&floor2, &r2, shown).err(),
+            not_the_set.clone()
+        );
+        assert_eq!(
+            check_link_under(&fresh2, &r2, shown).err(),
+            not_the_set.clone()
+        );
+        assert_eq!(
+            check_regenesis_under(Some(&floor2), now, &r2, &fresh2, shown).err(),
+            not_the_set.clone()
+        );
+    }
+}
+
+/// The churn bound: a set of connections that a Regenesis itself started keeps the hour for
+/// an hour after that Regenesis, so connections that drop again and again (or a relay that
+/// drops them) start anew at most once an hour. An hour on, the set goes fast again, 2
+/// minutes after its parent.
+#[test]
+fn a_set_a_regenesis_started_keeps_the_hour_for_an_hour() {
+    let ConnHeld { vol, fresh, .. } = conn_held();
+    let vol2 = Party::new(MemberId::Conn(11));
+    let r1 = regen_by(&vol, &fresh, fresh.header().time + FAST);
+    let t1 = r1.header().time;
+    assert_eq!(regenesis_wait(r1.header(), t1 + 3599), REGENESIS_WAIT);
+    assert_eq!(regenesis_wait(r1.header(), t1 + 3600), FAST);
+    let f2 = signed(Some(&r1), next(&r1, Kind::Fresh, t1 + 120), &vol);
+    let hour = Some(Refusal::Generation(
+        "a Regenesis comes an hour after its parent",
+    ));
+
+    // Again 2 minutes after its parent, within the hour of r1: refused everywhere
+    let r2 = regen_by(&vol2, &f2, t1 + 240);
+    let now = clock(t1 + 300);
+    let floor_r1 = Floor::after(None, &r1, t1);
+    let floor_f2 = Floor::after(Some(&floor_r1), &f2, t1);
+    assert_eq!(check_link_under(&f2, &r2, &r1).err(), hour.clone());
+    assert_eq!(
+        check_on_floor_under(&floor_f2, &r2, &r1).err(),
+        hour.clone()
+    );
+    assert_eq!(
+        check_regenesis_under(Some(&floor_f2), now, &r2, &f2, &r1).err(),
+        hour.clone()
+    );
+    let walker = check_walk(
+        WalkTo::Floor {
+            floor: &floor_r1,
+            kh: &r1,
+        },
+        &[],
+        link_of(&r2, Some(&f2)),
+        now,
+        NO_PINS,
+    );
+    assert_eq!(walker.err(), hour.clone());
+    // A newcomer whose walk starts at r1, on trust, still sees r1 as r2's set
+    let started = check_walk(
+        WalkTo::Start { floor: None },
+        &[link_of(&r1, Some(&fresh))],
+        link_of(&r2, Some(&f2)),
+        now,
+        NO_PINS,
+    );
+    assert_eq!(started.err(), hour);
+
+    // An hour after r1, 2 minutes after its parent: taken, and not a second sooner
+    let f3 = signed(Some(&r1), next(&r1, Kind::Fresh, t1 + 3500), &vol);
+    let r3 = regen_by(&vol2, &f3, t1 + 3500 + FAST);
+    let r3_early = regen_by(&vol2, &f3, t1 + 3500 + FAST - 1);
+    let now = clock(t1 + 3500 + FAST + 5);
+    let floor_f3 = Floor::after(Some(&floor_r1), &f3, t1);
+    assert_eq!(check_link_under(&f3, &r3, &r1), Ok(vec![]));
+    assert_eq!(check_on_floor_under(&floor_f3, &r3, &r1), Ok(vec![]));
+    assert!(check_regenesis_under(Some(&floor_f3), now, &r3, &f3, &r1).is_ok());
+    assert!(check_link_under(&f3, &r3_early, &r1).is_err());
+    let walker = check_walk(
+        WalkTo::Floor {
+            floor: &floor_r1,
+            kh: &r1,
+        },
+        &[],
+        link_of(&r3, Some(&f3)),
+        now,
+        NO_PINS,
+    );
+    assert!(walker.is_ok(), "{walker:?}");
+}
+
 #[test]
 fn a_header_ten_minutes_ahead_is_refused() {
     let (g, k) = (text(), Party::new(acct(1)));

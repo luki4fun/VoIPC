@@ -1,5 +1,5 @@
 //! Keyholder duty (3g): volunteering, the relay's dues taken whole and checked, the keyring
-//! brought up to the head, the lists a build needs, commits built off the lock
+//! brought up to the head, the lists a build needs, commits built off the lock and in steps
 //! (`take_build` → `BuildJob::step` → `built`), checked by the validator over this device's
 //! own view and paced out in parts (`next_frame`), rebased on `HEAD_MOVED`, declined where
 //! the rules forbid, and a desktop pair's `KeyholdersReplace` at a seat-key rotation.
@@ -11,6 +11,9 @@
 //! `commit::validate` before it goes.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
 use libsignal_protocol::{IdentityKey, IdentityKeyPair};
@@ -27,8 +30,9 @@ use super::{
     seat_keys, take_endorsement, EndorsementBad, GkCtx, GkEvent, GkOut, Platform, Warn, Who,
 };
 use crate::group_key::build::{
-    self, build_genesis, build_join, build_opening, build_regenesis, build_seed_welcomes, kx_tag,
-    plan_opening, BucketNow, Holding, ListSeat, Lists, OpeningAsk, Replacing, RowBases, Start,
+    self, build_genesis, build_regenesis, join_in_steps, kx_tag, opening_in_steps, plan_opening,
+    seed_welcomes_in_steps, steps, BucketNow, Holding, ListSeat, Lists, OpeningAsk, Replacing,
+    RowBases, Start,
 };
 use crate::group_key::commit::{
     self, list_order, validate, Candidate, Due, DueKind, Exit, GroupView, HeadView, HolderRef,
@@ -208,7 +212,6 @@ struct Task {
     now: u64,
     roster: Vec<u32>,
     reuse: Option<build::Built>,
-    cache: RowBases,
 }
 
 /// What a job made.
@@ -221,27 +224,98 @@ enum Done {
     },
 }
 
-/// A commit to build off the `SignalState` lock: owned and `Send`.
+/// A group's row bases (`RowBases`), shared by its hold and its jobs: a job takes them at
+/// its first step and puts them back when it ends or is dropped (`Lease`). A job waiting in
+/// the queue, or dropped there, holds none, so the job built next finds them.
+type Bases = Arc<Mutex<Option<RowBases>>>;
+
+/// A group's row bases while one job builds with them.
+struct Lease {
+    home: Bases,
+    bases: RowBases,
+}
+
+impl Lease {
+    fn take(home: Bases) -> Lease {
+        let bases = home
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+            .unwrap_or_default();
+        Lease { home, bases }
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        let bases = std::mem::take(&mut self.bases);
+        *self.home.lock().unwrap_or_else(PoisonError::into_inner) = Some(bases);
+    }
+}
+
+/// A job's build in progress: it owns its task and its lease.
+type Run = Pin<Box<dyn Future<Output = Result<Done, String>> + Send>>;
+
+/// What a job that stopped before its end says (`built` drops it: its due or attempt is no
+/// longer the one in hand).
+const JOB_GONE: &str = "the due is no longer in hand";
+
+/// A commit to build off the `SignalState` lock: owned and `Send`, built in steps.
 pub struct BuildJob {
     group: String,
     due: u64,
     attempt: u64,
+    /// Until its first step.
     task: Option<Box<Task>>,
+    /// From its first step to its end.
+    run: Option<Run>,
+    bases: Bases,
+    /// Alive while its due and attempt are the ones in hand (`Work::job`).
+    live: Weak<()>,
+    units: u64,
 }
 
 impl BuildJob {
-    /// Works on for at most `budget`; the job finished or failed once it says so. A build
-    /// runs whole at its first step: the builders are not cut into slices yet.
-    pub fn step(&mut self, _budget: Duration) -> Option<Built> {
-        let mut t = self.task.take()?;
-        let out = t.run();
+    /// Works on for about `budget`: the step stops at the first unit of work (a row and its
+    /// row base, a welcome, a seal, a list's digest; `build::steps`) that finds the budget
+    /// spent, so it lasts the budget and one unit at most. The one block it cannot cut, the
+    /// validator over the whole commit, begins a step of its own. A zero budget does one
+    /// unit a step. The job finished or failed once it says so; one whose due or attempt is
+    /// no longer the one in hand stops at its next step, unbuilt, and `built` drops it.
+    pub fn step(&mut self, budget: Duration) -> Option<Built> {
+        self.step_by(budget, steps::clock_ms)
+    }
+
+    /// `step` on `clock` (milliseconds).
+    fn step_by(&mut self, budget: Duration, clock: fn() -> f64) -> Option<Built> {
+        if self.task.is_none() && self.run.is_none() {
+            return None;
+        }
+        let out = if self.live.strong_count() == 0 {
+            Err(JOB_GONE.to_string())
+        } else {
+            if let Some(t) = self.task.take() {
+                self.run = Some(Box::pin(t.run_with(self.bases.clone())));
+            }
+            let run = self.run.as_mut()?;
+            let (out, units) = steps::step_by(run.as_mut(), budget, clock);
+            self.units += units;
+            out?
+        };
+        // Its lease ends with its run: the row bases are home before `built`
+        self.task = None;
+        self.run = None;
         Some(Built {
             group: std::mem::take(&mut self.group),
             due: self.due,
             attempt: self.attempt,
             out,
-            cache: std::mem::take(&mut t.cache),
         })
+    }
+
+    /// The units of work its steps did so far (`build::steps::unit`).
+    pub fn units(&self) -> u64 {
+        self.units
     }
 }
 
@@ -251,7 +325,6 @@ pub struct Built {
     due: u64,
     attempt: u64,
     out: Result<Done, String>,
-    cache: RowBases,
 }
 
 fn build_error(e: build::BuildError) -> String {
@@ -263,7 +336,13 @@ fn build_error(e: build::BuildError) -> String {
 }
 
 impl Task {
-    fn run(&mut self) -> Result<Done, String> {
+    /// The whole job, with the group's row bases for as long as it runs.
+    async fn run_with(mut self: Box<Task>, home: Bases) -> Result<Done, String> {
+        let mut lease = Lease::take(home);
+        self.run(&mut lease.bases).await
+    }
+
+    async fn run(&mut self, cache: &mut RowBases) -> Result<Done, String> {
         if let What::Welcomes(seats) = &self.what {
             let head = self.head.as_ref().ok_or("no head")?;
             let ring = self.ring.as_ref().ok_or("no keyring")?;
@@ -274,19 +353,21 @@ impl Task {
                 m: self.me.m,
                 keys: &self.me.pair,
             };
-            let list = build_seed_welcomes(&g, h.seed, seed, &me, seats).map_err(build_error)?;
+            let list = seed_welcomes_in_steps(&g, h.seed, seed, &me, seats)
+                .await
+                .map_err(build_error)?;
             return Ok(Done::Welcomes {
                 gen: h.gen,
                 s: h.seed,
                 list,
             });
         }
-        let b = self.build().map_err(build_error)?;
-        self.check(&b)?;
+        let b = self.build(cache).await.map_err(build_error)?;
+        self.check(&b).await?;
         Ok(Done::Commit(Box::new(b)))
     }
 
-    fn build(&mut self) -> Result<build::Built, build::BuildError> {
+    async fn build(&mut self, cache: &mut RowBases) -> Result<build::Built, build::BuildError> {
         let me = Me {
             m: self.me.m,
             keys: &self.me.pair,
@@ -311,17 +392,12 @@ impl Task {
                     stored: self.stored,
                     now: self.now,
                 };
+                // One seat and one keyring welcome: whole, in one step
                 if self.due.kind == DueKind::Genesis {
-                    build_genesis(&st, &mut self.cache)
+                    build_genesis(&st, cache)
                 } else {
                     let head = self.head.as_ref().ok_or(refuse("no head"))?;
-                    build_regenesis(
-                        &st,
-                        head,
-                        &self.due.exits,
-                        self.due.exits_upto,
-                        &mut self.cache,
-                    )
+                    build_regenesis(&st, head, &self.due.exits, self.due.exits_upto, cache)
                 }
             }
             dk => {
@@ -353,14 +429,15 @@ impl Task {
                         .iter()
                         .filter(|j| !out.contains(&j.seat))
                         .collect();
-                    build_join(
+                    join_in_steps(
                         &hold,
                         &seat,
                         self.refused.clone(),
                         self.now,
-                        &mut self.cache,
+                        cache,
                         self.reuse.as_ref(),
                     )
+                    .await
                 } else {
                     let pairs = &self.pairs;
                     let pair_of = |k: &Keyholder| {
@@ -390,7 +467,7 @@ impl Task {
                         pairs: &pair_of,
                         now: self.now,
                     };
-                    build_opening(&hold, &ask, &mut self.cache, self.reuse.as_ref())
+                    opening_in_steps(&hold, &ask, cache, self.reuse.as_ref()).await
                 }
             }
         }
@@ -400,8 +477,9 @@ impl Task {
     /// on, the lists it fetched (a version whose list it did not need shows by its leaf
     /// alone), each seat's seed as the due said. A bucket the commit drops or re-versions
     /// is read from its list, one its keyring names: by its leaf alone it would hide the
-    /// seats a drop takes (rules 8 and 10).
-    fn check(&self, b: &build::Built) -> Result<(), String> {
+    /// seats a drop takes (rules 8 and 10). A step may stop after each list it reads; the
+    /// validator runs in one block, at the start of a step of its own.
+    async fn check(&self, b: &build::Built) -> Result<(), String> {
         let anew = matches!(self.due.kind, DueKind::Genesis | DueKind::Regenesis);
         let leaves: Vec<Listed> = match (&self.ring, &self.head, anew) {
             (Some(ring), Some(head), false) => {
@@ -424,15 +502,20 @@ impl Task {
                         }
                         None => vec![],
                     };
+                    let read = !seats.is_empty();
                     leaves.push(Listed {
                         leaf: kb.leaf(),
                         seats,
                     });
+                    if read {
+                        steps::unit().await;
+                    }
                 }
                 leaves
             }
             _ => vec![],
         };
+        steps::fresh().await;
         let joiners: HashSet<SeatRef> = self.due.joiners.iter().map(|j| j.seat).collect();
         let seed = self.head.as_ref().map_or(0, |h| h.header().seed);
         let held =
@@ -501,6 +584,9 @@ struct Work {
     /// Joins of this due that went stale, by `D`, with the seats they sealed: the rebase
     /// names them again, else they are told once the due is let go (§5.2).
     rebased: Vec<([u8; 32], Vec<SeatRef>)>,
+    /// Held while this attempt's job is out: a job whose due or attempt went stops at its
+    /// next step (`BuildJob::live`).
+    job: Option<Arc<()>>,
 }
 
 /// A `KeyringIn` sequence's key: `(gen, epoch, join)`.
@@ -513,7 +599,7 @@ struct Hold {
     keyring: Option<Parts<RingAt, KeyringPiece>>,
     keyring_asked: Option<RingAt>,
     ring: Option<Ring>,
-    cache: Option<RowBases>,
+    cache: Bases,
     lists: Lists,
     lists_gen: [u8; 16],
     lists_out: usize,
@@ -1119,6 +1205,7 @@ impl Duty {
             lists_asked: false,
             stale: None,
             rebased: vec![],
+            job: None,
         });
         self.advance(who, m, c, out);
     }
@@ -1258,14 +1345,24 @@ impl Duty {
     fn job(&mut self, who: &mut Who, m: &Member, c: &mut GkCtx, out: &mut GkOut) {
         match self.task(who, m, c) {
             Ok((task, due, attempt)) => {
-                if let Some(w) = self.holds.get_mut(&m.t.group).and_then(|h| h.work.as_mut()) {
-                    w.stage = Stage::Building;
-                }
+                let Some(hold) = self.holds.get_mut(&m.t.group) else {
+                    return;
+                };
+                let live = Arc::new(());
+                let Some(w) = hold.work.as_mut() else {
+                    return;
+                };
+                w.stage = Stage::Building;
+                w.job = Some(live.clone());
                 self.jobs.push_back(BuildJob {
                     group: m.t.group.clone(),
                     due,
                     attempt,
                     task: Some(Box::new(task)),
+                    run: None,
+                    bases: hold.cache.clone(),
+                    live: Arc::downgrade(&live),
+                    units: 0,
                 });
                 out.build_ready = true;
             }
@@ -1477,7 +1574,6 @@ impl Duty {
             now: w.now,
             roster: m.voice_seats.keys().copied().collect(),
             reuse: None,
-            cache: RowBases::new(),
             due,
         };
         let (due_id, attempt) = (w.due, w.attempt);
@@ -1485,7 +1581,6 @@ impl Duty {
         let w = hold.work.as_mut().ok_or(not_ready("no due"))?;
         let mut task = task;
         task.reuse = w.stale.take().map(|b| *b);
-        task.cache = hold.cache.take().unwrap_or_default();
         Ok((task, due_id, attempt))
     }
 
@@ -1557,6 +1652,7 @@ impl Duty {
         w.piece.exits.retain(|x| x.seq > upto);
         w.lists_asked = false;
         w.attempt = self.attempts;
+        w.job = None;
     }
 
     /// A whole `KeyringIn` at `at`: taken under the member's head with the `KRK` this device
@@ -1780,12 +1876,10 @@ impl Duty {
             due,
             attempt,
             out: done,
-            cache,
         } = b;
         let Some(hold) = self.holds.get_mut(&group) else {
             return;
         };
-        hold.cache = Some(cache);
         let Some(w) = hold
             .work
             .as_mut()
@@ -2101,6 +2195,8 @@ mod tests {
         groups: BTreeMap<String, Member>,
         pins: MemoryPins,
         now: u64,
+        /// Each job's steps, units, and the most units one step did.
+        ran: Vec<(u64, u64, u64)>,
     }
 
     impl Rig {
@@ -2126,6 +2222,7 @@ mod tests {
                 groups,
                 pins: MemoryPins::default(),
                 now: T0 * 1000,
+                ran: vec![],
             }
         }
 
@@ -2167,11 +2264,56 @@ mod tests {
             })
         }
 
-        /// Every job run and handed back, as the host does off the lock.
+        /// `due` in parts of 20 joiners, as a relay cuts a big Join to `PIECE_MAX_BYTES`.
+        fn due_in_parts(&mut self, id: u64, mut p: DuePiece) -> GkOut {
+            let joins = std::mem::take(&mut p.joins);
+            let mut parts = vec![p];
+            for (i, chunk) in joins.chunks(20).enumerate() {
+                if i > 0 {
+                    parts.push(DuePiece {
+                        joins: vec![],
+                        exits: vec![],
+                        pairs: vec![],
+                        held: vec![],
+                        seed_seats: vec![],
+                        ..parts[0].clone()
+                    });
+                }
+                parts.last_mut().expect("one").joins = chunk.to_vec();
+            }
+            let n = parts.len();
+            let mut all = GkOut::default();
+            for (i, piece) in parts.into_iter().enumerate() {
+                let out = self.frame(ServerMessage::EpochDue {
+                    group: TEXT_ID.into(),
+                    due: id,
+                    part: i as u16,
+                    last: i + 1 == n,
+                    piece: Box::new(piece),
+                });
+                all.send.extend(out.send);
+                all.build_ready |= out.build_ready;
+            }
+            all
+        }
+
+        /// Every job run and handed back, as the host does off the lock: in steps of one
+        /// unit of work each (a zero budget), so every test here builds in steps.
         fn jobs(&mut self) -> GkOut {
             let mut all = GkOut::default();
             while let Some(mut job) = self.duty.take_build() {
-                let b = job.step(Duration::from_millis(8)).expect("a job finishes");
+                let (mut steps, mut most) = (0, 0);
+                let b = loop {
+                    let before = job.units();
+                    let b = job.step(Duration::ZERO);
+                    steps += 1;
+                    most = most.max(job.units() - before);
+                    if let Some(b) = b {
+                        break b;
+                    }
+                    assert!(steps < 10_000_000, "a job finishes");
+                };
+                self.ran.push((steps, job.units(), most));
                 let mut c = GkCtx {
                     pins: &mut self.pins,
                     now: self.now,
@@ -3810,5 +3952,147 @@ mod tests {
         send::<BuildJob>();
         send::<Built>();
         let _ = tag(&[0x05; 33]);
+    }
+
+    /// A keyholder's jobs build in steps: at a zero budget each step does one unit of work
+    /// (a row, a welcome, a seal, a list read), and the commits are the relay's to take, a
+    /// Join of 300 seats (two dues: 256 and 44), its exits and a refresh among them.
+    #[test]
+    fn a_keyholders_jobs_build_in_steps_of_one_unit_and_the_relay_takes_each_commit() {
+        let mut rig = Rig::new(None, Platform::Desktop);
+        let (mut w, pair) = genesis(&mut rig);
+        assert_eq!(rig.ran.len(), 1, "the Genesis: {:?}", rig.ran);
+        let by = HolderRef {
+            m: MemberId::Conn(U),
+            kx: pair.kx(),
+        };
+        let people: Vec<world::Member> = (0..300).map(world::Member::numbered).collect();
+        let mut due_id = 2;
+        let mut land_job = |rig: &mut Rig, w: &mut World, kind: u8, due: &Due| {
+            rig.ran.clear();
+            let out = rig.due_in_parts(due_id, piece(kind, due, Some(w), vec![]));
+            due_id += 1;
+            if let Some(lists) = lists_for(w, &out.send) {
+                rig.frame(lists);
+            }
+            let c = rig.commit();
+            let a = land(rig, w, due, by, &c);
+            let (steps, units, most) = rig.ran[0];
+            let rows: usize = c.rows.iter().map(|r| r.rows.len() / 60).sum();
+            let least = rows + c.welcomes.len() + c.seals.len();
+            assert!(
+                units >= least as u64,
+                "{units} units for {least} rows, welcomes and seals"
+            );
+            assert_eq!(most, 1, "one unit a step");
+            assert_eq!(steps, units + 1, "each step but the last stops at its unit");
+            a
+        };
+        for part in [&people[..256], &people[256..]] {
+            let refs: Vec<&world::Member> = part.iter().collect();
+            let join = w.join_due(&refs);
+            let a = land_job(&mut rig, &mut w, due_code::JOIN, &join);
+            assert_eq!(a.seated, part.len());
+        }
+        assert_eq!(w.head.header().seats, 301);
+        let leaving: Vec<SeatRef> = people.iter().step_by(11).map(|p| p.seat).collect();
+        let exits = w.exits(&leaving, DueKind::Exits);
+        let a = land_job(&mut rig, &mut w, due_code::EXITS, &exits);
+        assert_eq!(a.removed.len(), leaving.len());
+        w.tick(3700);
+        rig.now = w.now * 1000;
+        let refresh = w.due(DueKind::Refresh);
+        let a = land_job(&mut rig, &mut w, due_code::REFRESH, &refresh);
+        assert_eq!(a.header.header().kind, Kind::Fresh);
+    }
+
+    /// A job holds the group's row bases from its first step to its end, never while it
+    /// waits. One whose due went (asked again) stops at its next step, unbuilt, and its
+    /// bases go home, so the job for the due asked again builds on them, not cold.
+    #[test]
+    fn a_job_whose_due_went_stops_at_its_next_step_and_its_row_bases_go_home() {
+        let mut rig = Rig::new(None, Platform::Desktop);
+        let (mut w, pair) = genesis(&mut rig);
+        let by = HolderRef {
+            m: MemberId::Conn(U),
+            kx: pair.kx(),
+        };
+        let bases = |rig: &Rig| {
+            let home = rig.duty.holds[TEXT_ID].cache.lock().unwrap();
+            home.as_ref().map(RowBases::len)
+        };
+        let people: Vec<world::Member> = (10..40).map(world::Member::account).collect();
+        let refs: Vec<&world::Member> = people.iter().collect();
+        let join = w.join_due(&refs);
+        rig.due(2, piece(due_code::JOIN, &join, Some(&w), vec![]));
+        let c = rig.commit();
+        land(&mut rig, &mut w, &join, by, &c);
+        assert_eq!(
+            bases(&rig),
+            Some(30),
+            "a base for each row of the stored Join"
+        );
+
+        let exits = w.exits(&[people[0].seat], DueKind::Exits);
+        let out = rig.due(3, piece(due_code::EXITS, &exits, Some(&w), vec![]));
+        rig.frame(lists_for(&w, &out.send).expect("its lists"));
+        let mut job = rig.duty.take_build().expect("a job");
+        assert_eq!(bases(&rig), Some(30), "a job waiting holds none");
+        assert!(job.step(Duration::ZERO).is_none());
+        assert_eq!(job.units(), 1);
+        assert_eq!(bases(&rig), None, "out with the job while it builds");
+
+        // The relay asks the due again: the first job's attempt is gone
+        let out = rig.due(4, piece(due_code::EXITS, &exits, Some(&w), vec![]));
+        if let Some(lists) = lists_for(&w, &out.send) {
+            rig.frame(lists);
+        }
+        let b = job.step(Duration::MAX).expect("it stops at once");
+        assert!(job.step(Duration::MAX).is_none(), "and is done");
+        assert_eq!(job.units(), 1, "it built nothing more");
+        assert_eq!(bases(&rig), Some(30), "its bases are home");
+        let mut out = GkOut::default();
+        let mut c = GkCtx {
+            pins: &mut rig.pins,
+            now: rig.now,
+        };
+        rig.duty
+            .built(&mut rig.who, &mut rig.groups, b, &mut c, &mut out);
+        assert!(
+            out.send.is_empty(),
+            "a gone job says nothing: {:?}",
+            out.send
+        );
+
+        // The due asked again builds on the warm bases: no base made anew, none lost
+        let c = rig.commit();
+        let a = land(&mut rig, &mut w, &exits, by, &c);
+        assert_eq!(a.removed, vec![people[0].seat]);
+        assert_eq!(bases(&rig), Some(30));
+    }
+
+    /// A Join job at a zero budget does one unit of work a step: its first step does not
+    /// end it, and it takes a step for each seat's row and welcome at least.
+    #[test]
+    fn a_join_job_at_a_zero_budget_does_not_end_at_its_first_step() {
+        let mut rig = Rig::new(None, Platform::Desktop);
+        let (w, _) = genesis(&mut rig);
+        let people: Vec<world::Member> = (10..30).map(world::Member::account).collect();
+        let refs: Vec<&world::Member> = people.iter().collect();
+        let join = w.join_due(&refs);
+        rig.due(2, piece(due_code::JOIN, &join, Some(&w), vec![]));
+        let mut job = rig.duty.take_build().expect("a job");
+        assert!(
+            job.step(Duration::ZERO).is_none(),
+            "a step of one unit, not the whole build"
+        );
+        let mut steps = 1;
+        while job.step(Duration::ZERO).is_none() {
+            steps += 1;
+        }
+        assert!(
+            steps > 2 * 20,
+            "a step for each seat's row and welcome: {steps}"
+        );
     }
 }

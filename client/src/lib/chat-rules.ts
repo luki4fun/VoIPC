@@ -309,6 +309,11 @@ export const TOO_LARGE_REASON = "post too large: one message holds at most 16 Ki
 /** What the app says for `TOO_LARGE_REASON`. */
 export const TOO_LARGE_TOLD = "Your message was not sent: one message holds at most 16 KiB.";
 
+/** What a row of ours that never went says (`ChatMessage.not_sent`, the relay's words). */
+export function notSentLine(reason: string): string {
+  return reason === TOO_LARGE_REASON ? "Not sent: one message holds at most 16 KiB." : `Not sent: ${reason}`;
+}
+
 /** What a `ChannelError` is told as: the relay's words, a post past 16 KiB's plainly. */
 export function channelErrorText(reason: string): string {
   return reason === TOO_LARGE_REASON ? TOO_LARGE_TOLD : reason;
@@ -452,7 +457,7 @@ export function fileRef(v: unknown): FileRef | undefined {
 /** The fields the archive has a place of its own for (crypto.rs `ChatMessage`). */
 const ARCHIVE_FIELDS = new Set(["user_id", "username", "content", "timestamp", "kind", "id", "expires_at", "account"]);
 /** The fields `extra` holds that this version reads back (`fromArchived`). */
-const EXTRA_FIELDS = new Set(["reply_to", "thread", "file", "fwd", "edited_at", "reactions", "pin", "hide", "power", "relay_at"]);
+const EXTRA_FIELDS = new Set(["reply_to", "thread", "file", "fwd", "edited_at", "reactions", "pin", "hide", "power", "relay_at", "not_sent"]);
 
 /**
  * A message as the desktop archive stores it: every field it has no place of
@@ -500,6 +505,7 @@ export function fromArchived(m: ChatMessage & { extra?: string | null }): ChatMe
       ...eventState(more, rest.timestamp),
       ...(more.power === true ? { power: true } : {}),
       ...(typeof more.relay_at === "number" && Number.isFinite(more.relay_at) ? { relay_at: more.relay_at } : {}),
+      ...(typeof more.not_sent === "string" ? { not_sent: more.not_sent.slice(0, 200) } : {}),
       ...(unknown.length > 0 ? { extra_kept: JSON.stringify(Object.fromEntries(unknown)) } : {}),
     };
   } catch {
@@ -1092,6 +1098,7 @@ export function handOffOf(list: readonly ChatMessage[], now = Date.now()): ChatM
     .filter(
       (m) =>
         (!m.kind || m.kind === "text" || m.kind === "shared") &&
+        !m.not_sent &&
         !isHidden(m) &&
         !(m.expires_at !== undefined && m.expires_at <= now),
     )

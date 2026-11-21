@@ -275,8 +275,8 @@ impl Kept {
 
     /// The asks of `m`'s group not out yet, in frames of 16 (fewer only when fewer wait),
     /// each once at most `OUT_MOST` are out with it and the pace lets one go. `have` is the
-    /// floor where the relay uses the group key, so the keyholder headers it sends lead back
-    /// from one this device holds.
+    /// floor where the relay uses the group key and this device holds the keyholder header it
+    /// names, so the keyholder headers the relay sends lead back from that header (C1's anchor).
     pub(super) fn send(&mut self, who: &Who, m: &Member, out: &mut GkOut) {
         let Some(asks) = self.asks.get_mut(&m.t.group) else {
             return;
@@ -295,17 +295,27 @@ impl Kept {
             if due.is_empty() || due.len() > room || !self.pace.take(now) {
                 return;
             }
-            let have = m.floor.as_ref().filter(|_| who.on).map(|f| gk::FloorRef {
-                gen: f.gen,
-                epoch: f.epoch,
-                join: f.join,
-                d: f.d,
-                kh: f.kh,
-            });
-            let anchor = have
+            // `have` names the floor only with the keyholder header it names held here: the
+            // relay walks back from that header, and the walk is checked from it. With none
+            // held (a floor from the vault alone: a reloaded page before its live answer) the
+            // answer is taken on the binding alone, and the relay sends it so (a Join's set)
+            let anchor = m
+                .floor
                 .as_ref()
-                .and_then(|h| m.kh.as_ref().filter(|k| k.d() == h.kh))
+                .filter(|_| who.on)
+                .and_then(|f| m.kh.as_ref().filter(|k| k.d() == f.kh))
                 .cloned();
+            let have = m
+                .floor
+                .as_ref()
+                .filter(|_| anchor.is_some())
+                .map(|f| gk::FloorRef {
+                    gen: f.gen,
+                    epoch: f.epoch,
+                    join: f.join,
+                    d: f.d,
+                    kh: f.kh,
+                });
             for (i, k) in due.iter().enumerate() {
                 asks.sent.insert(*k, Some(now));
                 asks.order.push_back(Owed {
@@ -411,8 +421,8 @@ fn take(
 /// seats or a row (`row_key`), and its ratchets. A welcome binds no more than its sender,
 /// whom the relay names: it is our own only where its `s_m` is our self-row's (`self_s_m`).
 /// With `own_only` (no anchor reaches the header, §5.10) only our own is given: the key
-/// held this run is not, since a welcome a live answer brought keys it before its `confirm`
-/// is checked (`Member::key_in`).
+/// held this run is not (`Member::key_in` keeps one only once its seal's key passed
+/// `confirm`, so it could be, RV).
 fn bk_of(
     who: &Who,
     m: &Member,
@@ -1174,6 +1184,46 @@ mod tests {
         assert!(!read(p, false), "on the binding alone, no seed welcome");
     }
 
+    /// J9M (a reloaded page's kept read): a floor whose keyholder header this device does not
+    /// hold (the vault's, before the live answer brings the header) is no anchor. The kept ask
+    /// goes without `have`, so the relay answers it in the binding alone's shape (for a Join,
+    /// with the set its opening names) and does not walk back from a header this device cannot
+    /// check a walk from. With the header held, the floor goes as `have`.
+    #[test]
+    fn a_kept_ask_names_the_floor_only_with_its_keyholder_header_held() {
+        let keys = SeatKeys::generate(1, T0);
+        let c = case(&keys);
+        let gen = c.w.g.gen();
+        let e = c.past.header.header().epoch;
+        assert_eq!(c.past.header.kh(), c.w.kh.d(), "the set the floor names");
+        let have = |held: bool| {
+            let mut d = Device::new(c.ik, seat_keys::copy(&keys));
+            let m = d.keying.groups.get_mut(TEXT_ID).unwrap();
+            m.floor = Some(crate::group_key::Floor::after(None, &c.past.header, T0));
+            if held {
+                m.kh = Some(c.w.kh.clone());
+            }
+            d.keying.past_epoch(TEXT_ID, gen, e - 1);
+            let out = d.keying.past_asks();
+            out.send.iter().find_map(|m| match m {
+                ClientMessage::EpochFetch { have, at, .. } if !at.is_empty() => {
+                    Some(have.as_ref().map(|h| (h.epoch, h.kh)))
+                }
+                _ => None,
+            })
+        };
+        assert_eq!(
+            have(false),
+            Some(None),
+            "with no keyholder header held, no have"
+        );
+        assert_eq!(
+            have(true),
+            Some(Some((e, c.w.kh.d()))),
+            "held: the floor goes as have"
+        );
+    }
+
     /// C1 leaves it to the caller (P1): an answer whose header is another epoch's than the
     /// one asked is not taken, and the epoch is then not to be had; an answer nobody asked
     /// for is not taken either. `NOT_STORED` answers the oldest ask out, and only that one.
@@ -1636,15 +1686,14 @@ mod tests {
         assert_eq!(taken, vec![], "no key of the relay's taken");
     }
 
-    /// J8K review, left to `member.rs` (not this slice's file): the binding alone trusts the
-    /// account's self-row to hold an `s_m` a key passed `confirm` under. `Member::key_in`
-    /// writes one for the `s_m` of whatever seat keying came with an answer whose head key it
-    /// holds, though no key came through that keying: a relay that rides a welcome of its own
-    /// pair, under a seed number of its choosing, on a real push of the next Join gets its
-    /// `s_m` sealed as the account's (then a fresh device's past read under that seed counts
-    /// the relay's welcome as its own).
+    /// J8K review: the binding alone trusts the account's self-row to hold an `s_m` a key
+    /// passed `confirm` under. `Member::key_in` wrote one for the `s_m` of whatever seat keying
+    /// came with an answer whose head key it held, though no key came through that keying: a
+    /// relay that rides a welcome of its own pair, under a seed number of its choosing, on a
+    /// real push of the next Join got its `s_m` sealed as the account's (then a fresh device's
+    /// past read under that seed counted the relay's welcome as its own). Now a keying's `s_m`
+    /// is kept, and sealed, only once its own `BK` opened the seal of a confirmed key.
     #[test]
-    #[ignore = "J8K review: member.rs key_in writes a self-row for an s_m no key came through"]
     fn no_self_row_is_written_for_an_s_m_no_confirmed_key_came_through() {
         use crate::group_key::build::world::{Holder, Member};
         use crate::group_key::{open_self_row, seat_welcome};

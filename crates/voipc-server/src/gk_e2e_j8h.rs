@@ -34,14 +34,21 @@ use super::gk_e2e_tests::{account_session, drop_db, scratch_db, show, tracing_on
 use crate::control::{ControlRx, ControlTx};
 use crate::state::ServerState;
 
-const CHAN: ChannelId = 11;
-const CONV: &str = "c:j8hall";
+pub(super) const CHAN: ChannelId = 11;
+pub(super) const CONV: &str = "c:j8hall";
 
 /// How long a newcomer may wait for its seat while a keyholder's account is online in the
 /// channel again: a Join due and its commit, with room for a fetch's retry.
 const SEATED_WITHIN_MS: u64 = 2 * 60_000;
+/// The same after the set's last entry went for good ("Fast new start", owner 2026-11-19):
+/// the relay waits `REGENESIS_FAST_AFTER_MS` (2 min) from when it saw no keyholder online,
+/// which was before the newcomer came, then a Regenesis (30 s deadline, and a retry 30 s
+/// after a miss), a Join batch (2 s) and its commit (5 s) seat it. Two minutes over the fast
+/// wait: on Postgres under the other tests' load the seat came at 3.0 min (J9N, 1 run in 3),
+/// at about 2.1 min alone. Written out, so the old hour fails it.
+pub(super) const SEATED_AFTER_FAST_MS: u64 = 4 * 60_000;
 /// How long the tests watch for the newcomer's seat at most: past the 1 h Regenesis.
-const WATCH_MS: u64 = 75 * 60_000;
+pub(super) const WATCH_MS: u64 = 75 * 60_000;
 
 fn wall_ms() -> u64 {
     SystemTime::now()
@@ -56,14 +63,14 @@ fn raw(ik: &IdentityKeyPair) -> [u8; 32] {
 
 /// An account with its identity and published seat keys (counter 1), as `gk_e2e_tests.rs`
 /// makes one.
-struct Account {
+pub(super) struct Account {
     a: [u8; 16],
     ik: IdentityKeyPair,
     keys: SeatKeys,
 }
 
 impl Account {
-    async fn new(db: &Store, name: &str) -> Account {
+    pub(super) async fn new(db: &Store, name: &str) -> Account {
         let id = l4f_accounts::model::AccountId::new();
         db.create_user(
             &l4f_accounts::model::NewUser {
@@ -114,13 +121,13 @@ impl Account {
 
 /// One connection's `GroupKeying` as an app runs it: build jobs run whole as the host runs
 /// them off the lock, its uploads taken.
-struct App {
-    sid: UserId,
+pub(super) struct App {
+    pub(super) sid: UserId,
     name: &'static str,
-    keying: GroupKeying,
+    pub(super) keying: GroupKeying,
     st: SignalStores,
     pins: MemoryPins,
-    events: Vec<GkEvent>,
+    pub(super) events: Vec<GkEvent>,
 }
 
 impl App {
@@ -133,6 +140,24 @@ impl App {
         name: &'static str,
         acc: &Account,
         browser: bool,
+        local: Option<LocalGk>,
+    ) -> (App, Vec<ClientMessage>) {
+        let platform = if browser {
+            Platform::Browser
+        } else {
+            Platform::Desktop
+        };
+        App::with(state, sid, name, acc, platform, browser, local)
+    }
+
+    /// `acc`'s app on connection `sid` on `platform`, "Help hold keys" `holds`.
+    fn with(
+        state: &ServerState,
+        sid: UserId,
+        name: &'static str,
+        acc: &Account,
+        platform: Platform,
+        holds: bool,
         local: Option<LocalGk>,
     ) -> (App, Vec<ClientMessage>) {
         let mut app = App {
@@ -148,12 +173,8 @@ impl App {
             on: true,
             run: state.gk.run,
             relay_clock: now / 1000,
-            platform: if browser {
-                Platform::Browser
-            } else {
-                Platform::Desktop
-            },
-            help_hold_keys: browser,
+            platform,
+            help_hold_keys: holds,
             user_id: sid,
             identity: acc.ik,
             account: Some(acc.a),
@@ -225,13 +246,18 @@ impl App {
     }
 
     /// The head epoch it holds `CK` of.
-    fn epoch(&self) -> Option<u32> {
+    pub(super) fn epoch(&self) -> Option<u32> {
         self.keying.current_epoch(CONV).map(|e| e.epoch)
     }
 }
 
 /// What a session sends, where session.rs hands a group-key message over.
-async fn handle(state: &Arc<ServerState>, sid: UserId, tx: &ControlTx, send: Vec<ClientMessage>) {
+pub(super) async fn handle(
+    state: &Arc<ServerState>,
+    sid: UserId,
+    tx: &ControlTx,
+    send: Vec<ClientMessage>,
+) {
     for m in send {
         if tracing_on() {
             let what = format!("{m:?}");
@@ -243,9 +269,9 @@ async fn handle(state: &Arc<ServerState>, sid: UserId, tx: &ControlTx, send: Vec
 
 /// The keyholder's app on a task of its own: each frame answered as it comes, a tick every
 /// 500 ms, whatever the test awaits meanwhile.
-struct OnTask {
-    app: Arc<Mutex<App>>,
-    task: tokio::task::JoinHandle<()>,
+pub(super) struct OnTask {
+    pub(super) app: Arc<Mutex<App>>,
+    pub(super) task: tokio::task::JoinHandle<()>,
 }
 
 impl OnTask {
@@ -275,7 +301,7 @@ impl OnTask {
     }
 
     /// The page goes (a reload, a closed tab): its task stops with its connection.
-    async fn stop(self) -> App {
+    pub(super) async fn stop(self) -> App {
         self.task.abort();
         let _ = self.task.await;
         let mut app = Arc::try_unwrap(self.app)
@@ -303,10 +329,14 @@ impl Gate {
         Gate(Some(tx))
     }
 
-    /// A millisecond of real time for what the relay and the keyholder's task have to do
-    /// (their database work among it) before the clock moves on.
-    async fn settle() {
-        tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(1)))
+    /// Real time for what the relay and the keyholder's task have to do (their database
+    /// work among it) before the clock moves on by `every` ms: a millisecond for each 100 ms
+    /// of it, one at least. The coarse steps of an hour's watch then leave a store write on
+    /// Postgres, under the load of the other tests, the time it takes (J9N: with a millisecond
+    /// for each 500 ms step, the keyholder's commits fell behind the clock there).
+    async fn settle(every: u64) {
+        let real = every.div_ceil(100).max(1);
+        tokio::task::spawn_blocking(move || std::thread::sleep(Duration::from_millis(real)))
             .await
             .unwrap();
     }
@@ -332,22 +362,22 @@ fn now_or_never<F: std::future::Future>(f: F) -> Option<F::Output> {
 }
 
 /// A member's app, stepped by the test.
-struct Stepped {
-    app: App,
+pub(super) struct Stepped {
+    pub(super) app: App,
     tx: ControlTx,
     rx: ControlRx,
 }
 
 /// The relay over `db`, the browser keyholder's app on its task, the members' apps.
-struct World {
+pub(super) struct World {
     _gate: Gate,
     /// The clock is paused: steps advance it.
     paused: bool,
-    state: Arc<ServerState>,
-    db: Store,
+    pub(super) state: Arc<ServerState>,
+    pub(super) db: Store,
     file: std::path::PathBuf,
-    keyholder: Option<OnTask>,
-    members: HashMap<&'static str, Stepped>,
+    pub(super) keyholder: Option<OnTask>,
+    pub(super) members: HashMap<&'static str, Stepped>,
     last_tick: u64,
 }
 
@@ -358,7 +388,7 @@ impl Drop for World {
 }
 
 /// A relay with the group key on over `db`.
-async fn relay(db: &Store) -> Arc<ServerState> {
+pub(super) async fn relay(db: &Store) -> Arc<ServerState> {
     let inc = crate::accounts::gk::gk_start(db, true)
         .await
         .unwrap()
@@ -377,7 +407,7 @@ async fn relay(db: &Store) -> Arc<ServerState> {
 }
 
 impl World {
-    async fn new() -> World {
+    pub(super) async fn new() -> World {
         let _ = tracing_on();
         let gate = Gate::hold();
         let (db, file) = scratch_db().await;
@@ -393,12 +423,12 @@ impl World {
         }
     }
 
-    fn now(&self) -> u64 {
+    pub(super) fn now(&self) -> u64 {
         self.state.gk.now()
     }
 
     /// From here on the clock moves only by the steps of `until`.
-    fn pause(&mut self) {
+    pub(super) fn pause(&mut self) {
         tokio::time::pause();
         self.paused = true;
     }
@@ -424,22 +454,42 @@ impl World {
     }
 
     /// `acc`'s browser page, holding keys, on its task.
-    async fn browser(&mut self, acc: &Account) {
+    pub(super) async fn browser(&mut self, acc: &Account) {
         let (sid, tx, rx) = self.session(acc);
         let (app, send) = App::new(&self.state, sid, "kay", acc, true, None);
         handle(&self.state, sid, &tx, send).await;
         self.keyholder = Some(OnTask::run(self.state.clone(), app, tx, rx));
     }
 
+    /// `acc`'s desktop app with "Help hold keys" on (its own keyholder pair, 0x03), on the
+    /// keyholder's task.
+    pub(super) async fn desktop_keyholder(&mut self, acc: &Account) {
+        let (sid, tx, rx) = self.session(acc);
+        let (app, send) = App::with(&self.state, sid, "dex", acc, Platform::Desktop, true, None);
+        handle(&self.state, sid, &tx, send).await;
+        self.keyholder = Some(OnTask::run(self.state.clone(), app, tx, rx));
+    }
+
+    /// The keyholder's app goes for good: its task stops with its connection.
+    pub(super) async fn keyholder_goes(&mut self) {
+        let old = self.keyholder.take().expect("a keyholder").stop().await;
+        self.state.gk.on_session_end(old.sid);
+    }
+
     /// The browser page reloads: its connection ends, and the page comes back on a new one.
-    async fn reload(&mut self, acc: &Account) {
+    pub(super) async fn reload(&mut self, acc: &Account) {
         let old = self.keyholder.take().expect("a page").stop().await;
         self.state.gk.on_session_end(old.sid);
         self.browser(acc).await;
     }
 
     /// `acc`'s desktop app, holding no keys, stepped by the test.
-    async fn member(&mut self, name: &'static str, acc: &Account, local: Option<LocalGk>) {
+    pub(super) async fn member(
+        &mut self,
+        name: &'static str,
+        acc: &Account,
+        local: Option<LocalGk>,
+    ) {
         let (sid, tx, rx) = self.session(acc);
         let (app, send) = App::new(&self.state, sid, name, acc, false, local);
         handle(&self.state, sid, &tx, send).await;
@@ -483,11 +533,16 @@ impl World {
     }
 
     /// Runs in steps of `every` ms until `done`, at most `ms`: how long it took, if it was.
-    async fn until(&mut self, ms: u64, every: u64, done: impl Fn(&World) -> bool) -> Option<u64> {
+    pub(super) async fn until(
+        &mut self,
+        ms: u64,
+        every: u64,
+        done: impl Fn(&World) -> bool,
+    ) -> Option<u64> {
         let start = self.now();
         while self.now() < start + ms {
             if self.paused {
-                Gate::settle().await;
+                Gate::settle(every).await;
                 tokio::time::advance(Duration::from_millis(every)).await;
             } else {
                 tokio::time::sleep(Duration::from_millis(every)).await;
@@ -500,17 +555,17 @@ impl World {
         None
     }
 
-    fn epoch(&self, name: &str) -> Option<u32> {
+    pub(super) fn epoch(&self, name: &str) -> Option<u32> {
         self.members[name].app.epoch()
     }
 
-    fn keyholder_epoch(&self) -> Option<u32> {
+    pub(super) fn keyholder_epoch(&self) -> Option<u32> {
         let k = self.keyholder.as_ref()?;
         let app = k.app.lock().unwrap();
         app.epoch()
     }
 
-    fn load(&self) -> Option<GroupLoad> {
+    pub(super) fn load(&self) -> Option<GroupLoad> {
         self.state
             .gk
             .stats()
@@ -520,7 +575,7 @@ impl World {
 
     /// The group starts with the browser keyholder and member ann; newcomer nan is seated
     /// by a Join (the control: the browser holds the keys).
-    async fn started(&mut self, kay: &Account, ann: &Account, nan: &Account) {
+    pub(super) async fn started(&mut self, kay: &Account, ann: &Account, nan: &Account) {
         self.browser(kay).await;
         self.member("ann", ann, None).await;
         let keyed = self
@@ -546,23 +601,30 @@ impl World {
 
     /// Newcomer neo comes in; how long its seat takes, watched past the 1 h Regenesis.
     async fn newcomer_waits(&mut self, neo: &Account) -> Option<u64> {
-        self.member("neo", neo, None).await;
-        if let Some(t) = self
-            .until(SEATED_WITHIN_MS, 50, |w| w.epoch("neo").is_some())
+        self.newcomer_waits_as("neo", neo, SEATED_AFTER_FAST_MS)
             .await
-        {
+    }
+
+    /// Newcomer `name` comes in; how long its seat takes: watched closely for `close` ms,
+    /// then past the 1 h Regenesis.
+    pub(super) async fn newcomer_waits_as(
+        &mut self,
+        name: &'static str,
+        acc: &Account,
+        close: u64,
+    ) -> Option<u64> {
+        self.member(name, acc, None).await;
+        if let Some(t) = self.until(close, 50, |w| w.epoch(name).is_some()).await {
             return Some(t);
         }
         // Watched on in coarser steps: the apps tick each second still
-        self.until(WATCH_MS - SEATED_WITHIN_MS, 500, |w| {
-            w.epoch("neo").is_some()
-        })
-        .await
-        .map(|t| t + SEATED_WITHIN_MS)
+        self.until(WATCH_MS - close, 500, |w| w.epoch(name).is_some())
+            .await
+            .map(|t| t + close)
     }
 }
 
-fn minutes(t: Option<u64>) -> String {
+pub(super) fn minutes(t: Option<u64>) -> String {
     t.map_or_else(
         || format!("not within {} min", WATCH_MS / 60_000),
         |t| format!("{:.1} min", t as f64 / 60_000.0),
@@ -574,12 +636,13 @@ fn minutes(t: Option<u64>) -> String {
 /// gone for good, and it is the set's last entry, so nothing removes it (holders.rs
 /// `removal_where`: never the last entry, and only one another online entry can sign); the
 /// page on its new connection volunteers, but promoting it is a KeyholdersAdd only an entry of
-/// the set can sign. With no entry online the relay waits `REGENESIS_AFTER_MS` (1 h) before it
-/// asks a Regenesis (group.rs `ask`), and members hold a Regenesis to that hour themselves
-/// (§5.7, commit.rs rule 4): a newcomer waits about an hour for its seat, and so would an
-/// exit's opening (writers hold their posts 46 s after they are told of the exit).
+/// the set can sign. Before "Fast new start" (owner 2026-11-19) the relay waited
+/// `REGENESIS_AFTER_MS` (1 h) before it asked a Regenesis, and members held a Regenesis to
+/// that hour: a newcomer waited about an hour for its seat (J8H measured 60.1 min). A set of
+/// connection entries alone now starts anew 2 minutes on (`rules::regenesis_wait`): the page
+/// on its new connection makes the Regenesis, holds the keys from then on, and the newcomer
+/// is seated within `SEATED_AFTER_FAST_MS`.
 #[tokio::test]
-#[ignore = "J8H, dive 2 lead (a): a sole account-browser keyholder's reload leaves no entry that can sign; joins wait for the 1 h Regenesis"]
 async fn e2e_j8h_a_newcomer_is_seated_soon_after_the_sole_browser_keyholder_reloads() {
     let mut w = World::new().await;
     let kay = Account::new(&w.db, "kay").await;
@@ -602,22 +665,29 @@ async fn e2e_j8h_a_newcomer_is_seated_soon_after_the_sole_browser_keyholder_relo
     w.pause();
     let waited = w.newcomer_waits(&neo).await;
     assert!(
-        waited.is_some_and(|t| t <= SEATED_WITHIN_MS),
+        waited.is_some_and(|t| t <= SEATED_AFTER_FAST_MS),
         "the newcomer was seated after {} (within {} min wanted); load {:?}",
         minutes(waited),
-        SEATED_WITHIN_MS / 60_000,
+        SEATED_AFTER_FAST_MS / 60_000,
         w.load()
+    );
+    // The page on its new connection started anew and holds the keys: the old entry is gone
+    let l = w.load().unwrap();
+    assert_eq!(
+        (l.keyholders, l.keyholders_online),
+        (1, 1),
+        "the new page's entry alone, online"
     );
 }
 
 /// Dive 2, lead (b): the same channel across a relay restart (or self-update). The relay
 /// loads the set from the database with the browser's entry offline (store.rs `load`); the
 /// page comes back on a new connection with a new pair, and nothing online can sign its
-/// promotion or the old entry's removal. A newcomer waits for the 1 h Regenesis, as after a
-/// reload: every browser-only stored channel stalls its joins and exits for an hour after each
-/// restart.
+/// promotion or the old entry's removal. Before "Fast new start" a newcomer waited for the
+/// 1 h Regenesis, as after a reload: every browser-only stored channel stalled its joins and
+/// exits for an hour after each restart. Now it is seated 2 minutes and a settle on, the
+/// page on its new connection the keyholder.
 #[tokio::test]
-#[ignore = "J8H, dive 2 lead (b): after a relay restart a browser-only set has no entry that can sign; joins wait for the 1 h Regenesis"]
 async fn e2e_j8h_a_newcomer_is_seated_soon_after_a_relay_restart_of_a_browser_held_channel() {
     let mut w = World::new().await;
     let kay = Account::new(&w.db, "kay").await;
@@ -661,11 +731,18 @@ async fn e2e_j8h_a_newcomer_is_seated_soon_after_a_relay_restart_of_a_browser_he
     w.pause();
     let waited = w.newcomer_waits(&neo).await;
     assert!(
-        waited.is_some_and(|t| t <= SEATED_WITHIN_MS),
+        waited.is_some_and(|t| t <= SEATED_AFTER_FAST_MS),
         "the newcomer was seated after {} (within {} min wanted); load {:?}",
         minutes(waited),
-        SEATED_WITHIN_MS / 60_000,
+        SEATED_AFTER_FAST_MS / 60_000,
         w.load()
+    );
+    // The page on its new connection started anew and holds the keys: the old entry is gone
+    let l = w.load().unwrap();
+    assert_eq!(
+        (l.keyholders, l.keyholders_online),
+        (1, 1),
+        "the new page's entry alone, online"
     );
 }
 

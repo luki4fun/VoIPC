@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { get } from "svelte/store";
 
 await import("./node-stores.mjs");
-const { MAX_MESSAGES } = await import("../chat-rules.ts");
+const { MAX_MESSAGES, TOO_LARGE_REASON, fromArchived, handOffOf, notSentLine, toArchived } = await import("../chat-rules.ts");
 const {
   addChannelLineAtTop,
   addChannelMessage,
@@ -24,6 +24,7 @@ const {
   ensureAwayDm,
   fileStoredChannelMessage,
   fileStoredDm,
+  markNotSent,
   mergeChannelHistory,
   populateFromArchive,
   quietBlockedDms,
@@ -294,4 +295,30 @@ test("a message's text past 16 KiB is kept cut to 16 KiB on every way in to the 
   addDmMessage(S, ME, 5, "bobby", ME, message(long, 10));
   fileStoredDm(S, stored(long, 11), own, undefined, undefined);
   assert.deepEqual(texts().map((t: string) => t.length), [cut, cut]);
+});
+
+// ── A post of ours that never went (item J9W-1) ──────────────────────────────
+
+test("our own post that never went is marked not sent, its row shown before or after the word", () => {
+  // The backend refuses a post the relay would refuse as too large, sealed (the relay's
+  // refusal names no message, so the row stayed shown as sent). The browser's own row comes
+  // first; the desktop says so before `send_channel_message` shows the row
+  freshRoom();
+  reset(false);
+  const mine = (id: string) => ({ user_id: ME, username: "me", content: "big", timestamp: Date.now(), id });
+  addChannelMessage(S, ROOM, mine("first"));
+  markNotSent(S, ROOM, "first", ME, TOO_LARGE_REASON);
+  markNotSent(S, ROOM, "later", ME, TOO_LARGE_REASON);
+  addChannelMessage(S, ROOM, mine("later"));
+  // Someone else's row under the same id (an id is its writer's to choose) is not ours
+  addChannelMessage(S, ROOM, spam("theirs"));
+  markNotSent(S, ROOM, "theirs", ME, TOO_LARGE_REASON);
+  addChannelMessage(S, ROOM, mine("fine"));
+  const marks = Object.fromEntries(roomRows().map((m: { id?: string; not_sent?: string }) => [m.id, m.not_sent ?? null]));
+  assert.deepEqual(marks, { first: TOO_LARGE_REASON, later: TOO_LARGE_REASON, theirs: null, fine: null });
+  assert.equal(notSentLine(TOO_LARGE_REASON), "Not sent: one message holds at most 16 KiB.");
+  // Never handed on as history, and kept marked across a restart
+  assert.deepEqual(handOffOf(roomRows()).map((m: { id?: string }) => m.id), ["theirs", "fine"]);
+  const back = fromArchived(toArchived(roomRows()[0]));
+  assert.equal(back.not_sent, TOO_LARGE_REASON);
 });

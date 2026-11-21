@@ -18,9 +18,13 @@
 //!   header's `time`, `epoch` and `join`, and every entry in them passed the
 //!   guest, pin and counter checks as they stood at that time, or was removed
 //!   by a later opening header;
-//! - no Regenesis is taken within an hour of a parent that is not genuine and
-//!   at or above the floor, and no generation is taken that this device took
-//!   already, or that began before it last saw the group.
+//! - no Regenesis is taken sooner after its parent than its set in force
+//!   allows (`regenesis_wait`: an hour, or two minutes for a set of
+//!   connection entries alone that no Regenesis started in the last hour), or
+//!   after a parent that is not genuine and at or above the floor; a device
+//!   that holds a floor and cannot see the set in force waits the hour; and
+//!   no generation is taken that this device took already, or that began
+//!   before it last saw the group.
 //!
 //! Members take headers without the names (owner, 2026-11-17): only writers
 //! fold them, keyholders check each list they take, and every member of a
@@ -36,7 +40,8 @@ use super::header::{
 use super::keys::{Holder, Origin};
 use super::merkle::{Leaf, Via};
 use super::{
-    GkError, CLOCK_SLACK, EPOCH_MIN_GAP, LIVE_WINDOW, MAX_WALK, RECENT_GENS, REGENESIS_WAIT,
+    GkError, CLOCK_SLACK, EPOCH_MIN_GAP, LIVE_WINDOW, MAX_WALK, RECENT_GENS, REGENESIS_FAST_GAP,
+    REGENESIS_FAST_WAIT, REGENESIS_WAIT,
 };
 use crate::group_key::ctx::GroupKind;
 
@@ -517,12 +522,32 @@ fn seeds_follow(p: &HeaderV1, h: &HeaderV1) -> bool {
 /// in force; seeds as `seeds_follow`; `gated` changed only at an opening
 /// header; `names_hash` as §11.3 steps it, with the header's own `time`,
 /// `epoch` and `join`; `exits_upto` never going back; and a Regenesis at
-/// least an hour after its parent.
+/// least the wait its set in force allows after its parent
+/// (`regenesis_wait`).
+///
+/// The set in force is the header `kh_parent` names. Here it is seen only
+/// where the parent sets keyholders itself; otherwise the Regenesis waits the
+/// hour. `check_link_under` takes the set, as a member holds it beside its
+/// floor and the relay beside its head.
 ///
 /// The names check here needs only the two headers, which carry their lists;
 /// it is no fold. A member that takes headers without the names skips the
 /// Join headers and checks none (rule 4).
 pub fn check_link(parent: &SignedHeader, h: &SignedHeader) -> Result<Vec<Warning>, Refusal> {
+    link_ok(parent, h, SetSeen::Unseen)
+}
+
+/// `check_link` under the set in force, `set`: the keyholder header
+/// `h.kh_parent` names. A Regenesis waits what `regenesis_wait` says of it.
+pub fn check_link_under(
+    parent: &SignedHeader,
+    h: &SignedHeader,
+    set: &SignedHeader,
+) -> Result<Vec<Warning>, Refusal> {
+    link_ok(parent, h, SetSeen::held(h, set)?)
+}
+
+fn link_ok(parent: &SignedHeader, h: &SignedHeader, set: SetSeen) -> Result<Vec<Warning>, Refusal> {
     let (p, hd) = (parent.header(), h.header());
     let bad = |why| Err(Refusal::Chain(why));
     if hd.parent != parent.d() {
@@ -550,10 +575,11 @@ pub fn check_link(parent: &SignedHeader, h: &SignedHeader) -> Result<Vec<Warning
     if hd.exits_upto < p.exits_upto {
         return bad("exits_upto went back");
     }
-    if hd.kind == Kind::Regenesis && hd.time < p.time.saturating_add(REGENESIS_WAIT) {
-        return Err(Refusal::Generation(
-            "a Regenesis comes an hour after its parent",
-        ));
+    if hd.kind == Kind::Regenesis {
+        let wait = set.wait(Some(p), hd.time);
+        if hd.time < p.time.saturating_add(wait) {
+            return Err(too_soon(wait));
+        }
     }
     let warnings = gated_turn(p.gated, hd)?;
     if super::header::names_hash(Some(p), hd) != hd.names_hash {
@@ -578,7 +604,29 @@ fn gated_turn(was: bool, h: &HeaderV1) -> Result<Vec<Warning>, Refusal> {
 /// `exits_upto` and `names_hash` are not in the floor (§5.7); `check_link`
 /// covers them where the parent is held, and a writer's fold covers the
 /// names (rule 4).
+///
+/// The floor carries its keyholder set's `D` (`kh`), not the set: here a
+/// Regenesis waits the hour. The member holds that keyholder header beside
+/// its floor (§5.7, `LocalFloor.kh`); `check_on_floor_under` takes it, and
+/// holds a Regenesis to the wait its set allows.
 pub fn check_on_floor(floor: &Floor, h: &SignedHeader) -> Result<Vec<Warning>, Refusal> {
+    on_floor_ok(floor, h, SetSeen::Unseen)
+}
+
+/// `check_on_floor` under the set in force, `set`: the keyholder header the
+/// floor names (`floor.kh`), which the member holds beside it.
+pub fn check_on_floor_under(
+    floor: &Floor,
+    h: &SignedHeader,
+    set: &SignedHeader,
+) -> Result<Vec<Warning>, Refusal> {
+    if set.d() != floor.kh {
+        return Err(Refusal::Chain("kh_parent is not the set in force"));
+    }
+    on_floor_ok(floor, h, SetSeen::held(h, set)?)
+}
+
+fn on_floor_ok(floor: &Floor, h: &SignedHeader, set: SetSeen) -> Result<Vec<Warning>, Refusal> {
     let hd = h.header();
     let bad = |why| Err(Refusal::Chain(why));
     if hd.parent != floor.d || hd.gen != floor.gen {
@@ -597,12 +645,96 @@ pub fn check_on_floor(floor: &Floor, h: &SignedHeader) -> Result<Vec<Warning>, R
     if hd.kh_parent != floor.kh {
         return bad("kh_parent is not the set in force");
     }
-    if hd.kind == Kind::Regenesis && hd.time < floor.time.saturating_add(REGENESIS_WAIT) {
-        return Err(Refusal::Generation(
-            "a Regenesis comes an hour after its parent",
-        ));
+    if hd.kind == Kind::Regenesis {
+        let wait = set.wait(None, hd.time);
+        if hd.time < floor.time.saturating_add(wait) {
+            return Err(too_soon(wait));
+        }
     }
     gated_turn(floor.gated, hd)
+}
+
+/// Whether every entry of a keyholder set is a connection entry (origin
+/// 0x02): a browser's or a guest's per-connection pair, which goes with its
+/// connection (§2). A desktop's keyholder pair (0x03) is not one. An empty
+/// set is none.
+pub fn connection_only(set: &[Keyholder]) -> bool {
+    !set.is_empty() && set.iter().all(|k| k.origin == Origin::Connection as u8)
+}
+
+/// How long a Regenesis dated `time` waits after its parent (§4.3, §5.7),
+/// under `set`, the keyholder header its `kh_parent` names (the set in
+/// force). "Fast new start" (owner, 2026-11-19):
+///
+/// - `REGENESIS_FAST_WAIT`, 2 minutes, when every entry of the set is a
+///   connection entry (`connection_only`). Such an entry dies with its
+///   connection: after the sole browser keyholder's reload, or any relay
+///   restart, none can ever come back online, and the hour would only stall
+///   the group's joins and exits.
+/// - `REGENESIS_WAIT`, the hour, for a set with any other entry: a desktop's
+///   pair (0x03) comes back with its device, so its set is not replaced
+///   within the hour.
+/// - The hour too when the set is one a Regenesis started less than
+///   `REGENESIS_FAST_GAP` before `time` (the churn bound): connections that
+///   drop again and again, or a relay that drops them, start anew at most
+///   once an hour that way.
+///
+/// What it reads is all in the signed headers, so every member checks it
+/// itself. A relay can still drop every connection of such a set and have a
+/// volunteer start anew after 2 minutes: a new seed and keyring, no read and
+/// no forge.
+pub fn regenesis_wait(set: &HeaderV1, time: u64) -> u64 {
+    let churn = set.kind == Kind::Regenesis && time < set.time.saturating_add(REGENESIS_FAST_GAP);
+    if connection_only(&set.keyholders) && !churn {
+        REGENESIS_FAST_WAIT
+    } else {
+        REGENESIS_WAIT
+    }
+}
+
+/// What a check sees of the keyholder set in force before a Regenesis.
+#[derive(Clone, Copy)]
+enum SetSeen<'a> {
+    /// The keyholder header `kh_parent` names, as the caller holds it.
+    Held(&'a HeaderV1),
+    /// Not shown to the check: the hour, unless the parent sets keyholders
+    /// itself (then `kh_parent` is its `D`, and it is the set).
+    Unseen,
+    /// Where a device with no floor starts its walk, on trust (§5.7): the set
+    /// before is never shown to it, as none is before a Genesis of any age it
+    /// takes the same way. The shortest wait, unless the parent sets
+    /// keyholders itself.
+    Trust,
+}
+
+impl<'a> SetSeen<'a> {
+    /// `set` as what `h.kh_parent` names, or the refusal of one that is not.
+    fn held(h: &SignedHeader, set: &'a SignedHeader) -> Result<SetSeen<'a>, Refusal> {
+        if set.d() != h.header().kh_parent || !set.header().kind.sets_keyholders() {
+            return Err(Refusal::Chain("kh_parent is not the set in force"));
+        }
+        Ok(SetSeen::Held(set.header()))
+    }
+
+    /// The wait of a Regenesis dated `time` after `parent` (where the check
+    /// holds it).
+    fn wait(self, parent: Option<&HeaderV1>, time: u64) -> u64 {
+        match (self, parent) {
+            (SetSeen::Held(k), _) => regenesis_wait(k, time),
+            (_, Some(p)) if p.kind.sets_keyholders() => regenesis_wait(p, time),
+            (SetSeen::Unseen, _) => REGENESIS_WAIT,
+            (SetSeen::Trust, _) => REGENESIS_FAST_WAIT,
+        }
+    }
+}
+
+/// What a member says of a Regenesis that came before `wait` was out.
+fn too_soon(wait: u64) -> Refusal {
+    Refusal::Generation(if wait >= REGENESIS_WAIT {
+        "a Regenesis comes an hour after its parent"
+    } else {
+        "a Regenesis comes two minutes after its parent"
+    })
 }
 
 /// §5.7: within a generation, a header at or below the floor is refused.
@@ -715,7 +847,7 @@ pub fn check_walk(
                         let parent = last
                             .parent
                             .ok_or(Refusal::Walk("a Regenesis needs its parent"))?;
-                        check_regenesis(None, clock, s, parent)?;
+                        regenesis_ok(None, clock, s, parent, SetSeen::Trust)?;
                         signers.push((s.header().signer, check_signer(s, None, pins)?));
                     }
                     _ => return Err(Refusal::Walk("a new generation starts at its Genesis")),
@@ -745,7 +877,8 @@ pub fn check_walk(
                     WalkTo::Floor { floor, .. } => Some(floor),
                     WalkTo::Start { .. } => None,
                 };
-                check_regenesis(floor, clock, l, parent)?;
+                // The set before it is the walk's own: its wait is that set's
+                regenesis_ok(floor, clock, l, parent, SetSeen::held(l, prev)?)?;
                 regenesis_parent_ok(to, prev, parent, pins)?;
                 signers.push((l.header().signer, check_signer(l, None, pins)?));
             }
@@ -777,7 +910,7 @@ pub fn check_walk(
                 WalkTo::Floor { floor, .. } => Some(floor),
                 WalkTo::Start { .. } => None,
             };
-            check_regenesis(floor, clock, h, parent)?;
+            regenesis_ok(floor, clock, h, parent, SetSeen::held(h, last)?)?;
             regenesis_parent_ok(to, last, parent, pins)?;
             signers.push((hd.signer, check_signer(h, None, pins)?));
         }
@@ -809,9 +942,10 @@ pub fn check_walk(
     })
 }
 
-/// The parent of a Regenesis taken on a walk (§5.7): the hour a Regenesis
-/// waits is measured from its parent's `time`, so the parent must be one the
-/// walk stands behind, not any header the relay shows with it.
+/// The parent of a Regenesis taken on a walk (§5.7): the wait a Regenesis
+/// keeps (`regenesis_wait`) is measured from its parent's `time`, so the
+/// parent must be one the walk stands behind, not any header the relay shows
+/// with it.
 ///
 /// - It is signed by the set in force before the Regenesis, `prev`; one that
 ///   sets keyholders must be `prev` itself.
@@ -889,13 +1023,21 @@ fn live_ok(clock: Clock, h: &HeaderV1) -> Result<(), Refusal> {
     Ok(())
 }
 
-/// A Regenesis (§5.7, §4.3): at least an hour after its parent, which it
-/// follows (same generation, the next epoch, the set in force as
-/// `kh_parent`, a new seed); rule 7; and, for a device with a floor in its
-/// generation that follows the group live, within 10 minutes of the
-/// device's clock. Its signer is checked by `check_signer`. Whether the
-/// parent is genuine and at or above the floor is the caller's: a member
-/// that took the parent holds it, and `check_walk` checks one it walks to.
+/// A Regenesis (§5.7, §4.3): after its parent by the wait its set in force
+/// allows (`regenesis_wait`), a parent it follows (same generation, the next
+/// epoch, the set in force as `kh_parent`, a new seed); rule 7; and, for a
+/// device with a floor in its generation that follows the group live, within
+/// 10 minutes of the device's clock. Its signer is checked by
+/// `check_signer`. Whether the parent is genuine and at or above the floor is
+/// the caller's: a member that took the parent holds it, and `check_walk`
+/// checks one it walks to.
+///
+/// The set in force is the header `kh_parent` names. Here it is seen only
+/// where the parent sets keyholders itself; otherwise the Regenesis waits the
+/// hour. `check_regenesis_under` takes the set, as a member holds it beside
+/// its floor. A device with no floor whose walk starts at the Regenesis takes
+/// it on trust after the shortest wait (`check_walk`): the set before it is
+/// never shown to such a device, as it takes a Genesis of any age.
 ///
 /// A device with a floor in an older generation takes the Genesis first,
 /// then the Regenesis on the walk; one with no floor takes it on trust.
@@ -904,6 +1046,30 @@ pub fn check_regenesis(
     clock: Clock,
     regen: &SignedHeader,
     parent: &SignedHeader,
+) -> Result<(), Refusal> {
+    regenesis_ok(floor, clock, regen, parent, SetSeen::Unseen)
+}
+
+/// `check_regenesis` under the set in force, `set`: the keyholder header
+/// `regen.kh_parent` names, which a member holds beside its floor (§5.7). The
+/// Regenesis waits what `regenesis_wait` says of that set: 2 minutes for one
+/// of connection entries alone, else the hour.
+pub fn check_regenesis_under(
+    floor: Option<&Floor>,
+    clock: Clock,
+    regen: &SignedHeader,
+    parent: &SignedHeader,
+    set: &SignedHeader,
+) -> Result<(), Refusal> {
+    regenesis_ok(floor, clock, regen, parent, SetSeen::held(regen, set)?)
+}
+
+fn regenesis_ok(
+    floor: Option<&Floor>,
+    clock: Clock,
+    regen: &SignedHeader,
+    parent: &SignedHeader,
+    set: SetSeen,
 ) -> Result<(), Refusal> {
     let (r, p) = (regen.header(), parent.header());
     if r.kind != Kind::Regenesis {
@@ -917,10 +1083,9 @@ pub fn check_regenesis(
     {
         return Err(Refusal::Chain("a Regenesis follows its parent"));
     }
-    if r.time < p.time.saturating_add(REGENESIS_WAIT) {
-        return Err(Refusal::Generation(
-            "a Regenesis comes an hour after its parent",
-        ));
+    let wait = set.wait(Some(p), r.time);
+    if r.time < p.time.saturating_add(wait) {
+        return Err(too_soon(wait));
     }
     check_time(r, clock.now)?;
     if floor.is_some_and(|f| f.gen == r.gen) {

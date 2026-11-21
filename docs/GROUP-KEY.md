@@ -1,14 +1,20 @@
-# Group epoch key for text channels and voice rooms (draft v2)
+# Group epoch key for text channels and voice rooms
 
-Status: **draft v2, not built.** C1 is under way: the primitives in `voipc-crypto`, with unit tests and
-known-answer vectors. There is no external cryptography review (owner, 2026-11-17). Instead, the
-built version gets an adversarial review of our own, which works through section 7's questions
-against the code, and the owner's review once everything is done. The release notes say plainly that
-no outside cryptographer reviewed it.
+Status: **built, in VoIPC 1.14 / protocol 26.** The primitives, the relay's validator and state, both
+apps' state machines, kept history and voice are in the code (`voipc-crypto` `group_key` and
+`group_state`, voipc-server `gk/` and `accounts/gk.rs`, the desktop's `gk_net.rs`, voipc-web
+`gk.rs`). Where this text and the code disagree, the code is right and this text is a bug.
+**No outside cryptographer has reviewed this design or its code** (owner, 2026-11-17: no external
+review). Instead the built version gets an adversarial review of our own, which works through
+section 7's questions against the code, and the owner's review once everything is done. Section 7
+says which questions that review has answered; until it has run, none is answered. The release
+notes say plainly that no outside cryptographer reviewed it.
 
-It is planned for VoIPC 1.16 / protocol 27. The media edge pool (1.15 / protocol 26) ships first.
+It was first planned for 1.16 / protocol 27, after the media edge pool (1.15 / protocol 26). Neither
+1.14 nor 1.15 shipped on its own, so the group key went into protocol 26 beside the edges, and the
+release that carries both is 1.14 (owner, 2026-11-18).
 
-On a relay at 27 with `group_key` on (the default, §9), every text channel and every voice room uses
+On a relay at 26 with `group_key` on (the default, §9), every text channel and every voice room uses
 the group key, small ones too. There is one state machine per channel and no size threshold. It
 replaces the pairwise live path (protocol 21) in text channels and the 3N media-key join in voice
 rooms. Direct messages, files and the vault do not change. The app keeps the old paths for older
@@ -96,7 +102,8 @@ The log key `LK` plays no part. It keeps serving the per-writer kept log of prot
   endorses it with origin 0x03 and the account's counter `n` (§11.8).
 - Every other keyholder uses its connection's seat pair: guests, browsers, and every keyholder of a
   voice room. That makes it a **connection keyholder**, which leaves the set when its connection
-  ends. A browser keeps no local store this design relies on, so it is one too. A signed-in browser,
+  ends, unless it is the last entry (§5.6). A browser keeps no local store this design relies on, so
+  it is one too. A signed-in browser,
   whose text seat is the account's, makes a connection pair when it volunteers
   (`KeyholdVolunteer`, §9), endorsed with origin 0x02.
 - A desktop's pair is replaced at every seat-key rotation of its account (§5.11).
@@ -287,8 +294,9 @@ MK = HKDF(CK_e, ctx(media; v, group, gen, e, D_e, m, tag(SX_m), stream))
 
 - `(m, tag(SX_m))` is the sender's voice seat: its member id and its connection's seat pair. The
   sender derives its key from its own seat, which no relay chooses.
-- A receiver learns each sender's seat from the room's roster, which carries it at 27. A roster that
-  lies makes that sender's packets fail to open, and does nothing else.
+- A receiver learns each sender's seat from the room's roster, which the relay sends as
+  `VoiceSeats` (protocol 26). A roster that lies makes that sender's packets fail to open, and does
+  nothing else.
 - `stream` is the sender's random 32-bit stream id, in the packet.
 - The relay's session id `sid` stays in the AAD (`build_aad`) as today, but not in the key.
   `media_keys.rs` took it out of the nonce because a relay can give two members the same one, and
@@ -310,6 +318,12 @@ history_row = AEAD(HKDF(self, c), c, list of (K, tag(KX_K), RB))
 ```
 
 - A member writes a self-row only after a row or seal under that `s_m` opened and `confirm` passed.
+  The `s_m` must be the one a confirmed key came through: the keying's own `BK` opened the seal
+  whose key `confirm` checked. Until then nothing of the keying is stored (`BK`, `s_m`, row base).
+  A seed welcome's `s_m` waits until a row under it opens to a confirmed key: at most 4 for one seat
+  and seed, and at most 8 seat-and-seed pairs in all, the lowest seed dropped first (`member.rs` `key_in`, `pend_s_m`; tests
+  `no_self_row_is_written_for_an_s_m_no_confirmed_key_came_through`,
+  `a_welcome_whose_seal_fails_confirm_leaves_the_seats_s_m_as_it_was`).
 - History rows exist only in groups that keep history (§5.10, §5.11). They let the account open rows
   made to seat keys whose private parts it has deleted.
 - A guest keeps nothing past its connection.
@@ -385,10 +399,10 @@ The exact encoding is in §11.3. Its fields:
 | Kind | New epoch? | New `CK` and confirm? | Seed | `KRK` | Buckets | Seals to | Who may sign |
 |---|---|---|---|---|---|---|---|
 | Genesis | Yes: new `gen`, `e = 1` | Yes | New, `s = 1` | New | The signer's own | The signer's bucket | The volunteer the relay asked; members apply the rules for a new generation (§5.7) |
-| Regenesis | Yes: `e = parent.e + 1`, same `gen` | Yes | New, `s = parent.seed + 1`, `seed_floor = s`: a roll start, exempt from the 24 h rule, that clears a due roll (§5.6) | New | All new; members are re-seated by welcomes as they fetch | The new buckets as Join commits make them | A volunteer, on a relay with accounts, after at least 1 h with no keyholder online; `time ≥ parent.time + 1 h` |
+| Regenesis | Yes: `e = parent.e + 1`, same `gen` | Yes | New, `s = parent.seed + 1`, `seed_floor = s`: a roll start, exempt from the 24 h rule, that clears a due roll (§5.6) | New | All new; members are re-seated by welcomes as they fetch | The new buckets as Join commits make them | A volunteer, in a stored group (a `c:` id on a relay with accounts), after the Regenesis wait with no keyholder online, and `time ≥ parent.time` + that wait: 2 min when every entry of the set in force is a connection entry (origin 0x02) and no Regenesis started that set in the last hour, else 1 h (§5.6, "fast new start"). The relay's validator refuses one dated more than `CLOCK_SLACK` before its own clock (§5.7) |
 | Fresh | Yes | Yes | Same, or a due roll starts when the roll slot is open (`seed` rises, §5.6); a roll may finish (`seed_floor` rises) | Same | New versions for buckets with leavers, the refresh slice, merges, and every version over 1 h old (§5.5) | Every current version | A keyholder of the parent's set |
 | Join | No: `j + 1` | `confirm` of the same `CK_e` | Same | Same | New buckets for joiners | The new versions only | A keyholder of the parent's set |
-| KeyholdersAdd | Yes | Yes | Same, or a due roll starts when the slot is open; a roll may finish | New, welcomed to every keyholder | Every bucket ratchets in place (§3.5), except those re-versioned by rows for exits | Every current version | A keyholder of the parent's set |
+| KeyholdersAdd | Yes | Yes | Same, or a due roll starts when the slot is open; a roll may finish | New, welcomed to every keyholder | Every bucket ratchets in place (§3.5), except those re-versioned by rows for exits; a bucket its exits empty is dropped (§5.3) | Every current version | A keyholder of the parent's set |
 | KeyholdersRemove | Yes | Yes | Text: a roll becomes due, and starts here if the slot is open; else a roll may finish. Voice: a roll starts here, always (§5.6). This commit's rows still use `s` | New, welcomed to every keyholder | Every bucket re-versioned with a fresh `BK` by rows | Every current version | A keyholder of the parent's set that stays in the new one |
 | KeyholdersReplace | Yes | Yes | Same: it never starts or finishes a roll | New, welcomed to every keyholder from the old pair (§5.11) | As Fresh: new versions for buckets with leavers, the refresh slice, merges, and every version over 1 h old | Every current version | The keyholder whose entry it swaps (§5.11) |
 
@@ -515,7 +529,8 @@ when it folds the names, and what a failed check does.
    - In each such list no entry is a connection, and every `IK` the device has a pin for matches that
      pin. At a fold an entry is checked against the pin as it stood at its header's `time`, where the
      device knows it. An `IK` whose pin changed since, where the device does not know the old pin, is
-     shown, not refused (default, 2026-11-17).
+     shown, not refused (default, 2026-11-17). Such an entry is named to the writer too, as a checked
+     one is (`names.rs` `readers`).
    - What a failure does: at a writer's fold, it is a failed fold (rule 4). A keyholder refuses the
      header and says why, and takes the next opening header that names the refused seat in `removed`.
      In a voice room the app warns (§5.9). On demand, the app shows the entry as failed.
@@ -540,6 +555,8 @@ The relay keeps these headers:
 - the header that last raised `seed`, so a keyholder can tell when a roll is due (§5.6);
 - every header of the current epoch, and the last 64 of any kind;
 - each opening header while its epoch is current, and while a kept chain references it (§5.10);
+- the last Join of each epoch a kept chain references, with that opening: a seat a Join added
+  reads the epoch's kept posts there (§5.10);
 - in gated groups, for 90 days: every `added` list with its header's `(time, epoch, join,
   names_hash)`, every opening header whose `removed` list is not empty, and the step before the
   oldest of those lists (rule 4).
@@ -577,8 +594,8 @@ Two exceptions:
 - Voice seats are taken at room join (§5.9).
 
 The member sends `EpochFetch{group, have}`. A connection attaches its seat pair the first time. With
-no seat, the relay queues it for the next join batch (every 2 s), and the member holds the post
-(`HOLD_MS`, 60 s, unchanged).
+no seat, the relay queues it for the next join batch (every 2 s; in a voice room every 250 ms, open
+choice 7), and the member holds the post (`HOLD_MS`, 60 s, unchanged).
 
 **Before it encapsulates or makes a row,** the keyholder checks each joiner:
 - the endorsement of `SK` and `SX` verifies under the joiner's `IK`;
@@ -595,6 +612,10 @@ gated group's commit and make every member refuse the epoch.
   pools;
 - gives each joiner a seat welcome, or a row if the relay says it already holds `s_m` under the
   current seed (a returning account);
+- in a stored group, also makes a 60-byte row to each new account seat beside its welcome (open
+  choice 24, 2026-11-18). Every version a seat is in then has a row for it, or ratchets from one
+  that has, so kept epochs stay readable from `s_m` (its self-row) after the welcome or the old
+  KEM key is gone (§5.10). It costs one `RB` (about 29 µs) and 60 B per joiner;
 - seals `CK_e` to each new version;
 - uploads a keyring delta;
 - signs a Join header with `join = j + 1` and the new `bucket_root`; in gated groups, `added` lists
@@ -658,8 +679,14 @@ merges and repacks them within each pool, by the rules `sync/chains.rs` uses tod
 **Lists.**
 - The keyring keeps a seat-list digest per version, computed like `list_digest` (§11.5), not the
   lists themselves. The relay keeps the lists.
-- To re-version, merge or re-key a bucket, the keyholder takes the list from the relay. It refuses
-  the list unless it matches the digest.
+- To re-version, merge or re-key a bucket, the keyholder takes the list from the relay. It takes a
+  list only when its keyring names it, by digest and seat count, and refuses any other: the relay
+  then gets a `NOT_READY` decline, not a signature.
+- Every opening commit reads the lists of the buckets it drops, so the keyholder's own check sees
+  every seat a drop removes. A drop may take only seats the exits name (validator rule 10), and a
+  KeyholdersAdd that carries the exit emptying a bucket drops it (tests
+  `an_opening_asks_the_list_of_each_bucket_it_drops_and_drops_no_seat_no_exit_names`,
+  `a_promotion_carrying_the_exit_that_empties_a_bucket_drops_it_and_is_taken`).
 - It refuses any new version whose seats are not a subset of the old one's. Only Join buckets hold
   new seats, and in gated groups those are named.
 
@@ -766,6 +793,9 @@ connection (§2), so every rule below is per keyholder entry, not per account.
   volunteer is online, and the group has at most 10,000 seats, counted by its own `seats`. A browser
   is a connection keyholder (§2). In a text group it resigns once a header after its own promotion
   adds a desktop keyholder (origin 0x03).
+  - A browser tab that is hidden or in a call still offers, ranked below a visible one out of a
+    call, so a channel held only by browsers keeps its text keys while they talk (open choice 31,
+    owner, 2026-11-19). It builds in short steps (§8).
 - **Guests (connections):**
   - always allowed in voice rooms, on any relay;
   - in open text groups, only while no account volunteer that these rules allow there is online. A
@@ -826,9 +856,15 @@ connection (§2), so every rule below is per keyholder entry, not per account.
   - It names again the seats it sealed that are still unnamed (§5.2).
 
 **Stalls and removal:**
-- A desktop keyholder that misses 3 deadlines in an hour, or has been away 7 days, is proposed for
-  removal.
-- A connection keyholder is removed as soon as its connection ends.
+- Any keyholder entry that misses or declines 3 deadlines in an hour is proposed for removal, and so is
+  a desktop entry away 7 days.
+- A connection keyholder's entry is proposed for removal once its connection ends: a connection
+  pair never comes back.
+- The relay never proposes the last entry of a set, and proposes an entry only when another entry
+  that is online can sign its removal (a KeyholdersRemove's signer stays in the set). So when the
+  last entry is a connection entry and its connection ends (a sole browser keyholder's reload, or
+  a relay restart of a browser- or guest-held channel), the entry stays, nobody online can sign,
+  and the group waits for a Regenesis: the fast new start below (`holders.rs` `removal_where`).
 - When an account removes a device, the relay proposes the removal of that device's entries. So it
   does for an entry whose counter has been below its account's newest for 7 days: a device that never
   replaced its pair (§5.11). And so it does at once for an entry that a device of its account reports
@@ -859,6 +895,12 @@ connection (§2), so every rule below is per keyholder entry, not per account.
   its own KeyholdersRemove, at once. A voice roll covers at most 250 seats at today's cap
   (`[media] voice_room`, §5.9): about 0.4 MB of seed welcomes. The 30-day age applies to text groups
   only.
+- **Text rolls never overlap** (open choice 23, 2026-11-18). A roll starts in a text group only
+  once the last one has finished (`seed_floor` = `seed`), a Regenesis aside; the validator refuses
+  one that starts while a roll runs (rule 12). An overlapping roll would owe every seat still on the
+  dropped seed a seed welcome inside the commit: up to N of them, about 166 MB at 100k, far past a
+  commit's cap. A voice Remove may start a roll while one runs: the seats still on the seed it
+  drops get their seed welcomes in that commit (at most 250), and with none behind it carries none.
 - The commit that starts the roll draws `seed_{s+1}` and sets `seed = s + 1`, `seed_floor = s`. Its
   own rows still use `s`, since no seat has been given `s + 1` yet. Any older seed leaves the keyring
   there: a seat still on a seed the new floor drops (a roll that had not finished) gets its seed
@@ -888,8 +930,24 @@ connection (§2), so every rule below is per keyholder entry, not per account.
   channel's keys is online.
 - **On a relay without accounts, and in a voice room:** the relay asks a volunteer for a new Genesis
   at once, which is a new generation.
-- **On a relay with accounts:** after 1 h with no keyholder online, the relay may ask a volunteer for
-  a Regenesis. Members enforce the wait themselves (§5.7).
+- **In a stored group** (a `c:` id on a relay with accounts): once no keyholder has been online for
+  the Regenesis wait, the relay may ask a volunteer for a Regenesis. The wait is:
+  - **2 min**, the fast new start (owner, 2026-11-19), when every entry of the keyholder set in
+    force is a connection entry (origin 0x02: a browser's or a guest's pair) and no Regenesis
+    started that set less than an hour before. Such an entry dies with its connection and can never
+    come back online, so after the sole browser keyholder reloads, or after any relay restart, the
+    hour would only stall the group's joins and exits;
+  - **1 h** for any set with a desktop entry (origin 0x03), which comes back with its device, and
+    for a set a Regenesis itself started less than an hour before (the churn bound: connections
+    that drop again and again start anew at most once an hour that way).
+  - Members enforce the wait themselves, from the signed headers alone (§5.7): `rules.rs`
+    `regenesis_wait`, `REGENESIS_FAST_WAIT` and `REGENESIS_FAST_GAP` in `group_key.rs`. The relay
+    counts it on its own clock too, from when no keyholder was online (`group.rs` `regenesis_at`),
+    and its validator refuses a Regenesis that comes earlier.
+  - The trade-off, stated in §6 and THREAT-MODEL.md: a hostile relay can drop every connection of
+    such a set and have a new generation started every few minutes. It reads nothing and forges
+    nothing by it; it costs a re-seat each time (§8). A channel with a desktop keyholder keeps the
+    hour.
 - Every member shows "keys for this channel were made anew by X", within §5.12's limits. The relay
   chose that seat, and it is named to everyone. That is the same power the relay has over who is
   seated at all.
@@ -947,16 +1005,37 @@ Rules:
   - **With no floor** (a fresh device, or one that never met this group): the device takes the head's
     generation on TOFU, through the walk of rule 3 back to its newest Genesis or Regenesis. No clock
     check applies beyond rule 7.
-- **A Regenesis** is taken only if its `time ≥ parent.time + 1 h` and it passes rule 7, and:
+- **A Regenesis** is taken only if its `time ≥ parent.time` + the Regenesis wait (§5.6) and it passes
+  rule 7, and:
+  - the wait is read under the keyholder set in force before it, the header its `kh_parent` names:
+    2 min when every entry there is a connection entry (origin 0x02) and no Regenesis started that
+    set less than an hour before the new one's `time`, else 1 h (`rules.rs` `regenesis_wait`);
+  - a member checks it under the keyholder header it holds beside its floor, and a member that holds
+    only its floor (whose `kh` is only a digest) is handed that header: it must be the one `kh_parent`
+    and the floor's `kh` name, else it is refused, so a relay cannot swap in another set
+    (`check_link_under`, `check_on_floor_under`, `check_regenesis_under`). On a walk, every
+    Regenesis is checked under the set before it, which the hash chain fixes;
   - with a floor in its generation, its `parent` is the floor or reachable from it (§4.4 rule 3), and
     the live rule above applies to it as to a Genesis;
   - with a floor in an older generation, the device takes the generation's Genesis first, under the
     rules for a new generation, and then the Regenesis on the walk;
-  - with no floor, it takes the Regenesis on TOFU, as it would a Genesis.
-  - The volunteer's app refuses to make one earlier. The relay keeps each Regenesis's parent, so this
-    check can always be made (§4.4).
+  - with no floor, it takes the Regenesis on TOFU, as it would a Genesis. Such a device never saw
+    the set before it, so it takes a Regenesis 2 min after its parent whatever that set was, as it
+    takes any Genesis on trust.
+  - The volunteer's app refuses to make one earlier: the builder holds to the 2 min, and the
+    volunteer's own check of its commit under the set it holds holds to the hour for a set with a
+    desktop entry. The relay keeps each Regenesis's parent, so this check can always be made
+    (§4.4).
+  - The relay's validator also refuses a Regenesis dated more than `CLOCK_SLACK` (10 min) before its
+    own clock (rule 5, `BACKDATED`; test
+    `a_regenesis_dated_further_back_than_the_clock_slack_is_refused`). A new set's churn hour counts
+    from the Regenesis's own `time`, so a backdated one would let the next fast new start come
+    minutes later (J9 review).
+  - Signed header times may run up to `CLOCK_SLACK` ahead of a member's clock (rule 7), so a
+    dishonest volunteer can skip the 2 min, and take 10 min off the hour, as before. An honest
+    relay asks only once the wait is out on its own clock.
 - Every header has to pass §4.4 rule 7. A keyholder whose clock is more than 5 min off the relay's
-  clock (sent in `Authenticated` at 27) refuses to sign.
+  clock (sent in the `GroupKeys` frame right after `Authenticated`) refuses to sign.
 - So no clock ever raises a floor. A wrong clock on one phone makes that phone's headers refused, and
   nobody else's.
 - A voice joiner who was in the room an hour earlier, in a generation since dropped, has a floor in an
@@ -992,6 +1071,8 @@ A writer's first post in an epoch carries its writer blob (§3.8):
 - `w = (m, u)`. The relay keeps every blob per `w` per epoch, at most two (a chain ends after 1 h,
   and an epoch lasts at most 70 min for writers, §5.5), and hands them to whoever sends
   `EpochBlobWanted`. It refuses a third. The writer opens no session and makes no round trip.
+- Blobs live in the relay's memory only (open choice 5): a relay restart loses them, and each writer
+  starts a new chain, with a new blob, after it reconnects.
 - The SKDM's distribution id is `dist(group, gen, e, D_e)`: UUID v5, namespace OID, of
   `ctx(dist; k, group, gen, e, D_e)`. libsignal files the sender key under it, so a post decrypts
   only with the key installed for its epoch and that epoch's opening header, and the epoch check is
@@ -1015,10 +1096,28 @@ Consequences:
   half reads.
 - Two devices of one account are two writers, each with its own blob.
 
+**Size.** One channel message holds at most 16 KiB (owner, 2026-11-19). The relay refuses a larger
+post on every channel path, key on or off, text channels and voice rooms alike, in its own words
+("post too large: one message holds at most 16 KiB", `session.rs` `POST_TOO_LARGE`): under the key
+as `EpochRefused{POST, TOO_LARGE}` when the post carries a blob, else as a `ChannelError`. Both apps
+check it first: the writer bounds the sealed size of what it would send (`writer.rs` `post_fits`,
+with the 52-byte prefix under the key) and refuses a post that does not fit before it goes, so the
+row is marked "Not sent: one message holds at most 16 KiB." and nothing reaches anyone. Direct
+messages keep their own limit. Tests: `a_post_past_the_cap_is_refused_before_it_goes_and_told_as_the_relay_tells_it`,
+`a_key_post_past_16_kib_is_refused_as_a_post_with_or_without_a_blob`,
+`a_voice_rooms_post_is_held_to_16_kib_like_a_text_channels`, test-ui "a message past 16 KiB is
+stopped before it goes, and the composer says why".
+
+**Taken.** The relay answers each post it takes with `EpochPostTaken{group, post}` to the writer's
+own connection, where `post` is the first 16 bytes of SHA-256 over the post's ciphertext
+(`group_key::wire::post_digest`). A post it refuses gets no such answer. The writer files the
+post's kept copy the moment that answer comes (§5.10).
+
 **Push or pull.**
 - Text is pull: a member that cannot open a post sends `EpochFetch`. To save that round trip, the
   relay may attach the epoch to the first `EpochPostIn` it sends each seated member in an epoch,
-  within a byte budget per second that C6 sets.
+  within a byte budget per second. It does not yet (open choice 6): nothing measured so far needs
+  it.
 - Voice is push (§5.9).
 
 ### 5.9 Voice rooms
@@ -1026,6 +1125,17 @@ Consequences:
 A voice room is a group of its own, kind `v`. Seats are taken at room join, not lazily. Every seat
 uses the connection's seat pair; a signed-in member's seat id is still its account, so the guest
 check of gated rooms works.
+
+**Anonymous rooms seat by connection** (open choice 11, 2026-11-18). In an anonymous room that is
+not gated, every seat is `Conn(u)`, a signed-in member's too: the seats the relay sends
+(`VoiceSeats`), a post's writer and the writer blobs carry no account id, and a writer's key is
+taken on trust per connection, as a guest's is. The relay never puts an account behind a
+pseudonym, and the check of a voice keyholder reads `u` from its entry, so the room needs no
+mapping from accounts to user ids. A gated anonymous room keeps account seats, since its gate is
+about accounts, and keyholder entries still name the keyholder's account, as every header's do
+(§5.12). A keyholder takes either name of its own connection pair as its own seat
+(`own_seats`; tests `e2e_an_anonymous_rooms_signed_in_members_sit_by_connection_and_hear`,
+`a_signed_in_device_starts_an_anonymous_voice_room_seated_by_its_connection`).
 
 **Keyholders.**
 - They are the 2 lowest user ids in the room's roster: the rule today's minter uses, with no
@@ -1061,8 +1171,12 @@ check of gated rooms works.
   `k = v`. It needs no seat beyond the room seat, and no pairwise sender key.
 - Chat posts follow §5.4 and §5.5 as text posts do: a writer holds its posts when the keys are late.
   Voice itself does not.
-- At 27 with the switch on, the relay refuses `DistributeSenderKey` and `SendEncryptedChannelMessage`
+- At 26 with the switch on, the relay refuses `DistributeSenderKey` and `SendEncryptedChannelMessage`
   in voice rooms, as it refuses `DistributeMediaKey` (§9). A voice join is then one welcome in all.
+- **A voice room's kept log stays as it was** (open choice 26, 2026-11-18): per-reader wraps on the
+  0010 path, which the relay still takes there with the switch on. The chain seal of §3.9 is for text
+  only, and the voice group lives in memory. So a voice room keeps chat for its members as before,
+  and the group key adds nothing to what it keeps.
 
 **Delivery and storage.**
 - Opening headers and seals are pushed to everyone in the room. Join headers go to the joiner, and
@@ -1079,6 +1193,8 @@ check of gated rooms works.
 - The receiver keeps `CK` of the current and the previous epoch, and derives a sender's key at that
   sender's first packet, from the seat the roster gives for it.
 - `MediaKeyRing` is cleared on a generation change, since `e` starts again at 1.
+- A sender moves to a new epoch's key 300 ms after it takes it (open choice 8), so a receiver a
+  moment behind loses no packet.
 
 Routed (proximity) rooms use the same group, with no cap of their own. The 3N join is why rooms are
 capped at 250 today (`[media] voice_room`). That cap stays as the admin set it, but nothing in this
@@ -1091,31 +1207,80 @@ Kept history keeps its chains and step rows per writer (`log.rs`). What changes:
   none of its later steps.
 - **Chain starts** are sealed once under `CK_e` (§3.9), in `voipc_gk_chains(group, owner, chain,
   gen, epoch, sealed)`, instead of once per bucket the writer holds. A reader opens it from its seat
-  at epoch `e`, guests included.
+  at epoch `e`, guests included: at the epoch's opening header when the opening seated it, and for a
+  seat a later Join of that epoch added, at the epoch's last Join, which comes with the opening
+  (`past.rs` `take_past_at`; tests
+  `e2e_j8k_seats_a_join_added_and_seats_at_the_opening_read_their_epochs_kept_posts`,
+  `e2e_t1_kept_posts_of_the_epoch_a_member_was_joined_in_open_on_its_new_device`). A Join taken that
+  way must come with an opening of its own epoch and generation: its `epoch_parent` is the
+  opening's `D`, its `kh_parent` the opening's keyholder header, and `gated`, `seed` and
+  `seed_floor` are the opening's. Its signer is checked against the set the device's anchor
+  reaches, or, on the binding alone, against the opening's own keyholder set; the leaf must be in
+  the Join's bucket root, and `confirm` must hold for both headers
+  (`e2e_j8k_a_relay_that_hands_a_forged_or_out_of_epoch_join_gets_no_post_read`).
+- **Which epoch a copy goes under.** A writer files a post's kept copy under the epoch the post went
+  out under, once the relay took it: the moment `EpochPostTaken` names the post (§5.8). A post the
+  relay refuses for good is never kept, and one sent again after an `OLD_EPOCH` or `RATE` refusal
+  is kept once, under the epoch it went again under. The relay starts a kept chain only under the
+  head, or the one before for `HOLD_MS` after the head opened; a copy that comes too late for that
+  ("That epoch's key is gone here") is filed again under the head the app holds then, so whoever is
+  seated in that later epoch can read it in kept history, someone who joined after the post
+  included (`group_state/copies.rs`; tests
+  `a_taken_post_is_filed_at_once_under_the_epoch_it_went_under`,
+  `a_post_refused_for_good_is_never_kept`, `a_post_never_taken_is_never_filed_and_is_given_up`).
+  A page that closes within about one round trip after posting can still lose the kept copy; its
+  live readers got the post.
 - **Back-links.** For a chain with a sharer's back-link (`log.rs` `link`), the seal holds the state
   at index 1. Index 0, which opens the older chain, still goes only to who is proven to hold that
   older start, by today's proof path.
-- **Chain ids.** At one chain per 36 s of continuous posting, a writer uses up the 2²⁰ chain ids
-  (`MAX_CHAIN`) in about 437 days. Widening them is optional, and C4 decides.
+- **Chain ids** (open choice 12). A small group whose epochs open every 2 s would use up the 2²⁰
+  chain ids of `log.rs` (`MAX_CHAIN`) in about 24 days of continuous posting. So a chain under the
+  group key packs `chain << 1 | index` above the writer's last 0010 chain (`sync/chains.rs`), which
+  leaves about 2³¹ chains: over 100 years at 1800 an hour.
 
 **Reading old epochs.**
 - A device needs `CK_e`: from its seal, from its row then, and from `s_m` (its self-row) or, after a
   rotation, its history row (§3.11).
 - No inclusion path is needed: the seal's and the row's contexts bind `D_e` and `(b, v)`.
+- **Anchored or on the binding alone** (open choice 22). A past header is taken when the keyholder
+  headers sent with it lead back by `kh_parent` digests, at most 4096 links, from the keyholder header
+  the device holds beside its floor to the signer's set. With no such anchor (a fresh device, a
+  browser, an older generation), it is taken on the binding alone: the seal opens under a `BK` that is
+  the device's own, and `confirm` passes. Only the device's own `BK` counts there: one from a row
+  under its self-row's `s_m`, from its history row's `RB`, or from a welcome whose `s_m` is the
+  self-row's. A welcome or a seed welcome alone counts only when anchored, since the relay may have
+  chosen who made it (tests `a_fresh_device_takes_no_past_epoch_on_a_welcome_from_a_keyholder_the_relay_made`,
+  `e2e_j8k_a_relay_that_seats_a_new_device_from_a_keyholder_pair_of_its_own_gets_no_key_taken`). A
+  hostile relay can force the binding alone, by not answering the live fetch. A past header never
+  moves the floor.
+- A kept ask names the device's floor (`have`) only when the device holds the keyholder header that
+  floor names. A floor read from the vault alone, as a reloaded page has before its live answer, is
+  no anchor (`kept.rs` `send`; tests `a_kept_ask_names_the_floor_only_with_its_keyholder_header_held`,
+  `e2e_j9m_a_reloaded_browser_page_reads_its_kept_posts_before_its_live_answer`).
 
-**At the switch to 27:**
+**At the switch to 26:**
 - Each writer closes its per-writer chain at its first post after the switch.
 - The 0010 rows (`voipc_seats`, `voipc_seals`, `voipc_bucket_lists`, `voipc_chain_wraps`) stay. The
   existing opener reads them (their labels are frozen, COMPATIBILITY §4, and the 1.11.0 fixture
   covers them) until `kept_window` or `retention_days` sweeps them.
 - History from before the switch reaches newcomers only through sharers' links, as today.
-- No longer written at 27 with the switch on: those 0010 tables, `voipc_pending` for channels,
-  `ChainRekey`, and the `MOST_READERS` cap. The relay drops nothing it holds.
-- `kept_seats` keeps its meaning and its default of 5000. OPERATING will say it is now cheap to raise.
+- **Sharing with newcomers stays** (open choice 25, 2026-11-18), bounded to writers who share: for
+  them the relay still files `voipc_pending` and `LogPending`, and the index-0 wrap of the writer's
+  current chain when it has a back-link, one wrap per newcomer. Through that link the newcomer reads
+  the writer's older chains, 0010 ones included, as README and ACCOUNTS.md promise.
+- No longer written at 26 with the switch on: those 0010 tables for text channels, `voipc_pending`
+  for writers who do not share, `ChainRekey`, and the `MOST_READERS` cap. The relay drops nothing it
+  holds. A voice room's kept log keeps the 0010 path (§5.9).
+- `kept_seats` keeps its meaning and its default of 5000: an account that keeps a channel's history
+  is seated eagerly, online or not, up to that many a channel. OPERATING §10a says it is now cheap
+  to raise.
+- **The switch gap.** An account is seated eagerly at its first `SeatKeysPublish`: the first time one
+  of its devices signs in with a 1.14 app. Kept posts written under the group key before then are
+  not readable to it. COMPATIBILITY §3 and the CHANGELOG say so.
 - Group state is charged to the relay, not to any account's `quota_mb`, and shown in `AdminLoad`.
 
 **How long the relay keeps an epoch's header, seals and rows:**
-- **as long as** a kept chain starting in that epoch is kept;
+- **as long as** a kept chain starting in that epoch is kept, with the epoch's last Join (§4.4);
 - **or** until `HOLD_MS` after the next opening commit, when no kept chain references it.
 
 Kept chains are bounded by `kept_window` entries per channel, so at most `kept_window` epochs stay per
@@ -1130,8 +1295,8 @@ Estimates at 100k members:
 - rows add about 6 MB for every hour the kept epochs span, since every version is re-keyed by rows
   within the hour (100k rows of 60 B), plus about 3.7 KB per exit. With an exit batch every 36 s,
   10,000 kept epochs span about 100 h: about 0.6 GB of rows, 1.6 GB in all. With refresh alone they
-  span up to about 35 days: about 5 GB of rows, unless `retention_days` ends them sooner. C6
-  measures this, and OPERATING will say that `kept_window` is the way to bound it.
+  span up to about 35 days: about 5 GB of rows, unless `retention_days` ends them sooner. Not
+  measured yet; OPERATING §10a says `kept_window` is what bounds it.
 
 Today the same channel keeps one seal set per writer per chain, so the group key keeps less as soon
 as more than one person writes.
@@ -1267,16 +1432,20 @@ the database. That keeps account ids from anonymous rooms out of the database, a
 
 ### 5.13 What admins see
 
-`AdminLoad` gains, for each group of at least 1000 seats and any group with a warning:
-- keyholders online and in all;
+`AdminLoad` gains a row (`GroupLoad`) for each group of at least 1000 seats and each group with
+something amiss or a warning, those first, at most 50 rows (`load.rs` `groups_shown`):
+- seats, and keyholders online and in all;
 - the age of the last commit;
 - joins and exits waiting;
 - missed deadlines;
-- bytes of group state, in memory and in the database.
+- about how many bytes of group state it holds in memory and in the database.
 
-`LoadReport.warnings` carries "no keyholder online in #x for N min", "keys late in #x", "#x missed
-N deadlines" and "a member reports #x ahead of this database" (§5.7). They are logged at warn, at
-most once per 10 min per kind.
+"Amiss" is seats with no keyholder online, a head older than writers wait for (70 min), or a
+missed deadline. `LoadReport.warnings` carries, each naming its channel as `#<channel id>:`, "no
+keyholder online for N min", "keys late", "missed N deadlines" and "a member reports it ahead of
+this database" (§5.7), at most 50 of them, the largest groups' first, and then "N more group key
+warnings: the server's log has each". Each is logged at warn when raised, at most once per 10 min per
+kind and group.
 
 The timers are fixed, because clients enforce several of them (§5.4, §5.5, §5.7). There is no
 "re-key now" button for now. Admins choose no keyholders, which keeps moderators away from keys.
@@ -1284,12 +1453,17 @@ The timers are fixed, because clients enforce several of them (§5.4, §5.5, §5
 ### 5.14 The relay switch
 
 `group_key` (§9) is read at start, for the whole relay.
-- **Off to on** (the update to 1.16, or an admin turning it on): every group starts with no keyring,
+- **Off to on** (the update to 1.14, or an admin turning it on): every group starts with no keyring,
   so its first fetch makes a Genesis. Writers close their per-writer kept chains at their first post
-  (§5.10).
-- **On to off:** the relay goes back to the 1.15 paths at its next start. It keeps the group tables
-  and serves what kept chains reference, read-only, so history kept under the group key stays
-  readable. Apps see the change in `Authenticated` and use the live path and the 3N join.
+  (§5.10). An account is seated eagerly only from its first `SeatKeysPublish` (the switch gap,
+  §5.10).
+- **On to off:** the relay goes back to the old paths (the live path and the 3N join) at its next
+  start. It keeps the group tables and serves what kept chains reference, read-only, so history kept
+  under the group key stays readable: an account reads it with the seat keys in its vault, and
+  publishes nothing (test
+  `e2e_t1_an_account_on_a_relay_with_the_key_off_reads_kept_history_with_its_vaults_seat_keys`). Apps
+  see the change in the `GroupKeys` frame after `Authenticated` and use the live path and the 3N
+  join.
 - **Back on:** a start with the switch on after a run with it off begins a new generation for every
   group, as a new incarnation does (§5.7), since exits during the off run reached no keyholder.
   Members take it under §5.7's rule for a floor in an older generation, however long the off run
@@ -1298,12 +1472,12 @@ The timers are fixed, because clients enforce several of them (§5.4, §5.5, §5
 
 ## 6. What changes for each party
 
-These rows go into THREAT-MODEL.md at release, each naming its test.
+These rows are in THREAT-MODEL.md since 1.14, each with the tests that hold it.
 
 | Who | Can | Cannot | Compared with today |
 |---|---|---|---|
 | **The relay, honest or curious** | See who is seated and in which bucket, when epochs change, each commit's size, who holds keys and when they are online, when each member fetches, and when an account rotates its seat keys | Read `CK`, a bucket key, a seed, a keyring, a writer blob, a post or media | Same, plus keyholders |
-| **The relay, hostile** | <ul><li>Seat a ghost, by asking a keyholder to. In a gated group the header names it to every writer seated before it: before that writer's next post under an honest relay, and whatever the relay does, before its first post in a later epoch (≤ 70 min) (§4.4 rule 4). Keyholders, and writers at their fold, refuse guests and old seat keys; a writer whose fold fails holds its posts until the seat is removed.</li><li>Give a seat it chose (an account that passes the keyholder's checks) the current `CK_e` with no taken header naming it, by leaving the Join commit that seated it out of the heads it shows. The seat reads that whole epoch (≤ 70 min) from its start. The relay can repeat it in every epoch, with any keyholder, and each time one keyholder device sees it and warns.</li><li>Withhold commits: newcomers wait, and writers stop 46 s after a named exit, and 70 min into an epoch. In a voice room a leaver keeps hearing, and the app warns after 46 s.</li><li>Delay the names of new readers to a writer by up to one epoch (≤ 70 min), by withholding the pushed lists and the Join headers. Past 90 days away, the writer's app says that people joined more than 90 days ago whose names it was not shown. A member that only reads is not shown them unless it asks.</li><li>Hide an exit, with no bound, as today.</li><li>Keep an offline account's seat fed with every epoch until it exits, rotates or expires (90 days).</li><li>Choose which volunteer becomes a keyholder in a text group, within §5.6's rules.</li><li>Start a new generation: at will on a relay without accounts; on a relay with accounts by claiming a restore, or by a Regenesis after 1 h with no keyholder online. Members are told each time.</li><li>With a removed keyholder, fork members who have not yet seen the removal (below).</li><li>Split members onto two branches, which shows as posts they cannot open.</li><li>Roll a browser back within its vault floor's lag, or further by rolling back the vault item.</li><li>Make newcomers read up to 70 min back, by withholding refreshes.</li></ul> | <ul><li>Forge a header, a welcome, a row, a keyring or a writer blob.</li><li>Choose `CK` (confirm is in every header), a `BK` or an `s_m` (welcomes are authenticated), or a keyring (its hash is in the header).</li><li>Roll a desktop or phone app below its local floor, or back into one of the last 8 generations it took, or into a generation that began before its floor.</li><li>Seat an account's old seat keys again once a keyholder has seen its newer counter, or past a writer that has seen it: that writer's fold fails, and it holds its posts.</li><li>Skip a name in a writer's fold, move a list to another header, or pass off a shorter tail as the last 90 days: each step of `names_hash` binds its header's `time`, `epoch` and `join`.</li><li>Make two voice senders share a media key.</li><li>Make a writer open sessions with members.</li></ul> | Ghosts and hidden exits as today. New: withholding commits, keyholders, the stale-join residue, new generations shown to members, offline accounts staying seated. Gone: the 180 MB first post and the forced session-start uploads. |
+| **The relay, hostile** | <ul><li>Seat a ghost, by asking a keyholder to. In a gated group the header names it to every writer seated before it: before that writer's next post under an honest relay, and whatever the relay does, before its first post in a later epoch (≤ 70 min) (§4.4 rule 4). Keyholders, and writers at their fold, refuse guests and old seat keys; a writer whose fold fails holds its posts until the seat is removed.</li><li>Give a seat it chose (an account that passes the keyholder's checks) the current `CK_e` with no taken header naming it, by leaving the Join commit that seated it out of the heads it shows. The seat reads that whole epoch (≤ 70 min) from its start. The relay can repeat it in every epoch, with any keyholder, and each time one keyholder device sees it and warns.</li><li>Withhold commits: newcomers wait, and writers stop 46 s after a named exit, and 70 min into an epoch. In a voice room a leaver keeps hearing, and the app warns after 46 s.</li><li>Delay the names of new readers to a writer by up to one epoch (≤ 70 min), by withholding the pushed lists and the Join headers. Past 90 days away, the writer's app says that people joined more than 90 days ago whose names it was not shown. A member that only reads is not shown them unless it asks.</li><li>Hide an exit, with no bound, as today.</li><li>Keep an offline account's seat fed with every epoch until it exits, rotates or expires (90 days).</li><li>Choose which volunteer becomes a keyholder in a text group, within §5.6's rules.</li><li>Start a new generation: at will on a relay without accounts; on a relay with accounts by claiming a restore, or by a Regenesis once no keyholder has been online for the wait (§5.6). In a channel whose keyholders are all connection entries (browsers and guests), that wait is 2 min, so by dropping their connections it can force a new start every few minutes (the fast new start, owner 2026-11-19); a channel with a desktop keyholder keeps the hour. Members are told each time.</li><li>With a removed keyholder, fork members who have not yet seen the removal (below).</li><li>Split members onto two branches, which shows as posts they cannot open.</li><li>Roll a browser back within its vault floor's lag, or further by rolling back the vault item.</li><li>Make newcomers read up to 70 min back, by withholding refreshes.</li></ul> | <ul><li>Forge a header, a welcome, a row, a keyring or a writer blob.</li><li>Choose `CK` (confirm is in every header), a `BK` or an `s_m` (welcomes are authenticated), or a keyring (its hash is in the header).</li><li>Roll a desktop or phone app below its local floor, or back into one of the last 8 generations it took, or into a generation that began before its floor.</li><li>Seat an account's old seat keys again once a keyholder has seen its newer counter, or past a writer that has seen it: that writer's fold fails, and it holds its posts.</li><li>Skip a name in a writer's fold, move a list to another header, or pass off a shorter tail as the last 90 days: each step of `names_hash` binds its header's `time`, `epoch` and `join`.</li><li>Make two voice senders share a media key.</li><li>Make a writer open sessions with members.</li></ul> | Ghosts and hidden exits as today. New: withholding commits, keyholders, the stale-join residue, new generations shown to members, offline accounts staying seated. Gone: the 180 MB first post and the forced session-start uploads. |
 | **A keyholder, hostile** | Seat ghosts. With the relay's help they need not be named: seats in merge or re-version buckets, which members cannot see, and which an honest relay's validator refuses. It can also hand `CK` to anyone, which no design stops. Skip a leaver, only with the relay hiding the exit; stall commits until it is replaced; read everything the group carries while it holds keys; give away the seed | Open rows other keyholders made without breaking X25519; read bucket keys or keyrings from before its promotion | New role |
 | **A removed keyholder that also left the group** | Keep `seed_s`, the head's seed at its removal, until every seat is given `s + 1`: in a text group up to about 48 h, since the roll starts within 24 h of the removal and finishes within 24 h; in a voice room the roll starts at the removal itself (§5.6). With the relay, fork members who have not yet seen its removal: sign headers on the keyholder set from before it, which they take, and read what they write until they see the removal and need a new generation (§5.7). With a quantum computer and the recordings, open the rows under `s` made after its removal, its own removal's re-key rows among them, and through them the new bucket keys and epoch keys, until `seed_floor` passes `s` | Classically, open anything sealed from the KeyholdersRemove epoch on outside such a fork, or rows other keyholders made | New |
 | **A removed keyholder still seated** (a resignation, a stall or away removal) | Read everything the group carries, as any member. The seed and fork items of the row above | Open the bucket keys or the keyring made after its removal, or rows to other seats, except as above | New |
@@ -1315,7 +1489,7 @@ These rows go into THREAT-MODEL.md at release, each naming its test.
 | **A leaver** | Text: read for up to `exit_gap(N) + CHECK_WAIT_MS` after the exit is named under an honest relay, and at most 46 s once writers are told; with no bound if the relay hides the exit. Voice: hear until the opening commit that removes them, about 2 s under an honest relay; with no bound if the relay withholds that commit or hides the exit, and the app warns after 46 s | Open any epoch after the opening header that removed them | Same for text. Voice: today the minter re-keys as soon as it sees the leave |
 
 **Claims that change.** README.md and THREAT-MODEL.md change with these. The weakened ones (W) go
-into one GitHub security advisory and a CHANGELOG "Security" entry with 1.16 (COMPATIBILITY §5).
+into one GitHub security advisory and a CHANGELOG "Security" entry with 1.14 (COMPATIBILITY §5).
 
 1. **(W) Session keys after each round** (README, *Perfect Forward Secrecy*): in text groups, keys no
    longer reach readers through per-round sessions. Seat keys rotate every 30 days and on events, so
@@ -1372,7 +1546,8 @@ into one GitHub security advisory and a CHANGELOG "Security" entry with 1.16 (CO
 ## 7. Open questions
 
 The adversarial review of the built version (§10) answers each of these against the code, and states
-what it could not settle.
+what it could not settle. It runs after this text was brought up to date with the code; until its
+answers are written here, every question below is open.
 
 1. **Welcome** (§3.2): is the concatenation KDF enough, with `ct_q`, `eph.pub` and every public key in
    the salt and `ss_k` in the input? We want IND-CCA security if either Kyber1024 or X25519 holds, and
@@ -1412,8 +1587,10 @@ what it could not settle.
    A walk is bounded in epochs by elapsed time (one per 2 s). A new generation is taken only if it
    began after the floor's `time` (and within ±10 min of the device's clock when the
    device followed the group in the last 10 min), the last 8 generation ids are refused, a device
-   with no floor takes the head on TOFU, and members enforce the 1-hour Regenesis wait. Is that safe
-   for what it buys? Is "the relay can claim a restore, and members are told" an acceptable bound?
+   with no floor takes the head on TOFU, and members enforce the Regenesis wait: 2 min under a set
+   of connection entries alone that no Regenesis started in the last hour, else 1 h (§5.6, §5.7). Is
+   that safe for what it buys? Is "the relay can claim a restore, and members are told" an
+   acceptable bound?
 7. **Windows**: a text leaver reads up to `exit_gap(N) + CHECK_WAIT_MS` under an honest relay, and at
    most 46 s once writers are told. A voice leaver hears until the next commit, which voice never
    waits for. A hidden exit is unbounded, as today. Newcomers read 60 s or 5 min back, 70 min under a
@@ -1455,10 +1632,20 @@ what it could not settle.
       keyring, but members cannot check keyring welcomes, so on that branch it can re-seat members by
       welcomes from its own pair and act as a hostile keyholder until its entry is removed. The
       device whose entry it swapped sees the pushed header and warns. Is that bound acceptable?
+12. **Fast new start** (§5.6, §5.7, owner 2026-11-19): a Regenesis 2 min after its parent when every
+    entry of the set in force is a connection entry, checked by members from the signed headers, with
+    the churn bound (a set a Regenesis started keeps the hour for an hour) and the relay refusing a
+    Regenesis dated more than `CLOCK_SLACK` back. Known gaps: a hostile relay can have an online
+    connection keyholder promote another connection, then drop both, and so start anew every few
+    minutes, and it can have such a keyholder remove a desktop entry first (misses and time away are
+    the relay's word), which leaves a set of connection entries alone; header times may run 10 min
+    ahead, so a dishonest volunteer skips the 2 min. Each costs a re-seat and reads nothing. Does the rule hold anything else open, and is the churn bound worth
+    keeping as it is, against counting any change of the set in the last hour?
 
 ## 8. Costs at 100,000 members
 
-All figures are **estimates**, with `B = 1613` buckets. `group_load` (C6) measures them. Sizes used:
+The figures in the tables are **estimates** from this design, with `B = 1613` buckets. What was
+measured since is at the end of this section, under *Measured*. Sizes used:
 
 | Thing | Bytes |
 |---|---|
@@ -1498,10 +1685,10 @@ their joins are new accounts and seat-key rotations:
   sends about 7.2 GB of names, where every reader taking them would have cost about 720 GB.
 
 **Re-seat time.** Join commits on one group go one after another, at most 256 joiners each. So
-re-seating 100k seats, after a new generation or in a guest reconnect storm, takes 391 commits:
-several minutes. A member whose seat comes later than `HOLD_MS` (60 s) after its post loses that
-held post, and its app says the post was not sent because the channel's keys are late. C6 measures
-the re-seat time.
+re-seating 100k seats, after a new generation or in a guest reconnect storm, takes 391 commits
+one after another: 117 s measured at 100k (§8, Measured). A member whose seat comes later than
+`HOLD_MS` (60 s) after its post loses that held post, and its app says the post was not sent because
+the channel's keys are late.
 
 Per hour, at 100k:
 - A member that reads every epoch through exit batches every 36 s fetches about 90 KB an hour. With
@@ -1526,39 +1713,83 @@ Per hour, at 100k:
 
 CPU:
 - One X25519 per member per keyholder per seed, for `RB`. After that, a row costs one HKDF and one
-  AES-GCM.
-- 100k X25519 take about 4 s natively and 3–5 times that in wasm.
-- One Kyber1024 encapsulation per welcome. There is no measured figure yet; C6 measures it natively
-  and in wasm.
-- At the 10,000-seat browser limit that is about 1–2 s of X25519 in wasm.
+  AES-GCM. A keyholder keeps the row bases in memory, per seat and seed, so only its first opening
+  after it took the group (a promotion, a hand-over, a browser's reload or reconnect) pays the
+  X25519s: that build is **cold**, the ones after are warm.
+- 100k X25519 take about 3 s on a fast desktop core, up to about 9 s on a low-power core. In wasm an
+  X25519 costs about 2.6 times native.
+- One Kyber1024 encapsulation per welcome: about 22 µs natively, 0.6 ms in Chromium at `opt-level =
+  "s"` and about 0.1 ms with libcrux at opt-level 3, which the browser build uses (open choice 28).
+  A welcome's cost is mostly its X25519s, not Kyber.
+- At the 10,000-seat browser limit a cold re-key is about 0.8–0.9 s of page time in wasm.
+- **Builds run in steps** in the browser: after each unit of work (a row with its base, a welcome, a
+  seal, a list check, the keyring seal, the bucket root, the signature) a build stops once its
+  budget is spent (2 ms in a call or with the page hidden, 8 ms otherwise), so a step runs at most
+  one unit past its budget. The keyholder's own check of its commit with the relay's validator is one uncut step:
+  about 5.5 ms for an exits opening at 10k. A Genesis and a Regenesis build in one step.
 
-## 9. Wire and storage (protocol 27, sketch)
+**Measured** (2026-11-18 to 2026-11-21, one i9-13900K, Linux; the relay's side is in OPERATING
+§10a):
+- **Sizes** (C1 `group_cost`): an open-group header 383 B (about 413 with a 64-character id), a header
+  that sets keyholders 1119 B, a keyring base 146.8 KB (91 B a version), a delta 119 B, an `added`
+  entry 71 B, a `removed` one 33 B; an exit batch 0.244 MB + 3.66 KB × `E`, a refresh 0.75 MB. A
+  member's epoch read is 854 B (914 with a re-keyed bucket) and 34 µs.
+- **Native, one fast core:** X25519 26.2 µs, Kyber1024 encapsulation 22.2 µs and decapsulation
+  25.8 µs, a seat welcome 94.2 µs, a Join of 256 24.6 ms (434 KB), a refresh 23 ms, a full re-key by
+  rows 0.23 s warm and 3.1 s cold (9.0 s on a low-power core), a 100k re-seat 9.6 s of keyholder CPU
+  in 391 Joins (169.5 MB), a 100k seed roll 9.6 s (166 MB), a voice room's roll at 250 seats 24 ms
+  (415 KB), the names fold after a 100k re-seat 19 ms (7.1 MB).
+- **In the app's own duty** (`group_load`): a Join of 256 builds in 27–33 ms, plus about 10 ms for
+  its due's frames (mostly the 256 joiners' endorsement checks). A cold Remove at 100k builds in
+  3.6 s. A 100k re-seat is bound by its 391 commits one after another, not by the CPU.
+- **In the browser** (voipc-web, Chromium 156 and Firefox 159; opt-level 3 for libcrux):
+  - a Join of 256 81–86 ms in Chromium (212–217 at "s"), 73–78 in Firefox;
+  - a seed page of 256 75–76 ms in Chromium;
+  - an exits opening of 720 at 10k: 133–151 ms warm, 0.82–0.87 s cold;
+  - a refresh at 10k: 14–15 ms warm, 78–84 ms cold;
+  - a voice Remove at 250 with every seat behind the last roll: 98.5 ms (224 at "s"); with none
+    behind, 7.5–9.9 ms warm, 23–26 ms cold, and no seed welcome in the commit;
+  - against native: X25519 2.6 times, row builds 2.5–3.5 times, builds that make welcomes 2.6–3.2
+    times (4.0–8.7 at "s"), Kyber1024 2.4–4.7 times (8.9–28 at "s").
+  - In steps of 2 ms, a cold re-key of 10k runs as about 400 steps, the longest 5.3 ms (the own
+    check), and takes 0–5% longer in all than one block.
+- Not measured: a text Remove by a promoted second keyholder in the browser, phones, a page doing
+  anything else meanwhile, and the stepped builds' wall time on a busy page against the 4 s exits
+  deadline.
 
-This section is enough for C1 and the review. C2's spec pass writes every variant with its fields,
-direction, frame limits and order relative to posts.
+## 9. Wire and storage (protocol 26)
+
+This section was the sketch C1 and the review worked from. The messages as built, with every field,
+direction, frame limit and the order relative to posts, are in `crates/voipc-protocol/src/gk.rs`
+and the `Epoch*`, `Keyring*`, `Keyhold*`, `GroupKeys` and `VoiceSeats` variants of `messages.rs`;
+the golden file is `tests/golden/v26.json`. Where the sketch below differs, those are right.
 
 **Names.** Wire variants are `Epoch*`, `Keyring*` and `Keyhold*`; tables are `voipc_gk_*`. Nothing
 then clashes with the user groups of 1.7 (`GroupSave`, `voipc_group_style`). Every `Epoch*` message
 names its `group`, never a channel, since a channel's id can stand for groups of two kinds; one that
-names an epoch also names its `gen`. The crypto module is `voipc-crypto/src/group_key.rs`, and the
-relay's is `accounts/gk.rs`. The migration number is picked when C2 starts.
+names an epoch also names its `gen`. The crypto module is `voipc-crypto/src/group_key.rs` (and
+`group_state/` for the members' and keyholders' state), and the relay's is `gk/` with its store in
+`accounts/gk.rs`. The tables come in migration `0013_group_keys.sql`.
 
 **The relay switch.** A new top-level key in `server.toml`: `group_key = true`.
-- With it on, a relay at 27 uses the group key everywhere. It refuses `KeyCheck`, `OpenSessions` and
-  `DistributeSenderKeys` in text channels, and in voice rooms `DistributeMediaKey`,
-  `DistributeSenderKey` and `SendEncryptedChannelMessage`, the 3N join and the pairwise chat key
-  (§5.9).
-- With it off, the relay keeps the 1.15 paths and refuses `Epoch*` and `Keyring*`. Group tables
+- With it on, a relay at 26 uses the group key everywhere. It refuses `KeyCheck`, `OpenSessions` and
+  `DistributeSenderKeys` in text channels, and `SendEncryptedChannelMessage` there too (open choice
+  13), and in voice rooms `DistributeMediaKey`, `DistributeSenderKey` and
+  `SendEncryptedChannelMessage`, the 3N join and the pairwise chat key (§5.9). It answers the first
+  such frame of a session with one `EpochRefused{LEGACY}`, and drops the rest.
+- With it off, the relay keeps the old paths and refuses `Epoch*` and `Keyring*`. Group tables
   stay, and what kept chains reference is served read-only.
 - It is read at start, so a channel never switches mid-life.
-- `Authenticated` tells the app which paths the relay uses.
-- It goes into COMPATIBILITY §3 "What changed in 1.16". It is an exception, as `[files]` was in 1.3:
+- The `GroupKeys{on, run, clock}` frame, right after `Authenticated`, tells the app which paths the
+  relay uses (open choice 1), the run id of its `r:` groups and its clock.
+- It is in COMPATIBILITY §3 "What changed in 1.14". It is an exception, as `[files]` was in 1.3:
   its default changes behaviour, and `false` keeps the old. An older relay refuses the key.
 
 **The app.**
-- An app at 27 keeps the live path and the 3N voice join, for relays at 21–26 and for relays at 27
-  with the switch off. It also keeps the paths from before 21, down to `OLDEST_RELAY_PROTOCOL`.
-- It keeps both until `OLDEST_RELAY_PROTOCOL` passes 26.
+- An app at 26 keeps the live path and the 3N voice join, for relays at 21–24 (and the unreleased
+  25) and for relays at 26 with the switch off: a relay that sends no `GroupKeys` frame, or one with
+  `on: false`. It also keeps the paths from before 21, down to `OLDEST_RELAY_PROTOCOL`.
+- It keeps both until `OLDEST_RELAY_PROTOCOL` reaches 26 and the switch is gone.
 - The browser build keeps the old path too, for its own relay with the switch off.
 
 **Client → relay (sketch):**
@@ -1598,9 +1829,13 @@ relay's is `accounts/gk.rs`. The migration number is picked when C2 starts.
 - `EpochStale{group, head, reason}`.
 - `EpochExit{group, seq}`.
 - `EpochPostIn`, with `TextPost`'s fields plus `group`, `gen`, `epoch`, `blob?` and `ciphertext`.
+- `EpochPostTaken{group, post}`, to the writer's own connection for each post the relay took, never
+  for one it refused: `post` is the first 16 bytes of SHA-256 over the post's ciphertext, and the
+  app files that post's kept copy then (§5.8, §5.10).
 - `EpochBlob{group, gen, epoch, writer, blob}`.
 - `KeyringIn{group, part, last, krk_welcome?, sealed}`, chunked like the commit.
-- The voice roster carries each member's voice seat `(m, tag(SX))` at 27, for the media keys (§3.10).
+- The voice seats come as `VoiceSeats` (open choice 2): each member's voice seat `(m, tag(SX))`,
+  for the media keys (§3.10), beside the roster rather than in it.
 
 **Relay timers and validator:**
 
@@ -1611,8 +1846,8 @@ relay's is `accounts/gk.rs`. The migration number is picked when C2 starts.
 | Opening commits | at most one per group every 2 s (`EPOCH_MIN_GAP`) |
 | Deadline per keyholder | joins 5 s; exits 4 s (two fit in `CHECK_WAIT_MS`); refresh, promotion, removal, replacement 60 s; Genesis and Regenesis 30 s |
 | Refresh | every 5 min; every 60 s with a single bucket |
-| No keyholder online | a new Genesis at once on a relay without accounts and in voice rooms; a Regenesis after 1 h on a relay with accounts |
-| Removal proposed | 3 missed deadlines in an hour, or 7 days away (desktop keyholders); at disconnect (connection keyholders); at once for a device removed from its account; at once for an entry its account's own device reports swapped by a commit it did not make; 7 days after its account's counter passed the entry's |
+| No keyholder online | a new Genesis at once on a relay without accounts and in voice rooms; in a stored group a Regenesis after 2 min when every entry of the set in force is a connection entry and no Regenesis started that set in the last hour, else after 1 h (§5.6) |
+| Removal proposed | 3 missed or declined deadlines in an hour (any entry), or 7 days away (desktop entries); at disconnect (connection keyholders); at once for a device removed from its account; at once for an entry its account's own device reports swapped by a commit it did not make; 7 days after its account's counter passed the entry's. Never the last entry, and only one another online entry can sign |
 | Hand-over | a higher-ranked volunteer promoted while a lower-ranked keyholder holds the role (§5.6) |
 | Seed roll | every seat given a seed welcome within 24 h |
 | Roll starts | text groups: at most one per group per 24 h, by header `time`, a Regenesis exempt; voice: at every keyholder removal, at once |
@@ -1640,8 +1875,10 @@ The validator, modelled on `well_formed` and `chain_put`, takes a commit only if
   `removed` holds at most 768 entries;
 - the seeds follow §4.3 and §5.6. A Regenesis always raises `seed`. Any other kind raises it only at
   a due roll (a removal since the last raise, or a text seed 30 days old), and in a text group never
-  within 24 h of the last raise. In a voice group every KeyholdersRemove raises it. A
-  KeyholdersReplace changes neither `seed` nor `seed_floor`;
+  within 24 h of the last raise, nor while a roll runs. In a voice group every KeyholdersRemove
+  raises it. A KeyholdersReplace changes neither `seed` nor `seed_floor`;
+- a Regenesis comes no sooner than its wait after its parent and after no keyholder was online, by
+  the set in force (§5.6), and is dated no more than `CLOCK_SLACK` before the relay's clock;
 - a KeyholdersReplace swaps exactly one entry, named by its old `tag(KX)`, for one with the same `m`,
   `u` and origin and a higher `n`; it leaves the seed unchanged; and its keyring welcomes name the old
   pair as their maker (the other keyholders check that they open as from it, §4.3);
@@ -1664,10 +1901,13 @@ headers that carry `removed` lists (§4.4): about 7 MB after a full re-seat at 1
 and about 0.6 MB of headers at one per exit batch). That is about 90 MB over the 90 days.
 
 **Database** (stored groups only; sqlite and postgres):
-- `voipc_gk_groups`, `voipc_gk_headers`, `voipc_gk_seats`, `voipc_gk_lists`, `voipc_gk_names`,
+- `voipc_gk_groups`, `voipc_gk_gens`, `voipc_gk_headers`, `voipc_gk_seats`, `voipc_gk_lists`,
+  `voipc_gk_vids` (version ids, kept for the generation's life, open choice 30), `voipc_gk_names`,
   `voipc_gk_welcomes`, `voipc_gk_rows`, `voipc_gk_seals`, `voipc_gk_keyring`, `voipc_gk_krk`,
-  `voipc_gk_chains`, `voipc_gk_self` (keyed by group, account, generation, seed and seat tags), and
-  `voipc_gk_seatkeys` beside `voipc_logkeys`, with each account's counter;
+  `voipc_gk_pending`, `voipc_gk_exits` (open exit batches outlive a restart), `voipc_gk_holders`
+  (misses and away times outlive one), `voipc_gk_chains`, `voipc_gk_self` (keyed by group, account,
+  generation, seed and seat tags), and `voipc_gk_seatkeys` beside `voipc_logkeys`, with each
+  account's counter, all in migration `0013_group_keys.sql`;
 - `voipc_meta` gets `gk_incarnation`;
 - a relay without accounts keeps it all in memory, and so does every `r:` group (§5.12).
 
@@ -1689,7 +1929,10 @@ and about 0.6 MB of headers at one per exit batch). That is about 90 MB over the
     forged header or blob; a guest in a gated header, or a gated header with `conn_seats` above 0; a
     header below the floor; an opening header whose epoch is not its parent's plus one; a walked
     header past the epoch bound; a generation among the last 8, or one whose Genesis is older than
-    the floor's `time`; a Regenesis before `parent.time + 1 h`; a header 10 min ahead; an `added`
+    the floor's `time`; a Regenesis before its wait after its parent (2 min under a set of
+    connection entries alone, the hour under one with a desktop entry, and the hour for a set a
+    Regenesis started less than an hour before, on every member path, a floor-only member's
+    included); a header 10 min ahead; an `added`
     entry or new keyholder with a counter below the highest seen for its account, in a header made
     after that endorsement's `made` plus `CLOCK_SLACK`.
   - **Names:** a gated writer's post is held until every `added` list since its names floor folds to
@@ -1766,7 +2009,11 @@ and about 0.6 MB of headers at one per exit batch). That is about 90 MB over the
     gated groups.
   - A stalled keyholder is passed over.
   - With no keyholder online: voice rooms and relays without accounts start a new Genesis at once; a
-    relay with accounts offers a Regenesis only after 1 h.
+    relay with accounts offers a Regenesis after 2 min when the set in force is all connection
+    entries, after 1 h when it holds a desktop entry, and after 1 h again within an hour of a
+    Regenesis; it refuses a Regenesis dated more than `CLOCK_SLACK` back. A newcomer is seated soon
+    after the sole browser keyholder reloads, or after a relay restart of a browser-held channel
+    (`e2e_j8h_*`, `e2e_j9n_*`).
   - **Restore:** after `db new-incarnation` the relay starts a new generation, and members follow it.
     `EpochFloorAhead` without a valid header changes nothing, nor does one signed by a removed
     keyholder, nor one for a generation the relay does not know (that raises the admin warning).
@@ -1792,24 +2039,28 @@ and about 0.6 MB of headers at one per exit batch). That is about 90 MB over the
   - At most 2 writer blobs per writer per epoch are kept; both serve a reader seated late.
   - A change of `anonymous` moves the channel to its other group id, and back again starts a new
     generation.
-  - With the switch off, the relay keeps the 1.15 paths.
+  - With the switch off, the relay keeps the old paths, and still serves what the key kept.
   - `r:` groups write nothing to the database.
 - **Voice** (C5): a join is one welcome. Chat in a voice room goes under the voice group, and the
   relay refuses `DistributeSenderKey`, `DistributeMediaKey` and `SendEncryptedChannelMessage` there.
 - **Compatibility:**
-  - The C3 and C5 tests also run against a relay at 26.
-  - The nightly old-relays job covers text channels. Its relay list stops at 1.11.0 today, although
-    its own comment says each protocol bump adds its last release, so it gains 1.12 now and 1.13–1.15
-    once they are tagged.
-  - Golden `v27.json`, and compat rows as usual.
+  - The apps choose the path by the `GroupKeys` frame: none, or `on: false`, means the live path and
+    the 3N voice join (`the_frame_after_authenticated_chooses_the_path_once` in `gk_net.rs`,
+    `live-gk.test.ts`, `voice-gk.test.ts`), and the `GK=0` lane of `test-web.sh` runs a relay with
+    the switch off.
+  - The nightly old-relays job covers text channels on released relays, 1.12.0 the newest; 1.13.0
+    joins once it is tagged.
+  - Golden `v26.json`, re-recorded with the group key in it, and compat rows as usual.
 - **Fuzz:** `fuzz/fuzz_targets/group.rs` covers every opener, the header decoder, the Merkle path check
   and the relay's commit validator.
-- **Mutation:** `cargo mutants` on `group_key.rs` and the validator, with no survivor left.
-- **Load:** `examples/group_load.rs` (C6). It runs 100k seats, a 100k guest reconnect storm, continuous
-  exits, a seed roll, guest keyholder churn, rotation, a restore, a gated re-seat with its names, and
-  the 100k fetch burst at an epoch's first post. It reports bytes per member per hour, the re-seat
-  time and the held posts it drops, and keyholder CPU (X25519, Kyber1024), natively and in wasm. The
-  results go into OPERATING §10a.
+- **Mutation:** `cargo mutants` over voipc-crypto's `group_key` module in C1 (1087 mutants): every
+  survivor was killed by a test or shown equivalent. It was not run again on the code that came after.
+- **Load:** `examples/group_load.rs` (C6): `seats N` (offline accounts seated eagerly, SQLite or
+  Postgres), `storm N` (guests connecting, then a reconnect storm), `exits R` (continuous exits with posts
+  and a keyholder's Remove in flight) and `--check` (the smoke run). It reports the re-seat time, posts
+  held and dropped, bytes per member per hour and keyholder CPU, natively. The browser's numbers come
+  from `tools/gk-wasm-bench.mjs` (`gk_bench.rs`). A storm of 100k guests was not run (it needs about
+  38 GiB). The results are in OPERATING §10a and §8 above.
 - **Reviews:** no external review (owner, 2026-11-17). Before release, an adversarial review of our
   own of the whole built state machine: independent reviewers, each told to refute a §7 answer or a
   §6 claim against the code, with every finding verified before it counts. Then the owner's review.
@@ -2003,7 +2254,9 @@ struct SeatRef   { m: MemberId, tag_sk: [u8; 8], tag_sx: [u8; 8] }
 - A seat record is 33 bytes: `kind (1: 0x01 account, 0x02 connection) ‖ id (16: the account id, or
   12 zero bytes ‖ user id u32 BE) ‖ tag_sk (8) ‖ tag_sx (8)`.
 - Its first 17 bytes are the seat id of the seat's member id `m`. A signed-in member's voice seat
-  has the account's (§5.9). An endorsement signs a seat id too, chosen by its origin (§11.8).
+  has the account's (§5.9), except in an anonymous room that is not gated, where every seat is the
+  connection's (`Conn(u)`, open choice 11). An endorsement signs a seat id too, chosen by its origin
+  (§11.8).
 - `list(b,v) = SHA-256(len(c) u32 BE ‖ c ‖ records)`, with `c = ctx(list; k, group, gen, b, v)` and the
   records sorted ascending and deduplicated, as `log.rs` `list_digest` does.
 

@@ -231,9 +231,22 @@ WantedBy=multi-user.target
   A copy made before someone's deletion still holds their posts until it is deleted, which the timer below does within
   30 days. Put the database and its copies on an encrypted disk ([MOVING.md](MOVING.md#data-protection)).
 - **Restore:** stop the service, `gunzip` the copy first and copy the files back (Postgres: `pg_restore --clean --if-exists
-  -d voipc` from the dump), start it again. Test a restore once, before you need one.
-- **A restore puts back whoever left or was removed since the copy.** Their seat returns with the rest, and writers' apps
-  hand them keys again at their next post, each named as it happens, until someone removes them again.
+  -d voipc` from the dump), then, with the service still stopped,
+
+      sudo -u voipc voipc-server --config /etc/voipc/server.toml db new-incarnation
+
+  and start it again. Test a restore once, before you need one.
+- **`db new-incarnation` (1.14) belongs to every restore.** A channel's group key moved on after the copy was made, and
+  whoever left since was taken out of it there, which the copy does not know. The command marks the database as restored:
+  at its next start every channel with a key starts a new generation and its members are seated again, as after the
+  switch to the group key (§10a has what a re-seat costs). Members' apps see the new start as made anew. If it is
+  forgotten, an app whose keys are ahead of the database proves it with a signed header the relay can check, and the relay
+  starts that channel anew itself, at most once an hour; for a copy older than the channel's current generation it cannot
+  check that, and only warns in the Load tab ("a member reports it ahead of this database"). What kept history the copy
+  holds stays readable.
+- **A restore puts back whoever left or was removed since the copy.** Their seat returns with the rest. On the live path
+  writers' apps hand them keys again at their next post, each named as it happens; under the group key they are seated
+  again in the new generation, and in a gated channel named to its writers, until someone removes them again.
 - **A restore also takes back what members deleted since.** It is there again, and on a server that moved from Discord
   their wishes are gone too, so the next run files those posts again. To start a move over, use Undo instead
   ([MOVING.md](MOVING.md#undo-and-re-runs), which says what to do if you have to restore).
@@ -373,6 +386,25 @@ of them:
   device that already was) now drops its old device key at once; on 1.12 those stayed until the
   90-day sweep.
 
+**From 1.13 to 1.14** (protocol 24 to 26; 25 was never released):
+- **Apps first**, as for any protocol: a 1.14 app talks to the 1.13 relay meanwhile, without the group key and
+  without edges there.
+- **A migration:** `0013_group_keys.sql` adds the group key's tables. Going back takes the old binary and the backup.
+- **The group key is on by default** (`group_key`, §13; [GROUP-KEY.md](GROUP-KEY.md)). At the first start no channel has
+  keys yet, and each makes them at its first use: the first member who needs one asks, a volunteer's app starts the
+  channel's keys, and members are seated as they read or write. An account that keeps a channel's history is seated for
+  it from the first time one of its devices signs in with a 1.14 app; kept posts written under the group key before then
+  are not readable to it. What the channel kept before the update stays readable as before. Desktop apps help hold keys
+  unless their user turns that off; browsers and guests only as a last resort.
+- **`group_key = false` keeps 1.13's paths**: the live path in text channels and the 3N join in voice rooms, and the
+  relay still serves what the key kept, read-only. A start with it on again after a run with it off starts every
+  channel's keys anew, a full re-seat, so leave it as it is unless the group key is what fails you.
+- **A restore now ends with `db new-incarnation`** (§7).
+- **Keys whose defaults change something:** `[media] voice_room` (250): a voice room over 250 refuses the next joiner
+  until its limit or this is raised; `db_connections` (32, was 10). One channel message holds at most 16 KiB in voice
+  rooms too, as it always did in text channels. Every new key is listed in
+  [COMPATIBILITY.md](COMPATIBILITY.md) §3, "What changed in 1.14".
+
 **A later release that migrates the database** needs the old binary **and** the backup taken
 before the upgrade for a rollback: an older relay refuses a database that a newer one has
 migrated, by design. Release candidates (`-rc.N`) are for testing on a relay you can roll back.
@@ -485,17 +517,22 @@ real community meets first are these:
 - **One message holds one list.** `UserList` fits 2621 guests, 1598 accounts, or 789 accounts with three
   badges each; `ChannelList` 1213 channels, 555 with a 64-byte description, 210 with 256 bytes. Past that
   the relay sends the rest in further messages and every app reads them, so a long list only takes longer.
-- **Joining a voice room takes time at the client.** A member joining a room of N sends 3N control messages
-  at 50 a second: 120 s at 2000. The crypto itself is small: 0.4 ms and about 4 KiB a member.
-- **In text channels a writer pays, at its first post.** Following them is one message however many there
-  are, and costs nobody else anything. A first post to 2000 online who have no session with the writer comes
-  to about 3.6 MB down and 360 KB up for that writer, and its readers can read within seconds. These are
-  sums, not yet a measured run.
+- **Joining a voice room took time at the client** before the group key, and still does with `group_key = false`: a
+  member joining a room of N sends 3N control messages at 50 a second, 120 s at 2000, though the crypto itself is small
+  (0.4 ms and about 4 KiB a member). Under the group key a join is one welcome from the room's keyholders.
+- **On the live path a writer in a text channel pays, at its first post.** Following them is one message however many
+  there are, and costs nobody else anything. A first post to 2000 online who have no session with the writer comes to
+  about 3.6 MB down and 360 KB up for that writer, and its readers can read within seconds. These are sums, not yet a
+  measured run. Under the group key (the default) a post costs its writer the post and, once an epoch, about 230 bytes,
+  however many read it; the channel's keyholders carry the rest (below).
 - **Finding someone's direct conversations reads every kept direct message on the relay,** at each connect, though no channel's:
   at a million of them, about 75 ms on SQLite and 155 ms on Postgres, measured with all of it in memory.
 - **Kept history is for 5000 members a channel** (`kept_seats`): the next joiner gets no offline catch-up there. Half of them
   take a seat by following a channel, the rest by asking for one or writing there. It is a guard for a small disk, not a wall: set
-  it lower on one. Past about 32,000 a writer's app no longer keeps a copy there, since it can hold no more pins.
+  it lower on one. Under the group key those accounts are seated in the channel's group at once, online or not, and that is
+  cheap to raise: a seat costs a keyholder one welcome of about 1.7 KB and a 60-byte row, and 100,000 seats took two minutes
+  (below). On the live path, past about 32,000 a writer's app no longer keeps a copy there, since it can hold no more pins;
+  the group key has no such limit.
 - **What kept messages cost the relay,** measured at 2000 and at 5000 members on a desktop NVMe, through the relay's own code, with a
   bare commit at about 3 ms. A post checks the channel's members against who holds its key, so it grows with members. A person does
   not wait for it: the live post goes first.
@@ -513,6 +550,10 @@ real community meets first are these:
 - **A channel keeps its newest 10,000 messages** (`kept_window`). The sweep deletes older ones for good, once the posts that
   pushed them out are three days old and have three days left: a raid cleaned up before then, or one on a short timer, takes
   nothing. Lowering it later only takes more; raising it brings nothing back. A big server should set it lower: keys grow with it.
+  Under the group key it is also what bounds the channel's key material: the relay keeps each epoch a kept message was
+  written in, its seals (about 97 KB at 100,000 members) and the rows of its buckets, until the sweep takes the last message
+  of it. At 100,000 members and the default, that is estimated at 1.6 to 6 GB a channel, by how often epochs change
+  ([GROUP-KEY.md](GROUP-KEY.md) §5.10); it was not measured yet.
 - **What a writer's keys take is counted against `quota_mb`**, a seat's row at half. So seat rows on disk are bounded by
   accounts times that figure, and nothing evicts them: a writer over it stops being kept.
 - **A person's pins fit about 32,000 accounts,** in 56 pages of 48 KiB outside the sign-in message, read after it: at 2000 pins
@@ -587,7 +628,7 @@ Screen shares (`share_load`, one HD share at 7.5 Mbit/s, 30 frames a second, vie
 So a relay sends about 1,000 HD viewers before its network port is full, and its processor follows at about half a
 core per Gbit/s. `[media]` (§13) keeps it under what its port carries, and media edges (§10b) carry the rest.
 
-Through media edges (1.15), measured 2026-11-18 on the same machine, everything on loopback: the relay held to 4 CPUs
+Through media edges (1.14), measured 2026-11-18 on the same machine, everything on loopback: the relay held to 4 CPUs
 (`taskset -c 0-3`, so 4 threads), each edge to 4 of its own (2 physical cores; `max_viewers` 1000, `egress_mbit` 8000),
 `share_load` on the other 16, one HD share at 7.5 Mbit/s and 30 frames a second for 30 s, `local_first` 8, `rmem_max` at
 32 MiB. A Firefox tab took about one core beside it, on no CPU of its own. The 2,000 run was made once with one load
@@ -639,6 +680,48 @@ twice what 4 do.
 
 Not measured: one voice room at its limit of 250, real networks.
 
+**The group key (1.14)**, measured with `group_load` on the same machine, 2026-11-19, relay and load clients together,
+every keyholder an app's own duty building its commits whole, the way the desktop app does. A re-seat is bound by its
+Join commits one after another (at most 256 seats each, 391 at 100,000), not by the keyholders' processors:
+
+| What | Seats | Took | Relay RSS | Relay CPU | Database |
+|---|---|---|---|---|---|
+| Offline accounts that keep the channel's history, seated at once (`seats N`), SQLite | 5,000 | 4.8 s | 48 MiB | 0.4 s | 44 MB |
+| the same | 20,000 | 13.1 s | 90 MiB | 2.1 s | 165 MB |
+| the same | 50,000 | 27.6 s | 150 MiB | 9.1 s | 404 MB |
+| the same | 100,000 | 117 s | 269 MiB | 30.2 s | 804 MB |
+| the same, Postgres | 100,000 | 118 s | 250 MiB | 23.1 s | 605 MB |
+| Guests connecting 1,000 a second and reading (`storm N`), no accounts | 50,000 | 52 s, each seated within 0.3 s (p95) | 4,976 MiB | 104 s | – |
+
+- The 100,000 runs include a stall of about 30 s, from the relay queueing each eager seat against the whole queue; that was
+  fixed after these runs (a seat index on the join queue) and they were not made again. Below 100,000 it cost little.
+- A keyholder spends about 28 ms building a Join of 256 and 10 ms more on its due's frames, mostly checking the 256
+  joiners' signatures: 15 s of keyholder CPU for a 100,000 re-seat. Each keyholder held about 50 MiB at 100,000.
+- A refresh at 100,000 builds in about 60 ms and sends 0.85 MB: about 10 MB an hour from the keyholders.
+- A keyholder's leaving is a full re-key: 3.6 s of build at 100,000. With guests leaving and coming back 20 a second for two
+  minutes (`exits 20`) and two writers posting each second, no post was dropped at 5,000 to 100,000 seats, and each member
+  took about 3.3 MB an hour, almost all of it the posts. Being seated costs a member 4 to 5 KB.
+- A relay's group memory is about 1.8 KB a guest seat (88 MB at 50,000). A reconnect storm of 50,000 guests is bound by
+  admission, as without the key: 189 Joins and one opening took 8.7 s of keyholder CPU, and nothing was missed. In that run
+  up to 8% of guests whose first ask came while the group's inbox was full stayed unseated until their next post; the apps
+  have asked again by themselves since, also not measured again.
+- In a browser a keyholder builds in steps of 2 ms in a call or while hidden, 8 ms otherwise: a cold re-key of 10,000,
+  about 0.8 s of work, ran as about 400 steps, the longest 5.3 ms; a Join's due still takes about 22 ms of the page at once
+  for its joiners' signatures ([GROUP-KEY.md](GROUP-KEY.md) §8 has the browser's numbers). A browser holds text keys for at
+  most 10,000 seats; above that only desktops do.
+- Not measured: a storm of 100,000 guests (it would need about 38 GiB here), keyholders on other machines, phones, and the
+  key material `kept_window` keeps.
+
+The Load tab (*Server admin*) shows a row for each group of at least 1,000 seats and for any group with something amiss, at
+most 50: its seats, keyholders online and in all, the age of its last commit, joins and exits waiting, missed deadlines, and
+about what it holds in memory and in the database. It shows a commit as soon as the relay has queued it to the members,
+a moment before their apps take it. Its warnings name the channel: no keyholder online for some minutes, keys
+late (no new epoch for 70 minutes), missed deadlines, and a member reporting the channel ahead of this database (a restore
+without `db new-incarnation`, §7). On a relay with accounts, a text channel that keeps its history (not an anonymous one or one
+that hides its members) waits, when its keyholders are all away, before a volunteer starts its keys anew: 2 minutes
+where every keyholder was a browser or a guest, unless a new start began that set within the hour, else an hour. Other
+text channels, voice rooms, and every channel on a relay without accounts start anew at once.
+
 ```sh
 cargo build -p voipc-server --release --bin voipc-server --examples
 target/release/voipc-server -c server.toml &   # max_users above N
@@ -648,6 +731,9 @@ target/release/examples/share_load 500 127.0.0.1:9987 "$!" --shares 1 --mbit 7.5
 target/release/examples/voice_load 1000 127.0.0.1:9987 90 --rooms 20 --speakers 3
 target/release/examples/community_load frames
 target/release/examples/community_load crypto 2000
+target/release/examples/group_load seats 20000      # the group key; starts a relay of its own (port 29900), --database postgres://… for Postgres
+target/release/examples/group_load storm 20000
+target/release/examples/group_load exits 20 --guests 20000
 ```
 
 With edges (`edge-core.toml` is `server.toml` with `[pool] edges = { e1 = "…" }`, `e1.toml` that edge's file, §10b),
@@ -674,7 +760,7 @@ HD viewers on 10 Gbit/s (§10a). Two things keep that in hand.
 - A viewer past either is told the share is full, or that the server is sending all the video it can, with a Retry.
   Nothing else changes, and the sharer's own share goes on.
 
-**Media edges** (`[pool]`, 1.15) carry more. An edge is the same `voipc-server` binary, run as `voipc-server -c edge.toml
+**Media edges** (`[pool]`, 1.14) carry more. An edge is the same `voipc-server` binary, run as `voipc-server -c edge.toml
 edge`, best on a machine and a port of its own. It links to the relay over the relay's own UDP port, proves itself with a
 secret both hold, and forwards the shares the relay places viewers on: the relay sends it one copy of each, and it sends
 one to each viewer there.
@@ -803,7 +889,7 @@ viewer and a smaller one 2, so an `egress_mbit` of 8000 has room for 2,000 or 4,
   and down with the reason, and in a minute when anything happened one `last minute:` line: viewers, shares, Mbit/s,
   frames dropped, tickets refused and why, and datagrams its socket dropped.
 - **Upgrading: the relay first, then its edges.** A relay and an edge talk when they speak the same pool version, whatever
-  their releases (1.15 speaks 1; both log it when they link); the client protocol has nothing to do with it. A relay
+  their releases (1.14 speaks 1; both log it when they link); the client protocol has nothing to do with it. A relay
   refuses an edge of another pool version, and says in its log and the Load tab which one to update. That edge logs an
   error and asks again every minute, and until it is updated the viewers it would carry are served by the relay. Edges
   do not update themselves: verify the new binary (§1), put it in place and restart them.
@@ -926,6 +1012,7 @@ host = "::"               # Bind address — "::" serves IPv6 and IPv4 from one 
 tcp_port = 9987           # HTTPS: the browser page, file transfers (and the TCP fallback)
 udp_port = 9987           # QUIC endpoint (all clients) — keep equal to tcp_port so one host:port reaches both
 tcp_fallback = false      # true: clients that cannot reach UDP carry everything over tcp_port (see below)
+group_key = true          # the group epoch key in every text channel and voice room (1.14, docs/GROUP-KEY.md); false keeps 1.13's paths
 max_users = 64
 live_lobby = 2000         # While General holds at most this many, an app showing its list hears each join there by name; above it, counts and pages
 max_connections_per_ip = 32   # A browser client holds two of these, a native client one — so 32 is sixteen browser users behind one NAT.
@@ -940,7 +1027,7 @@ share_viewers = 100        # viewers of one share on this relay (its edges carry
 video_egress_mbit = 1000   # video sent, all shares together, counted at each share's resolution (1080p 7.5, 720p 4, less 2 Mbit/s), one copy per edge fed
 voice_room = 250           # people in a voice room that names no limit (0: none); routed rooms keep none
 
-[pool]                     # media edges for big screen shares, none by default (1.15, §10b)
+[pool]                     # media edges for big screen shares, none by default (1.14, §10b)
 local_first = 8            # the first viewers of each share stay on this relay; at most share_viewers
 # edges = { fra1 = "<openssl rand -base64 32>" }   # name = secret, as in that edge's edge.toml; keep this file 0600
 
@@ -1098,7 +1185,9 @@ ready, puts `voipc-server.previous` back, lists that version in `voipc-server.fa
 starts the previous binary. `Restart=on-failure` (§3) is what starts it again. If the new
 binary had already migrated the accounts database, the previous one refuses it: stop the
 service, delete `voipc.db-wal` and `voipc.db-shm`, copy
-`voipc-server.accounts-before-<version>.db` over `voipc.db`, and start it.
+`voipc-server.accounts-before-<version>.db` over `voipc.db`, run `voipc-server --config …
+db new-incarnation` if the previous version knows that command (1.14 and later; one before the
+group key has no group key tables to start anew), and start it. The relay's log says the same.
 
 **By hand:** `enabled = false` stops the checks. The binary in place stays whatever it is; put
 another one there to go back (§8).

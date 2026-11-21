@@ -739,6 +739,30 @@ test("opening a quiet channel makes it whole, and ten minutes off screen makes i
   clearQuiet(s);
 });
 
+test("a quiet channel's kept copies are read as it opens, and again once a writer's last copy is filed", () => {
+  // Item J9W-2: under the group key a writer files its post's copy a second or two after the
+  // post (group_state::Copies, SETTLE_MS at its next tick), and nothing tells a quiet reader of
+  // it. A reader that opened the channel in that while read once and never saw it
+  const s = server();
+  quietServer(s, [ch(1, { log: "c:one" })], "always");
+  applyQuiet(s);
+  invoked().length = 0;
+  mock.timers.reset();
+  mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000_000_000_000 });
+  channelOpened(s, 1);
+  const reads = () => asked("account_read_now");
+  assert.deepEqual(reads(), [{ server: s, conv: "c:one" }], "read as it opens");
+  mock.timers.tick(2_999);
+  assert.equal(reads().length, 1);
+  mock.timers.tick(1);
+  assert.equal(reads().length, 2, "read again past the writer's settle, at its next tick");
+  mock.timers.tick(7_000);
+  assert.equal(reads().length, 3, "and once more for a writer whose clock runs late");
+  mock.timers.tick(60_000);
+  assert.equal(reads().length, 3, "and no more");
+  clearQuiet(s);
+});
+
 test("the channel on screen never goes quiet, and goes by the mode once it has been off screen", () => {
   const s = server();
   mock.timers.reset();

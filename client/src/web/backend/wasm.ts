@@ -569,6 +569,11 @@ export interface WasmApi {
   newVideoAssembler(): VideoAssembler;
   /** Largest opaque blob the relay will re-wrap and forward. */
   maxRelayCiphertext(): number;
+  /** Whether a channel post of `len` envelope bytes, sealed as it goes (`underKey`: under the
+   *  group key; else the old path's), stays within what the relay takes. */
+  postFits(len: number, underKey: boolean): boolean;
+  /** The most a channel post's ciphertext may be. */
+  maxPostSealed(): number;
   /**
    * Of the members who offer a channel's recent chat, the few actually asked —
    * picked at random, so a whole server reconnecting does not aim every
@@ -707,6 +712,8 @@ export async function loadWasm(): Promise<WasmApi> {
     newMediaKeys: () => new mod.MediaKeys(),
     newVideoAssembler: () => new mod.VideoAssembler(),
     maxRelayCiphertext: () => mod.maxRelayCiphertext(),
+    postFits: (len, underKey) => mod.postFits(len, underKey),
+    maxPostSealed: () => mod.maxPostSealed(),
     pickHistorySources: (s) => mod.pickHistorySources(s),
     controlMsgsPerSec: () => mod.controlMsgsPerSec(),
     isGkFrame: (p) => mod.isGkFrame(p),

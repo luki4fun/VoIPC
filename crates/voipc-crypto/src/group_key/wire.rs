@@ -501,6 +501,20 @@ impl TryFrom<Commit> for gk::CommitPiece {
     }
 }
 
+// ── Posts ─────────────────────────────────────────────────────────────────
+
+/// An `EpochPost`'s name in `ServerMessage::EpochPostTaken`: the first 16 bytes of SHA-256 over
+/// its `ciphertext`. The relay names the post it took by it, the writer's app finds the post's
+/// kept copy by it (`group_state::Copies::taken`). One writer's two posts never seal to the
+/// same bytes (each has its own message key and nonce), so the name is the post's.
+pub fn post_digest(ciphertext: &[u8]) -> [u8; 16] {
+    use sha2::{Digest, Sha256};
+    let d = Sha256::digest(ciphertext);
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&d[..16]);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -654,5 +668,19 @@ mod tests {
         assert!(NamesList::try_from(&longer).is_err());
         let step = list.step_from(&[9; 32]);
         assert_eq!(NamesStep::from(gk::NamesStepIn::from(&step)), step);
+    }
+
+    /// The relay and the app name a post by these bytes: pinned, so neither side moves alone.
+    #[test]
+    fn a_posts_digest_is_the_start_of_its_sha256() {
+        // SHA-256("abc") = ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+        assert_eq!(
+            post_digest(b"abc"),
+            [
+                0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
+                0x22, 0x23
+            ]
+        );
+        assert_ne!(post_digest(b"abc"), post_digest(b"abd"));
     }
 }

@@ -484,19 +484,39 @@ What is done in the app counts at once.
   off, and is also in the copies question if you may use it here. With it on, someone who
   joins gets the keys to everything the channel still keeps of yours, not only recent chat, and can
   ask your app for recent chat, which they see as your word. With it off, they read from the
-  moment they joined. It also takes the *Share history* privilege here: without it the switch
+  moment they joined: under the group key, from the start of the epoch they joined in, a few
+  minutes back at most under an honest server. The group key changes nothing of this: what
+  you kept before reaches newcomers only through members who share, as before. It also takes the *Share history* privilege here: without it the switch
   does nothing on this server, and a guest holds no privileges, so a guest does not share. The
   switch is one setting per device, for all your servers; the privilege is per server. Turning
   it off, or losing the privilege, takes back nothing already given.
-- **Who can read what you keep** is said in the channel, by name, when your app
-  hands them a key. If a name there is new to you, the server added a member you
-  did not see join. The server cannot add a reader to your messages without that
-  notice on the device that hands the key over.
+- **Who can read what you keep.** Since 1.14 a channel's messages, live and kept, are under
+  its group epoch key ([GROUP-KEY.md](GROUP-KEY.md)), which reaches members through the
+  channel's keyholders, not through your app. In a channel with a gate, the signed headers
+  name every new reader to you before you write there again (a server that turns hostile can
+  hold that back to your first message in a later epoch, 70 minutes at most); if a name is new
+  to you, the server added a member you did not see join. In an open channel, which anyone on the server
+  may read, readers are not named. On a server with `group_key = false`, as before 1.14, who
+  can read what you keep is said in the channel, by name, when your app hands them a key, and
+  the server cannot add a reader without that notice on the device that hands the key over.
+- **Your seat keys.** For the group key your account keeps a pair of seat keys (Kyber1024 and
+  X25519) in its vault, as the item `item.seat_kem`, and publishes their public halves. They
+  are made anew every 30 days, at a password change, a recovery-key reset and when a device
+  is removed: what a stolen device holds then opens no new epoch once the server takes the old
+  seat out. Your account is seated in a channel that keeps its history (up to `kept_seats`
+  accounts a channel) as soon as one of your devices signs in with a 1.14 app, online or not;
+  kept posts written under the group key before that are not readable to it.
+- **Keyholders.** A desktop app helps hold the keys of the text channels it is in, and hands
+  them to new members, unless you turn off *Settings → Help hold keys for text channels*;
+  browsers and guests do so only as a last resort, and in a voice room the two members with
+  the lowest user ids do. The member list names a channel's keyholders ("Keys held by").
 - **Leaving ends it.** Leaving a text channel, or being kicked from it, takes you
   out of its log: the server does it, and every writer's next message there is
   under a new key you do not get. What you already have stays yours. Moving
   between voice channels keeps their logs; *Stop keeping this channel's messages
-  for me* (under the chat's bin) ends one until you come back to it.
+  for me* (under the chat's bin) ends one until you come back to it. A voice room's kept
+  chat is kept as before 1.14, with a key for each reader; only its live chat and voice use
+  the room's epoch key.
 - **Deleting what you kept.** The bin in a conversation offers *Clear here, and
   delete what I wrote from the server's copy*: your messages there go from the
   server, and a tombstone, signed like a message, asks the readers' devices to
@@ -678,7 +698,10 @@ From accounts:
   that a list of blocked people (`item.blocks`) exists and changed, and how long it
   is to the nearest kilobyte, never who is on it. The identities you pinned are items
   too (`pins.0` and on, listed in `item.pins`), each sealed the same way and up to 48 KiB,
-  so it can see about how many people you have met, and when you met more
+  so it can see about how many people you have met, and when you met more. Since 1.14 so are
+  your seat keys (`item.seat_kem`) and how far your devices took each channel's keys
+  (`item.gk_floors`, with pages `gkf.0` and on and `gkc.0` and on): it sees when they change,
+  and about how many channels and people they cover
 - bans: a keyed hash of each banned address (never the address), and banned
   accounts
 - that a connection asked who takes reports, and when. A report itself is a direct message:
@@ -695,6 +718,15 @@ From accounts:
   after those accounts are deleted. Whose posts were removed goes out to everyone who
   connects for that long, guests too, by account where it has one and by name, with who
   did it and the time span, never the channel or the reason
+
+From the group key (1.14), for each channel that keeps its history:
+
+- who is seated in it and in which bucket, when its epochs change, and each commit's size
+- which devices hold its keys, their accounts, and when they are online
+- each account's seat public keys, with their counter and when they were made, and so when an
+  account rotates them
+- the signed headers, sealed keys and rows of each epoch a kept message was written in: never a
+  key that opens them
 
 From kept messages:
 
@@ -745,13 +777,19 @@ in [THREAT-MODEL.md](THREAT-MODEL.md)):
 - **withhold or replay kept copies**, but not forge or alter one: each is signed
   by its writer;
 - **guess your password offline**, at the cost above;
-- **decide who is a member** of a channel's log: a member it made up gets keys
-  only with the notice above, and that notice is shown on the device that hands
-  the key over;
+- **decide who is a member** of a channel's log: under the group key a member it
+  made up is named by the signed headers to the writers of a gated channel, and in
+  an open one is one more reader; it can also leave one account of its choice
+  unnamed for an epoch, which the keyholder device that seated it warns of. On the
+  live path such a member gets keys only with the notice above, shown on the device
+  that hands the key over;
 - **keep a writer on an older key of their own** that still reaches somebody who
   left, which helps it only together with that person;
-- **hold a copy for later**: kept copies use X25519 for their keys, not a post-quantum
-  one, so a database copied today could be read by a quantum computer later;
+- **hold a copy for later**: kept copies under the group key reach members in welcomes
+  that use Kyber1024 as well as X25519, but those kept before 1.14, and on the live path,
+  use X25519 alone, so a database copied today could be read by a quantum computer later;
+  and if a keyholder's seed ever leaks, a quantum computer opens the rows under it, about
+  31 days of them at most in a text channel;
 - **show display names, pictures and a server name as it likes**: they are its word,
   so they are no proof of who someone is. That is why your app always shows the
   `@name` and the address beside them. Pictures are sanitized on your device first;
@@ -776,7 +814,9 @@ in [THREAT-MODEL.md](THREAT-MODEL.md)):
 - 50 MB of kept messages per account by default (`quota_mb`). One message can be up
   to 16 KiB sealed.
 - A channel keeps messages for up to `kept_seats` accounts, 5000 by default. Half of them
-  take a seat by following it; the rest by asking, or by writing there.
+  take a seat by following it; the rest by asking, or by writing there. Under the group key
+  that is the number seated in the channel's keys at once, online or not; others are seated
+  when they next read or write there.
 - Your device remembers the identity of about 32,000 people it met, in pages kept
   outside what a sign-in sends. Those met only in open channels stop at half of that,
   and past it they are new again at each connect. Nobody is ever forgotten to make room.

@@ -29,7 +29,7 @@ use crate::account::AccountLink;
 const SETTLE_ROUNDS: usize = 4;
 
 /// The variant tags of the group key's frames: from the one after `GroupKeys` to
-/// `EpochReseated`, the last (protocol 26 appended them in that order).
+/// `EpochPostTaken`, the last (protocol 26 appended them in that order).
 fn gk_tags() -> (u32, u32) {
     static TAGS: OnceLock<(u32, u32)> = OnceLock::new();
     *TAGS.get_or_init(|| {
@@ -42,7 +42,11 @@ fn gk_tags() -> (u32, u32) {
             run: [0; 16],
             clock: 0,
         }) + 1;
-        (first, tag(&ServerMessage::EpochReseated { n: 0, left: 0 }))
+        let last = ServerMessage::EpochPostTaken {
+            group: String::new(),
+            post: [0; 16],
+        };
+        (first, tag(&last))
     })
 }
 
@@ -270,6 +274,11 @@ impl Gk {
             if let Some(a) = self.with_session(|s| s.gk_reseated(n, left)) {
                 self.actions(a, &mut out);
             }
+        } else if let ServerMessage::EpochPostTaken { .. } = msg {
+            // The relay took a post of ours: its kept copy is filed now, not at the next tick,
+            // so a page closed a moment after posting still keeps it
+            let due = self.copies.taken(&msg);
+            self.file(due.into_iter().collect(), &mut out);
         } else {
             // A post's refusal to the copies before the group key sends it again
             self.copies.refused(&msg);
@@ -281,8 +290,8 @@ impl Gk {
     }
 
     /// A post of ours (`post_id`: its message id). With a channel log its kept copy is
-    /// filed once it went, under the epoch it went under (`Copies`). A channel whose group is
-    /// not tracked yet (its join not answered) holds it until it is (`Early`).
+    /// filed once the relay took it, under the epoch it went under (`Copies`). A channel
+    /// whose group is not tracked yet (its join not answered) holds it until it is (`Early`).
     pub fn post(
         &mut self,
         st: &mut SignalStores,
@@ -454,8 +463,8 @@ impl Gk {
         }
         let o = self.keying.end();
         self.take(o, &mut out);
-        let rest = self.copies.end();
-        self.file(rest, &mut out);
+        // A copy is kept only on the relay's word that it took the post (`Copies::end`)
+        self.copies.end();
         self.started = false;
         self.tracked.clear();
         self.job = None;
@@ -794,6 +803,10 @@ mod tests {
                 piece: Default::default(),
             },
             ServerMessage::EpochReseated { n: 1, left: 0 },
+            ServerMessage::EpochPostTaken {
+                group: "g".into(),
+                post: [7; 16],
+            },
         ];
         for m in &gk {
             assert!(is_gk_frame(&postcard::to_allocvec(m).unwrap()), "{m:?}");
@@ -1031,42 +1044,57 @@ mod tests {
         );
     }
 
-    /// T1e D (J8F): the browser files a post's kept copy by the desktop's rule
-    /// (`group_state::Copies`), not at its first `released`: the copy waits for its post to
-    /// settle, and a refusal as `OLD_EPOCH` sends it waiting for the post's next send.
+    /// T1e D (J8F), J9: the browser files a post's kept copy by the desktop's rule
+    /// (`group_state::Copies`), not at its first `released`: the copy waits for the relay to
+    /// take its post (`EpochPostTaken`) and is filed in that frame's call, not at a tick; a
+    /// refusal as `OLD_EPOCH` sends it waiting for the post's next send, and only that send's
+    /// word files it, under the epoch it went under.
     #[test]
-    fn a_kept_copy_waits_for_its_post_to_settle_and_old_epoch_rearms_it() {
+    fn a_kept_copy_is_filed_when_the_relay_takes_its_post_and_old_epoch_rearms_it() {
         let mut core = SignalCore::new().unwrap();
         core.gk.account = Some(Rc::new(AccountLink::default()));
         start(&mut core, false);
         core.gk.track(TEXT, true, "c:abc", false, false, false);
         core.gk_post(TEXT, [9; 16], b"hi".to_vec(), "c:abc".into(), None);
         assert_eq!(core.gk.copies.went_under(&[9; 16]), Some(None));
-        let ep = GkEpoch {
+        let ep = |epoch: u32| GkEpoch {
             group: "c:abc".into(),
             gen: [1; 16],
-            epoch: 4,
-            d_e: [4; 32],
+            epoch,
+            d_e: [epoch as u8; 32],
             ck: [0; 32].into(),
         };
-        let went = GkOut {
+        let went = |epoch: u32, ciphertext: Vec<u8>| GkOut {
             send: vec![ClientMessage::EpochPost {
                 channel_id: TEXT,
                 group: "c:abc".into(),
                 gen: [1; 16],
-                epoch: 4,
+                epoch,
                 blob: Some(vec![1]),
-                ciphertext: vec![2],
+                ciphertext,
             }],
-            released: vec![(TEXT, [9; 16], ep)],
+            released: vec![(TEXT, [9; 16], ep(epoch))],
             ..GkOut::default()
         };
+        let taken = |ciphertext: &[u8]| {
+            let msg = ServerMessage::EpochPostTaken {
+                group: "c:abc".into(),
+                post: voipc_crypto::group_key::wire::post_digest(ciphertext),
+            };
+            postcard::to_allocvec(&msg).unwrap()
+        };
         let mut out = Out::default();
-        core.gk.take(went, &mut out);
+        core.gk.take(went(4, vec![2]), &mut out);
         assert_eq!(
             core.gk.copies.went_under(&[9; 16]),
             Some(Some(4)),
             "not filed at the release"
+        );
+        core.gk_frame(&taken(&[5])).unwrap();
+        assert_eq!(
+            core.gk.copies.went_under(&[9; 16]),
+            Some(Some(4)),
+            "not for another post"
         );
         let refused = ServerMessage::EpochRefused {
             group: "c:abc".into(),
@@ -1077,6 +1105,28 @@ mod tests {
         core.gk_frame(&postcard::to_allocvec(&refused).unwrap())
             .unwrap();
         assert_eq!(core.gk.copies.went_under(&[9; 16]), Some(None));
+        core.gk.take(went(6, vec![3]), &mut out);
+        core.gk_frame(&taken(&[2])).unwrap();
+        assert_eq!(
+            core.gk.copies.went_under(&[9; 16]),
+            Some(Some(6)),
+            "not for the send refused"
+        );
+        core.gk_frame(&taken(&[3])).unwrap();
+        assert_eq!(
+            core.gk.copies.went_under(&[9; 16]),
+            None,
+            "filed in the frame's call"
+        );
+        // Filed under epoch 6: offered again only under a newer head
+        let now = now_millis();
+        assert!(core.gk.copies.file(now, |_| Some(ep(6))).is_empty());
+        let again = core.gk.copies.file(now, |_| Some(ep(7)));
+        assert_eq!(again.len(), 1);
+        assert_eq!(
+            (again[0].0.envelope.as_slice(), again[0].1.epoch),
+            (&b"hi"[..], 7)
+        );
     }
 
     #[test]

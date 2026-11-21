@@ -821,13 +821,20 @@ pub(crate) async fn frame(conn: &GkLink, msg: &ServerMessage) {
         }
         return;
     }
-    {
+    let taken = {
         let mut sig = conn.lock();
         if !sig.gk.started {
             return;
         }
         // A post's refusal to the copies before the group key sends it again
         sig.gk.copies.refused(msg);
+        sig.gk.copies.taken(msg)
+    };
+    if matches!(msg, ServerMessage::EpochPostTaken { .. }) {
+        // The relay took a post of ours: its kept copy is filed now, not at the next tick, so
+        // an app closed a moment after posting still keeps it
+        file(conn, taken.into_iter().collect()).await;
+        return;
     }
     if let Some(out) = with_gk(conn, |k, st, c| k.frame(st, msg, c)) {
         carry_out(conn, out).await;
@@ -960,6 +967,10 @@ pub(crate) async fn post(
     envelope: &[u8],
     kept: Option<(String, u64, Option<u32>)>,
 ) -> Result<(), String> {
+    if let Some(said) = not_sent(channel_id, envelope) {
+        emit_server(&conn.app, &conn.server, "channel-not-sent", said);
+        return Ok(());
+    }
     let post = EarlyPost {
         post_id: rand::random(),
         envelope: envelope.to_vec(),
@@ -980,6 +991,25 @@ pub(crate) async fn post(
     Ok(())
 }
 
+/// A post the relay would refuse as too large, sealed under the key (a forward of a long
+/// message, say: the composer counts only what is typed), goes nowhere, its kept copy with it:
+/// `channel-not-sent`, under the message id its envelope carries, so its row (shown as sent by
+/// `send_channel_message`, before or after this) says so. The relay's refusal would name no
+/// message (`EarlyPost::fits`, the group key's own rule). `None`: it goes.
+fn not_sent(channel_id: u32, envelope: &[u8]) -> Option<serde_json::Value> {
+    if EarlyPost::fits(envelope.len(), true) {
+        return None;
+    }
+    let id = voipc_crypto::open_envelope(envelope).id;
+    Some(not_sent_said(channel_id, id))
+}
+
+/// `channel-not-sent` for message `id` in `channel_id`, in the relay's words (also the old
+/// path's, network.rs `drain_pending_channel_messages`).
+pub(crate) fn not_sent_said(channel_id: u32, id: Option<String>) -> serde_json::Value {
+    json!({ "channel_id": channel_id, "message_id": id, "reason": EarlyPost::TOO_LARGE })
+}
+
 /// "Help hold keys" switched while connected.
 pub(crate) async fn set_volunteer(conn: &GkLink, on: bool) {
     if !conn.lock().gk.started {
@@ -995,21 +1025,21 @@ pub(crate) async fn set_volunteer(conn: &GkLink, on: bool) {
 }
 
 /// The connection ends: posts still held are given up, a keyholder's resigns go before the
-/// `Disconnect`, the copies of posts that went are filed as they stand, and the floors are
-/// kept.
+/// `Disconnect`, copies the relay did not say it took are given up (`Copies::end`), and the
+/// floors are kept.
 pub(crate) async fn end(conn: &GkLink) {
-    let (out, rest) = {
+    let out = {
         let mut sig = conn.lock();
         if !sig.gk.started {
             return;
         }
         sig.gk.started = false;
-        let rest = sig.gk.copies.end();
+        // A copy is kept only on the relay's word that it took the post (`Copies::end`)
+        sig.gk.copies.end();
         let early = sig.gk.early.end();
-        (then(sig.gk.keying.end(), early), rest)
+        then(sig.gk.keying.end(), early)
     };
     carry_out(conn, out).await;
-    file(conn, rest).await;
     save(conn);
 }
 
@@ -1083,7 +1113,8 @@ async fn tick(conn: &GkLink) {
     file(conn, due).await;
 }
 
-/// Every keyholder job waiting, each run whole on a blocking thread while the lock is free.
+/// Every keyholder job waiting, each stepped to its end on a blocking thread while the lock is
+/// free (a job whose due went stops at its next step).
 async fn builds(conn: &GkLink) {
     loop {
         let job = conn.lock().gk.keying.take_build();
@@ -1359,6 +1390,24 @@ mod tests {
                 }
             ]
         );
+    }
+
+    /// Item J9W-1: a post past what the relay takes, sealed under the key, is said not sent
+    /// under its envelope's message id, the relay's words why; one that fits goes.
+    #[test]
+    fn a_post_too_large_sealed_is_said_not_sent_under_its_message_id() {
+        let id = voipc_crypto::new_message_id();
+        let long = voipc_crypto::envelope::envelope(&id, &"z".repeat(16 * 1024), None);
+        assert_eq!(
+            not_sent(7, &long),
+            Some(json!({
+                "channel_id": 7,
+                "message_id": id,
+                "reason": "post too large: one message holds at most 16 KiB",
+            }))
+        );
+        let short = voipc_crypto::envelope::envelope(&id, &"z".repeat(15 * 1024), None);
+        assert_eq!(not_sent(7, &short), None);
     }
 
     #[test]

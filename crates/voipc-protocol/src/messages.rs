@@ -2674,6 +2674,11 @@ pub enum ServerMessage {
     /// To an account's sessions: `left` groups are not yet re-seated at seat-key counter
     /// `n`.
     EpochReseated { n: u32, left: u32 },
+    /// To the writer's own connection: its `EpochPost` in `group` was taken (went to the
+    /// channel's readers), never sent for one refused. `post` is the first 16 bytes of
+    /// SHA-256 over the post's `ciphertext` (voipc-crypto `group_key::wire::post_digest`): the
+    /// app files that post's kept copy now, under the epoch it went under.
+    EpochPostTaken { group: String, post: [u8; 16] },
 }
 
 /// A relay's refusal of `AccountRequest::KeyChallenge` for an account whose password is not a

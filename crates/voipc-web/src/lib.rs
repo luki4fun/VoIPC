@@ -870,6 +870,21 @@ pub fn max_relay_ciphertext() -> usize {
     voipc_protocol::codec::MAX_RELAY_CIPHERTEXT
 }
 
+/// Whether a channel post of `len` envelope bytes, sealed as it goes (`under_key`: an
+/// `EpochPost`; else the old path's `SendEncryptedChannelMessage`), stays within what the relay
+/// takes (`EarlyPost::fits`, the group key's own rule). The page sends none past it, and
+/// marks its row as not sent.
+#[wasm_bindgen(js_name = postFits)]
+pub fn post_fits(len: usize, under_key: bool) -> bool {
+    voipc_crypto::group_state::EarlyPost::fits(len, under_key)
+}
+
+/// The most a channel post's ciphertext may be (`EarlyPost::MAX_SEALED`).
+#[wasm_bindgen(js_name = maxPostSealed)]
+pub fn max_post_sealed() -> usize {
+    voipc_crypto::group_state::EarlyPost::MAX_SEALED
+}
+
 /// Of the members who offer a channel's recent chat, the few actually asked —
 /// picked at random, so a whole server reconnecting does not aim every request
 /// at the same two or three people.

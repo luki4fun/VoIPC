@@ -894,6 +894,38 @@ pub async fn send_channel_message(
     let message_id = crypto::new_message_id();
     let extras = checked_extras(reply_to, thread, file, fwd, event)?;
     let payload = crypto::envelope_with(&message_id, &content, ttl_secs, &extras);
+    // One the relay would refuse as too large, sealed as it goes (a forward of a long message,
+    // say: the composer counts only what is typed), goes nowhere, kept copy and all, and its
+    // row says so: the relay's refusal would name no message (`EarlyPost::fits`)
+    if !voipc_crypto::group_state::EarlyPost::fits(payload.len(), group_key) {
+        let too_large = voipc_crypto::group_state::EarlyPost::TOO_LARGE;
+        // An edit, a reaction: no row of its own to mark, and none done
+        if extras.event.is_some() {
+            return Err(too_large.into());
+        }
+        network::emit_server(
+            &app_handle,
+            &server,
+            "channel-chat-message",
+            serde_json::json!({
+                "channel_id": channel_id,
+                "user_id": user_id,
+                "username": username,
+                "content": content,
+                "timestamp": crypto::now_ms(),
+                "message_id": message_id,
+                "ttl_secs": ttl_secs,
+                "reply_to": extras.reply,
+                "thread": extras.thread,
+                "file": extras.file,
+                "fwd": extras.fwd,
+                "event": extras.event,
+                "encrypted": true,
+                "not_sent": too_large,
+            }),
+        );
+        return Ok(());
+    }
 
     // A channel with a log keeps it for its members too (cloud copies on),
     // whether or not anybody is here to read it now. Under the group key a text

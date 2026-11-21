@@ -188,7 +188,8 @@ pub struct Holding<'a> {
     /// the keyring's digests.
     pub lists: &'a Lists,
     /// The newest seed each seat holds, as the relay said with the due.
-    pub held: &'a dyn Fn(&SeatRef) -> Option<u32>,
+    /// `Sync`, so a build in steps (`steps`) stays `Send`.
+    pub held: &'a (dyn Fn(&SeatRef) -> Option<u32> + Sync),
     pub rolls: SeedRolls,
     pub stored: bool,
 }
@@ -325,8 +326,9 @@ fn seat_welcome_agreed(
 
 /// Every row to `seats` of version `at`, packed in list order, each under
 /// the seed `seed_of` gives (which differ by at most one: `RowsOut.up`).
+/// A step may stop after each row (its row base made, if not kept).
 #[allow(clippy::too_many_arguments)]
-fn rows_to(
+async fn rows_to(
     g: &Group,
     at: Version,
     bk: &[u8; 32],
@@ -334,7 +336,7 @@ fn rows_to(
     seed_of: &[u32],
     seeds: &[(u32, Zeroizing<[u8; 32]>)],
     dh: &HashMap<SeatRef, &[u8]>,
-    me: &Me,
+    me: &Me<'_>,
     cache: &mut RowBases,
 ) -> Result<RowsOut, BuildError> {
     let s = seed_of.iter().copied().min().unwrap_or(0);
@@ -363,6 +365,7 @@ fn rows_to(
             .get(seat)
             .ok_or(BuildError::Refuse("a seat with no dh in its list"))?;
         rows.extend(cache.base(g, si, me, seat, d, &s_m)?.row(at, bk));
+        steps::unit().await;
     }
     Ok(RowsOut {
         b: at.b,
@@ -376,13 +379,14 @@ fn rows_to(
 /// New buckets for `joiners` (a Join, or a start's own seat): at most 62 a
 /// bucket, accounts and connections apart, in list order. Each gets a
 /// welcome, or a row when returning; every seat of a version gets a row
-/// when one does, and in a stored group every account version does.
+/// when one does, and in a stored group every account version does. A step
+/// may stop after each seat's agreement and row, and after its welcome.
 #[allow(clippy::too_many_arguments)]
-fn seat_joiners(
+async fn seat_joiners(
     g: &Group,
     s: u32,
     seed: &[u8; 32],
-    me: &Me,
+    me: &Me<'_>,
     joiners: &[&Joiner],
     stored: bool,
     now: u64,
@@ -442,6 +446,7 @@ fn seat_joiners(
                     rows.extend(cache.put(g, s, me, seat, rb).row(at, &bk));
                 }
                 if !j.returning {
+                    steps::unit().await;
                     let to = Them {
                         m: seat.m,
                         keys: &j.keys,
@@ -455,6 +460,7 @@ fn seat_joiners(
                         bytes,
                     });
                 }
+                steps::unit().await;
             }
             out.push(Made {
                 bucket: KeyringBucket {
@@ -505,14 +511,26 @@ fn counts(buckets: &[KeyringBucket]) -> Result<(u32, u32, u32, [u8; 32]), GkErro
 }
 
 fn seals(g: &Group, ep: &Epoch, ck: &[u8; 32], buckets: &[&KeyringBucket]) -> Vec<SealOut> {
-    buckets
-        .iter()
-        .map(|kb| SealOut {
+    steps::whole(seals_in_steps(g, ep, ck, buckets))
+}
+
+/// `seals`, a step stopping after any seal.
+async fn seals_in_steps(
+    g: &Group,
+    ep: &Epoch,
+    ck: &[u8; 32],
+    buckets: &[&KeyringBucket],
+) -> Vec<SealOut> {
+    let mut out = Vec::with_capacity(buckets.len());
+    for kb in buckets {
+        out.push(SealOut {
             b: kb.b,
             v: kb.v,
             bytes: seal(g, ep, kb.version(), &kb.bk, ck),
-        })
-        .collect()
+        });
+        steps::unit().await;
+    }
+    out
 }
 
 fn names(gated: bool, added: Vec<AddedSeat>, removed: Vec<SeatRef>) -> (Added, Removed) {
@@ -568,7 +586,8 @@ pub fn build_genesis(st: &Start, cache: &mut RowBases) -> Result<Built, BuildErr
     build_anew(st, None, cache)
 }
 
-/// A Regenesis (§4.3): after an hour with no keyholder online, the next
+/// A Regenesis (§4.3): after an hour with no keyholder online (2 minutes
+/// for a set of connection entries alone, `rules::regenesis_wait`), the next
 /// epoch of the same generation under a new seed that every seat is
 /// welcomed to anew, as Join commits seat them. `exits` is the closed batch
 /// the due carries, if any.
@@ -603,10 +622,21 @@ fn build_anew(
         ),
         Some((p, exits, upto)) => {
             let ph = p.header();
-            if st.now < ph.time.saturating_add(REGENESIS_WAIT) {
-                return Err(BuildError::Refuse(
-                    "a Regenesis waits an hour after its parent",
-                ));
+            // The wait its set in force allows (`regenesis_wait`, "Fast new start"): known
+            // here where the head sets keyholders; else the shortest, and the volunteer's own
+            // check (`validate`, over the keyholder header in force it holds) holds it to
+            // the rest
+            let wait = if ph.kind.sets_keyholders() {
+                super::regenesis_wait(ph, st.now)
+            } else {
+                super::REGENESIS_FAST_WAIT
+            };
+            if st.now < ph.time.saturating_add(wait) {
+                return Err(BuildError::Refuse(if wait >= REGENESIS_WAIT {
+                    "a Regenesis waits an hour after its parent"
+                } else {
+                    "a Regenesis waits two minutes after its parent"
+                }));
             }
             let upto = if exits.is_empty() {
                 ph.exits_upto
@@ -631,9 +661,9 @@ fn build_anew(
     let ck = Zeroizing::new(crate::aead::random());
     cache.bind(&g, s, &seed);
     let mut ids = Ids::of(None);
-    let made = seat_joiners(
+    let made = steps::whole(seat_joiners(
         &g, s, &seed, &st.me, st.joiners, st.stored, st.now, &mut ids, cache, None,
-    )?;
+    ))?;
     let mut buckets: Vec<KeyringBucket> = made.iter().map(|m| m.bucket.clone()).collect();
     buckets.sort_by_key(|b| b.b);
     let (seats, n_buckets, conn_seats, root) = counts(&buckets)?;
@@ -739,6 +769,19 @@ pub fn build_join(
     cache: &mut RowBases,
     reuse: Option<&Built>,
 ) -> Result<Built, BuildError> {
+    steps::whole(join_in_steps(hold, joiners, refused, now, cache, reuse))
+}
+
+/// `build_join` in steps (`steps`): one may stop after each seat's row and
+/// its welcome, the bucket root, the signature and each seal.
+pub async fn join_in_steps(
+    hold: &Holding<'_>,
+    joiners: &[&Joiner],
+    refused: Vec<Refused>,
+    now: u64,
+    cache: &mut RowBases,
+    reuse: Option<&Built>,
+) -> Result<Built, BuildError> {
     let g = hold.g;
     let head = hold.head.header();
     let s = head.seed;
@@ -759,13 +802,15 @@ pub fn build_join(
         &mut ids,
         cache,
         reuse,
-    )?;
+    )
+    .await?;
     let mut new: Vec<KeyringBucket> = made.iter().map(|m| m.bucket.clone()).collect();
     new.sort_by_key(|b| b.b);
     let mut all: Vec<KeyringBucket> = hold.ring.buckets.clone();
     all.extend(new.iter().cloned());
     all.sort_by_key(|b| b.b);
     let (seats, n_buckets, conn_seats, root) = counts(&all)?;
+    steps::unit().await;
     let ks = keyholder_set_digest(&hold.kh.header().keyholders);
     let join = head.join + 1;
     let delta = KeyringDelta {
@@ -800,10 +845,12 @@ pub fn build_join(
         ..head.clone()
     };
     let sh = sign(h, Some(hold.head), hold.ik)?;
+    steps::unit().await;
     let ep = Epoch {
         e: head.epoch,
         d_e: hold.head.d_e(),
     };
+    let seals = seals_in_steps(g, &ep, &ck, &new.iter().collect::<Vec<_>>()).await;
     let commit = Commit {
         body: sh.body().to_vec(),
         sig: sh.sig().to_vec(),
@@ -813,7 +860,7 @@ pub fn build_join(
             .collect(),
         welcomes: made.iter().flat_map(|m| m.welcomes.clone()).collect(),
         rows: made.iter().filter_map(|m| m.rows.clone()).collect(),
-        seals: seals(g, &ep, &ck, &new.iter().collect::<Vec<_>>()),
+        seals,
         keyring: sealed,
         refused,
         ..Commit::default()
@@ -1050,8 +1097,9 @@ pub struct OpeningAsk<'a> {
     pub finish: bool,
     /// The KEM keys of seats the new floor may drop (`EpochDue.seed_seats`).
     pub seed_seats: &'a HashMap<SeatRef, SeatPublic>,
-    /// Every keyholder's pair, for its `KRK` welcome.
-    pub pairs: &'a dyn Fn(&Keyholder) -> Option<SeatPublic>,
+    /// Every keyholder's pair, for its `KRK` welcome (`Sync`, as `Holding`'s
+    /// `held`).
+    pub pairs: &'a (dyn Fn(&Keyholder) -> Option<SeatPublic> + Sync),
     pub now: u64,
 }
 
@@ -1062,6 +1110,19 @@ pub struct OpeningAsk<'a> {
 pub fn build_opening(
     hold: &Holding,
     ask: &OpeningAsk,
+    cache: &mut RowBases,
+    reuse: Option<&Built>,
+) -> Result<Built, BuildError> {
+    steps::whole(opening_in_steps(hold, ask, cache, reuse))
+}
+
+/// `build_opening` in steps (`steps`): one may stop after each list it
+/// checks, each bucket's seats it reads, each row, each ratchet, the
+/// keyring's seal, the bucket root, the signature, each `KRK` welcome, each
+/// seed welcome and each seal.
+pub async fn opening_in_steps(
+    hold: &Holding<'_>,
+    ask: &OpeningAsk<'_>,
     cache: &mut RowBases,
     reuse: Option<&Built>,
 ) -> Result<Built, BuildError> {
@@ -1208,6 +1269,7 @@ pub fn build_opening(
             dh.insert(l.seat, &l.dh);
         }
         lists.insert(at.b, seats);
+        steps::unit().await;
     }
     for x in ask.exits {
         if lists.get(&x.b).is_some_and(|l| !l.contains(&x.seat)) {
@@ -1234,6 +1296,7 @@ pub fn build_opening(
                 _ => return Err(BuildError::Refuse("a seat on a seed the floor drops")),
             }
         }
+        steps::unit().await;
     }
     let seed_of = |seat: &SeatRef| -> Result<u32, BuildError> {
         if seed_welcomed.contains(seat) {
@@ -1305,6 +1368,7 @@ pub fn build_opening(
                     rows: None,
                     welcomes: vec![],
                 });
+                steps::unit().await;
             }
             Step::ReKey => {
                 let all = &lists[&kb.b];
@@ -1314,7 +1378,9 @@ pub fn build_opening(
                     .enumerate()
                     .filter(|(_, s)| !leaving.contains(s))
                     .fold(0u64, |m, (i, _)| m | (1 << i));
-                let m = rk.version(kb.b, kb.pool, &seats, &[kb.leaf()], cache, &mut ids)?;
+                let m = rk
+                    .version(kb.b, kb.pool, &seats, &[kb.leaf()], cache, &mut ids)
+                    .await?;
                 versions.push(version_out(&m, Make::Keep { from_v: kb.v, mask }));
                 after.push(m.bucket.clone());
                 made.push(m);
@@ -1327,7 +1393,7 @@ pub fn build_opening(
             let b = rk
                 .stale(chunk, *pool, &from)
                 .map_or_else(|| ids.bucket(), |m| m.bucket.b);
-            let m = rk.version(b, *pool, chunk, &from, cache, &mut ids)?;
+            let m = rk.version(b, *pool, chunk, &from, cache, &mut ids).await?;
             versions.push(version_out(&m, Make::Seats(chunk.to_vec())));
             after.push(m.bucket.clone());
             made.push(m);
@@ -1363,7 +1429,9 @@ pub fn build_opening(
         buckets: after.clone(),
     };
     let sealed = seal_base(g, s, &ks, &krk, &base);
+    steps::unit().await;
     let (seats_n, n_buckets, conn_seats, root) = counts(&after)?;
+    steps::unit().await;
     let (added, removed) = names(
         ask.gated,
         vec![],
@@ -1394,6 +1462,7 @@ pub fn build_opening(
         ..head.clone()
     };
     let sh = sign(h, Some(hold.head), hold.ik)?;
+    steps::unit().await;
     let ep = Epoch { e, d_e: sh.d() };
 
     let mut krk_out = Vec::new();
@@ -1428,6 +1497,7 @@ pub fn build_opening(
                 from_kx: own.kx,
                 bytes: keyring_welcome(g, s, e, &ks, &hold.me, &to, &krk)?,
             });
+            steps::unit().await;
         }
     }
     let mut seed_welcomes = Vec::new();
@@ -1448,15 +1518,17 @@ pub fn build_opening(
                 seat,
                 bytes: seed_welcome(g, s, row_me, &to, &s_m)?,
             });
+            steps::unit().await;
         }
     }
+    let seals = seals_in_steps(g, &ep, &ck, &after.iter().collect::<Vec<_>>()).await;
     let commit = Commit {
         body: sh.body().to_vec(),
         sig: sh.sig().to_vec(),
         versions,
         drops,
         rows: made.iter().filter_map(|m| m.rows.clone()).collect(),
-        seals: seals(g, &ep, &ck, &after.iter().collect::<Vec<_>>()),
+        seals,
         seed_welcomes,
         keyring: sealed,
         krk: krk_out,
@@ -1480,7 +1552,7 @@ pub fn build_opening(
 /// What every re-version by rows of one opening shares.
 struct Rekeying<'x> {
     g: &'x Group,
-    seed_of: &'x dyn Fn(&SeatRef) -> Result<u32, BuildError>,
+    seed_of: &'x (dyn Fn(&SeatRef) -> Result<u32, BuildError> + Sync),
     seeds: &'x [(u32, Zeroizing<[u8; 32]>)],
     /// The seed numbers whose seed the stale attempt drew the same.
     same_seeds: &'x HashSet<u32>,
@@ -1510,8 +1582,9 @@ impl Rekeying<'_> {
 
     /// A version by rows for `seats` in bucket `b`: reused from the stale
     /// attempt where `reusable` allows (its rows too, if every seat's seed is
-    /// the same number and the same draw), else a new id and `BK`.
-    fn version(
+    /// the same number and the same draw), else a new id and `BK`. A step
+    /// may stop after each row.
+    async fn version(
         &self,
         b: u64,
         pool: Pool,
@@ -1547,9 +1620,12 @@ impl Rekeying<'_> {
             {
                 r
             }
-            _ => rows_to(
-                self.g, at, &bk, seats, &seed_list, self.seeds, self.dh, self.me, cache,
-            )?,
+            _ => {
+                rows_to(
+                    self.g, at, &bk, seats, &seed_list, self.seeds, self.dh, self.me, cache,
+                )
+                .await?
+            }
         };
         Ok(Made {
             bucket: KeyringBucket {
@@ -1581,25 +1657,215 @@ pub fn build_seed_welcomes(
     me: &Me,
     seats: &[(SeatRef, SeatPublic)],
 ) -> Result<Vec<SeedWelcomeOut>, BuildError> {
-    seats
-        .iter()
-        .map(|(seat, keys)| {
-            if keys.seat(seat.m) != *seat {
-                return Err(GkError::Forged.into());
-            }
-            let s_m = member_secret(g, s, seed, seat);
-            let to = Them { m: seat.m, keys };
-            Ok(SeedWelcomeOut {
-                seat: *seat,
-                bytes: seed_welcome(g, s, me, &to, &s_m)?,
-            })
-        })
-        .collect()
+    steps::whole(seed_welcomes_in_steps(g, s, seed, me, seats))
+}
+
+/// `build_seed_welcomes` in steps (`steps`): one may stop after each welcome.
+pub async fn seed_welcomes_in_steps(
+    g: &Group,
+    s: u32,
+    seed: &[u8; 32],
+    me: &Me<'_>,
+    seats: &[(SeatRef, SeatPublic)],
+) -> Result<Vec<SeedWelcomeOut>, BuildError> {
+    let mut out = Vec::with_capacity(seats.len());
+    for (seat, keys) in seats {
+        if keys.seat(seat.m) != *seat {
+            return Err(GkError::Forged.into());
+        }
+        let s_m = member_secret(g, s, seed, seat);
+        let to = Them { m: seat.m, keys };
+        out.push(SeedWelcomeOut {
+            seat: *seat,
+            bytes: seed_welcome(g, s, me, &to, &s_m)?,
+        });
+        steps::unit().await;
+    }
+    Ok(out)
 }
 
 /// `tag(KX)` of a raw key, as `KeyholdReplace` names an old pair.
 pub fn kx_tag(kx: &[u8; 32]) -> [u8; 8] {
     tag(&[&[0x05u8][..], kx].concat())
+}
+
+// ── Builds in steps ───────────────────────────────────────────────────────
+
+pub mod steps {
+    //! A build cut into steps (plan 3b): a browser keyholder builds on its
+    //! page's thread, where a long build is a frozen page and, in a call, a
+    //! gap in its voice. The builders are `async`, and between any two
+    //! indivisible units of work (one row and its row base, one welcome's
+    //! KEM, one seal, one list's digest, the keyring's seal, the bucket
+    //! root, the signature) they pass a `unit()`; `step` polls one with a
+    //! budget, and a unit that finds the budget spent ends the step there.
+    //! The next step goes on from that unit with everything the build had.
+    //!
+    //! A build is the same code whole or in steps: `whole` polls it with no
+    //! budget, where no unit ever stops it. Nothing in a step waits on
+    //! anything; the future is only a way to stop and go on.
+
+    use std::cell::Cell;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll, Waker};
+    use std::time::Duration;
+
+    /// The step running on this thread: when it began and may run to, by
+    /// its clock, and the units it did.
+    #[derive(Clone, Copy)]
+    struct Slice {
+        start: f64,
+        budget: f64,
+        units: u64,
+        clock: fn() -> f64,
+    }
+
+    thread_local! {
+        static SLICE: Cell<Option<Slice>> = const { Cell::new(None) };
+    }
+
+    /// Puts back the slice a poll found, also when the build panics.
+    struct Restore(Option<Slice>);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SLICE.with(|s| s.set(self.0.take()));
+        }
+    }
+
+    /// The end of one unit of work: a step whose budget is spent stops
+    /// here, and the next goes on from here. Outside `step`, nothing.
+    pub fn unit() -> Unit {
+        Unit { stopped: false }
+    }
+
+    /// See `unit`.
+    pub struct Unit {
+        stopped: bool,
+    }
+
+    impl Future for Unit {
+        type Output = ();
+
+        fn poll(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+            if self.stopped {
+                return Poll::Ready(());
+            }
+            let spent = SLICE.with(|s| {
+                let mut slice = s.get()?;
+                slice.units += 1;
+                s.set(Some(slice));
+                Some((slice.clock)() - slice.start >= slice.budget)
+            });
+            if spent == Some(true) {
+                self.stopped = true;
+                Poll::Pending
+            } else {
+                Poll::Ready(())
+            }
+        }
+    }
+
+    /// Before a block that cannot be cut (the validator over a whole
+    /// commit): a step that did any unit stops here, so the block begins a
+    /// step of its own rather than adding to a spent one.
+    pub fn fresh() -> Fresh {
+        Fresh { stopped: false }
+    }
+
+    /// See `fresh`.
+    pub struct Fresh {
+        stopped: bool,
+    }
+
+    impl Future for Fresh {
+        type Output = ();
+
+        fn poll(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+            if self.stopped {
+                return Poll::Ready(());
+            }
+            if SLICE.with(|s| s.get().is_some_and(|slice| slice.units > 0)) {
+                self.stopped = true;
+                Poll::Pending
+            } else {
+                Poll::Ready(())
+            }
+        }
+    }
+
+    /// Runs a build to its end at once: no unit stops it (`build_join` and
+    /// the others, and anything a step runs whole inside it).
+    pub fn whole<F: Future>(f: F) -> F::Output {
+        let _restore = Restore(SLICE.with(|s| s.take()));
+        let mut f = std::pin::pin!(f);
+        let mut cx = Context::from_waker(Waker::noop());
+        loop {
+            if let Poll::Ready(out) = f.as_mut().poll(&mut cx) {
+                return out;
+            }
+        }
+    }
+
+    /// One step of a build: it runs until a unit finds `budget` spent by
+    /// `clock` (milliseconds), or to its end. What it made if it ended, and
+    /// the units the step did. A zero budget stops at the first unit, so
+    /// every step does at least one, and the build always ends.
+    pub fn step_by<F: Future + ?Sized>(
+        f: Pin<&mut F>,
+        budget: Duration,
+        clock: fn() -> f64,
+    ) -> (Option<F::Output>, u64) {
+        let slice = Slice {
+            start: clock(),
+            budget: budget.as_secs_f64() * 1e3,
+            units: 0,
+            clock,
+        };
+        let restore = Restore(SLICE.with(|s| s.replace(Some(slice))));
+        let out = f.poll(&mut Context::from_waker(Waker::noop()));
+        let units = SLICE.with(|s| s.get()).map_or(0, |s| s.units);
+        drop(restore);
+        match out {
+            Poll::Ready(out) => (Some(out), units),
+            Poll::Pending => (None, units),
+        }
+    }
+
+    /// `step_by` on this device's clock.
+    pub fn step<F: Future + ?Sized>(f: Pin<&mut F>, budget: Duration) -> (Option<F::Output>, u64) {
+        step_by(f, budget, clock_ms)
+    }
+
+    /// A monotonic clock in milliseconds.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn clock_ms() -> f64 {
+        use std::sync::OnceLock;
+        use std::time::Instant;
+        static START: OnceLock<Instant> = OnceLock::new();
+        START.get_or_init(Instant::now).elapsed().as_secs_f64() * 1e3
+    }
+
+    /// A monotonic clock in milliseconds: the page's `performance.now()`
+    /// (`Instant` panics on wasm32), else its `Date.now()`. One import, read
+    /// at every unit.
+    #[cfg(target_arch = "wasm32")]
+    pub fn clock_ms() -> f64 {
+        page::performance_now().unwrap_or_else(|_| js_sys::Date::now())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    mod page {
+        use js_sys::wasm_bindgen::prelude::wasm_bindgen;
+        use js_sys::wasm_bindgen::JsValue;
+
+        #[wasm_bindgen(wasm_bindgen = js_sys::wasm_bindgen)]
+        extern "C" {
+            #[wasm_bindgen(catch, js_namespace = performance, js_name = now)]
+            pub fn performance_now() -> Result<f64, JsValue>;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2175,6 +2441,20 @@ pub(crate) mod world {
             replacing: Option<&Holder>,
             reuse: Option<&Built>,
         ) -> Result<Built, BuildError> {
+            self.opening_with(i, due, finish, replacing, |hold, ask, cache| {
+                build_opening(hold, ask, cache, reuse)
+            })
+        }
+
+        /// `opening_by`'s holding and ask, handed to `run` (a builder whole or in steps).
+        pub(crate) fn opening_with<R>(
+            &mut self,
+            i: usize,
+            due: &Due,
+            finish: bool,
+            replacing: Option<&Holder>,
+            run: impl FnOnce(&Holding, &OpeningAsk, &mut RowBases) -> R,
+        ) -> R {
             self.with_holding(i, |hold, cache, w| {
                 let pairs = |k: &Keyholder| w.pair_of(k);
                 let replace = replacing.map(|r| Replacing {
@@ -2195,7 +2475,7 @@ pub(crate) mod world {
                     pairs: &pairs,
                     now: w.now,
                 };
-                build_opening(hold, &ask, cache, reuse)
+                run(hold, &ask, cache)
             })
         }
 
@@ -2388,11 +2668,25 @@ mod tests {
             ..w.due(DueKind::Regenesis)
         };
         let head = w.head.clone();
-        w.tick(1800);
+        w.tick(60);
         assert_eq!(
             World::build_start(&vol, w.kind, w.id, true, &due, w.now, Some(&head)).err(),
             Some(BuildError::Refuse(
-                "a Regenesis waits an hour after its parent"
+                "a Regenesis waits two minutes after its parent"
+            ))
+        );
+        // The set in force holds a desktop's pair, which the builder does not see under a
+        // Join head: it makes the commit, and the volunteer's own check refuses it
+        w.tick(1740);
+        let early = World::build_start(&vol, w.kind, w.id, true, &due, w.now, Some(&head)).unwrap();
+        w.no_keyholder_since = Some(w.now - 1800);
+        assert_eq!(
+            w.check(&due, vol.by(), &early.commit)
+                .err()
+                .map(|b| (b.rule, b.detail)),
+            Some((
+                4,
+                r#"Generation("a Regenesis comes an hour after its parent")"#.into()
             ))
         );
         w.tick(1800);
@@ -3056,5 +3350,375 @@ mod tests {
         for i in 0..leaves.len() {
             assert_eq!(tree.path(i), inclusion_path(&leaves, i));
         }
+    }
+
+    // ── Builds in steps (`steps`) ─────────────────────────────────────────
+
+    use std::cell::Cell;
+    use std::future::Future;
+    use std::time::Duration;
+
+    use crate::group_key::commit::Joiner;
+    use crate::group_key::ctx::MemberId;
+
+    /// What a build run in steps did.
+    #[derive(Debug, Default)]
+    struct Ran {
+        steps: u64,
+        units: u64,
+        /// The most units one step did.
+        most: u64,
+    }
+
+    /// `f` run in steps of `budget` on `clock`, to its end.
+    fn in_steps<F: Future>(f: F, budget: Duration, clock: fn() -> f64) -> (F::Output, Ran) {
+        let mut f = std::pin::pin!(f);
+        let mut ran = Ran::default();
+        loop {
+            let (out, units) = steps::step_by(f.as_mut(), budget, clock);
+            ran.steps += 1;
+            ran.units += units;
+            ran.most = ran.most.max(units);
+            if let Some(out) = out {
+                return (out, ran);
+            }
+            assert!(ran.steps < 10_000_000, "a build in steps ends");
+        }
+    }
+
+    /// In steps of a zero budget: one unit each.
+    fn unit_steps<F: Future>(f: F) -> (F::Output, Ran) {
+        in_steps(f, Duration::ZERO, steps::clock_ms)
+    }
+
+    thread_local! {
+        static TICKS: Cell<f64> = const { Cell::new(0.0) };
+    }
+
+    /// A clock that moves on a millisecond each time it is read: as if each unit took one.
+    fn ticking() -> f64 {
+        TICKS.with(|t| {
+            t.set(t.get() + 1.0);
+            t.get()
+        })
+    }
+
+    /// What a commit makes, less what its build draws at random (the ids of new buckets
+    /// and versions, `BK`, `CK`, `KRK`, a new seed, the welcomes' KEM and ephemeral keys):
+    /// whole or in steps, the same.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Shape {
+        header: Vec<String>,
+        versions: Vec<(String, Pool, Make)>,
+        drops: Vec<u64>,
+        rows: Vec<(String, u32, u64, usize)>,
+        welcomes: Vec<(SeatRef, String, u32)>,
+        seed_welcomes: Vec<SeatRef>,
+        krk: Vec<(HolderRef, [u8; 32])>,
+        seals: Vec<String>,
+        refused: Vec<Refused>,
+        sealed_to: Vec<SeatRef>,
+        made: Vec<(Vec<SeatRef>, Vec<Leaf>, bool)>,
+    }
+
+    fn shape(b: &Built) -> Shape {
+        let h = b.header.header();
+        // A version by the bucket it goes on from, else (a new bucket) by its first seat
+        let mut name: HashMap<(u64, u64), String> = HashMap::new();
+        for vo in &b.commit.versions {
+            let n = match &vo.make {
+                Make::Seats(seats) => format!("new {:?}", seats.first()),
+                Make::Keep { from_v, .. } | Make::Ratchet { from_v } => {
+                    format!("{} from {from_v}", vo.b)
+                }
+            };
+            name.insert((vo.b, vo.v), n);
+        }
+        let named = |b: u64, v: u64| {
+            name.get(&(b, v))
+                .cloned()
+                .unwrap_or_else(|| format!("{b}.{v} as it was"))
+        };
+        let mut seals: Vec<String> = b.commit.seals.iter().map(|x| named(x.b, x.v)).collect();
+        seals.sort();
+        Shape {
+            header: vec![
+                format!(
+                    "{:?}",
+                    (h.group_kind, &h.group, h.gen, h.epoch, h.join, h.kind)
+                ),
+                format!(
+                    "{:?}",
+                    (h.time, h.parent, h.epoch_parent, h.kh_parent, h.signer)
+                ),
+                format!(
+                    "{:?}",
+                    (&h.keyholders, h.gated, h.seed, h.seed_floor, h.exits_upto)
+                ),
+                format!(
+                    "{:?}",
+                    (h.seats, h.buckets, h.conn_seats, &h.added, &h.removed)
+                ),
+                format!("{:?}", h.names_hash),
+            ],
+            versions: b
+                .commit
+                .versions
+                .iter()
+                .map(|vo| (named(vo.b, vo.v), vo.pool, vo.make.clone()))
+                .collect(),
+            drops: b.commit.drops.clone(),
+            rows: b
+                .commit
+                .rows
+                .iter()
+                .map(|r| (named(r.b, r.v), r.s, r.up, r.rows.len() / ROW_BYTES))
+                .collect(),
+            welcomes: b
+                .commit
+                .welcomes
+                .iter()
+                .map(|x| (x.seat, named(x.b, x.v), x.s))
+                .collect(),
+            seed_welcomes: b.commit.seed_welcomes.iter().map(|x| x.seat).collect(),
+            krk: b.commit.krk.iter().map(|x| (x.to, x.from_kx)).collect(),
+            seals,
+            refused: b.commit.refused.clone(),
+            sealed_to: b.sealed_to.clone(),
+            made: b
+                .made
+                .iter()
+                .map(|m| (m.seats.clone(), m.from.clone(), m.rows.is_some()))
+                .collect(),
+        }
+    }
+
+    /// `whole` and `stepped`, both built for `due` by holder `i` on the same head: the
+    /// relay's check takes both, they make the same, and the steps did one unit each, at
+    /// least one for each row, welcome and seal.
+    fn twins(w: &World, i: usize, due: &Due, whole: &Built, stepped: &Built, ran: &Ran) {
+        let by = w.holders[i].by();
+        w.check(due, by, &whole.commit)
+            .unwrap_or_else(|bad| panic!("whole: {bad}"));
+        w.check(due, by, &stepped.commit)
+            .unwrap_or_else(|bad| panic!("in steps: {bad}"));
+        assert_eq!(shape(whole), shape(stepped));
+        let c = &stepped.commit;
+        let rows: usize = c.rows.iter().map(|r| r.rows.len() / ROW_BYTES).sum();
+        let least = rows + c.welcomes.len() + c.seed_welcomes.len() + c.krk.len() + c.seals.len();
+        assert!(
+            ran.units >= least as u64,
+            "a unit for each row, welcome and seal: {ran:?}, at least {least}"
+        );
+        assert_eq!(ran.most, 1, "a zero budget does one unit a step: {ran:?}");
+        assert_eq!(
+            ran.steps,
+            ran.units + 1,
+            "every step but the last stops at its unit"
+        );
+    }
+
+    /// A Join of `seats` by holder 0, whole and in steps; the one in steps is taken.
+    fn join_twins(w: &mut World, seats: &[&Member]) -> Built {
+        let due = w.join_due(seats);
+        let whole = w.build_join(&due, None).unwrap();
+        let (stepped, ran) = w.with_holding(0, |hold, cache, w| {
+            let js: Vec<&Joiner> = due.joiners.iter().collect();
+            unit_steps(join_in_steps(hold, &js, vec![], w.now, cache, None))
+        });
+        let stepped = stepped.unwrap();
+        twins(w, 0, &due, &whole, &stepped, &ran);
+        for m in seats {
+            if let MemberId::Conn(u) = m.seat.m {
+                w.roster.push(u);
+            }
+        }
+        w.step(&due, &stepped);
+        stepped
+    }
+
+    /// An opening for `due` by holder `i`, whole and in steps; the one in steps is taken.
+    fn opening_twins(w: &mut World, i: usize, due: &Due, replacing: Option<&Holder>) -> Built {
+        let whole = w.opening_by(i, due, false, replacing, None).unwrap();
+        let (stepped, ran) = w.opening_with(i, due, false, replacing, |hold, ask, cache| {
+            unit_steps(opening_in_steps(hold, ask, cache, None))
+        });
+        let stepped = stepped.unwrap();
+        twins(w, i, due, &whole, &stepped, &ran);
+        w.step_by(i, due, &stepped);
+        stepped
+    }
+
+    #[test]
+    fn builds_in_steps_make_what_whole_builds_make_and_the_relay_takes_both() {
+        let mut w = World::text(true, false);
+        let people = accounts(10, 300);
+        let guests: Vec<Member> = (100..120).map(Member::conn).collect();
+        // A Join of 300 seats: a due seats 256 at most (`JOIN_BATCH_MAX`)
+        join_twins(&mut w, &refs(&people[..256]));
+        join_twins(&mut w, &refs(&people[256..]));
+        join_twins(&mut w, &refs(&guests));
+        assert_eq!(w.head.header().seats, 1 + 300 + 20);
+        // Exits from every bucket, and from the guests': re-keys by rows
+        let mut leaving: Vec<SeatRef> = people.iter().step_by(9).map(|p| p.seat).collect();
+        leaving.push(guests[3].seat);
+        let due = w.exits(&leaving, DueKind::Exits);
+        let b = opening_twins(&mut w, 0, &due, None);
+        assert!(
+            b.commit.versions.len() >= 5,
+            "re-keys: {:?}",
+            b.commit.versions.len()
+        );
+        // The other guests leave: their bucket is dropped
+        let gone: Vec<SeatRef> = guests
+            .iter()
+            .map(|g| g.seat)
+            .filter(|s| *s != guests[3].seat)
+            .collect();
+        let due = w.exits(&gone, DueKind::Exits);
+        let b = opening_twins(&mut w, 0, &due, None);
+        assert_eq!(b.commit.drops.len(), 1);
+        // A refresh, an hour on: every version over an hour old is re-keyed (Fresh)
+        w.tick(3700);
+        let due = w.due(DueKind::Refresh);
+        let b = opening_twins(&mut w, 0, &due, None);
+        assert_eq!(b.header.header().kind, Kind::Fresh);
+        assert!(!b.commit.rows.is_empty());
+        // A second keyholder's Add (ratchets), its pair replaced, then its Remove (re-keys all)
+        let cand = Holder::desktop(2);
+        let due = w.promote_due(&cand);
+        opening_twins(&mut w, 0, &due, None);
+        w.holders.push(cand);
+        let new = w.holders[0].rotated();
+        let due = w.replace_due(&new);
+        opening_twins(&mut w, 0, &due, Some(&new));
+        w.holders[0] = new;
+        let due = w.remove_due(1);
+        let b = opening_twins(&mut w, 0, &due, None);
+        w.holders.remove(1);
+        assert_eq!(b.header.header().kind, Kind::KeyholdersRemove);
+        assert_eq!(b.commit.krk.len(), 1);
+    }
+
+    #[test]
+    fn a_voice_removal_in_steps_welcomes_every_seat_behind_as_the_whole_one_does() {
+        let mut w = World::voice();
+        let people: Vec<Member> = (10..40).map(Member::conn).collect();
+        join_twins(&mut w, &refs(&people));
+        w.promote(Holder::conn(4));
+        let due = w.remove_due(1);
+        opening_twins(&mut w, 0, &due, None);
+        w.holders.remove(1);
+        assert_eq!(w.head.header().seed, 2, "a voice removal rolls the seed");
+        // Every seat is still on seed 1: the next removal welcomes each to seed 3
+        w.promote(Holder::conn(5));
+        let due = w.remove_due(1);
+        let b = opening_twins(&mut w, 0, &due, None);
+        w.holders.remove(1);
+        assert_eq!(b.commit.seed_welcomes.len(), 31);
+        rows_open_under_the_seed_welcomes(&w, &b, &people);
+    }
+
+    #[test]
+    fn a_seed_welcome_page_in_steps_gives_each_seat_what_the_whole_page_gives() {
+        let w = World::text(false, false);
+        let people = accounts(10, 40);
+        let seed = [9u8; 32];
+        let seats: Vec<(SeatRef, SeatPublic)> =
+            people.iter().map(|p| (p.seat, p.pair.public())).collect();
+        let me = w.holders[0].me();
+        let whole = build_seed_welcomes(&w.g, 2, &seed, &me, &seats).unwrap();
+        let (stepped, ran) = unit_steps(seed_welcomes_in_steps(&w.g, 2, &seed, &me, &seats));
+        let stepped = stepped.unwrap();
+        assert_eq!((ran.units, ran.most, ran.steps), (40, 1, 41));
+        let k = w.holders[0].holder();
+        for (p, (a, b)) in people.iter().zip(whole.iter().zip(&stepped)) {
+            assert_eq!((a.seat, b.seat), (p.seat, p.seat));
+            let open =
+                |x: &SeedWelcomeOut| open_seed_welcome(&w.g, 2, &p.me(), &k, &x.bytes).unwrap();
+            assert_eq!(*open(b), *open(a));
+            assert_eq!(*open(b), *member_secret(&w.g, 2, &seed, &p.seat));
+        }
+    }
+
+    #[test]
+    fn a_step_stops_at_the_first_unit_past_its_budget_and_the_next_goes_on_from_there() {
+        let mut w = World::text(true, false);
+        let people = accounts(10, 100);
+        let due = w.join_due(&refs(&people));
+        // Each unit takes a millisecond of this clock: a step does `budget` units, the last
+        // what is left
+        let mut units = None;
+        for budget in [1u64, 7, 40] {
+            let (b, ran) = w.with_holding(0, |hold, cache, w| {
+                let js: Vec<&Joiner> = due.joiners.iter().collect();
+                let f = join_in_steps(hold, &js, vec![], w.now, cache, None);
+                in_steps(f, Duration::from_millis(budget), ticking)
+            });
+            w.check(&due, w.holders[0].by(), &b.unwrap().commit)
+                .unwrap_or_else(|bad| panic!("{bad}"));
+            assert_eq!(ran.most, budget, "{ran:?}");
+            assert_eq!(ran.steps, ran.units / budget + 1, "{ran:?}");
+            assert_eq!(
+                *units.get_or_insert(ran.units),
+                ran.units,
+                "the same units at any budget"
+            );
+        }
+        // On the real clock, a zero or one-microsecond budget: a step a unit (or few), done
+        for budget in [Duration::ZERO, Duration::from_micros(1)] {
+            let (b, ran) = w.with_holding(0, |hold, cache, w| {
+                let js: Vec<&Joiner> = due.joiners.iter().collect();
+                in_steps(
+                    join_in_steps(hold, &js, vec![], w.now, cache, None),
+                    budget,
+                    steps::clock_ms,
+                )
+            });
+            let b = b.unwrap();
+            w.check(&due, w.holders[0].by(), &b.commit)
+                .unwrap_or_else(|bad| panic!("{bad}"));
+            assert!(
+                ran.steps > b.commit.welcomes.len() as u64,
+                "a step for each welcome at least: {ran:?}"
+            );
+        }
+        // A budget no build spends: one step
+        let (_, ran) = w.with_holding(0, |hold, cache, w| {
+            let js: Vec<&Joiner> = due.joiners.iter().collect();
+            let f = join_in_steps(hold, &js, vec![], w.now, cache, None);
+            in_steps(f, Duration::MAX, steps::clock_ms)
+        });
+        assert_eq!(ran.steps, 1);
+        assert_eq!(Some(ran.units), units);
+    }
+
+    #[test]
+    fn a_whole_run_inside_a_step_never_stops_and_counts_no_unit() {
+        let f = async {
+            steps::whole(async {
+                for _ in 0..10 {
+                    steps::unit().await;
+                }
+            });
+            for _ in 0..3 {
+                steps::unit().await;
+            }
+            steps::fresh().await;
+        };
+        let ((), ran) = unit_steps(f);
+        assert_eq!((ran.units, ran.steps, ran.most), (3, 4, 1));
+        // `fresh` stops a step that did any unit, before what follows it
+        let f = async {
+            steps::unit().await;
+            steps::fresh().await;
+        };
+        let ((), ran) = in_steps(f, Duration::MAX, steps::clock_ms);
+        assert_eq!((ran.units, ran.steps), (1, 2));
+        // Outside a step, nothing stops
+        steps::whole(async {
+            steps::unit().await;
+            steps::fresh().await;
+        });
     }
 }

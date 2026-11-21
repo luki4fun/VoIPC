@@ -203,6 +203,9 @@ export interface ChatMessage {
   hide?: { on: boolean; at: number; by: string; ban?: boolean };
   /** It arrived from a member allowed to call on everybody (mention-rules.ts). */
   power?: boolean;
+  /** Our own post that never went, and why (the relay's words): one the relay would refuse
+   *  as too large, sealed. Shown on its row; never handed on as history. */
+  not_sent?: string;
   /** What a later version kept in this message's archive entry that this one
    *  does not know (JSON): written back on the next save, never read, never
    *  handed to anyone (chat-rules.ts `fromArchived`). */

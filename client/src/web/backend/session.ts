@@ -16,6 +16,7 @@ import { connect as openTransport, openEdgeView, type Transport } from "./transp
 import { EdgeView } from "./edge-view";
 import { entryAsksHistory, gkVoiceRoom, historyAskSealed, roomAsksBundles, type SessionContext } from "./types";
 import type { ChannelInfo } from "../../lib/types";
+import { TOO_LARGE_REASON } from "../../lib/chat-rules";
 import { parseHostPort } from "../../lib/invite";
 import type { ProximityMode } from "../../lib/spatial";
 import { audio } from "./audio";
@@ -177,6 +178,9 @@ export function sessionOrSigningIn(server: string): Session | null {
 // to see which frames came and what went, and to cut a link (test-community.mjs).
 const heard: [string, number | string | undefined][] = [];
 const said: unknown[] = [];
+/** A test build's record of what the group key told the page (`gk-*`), and of posts marked not
+ *  sent: [when, event, its data], the latest few hundred. */
+const told: [number, string, unknown][] = [];
 /** A test build's barriers: a Ping's timestamp, and what its Pong resolves. */
 const barriers = new Map<number, () => void>();
 let barrierNext = 1;
@@ -185,6 +189,7 @@ if (__SELFTEST__) {
     __voipc_frame: unknown;
     __voipc_heard: unknown;
     __voipc_said: unknown;
+    __voipc_told: unknown;
     __voipc_cut: unknown;
     __voipc_barrier: unknown;
   };
@@ -206,6 +211,7 @@ if (__SELFTEST__) {
     return wasm().decodeServerMsg(bytes);
   };
   page.__voipc_heard = heard;
+  page.__voipc_told = told;
   page.__voipc_cut = (server: string) => sessionFor(server)?.onTransportClosed("a test cut the link");
 }
 
@@ -566,6 +572,10 @@ export class Session implements SessionContext, AccountHost {
 
   /** A per-connection event: the payload it always had, tagged with its server. */
   emit(name: string, data: unknown = null): void {
+    if (__SELFTEST__ && (name.startsWith("gk-") || name === "channel-not-sent")) {
+      told.push([Date.now(), name, data]);
+      if (told.length > 500) told.splice(0, told.length - 500);
+    }
     emitEvent(name, { server: this.server, data });
   }
 
@@ -2010,7 +2020,7 @@ export class Session implements SessionContext, AccountHost {
           channelId,
           wasm().envelope(id, content, ttlSecs, refs),
         );
-        this.sendControl({ SendEncryptedChannelMessage: { channel_id: channelId, ciphertext } });
+        this.sendChannelCiphertext(channelId, id, ciphertext);
       } catch (e) {
         console.warn(`failed to encrypt queued channel message for ${channelId}:`, e);
       }
@@ -2304,16 +2314,10 @@ export class Session implements SessionContext, AccountHost {
     const text = this.isTextChannel(channelId);
     const gk = gkPosts(this.gkPath) && (text || channelId === this.channelId);
 
-    if (!gk) this.rotateSenderKeyIfStale(channelId);
-
     // The id travels inside the ciphertext, so our own echo and every
     // receiver's copy file the message under the same one.
     const messageId = wasm().newMessageId();
-    // A channel with a log keeps it for its members too (cloud copies on),
-    // whether or not anybody is here to read it now. Under the group key a text channel's
-    // copy goes once the post does, under its epoch; a voice room's log keeps its own path.
-    const log = this.channels.find((c) => c.channel_id === channelId)?.log;
-    if (log && !(gk && text)) this.account?.outgoingChannel(this, log, wasm().envelope(messageId, content, ttlSecs, refs), ttlSecs);
+    const envelope = wasm().envelope(messageId, content, ttlSecs, refs);
     const event = {
       channel_id: channelId,
       user_id: this.userId,
@@ -2328,9 +2332,23 @@ export class Session implements SessionContext, AccountHost {
       fwd: refs?.fwd ?? null,
       event: refs?.event ?? null,
     };
+    // One the relay would refuse as too large, sealed as it goes (a forward of a long message,
+    // say: the composer counts only what is typed), goes nowhere, kept copy and all, and its
+    // row says so: the relay's refusal would name no message (`postFits`, the group key's rule)
+    if (!wasm().postFits(envelope.length, gk)) {
+      // An edit, a reaction: no row of its own to mark, and none done
+      if (refs?.event) throw new Error(TOO_LARGE_REASON);
+      this.emit("channel-chat-message", { ...event, encrypted: true, not_sent: TOO_LARGE_REASON });
+      return;
+    }
+    if (!gk) this.rotateSenderKeyIfStale(channelId);
+    // A channel with a log keeps it for its members too (cloud copies on),
+    // whether or not anybody is here to read it now. Under the group key a text channel's
+    // copy goes once the post does, under its epoch; a voice room's log keeps its own path.
+    const log = this.channels.find((c) => c.channel_id === channelId)?.log;
+    if (log && !(gk && text)) this.account?.outgoingChannel(this, log, envelope, ttlSecs);
     // Shown as sent: what the group key cannot send it says (`gk-state`, `gk-post-dropped`)
     if (gk) {
-      const envelope = wasm().envelope(messageId, content, ttlSecs, refs);
       this.gkRun(() => this.signal.gkPost(channelId, messageId, envelope, text ? (log ?? "") : "", ttlSecs ?? null));
       this.emit("channel-chat-message", { ...event, encrypted: true });
       return;
@@ -2339,31 +2357,40 @@ export class Session implements SessionContext, AccountHost {
     // shows it as sent: the check and the keys are the app's to do, and
     // `channel-undelivered` says so if they cannot be.
     if (text) {
-      this.runLive(this.signal.livePost(channelId, wasm().envelope(messageId, content, ttlSecs, refs)));
+      this.runLive(this.signal.livePost(channelId, envelope));
       this.emit("channel-chat-message", { ...event, encrypted: true });
       return;
     }
     let ciphertext: Uint8Array | null = null;
     if (this.signal.anyoneHoldsOurKey(channelId)) {
       try {
-        ciphertext = this.signal.groupEncrypt(
-          this.userId,
-          channelId,
-          wasm().envelope(messageId, content, ttlSecs, refs),
-        );
+        ciphertext = this.signal.groupEncrypt(this.userId, channelId, envelope);
       } catch (e) {
         console.info("group encryption not ready, queueing message:", e);
       }
     }
     if (ciphertext) {
-      this.sendControl({ SendEncryptedChannelMessage: { channel_id: channelId, ciphertext } });
       // The server excludes us from the encrypted broadcast: show it locally
       this.emit("channel-chat-message", { ...event, encrypted: true });
+      this.sendChannelCiphertext(channelId, messageId, ciphertext);
     } else {
       // Sent once sender key distribution completes; shown immediately as pending
       this.pendingMessages.push({ target: { kind: "channel", channelId }, id: messageId, content, ttlSecs, refs, queuedAt: Date.now() });
       this.emit("channel-chat-message", { ...event, pending: true });
     }
+  }
+
+  /**
+   * A voice room's post on the old path (the key off), sealed: sent, unless the relay would
+   * refuse it as too large. Then its row, shown already, is marked not sent: the relay's
+   * refusal would name no message (network.rs `drain_pending_channel_messages`).
+   */
+  private sendChannelCiphertext(channelId: number, messageId: string, ciphertext: Uint8Array): void {
+    if (ciphertext.length > wasm().maxPostSealed()) {
+      this.emit("channel-not-sent", { channel_id: channelId, message_id: messageId, reason: TOO_LARGE_REASON });
+      return;
+    }
+    this.sendControl({ SendEncryptedChannelMessage: { channel_id: channelId, ciphertext } });
   }
 
   /**

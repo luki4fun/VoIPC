@@ -36,6 +36,14 @@ mod gk_e2e_j8k;
 #[cfg(test)]
 mod gk_e2e_j8r;
 #[cfg(test)]
+mod gk_e2e_j9m;
+#[cfg(test)]
+mod gk_e2e_j9n;
+#[cfg(test)]
+mod gk_e2e_j9s;
+#[cfg(test)]
+mod gk_e2e_j9x;
+#[cfg(test)]
 mod gk_e2e_k2;
 #[cfg(test)]
 mod gk_e2e_r2;

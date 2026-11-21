@@ -122,6 +122,17 @@ function lookBack(server: string): void {
 }
 
 /**
+ * When what a quiet channel kept is read again after it came on screen. A post written just
+ * before is kept a little after it went: under the group key its writer files the copy when the
+ * relay says it took the post (`EpochPostTaken`, `group_state::Copies`), and the filing may need a
+ * log join and a chain start first, a round trip each. Nothing tells a reader of a post on a chain
+ * it holds, so a read on opening can miss a post of the last moment, and nothing would read it
+ * after: the channel is whole from then on, and the post went while it was not. A second read
+ * past that, and a third for a writer that is slow (a page in the background), bring it.
+ */
+export const READ_AGAIN_MS = [3_000, 10_000] as const;
+
+/**
  * A quiet channel came on screen. Writers key this person at their next post, naming them on
  * the writer's device as anyone, and it goes quiet again when they have moved on.
  */
@@ -130,7 +141,10 @@ export function openedQuiet(server: string, channelId: number): void {
   keepOpen(server, channelId);
   applyQuiet(server);
   const log = get(channels.peek(server)).find((c) => c.channel_id === channelId)?.log;
-  if (log) invoke("account_read_now", { server, conv: log }).catch(() => {}); // a guest keeps none
+  if (!log) return; // a guest keeps none
+  const read = () => void invoke("account_read_now", { server, conv: log }).catch(() => {});
+  read();
+  for (const ms of READ_AGAIN_MS) setTimeout(read, ms);
 }
 
 /** A connection's quiet goes with it; what was picked is in the prefs. */

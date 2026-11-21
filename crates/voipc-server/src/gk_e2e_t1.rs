@@ -8,9 +8,10 @@
 //! `AccountSync` and C3b's `GroupKeying`, glued as both apps glue them, kept copies included:
 //! `group_state::Copies` (J8F), the one filing rule the desktop (gk_net.rs) and the browser
 //! (voipc-web gk.rs) both use, each copy filed once, under the epoch its latest `released`
-//! names, once no refusal came for it, and offered again under the head when the relay refused
-//! that epoch's chain start as gone. The keyholder is `gk_e2e_tests.rs`'s guest on a task of
-//! its own.
+//! names, as the relay's `EpochPostTaken` for that send comes (J9: the post path here tells
+//! the writer so as session.rs does, `session::post_taken`), and offered again under the head
+//! when the relay refused that epoch's chain start as gone. The keyholder is
+//! `gk_e2e_tests.rs`'s guest on a task of its own.
 //!
 //! The third runs a voice room through the relay's real session path (`handle_connection`
 //! over a duplex, as `gk_e2e_v2.rs` serves it), every member an app of its own whose
@@ -24,6 +25,7 @@ use l4f_accounts::model::{AccountId, NewUser};
 use l4f_accounts::store::Store;
 use voipc_crypto::account::{SignedIn, Vault};
 use voipc_crypto::envelope::{envelope, open_envelope};
+use voipc_crypto::group_key::wire::post_digest;
 use voipc_crypto::group_key::{Endorsement, GroupKind, MemberId, Origin, SeatKeys};
 use voipc_crypto::group_state::{
     group_id, Copies, GkCtx, GkOut, GkStart, GkTrack, GroupKeying, KeptCopy, MemoryPins,
@@ -52,9 +54,9 @@ use crate::state::{RateLimiter, ServerState};
 const CHAN: ChannelId = 9;
 const CONV: &str = "c:t1hall";
 
-/// The apps' settle (`group_state::SETTLE_MS`): a post's kept copy is filed once no refusal
-/// came for it this long.
-const KEPT_SETTLE_MS: u64 = voipc_crypto::group_state::SETTLE_MS;
+/// A while with nothing in flight, after a copy was filed: long enough for anything else to
+/// be filed if it were going to be (a round trip is a step here).
+const QUIET_MS: u64 = 3_000;
 
 /// N1's settle before J8F (gk_net.rs `SETTLE_MS`, 10 s), which two openings could outlast.
 const N1_SETTLE_MS: u64 = 10_000;
@@ -140,6 +142,15 @@ impl Person {
                 let out = self.sync.gk_reseated(*n, *left);
                 self.out.extend(out);
             }
+            ServerMessage::EpochPostTaken { .. } => {
+                // As both apps do: the relay took a post of ours, its copy is filed now
+                if let Some((c, ep)) = self.copies.taken(f) {
+                    let kept = self
+                        .sync
+                        .send_channel_gk(&c.log, c.envelope, c.sent_at, c.ttl_secs, ep);
+                    self.out.extend(kept);
+                }
+            }
             f => {
                 // As both apps do: a post's refusal goes to the copies before the group key
                 // takes it, so what it sends again is noted after
@@ -198,8 +209,9 @@ impl Person {
     }
 
     /// The copies `Copies::file` hands back, each filed under its epoch, as both apps file
-    /// them (`AccountSync::send_channel_gk`): those whose post settled, in the order their
-    /// posts went, and those offered again under the head.
+    /// them (`AccountSync::send_channel_gk`): those offered again under the head (the relay
+    /// refused their chain start as gone). A taken post's copy was filed at its
+    /// `EpochPostTaken` (`frame`).
     fn file(&mut self, now: u64) {
         let keying = &self.keying;
         let due = self.copies.file(now, |group| keying.current_epoch(group));
@@ -537,11 +549,20 @@ impl World {
                         return;
                     }
                 };
+                let ServerMessage::EpochPostIn {
+                    group, ciphertext, ..
+                } = &msg
+                else {
+                    unreachable!()
+                };
+                let taken = (group.clone(), post_digest(ciphertext));
                 for f in self.followers.clone() {
                     if f != sid {
                         let _ = crate::session::send_msg(&self.queues[&f].0, &msg);
                     }
                 }
+                // As session.rs does once a post went: its writer is told
+                crate::session::post_taken(&tx, taken);
             }
             m => self.state.gk.handle(&self.state, sid, m, &tx).await,
         }
@@ -1015,9 +1036,9 @@ async fn e2e_t1_a_post_refused_as_old_epoch_is_kept_once_under_the_epoch_it_went
             .map(|m| format!("{m:?}").chars().take(60).collect::<String>())
             .collect::<Vec<_>>()
     );
-    // Past the settle again, with nothing in flight: nothing else is filed
-    let quiet = w.now() + 3 * KEPT_SETTLE_MS;
-    w.until(5 * KEPT_SETTLE_MS, |w| w.now() >= quiet).await;
+    // A while on, with nothing in flight: nothing else is filed
+    let quiet = w.now() + QUIET_MS;
+    w.until(2 * QUIET_MS, |w| w.now() >= quiet).await;
     assert_eq!(
         w.people[ann].posts(mark),
         vec![y, y, y],
@@ -1154,9 +1175,9 @@ async fn first_post_in_an_old_epoch() {
         })
         .await;
     assert!(done, "its copy filed, or given up");
-    // Past the settle again, with nothing in flight
-    let quiet = w.now() + 3 * KEPT_SETTLE_MS;
-    w.until(5 * KEPT_SETTLE_MS, |w| w.now() >= quiet).await;
+    // A while on, with nothing in flight
+    let quiet = w.now() + QUIET_MS;
+    w.until(2 * QUIET_MS, |w| w.now() >= quiet).await;
     let p = &w.people[ann];
     assert_eq!(p.not_kept, Vec::<String>::new(), "no kept copy lost");
     let starts = p.chain_starts(mark);
@@ -1177,8 +1198,8 @@ async fn first_post_in_an_old_epoch() {
 /// ("That epoch's key is gone here", accounts/log.rs `chain_start`: the head, or the one
 /// before within `HOLD_MS`), K1 dropped it with `NotKept`, and the post's next `released`,
 /// under Y, found no copy. Now the browser files by the desktop's rule, `group_state::Copies`,
-/// which this harness runs: once, under the epoch the post finally went out under, once no
-/// refusal came for it.
+/// which this harness runs: once, under the epoch the post finally went out under, once the
+/// relay took it (`EpochPostTaken`, J9).
 #[tokio::test]
 async fn e2e_t1_a_browsers_first_post_in_an_epoch_refused_as_old_is_kept_under_the_head() {
     first_post_in_an_old_epoch().await;
@@ -1192,9 +1213,9 @@ async fn e2e_t1_a_browsers_first_post_in_an_epoch_refused_as_old_is_kept_under_t
 /// gate makes them), or a post under head - 1 in the last 10 s of its window, and the chain
 /// start was refused, K1 dropped the copy with `NotKept`, and nothing filed it again. Here
 /// ann's first kept post in X is taken under the head, then two log leaves open two epochs
-/// within N1's old settle. The apps' settle (`group_state::SETTLE_MS`) is shorter than
-/// `EPOCH_MIN_GAP`, so the copy meets X still open; one that does not is filed again under the
-/// head (`gk_e2e_j8f`).
+/// within N1's old settle. The apps file a copy as the relay's `EpochPostTaken` comes (J9),
+/// a round trip after the post, so the copy meets X still open; one that does not is filed
+/// again under the head (`gk_e2e_j8f`).
 #[tokio::test]
 async fn e2e_t1_a_kept_copy_whose_post_two_openings_follow_within_n1s_settle_is_kept() {
     two_openings_after_a_post().await;
@@ -1249,8 +1270,9 @@ async fn two_openings_after_a_post() {
 
 /// J8F (`gk_e2e_j8f`): a kept copy filed only after its epoch's window for a chain start
 /// closed is not lost. ann's post is taken under X; then her app takes and files nothing (its
-/// frames in flight, the app asleep) while two openings go by, so its copy, settled, is filed
-/// under X at last, and the relay refuses that chain start as gone. K1 lets the copy go, and
+/// frames in flight, the relay's `EpochPostTaken` among them, the app asleep) while two
+/// openings go by, so its copy is filed under X at last, and the relay refuses that chain
+/// start as gone. K1 lets the copy go, and
 /// `Copies` offers it again under the head ann holds by then: it is kept once, under that
 /// head, and a reader seated there reads it.
 pub(super) async fn a_copy_filed_after_its_epochs_window_is_kept_under_the_head() {
@@ -1286,9 +1308,9 @@ pub(super) async fn a_copy_filed_after_its_epochs_window_is_kept_under_the_head(
         })
         .await;
     assert!(done, "its copy filed, or given up");
-    // Past the settle again, with nothing in flight: nothing else is filed
-    let quiet = w.now() + 3 * KEPT_SETTLE_MS;
-    w.until(5 * KEPT_SETTLE_MS, |w| w.now() >= quiet).await;
+    // A while on, with nothing in flight: nothing else is filed
+    let quiet = w.now() + QUIET_MS;
+    w.until(2 * QUIET_MS, |w| w.now() >= quiet).await;
     let p = &w.people[ann];
     assert_eq!(p.not_kept, Vec::<String>::new(), "no kept copy lost");
     let starts = p.chain_starts(mark);
@@ -1835,6 +1857,37 @@ async fn e2e_t1_a_rooms_post_under_a_gated_head_after_its_gate_came_off_is_named
         })
         .await;
     assert!(read, "every reader opens the post under the gated head");
+    // J9: the room's post path tells the writer its post taken, named by the bytes that went
+    let ct = r.devices[0]
+        .log
+        .iter()
+        .find_map(|f| match f {
+            ServerMessage::EpochPostIn {
+                user_id,
+                epoch,
+                ciphertext,
+                ..
+            } if *user_id == from && *epoch == gated_at => Some(ciphertext.clone()),
+            _ => None,
+        })
+        .expect("the post reached a reader");
+    let group = r.devices[writer].group.clone();
+    let told = r
+        .until(ROOM_LIMIT_MS, |r| {
+            r.devices[writer].log.iter().any(|f| {
+                matches!(f, ServerMessage::EpochPostTaken { group: g, post }
+                    if *g == group && *post == post_digest(&ct))
+            })
+        })
+        .await;
+    assert!(told, "the writer was told its post taken");
+    assert!(
+        !r.devices[0]
+            .log
+            .iter()
+            .any(|f| matches!(f, ServerMessage::EpochPostTaken { .. })),
+        "a reader is told nothing taken"
+    );
     for i in readers {
         let d = &r.devices[i];
         assert_eq!(

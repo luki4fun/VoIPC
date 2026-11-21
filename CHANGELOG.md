@@ -2,13 +2,86 @@
 
 All notable changes to VoIPC are documented here.
 
-## [Unreleased]
+## [1.14.0] - not released yet
 
-Protocol 26 (1.15): a 1.15 relay admits only 1.15 apps, so update the apps first. A 1.15 app still talks to 1.14
-relays and older ones. Media edges speak a version of their own (pool 1): update a relay before its edges. No
-database migration.
+Protocol 26: a 1.14 relay admits only 1.14 apps, so update the apps first. A 1.14 app still talks to 1.13 relays and
+older ones, down to 1.0 (protocol 25 was a step on the way here and never shipped). Media edges speak a version of their
+own (pool 1): update a relay before its edges. One database migration (`0013_group_keys.sql`), and l4f-accounts 0.15.
+**Text channels and voice rooms move to a group epoch key, which weakens several security claims** (Security, below).
+No outside cryptographer has reviewed it.
+
+### Security
+- **Channel keys come from a group epoch key now, and some promises are weaker for it** (`group_key`, on by default;
+  [GROUP-KEY.md](docs/GROUP-KEY.md) §6, [THREAT-MODEL.md](docs/THREAT-MODEL.md)). These are for one GitHub security
+  advisory. A relay with `group_key = false` keeps 1.13's paths, and their promises:
+  - **A stolen device reads recorded live text back to the last seat-key rotation**, not the last hour. A channel's keys
+    reach its members through seat keys each account keeps in its vault, made anew every 30 days and at a password
+    change, a recovery-key reset and a removed device.
+  - **A held key lasts until the next epoch**: at most 5 minutes (one in the smallest channels) under an honest relay,
+    and up to 70 minutes under a hostile one, in a channel of any size. On the live path a writer ended its own chain by
+    age, which no relay could stretch, so small channels lose most.
+  - **Writers no longer name each new reader themselves.** In a gated channel the signed headers name every new reader
+    to each writer seated before them: before that writer's next post under an honest relay, and before its first post
+    in a later epoch (70 minutes at most) under a hostile one, with no name skipped. A member who only reads is not shown
+    them, and in an open channel nobody is named. A relay can also give one account of its choice an epoch's key with no
+    header naming it, for that epoch; the keyholder device that seated it warns.
+  - **An account that only goes offline stays seated** until it leaves, rotates its keys at its next sign-in, or 90 days
+    pass unused, and a relay that keeps feeding it the epochs lets it read them all when it is back. A guest's seat ends
+    with its connection.
+  - **A new party holds each channel's keys**: the keyholders, named in the member list, whose online times show. Like
+    any member a keyholder reads what the channel carries and can give its keys away. If a keyholder's seed leaks, a
+    quantum computer with the recordings opens the rows under it: about 31 days of them at most in a text channel. A
+    desktop's keyholder pair lives in `gk_local.bin` beside its settings, readable by your user only and not encrypted.
+  - **Newcomers read up to 5 minutes back** (60 s in the smallest channels) under an honest relay, and up to 70 minutes
+    under a hostile one, where the live path gave about 60 s.
+  - **Where only browsers and guests hold a channel's keys, a hostile relay can have them made anew every few minutes**,
+    by dropping their connections (the fast new start, below). It reads and forges nothing by it, and a channel with a
+    desktop keyholder keeps the hour.
+  - **In an anonymous room** everyone is seated by their connection, so a writer's key there is taken on trust as a
+    guest's is; the signed headers still name each keyholder's account, which the app does not show.
+  - Stronger: kept copies under the group key reach their readers in welcomes that use Kyber1024 as well as X25519
+    (copies from before stay X25519 only); writers no longer upload a session start for each reader; two voice senders
+    never share a media key and nonce, whatever ids are handed out; a desktop or phone app refuses a channel's keys
+    rolled back below what it saw.
+- **No outside cryptographer has reviewed the group key** (owner, 2026-11-17). It had adversarial reviews of our own
+  while it was built, one more works through GROUP-KEY.md §7 against the code before the release, and then the owner's.
 
 ### Added
+- **The group epoch key in every text channel and voice room** (`group_key = true`, [GROUP-KEY.md](docs/GROUP-KEY.md)).
+  A channel's messages, and a room's voice, video and chat, are under one epoch key, which reaches each member in a
+  hybrid welcome (Kyber1024 and X25519) from the channel's keyholders. A post costs its writer the same however many
+  read it, where by our sums a first post to 100,000 followers cost the writer about 180 MB down and 17.6 MB up on the live path. A
+  newcomer costs the channel one welcome, a leaver a new epoch soon after (writers hold their posts if none comes within
+  46 s), and joining a voice room is one welcome, where it was 3 messages to each member. On this machine 100,000
+  accounts that keep a channel's history were seated in two minutes, and 50,000 guests connecting 1,000 a second, 95% of
+  them seated within 0.3 s (OPERATING §10a).
+  - **Keyholders.** Desktop apps help hold the keys of the text channels they are in (*Settings → Help hold keys for text
+    channels*, on by default), browsers and guests only as a last resort, and in a voice room the two members with the
+    lowest user ids. The member list says "Keys held by …". A browser builds in short steps, 2 ms at a time in a call or
+    while hidden, so the call goes on while it holds keys.
+  - **What the app says** in the channel: its keys are late; nobody who holds them is online, and a message was not sent;
+    keys were made anew, and by whom; new readers of a gated channel, by name. And it warns when this device gave the
+    channel's keys to people the server then did not list, when an old key of your account was listed, when the server's
+    keys are older than what this device saw, and when someone who left may still hear a room.
+  - **Fast new start** (owner, 2026-11-19). When every keyholder of a channel is a browser or a guest and none is
+    online, as after the only browser holding its keys reloads or the relay restarts, a volunteer starts its keys anew
+    after 2 minutes, where it waited an hour. Members check that from the signed headers. A set of keyholders a new start
+    began keeps the hour for an hour, and one with a desktop always does.
+  - **Kept history under the group key.** A writer's chain lives inside one epoch and is sealed once to the epoch key,
+    for every reader at once. A post's kept copy is filed the moment the relay answers that it took the post
+    (`EpochPostTaken`), under the epoch the post went under, and a post the relay refused is never kept. A page closed
+    within about one round trip of posting can still lose the kept copy; its live readers got the post. `kept_seats`
+    (5000) is now cheap to raise, and `kept_window` bounds the key material as well as the messages.
+  - **The Load tab lists the groups** of 1,000 seats and more, and any with something amiss: keyholders online, the last
+    commit's age, joins and exits waiting, missed deadlines and memory, with warnings that name the channel.
+  - **`voipc-server db new-incarnation`**, the last step of every restore of the database (OPERATING §7): every
+    channel's keys start anew at the next start, since whoever left after the backup was taken out only in keys the
+    backup does not hold. Forgotten, an app whose keys are ahead of the database proves it, and the relay starts that
+    channel anew itself, at most once an hour.
+  - **`group_key = false`** keeps 1.13's paths, and still serves, read-only, what was kept under the group key. Turned
+    on again later, it starts every channel's keys anew. **The switch gap:** an account is seated for a channel's kept
+    history from the first time one of its devices signs in with a 1.14 app; kept posts written under the group key
+    before then are not readable to it. What was kept before the update stays readable as before.
 - **Media edges for big screen shares** (`[pool]`, `voipc-server -c edge.toml edge`): a relay can hand the viewers of
   a share past its first `local_first` (8) to edges, processes of the same binary on machines of their own, so a share
   with thousands of viewers costs it one copy per edge instead of one per viewer. An edge links to the relay and
@@ -26,27 +99,13 @@ database migration.
   OPERATING.md §10a and §10b.
 
 ### Changed
-- **A sharer is told how many watch at most once a second**, the latest count, where every watch and stop sent one:
-  thousands of messages a second for a big share. The first viewer and the last one to go are still told at once:
-  the sharer's app starts and stops its capture by them, unless its own preview is open.
-- **Above 8 viewers, a sharer gets one loss summary a second** (`VideoLossSummary`): how many of its viewers lost
-  frames in the last 2 s, of how many, instead of each viewer's report. The app steps the share down on a majority, as
-  before. Up to 8 viewers each report comes as before.
-- **A viewer drops a frame it already put together, or an older one**, up to 1000 frames back: a frame that comes
-  twice, from the relay and from an edge across a move, or that an edge replays, is not shown again.
-- **With edges, `[media] share_viewers` is what the relay serves of a share itself**: its edges carry the rest, each
-  up to its own `max_viewers` and `egress_mbit`, and `video_egress_mbit` counts one copy for each edge fed.
-
-### Known
-- Watching through an edge was tested in Chromium (the `EDGE=1` lane of test-web.sh, in CI). Firefox, the desktop
-  apps and Android were not tried yet, nor an edge or a viewer on another machine.
-
-## [1.14.0] - not released yet
-
-Protocol 25 (1.14): a 1.14 relay admits only 1.14 apps, so update the apps first. A 1.14 app still talks
-to 1.13 relays and older ones.
-
-### Changed
+- **One channel message holds at most 16 KiB, everywhere**: text channels and voice rooms, the group key on or off. The
+  composer stops a longer one before it goes and says why, and one refused anyway is marked on its row: "Not sent: one
+  message holds at most 16 KiB." A voice room's chat could run to 60 KiB before. Direct messages keep that limit.
+- **Opening a quiet channel reads its kept copies again at 3 s and at 10 s**, so a post whose copy was filed a moment
+  after the channel opened shows too. The relay learns nothing new from the two extra reads.
+- **The browser's module is about 38 KB larger on the wire** (brotli): its Kyber code is built for speed (libcrux at
+  opt-level 3), 6 to 11 times faster in Chromium, which a browser holding a channel's keys needs.
 - **A big server's lobby is no longer sent whole.** Everyone stands in General, so each app was sent a list of
   everyone online and told of every join there: work that grew with the square of who is online, 197 s of relay
   CPU to let 5000 people in. Now the Online list comes a page at a time as it scrolls, sorted as before
@@ -75,6 +134,19 @@ to 1.13 relays and older ones.
   that Postgres would serve it better.
 - **`voice_load` takes `--rooms` and `--speakers`**, and counts what is lost once everyone is in: 20 rooms of 50 with
   three talking in each lost 0.001%, and the numbers are in OPERATING §10a.
+- **A sharer is told how many watch at most once a second**, the latest count, where every watch and stop sent one:
+  thousands of messages a second for a big share. The first viewer and the last one to go are still told at once:
+  the sharer's app starts and stops its capture by them, unless its own preview is open.
+- **Above 8 viewers, a sharer gets one loss summary a second** (`VideoLossSummary`): how many of its viewers lost
+  frames in the last 2 s, of how many, instead of each viewer's report. The app steps the share down on a majority, as
+  before. Up to 8 viewers each report comes as before.
+- **A viewer drops a frame it already put together, or an older one**, up to 1000 frames back: a frame that comes
+  twice, from the relay and from an edge across a move, or that an edge replays, is not shown again.
+- **With edges, `[media] share_viewers` is what the relay serves of a share itself**: its edges carry the rest, each
+  up to its own `max_viewers` and `egress_mbit`, and `video_egress_mbit` counts one copy for each edge fed.
+- **The relay writes one line a minute about connections, when anything happened**: connects refused and why, setups
+  that failed or timed out, how sessions ended (closed by the app, timed out), and UDP datagrams the kernel dropped for
+  a full buffer. The line for each connect stays at debug.
 
 ### Fixed
 - **Many people signing in at once stopped the relay signing anyone in.** Past 32 sign-ins at once it told the next
@@ -93,10 +165,13 @@ to 1.13 relays and older ones.
   carrying the fix (upstream issue #331), until upstream releases one. With the relay held to 2 cores and 1000 clients:
   8 connects failed in 5 runs before, none in 11 after.
 
-### Changed
-- **The relay writes one line a minute about connections, when anything happened**: connects refused and why, setups
-  that failed or timed out, how sessions ended (closed by the app, timed out), and UDP datagrams the kernel dropped for
-  a full buffer. The line for each connect stays at debug.
+### Known
+- Watching through an edge was tested in Chromium (the `EDGE=1` lane of test-web.sh, in CI). Firefox, the desktop
+  apps and Android were not tried yet, nor an edge or a viewer on another machine.
+- **The group key ran in end-to-end tests** of the relay with the apps' own key code, on SQLite and Postgres, and in the
+  browser lanes of test-web.sh (Chromium, and a Chromium and Firefox pair). The desktop apps and Android were not tried
+  against it by hand yet, nor keyholders on machines of their own, nor how long a browser's stepped builds take on a busy
+  page against the 4 s a keyholder has for an exit's commit.
 
 ## [1.13.0] - release candidate
 

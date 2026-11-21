@@ -1,4 +1,4 @@
--- 1.16: the group epoch key (docs/GROUP-KEY.md §9, accounts/gk.rs). Only stored groups are here:
+-- 1.14: the group epoch key (docs/GROUP-KEY.md §9, accounts/gk.rs). Only stored groups are here:
 -- `c:` ids on a relay with accounts. `r:` groups, and relays without accounts, keep it all in memory.
 -- `b`, `v` and commit ids are random u64 bound as i64: compared for equality only, never ordered
 -- in SQL. Epochs, joins (`j`), seeds and exit `seq` are counters. `seat`: a seat's 33-byte record

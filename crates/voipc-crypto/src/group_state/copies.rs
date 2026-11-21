@@ -2,17 +2,24 @@
 //! (voipc-web gk.rs), plan 3b and C4:
 //!
 //! - `Copies`: a post's kept copy is filed once, under the epoch the post finally went out
-//!   under (`GkOut::released`), once the relay took the post: `SETTLE_MS` after its last
-//!   `released` with no `EpochRefused{POST}` for it (the relay names no post and sends no word
-//!   when it takes one). At `OLD_EPOCH` and `RATE` what went in that group goes again, and its
-//!   next `released` says under what; a refusal for good drops what the group key drops
-//!   (`drop_refused`: the latest that started a chain, else the latest). The relay starts a
-//!   kept chain under an epoch only while it is the head, or the one before for `HOLD_MS`
-//!   after the head opened (accounts/log.rs `chain_start`): a copy whose chain start comes too
-//!   late for that ("That epoch's key is gone here") is filed again under the head the app
-//!   holds then. `AccountSync` keeps every copy once (`send_channel_gk`) and lets one go again
-//!   only after that refusal, so offering a filed copy again under a newer head files only
-//!   what was refused.
+//!   under (`GkOut::released`), as soon as the relay took the post: its `EpochPostTaken` names
+//!   the post by `group_key::wire::post_digest` of the ciphertext that went, and comes only for
+//!   a post the relay took (never for a refused one, a blobless post its rules refused, told
+//!   by `ChannelError`, included). Nothing is filed at a `released` alone (T1e D: a post
+//!   refused `OLD_EPOCH` goes again under a newer epoch, and a copy filed at its first
+//!   `released` named an epoch it never went under). At `OLD_EPOCH` and `RATE` what went in
+//!   that group goes again, and its next `released` says under what and as which bytes; a
+//!   refusal for good drops what the group key drops (`drop_refused`: the latest that started
+//!   a chain, else the latest). A copy whose post is never taken is given up at
+//!   `KEPT_WAIT_MS`. The relay starts a kept chain under an epoch only while it is the head,
+//!   or the one before for `HOLD_MS` after the head opened (accounts/log.rs `chain_start`): a
+//!   copy whose chain start comes too late for that ("That epoch's key is gone here") is filed
+//!   again under the head the app holds then. `AccountSync` keeps every copy once
+//!   (`send_channel_gk`) and lets one go again only after that refusal, so offering a filed
+//!   copy again under a newer head files only what was refused.
+//!
+//!   The host files what `taken` hands back in the same call as the frame, not at its next
+//!   tick: a writer that leaves a moment after posting still has its copy filed.
 //! - `Early`: a post to a channel whose group is not tracked yet (the join is not answered) waits
 //!   for it and then goes, instead of being dropped at once; it is dropped, and the app says
 //!   so, if the join is refused, the channel is left, or `EARLY_WAIT_MS` passes.
@@ -26,18 +33,13 @@ use voipc_protocol::gk::{refused_what, refused_why};
 use voipc_protocol::messages::{ClientMessage, ServerMessage};
 
 use super::{Dropped, GkEpoch, GkEvent, GkOut, GkState};
-use crate::group_key::timers::{EPOCH_MIN_GAP_MS, HOLD_MS};
+use crate::group_key::timers::HOLD_MS;
+use crate::group_key::wire::post_digest;
 
-/// One out this long with no refusal was taken under its epoch: the relay refuses a post
-/// within a round trip. Short on purpose: two openings come `EPOCH_MIN_GAP_MS` apart at least,
-/// and a copy filed this soon after its post meets its epoch still the head or the one
-/// before, where the relay starts a kept chain. One that comes later is filed again under the
-/// head (`Copies::file`).
-pub const SETTLE_MS: u64 = 1_000;
-const _: () = assert!(SETTLE_MS < EPOCH_MIN_GAP_MS);
-
-/// A copy whose post never went is given up this long after it was written: the group key
-/// gives a held post up at `HOLD_MS`, and an early one waits as long before that.
+/// A copy whose post was not taken is given up this long after it was written or its post last
+/// went, whichever is later: the group key gives a held post up at `HOLD_MS`, and an early one
+/// waits as long before that. The relay tells a post taken within a round trip; a post it
+/// refused by its rules with no word to the group key (`ChannelError`) is never taken.
 pub const KEPT_WAIT_MS: u64 = 2 * HOLD_MS;
 
 /// A filed copy is offered again under a newer head for this long: past it a refused chain
@@ -64,12 +66,15 @@ pub struct KeptCopy {
     pub ttl_secs: Option<u32>,
 }
 
-/// When a post last went out, in which order, under what, and whether it started a chain.
+/// When a post last went out, in which order, under what, whether it started a chain, and
+/// as which bytes.
 struct Went {
     ep: GkEpoch,
     at: u64,
     order: u64,
     blob: bool,
+    /// `post_digest` of the ciphertext that went: what its `EpochPostTaken` names.
+    post: [u8; 16],
 }
 
 struct Waiting {
@@ -78,7 +83,7 @@ struct Waiting {
     went: Option<Went>,
 }
 
-/// A copy filed, kept `AGAIN_MS` to be offered again under a newer head.
+/// A copy filed, kept `AGAIN_MS` from its post's send to be offered again under a newer head.
 struct Filed {
     copy: KeptCopy,
     /// The epoch it was filed under.
@@ -108,19 +113,24 @@ impl Copies {
         );
     }
 
-    /// What a `GroupKeying` call handed back, before its frames go (so a post's refusal never
-    /// comes before its send is noted): each `released` went out under its epoch, again if it
-    /// went before. The `EpochPost`s and `released` go in the same order, one for one.
+    /// What a `GroupKeying` call handed back, before its frames go (so a post's refusal or
+    /// `EpochPostTaken` never comes before its send is noted): each `released` went out under
+    /// its epoch, as its `EpochPost`'s ciphertext, again if it went before. The `EpochPost`s
+    /// and `released` go in the same order, one for one.
     pub fn sent(&mut self, out: &GkOut, now: u64) {
         if out.released.is_empty() {
             return;
         }
-        let mut blobs = out.send.iter().filter_map(|m| match m {
-            ClientMessage::EpochPost { blob, .. } => Some(blob.is_some()),
+        let mut posts = out.send.iter().filter_map(|m| match m {
+            ClientMessage::EpochPost {
+                blob, ciphertext, ..
+            } => Some((blob.is_some(), post_digest(ciphertext))),
             _ => None,
         });
         for (_, post_id, ep) in &out.released {
-            let blob = blobs.next().unwrap_or(false);
+            let Some((blob, post)) = posts.next() else {
+                break;
+            };
             if let Some(p) = self.waiting.get_mut(post_id) {
                 self.sends += 1;
                 p.went = Some(Went {
@@ -128,9 +138,42 @@ impl Copies {
                     at: now,
                     order: self.sends,
                     blob,
+                    post,
                 });
             }
         }
+    }
+
+    /// A frame from the relay: `EpochPostTaken` for a post of ours that went, named in its
+    /// group by the digest of the bytes it last went as. Its copy is to be filed now, under the
+    /// epoch it went under, and is kept to be offered again under a newer head (`file`). Any
+    /// other frame, or one naming no post of ours that went (another group, an earlier send of
+    /// a post that went again), files nothing.
+    pub fn taken(&mut self, msg: &ServerMessage) -> Option<(KeptCopy, GkEpoch)> {
+        let ServerMessage::EpochPostTaken { group, post } = msg else {
+            return None;
+        };
+        let id = self
+            .waiting
+            .iter()
+            .find(|(_, p)| {
+                p.went
+                    .as_ref()
+                    .is_some_and(|w| w.ep.group == *group && w.post == *post)
+            })
+            .map(|(id, _)| *id)?;
+        let p = self.waiting.remove(&id)?;
+        let w = p.went?;
+        self.filed.push_back(Filed {
+            copy: p.copy.clone(),
+            gen: w.ep.gen,
+            epoch: w.ep.epoch,
+            at: w.at,
+        });
+        while self.filed.len() > AGAIN_MOST {
+            self.filed.pop_front();
+        }
+        Some((p.copy, w.ep))
     }
 
     /// A frame from the relay, before the group key takes it: `EpochRefused{POST}` for one of
@@ -164,20 +207,20 @@ impl Copies {
         }
     }
 
-    /// The copies to file now, each with the epoch to file it under, in order: those whose
-    /// post settled (`SETTLE_MS` after its last `released`, in the order their posts went),
-    /// then those filed before under an epoch older than the head the group is at now
-    /// (`head`, `GroupKeying::current_epoch`), offered under that head. `AccountSync` files
-    /// one of those only if the relay refused its chain start as gone. A copy whose post
-    /// never went is given up with it.
+    /// The copies to file again, each with the epoch to file it under: those filed before
+    /// (`taken`) under an epoch older than the head the group is at now (`head`,
+    /// `GroupKeying::current_epoch`), offered under that head. `AccountSync` files one of those
+    /// only if the relay refused its chain start as gone. A copy whose post was not taken
+    /// `KEPT_WAIT_MS` on is given up with it; nothing is filed here first.
     pub fn file(
         &mut self,
         now: u64,
         head: impl Fn(&str) -> Option<GkEpoch>,
     ) -> Vec<(KeptCopy, GkEpoch)> {
-        self.waiting
-            .retain(|_, p| p.went.is_some() || now.saturating_sub(p.since) < KEPT_WAIT_MS);
-        let settled = self.take(|w| now >= w.at.saturating_add(SETTLE_MS));
+        self.waiting.retain(|_, p| {
+            let last = p.went.as_ref().map_or(p.since, |w| w.at.max(p.since));
+            now < last.saturating_add(KEPT_WAIT_MS)
+        });
         self.filed.retain(|f| now < f.at.saturating_add(AGAIN_MS));
         let mut out = Vec::new();
         for f in &self.filed {
@@ -185,51 +228,22 @@ impl Copies {
                 out.push((f.copy.clone(), h));
             }
         }
-        for (copy, ep) in &settled {
-            self.filed.push_back(Filed {
-                copy: copy.clone(),
-                gen: ep.gen,
-                epoch: ep.epoch,
-                at: now,
-            });
-        }
-        while self.filed.len() > AGAIN_MOST {
-            self.filed.pop_front();
-        }
-        let mut all = settled;
-        all.extend(out);
-        all
+        out
     }
 
-    /// The connection ended: whatever went is filed as it stands, in order; the rest is
-    /// given up with the posts.
-    pub fn end(&mut self) -> Vec<(KeptCopy, GkEpoch)> {
-        let all = self.take(|_| true);
+    /// The connection ended: a copy whose post the relay did not say it took is given up, as
+    /// one with no word for `KEPT_WAIT_MS` is. A copy is kept only on the relay's word: one
+    /// refused by the channel's rules (`ChannelError`, which names no group) would otherwise
+    /// be kept although nobody got its post. One taken whose word was lost with the
+    /// connection, a round trip at most, is lost as one whose page closed that soon is.
+    pub fn end(&mut self) {
         *self = Copies::default();
-        all
     }
 
     /// Whether a copy waits for `post_id`, and if its post went, under which epoch.
     pub fn went_under(&self, post_id: &[u8; 16]) -> Option<Option<u32>> {
         let p = self.waiting.get(post_id)?;
         Some(p.went.as_ref().map(|w| w.ep.epoch))
-    }
-
-    /// The waiting copies whose post went and `due`, out of `waiting`, in the order they went.
-    fn take(&mut self, due: impl Fn(&Went) -> bool) -> Vec<(KeptCopy, GkEpoch)> {
-        let ids: Vec<[u8; 16]> = self
-            .waiting
-            .iter()
-            .filter(|(_, p)| p.went.as_ref().is_some_and(&due))
-            .map(|(id, _)| *id)
-            .collect();
-        let mut due: Vec<(KeptCopy, Went)> = ids
-            .iter()
-            .filter_map(|id| self.waiting.remove(id))
-            .filter_map(|p| Some((p.copy, p.went?)))
-            .collect();
-        due.sort_by_key(|(_, w)| w.order);
-        due.into_iter().map(|(c, w)| (c, w.ep)).collect()
     }
 }
 
@@ -240,6 +254,23 @@ pub struct EarlyPost {
     pub envelope: Vec<u8>,
     /// Its kept copy, for `Copies::wait` once it goes to the group key.
     pub copy: Option<KeptCopy>,
+}
+
+impl EarlyPost {
+    /// The most a channel post's ciphertext may be, the key on or off (the writer's
+    /// `POST_MAX_BYTES`, the relay's `MAX_TEXT_POST`).
+    pub const MAX_SEALED: usize = super::writer::POST_MAX_BYTES;
+    /// The relay's words for a post past it, which a host says of a post it does not send.
+    pub const TOO_LARGE: &'static str = super::writer::TOO_LARGE;
+
+    /// Whether a post of `len` envelope bytes, sealed as it goes (`under_key`: an `EpochPost`;
+    /// else the old path's `SendEncryptedChannelMessage`, the key off), stays within
+    /// `MAX_SEALED`. Under the key one that does not never goes (the writer refuses it, naming
+    /// no post): the host checks first, with the post's id, and marks its row as not sent with
+    /// `TOO_LARGE`.
+    pub fn fits(len: usize, under_key: bool) -> bool {
+        super::writer::post_fits(len, under_key)
+    }
 }
 
 /// Posts made before their channel's group was tracked (module doc).
@@ -353,6 +384,11 @@ mod tests {
         }
     }
 
+    /// The ciphertext post `id` went as under epoch `e`: one of its own for each send.
+    fn ct(id: u8, e: u32) -> Vec<u8> {
+        vec![id, e as u8]
+    }
+
     /// `GroupKeying`'s out for posts that went: one `EpochPost` and one `released` each.
     fn went(posts: &[(u8, u32, bool)]) -> GkOut {
         let mut out = GkOut::default();
@@ -363,7 +399,7 @@ mod tests {
                 gen: [1; 16],
                 epoch: e,
                 blob: blob.then(|| vec![1]),
-                ciphertext: vec![2],
+                ciphertext: ct(id, e),
             });
             out.released.push((7, [id; 16], epoch(e)));
         }
@@ -379,6 +415,18 @@ mod tests {
         }
     }
 
+    /// The relay's word that post `id`'s send under epoch `e` in `group` was taken.
+    fn ack(group: &str, id: u8, e: u32) -> ServerMessage {
+        ServerMessage::EpochPostTaken {
+            group: group.into(),
+            post: post_digest(&ct(id, e)),
+        }
+    }
+
+    fn one(due: Option<(KeptCopy, GkEpoch)>) -> Option<(u8, u32)> {
+        due.map(|(c, ep)| (c.envelope[0], ep.epoch))
+    }
+
     fn filed(due: Vec<(KeptCopy, GkEpoch)>) -> Vec<(u8, u32)> {
         due.into_iter()
             .map(|(c, ep)| (c.envelope[0], ep.epoch))
@@ -389,8 +437,54 @@ mod tests {
         None
     }
 
+    /// The relay took the post: its copy is filed at once, under the epoch it went under, and
+    /// only once.
+    #[test]
+    fn a_taken_post_is_filed_at_once_under_the_epoch_it_went_under() {
+        let mut c = Copies::default();
+        c.wait([1; 16], copy(1), T0);
+        c.sent(&went(&[(1, 4, true)]), T0);
+        assert!(c.file(T0, no_head).is_empty(), "not at the release");
+        assert_eq!(one(c.taken(&ack(LOG, 1, 4))), Some((1, 4)));
+        assert_eq!(c.went_under(&[1; 16]), None, "no longer waiting");
+        assert_eq!(one(c.taken(&ack(LOG, 1, 4))), None, "filed once");
+        assert!(c.file(T0 + 1, |_| Some(epoch(4))).is_empty());
+        c.end();
+        assert!(
+            c.file(T0 + 2, |_| Some(epoch(5))).is_empty(),
+            "the end forgets it"
+        );
+    }
+
+    /// An `EpochPostTaken` naming no post of ours that went files nothing: another group,
+    /// bytes no post of ours went as, a post that never went, or any other frame.
+    #[test]
+    fn an_ack_naming_another_post_or_group_files_nothing() {
+        let mut c = Copies::default();
+        c.wait([1; 16], copy(1), T0);
+        c.wait([2; 16], copy(2), T0);
+        c.sent(&went(&[(1, 4, true)]), T0);
+        assert_eq!(one(c.taken(&ack("c:other", 1, 4))), None, "another group");
+        assert_eq!(one(c.taken(&ack(LOG, 9, 4))), None, "an unknown digest");
+        assert_eq!(
+            one(c.taken(&ack(LOG, 1, 5))),
+            None,
+            "bytes it never went as"
+        );
+        assert_eq!(
+            one(c.taken(&ack(LOG, 2, 4))),
+            None,
+            "a post that never went"
+        );
+        assert_eq!(one(c.taken(&refused(LOG, refused_why::THIRD_BLOB))), None);
+        assert_eq!(c.went_under(&[1; 16]), Some(Some(4)));
+        assert_eq!(c.went_under(&[2; 16]), Some(None));
+        assert!(c.file(T0 + 10_000, no_head).is_empty());
+        assert_eq!(one(c.taken(&ack(LOG, 1, 4))), Some((1, 4)));
+    }
+
     /// T1e D: nothing is filed at the first `released`; a post refused as `OLD_EPOCH` and
-    /// sent again under the head is filed once, under the head, once that send settled.
+    /// sent again under the head is filed once, under the head, once the relay took that send.
     #[test]
     fn a_post_sent_again_after_old_epoch_is_kept_once_under_the_epoch_it_went_again_under() {
         let mut c = Copies::default();
@@ -398,18 +492,21 @@ mod tests {
         c.sent(&went(&[(1, 4, true)]), T0);
         assert!(c.file(T0, no_head).is_empty(), "not at the release");
         assert!(
-            c.file(T0 + SETTLE_MS - 1, no_head).is_empty(),
-            "a refusal may still come"
+            c.file(T0 + 10_000, no_head).is_empty(),
+            "not without the relay's word"
         );
         // The head moved past epoch 4: refused, and sent again under the head
         c.refused(&refused(LOG, refused_why::OLD_EPOCH));
         assert_eq!(c.went_under(&[1; 16]), Some(None));
-        assert!(c.file(T0 + SETTLE_MS, no_head).is_empty(), "not gone yet");
-        c.sent(&went(&[(1, 6, true)]), T0 + 2_000);
-        assert_eq!(filed(c.file(T0 + 2_000 + SETTLE_MS, no_head)), [(1, 6)]);
+        assert_eq!(one(c.taken(&ack(LOG, 1, 4))), None, "the refused send");
+        c.sent(&went(&[(1, 6, true)]), T0 + 12_000);
+        assert_eq!(one(c.taken(&ack(LOG, 1, 4))), None, "an earlier send");
+        assert_eq!(one(c.taken(&ack(LOG, 1, 6))), Some((1, 6)));
         // Sent again once more (another post's refusal): not filed again
-        c.sent(&went(&[(1, 7, true)]), T0 + 3_000);
-        assert!(c.end().is_empty());
+        c.sent(&went(&[(1, 7, true)]), T0 + 13_000);
+        assert_eq!(one(c.taken(&ack(LOG, 1, 7))), None);
+        c.end();
+        assert!(c.went_under(&[1; 16]).is_none());
     }
 
     #[test]
@@ -419,7 +516,7 @@ mod tests {
         c.sent(&went(&[(1, 4, true)]), T0);
         c.refused(&refused("c:other", refused_why::OLD_EPOCH));
         c.refused(&refused("c:other", refused_why::THIRD_BLOB));
-        assert_eq!(filed(c.file(T0 + SETTLE_MS, no_head)), [(1, 4)]);
+        assert_eq!(one(c.taken(&ack(LOG, 1, 4))), Some((1, 4)));
     }
 
     #[test]
@@ -431,28 +528,50 @@ mod tests {
         // 1 started a chain, 2 went on it: the relay refused the blob, the group key drops 1
         c.sent(&went(&[(1, 4, true), (2, 4, false)]), T0);
         c.refused(&refused(LOG, refused_why::THIRD_BLOB));
-        assert_eq!(filed(c.file(T0 + SETTLE_MS, no_head)), [(2, 4)]);
+        assert_eq!(c.went_under(&[1; 16]), None);
+        assert_eq!(one(c.taken(&ack(LOG, 1, 4))), None);
+        assert_eq!(one(c.taken(&ack(LOG, 2, 4))), Some((2, 4)));
+        assert!(c.file(T0 + KEPT_WAIT_MS, no_head).is_empty());
         // One that never went is given up with its post
         c.wait([3; 16], copy(3), T0);
         assert!(c.file(T0 + KEPT_WAIT_MS, no_head).is_empty());
         assert_eq!(c.went_under(&[3; 16]), None);
     }
 
+    /// A blobless post the relay refuses by its rules is told by `ChannelError`, which names no
+    /// group: no `EpochPostTaken` comes, so its copy is never filed, and it is given up
+    /// `KEPT_WAIT_MS` after its post last went.
+    #[test]
+    fn a_post_never_taken_is_never_filed_and_is_given_up() {
+        let mut c = Copies::default();
+        c.wait([1; 16], copy(1), T0);
+        c.sent(&went(&[(1, 4, false)]), T0);
+        assert!(c.file(T0 + KEPT_WAIT_MS - 1, no_head).is_empty());
+        assert_eq!(c.went_under(&[1; 16]), Some(Some(4)), "still waiting");
+        assert!(c.file(T0 + KEPT_WAIT_MS, no_head).is_empty());
+        assert_eq!(c.went_under(&[1; 16]), None, "given up");
+        assert_eq!(one(c.taken(&ack(LOG, 1, 4))), None);
+        // Counted from its last send, not from when it was written
+        c.wait([2; 16], copy(2), T0);
+        c.sent(&went(&[(2, 4, false)]), T0 + 30_000);
+        assert!(c.file(T0 + KEPT_WAIT_MS, no_head).is_empty());
+        assert_eq!(c.went_under(&[2; 16]), Some(Some(4)));
+        assert!(c.file(T0 + 30_000 + KEPT_WAIT_MS, no_head).is_empty());
+        assert_eq!(c.went_under(&[2; 16]), None);
+    }
+
     /// T1e E: a copy filed under X whose chain start the relay refused as gone (two openings
     /// came first) is offered again under the head; one filed under the head is not, nor
-    /// one past `AGAIN_MS`.
+    /// one past `AGAIN_MS` from its post's send.
     #[test]
     fn a_filed_copy_is_offered_again_under_a_newer_head_for_a_while() {
         let mut c = Copies::default();
         c.wait([1; 16], copy(1), T0);
         c.sent(&went(&[(1, 4, true)]), T0);
-        let at = T0 + SETTLE_MS;
+        assert_eq!(one(c.taken(&ack(LOG, 1, 4))), Some((1, 4)));
+        let at = T0 + 100;
         let head4 = |_: &str| Some(epoch(4));
-        assert_eq!(filed(c.file(at, head4)), [(1, 4)]);
-        assert!(
-            c.file(at + 100, head4).is_empty(),
-            "the head it was filed under"
-        );
+        assert!(c.file(at, head4).is_empty(), "the head it was filed under");
         let head6 = |g: &str| (g == LOG).then(|| epoch(6));
         assert_eq!(filed(c.file(at + 200, head6)), [(1, 6)]);
         assert_eq!(
@@ -463,21 +582,21 @@ mod tests {
         let mut regen = epoch(1);
         regen.gen = [2; 16];
         assert_eq!(filed(c.file(at + 400, |_| Some(regen.clone()))), [(1, 1)]);
-        assert!(c.file(at + AGAIN_MS, head6).is_empty());
+        assert!(c.file(T0 + AGAIN_MS, head6).is_empty());
     }
 
-    /// The copies settled together go in the order their posts went.
+    /// The connection ended: what went and was not told taken is filed as it stands, in the
+    /// order the posts went; one that never went is given up.
     #[test]
-    fn copies_go_in_the_order_their_posts_went() {
+    fn at_the_end_a_copy_no_word_came_for_is_given_up() {
         let mut c = Copies::default();
-        for id in [3, 1, 2] {
+        for id in [3, 1, 2, 4] {
             c.wait([id; 16], copy(id), T0);
         }
         c.sent(&went(&[(2, 4, true), (3, 4, false), (1, 4, false)]), T0);
-        assert_eq!(
-            filed(c.file(T0 + SETTLE_MS, no_head)),
-            [(2, 4), (3, 4), (1, 4)]
-        );
+        c.end();
+        assert!(c.file(T0 + 1, no_head).is_empty());
+        assert!(c.went_under(&[2; 16]).is_none());
     }
 
     /// G: a post before its channel is tracked waits for it, and goes when it is; it is

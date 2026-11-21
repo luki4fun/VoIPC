@@ -41193,6 +41193,112 @@ mod group_key {
         );
     }
 
+    /// J9: the writer is told each post the relay took (`EpochPostTaken`, named by its
+    /// ciphertext's digest), the moment it went to the readers, and never one refused: under
+    /// too old an epoch (`OLD_EPOCH`), by the channel's rules with a blob (`EpochRefused`) and
+    /// without (`ChannelError`, which names no group: the app's copy waited a settle and was
+    /// filed for a post that went to nobody).
+    #[tokio::test]
+    async fn the_writer_is_told_each_post_taken_and_never_one_refused() {
+        let mut w = World::new(gk_state()).await;
+        w.member("ann").await;
+        assert!(
+            w.until(20_000, |w| w.holder.head().is_some()).await,
+            "the keyholder's Genesis was taken"
+        );
+        let (gen, epoch) = w.holder.head().unwrap();
+        let state = w.state.clone();
+        let mut writer = Conn::open(&state, "wes", &ik()).await;
+        let mut reader = Conn::open(&state, "rae", &ik()).await;
+        writer.follow().await;
+        reader.follow().await;
+        writer.settled().await;
+        let group = lounge_group(&state, &writer.run).await;
+        let post = |epoch: u32, blob: Option<Vec<u8>>, ct: &[u8]| ClientMessage::EpochPost {
+            channel_id: LOUNGE,
+            group: group.clone(),
+            gen,
+            epoch,
+            blob,
+            ciphertext: ct.to_vec(),
+        };
+        let taken = |frames: &[ServerMessage]| -> Vec<(String, [u8; 16])> {
+            frames
+                .iter()
+                .filter_map(|f| match f {
+                    ServerMessage::EpochPostTaken { group, post } => Some((group.clone(), *post)),
+                    _ => None,
+                })
+                .collect()
+        };
+        writer.send(&post(epoch, None, b"one")).await;
+        writer.send(&post(epoch, None, b"two")).await;
+        reader
+            .expect(|m| matches!(m, ServerMessage::EpochPostIn { ciphertext, .. } if ciphertext == b"two"))
+            .await;
+        let frames = writer.settled().await;
+        assert_eq!(
+            taken(&frames),
+            vec![
+                (
+                    group.clone(),
+                    voipc_crypto::group_key::wire::post_digest(b"one")
+                ),
+                (
+                    group.clone(),
+                    voipc_crypto::group_key::wire::post_digest(b"two")
+                )
+            ],
+            "each post taken, in order: {frames:?}"
+        );
+        // Refused: under an epoch the head is past, and by the channel's rules
+        writer.send(&post(epoch + 5, None, b"old")).await;
+        let frames = writer.settled().await;
+        assert_eq!(
+            refusals(&frames),
+            vec![(refused_what::POST, refused_why::OLD_EPOCH)]
+        );
+        assert_eq!(taken(&frames), vec![], "an old epoch's post");
+        state
+            .sessions
+            .get_mut(&writer.sid)
+            .unwrap()
+            .listen_only
+            .insert(LOUNGE);
+        writer.send(&post(epoch, None, b"ruled")).await;
+        let frames = writer.settled().await;
+        assert!(frames
+            .iter()
+            .any(|f| matches!(f, ServerMessage::ChannelError { .. })));
+        assert_eq!(taken(&frames), vec![], "a blobless post the rules refused");
+        // One with a blob goes behind the group's task, so a ping may come back first
+        writer
+            .send(&post(epoch, Some(vec![1; 64]), b"ruled blob"))
+            .await;
+        let mut frames = vec![];
+        while refusals(&frames).is_empty() {
+            frames.push(writer.next().await);
+        }
+        frames.extend(writer.settled().await);
+        assert_eq!(
+            refusals(&frames),
+            vec![(refused_what::POST, refused_why::NOT_MEMBER)]
+        );
+        assert_eq!(
+            taken(&frames),
+            vec![],
+            "a post with a blob the rules refused"
+        );
+        let later = reader.settled().await;
+        assert!(
+            !later
+                .iter()
+                .any(|f| matches!(f, ServerMessage::EpochPostIn { .. })),
+            "the refused posts reached nobody"
+        );
+        assert_eq!(taken(&later), vec![], "a reader is told nothing taken");
+    }
+
     #[tokio::test]
     async fn fetches_blob_asks_and_name_lists_over_their_budget_are_refused_rate() {
         let state = gk_state();

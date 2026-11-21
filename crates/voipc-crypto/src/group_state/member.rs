@@ -3,7 +3,6 @@
 //! the ratchets since, the seal to `CK` and its `confirm`. Self-rows for the account's other
 //! devices. Every check is C1's; this only runs them in order and keeps what passed.
 
-use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use voipc_protocol::gk::{self, InPiece, Lost, Part, Parts, Seq, VoiceSeatsPiece};
@@ -17,12 +16,12 @@ use super::{
 };
 use crate::group_key::timers::{CHECK_WAIT_MS, EPOCH_AGE_MAX_SECS, FLOOR_AHEAD_GAP_SECS};
 use crate::group_key::{
-    check_above, check_added, check_counters, check_form, check_gated, check_link,
-    check_new_generation, check_on_floor, check_regenesis, check_signer, check_time,
-    check_voice_keyholders, check_walk, confirm_ok, open_seal, open_seat_welcome,
-    open_seed_welcome, open_self_row, path_ok, ratchet, self_row, Clock, Epoch, Floor, Group,
-    GroupKind, Holder, HolderId, Keyholder, Kind, Leaf, Me, MemberId, NamesFloor, Path, Refusal,
-    RowBase, SeatRef, SignedHeader, Version, WalkLink, WalkTo, Warning, LIVE_WINDOW,
+    check_above, check_added, check_counters, check_form, check_gated, check_link_under,
+    check_new_generation, check_on_floor_under, check_regenesis, check_regenesis_under,
+    check_signer, check_time, check_voice_keyholders, check_walk, confirm_ok, open_seal,
+    open_seat_welcome, open_seed_welcome, open_self_row, path_ok, ratchet, self_row, Clock, Epoch,
+    Floor, Group, GroupKind, Holder, HolderId, Keyholder, Kind, Leaf, Me, MemberId, NamesFloor,
+    Path, Refusal, RowBase, SeatRef, SignedHeader, Version, WalkLink, WalkTo, Warning, LIVE_WINDOW,
 };
 
 /// The epoch keys a member keeps: the head epoch's and the one before (1f.7).
@@ -31,6 +30,10 @@ const KEYS_KEPT: usize = 2;
 const KH_SEEN_MOST: usize = 64;
 /// Digests of the headers last taken, met again below the floor without a word (`recent`).
 const RECENT_MOST: usize = 16;
+/// Seed welcomes' `s_m` waiting for a row (`Member::pend_s_m`): per seat and seed, and
+/// seats and seeds.
+const PENDING_PER_SEED: usize = 4;
+const PENDING_SEEDS: usize = 8;
 
 /// `CK` of one epoch.
 pub(super) struct EpochKey {
@@ -82,8 +85,12 @@ pub(super) struct Member {
     /// `BK` of the versions this seat holds, in the floor's generation.
     pub(super) bks: HashMap<(u64, u64), Zeroizing<[u8; 32]>>,
     pub(super) leaf: Option<Leaf>,
-    /// `s_m` per seat of ours and seed, in the floor's generation.
+    /// `s_m` per seat of ours and seed, in the floor's generation: from a welcome or row
+    /// that keyed a seal whose key passed `confirm`, or from the account's self-row.
     s_m: HashMap<(SeatRef, u32), Zeroizing<[u8; 32]>>,
+    /// A seed welcome's `s_m` per seat of ours and seed, until a row under it keys a seal
+    /// whose key passes `confirm` (`pend_s_m`).
+    s_m_pending: HashMap<(SeatRef, u32), Vec<Zeroizing<[u8; 32]>>>,
     /// Row bases by our seat, `(K, tag(KX_K))` and seed (§3.3).
     row_bases: HashMap<(SeatRef, HolderId, u32), RowBase>,
     /// Seeds whose self-row went out, per seat, in the floor's generation.
@@ -119,6 +126,26 @@ pub(super) struct Member {
     pub(super) names: super::names::Names,
     /// The last state told, so each is told once.
     pub(super) told: Option<GkState>,
+}
+
+/// A seat keying's `BK` of the version it reaches (`Member::key_in`), and what it came by.
+struct Keyed {
+    at: (u64, u64),
+    bk: Zeroizing<[u8; 32]>,
+    /// By a welcome or a row to one of our seats; `None`: steps from a version this seat holds.
+    came: Option<Came>,
+}
+
+/// A seed welcome's `s_m` to one of our seats, by seat and seed.
+type SeedSm = ((SeatRef, u32), Zeroizing<[u8; 32]>);
+
+/// The welcome or row a keying's `BK` came by: the seat and seed, and the `s_m` and row
+/// base it opened by that this member does not hold yet.
+struct Came {
+    seat: SeatRef,
+    s: u32,
+    s_m: Option<Zeroizing<[u8; 32]>>,
+    rb: Option<((SeatRef, HolderId, u32), RowBase)>,
 }
 
 /// What a whole `EpochIn`'s headers came to.
@@ -166,6 +193,7 @@ impl Member {
             bks: HashMap::new(),
             leaf: None,
             s_m: HashMap::new(),
+            s_m_pending: HashMap::new(),
             row_bases: HashMap::new(),
             self_rows_done: HashSet::new(),
             parts: Parts::new(Seq::In),
@@ -828,14 +856,14 @@ impl Member {
                         .filter(|k| k.d() == f.kh)
                         .ok_or(Stop::NeedKh)?;
                     warnings = match self.head.as_ref().filter(|p| p.d() == f.d) {
-                        Some(p) => check_link(p, h)?,
-                        None => check_on_floor(f, h)?,
+                        Some(p) => check_link_under(p, h, kh)?,
+                        None => check_on_floor_under(f, h, kh)?,
                     };
                     if hd.kind == Kind::Regenesis {
                         let p = parent
                             .or(self.head.as_ref().filter(|p| p.d() == f.d))
                             .ok_or(Refusal::Chain("a Regenesis comes with its parent"))?;
-                        check_regenesis(Some(f), clock, h, p)?;
+                        check_regenesis_under(Some(f), clock, h, p, kh)?;
                         anew = Some(hd.signer);
                     }
                     let ik = check_signer(h, Some(kh), &pin)?;
@@ -977,6 +1005,7 @@ impl Member {
             self.keys.clear();
             self.bks.clear();
             self.s_m.clear();
+            self.s_m_pending.clear();
             self.row_bases.clear();
             self.self_rows_done.clear();
             self.kh_seen.clear();
@@ -1102,16 +1131,16 @@ impl Member {
                 }
             }
         }
+        // A seed welcome's `s_m` binds only the maker the relay names: it is ours once a row
+        // under it opened to the key of a seal that passed `confirm`, and waits till then
+        let mut seeded = None;
         if let Some(sw) = &p.seed_welcome {
             sw.check().map_err(|_| bad("seed welcome"))?;
             let from = Holder::from_raw(sw.from.m.into(), &sw.from.kx).map_err(|_| bad("kx"))?;
-            let opened = seats.iter().find_map(|(me, seat)| {
+            seeded = seats.iter().find_map(|(me, seat)| {
                 let s_m = open_seed_welcome(&g, sw.s, me, &from, &sw.bytes).ok()?;
-                Some((*seat, s_m))
+                Some(((*seat, sw.s), s_m))
             });
-            if let Some((seat, s_m)) = opened {
-                self.s_m.insert((seat, sw.s), s_m);
-            }
         }
         if let (Some(leaf), Some(path)) = (&p.leaf, &p.path) {
             leaf.check().map_err(|_| bad("leaf"))?;
@@ -1127,7 +1156,9 @@ impl Member {
             }
             self.leaf = Some(leaf);
         }
-        let mut used = None;
+        // The keying's `BK`, and what it came by: kept only once it opened the seal of a key
+        // that passed `confirm` (J8K review)
+        let mut keyed: Option<Keyed> = None;
         if let Some(sk) = &p.seat {
             sk.check().map_err(|_| bad("seat keying"))?;
             let from = Holder::from_raw(sk.from.m.into(), &sk.from.kx).map_err(|_| bad("kx"))?;
@@ -1135,7 +1166,7 @@ impl Member {
                 b: sk.b,
                 v: sk.base_v,
             };
-            let mut bk = match (&sk.welcome, &sk.row) {
+            let (mut bk, came) = match (&sk.welcome, &sk.row) {
                 (Some(w), _) => {
                     let (seat, s_m, bk) = seats
                         .iter()
@@ -1144,74 +1175,75 @@ impl Member {
                             Some((*seat, s_m, bk))
                         })
                         .ok_or(Refusal::Form("a seat welcome that does not open"))?;
-                    self.s_m.insert((seat, sk.s), s_m);
-                    used = Some(seat);
-                    bk
+                    let came = Came {
+                        seat,
+                        s: sk.s,
+                        s_m: Some(s_m),
+                        rb: None,
+                    };
+                    (bk, Some(came))
                 }
                 (None, Some(row)) => {
-                    let mut opened = None;
-                    for (me, seat) in &seats {
-                        let Some(s_m) = self.s_m.get(&(*seat, sk.s)) else {
-                            continue;
-                        };
-                        let at = (*seat, from.id(), sk.s);
-                        let rb = match self.row_bases.entry(at) {
-                            Entry::Occupied(e) => e.into_mut(),
-                            Entry::Vacant(e) => {
-                                let Ok(rb) = RowBase::member_side(&g, sk.s, me, &from, s_m) else {
-                                    continue;
-                                };
-                                e.insert(rb)
-                            }
-                        };
-                        if let Ok(bk) = rb.open_row(base, row) {
-                            opened = Some((*seat, bk));
-                            break;
-                        }
-                    }
-                    let (seat, bk) = opened
+                    let (bk, came) = self
+                        .open_row(&g, &seats, sk.s, &from, base, row, seeded.as_ref())
                         .ok_or(Refusal::Form("a row that does not open to a seat of ours"))?;
-                    used = Some(seat);
-                    bk
+                    (bk, Some(came))
                 }
-                (None, None) => self
-                    .bks
-                    .get(&(sk.b, sk.base_v))
-                    .cloned()
-                    .ok_or(bad("ratchets from a version this seat holds no key of"))?,
+                (None, None) => (
+                    self.bks
+                        .get(&(sk.b, sk.base_v))
+                        .cloned()
+                        .ok_or(bad("ratchets from a version this seat holds no key of"))?,
+                    None,
+                ),
             };
             let mut v = sk.base_v;
             for step in &sk.ratchets {
                 bk = ratchet(&g, step.e, Version { b: sk.b, v }, step.to, &bk);
                 v = step.to;
             }
-            self.bks.insert((sk.b, v), bk);
+            keyed = Some(Keyed {
+                at: (sk.b, v),
+                bk,
+                came,
+            });
+        }
+        // Waits for a row under it, unless one in this piece takes it in below
+        if let Some((at, s_m)) = seeded {
+            self.pend_s_m(at, s_m);
         }
         let ep = Epoch {
             e: hd.epoch,
             d_e: head.d_e(),
         };
+        // `CK`, and whether this keying's `BK` opened it
         let ck = match (&p.seal, &self.leaf) {
             (Some(seal), Some(leaf)) => {
                 let at = Version {
                     b: leaf.b,
                     v: leaf.v,
                 };
-                let bk = self
-                    .bks
-                    .get(&(leaf.b, leaf.v))
-                    .ok_or(bad("a seal to a version this seat holds no key of"))?;
-                Some(
+                let (bk, by_keying) = match keyed.as_ref().filter(|k| k.at == (leaf.b, leaf.v)) {
+                    Some(k) => (&k.bk, true),
+                    None => (
+                        self.bks
+                            .get(&(leaf.b, leaf.v))
+                            .ok_or(bad("a seal to a version this seat holds no key of"))?,
+                        false,
+                    ),
+                };
+                Some((
                     open_seal(&g, &ep, at, bk, seal)
                         .map_err(|_| Refusal::Form("a seal that does not open"))?,
-                )
+                    by_keying,
+                ))
             }
             _ => self
                 .key_of(&hd.gen, hd.epoch)
                 .filter(|k| k.d_e == ep.d_e)
-                .map(|k| k.ck.clone()),
+                .map(|k| (k.ck.clone(), false)),
         };
-        let Some(ck) = ck else {
+        let Some((ck, by_keying)) = ck else {
             return Ok(());
         };
         // Rule 5
@@ -1236,11 +1268,101 @@ impl Member {
             }
         }
         self.seat_owed = false;
-        // A self-row for the current seat only: the old one's are K1's to seal again
-        if let Some(sk) = p.seat.as_ref().filter(|_| used == Some(own)) {
-            self.write_self_row(who, &g, sk.s, &own, out);
+        // The keying's key came through: it, and the `s_m` and row base it came by, are ours
+        let Some(k) = keyed.filter(|_| by_keying) else {
+            return Ok(());
+        };
+        self.bks.insert(k.at, k.bk);
+        if let Some(came) = k.came {
+            let at = (came.seat, came.s);
+            if let Some(s_m) = came.s_m {
+                self.s_m.insert(at, s_m);
+            }
+            self.s_m_pending.remove(&at);
+            if let Some((key, rb)) = came.rb {
+                self.row_bases.insert(key, rb);
+            }
+            // A self-row for the current seat only: the old one's are K1's to seal again
+            if came.seat == own {
+                self.write_self_row(who, &g, came.s, &own, out);
+            }
         }
         Ok(())
+    }
+
+    /// A row to one of our seats under seed `s`, by `from`: opened by the row base of the
+    /// `s_m` the seat holds, else of one that waits (`seeded`, this piece's seed welcome, then
+    /// `s_m_pending`). With the key, what it came by that is new here.
+    #[allow(clippy::too_many_arguments)]
+    fn open_row(
+        &self,
+        g: &Group,
+        seats: &[(Me, SeatRef)],
+        s: u32,
+        from: &Holder,
+        base: Version,
+        row: &[u8],
+        seeded: Option<&SeedSm>,
+    ) -> Option<(Zeroizing<[u8; 32]>, Came)> {
+        for (me, seat) in seats {
+            let key = (*seat, from.id(), s);
+            let came = |s_m, rb| Came {
+                seat: *seat,
+                s,
+                s_m,
+                rb,
+            };
+            if let Some(rb) = self.row_bases.get(&key) {
+                if let Ok(bk) = rb.open_row(base, row) {
+                    return Some((bk, came(None, None)));
+                }
+            }
+            if let Some(s_m) = self.s_m.get(&(*seat, s)) {
+                if let Ok(rb) = RowBase::member_side(g, s, me, from, s_m) {
+                    if let Ok(bk) = rb.open_row(base, row) {
+                        return Some((bk, came(None, Some((key, rb)))));
+                    }
+                }
+            }
+            let waiting = seeded
+                .filter(|(at, _)| *at == (*seat, s))
+                .map(|(_, s_m)| s_m)
+                .into_iter()
+                .chain(self.s_m_pending.get(&(*seat, s)).into_iter().flatten());
+            for s_m in waiting {
+                let Ok(rb) = RowBase::member_side(g, s, me, from, s_m) else {
+                    continue;
+                };
+                if let Ok(bk) = rb.open_row(base, row) {
+                    return Some((bk, came(Some(s_m.clone()), Some((key, rb)))));
+                }
+            }
+        }
+        None
+    }
+
+    /// A seed welcome's `s_m` that waits for a row under it: a few per seat and seed, the
+    /// newest last, and a few seats and seeds, the lowest seed going first.
+    fn pend_s_m(&mut self, at: (SeatRef, u32), s_m: Zeroizing<[u8; 32]>) {
+        if self.s_m.contains_key(&at) {
+            return;
+        }
+        let waiting = self.s_m_pending.entry(at).or_default();
+        if waiting.iter().any(|x| **x == *s_m) {
+            return;
+        }
+        waiting.push(s_m);
+        if waiting.len() > PENDING_PER_SEED {
+            waiting.remove(0);
+        }
+        while self.s_m_pending.len() > PENDING_SEEDS {
+            let lowest = *self
+                .s_m_pending
+                .keys()
+                .min_by_key(|(_, s)| *s)
+                .expect("not empty");
+            self.s_m_pending.remove(&lowest);
+        }
     }
 
     /// A self-row for `s_m` of seed `s`, once a row or seal under it opened and `confirm`

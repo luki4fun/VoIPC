@@ -44,7 +44,7 @@ mod writer;
 #[cfg(test)]
 mod tests;
 
-pub use copies::{Copies, Early, EarlyPost, KeptCopy, EARLY_WAIT_MS, JOIN_REFUSED, SETTLE_MS};
+pub use copies::{Copies, Early, EarlyPost, KeptCopy, EARLY_WAIT_MS, JOIN_REFUSED};
 pub use holder::{BuildJob, Built, HolderKeep};
 pub use kept::PastEpoch;
 
@@ -742,6 +742,8 @@ impl GroupKeying {
                     .frame(who, &mut self.groups, msg, &mut c, &mut out);
                 return out;
             }
+            // The host's: it files that post's kept copy (`Copies::taken`)
+            ServerMessage::EpochPostTaken { .. } => return out,
             _ => return out,
         };
         let Some(m) = self.groups.get_mut(group) else {

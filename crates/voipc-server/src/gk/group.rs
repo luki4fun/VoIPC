@@ -16,10 +16,10 @@ use voipc_crypto::group_key::commit::{
     Joiner, Listed, Make, Pair, ReplaceAsk,
 };
 use voipc_crypto::group_key::timers::{
-    deadline_ms, refresh_ms, BLOBS_PER_WRITER, BLOB_MAX_BYTES, DEADLINE_SLOW_MS,
-    EPOCH_AGE_MAX_SECS, EPOCH_MIN_GAP_MS, FLOOR_AHEAD_GAP_SECS, OPEN_COMMIT_MS,
-    OPEN_PER_CONN_BYTES, OPEN_PER_RELAY_BYTES, REGENESIS_AFTER_MS, RETRY_ALL_MISSED_MS,
-    SEED_PAGE_EVERY_MS, SEED_PAGE_SEATS,
+    deadline_ms, refresh_ms, regenesis_after_ms, BLOBS_PER_WRITER, BLOB_MAX_BYTES,
+    DEADLINE_SLOW_MS, EPOCH_AGE_MAX_SECS, EPOCH_MIN_GAP_MS, FLOOR_AHEAD_GAP_SECS, OPEN_COMMIT_MS,
+    OPEN_PER_CONN_BYTES, OPEN_PER_RELAY_BYTES, REGENESIS_AFTER_MS, REGENESIS_FAST_AFTER_MS,
+    RETRY_ALL_MISSED_MS, SEED_PAGE_EVERY_MS, SEED_PAGE_SEATS,
 };
 use voipc_crypto::group_key::tree::BucketTree;
 use voipc_crypto::group_key::{
@@ -835,7 +835,7 @@ impl GroupState {
                         self.new_gen = true;
                         self.ask_start(Kind::Genesis, true, now, out);
                     }
-                } else if now >= self.no_keyholder_since.unwrap_or(now) + REGENESIS_AFTER_MS {
+                } else if self.regenesis_at().is_some_and(|t| now >= t) {
                     self.ask_start(Kind::Regenesis, true, now, out);
                 }
             }
@@ -1047,6 +1047,29 @@ impl GroupState {
             return Some((self.exits_due(DueKind::Refresh), None));
         }
         None
+    }
+
+    /// When a stored group with no keyholder online may be asked a Regenesis (relay ms):
+    /// once the wait the head's set allows is out, counted from when no keyholder was
+    /// online and from the head's own `time`, as the volunteer and every member count it
+    /// (`regenesis_after_ms`, "Fast new start": 2 min for a set of connection entries
+    /// alone that no Regenesis started in the last hour, else the hour). `None` with a
+    /// keyholder online, or no head.
+    pub fn regenesis_at(&self) -> Option<u64> {
+        let since = self.no_keyholder_since?;
+        let head = self.head.as_ref()?;
+        let set = head.kh.header();
+        let base = since.max(head.sh.header().time.saturating_mul(1000));
+        // The churn bound lets a set a Regenesis started go fast an hour after it
+        let gap = set
+            .time
+            .saturating_add(voipc_crypto::group_key::REGENESIS_FAST_GAP)
+            .saturating_mul(1000);
+        let fast = base.saturating_add(REGENESIS_FAST_AFTER_MS);
+        [fast, fast.max(gap), base.saturating_add(REGENESIS_AFTER_MS)]
+            .into_iter()
+            .filter(|t| *t >= base.saturating_add(regenesis_after_ms(set, *t)))
+            .min()
     }
 
     /// A Genesis (no generation, or a new one due) or a Regenesis, to the best volunteer.
@@ -1747,9 +1770,7 @@ impl GroupState {
             self.joins.closes_at(self.kind),
             self.next_refresh,
             Some(self.last_opening + EPOCH_MIN_GAP_MS),
-            self.no_keyholder_since
-                .filter(|_| self.stored)
-                .map(|t| t + REGENESIS_AFTER_MS),
+            self.regenesis_at().filter(|_| self.stored),
             paging.then_some(self.next_page),
         ];
         [

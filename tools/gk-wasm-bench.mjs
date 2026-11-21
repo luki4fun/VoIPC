@@ -17,9 +17,10 @@
 //   node tools/gk-wasm-bench.mjs sizes DIR...
 //       Each module's bytes raw, gzip -9 and brotli q11.
 //   node tools/gk-wasm-bench.mjs run --pkg DIR [--engines chromium,firefox,node]
-//       [--max 100000] [--budget 2] [--label s] [--out FILE] [--work DIR]
-//       The bench. --max is the largest text group (10k and 20k on the way below it), --budget the
-//       step budget in ms (session.ts GK_STEP_CALL_MS). Every result line goes to --out
+//       [--max 100000 | --sizes 1000,10000] [--budget 2] [--label s] [--out FILE] [--work DIR]
+//       The bench. --max is the largest text group (10k and 20k on the way below it), --sizes
+//       the text group's sizes instead, --budget the step budget in ms (session.ts
+//       GK_STEP_CALL_MS; GK_STEP_MS is 8). Every result line goes to --out
 //       (JSON lines), a summary to stdout. CHROME= and FIREFOX= pick the browsers.
 //   node tools/gk-wasm-bench.mjs summary FILE...
 //       The summary again, from result lines.
@@ -283,7 +284,7 @@ function summary(lines, label) {
   if (prim) {
     out.push(`  prim (per call, median of ${prim.n} batches): X25519 ${prim.x25519_us} µs, Kyber1024 encaps ${prim.kyber_encaps_us} / decaps ${prim.kyber_decaps_us} µs, seat welcome ${prim.seat_welcome_us} µs`);
   }
-  out.push("  | what | n | at seats | build ms | steps | longest step ms | duty's frames ms (longest) | built ms | uploads ms (longest) | header taken ms | page ms in all | validator ms | rows | seed welcomes | KB |");
+  out.push("  | what | n | at seats | build ms | steps | longest step ms (memory grew / did not) | duty's frames ms (longest) | built ms | uploads ms (longest) | header taken ms | page ms in all | validator ms | rows | seed welcomes | KB |");
   out.push("  |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
   const groups = new Map();
   for (const l of lines) {
@@ -300,7 +301,7 @@ function summary(lines, label) {
     const m = (name) => median(ls.map((l) => l[name] ?? NaN));
     const max = (name) => Math.max(...ls.map((l) => l[name] ?? 0));
     const seats = at ?? `${ls[0].seats_before}–${ls.at(-1).seats_after}`;
-    out.push(`  | ${key} (×${ls.length}) | ${ls[0].n} | ${seats} | ${f(m("build_ms"))} | ${max("steps")} | ${f(max("step_max_ms"))} | ${f(m("lock_ms"))} (${f(max("lock_max_ms"))}) | ${f(m("built_ms"))} | ${f(m("upload_ms"))} (${f(max("upload_max_ms"))}) | ${f(m("take_ms"))} | ${f(m("page_ms"))} | ${f(m("check_ms"))} | ${f(m("rows"), 0)} | ${f(m("seed_welcomes"), 0)} | ${f(m("bytes") / 1000, 0)} |`);
+    out.push(`  | ${key} (×${ls.length}) | ${ls[0].n} | ${seats} | ${f(m("build_ms"))} | ${max("steps")} | ${f(max("step_max_ms"))}${ls.some((l) => l.grew_steps !== undefined) ? ` (${f(max("grew_max_ms"))} / ${f(max("flat_max_ms"))})` : ""} | ${f(m("lock_ms"))} (${f(max("lock_max_ms"))}) | ${f(m("built_ms"))} | ${f(m("upload_ms"))} (${f(max("upload_max_ms"))}) | ${f(m("take_ms"))} | ${f(m("page_ms"))} | ${f(m("check_ms"))} | ${f(m("rows"), 0)} | ${f(m("seed_welcomes"), 0)} | ${f(m("bytes") / 1000, 0)} |`);
   }
   // Cold against warm: a cold build that is not well above the warm one kept its row bases
   for (const [cold, warm] of [["cexits", "exits"], ["crefresh", "refresh"], ["cvremove", "vremove"]]) {
@@ -354,7 +355,9 @@ if (cmd === "build") {
   if (!existsSync(join(pkg, "voipc_web_bg.wasm"))) die(`no voipc_web_bg.wasm in ${pkg}`);
   const max = Number(opt("max", "100000"));
   const label = opt("label", "s");
-  const opts = { budget: Number(opt("budget", "2")), prims: 200, sizes: [...SIZES.filter((s) => s < max), max] };
+  const sizes = opt("sizes", "") ? opt("sizes", "").split(",").map(Number).sort((a, b) => a - b) : [...SIZES.filter((s) => s < max), max];
+  if (!sizes.every((s) => Number.isInteger(s) && s > 0)) die("--sizes: whole numbers of seats, comma-separated");
+  const opts = { budget: Number(opt("budget", "2")), prims: 200, sizes };
   const work = resolve(opt("work", join(ROOT, "target", "gk-wasm-bench")));
   mkdirSync(work, { recursive: true });
   const outFile = opt("out", join(work, `results-${label}.jsonl`));

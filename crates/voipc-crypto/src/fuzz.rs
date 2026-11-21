@@ -157,6 +157,9 @@ pub fn fuzz_group(data: &[u8]) {
         ik: libsignal_protocol::IdentityKeyPair,
         /// The keyholder header the keyring's head names.
         genesis: SignedHeader,
+        /// The same Genesis with its one entry a connection's pair (0x02): a Regenesis over
+        /// it may come 2 minutes on ("Fast new start").
+        conn_genesis: SignedHeader,
     }
     static FIXED: OnceLock<Fixed> = OnceLock::new();
     let f = FIXED.get_or_init(|| {
@@ -169,6 +172,8 @@ pub fn fuzz_group(data: &[u8]) {
         let ik = libsignal_protocol::IdentityKeyPair::generate(&mut rng);
         let genesis = SignedHeader::sign(fuzz_genesis(&ik, &holder.public()), &ik)
             .expect("a well-formed Genesis");
+        let conn_genesis = SignedHeader::sign(conn_genesis(&ik, &holder.public()), &ik)
+            .expect("a well-formed Genesis");
         Fixed {
             g: Group::new(GroupKind::Text, "c:fuzz", gen).expect("a valid id"),
             voice: Group::new(GroupKind::Voice, "c:fuzz", gen).expect("a valid id"),
@@ -177,6 +182,7 @@ pub fn fuzz_group(data: &[u8]) {
             seat_keys,
             ik,
             genesis,
+            conn_genesis,
         }
     });
     let g = &f.g;
@@ -232,7 +238,14 @@ pub fn fuzz_group(data: &[u8]) {
         &fuzz_seal::history(g, 1, &seat, self_key, data),
     );
     fuzz_keyring(g, f.genesis.clone(), &f.ik, &key, data);
-    fuzz_wire(&f.genesis, &f.ik, &f.holder.public(), data);
+    // Which set is in force picks the Regenesis wait (`rules::regenesis_wait`): bit 1 of the
+    // input's length, beside bit 0 (`stored`)
+    let set = if data.len() % 4 >= 2 {
+        &f.conn_genesis
+    } else {
+        &f.genesis
+    };
+    fuzz_wire(set, &f.ik, &f.holder.public(), data);
     fuzz_keying(&f.ik, data);
 
     // The Merkle path check: a root, a leaf, an index and a count, siblings.
@@ -285,6 +298,20 @@ pub fn fuzz_group(data: &[u8]) {
         let floor = Floor::after(None, &h, h.header().time);
         let _ = check_link(&h, &h);
         let _ = check_on_floor(&floor, &h);
+        // The same under a set in force, itself (`regenesis_wait`)
+        let _ = check_link_under(&h, &h, &h);
+        let _ = check_on_floor_under(&floor, &h, &h);
+        let _ = check_regenesis_under(
+            Some(&floor),
+            Clock {
+                now: h.header().time,
+                taken: None,
+            },
+            &h,
+            &h,
+            &h,
+        );
+        let _ = regenesis_wait(h.header(), h.header().time);
         let _ = check_signer(&h, Some(&h), &none);
         let top = |_: &[u8; 16]| {
             Some(Seen {
@@ -650,7 +677,12 @@ impl<'a> FuzzGroup<'a> {
         h.signer = self.by.m;
         let anew = h.kind.starts_anew();
         if anew {
-            h.keyholders = p.keyholders.clone();
+            // The volunteer's own entry (rule 7), whichever set is in force: the fixed
+            // Genesis's one entry, or `conn_genesis`'s connection pair in its place
+            h.keyholders = (self.due.volunteer.as_ref())
+                .and_then(|v| v.pair.entry(GroupKind::Text, v.m, v.ik))
+                .into_iter()
+                .collect();
         }
         // The leaves after the commit, as rule 8 makes them.
         let g = Group::new(GroupKind::Text, "c:fuzz", h.gen).ok()?;
@@ -763,6 +795,17 @@ fn fuzz_genesis(
         removed: Removed::Count(0),
         confirm: [3; 32],
     }
+}
+
+/// `fuzz_genesis` with its one entry a connection's pair (0x02): the set in force of a
+/// "Fast new start" Regenesis.
+fn conn_genesis(
+    ik: &libsignal_protocol::IdentityKeyPair,
+    holder: &crate::group_key::SeatPublic,
+) -> crate::group_key::HeaderV1 {
+    let mut h = fuzz_genesis(ik, holder);
+    h.keyholders[0].origin = crate::group_key::Origin::Connection as u8;
+    h
 }
 
 /// The keyring past its AEADs and its hash chain: the input split into a
@@ -961,6 +1004,10 @@ mod tests {
             seed_floor: 2,
             ..p.clone()
         };
+        let fast = HeaderV1 {
+            time: 1 + 2 * 60,
+            ..regen.clone()
+        };
         for (kind, h, rule) in [
             (DueKind::Join, join, None),
             (DueKind::Genesis, gen, Some(14)),
@@ -978,6 +1025,24 @@ mod tests {
             assert!(matches!(sent, Some(2 | 4)), "{kind:?} as sent: {sent:?}");
             let got = validate(&view, &fg.resigned(&c).unwrap()).err();
             assert_eq!(got.as_ref().map(|b| b.rule), rule, "{kind:?}: {got:?}");
+        }
+        // "Fast new start": a Regenesis 2 minutes after a Genesis whose one entry is a
+        // connection's pair runs to the last rule too; after the desktop's, rule 4 stops it.
+        let conn = SignedHeader::sign(conn_genesis(&ik, &holder), &ik).unwrap();
+        for (set, rule) in [(&conn, Some(14)), (&genesis, Some(4))] {
+            let sh = SignedHeader::sign(fast.clone(), &other).unwrap();
+            let c = Commit {
+                body: sh.body().to_vec(),
+                sig: sh.sig().to_vec(),
+                ..Commit::default()
+            };
+            let fg = FuzzGroup::new(set, &ik, &holder, DueKind::Regenesis);
+            // The relay's clock at the header's own time: one dated back past the clock slack
+            // is refused (rule 5, `commit::BACKDATED`)
+            let mut view = fg.view(true);
+            view.now = fast.time;
+            let got = validate(&view, &fg.resigned(&c).unwrap()).err();
+            assert_eq!(got.as_ref().map(|b| b.rule), rule, "{got:?}");
         }
     }
 }

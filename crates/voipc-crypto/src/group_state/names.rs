@@ -392,14 +392,11 @@ fn readers(m: &Member, shown: &crate::group_key::Shown, show: bool, out: &mut Gk
     if shown.named.is_empty() && !shown.older_unnamed {
         return;
     }
-    let checked: Vec<_> = shown
-        .named
-        .iter()
-        .filter(|a| !shown.unchecked.contains(a))
-        .map(|a| a.m)
-        .collect();
+    // Every new reader by name, one this device cannot check against the pin as it stood then
+    // too (§4.4 rule 6: shown, not refused; claim 5: the headers name every new reader). The
+    // count is of those with no name to show here: all of them in a room that shows none
     let (named, unchecked) = if show {
-        (checked, shown.unchecked.len())
+        (shown.named.iter().map(|a| a.m).collect(), 0)
     } else {
         (Vec::new(), shown.named.len())
     };

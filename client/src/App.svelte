@@ -64,6 +64,7 @@
   import { pendingPokes, createPoke, addPoke } from "./lib/stores/pokes.js";
   import {
     addChannelMessage,
+    markNotSent,
     noteNeverOpened,
     addChannelLineAtTop,
     addDmMessage,
@@ -1922,6 +1923,8 @@
         is_moderator?: boolean;
         /** It waited for its key. */
         held?: boolean;
+        /** Our own post, which never went: why (the relay's words). */
+        not_sent?: string;
       }>("channel-chat-message", (server, data) => {
         const { channel_id, user_id: uid, username, timestamp, message_id } = data;
         // Cut where it arrives (D-7): what follows parses it, for a mention
@@ -1986,6 +1989,7 @@
               kind: data.decryption_failed ? "undecryptable" : undefined,
               account: writer ? accountHex(writer) : undefined,
               ...messageRefs(data),
+              ...(uid === self && data.not_sent ? { not_sent: data.not_sent } : {}),
             },
             !!data.held,
           );
@@ -2184,6 +2188,13 @@
           }
         },
       ),
+
+      // A post of ours that never went, though its row showed it sent: the relay would have
+      // refused it as too large, sealed, naming no message. Its row says so.
+      listenServer<{ channel_id: number; message_id: string; reason: string }>("channel-not-sent", (server, d) => {
+        const name = channelNameById(server, d.channel_id);
+        if (name) markNotSent(server, name, d.message_id, get(userId.peek(server)), d.reason);
+      }),
 
       // The channel's keys did not get out, so what was written then was never
       // sent, though it showed as sent.

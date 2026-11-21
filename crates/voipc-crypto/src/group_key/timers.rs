@@ -4,11 +4,13 @@
 //! Milliseconds end in `_MS`, seconds in `_SECS`; a count says what it counts.
 //!
 //! The ones C1 already has stay there: `CLOCK_SLACK`, `EPOCH_MIN_GAP`,
-//! `REGENESIS_WAIT`, `ROLL_GAP`, `SEED_MAX_AGE`, `NAMES_KEPT`,
-//! `HEADER_MAX_BYTES`, `MAX_REMOVED`, `MAX_KEYHOLDERS`, `BUCKET_SEATS`.
+//! `REGENESIS_WAIT` (and `REGENESIS_FAST_WAIT`, `REGENESIS_FAST_GAP`),
+//! `ROLL_GAP`, `SEED_MAX_AGE`, `NAMES_KEPT`, `HEADER_MAX_BYTES`,
+//! `MAX_REMOVED`, `MAX_KEYHOLDERS`, `BUCKET_SEATS`.
 
 use super::ctx::GroupKind;
-use super::{CLOCK_SLACK, EPOCH_MIN_GAP, REGENESIS_WAIT};
+use super::header::HeaderV1;
+use super::{CLOCK_SLACK, EPOCH_MIN_GAP, REGENESIS_FAST_WAIT, REGENESIS_WAIT};
 
 const SEC: u64 = 1000;
 const MIN: u64 = 60 * SEC;
@@ -107,8 +109,19 @@ pub const BUCKET_AGE_MAX_SECS: u64 = 60 * 60;
 pub const REFRESH_SLICE: usize = 12;
 
 /// No keyholder online on a relay with accounts: a Regenesis may be asked
-/// after this long (§5.6).
+/// after this long (§5.6)…
 pub const REGENESIS_AFTER_MS: u64 = REGENESIS_WAIT * SEC;
+/// …or after this long when every entry of the set in force is a connection
+/// entry, none of which can come back online ("Fast new start", owner
+/// 2026-11-19), unless a Regenesis started that set in the last hour.
+pub const REGENESIS_FAST_AFTER_MS: u64 = REGENESIS_FAST_WAIT * SEC;
+
+/// How long the relay waits with no keyholder online before it asks a
+/// Regenesis, at `now_ms`, under `set`, the keyholder header in force: the
+/// wait every member holds the Regenesis to (`rules::regenesis_wait`).
+pub fn regenesis_after_ms(set: &HeaderV1, now_ms: u64) -> u64 {
+    super::regenesis_wait(set, now_ms / SEC) * SEC
+}
 /// Misses or declines in an hour that propose a keyholder's removal.
 pub const REMOVAL_MISSES: usize = 3;
 /// The hour those are counted in.
@@ -229,7 +242,80 @@ mod tests {
         assert_eq!(EPOCH_AGE_MAX_SECS, 70 * 60);
         assert_eq!(EPOCH_MIN_GAP_MS, 2_000);
         assert_eq!(REGENESIS_AFTER_MS, 3_600_000);
+        assert_eq!(REGENESIS_FAST_AFTER_MS, 120_000);
         assert_eq!(GATED_EXIT_BATCH, 768);
+    }
+
+    /// "Fast new start": the relay asks a Regenesis after 2 minutes under a set of
+    /// connection entries alone, after the hour under a set with a desktop's pair, and
+    /// after the hour too while the set is one a Regenesis started less than an hour ago.
+    #[test]
+    fn a_regenesis_is_asked_after_two_minutes_under_connection_entries_alone_else_after_the_hour() {
+        use crate::group_key::{Keyholder, Kind, MemberId, Origin};
+        let entry = |origin: Origin, b: u8| Keyholder {
+            m: MemberId::Account([b; 16]),
+            u: None,
+            origin: origin as u8,
+            n: 1,
+            ik: [b; 32],
+            kx: [b; 32],
+            tag_kk: [b; 8],
+        };
+        let t0 = 1_800_000_000u64;
+        let set = |kind: Kind, keyholders: Vec<Keyholder>| HeaderV1 {
+            group_kind: GroupKind::Text,
+            group: "c:lounge-1".into(),
+            gen: [1; 16],
+            epoch: 3,
+            join: 0,
+            kind,
+            time: t0,
+            parent: [2; 32],
+            epoch_parent: [0; 32],
+            kh_parent: [3; 32],
+            signer: keyholders[0].m,
+            keyholders,
+            gated: false,
+            seed: 1,
+            seed_floor: 1,
+            exits_upto: 0,
+            seats: 1,
+            buckets: 1,
+            conn_seats: 0,
+            bucket_root: [4; 32],
+            keyring_hash: [5; 32],
+            names_hash: [0; 32],
+            added: crate::group_key::Added::Count(0),
+            removed: crate::group_key::Removed::Count(0),
+            confirm: [6; 32],
+        };
+        let now = (t0 + 300) * 1000;
+        let conn = vec![entry(Origin::Connection, 1), entry(Origin::Connection, 2)];
+        let mixed = vec![entry(Origin::Connection, 1), entry(Origin::Desktop, 3)];
+        assert_eq!(
+            regenesis_after_ms(&set(Kind::KeyholdersAdd, conn.clone()), now),
+            120_000
+        );
+        assert_eq!(
+            regenesis_after_ms(&set(Kind::Genesis, conn.clone()), now),
+            120_000
+        );
+        assert_eq!(
+            regenesis_after_ms(&set(Kind::KeyholdersAdd, mixed), now),
+            3_600_000
+        );
+        assert_eq!(
+            regenesis_after_ms(
+                &set(Kind::KeyholdersAdd, vec![entry(Origin::Desktop, 3)]),
+                now
+            ),
+            3_600_000
+        );
+        // The churn bound: a set a Regenesis started keeps the hour for an hour
+        let regen = set(Kind::Regenesis, conn);
+        assert_eq!(regenesis_after_ms(&regen, now), 3_600_000);
+        assert_eq!(regenesis_after_ms(&regen, (t0 + 3599) * 1000), 3_600_000);
+        assert_eq!(regenesis_after_ms(&regen, (t0 + 3600) * 1000), 120_000);
     }
 
     #[test]

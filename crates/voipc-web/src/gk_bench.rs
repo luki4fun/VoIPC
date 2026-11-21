@@ -129,6 +129,11 @@ mod clock {
     pub fn ms() -> f64 {
         performance_now()
     }
+
+    /// The module's memory, in 64 KiB pages.
+    pub fn pages() -> usize {
+        core::arch::wasm32::memory_size::<0>()
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -139,6 +144,11 @@ mod clock {
     pub fn ms() -> f64 {
         static START: OnceLock<Instant> = OnceLock::new();
         START.get_or_init(Instant::now).elapsed().as_secs_f64() * 1e3
+    }
+
+    /// Natively, no module memory to watch.
+    pub fn pages() -> usize {
+        0
     }
 }
 
@@ -224,6 +234,15 @@ struct Cost {
     lock_calls: u32,
     steps: u32,
     step_max_ms: f64,
+    /// The build's units of work (`build::steps::unit`).
+    units: u64,
+    /// Steps in which the module's memory grew, and the longest of them and of the others:
+    /// a `memory.grow` (and the first touch of its pages) lands in the step that asks it.
+    grew_steps: u32,
+    grew_max_ms: f64,
+    flat_max_ms: f64,
+    /// The longest step: which (from 0), and the units it did.
+    step_max_at: (u32, u64),
     build_ms: f64,
     built_ms: f64,
     /// The commit's parts and welcome pages, each out of the duty and encoded
@@ -253,6 +272,12 @@ impl Cost {
             "lock_calls": self.lock_calls,
             "steps": self.steps,
             "step_max_ms": r3(self.step_max_ms),
+            "units": self.units,
+            "grew_steps": self.grew_steps,
+            "grew_max_ms": r3(self.grew_max_ms),
+            "flat_max_ms": r3(self.flat_max_ms),
+            "step_max_at": self.step_max_at.0,
+            "step_max_units": self.step_max_at.1,
             "build_ms": r3(self.build_ms),
             "built_ms": r3(self.built_ms),
             "upload_ms": r3(self.upload_ms),
@@ -1120,12 +1145,12 @@ impl Bench {
     /// for it. `due` is the relay's for a commit, `None` for a seed-welcome page.
     ///
     /// `cold`: built with no row bases, as by a keyholder new to the group or back after a
-    /// reload. The bases travel with the job in hand (holder.rs `task` takes `Hold::cache`,
-    /// `built` puts it back), so the host holds the due's job (as a page midway through a
-    /// stepped build does) while the relay asks the due again: the duty's second job finds
-    /// no bases, and that one is timed. The first is built afterwards, untimed, and handed
-    /// back, so its bases come home for the dues after. The page pays the due's frames and
-    /// lists once, the first time.
+    /// reload. A job holds the group's bases from its first step to its end (holder.rs
+    /// `Lease`), so the host takes one step of the due's job (as a page midway through a
+    /// stepped build does) and the relay asks the due again: the duty's second job finds no
+    /// bases, and that one is timed. The first then stops at its next step (its due went)
+    /// and its bases go home for the dues after. The page pays the due's frames and lists
+    /// once, the first time.
     #[allow(clippy::too_many_arguments)]
     fn run_due(
         &mut self,
@@ -1149,7 +1174,13 @@ impl Bench {
         let lists = until_ready(kh, room, frames, &mut cost, op)?;
         let mut held = None;
         if cold {
-            held = Some(kh.keying.take_build().ok_or("no job")?);
+            let mut first = kh.keying.take_build().ok_or("no job")?;
+            if first.step(std::time::Duration::ZERO).is_some() {
+                return Err(format!(
+                    "{op}: the build ended in one unit: nothing to time cold"
+                ));
+            }
+            held = Some(first);
             until_ready(
                 kh,
                 room,
@@ -1160,16 +1191,28 @@ impl Bench {
         }
         let mut job = kh.keying.take_build().ok_or("no job")?;
         let b = loop {
+            let pages = clock::pages();
+            let units = job.units();
             let at = clock::ms();
             let step = job.step(std::time::Duration::from_secs_f64(budget_ms / 1000.0));
             let ms = clock::ms() - at;
+            if ms > cost.step_max_ms {
+                cost.step_max_at = (cost.steps, job.units() - units);
+            }
             cost.steps += 1;
             cost.build_ms += ms;
             cost.step_max_ms = cost.step_max_ms.max(ms);
+            if clock::pages() > pages {
+                cost.grew_steps += 1;
+                cost.grew_max_ms = cost.grew_max_ms.max(ms);
+            } else {
+                cost.flat_max_ms = cost.flat_max_ms.max(ms);
+            }
             if let Some(b) = step {
                 break b;
             }
         };
+        cost.units = job.units();
         let at = clock::ms();
         let out = kh.keying.built(
             b,
@@ -1253,11 +1296,9 @@ impl Bench {
             r["seed_welcomes"] = seed_welcomes.into();
         }
         if let Some(mut job) = held {
-            let b = loop {
-                if let Some(b) = job.step(std::time::Duration::MAX) {
-                    break b;
-                }
-            };
+            let b = job
+                .step(std::time::Duration::MAX)
+                .ok_or("the held job had ended")?;
             let c = GkCtx {
                 pins: &mut kh.pins,
                 now: now_millis(),
@@ -1419,6 +1460,12 @@ mod tests {
         assert_eq!(s["seed_welcomes"], 40);
         // A Join after them all still builds on the head the duty holds
         assert_eq!(ok("join", 3)["seats_after"], 393);
+        // At a zero budget, a step a unit: the last step ends the job with none
+        let z = step("exits", 3, 0.0).unwrap();
+        assert_eq!(z["seats_after"], 390);
+        let units = z["units"].as_u64().unwrap();
+        assert!(units > z["rows"].as_u64().unwrap(), "{z}");
+        assert_eq!(z["steps"].as_u64(), Some(units + 1), "{z}");
         // A memory group's Joins make no rows: its first opening makes them all
         let m = ok("mjoin", 130);
         assert_eq!(m["rows"], 0);

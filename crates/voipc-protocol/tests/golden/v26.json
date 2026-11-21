@@ -9481,6 +9481,23 @@
             }
           ]
         }
+      },
+      "107": {
+        "EpochPostTaken": {
+          "STRUCT": [
+            {
+              "group": "STR"
+            },
+            {
+              "post": {
+                "TUPLEARRAY": {
+                  "CONTENT": "U8",
+                  "SIZE": 16
+                }
+              }
+            }
+          ]
+        }
       }
     }
   },

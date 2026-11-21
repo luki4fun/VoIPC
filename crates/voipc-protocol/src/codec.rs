@@ -110,9 +110,9 @@ pub const CONTROL_MSGS_PER_SEC: u32 = 50;
 ///      EpochWelcomes/EpochListsWanted/KeyringWanted/EpochPost/EpochBlobWanted/EpochNames/
 ///      EpochFloorAhead/KeyholdVolunteer/KeyholdResign/KeyholdReplace, GroupKeys/EpochIn/
 ///      EpochWait/EpochDue/EpochStale/EpochLists/KeyringIn/EpochExit/EpochPostIn/EpochBlob/
-///      EpochNamesIn/EpochRefused/VoiceSeats/EpochReseated, AccountRequest::SeatKeysPublish/
-///      SelfRowPut/EpochChainStart/EpochChainKeys/SelfRowsList/RowMakers and their
-///      AccountReply answers, LoadReport.groups (types::GroupLoad)
+///      EpochNamesIn/EpochRefused/VoiceSeats/EpochReseated/EpochPostTaken,
+///      AccountRequest::SeatKeysPublish/SelfRowPut/EpochChainStart/EpochChainKeys/SelfRowsList/
+///      RowMakers and their AccountReply answers, LoadReport.groups (types::GroupLoad)
 ///
 /// A relay admits only its own protocol; an app speaks its own down to
 /// `compat::OLDEST_RELAY_PROTOCOL` (1.6).

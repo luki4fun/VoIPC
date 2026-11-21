@@ -11,8 +11,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use voipc_crypto::group_key::{GroupKind, HeaderV1, Kind, SeatKeys, SignedHeader};
 use voipc_crypto::group_state::{
-    group_id, GkCtx, GkOut, GkStart, GkTrack, GroupKeying, MemoryPins, OpenedPost, Platform,
-    VaultFloor,
+    group_id, GkCtx, GkOut, GkStart, GkTrack, GroupKeying, MemoryPins, OpenedPost, PastEpoch,
+    Platform, VaultFloor,
 };
 use voipc_crypto::{
     build_aad, generate_identity_key_pair, media_decrypt, media_encrypt, MediaKeyRing, SignalStores,
@@ -213,8 +213,22 @@ impl Device {
 
     /// Every header the relay sent it, in order.
     fn headers(&self) -> Vec<HeaderV1> {
+        self.headers_from(0)
+    }
+
+    /// The epoch an exit asked, by the headers it was sent from `log[from..]`: the first
+    /// opening of generation `gen` that seats `seats`.
+    fn opening_since(&self, from: usize, gen: [u8; 16], seats: u32) -> Option<u32> {
+        self.headers_from(from)
+            .iter()
+            .find(|h| h.gen == gen && h.kind.opens_epoch() && h.seats == seats)
+            .map(|h| h.epoch)
+    }
+
+    /// Every header the relay sent it from `log[from..]`, in order.
+    fn headers_from(&self, from: usize) -> Vec<HeaderV1> {
         let mut hs = vec![];
-        for f in &self.log {
+        for f in &self.log[from..] {
             let ServerMessage::EpochIn { piece, .. } = f else {
                 continue;
             };
@@ -227,6 +241,20 @@ impl Device {
             }
         }
         hs
+    }
+
+    /// The headers it was sent, shortly (kind, epoch, join, exits covered, seats), for a
+    /// failure's message.
+    fn trail(&self) -> Vec<String> {
+        self.headers()
+            .iter()
+            .map(|h| {
+                format!(
+                    "{:?} e{} j{} upto{} seats{}",
+                    h.kind, h.epoch, h.join, h.exits_upto, h.seats
+                )
+            })
+            .collect()
     }
 
     /// Whether the relay told it the room's roster.
@@ -256,6 +284,22 @@ fn hears(from: &Device, to: &mut Device) -> bool {
 
 // ── The world ─────────────────────────────────────────────────────────────
 
+/// `GK_E2E_LAG_MS=<ms>`: each step's check waits this long first. The relay takes a commit
+/// sent in the step meanwhile and shows it in its Load before any app took the push, as it
+/// does now and then when the test's thread is slow: soak controls widen that window with it.
+async fn lag() {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let ms = *MS.get_or_init(|| {
+        std::env::var("GK_E2E_LAG_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    });
+    if ms > 0 {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+    }
+}
+
 struct World {
     state: Arc<ServerState>,
     devices: Vec<Device>,
@@ -284,6 +328,7 @@ impl World {
         let end = wall_ms() + ms;
         while wall_ms() < end {
             self.step().await;
+            lag().await;
             if done(self) {
                 return true;
             }
@@ -405,16 +450,20 @@ async fn e2e_a_leaver_cannot_derive_the_next_epochs_key_while_the_others_hear_ea
     let (gen, was) = w.devices[2].epoch().expect("the leaver's epoch");
     let mark = w.devices[1].log.len();
     w.leave(2).await;
-    let moved = |w: &World| {
-        w.devices[1]
-            .epoch()
-            .is_some_and(|(g, e)| g == gen && e > was)
-    };
+    // The epoch the exit asked is the first opening after the leave that seats the two left,
+    // not where the two stand once the relay's Load is at rest: the Load shows a commit as
+    // soon as its pushes are queued, a step before an app may take them, so the two can
+    // still stand on an opening made before the exit, whose key the leaver holds
+    let covering = |w: &World| w.devices[1].opening_since(mark, gen, 2);
     assert!(
-        w.until(SETTLE_MS, |w| moved(w) && w.settled(&[0, 1])).await,
+        w.until(SETTLE_MS, |w| covering(w)
+            .is_some_and(|e| w.devices[1].epoch() == Some((gen, e)))
+            && w.settled(&[0, 1]))
+            .await,
         "an opening covers the exit and the two left hear each other under it"
     );
-    let (_, now) = w.devices[1].epoch().unwrap();
+    let now = covering(&w).unwrap();
+    assert!(now > was, "the exit's opening e{now} is past e{was}");
     // A sender moves to the new epoch a moment after taking it (`SWITCH_MS`)
     let sends_now = |w: &World| {
         w.devices[0]
@@ -423,6 +472,15 @@ async fn e2e_a_leaver_cannot_derive_the_next_epochs_key_while_the_others_hear_ea
             .is_some_and(|k| k.key_id == now as u16)
     };
     assert!(w.until(SETTLE_MS, |w| sends_now(w)).await);
+    let (stream, key, sid) = {
+        let sender = &w.devices[0];
+        let k = sender.ring.current().unwrap().key_id;
+        (sender.ring.stream_id(), k, sender.sid)
+    };
+    let had = (
+        w.devices[2].epoch(),
+        w.devices[2].ring.get_for(ROOM, sid, stream, key).is_some(),
+    );
     let seen: Vec<ServerMessage> = w.devices[1].log[mark..].to_vec();
     let leaver = &mut w.devices[2];
     for f in &seen {
@@ -433,19 +491,33 @@ async fn e2e_a_leaver_cannot_derive_the_next_epochs_key_while_the_others_hear_ea
         let out = leaver.keying.frame(&mut leaver.st, f, c);
         let _ = leaver.took(out, wall_ms());
     }
+    let after = leaver.epoch().map(|(_, e)| e);
+    let why = format!(
+        "was e{was}, now e{now}; the leaver before the frames: epoch {:?}, media key {}; \
+         after: epoch {after:?}; the leaver was sent {:?}; the member who stayed {:?}",
+        had.0.map(|(_, e)| e),
+        had.1,
+        w.devices[2].trail(),
+        w.devices[1].trail()
+    );
+    let leaver = &mut w.devices[2];
     assert!(
         leaver.epoch().is_none_or(|(_, e)| e < now),
-        "the leaver holds no key of the epoch its exit asked"
+        "the leaver holds no key of the epoch its exit asked; {why}"
     );
-    let sender = &w.devices[0];
-    let (stream, key) = (
-        sender.ring.stream_id(),
-        sender.ring.current().unwrap().key_id,
-    );
-    let sid = sender.sid;
+    // Its head is that epoch's once it took the frames (`epoch()` is then none): nor does
+    // it hold that epoch's key below its head
+    let group = leaver.group.clone();
     assert!(
-        w.devices[2].ring.get_for(ROOM, sid, stream, key).is_none(),
-        "nor a media key for a packet under it"
+        !matches!(
+            leaver.keying.past_epoch(&group, gen, now),
+            PastEpoch::Ready(_)
+        ),
+        "nor below its head; {why}"
+    );
+    assert!(
+        leaver.ring.get_for(ROOM, sid, stream, key).is_none(),
+        "nor a media key for a packet under it; {why}"
     );
 }
 
@@ -500,23 +572,25 @@ async fn e2e_a_voice_kick_exits_the_seat_and_the_others_move_to_an_epoch_it_cann
         channel_id: ROOM,
         user_id: target,
     };
+    let mark = w.devices[0].log.len();
     w.devices[0].conn.send(&kick).await;
-    let moved = |w: &World| {
-        w.devices[0]
-            .epoch()
-            .is_some_and(|(g, e)| g == gen && e > was)
-    };
+    // The kick's opening: the first after it that seats the two left (as the leaver's above:
+    // the relay's Load at rest does not say the others took it yet). A push sent before the
+    // kick may still move the kicked app past `was`, never to that epoch
+    let covering = |w: &World| w.devices[0].opening_since(mark, gen, 2);
     assert!(
-        w.until(SETTLE_MS, |w| moved(w) && w.settled(&[0, 1])).await,
+        w.until(SETTLE_MS, |w| covering(w)
+            .is_some_and(|e| w.devices[0].epoch() == Some((gen, e)))
+            && w.settled(&[0, 1]))
+            .await,
         "an opening covers the kicked seat"
     );
     assert!(w.devices[2]
         .log
         .iter()
         .any(|f| matches!(f, ServerMessage::Kicked { channel_id, .. } if *channel_id == ROOM)));
-    // At rest no exit waits: the head the others hold is the kick's opening or later. A push
-    // sent before the kick may still move the kicked app past `was`, never to that head
-    let (_, now) = w.devices[0].epoch().unwrap();
+    let now = covering(&w).unwrap();
+    assert!(now > was, "the kick's opening e{now} is past e{was}");
     let sends_now = |w: &World| {
         w.devices[1]
             .ring

@@ -865,6 +865,23 @@ impl Member {
 
 // ── The world ─────────────────────────────────────────────────────────────
 
+/// `GK_E2E_LAG_MS=<ms>`: each step waits this long between the keyholders' turn and the
+/// members'. A commit a keyholder sent in its turn is taken meanwhile, and its push reaches
+/// the members a step before the keyholder sees it, as it does now and then when the relay
+/// is quick or the test's thread slow: soak controls widen that window with it.
+async fn lag() {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let ms = *MS.get_or_init(|| {
+        std::env::var("GK_E2E_LAG_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    });
+    if ms > 0 {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+    }
+}
+
 struct World {
     relay: Relay,
     holders: Vec<Holder>,
@@ -940,6 +957,7 @@ impl World {
                 self.relay.send(sid, m).await;
             }
         }
+        lag().await;
         let tick = now >= self.last_tick + 1_000;
         for i in 0..self.members.len() {
             let sid = self.members[i].sid;
@@ -1395,7 +1413,30 @@ async fn e2e_a_stored_group_across_a_restart_lets_a_member_with_only_its_floor_p
         w.members[a].events,
         w.members[b].events
     );
+    // The keyholder and both members on one head. The keyholder takes its commit when the
+    // relay's push of it reaches it; a push sent in the keyholders' turn of a step reaches
+    // the members in that step's turn, so the members can be seated a step before the
+    // keyholder holds the head that seated them
+    let floor = |w: &World, i: usize| {
+        let local = w.members[i].keying.local()?;
+        local
+            .floors
+            .get(w.members[i].group.as_str())
+            .map(|f| f.floor.d)
+    };
+    let one_head = move |w: &World| {
+        let held = w.holders[0].held.as_ref().map(|h| h.head.d());
+        held.is_some() && floor(w, a) == held && floor(w, b) == held
+    };
+    assert!(
+        w.until(15_000, one_head).await,
+        "the keyholder and both members on one head"
+    );
     let head = w.holders[0].held.as_ref().unwrap().head.d();
+    let head_was = {
+        let h = w.holders[0].held.as_ref().unwrap().head.header();
+        format!("{:?} e{} j{}", h.kind, h.epoch, h.join)
+    };
     let e = w.members[a].epoch().unwrap();
     w.post(a, 1, b"before the restart").await;
     w.run(1_000).await;
@@ -1406,8 +1447,14 @@ async fn e2e_a_stored_group_across_a_restart_lets_a_member_with_only_its_floor_p
         let _ = m.keying.end();
         locals.push(m.keying.local().cloned().expect("a local floor"));
     }
+    let held = w.holders[0].held.as_ref().unwrap().head.header();
     for f in locals[0].floors.values() {
-        assert_eq!(f.floor.d, head, "the floor is the head");
+        assert_eq!(
+            f.floor.d, head,
+            "the floor is the head: the floor e{} j{}, the head the holder held when they \
+             were seated {head_was}, the holder's now {:?} e{} j{}",
+            f.floor.epoch, f.floor.join, held.kind, held.epoch, held.join
+        );
     }
     w.relay.groups.on_purge("lounge");
     drop(w);
