@@ -96,6 +96,9 @@ function log(line: string, data?: unknown) {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/** How long after the listener is seated the talker's schedule starts (see its loop). */
+const TALKER_LAG_MS = 6000;
+
 async function sha256(bytes: Uint8Array): Promise<string> {
   const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes as Uint8Array<ArrayBuffer>));
   return Array.from(digest, (b) => b.toString(16).padStart(2, "0")).join("");
@@ -197,6 +200,8 @@ export async function run(params: URLSearchParams): Promise<void> {
   let textPeerSeen = 0;
   /** Who else is in the text channel, so the talker writes once somebody reads. */
   const textPeers = new Set<number>();
+  /** When the relay said someone else took a seat in our room (wall clock, from the event). */
+  let peerSeatedAt = 0;
   // What App.svelte would hand to a newcomer, per channel: a member of several
   // channels must answer each one with its own conversation.
   type SeenMessage = { user_id: number; username: string; content: string; timestamp: number };
@@ -312,6 +317,9 @@ export async function run(params: URLSearchParams): Promise<void> {
       if (ev === "user-joined") {
         const u = e.payload as UserInfo;
         if (!isTextChannel(u.channel_id)) users.set(u.user_id, u);
+        if (u.user_id !== myUserId && u.channel_id !== 0 && u.channel_id === joinedChannelId && peerSeatedAt === 0) {
+          peerSeatedAt = Date.now();
+        }
       }
       if (ev === "admin-status") {
         const p = e.payload as { user_id: number; is_admin: boolean };
@@ -407,39 +415,14 @@ export async function run(params: URLSearchParams): Promise<void> {
     log("error", { message: `channel: ${String(e)}` });
   }
 
-  // The message alice types while alone, sent before the loop rather than on
-  // its first tick: a peer that joins in between asks for the channel history
-  // straight away, and she can only hand over what she already has.
-  if (role === "talker") {
-    // No fixed budget: test-web.sh holds the second browser until the line
-    // below appears, so taking longer here costs time but never correctness.
-    for (let i = 0; i < 200 && joinedChannelId === 0; i++) {
-      await sleep(50);
-      const me = users.get(myUserId);
-      if (me && me.channel_id !== 0) joinedChannelId = me.channel_id;
-    }
-    if (joinedChannelId === 0) {
-      log("error", { message: "no channel after 10s, skipping the early message" });
-    } else {
-      earlySent = true;
-      const early = `early from ${name}`;
-      const inHistory = () => historyOf(joinedChannelId).some((m) => m.content === early);
-      try {
-        await invoke("send_channel_message", { server, content: early });
-        // "Sent" is not the state the next peer depends on: the message reaches
-        // channelHistory — the list handed to a newcomer — only when the server
-        // echoes it back. Log the line the harness waits for once it is there.
-        for (let i = 0; i < 100 && !inHistory(); i++) await sleep(50);
-        log("early-chat-sent", { in_history: inHistory() });
-      } catch (e) {
-        log("error", { message: `early chat: ${String(e)}` });
-      }
-    }
-  }
-
   // The talker's text channel, made before the loop so its first message is
   // written while nobody else is in it — which is what the listener later has
-  // to be handed as history.
+  // to be handed as history. And made before early-chat-sent below, which is
+  // the line test-web.sh starts bob on and hides alice's page after: made
+  // after it, the retries below ran on a hidden page, whose timers Chrome
+  // stretched until the channel took 16-18 s on CI (run 45225396106), and bob
+  // finished his whole run, or joined the channel before its first line was
+  // written, while alice had not reached her loop yet.
   if (textChannelName && role === "talker") {
     try {
       textCreated = true;
@@ -471,7 +454,39 @@ export async function run(params: URLSearchParams): Promise<void> {
     }
   }
 
-  const started = Date.now();
+  // The message alice types while alone, sent before the loop rather than on
+  // its first tick: a peer that joins in between asks for the channel history
+  // straight away, and she can only hand over what she already has.
+  if (role === "talker") {
+    // No fixed budget: test-web.sh holds the second browser until the line
+    // below appears, so taking longer here costs time but never correctness.
+    for (let i = 0; i < 200 && joinedChannelId === 0; i++) {
+      await sleep(50);
+      const me = users.get(myUserId);
+      if (me && me.channel_id !== 0) joinedChannelId = me.channel_id;
+    }
+    if (joinedChannelId === 0) {
+      log("error", { message: "no channel after 10s, skipping the early message" });
+    } else {
+      earlySent = true;
+      const early = `early from ${name}`;
+      const inHistory = () => historyOf(joinedChannelId).some((m) => m.content === early);
+      try {
+        await invoke("send_channel_message", { server, content: early });
+        // "Sent" is not the state the next peer depends on: the message reaches
+        // channelHistory — the list handed to a newcomer — only when the server
+        // echoes it back. Log the line the harness waits for once it is there.
+        for (let i = 0; i < 100 && !inHistory(); i++) await sleep(50);
+        log("early-chat-sent", { in_history: inHistory() });
+      } catch (e) {
+        log("error", { message: `early chat: ${String(e)}` });
+      }
+    }
+  }
+
+  // The talker's clock is set again once the listener is seated (below)
+  let started = Date.now();
+  let clockSet = false;
   let talked = false;
   let positionShared = false;
   let effectsSet = false;
@@ -566,6 +581,22 @@ export async function run(params: URLSearchParams): Promise<void> {
       }
     }
     const peers = [...users.values()].filter((u) => u.user_id !== myUserId && u.channel_id === joinedChannelId && joinedChannelId !== 0);
+
+    // The talker's schedule (share at 3 s, chat at 4, talk at 5, the end at
+    // `duration`) runs from TALKER_LAG_MS after the listener took his seat, so
+    // by then he holds the room's key and has joined the text channel (his own
+    // 6 s), however late his browser came up. Every lane was tuned on that
+    // shape, when the text channel's 6 s creation sat between his start and
+    // her loop; once that moved before it, a late bob (the lossy lane 3-8 s,
+    // the capped one 10-14 s) would have met a talker already half done.
+    // The seat's time comes from the event, not this loop's tick, which a
+    // hidden page's timers stretch.
+    if (role === "talker" && !clockSet && peers.length > 0) {
+      clockSet = true;
+      const seatedAt = peerSeatedAt || Date.now();
+      started = seatedAt + TALKER_LAG_MS;
+      log("talker-clock", { seated_ms_ago: Date.now() - seatedAt, lag_ms: TALKER_LAG_MS });
+    }
 
     // Drive both kinds of lane — one coming in, and our own going out — with
     // all four controls on, so the voice checks below cover the whole chain:

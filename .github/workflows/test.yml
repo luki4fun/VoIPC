@@ -460,8 +460,9 @@ jobs:
       # TALK_MS: alice talks across the share's start and its first climb. Voice is gated
       # over the first 4 s of her talk as the share starts (the bar as it was measured, over a
       # 4 s talk) and over all of it: 4.9-7.2 % / 2.3-2.5 % with the share starting at full
-      # quality, 3.6-7.6 % / 1.1-2.3 % one level low (4 cores here, 2026-11-23), so both can
-      # be red, the first most of all: its loss comes in the first second the video flows.
+      # quality, 3.6-7.6 % / 1.1-2.3 % one level low (4 cores here, 2026-11-23; on the runners
+      # 4.0-8.4 % / 1.2-2.5 % in 6 runs, soak 45226171956), so both can be red, the first in
+      # every run so far: its loss comes in the first second the video flows.
       # SHARE_NOISE's blocks make the encoder send past its bitrate, so only a level's halved
       # frame rate lightens the link (CHANGELOG 1.14 Known, with what was tried).
       - name: Capped link (netem rate)

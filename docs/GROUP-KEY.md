@@ -3252,8 +3252,8 @@ and about 0.6 MB of headers at one per exit batch). That is about 90 MB over the
     the 3N voice join (`the_frame_after_authenticated_chooses_the_path_once` in `gk_net.rs`,
     `live-gk.test.ts`, `voice-gk.test.ts`), and the `GK=0` lane of `test-web.sh` runs a relay with
     the switch off.
-  - The nightly old-relays job covers text channels on released relays, 1.12.0 the newest; 1.13.0
-    joins once it is tagged.
+  - The nightly old-relays job covers text channels on released relays, 1.12.0 the newest (1.12.1 and
+    1.13.0 were never tagged).
   - Golden `v26.json`, re-recorded with the group key in it, and compat rows as usual.
 - **Fuzz:** `fuzz/fuzz_targets/group.rs` covers every opener, the header decoder, the Merkle path check
   and the relay's commit validator.

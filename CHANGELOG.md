@@ -4,8 +4,9 @@ All notable changes to VoIPC are documented here.
 
 ## [1.14.0] - release candidate
 
-Protocol 26: a 1.14 relay admits only 1.14 apps, so update the apps first. A 1.14 app still talks to 1.13 relays and
-older ones, down to 1.0 (protocol 25 was a step on the way here and never shipped). Bugs found and fixed during 1.14's
+Protocol 26: a 1.14 relay admits only 1.14 apps, so update the apps first. A 1.14 app still talks to older relays,
+down to 1.0. 1.12.1 and 1.13.0 (protocol 24) were never released: their changes come with 1.14.0, listed at the end of
+this section (protocol 25 was a step on the way here and never shipped either). Bugs found and fixed during 1.14's
 own development, which no release carried, are not listed. Media edges speak a version of their own (pool 1): update a
 relay before its edges. One database migration (`0013_group_keys.sql`), and l4f-accounts 0.15.
 **Text channels and voice rooms move to a group epoch key, which weakens several security claims** (Security, below).
@@ -14,7 +15,7 @@ No outside cryptographer has reviewed it.
 ### Security
 - **Channel keys come from a group epoch key now, and some promises are weaker for it** (`group_key`, on by default;
   [GROUP-KEY.md](docs/GROUP-KEY.md) §6, [THREAT-MODEL.md](docs/THREAT-MODEL.md)). These are for one GitHub security
-  advisory. A relay with `group_key = false` keeps 1.13's paths, and their promises:
+  advisory. A relay with `group_key = false` keeps 1.12's paths, and their promises:
   - **A stolen device reads recorded live text back to the last seat-key rotation**, not the last hour. A channel's keys
     reach its members through seat keys each account keeps in its vault, made anew every 30 days and at a password
     change, a recovery-key reset and a removed device. The vault's own key never changes, though: whoever once held it
@@ -149,7 +150,7 @@ No outside cryptographer has reviewed it.
     channel's keys start anew at the next start, since whoever left after the backup was taken out only in keys the
     backup does not hold. Forgotten, an app whose keys are ahead of the database proves it, and the relay starts that
     channel anew itself, at most once an hour.
-  - **`group_key = false`** keeps 1.13's paths, and still serves, read-only, what was kept under the group key. Turned
+  - **`group_key = false`** keeps 1.12's paths, and still serves, read-only, what was kept under the group key. Turned
     on again later, it starts every channel's keys anew. **The switch gap:** an account is seated for a channel's kept
     history from the first time one of its devices signs in with a 1.14 app; kept posts written under the group key
     before then are not readable to it. What was kept before the update stays readable as before.
@@ -252,7 +253,8 @@ No outside cryptographer has reviewed it.
 - Watching through an edge was tested in Chromium (the `EDGE=1` lane of test-web.sh, in CI). Firefox, the desktop
   apps and Android were not tried yet, nor an edge or a viewer on another machine.
 - **Voice still loses frames when a screen share starts on a link too small for it**: 3.6-7.6 % in the first 4 s, over
-  the capped-link lane's 2 %. Most of it falls in the first second the video flows, and some of it is the start
+  the capped-link lane's 2 % (4.0-8.4 % on CI's runners in 6 runs, where the whole share lost 1.2-2.5 %, so the lane's
+  check over all of it is red in some runs too: 2 of the 6). Most of it falls in the first second the video flows, and some of it is the start
   itself, not the link: on a far link with no cap at all one run lost 2.2 %. Tried and left out of 1.14 (2026-11-23):
   the desktop's own-uplink watch, ported to the browser (Chromium 156 has no WebTransport `getStats`, so it timed
   pings) steps the share down sooner but lost as much voice; fewer video frames in flight halved the loss on the
@@ -291,12 +293,11 @@ No outside cryptographer has reviewed it.
   about one row past it (the per-answer count is read outside the write's transaction), and the quota counts a chain
   start's 60 B self-wrap but not its 60 B group-key seal, so a chain costs its writer about 61 B, not 121 B.
 
-## [1.13.0] - release candidate
+### From 1.13.0, never released on its own
 
-Protocol 24: a 1.13 relay admits only 1.13 apps, so update the apps first. A 1.13 app still talks to 1.12 relays (and
-older ones, down to 1.0). No database migration.
+Written for 1.13.0 (protocol 24), which was never released: these changes come with 1.14.0.
 
-### Changed
+#### Changed
 - **The Android app draws a watched share at its full frame rate**: it decodes the share in its own WebView with
   WebCodecs, as the browser does, fed the frames over a URI scheme of the app's own (Tauri's IPC carries no bytes on
   Android), instead of decoding with MediaCodec, converting and JPEG-encoding each shown frame and sending it as base64
@@ -325,7 +326,7 @@ older ones, down to 1.0). No database migration.
   while frames come, with frames put together, decoded and shown, the time each step took (p50/p95/max), and how many
   frames the view drew and how long each took from the app to the screen. Nothing is logged while not watching.
 
-### Fixed
+#### Fixed
 - **A Linux share whose source went away stood frozen and still "live"**: when the shared window closed, or sharing
   was stopped from the desktop, the compositor removed the screen's PipeWire node and the app never noticed, so viewers
   kept a still picture of a share that had ended. The app now sees the node go, ends the share as Stop does (the relay
@@ -334,16 +335,16 @@ older ones, down to 1.0). No database migration.
   buffer free, the app stopped taking its finished pictures out, so the decoder never freed one again and the picture
   stood still until the share changed (seen on the emulator at 1080p30: frozen after 41 s, 8.5 fps drawn until then).
   It now takes them out and tries the frame again: 14.2 fps for the whole minute.
-- **A device remembered again left its old key on the relay** (1.12.1, Known): a password or provider sign-in on a
+- **A device remembered again left its old key on the relay** (found after 1.12.0): a password or provider sign-in on a
   device that already remembered the account enrolled a new device key, and the relay kept the old one, unused, until
   its 90-day sweep. Once the new key is in, the app now asks the relay to drop the old one (`DeviceForget`, protocol
   24); the relay drops only a key of the signed-in account. On a 1.12 relay the old key stays until the sweep, as before.
 
-## [1.12.1] - 2026-11-15
+### From 1.12.1, never released on its own
 
-Protocol 23, as 1.12.0: apps and relays of both versions talk to each other. No database migration.
+A patch to 1.12.0 that was never released: these fixes come with 1.14.0.
 
-### Fixed
+#### Fixed
 - **On a phone, a toast that stays (a new server's certificate) covered the connect form's first fields** (1.12.0 moved
   the toasts to the top while a dialog is open, off its Connect button): the dialog now moves down under the toasts while
   they are up, and scrolls. The toast also takes the screen's width: centred from half way, a fingerprint stood three
@@ -358,10 +359,6 @@ Protocol 23, as 1.12.0: apps and relays of both versions talk to each other. No 
   Coming back to the app now catches up.
 - **In a narrow chat column (a tablet's, beside both side panels) the message field's hint wrapped**, and the empty
   field stood two lines tall; it is one line, cut short.
-
-### Known
-- A password sign-in on a device that already remembers the account remembers it again; the relay keeps the old key,
-  unused, until its 90-day sweep. Replacing it needs a wire change, planned for 1.13.
 
 ## [1.12.0] - 2026-11-15
 

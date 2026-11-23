@@ -13,8 +13,9 @@ nobody checks, so a new one comes with its test.
 **1.x keeps:**
 - A relay admits a client exactly when their `PROTOCOL_VERSION` is equal (12 in 1.0, 13 in
   1.3, 14 in 1.4, 15 in 1.5, 16 in 1.7, 17 in 1.8, 18 in 1.9, 19 in 1.10, 21 in 1.11, 20 in its rc.1 only,
-  23 in 1.12, 22 in its rc.1 only, 24 in 1.13, 26 in 1.14). 25 was a step on 1.14's own branch,
-  never released; `compat.rs` still has its shapes. The app version is informational only.
+  23 in 1.12, 22 in its rc.1 only, 24 in 1.13, 26 in 1.14). 1.13 was never released (its changes
+  ship in 1.14), and 25 was a step on 1.14's own branch, never released either; `compat.rs` still
+  has its shapes. The app version is informational only.
 - **Since 1.6, an app talks to relays from its own protocol down to `OLDEST_RELAY_PROTOCOL`**
   (`crates/voipc-protocol/src/compat.rs`; 12 in 1.6 to 1.14), never fewer than three protocols back.
   It asks with its own; a relay of an older protocol refuses with its own (below), and the app
@@ -23,7 +24,7 @@ nobody checks, so a new one comes with its test.
 
   | Relay | What a 1.14 app does not offer there |
   |---|---|
-  | 1.13 (24) | the group key: text channels there use the live path and voice rooms the 3N join, as in 1.13; edges: viewers there are served by the relay itself. That relay sends the lobby whole, as it always did, and the app reads it so. Approving a new device from another (pairing): its vault-key wrap is hybrid since 1.14 and too large for an older relay, so the app says it needs a server on 1.14 and sends nothing (`PAIR_PQ_SINCE`); the recovery key and the password still work |
+  | 1.13 (24, never released) | the group key: text channels there use the live path and voice rooms the 3N join, as before 1.14; edges: viewers there are served by the relay itself. That relay sends the lobby whole, as it always did, and the app reads it so. Approving a new device from another (pairing): its vault-key wrap is hybrid since 1.14 and too large for an older relay, so the app says it needs a server on 1.14 and sends nothing (`PAIR_PQ_SINCE`); the recovery key and the password still work |
   | 1.12 (23) | dropping a device's old key when the device is remembered again: there it stays until the relay's 90-day sweep |
   | 1.12.0-rc.1 (22) | a restriction's parts: a voice-only mute during the new-member wait reads as a time-out there, until the wait ends |
   | 1.11 (21) | a sign-in bound to its connection (device key, provider, reset) and a password that never leaves the device: there they go as in 1.11; an admin step's refusal ends every step waiting, not only its own |
@@ -174,7 +175,7 @@ rest; without, it means what it did. An older relay refuses each of them. A new 
 new-incarnation`, belongs to every restore of the database ([OPERATING.md](OPERATING.md) §7).
 - **`group_key` is the second key whose default changes behaviour**, as `[files]` was in 1.3: on,
   every text channel and voice room uses the group epoch key ([GROUP-KEY.md](GROUP-KEY.md)), and the
-  relay refuses the old key paths there. `group_key = false` keeps the paths of 1.13, and still
+  relay refuses the old key paths there. `group_key = false` keeps the paths of 1.12, and still
   serves, read-only, what was kept under the group key. It is read at start. Turning it on again
   after a run with it off starts every channel's keys anew, a full re-seat of every group, so it is
   a way back from a fault, not a setting to flip often.
@@ -184,7 +185,7 @@ new-incarnation`, belongs to every restore of the database ([OPERATING.md](OPERA
   before the update stays readable as before, and reaches newcomers through members who share
   history.
 - **One channel message holds at most 16 KiB** on every path, the key on or off, voice rooms too: a
-  1.13 relay let a voice room's chat run to its 60 KiB frame. Direct messages keep that.
+  1.12 relay let a voice room's chat run to its 60 KiB frame. Direct messages keep that.
 
 **An older relay on a newer config:** it refuses the unknown key, never ignores it, so a relay
 cannot silently run without a setting it was given. The JSON files stay lenient: a rewrite of

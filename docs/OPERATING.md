@@ -382,15 +382,11 @@ of them:
   proxy that passes TLS through is fine; one that ends it in front of the TCP fallback makes
   app sign-ins over that fallback fail.
 
-**From 1.12 to 1.13** (protocol 23 to 24):
-- **Apps first**, as for any protocol: a 1.13 app talks to the 1.12 relay meanwhile.
-- No migration and no new keys. A device remembered again (a password or provider sign-in on a
-  device that already was) now drops its old device key at once; on 1.12 those stayed until the
-  90-day sweep.
-
-**From 1.13 to 1.14** (protocol 24 to 26; 25 was never released):
-- **Apps first**, as for any protocol: a 1.14 app talks to the 1.13 relay meanwhile, without the group key and
+**From 1.12 to 1.14** (protocol 23 to 26; 1.12.1, 1.13 with protocol 24, and 25 were never released):
+- **Apps first**, as for any protocol: a 1.14 app talks to the 1.12 relay meanwhile, without the group key and
   without edges there.
+- A device remembered again (a password or provider sign-in on a device that already was) now drops its old device
+  key at once; on 1.12 those stayed until the 90-day sweep.
 - **A migration:** `0013_group_keys.sql` adds the group key's tables. Going back takes the old binary and the backup.
 - **The group key is on by default** (`group_key`, §13; [GROUP-KEY.md](GROUP-KEY.md)). At the first start no channel has
   keys yet, and each makes them at its first use: the first member who needs one asks, a volunteer's app starts the
@@ -398,7 +394,7 @@ of them:
   it from the first time one of its devices signs in with a 1.14 app; kept posts written under the group key before then
   are not readable to it. What the channel kept before the update stays readable as before. Desktop apps help hold keys
   unless their user turns that off; browsers and guests only as a last resort.
-- **`group_key = false` keeps 1.13's paths**: the live path in text channels and the 3N join in voice rooms, and the
+- **`group_key = false` keeps 1.12's paths**: the live path in text channels and the 3N join in voice rooms, and the
   relay still serves what the key kept, read-only. A start with it on again after a run with it off starts every
   channel's keys anew, a full re-seat, so leave it as it is unless the group key is what fails you.
 - **A restore now ends with `db new-incarnation`** (§7).
@@ -1020,7 +1016,7 @@ host = "::"               # Bind address — "::" serves IPv6 and IPv4 from one 
 tcp_port = 9987           # HTTPS: the browser page, file transfers (and the TCP fallback)
 udp_port = 9987           # QUIC endpoint (all clients) — keep equal to tcp_port so one host:port reaches both
 tcp_fallback = false      # true: clients that cannot reach UDP carry everything over tcp_port (see below)
-group_key = true          # the group epoch key in every text channel and voice room (1.14, docs/GROUP-KEY.md); false keeps 1.13's paths
+group_key = true          # the group epoch key in every text channel and voice room (1.14, docs/GROUP-KEY.md); false keeps 1.12's paths
 max_users = 64
 live_lobby = 2000         # While General holds at most this many, an app showing its list hears each join there by name; above it, counts and pages
 max_connections_per_ip = 32   # A browser client holds two of these, a native client one — so 32 is sixteen browser users behind one NAT.

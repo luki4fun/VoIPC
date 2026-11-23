@@ -719,13 +719,19 @@ async function lane() {
   await waitFor(fay, `document.querySelector(".join-text-btn")`);
   await fay.evaluate(`document.querySelector(".join-text-btn").click()`);
   await waitFor(fay, `document.querySelector(".input-bar .chat-input")`);
-  // Her compose box comes with the relay's TextJoined, so his post's key check names her.
-  // His list is not what decides it: a text join tells nobody, and only a sweep would show
-  // her there before he posts (a random moment in the first minute, then ten minutes on)
+  // Her compose box comes with the relay's TextJoined. His list is not what decides whether
+  // she reads him: a text join tells nobody, and only a sweep would show her there (a random
+  // moment in the first minute, then ten minutes on)
   check("the maker's own list is there at once", await seen(gus, listRow("gus")), await pageText(gus));
   await say(gus, "only gus holds this");
   await waitFor(fay, lastMessage("only gus holds this"), 30_000);
-  check("handing her his key puts her on his list", await seen(gus, listRow("fay")), await pageText(gus));
+  // Nor does his post put her on it under the group key: a writer names no reader there (her
+  // seat is the keyholder's commit, which only "Keys held by" shows), and the list is the last
+  // sweep's, "up to ten minutes ago". It used to pass by a race: her history ask, coming after
+  // his post, moved his sweep up; when his sweep budget held that back, nothing listed her for
+  // 90 s (soak 45226171956). Refresh is how 1.14 asks who is here now, so it is asked once
+  await gus.evaluate(`document.querySelector(".user-list.modern .refresh-list").click()`);
+  check("after she reads him, his Refresh lists her", await seen(gus, listRow("fay")), await pageText(gus));
   await fay.evaluate(`${notesRow}.parentElement.querySelector('.settings-icon[title^="Leave this channel"]').click()`);
   await waitFor(gus, `!${listRow("fay")}`);
   await waitFor(han, notesRow);
