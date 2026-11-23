@@ -18,7 +18,15 @@
 
 import { wasm } from "./wasm";
 import { displayConstraints } from "../../lib/display-capture";
-import { lossMajority, paceFrame, shouldForceKey } from "../../lib/share-rules";
+import {
+  LEVELS,
+  START_LEVEL,
+  lossMajority,
+  nextLevel,
+  paceFrame,
+  shouldForceKey,
+  type LadderChange,
+} from "../../lib/share-rules";
 import type { SessionContext, ShareApi, VideoCodec } from "./types";
 import { audio } from "./audio";
 
@@ -45,28 +53,8 @@ const MAX_FRAME_BYTES = 255 * (1280 - 17 - 16);
 /** Consecutive encoder failures before the share gives up and tells the user. */
 const MAX_ENCODER_FAILURES = 3;
 
-/** Quality ladder, identical to screenshare/mod.rs LEVELS. */
-const LEVELS: [number, number][] = [
-  [1.0, 1],
-  [0.6, 1],
-  [0.4, 2],
-  [0.25, 2],
-];
-const LOSS_RECENT_MS = 2_000;
-const STEP_DOWN_HOLD_MS = 3_000;
-const STEP_UP_AFTER_MS = 30_000;
-
-/** screenshare/mod.rs next_level, verbatim. */
-export function nextLevel(level: number, lossAgeMs: number, sinceChangeMs: number): number {
-  const max = LEVELS.length - 1;
-  if (lossAgeMs < LOSS_RECENT_MS) {
-    return sinceChangeMs >= STEP_DOWN_HOLD_MS && level < max ? level + 1 : level;
-  }
-  if (lossAgeMs >= STEP_UP_AFTER_MS && sinceChangeMs >= STEP_UP_AFTER_MS && level > 0) {
-    return level - 1;
-  }
-  return level;
-}
+/** The ladder's last changes, kept for the self-test (capped-link lane). */
+const LADDER_STEPS_KEPT = 64;
 
 /** Chromium reads the capture track directly; Firefox goes through a <video>. */
 function hasTrackProcessor(): boolean {
@@ -120,10 +108,15 @@ export class ShareSender implements ShareApi {
   /** Timestamp of the first encoded chunk; wire timestamps are relative to it. */
   private firstChunkUs: number | null = null;
 
-  // Quality ladder
-  private level = 0;
+  // Quality ladder (share-rules.ts nextLevel)
+  private level = START_LEVEL;
   private levelChangedAt = 0;
+  private lastChange: LadderChange = "start";
   private lossAt = 0;
+  /** A frame went out since the video started: until one does, the first climb's quiet does not count. */
+  private sentSinceStart = true;
+  /** Each change: ms since the share started, the wall clock, the level, what it was. */
+  private steps: { at: number; t: number; level: number; change: LadderChange }[] = [];
 
   private framesSent = 0;
   private bytesSent = 0;
@@ -222,9 +215,11 @@ export class ShareSender implements ShareApi {
     this.startedAt = performance.now();
     this.framesSent = 0;
     this.bytesSent = 0;
-    this.level = 0;
+    this.level = START_LEVEL;
     this.levelChangedAt = performance.now();
+    this.lastChange = "start";
     this.lossAt = 0;
+    this.steps = [];
 
     ctx.sendControl({
       StartScreenShare: { source: "browser", resolution: this.shareHeight, codec: this.codec },
@@ -286,6 +281,11 @@ export class ShareSender implements ShareApi {
     this.dropDeltasUntilKey = false;
     this.encoderFailures = 0;
     this.firstChunkUs = null;
+    // Its video starts one level low and climbs once the link carries it
+    // (nextLevel); a level the ladder stepped below that stays, and its quiet
+    // counts again from now: time with nobody watching tells nothing of the link.
+    if (this.level <= START_LEVEL) this.setLevel(START_LEVEL, "start");
+    else this.levelChangedAt = performance.now();
     // The encoder opens on the first frame, whose size is the one that counts.
     this.closeEncoder();
 
@@ -637,14 +637,30 @@ export class ShareSender implements ShareApi {
   private adapt(): void {
     const now = performance.now();
     const lossAge = this.lossAt === 0 ? Number.MAX_SAFE_INTEGER : now - this.lossAt;
-    const next = nextLevel(this.level, lossAge, now - this.levelChangedAt);
+    // Nothing has crossed the link yet (no media key, a still screen): no quiet to count
+    const since = this.lastChange === "start" && !this.sentSinceStart ? 0 : now - this.levelChangedAt;
+    const next = nextLevel(this.level, lossAge, since, this.lastChange);
     if (next === this.level) return;
-    this.level = next;
-    this.levelChangedAt = now;
+    this.setLevel(next, next < this.level ? "up" : "down");
     this.reconfigure();
     console.info(
       `screen share quality level ${next}: ${Math.round(this.currentBitrate() / 1000)} kbps, ${this.currentFps()} fps`,
     );
+  }
+
+  private setLevel(level: number, change: LadderChange): void {
+    this.level = level;
+    this.lastChange = change;
+    this.levelChangedAt = performance.now();
+    if (change === "start") this.sentSinceStart = false;
+    const at = Math.round(this.levelChangedAt - this.startedAt);
+    this.steps.push({ at, t: Date.now(), level, change });
+    if (this.steps.length > LADDER_STEPS_KEPT) this.steps.shift();
+  }
+
+  /** The ladder's changes since the share started (self-test). */
+  ladderSteps(): { at: number; t: number; level: number; change: LadderChange }[] {
+    return [...this.steps];
   }
 
   private onEncodedChunk(chunk: EncodedVideoChunk): void {
@@ -706,16 +722,18 @@ export class ShareSender implements ShareApi {
       this.lastKeyAt = performance.now();
       this.dropDeltasUntilKey = false;
     }
+    // The first frame out since the video started: the first climb's quiet counts from here
+    if (!this.sentSinceStart) {
+      this.sentSinceStart = true;
+      if (this.lastChange === "start") this.levelChangedAt = performance.now();
+    }
     this.framesSent++;
     this.bytesSent += body.length;
   }
 
   /** Emergency step down after an oversized frame (outside the ladder's timing). */
   private lowerBitrate(): void {
-    if (this.level < LEVELS.length - 1) {
-      this.level++;
-      this.levelChangedAt = performance.now();
-    }
+    if (this.level < LEVELS.length - 1) this.setLevel(this.level + 1, "down");
     this.reconfigure();
     this.keyframeRequested = true;
   }

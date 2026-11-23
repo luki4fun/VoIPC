@@ -455,8 +455,15 @@ jobs:
       # share whose picture costs its 3 Mbit/s (SHARE_NOISE; ~3.4 measured uncapped) crosses
       # loopback twice, sharer to relay and relay to viewer, so the link gives way: voice
       # loses at most 2 %, the viewer draws in every 10 s window, and the sharer's ladder steps
-      # down (H3-14; EXPECT_LADDER in test-web.sh). Uncapped, the ladder check fails: that is
-      # the control that it measures the cap, not the picture.
+      # down (H3-14; EXPECT_LADDER in test-web.sh, from the changes the sharer logs). Uncapped,
+      # the ladder check fails: that is the control that it measures the cap, not the picture.
+      # TALK_MS: alice talks across the share's start and its first climb. Voice is gated
+      # over the first 4 s of her talk as the share starts (the bar as it was measured, over a
+      # 4 s talk) and over all of it: 4.9-7.2 % / 2.3-2.5 % with the share starting at full
+      # quality, 3.6-7.6 % / 1.1-2.3 % one level low (4 cores here, 2026-11-23), so both can
+      # be red, the first most of all: its loss comes in the first second the video flows.
+      # SHARE_NOISE's blocks make the encoder send past its bitrate, so only a level's halved
+      # frame rate lightens the link (CHANGELOG 1.14 Known, with what was tried).
       - name: Capped link (netem rate)
         if: ${{ !cancelled() && matrix.part == 'lanes' }}
         timeout-minutes: 15
@@ -477,6 +484,7 @@ jobs:
           SHARE_NOISE: '100'
           EXPECT_LADDER: '1'
           DURATION: '45000'
+          TALK_MS: '15000'
 
       # The relay on Postgres, which nothing above reaches: the accounts tests that take a
       # second database, and the lanes that read and write it most. The runner's own Postgres,

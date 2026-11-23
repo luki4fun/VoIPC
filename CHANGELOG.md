@@ -2,7 +2,7 @@
 
 All notable changes to VoIPC are documented here.
 
-## [1.14.0] - not released yet
+## [1.14.0] - release candidate
 
 Protocol 26: a 1.14 relay admits only 1.14 apps, so update the apps first. A 1.14 app still talks to 1.13 relays and
 older ones, down to 1.0 (protocol 25 was a step on the way here and never shipped). Bugs found and fixed during 1.14's
@@ -223,6 +223,13 @@ No outside cryptographer has reviewed it.
 - **The relay writes one line a minute about connections, when anything happened**: connects refused and why, setups
   that failed or timed out, how sessions ended (closed by the app, timed out), and UDP datagrams the kernel dropped for
   a full buffer. The line for each connect stays at debug.
+- **A screen share starts a little below its quality and climbs once its first frames crossed with no loss for 5 s**,
+  in the browser and the desktop apps: at 60 % of its bitrate, full resolution and frame rate. Started at full quality
+  on a small uplink, it filled the link for the seconds before the first loss report came back, and voice lost frames
+  meanwhile. A climb that meets loss steps back at once instead of after 3 s. On a link with room, a share reaches
+  full quality about 5 s after its first frames. Measured on a 6 Mbit/s link with a 720p30 share whose picture does
+  not compress (Known, below): voice lost 1.1-2.3 % over 15 s of talk where it lost 2.3-2.5 %, and 3.6-7.6 % in the
+  first 4 s as the share started, where it lost 4.9-7.2 % (this machine, 4 cores, 4 runs against 2).
 
 ### Fixed
 - **Many people signing in at once stopped the relay signing anyone in.** Past 32 sign-ins at once it told the next
@@ -244,6 +251,16 @@ No outside cryptographer has reviewed it.
 ### Known
 - Watching through an edge was tested in Chromium (the `EDGE=1` lane of test-web.sh, in CI). Firefox, the desktop
   apps and Android were not tried yet, nor an edge or a viewer on another machine.
+- **Voice still loses frames when a screen share starts on a link too small for it**: 3.6-7.6 % in the first 4 s, over
+  the capped-link lane's 2 %. Most of it falls in the first second the video flows, and some of it is the start
+  itself, not the link: on a far link with no cap at all one run lost 2.2 %. Tried and left out of 1.14 (2026-11-23):
+  the desktop's own-uplink watch, ported to the browser (Chromium 156 has no WebTransport `getStats`, so it timed
+  pings) steps the share down sooner but lost as much voice; fewer video frames in flight halved the loss on the
+  capped link but throttled a healthy far one. Chromium's software H.264 encoder sends 2-20 times the share's bitrate
+  on dense moving detail (the lane's random blocks, or a faint grain), so on such a picture only the halved frame rate
+  two levels down lightens the link. The lower start was measured in Chromium only; in the desktop apps it is
+  unit-tested and builds for Linux and Windows, but no real capture ran it yet, and on encoders that cannot change
+  their rate in place (the hardware ones) each level change rebuilds the encoder and sends a keyframe, the climb too.
 - **The group key ran in end-to-end tests** of the relay with the apps' own key code, on SQLite and Postgres, and in the
   browser lanes of test-web.sh (Chromium, and a Chromium and Firefox pair). The desktop apps and Android were not tried
   against it by hand yet, nor keyholders on machines of their own, nor how long a browser's stepped builds take on a busy

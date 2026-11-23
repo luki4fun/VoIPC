@@ -18,7 +18,11 @@
 # frame, so the encoder needs its bitrate) set what alice's share sends (default 480p at
 # 15 fps, no noise). EXPECT_LADDER=1 is the capped-link lane (CI rates loopback):
 # bob's voice loses at most 2 %, his canvas gets pictures in every 10 s window, and
-# alice's quality ladder steps her bitrate down at least once. Give it DURATION=45000.
+# alice's quality ladder (its changes, as her sharer logs them) steps down at least once.
+# Voice is counted over the first 4 s alice talks once video flows (the lane's own bar,
+# as it was measured over a 4 s talk), and over the 4 s after a climb, if one came while
+# she talked (shown, not gated). Give it DURATION=45000, and TALK_MS (how long alice
+# talks, default 4000) long enough that her voice crosses the share's start and its climb.
 #
 # EXPECT_FALLBACK=1 is for a run with the relay's UDP ports blocked (the CI
 # lane drops them with iptables): both browsers ask for QUIC as usual, and
@@ -410,7 +414,7 @@ start_page() { # as run_browser
 # alice creates the channel, becomes admin at the end and kicks bob; bob joins
 # through an invite-link fragment (#channel=…) and expects the kick
 # alice also shares her (synthetic) screen; bob watches it
-start_page alice talker "&channel=e2e&textchannel=e2e-text&dm=bob&admin=e2e-admin-token-0001&kick=bob&share=1$SHARE_PARAMS&proximity=2d&pos=3,0,0&spatialtest=3d&file=$FILE_KIB$(via "$TRANSPORT_ALICE")" \
+start_page alice talker "&channel=e2e&textchannel=e2e-text&dm=bob&admin=e2e-admin-token-0001&kick=bob&share=1$SHARE_PARAMS&proximity=2d&pos=3,0,0&spatialtest=3d&file=$FILE_KIB&talk_ms=${TALK_MS:-4000}$(via "$TRANSPORT_ALICE")" \
   "$WORK/alice.log" "$BROWSER_ALICE"
 # Not a fixed stagger: the run asserts that a message alice sent *before* bob
 # arrived reaches him as channel history, so the harness has to make "before"
@@ -588,18 +592,40 @@ if [ "${EXPECT_LADDER:-}" = 1 ]; then
   # Under the cap: voice first, the picture keeps coming, and the ladder gives way (H3-14)
   ladder=$(node -e '
     const fs = require("fs");
+    const TALK = +process.argv[3];
     const rows = (f, what) => fs.readFileSync(f, "utf8").split("\n").filter((l) => l.includes(what))
       .map((l) => JSON.parse(l.slice(l.indexOf("{"), l.lastIndexOf("}") + 1)));
     const voice = rows(process.argv[2], "SELFTEST voice-stats").pop() ?? { played: 0, lost: 1 };
+    // Each row with the wall clock its line ends with ("@<ms>")
+    const stamped = (f, what) => fs.readFileSync(f, "utf8").split("\n").filter((l) => l.includes(what))
+      .map((l) => ({ ...(l.includes("{") ? JSON.parse(l.slice(l.indexOf("{"), l.lastIndexOf("}") + 1)) : {}), t: +l.slice(l.lastIndexOf("@") + 1) }));
+    const ticks = stamped(process.argv[2], "SELFTEST voice-tick");
+    const talkAt = stamped(process.argv[1], "SELFTEST transmit-started").map((r) => r.t).pop() ?? 0;
+    // Loss in [from, from + 4 s], from the counters bob logged around it
+    const windowLoss = (from) => {
+      const a = ticks.filter((k) => k.t <= from).pop() ?? { played: 0, lost: 0 };
+      const b = ticks.find((k) => k.t >= from + 4000) ?? ticks[ticks.length - 1] ?? a;
+      const played = b.played - a.played, lost = b.lost - a.lost;
+      return { lost, of: played + lost, share: +(lost / Math.max(1, played + lost)).toFixed(4) };
+    };
     const seen = rows(process.argv[2], "SELFTEST share-window").map((w) => w.drawn);
     const kbps = rows(process.argv[1], "SELFTEST share-window").map((w) => w.kbps);
+    // As her sharer logged it: a step inside one 10 s window shows in no window average
+    const steps = (rows(process.argv[1], "SELFTEST share-ladder").pop() ?? { steps: [] }).steps;
     const lost = voice.lost / Math.max(1, voice.played + voice.lost);
-    const stepped = kbps.some((k, i) => kbps.slice(0, i).some((before) => k < 0.8 * before));
-    console.log(JSON.stringify({ lost: +lost.toFixed(4), drawn: seen, kbps }));
+    // The first 4 s of talk once video flows; a climb inside the talk, its 4 s
+    const videoAt = (steps.find((s) => s.change === "start") ?? { t: 0 }).t;
+    const atStart = windowLoss(Math.max(talkAt, videoAt));
+    const climb = steps.find((s) => s.change === "up" && s.t >= talkAt && s.t + 4000 <= talkAt + TALK);
+    const atClimb = climb ? windowLoss(climb.t) : null;
+    const stepped = steps.some((s) => s.change === "down");
+    const ladder = steps.map((s) => `${s.change} ${s.level} @${s.at}`).join(", ");
+    console.log(JSON.stringify({ lost: +lost.toFixed(4), played: voice.played, atStart, atClimb, drawn: seen, kbps, ladder }));
+    console.log(atStart.of >= 150 && atStart.share <= 0.02 ? "PASS" : "FAIL", "bob lost at most 2 % of voice in the first 4 s of talk as the share starts");
     console.log(lost <= 0.02 ? "PASS" : "FAIL", "bob lost at most 2 % of voice under the cap");
     console.log(seen.length >= 2 && seen.every((n) => n > 0) ? "PASS" : "FAIL", "bob drew pictures in every 10 s window");
-    console.log(stepped ? "PASS" : "FAIL", "alice stepped her bitrate down under the cap");
-  ' "$WORK/alice.txt" "$WORK/bob.txt")
+    console.log(stepped ? "PASS" : "FAIL", "the quality ladder of alice stepped down under the cap");
+  ' "$WORK/alice.txt" "$WORK/bob.txt" "${TALK_MS:-4000}")
   echo "--- capped link: $(head -1 <<< "$ladder")"
   while read -r verdict what; do
     echo "$verdict $what"

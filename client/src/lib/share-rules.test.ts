@@ -3,6 +3,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import {
   KEYFRAME_INTERVAL_MS,
   paceFrame,
@@ -13,6 +14,9 @@ import {
   edgeFailedDue,
   validEdgeView,
   lossMajority,
+  LEVELS,
+  START_LEVEL,
+  nextLevel,
 } from "./share-rules.ts";
 
 /** One frame at 60 fps, in µs. */
@@ -137,4 +141,63 @@ test("lossMajority: half of the viewers or more step the share down, as the nati
   assert.equal(lossMajority(5, 9), true);
   assert.equal(lossMajority(499, 1000), false);
   assert.equal(lossMajority(500, 1000), true);
+});
+
+test("nextLevel: the ladder steps down on loss with a hold, and climbs after quiet", () => {
+  // Fresh loss, long since the last change: one step down
+  assert.equal(nextLevel(0, 100, 10_000, "down"), 1);
+  // A burst of reports within the hold is one step, not many
+  assert.equal(nextLevel(1, 100, 500, "down"), 1);
+  assert.equal(nextLevel(3, 100, 10_000, "down"), 3, "never past the last level");
+  assert.equal(nextLevel(2, 5_000, 5_000, "down"), 2, "loss just stopped: hold the level");
+  assert.equal(nextLevel(2, 31_000, 31_000, "down"), 1, "quiet long enough: climb one level");
+  assert.equal(nextLevel(2, 31_000, 1_000, "down"), 2, "not right after a change");
+  assert.equal(nextLevel(0, Number.MAX_SAFE_INTEGER, 60_000, "up"), 0, "level 0 stays put");
+  for (const [scale, divisor] of LEVELS) assert.ok(scale > 0 && divisor >= 1);
+});
+
+test("nextLevel: a share starts one level low, climbs after 5 s without loss, and a climb that meets loss goes back at once", () => {
+  assert.equal(START_LEVEL, 1);
+  const never = Number.MAX_SAFE_INTEGER;
+  assert.equal(nextLevel(START_LEVEL, never, 4_999, "start"), 1, "not before 5 s");
+  assert.equal(nextLevel(START_LEVEL, never, 5_000, "start"), 0, "5 s without loss: climb");
+  // A loss after the start, 3 s ago and over now: no quick climb on that link
+  assert.equal(nextLevel(START_LEVEL, 3_000, 6_000, "start"), 1);
+  // A loss from before this video started (the share was watched earlier) does not count
+  assert.equal(nextLevel(START_LEVEL, 9_000, 6_000, "start"), 0);
+  // Loss at the start level steps down with the hold, as any loss does
+  assert.equal(nextLevel(START_LEVEL, 100, 1_000, "start"), 1);
+  assert.equal(nextLevel(START_LEVEL, 100, 3_000, "start"), 2);
+  // The climb met loss: back at once, without the hold
+  assert.equal(nextLevel(0, 100, 200, "up"), 1);
+  // A step down after that waits for the hold again
+  assert.equal(nextLevel(1, 100, 200, "down"), 1);
+  // After a climb back from loss, the next climb waits the long quiet
+  assert.equal(nextLevel(1, 10_000, 10_000, "down"), 1);
+  assert.equal(nextLevel(1, 30_000, 30_000, "down"), 0);
+  // A loss in the start's first second, none since: the long quiet, never stuck at 60 %
+  assert.equal(nextLevel(START_LEVEL, 40_000, 41_000, "start"), 0);
+  assert.equal(nextLevel(START_LEVEL, 599_500, 600_000, "start"), 0);
+  assert.equal(nextLevel(START_LEVEL, 29_999, 30_500, "start"), 1);
+  // A loss at the very moment the video started counts as before it
+  assert.equal(nextLevel(START_LEVEL, 5_000, 5_000, "start"), 0);
+  // Start at level 0 (a native rebuild at the video's start failed): nothing to climb
+  assert.equal(nextLevel(0, never, 60_000, "start"), 0);
+  assert.equal(nextLevel(0, 100, 3_000, "start"), 1);
+  // After a successful climb above level 0, the next one waits the long quiet
+  assert.equal(nextLevel(2, 10_000, 10_000, "up"), 2);
+  assert.equal(nextLevel(2, 30_000, 30_000, "up"), 1);
+});
+
+test("nextLevel gives share-ladder-grid.txt, which the native sharer's next_level is held to too", () => {
+  // The same grid, in the same order, as mod.rs ladder_tests: a change to one sharer's
+  // rule alone fails here or there. After a change to both, regenerate the file from this.
+  const AGES = [100, 1_999, 2_000, 3_000, 4_999, 5_000, 6_000, 30_000, 1_000_000_000_000];
+  let got = "";
+  for (let level = 0; level < LEVELS.length; level++)
+    for (const age of AGES)
+      for (const since of AGES)
+        for (const change of ["start", "up", "down"] as const) got += String(nextLevel(level, age, since, change));
+  const want = readFileSync(new URL("./share-ladder-grid.txt", import.meta.url), "utf8").trim();
+  assert.equal(got, want);
 });

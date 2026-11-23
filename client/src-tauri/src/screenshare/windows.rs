@@ -7,8 +7,9 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use super::{
-    run_encode_loop, AudioProcessor, CapturedFrame, DisplayInfo, FrameProcessor, FrameSlot, PixFmt,
-    WindowInfo, SCREEN_AUDIO_BITRATE, SCREEN_AUDIO_FRAME_SIZE,
+    level_rate, run_encode_loop, AudioProcessor, CapturedFrame, Change, DisplayInfo,
+    FrameProcessor, FrameSlot, PixFmt, WindowInfo, SCREEN_AUDIO_BITRATE, SCREEN_AUDIO_FRAME_SIZE,
+    START_LEVEL,
 };
 
 // ── Win32 imports for window/monitor enumeration ──────────────────────────
@@ -383,9 +384,16 @@ fn run_capture_and_encode(
     preview: Arc<AtomicBool>,
     viewers: Arc<AtomicU32>,
 ) -> Result<(), String> {
-    let encoder =
-        voipc_video::encoder::Encoder::new(codec, target_width, target_height, bitrate, target_fps)
-            .map_err(|e| format!("Failed to create the {codec:?} encoder: {e}"))?;
+    // At the ladder's start level, which the first watched frame starts from
+    let (start_kbps, start_fps) = level_rate(bitrate, target_fps, START_LEVEL);
+    let encoder = voipc_video::encoder::Encoder::new(
+        codec,
+        target_width,
+        target_height,
+        start_kbps,
+        start_fps,
+    )
+    .map_err(|e| format!("Failed to create the {codec:?} encoder: {e}"))?;
 
     let source_desc = match &source {
         CaptureSource::Display { hmonitor } => format!("WGC monitor 0x{:x}", hmonitor),
@@ -447,8 +455,10 @@ fn run_capture_and_encode(
         loss_ms,
         base_bitrate_kbps: bitrate,
         base_fps: target_fps,
-        level: 0,
+        level: START_LEVEL,
         level_changed: Instant::now(),
+        last_change: Change::Start,
+        sent_since_start: false,
         video_tx,
         session_id,
         media_key,

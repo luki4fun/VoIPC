@@ -13,6 +13,7 @@
 //                        session, which is the case where a sender key used to
 //                        go missing and every message read as undecryptable
 //   role=talker|listener talker transmits a PTT burst, listener reports stats
+//   talk_ms=<ms>         how long the talker's burst lasts (default 4000)
 //   dm=<username>        send a direct message to this user once seen
 //   duration=<ms>        main phase before the wrap-up (default 15000)
 //   admin=<token>        wrap-up: log in as admin and kick the user in `kick`
@@ -25,7 +26,9 @@
 //                        what the share sends (default 480p at 15 fps, and that many
 //                        random blocks a frame to cost bitrate, default 0); both sides log
 //                        a share-window line every 10 s (the sharer's kbps, the
-//                        viewer's canvas draws) for the capped-link lane
+//                        viewer's canvas draws) for the capped-link lane; the
+//                        sharer logs its quality ladder's changes (share-ladder), and
+//                        the viewer its voice counters as they move (voice-tick)
 //   proximity=off|2d|3d  proximity mode for a channel this run creates
 //   pos=<x,y,z>          stand here (metres) and share the position with the
 //                        channel, so peers receive a position beacon
@@ -40,6 +43,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { parseInviteFragment } from "../lib/invite";
 import { checkGoldenValues, testLabel, type ProximityMode } from "../lib/spatial";
+import { share, type ShareSender } from "./backend/share";
 
 interface ChannelInfo { channel_id: number; name: string; text?: boolean }
 interface UserInfo { user_id: number; username: string; channel_id: number; is_screen_sharing?: boolean }
@@ -117,6 +121,7 @@ export async function run(params: URLSearchParams): Promise<void> {
   const ownPosition = params.get("pos");
   const spatialTest = params.get("spatialtest") as "2d" | "3d" | null;
   const fileKib = Number(params.get("file") ?? 0);
+  const talkMs = Number(params.get("talk_ms") ?? 4000);
   // The server id every server-scoped command names: the address we connect with
   const server = window.location.host;
 
@@ -470,8 +475,17 @@ export async function run(params: URLSearchParams): Promise<void> {
   let talked = false;
   let positionShared = false;
   let effectsSet = false;
+  let voiceSeen = [0, 0];
   while (Date.now() - started < duration) {
     await sleep(500);
+    // The viewer's voice counters as they move: the capped-link lane counts loss per window
+    if (role === "listener" && doWatch) {
+      const [played, lost] = await invoke<[number, number]>("get_voice_stats").catch(() => [0, 0]);
+      if (played !== voiceSeen[0] || lost !== voiceSeen[1]) {
+        voiceSeen = [played, lost];
+        log("voice-tick", { played, lost });
+      }
+    }
     const me = users.get(myUserId);
     if (me && me.channel_id !== 0) joinedChannelId = me.channel_id;
 
@@ -536,8 +550,11 @@ export async function run(params: URLSearchParams): Promise<void> {
     }
 
     // Proximity chat: stand somewhere and share it, so the peer's client
-    // receives a position beacon and places us
-    if (ownPosition && !positionShared && joinedChannelId !== 0) {
+    // receives a position beacon and places us. Once the relay has seated us
+    // (our own row in the room's list): a joiner's joinedChannelId is set when
+    // it asks, and a share before the seat throws and is never tried again.
+    // The lossy lane's seat once took 776 ms against this loop's 500 ms tick.
+    if (ownPosition && !positionShared && joinedChannelId !== 0 && users.get(myUserId)?.channel_id === joinedChannelId) {
       positionShared = true;
       const [x, y, z] = ownPosition.split(",").map(Number);
       try {
@@ -656,7 +673,7 @@ export async function run(params: URLSearchParams): Promise<void> {
         // A file crosses while this side talks: what voice does then is the measure
         const fileTo = fileKib > 0 ? [...users.values()].find((u) => u.username === dmTarget) : undefined;
         if (fileTo) fileTransfer = sendOffered(fileTo.user_id);
-        await sleep(4000);
+        await sleep(talkMs);
         await invoke("stop_transmit");
         log("transmit-stopped");
       } catch (e) {
@@ -714,6 +731,8 @@ export async function run(params: URLSearchParams): Promise<void> {
     } catch (e) {
       log("error", { message: `screenshare-stats: ${String(e)}` });
     }
+    // Each change of the sharer's quality ladder, ms after the share started
+    if (doShare) log("share-ladder", { steps: (share as ShareSender).ladderSteps() });
     if (doShare) await invoke("stop_screen_share").catch(() => {});
   }
 

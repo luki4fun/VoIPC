@@ -38,6 +38,57 @@ export function shouldForceKey(
 }
 
 /**
+ * Quality ladder (mod.rs LEVELS): bitrate scale and fps divisor per level.
+ * Level 0 is the configured quality.
+ */
+export const LEVELS: readonly (readonly [number, number])[] = [
+  [1.0, 1],
+  [0.6, 1],
+  [0.4, 2],
+  [0.25, 2],
+];
+/** Where a share's video starts: one level below its quality (mod.rs START_LEVEL). */
+export const START_LEVEL = 1;
+const LOSS_RECENT_MS = 2_000;
+const STEP_DOWN_HOLD_MS = 3_000;
+const STEP_UP_AFTER_MS = 30_000;
+/** Loss-free time from the start of a share's video before its first climb. */
+const FIRST_CLIMB_MS = 5_000;
+
+/** The ladder's last change: the share's video starting, a climb, or a step down. */
+export type LadderChange = "start" | "up" | "down";
+
+/**
+ * mod.rs next_level, verbatim. A share's video starts at START_LEVEL: started
+ * at full quality, it overloaded a small uplink for the seconds before the
+ * first loss report came back, and voice lost frames meanwhile (capped-link
+ * lane, 2026-11-23). The first climb comes once the link has carried the start
+ * FIRST_CLIMB_MS with no loss at all (the sharers count that from the first
+ * frame out). Once a loss came after the start, climbs wait STEP_UP_AFTER_MS of
+ * quiet, as every later climb does. A climb that meets loss goes back at once,
+ * without the hold, so a link too small for the level above pays one loss
+ * report for trying it.
+ */
+export function nextLevel(
+  level: number,
+  lossAgeMs: number,
+  sinceChangeMs: number,
+  last: LadderChange,
+): number {
+  const max = LEVELS.length - 1;
+  if (lossAgeMs < LOSS_RECENT_MS) {
+    if (level >= max) return level;
+    return last === "up" || sinceChangeMs >= STEP_DOWN_HOLD_MS ? level + 1 : level;
+  }
+  if (level === 0) return level;
+  if (last === "start" && lossAgeMs >= sinceChangeMs) {
+    // No loss since the video started (any loss is older than the start)
+    return sinceChangeMs >= FIRST_CLIMB_MS ? level - 1 : level;
+  }
+  return lossAgeMs >= STEP_UP_AFTER_MS && sinceChangeMs >= STEP_UP_AFTER_MS ? level - 1 : level;
+}
+
+/**
  * voipc_video::MAX_DECODE_PIXELS: the largest picture the desktop viewer
  * decodes. Every share resolution (1080p at most) fits, either way up.
  */
