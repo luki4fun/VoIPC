@@ -1661,9 +1661,8 @@ async fn the_account_hooks_seat_an_account_eagerly_and_exit_its_seat_at_a_rotati
     net.groups
         .on_follow(7, &id, GroupKind::Text, asid, Some(a.0));
     net.groups.on_log_join("lounge", a.0, raw(&ann)).await;
-    let out = net.frames(k.sid, 50).await;
-    let (due, piece) = dues(&out, k.sid)
-        .pop()
+    let (due, piece) = due_within(&mut net, k.sid, 5_000)
+        .await
         .expect("a Genesis for the eager seat");
     let joiner = Joiner::try_from(&piece.joins[0]).unwrap();
     let st = Start {
@@ -1685,9 +1684,8 @@ async fn the_account_hooks_seat_an_account_eagerly_and_exit_its_seat_at_a_rotati
         krk: b.krk,
         cache: RowBases::new(),
     };
-    let out = net.frames(k.sid, 2_500).await;
-    let (due, piece) = dues(&out, k.sid)
-        .pop()
+    let (due, piece) = due_within(&mut net, k.sid, 10_000)
+        .await
         .expect("a Join of the account's seat");
     assert_eq!(piece.joins[0].seat.m, gk::GkMember::Account(a.0));
     let b = join_on(&k, &id, &head, &mut h, &piece, true, net.groups.now());
@@ -1716,7 +1714,6 @@ async fn the_account_hooks_seat_an_account_eagerly_and_exit_its_seat_at_a_rotati
         endorsement: e2,
     };
     net.groups.on_seat_keys(a.0, pair, raw(&ann)).await;
-    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
     let reseated = |frames: Vec<ServerMessage>| {
         frames
             .into_iter()
@@ -1726,16 +1723,25 @@ async fn the_account_hooks_seat_an_account_eagerly_and_exit_its_seat_at_a_rotati
             })
             .collect::<Vec<_>>()
     };
-    let got = drain(net.rxs.get_mut(&asid).unwrap()).await;
-    assert_eq!(reseated(got), vec![(2, 1)], "one group to re-seat");
+    // Told once the group's store read is back, which takes what it takes (Postgres)
+    let mut got = vec![];
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        got.extend(reseated(drain(net.rxs.get_mut(&asid).unwrap()).await));
+        if !got.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(got, vec![(2, 1)], "one group to re-seat");
     let new = seat2.public().seat(MemberId::Account(a.0));
     net.groups.reseat_done_for_test(&id, &new);
     let got = drain(net.rxs.get_mut(&asid).unwrap()).await;
     assert_eq!(reseated(got), vec![(2, 0)], "done: the old keys may go");
     let row = stats_until(&net, 7, |r| (r.exits_waiting, r.joins_waiting) == (1, 1)).await;
     assert_eq!((row.exits_waiting, row.joins_waiting), (1, 1));
-    let out = net.frames(k.sid, 200).await;
-    let (_, piece) = dues(&out, k.sid).pop().expect("the exits go first");
+    let (_, piece) = due_within(&mut net, k.sid, 5_000)
+        .await
+        .expect("the exits go first");
     assert_eq!(
         (piece.kind, piece.exits[0].seat),
         (gk::due::EXITS, old.into())
@@ -1802,9 +1808,8 @@ async fn an_account_seated_in_a_stored_group() -> (
     let k = net.guest(7, &id);
     net.volunteer(&k).await;
     net.groups.on_log_join("lounge", a.0, raw(&ann)).await;
-    let out = net.frames(k.sid, 50).await;
-    let (due, piece) = dues(&out, k.sid)
-        .pop()
+    let (due, piece) = due_within(&mut net, k.sid, 5_000)
+        .await
         .expect("a Genesis for the eager seat");
     let joiner = Joiner::try_from(&piece.joins[0]).unwrap();
     let st = Start {
@@ -1826,9 +1831,8 @@ async fn an_account_seated_in_a_stored_group() -> (
         krk: b.krk,
         cache: RowBases::new(),
     };
-    let out = net.frames(k.sid, 2_500).await;
-    let (due, piece) = dues(&out, k.sid)
-        .pop()
+    let (due, piece) = due_within(&mut net, k.sid, 10_000)
+        .await
         .expect("a Join of the account's seat");
     let b = join_on(&k, &id, &head, &mut h, &piece, true, net.groups.now());
     let gen = b.header.header().gen;
@@ -3248,8 +3252,7 @@ async fn new_start_eagerly(kept_seats: u32) {
     net.volunteer(&k).await;
     let p = net.guest(7, &id);
     net.fetch(&p, &id).await;
-    let out = net.frames(k.sid, 50).await;
-    let (due, piece) = dues(&out, k.sid).pop().expect("a Genesis");
+    let (due, piece) = due_within(&mut net, k.sid, 5_000).await.expect("a Genesis");
     assert_eq!(piece.kind, gk::due::GENESIS);
     let joiner = Joiner::try_from(&piece.joins[0]).unwrap();
     let st = Start {
@@ -3388,8 +3391,7 @@ async fn a_new_start_does_not_seat_again_an_account_gone_longer_than_the_seat_ex
     net.volunteer(&k).await;
     let p = net.guest(7, &id);
     net.fetch(&p, &id).await;
-    let out = net.frames(k.sid, 50).await;
-    let (due, piece) = dues(&out, k.sid).pop().expect("a Genesis");
+    let (due, piece) = due_within(&mut net, k.sid, 5_000).await.expect("a Genesis");
     assert_eq!(piece.kind, gk::due::GENESIS);
     let joiner = Joiner::try_from(&piece.joins[0]).unwrap();
     let st = Start {
@@ -4192,8 +4194,7 @@ async fn a_used_seat_has_its_last_use_written_by_the_daily_sweep_and_load_shows_
     let k = net.guest(7, &id);
     net.volunteer(&k).await;
     net.fetch(&k, &id).await;
-    let out = net.frames(k.sid, 50).await;
-    let (due, piece) = dues(&out, k.sid).pop().expect("a Genesis");
+    let (due, piece) = due_within(&mut net, k.sid, 5_000).await.expect("a Genesis");
     let b = genesis(&k, &id, &piece, true, net.groups.now());
     net.commit(k.sid, &id, due, &b).await;
     stats_until(&net, 7, |s| s.seats == 1).await;
@@ -4231,8 +4232,7 @@ async fn an_accounts_first_seat_keys_seat_it_eagerly_in_its_conversations_stored
     let k = net.guest(7, &id);
     net.volunteer(&k).await;
     net.fetch(&k, &id).await;
-    let out = net.frames(k.sid, 50).await;
-    let (due, piece) = dues(&out, k.sid).pop().expect("a Genesis");
+    let (due, piece) = due_within(&mut net, k.sid, 5_000).await.expect("a Genesis");
     let b = genesis(&k, &id, &piece, true, net.groups.now());
     net.commit(k.sid, &id, due, &b).await;
     stats_until(&net, 7, |s| s.seats == 1).await;
@@ -4380,6 +4380,7 @@ async fn a_member_reporting_another_generation_ahead_warns_the_admin_of_its_chan
 }
 
 /// The first due `sid` is sent within `ms`, its store writes taking what they take (Postgres).
+/// A fixed wait in its place failed on a CI runner's slower Postgres (PR #21, 2026-11-23).
 async fn due_within(net: &mut Net, sid: UserId, ms: u64) -> Option<(u64, DuePiece)> {
     let mut out = vec![];
     for _ in 0..ms / 100 {

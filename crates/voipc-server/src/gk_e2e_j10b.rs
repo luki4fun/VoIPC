@@ -47,6 +47,8 @@ const CHAN: ChannelId = 12;
 const CONV: &str = "c:j10bkept";
 
 use super::gk_e2e_j8h::SEATED_AT_ONCE_MS;
+/// The longest the relay's work may stay under way before a step (`gk_e2e_j8h.rs`).
+const BUSY_MAX: Duration = Duration::from_secs(120);
 
 fn raw(ik: &IdentityKeyPair) -> [u8; 32] {
     ik.public_key().public_key_bytes().try_into().unwrap()
@@ -744,12 +746,35 @@ impl World {
     }
 
     /// Runs until `done`, at most `ms`; whether it was.
+    /// Before the paused clock moves on by `every` ms: real time for the relay's work
+    /// (`Gate::settle`), then, while some of it is still under way (an actor's turn on a store
+    /// write, a message in an inbox), the clock moves at real time, as a relay's does while its
+    /// database works (`gk_e2e_j8h.rs` `World::settle`, J10). Moving it by the steps' pace
+    /// meanwhile made a slow store write outlast the Regenesis' deadline on the relay's clock:
+    /// a Postgres 20 ms away each way failed "a page never seated makes the
+    /// Regenesis it is asked" (PR #21 review).
+    async fn settle(&self, every: u64) {
+        Gate::settle(every).await;
+        let start = std::time::Instant::now();
+        let mut at = start;
+        while self.state.gk.busy_for_test() {
+            assert!(
+                start.elapsed() < BUSY_MAX,
+                "the relay's work stayed under way for {BUSY_MAX:?}"
+            );
+            Gate::settle(1).await;
+            let now = std::time::Instant::now();
+            tokio::time::advance(now - at).await;
+            at = now;
+        }
+    }
+
     async fn until(&mut self, ms: u64, done: impl Fn(&World) -> bool) -> bool {
         let end = self.now() + ms;
         let every = if self.paused { 50 } else { 10 };
         while self.now() < end {
             if self.paused {
-                Gate::settle(every).await;
+                self.settle(every).await;
                 tokio::time::advance(Duration::from_millis(every)).await;
             } else {
                 tokio::time::sleep(Duration::from_millis(every)).await;
