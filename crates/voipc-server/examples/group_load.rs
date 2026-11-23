@@ -2142,6 +2142,17 @@ async fn seats(
         seats_stored(&store).await
     })
     .await?;
+    // The relay stores a Join's seats before its keyholder is told the commit was taken: the
+    // phase's numbers wait for that word on every Join asked, or "two Joins" reads one
+    wait_for("joins taken", 1, &relay, &crowd, async || {
+        let h = crowd.tally.holding.lock().unwrap();
+        u64::from(
+            h.dues
+                .get(&due_code::JOIN)
+                .is_none_or(|d| d.taken >= d.asked),
+        )
+    })
+    .await?;
     let phase = |label: String, wall: f64, m| Phase {
         label,
         seats: all,

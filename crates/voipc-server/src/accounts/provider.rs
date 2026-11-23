@@ -1460,6 +1460,7 @@ impl Relay {
             for q in [
                 "DELETE FROM voipc_identity WHERE account = $1",
                 "DELETE FROM voipc_logkeys WHERE account = $1",
+                "DELETE FROM voipc_log_kems WHERE account = $1",
                 "DELETE FROM voipc_members WHERE account = $1",
                 "DELETE FROM voipc_pending WHERE owner = $1 OR recipient = $1",
             ] {

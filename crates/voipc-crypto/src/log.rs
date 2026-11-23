@@ -57,11 +57,12 @@
 //! one opens every chain sealed to that bucket until then.
 
 use hkdf::Hkdf;
+use libsignal_protocol::kem;
 use libsignal_protocol::{IdentityKey, IdentityKeyPair, KeyPair, PrivateKey, PublicKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use voipc_protocol::conv::hex;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::aead::random;
 
@@ -445,6 +446,80 @@ impl StaticKey {
         self.open_from_them(&state_ctx(conv, owner, epoch, me), row)
     }
 
+    /// The KEK of a row from `owner` to `recipient` on a gk chain: the static X25519 of the
+    /// two log keys, which only the two of them can make, and a Kyber1024 secret encapsulated
+    /// to the recipient's kept key, which only its account opens. The salt binds every public
+    /// value. Opening it takes both broken, as a hybrid welcome does (GROUP-KEY §3.2).
+    fn pq_kek(
+        &self,
+        (owner, recipient): (&[u8], &[u8]),
+        ct_q: &[u8],
+        kem: &[u8],
+        ss_q: &[u8],
+        ctx: &str,
+    ) -> Zeroizing<[u8; 32]> {
+        let salt = Sha256::new()
+            .chain_update(ct_q)
+            .chain_update(kem)
+            .chain_update(owner)
+            .chain_update(recipient)
+            .finalize();
+        let ikm = Zeroizing::new([ss_q, &self.shared[..]].concat());
+        hkdf32(Some(&salt), &ikm, ctx.as_bytes())
+    }
+
+    /// A gk chain's start for a newcomer: their row, `PQ_ROW_BYTES`, to their kept key `to`.
+    pub fn wrap_state_pq(
+        &self,
+        to: &KemKey,
+        state: &[u8; 32],
+        conv: &str,
+        me: &[u8; 16],
+        epoch: u32,
+        recipient: &[u8; 16],
+    ) -> Vec<u8> {
+        let ctx = pq_ctx(conv, me, epoch, recipient);
+        let Ok((ss_q, ct_q)) = to.0.encapsulate(&mut crate::rng()) else {
+            return blank_pq_row();
+        };
+        let ss_q = Zeroizing::new(ss_q.into_vec());
+        let kek = self.pq_kek((&self.own, &self.them), &ct_q, &to.bytes(), &ss_q, &ctx);
+        [&ct_q[..], &seal(&kek, &ctx, state)].concat()
+    }
+
+    /// Their gk chain's start out of a row to us, with our kept keys. Only this shape opens:
+    /// a row of the static shape alone, which a quantum computer opens from the database, is
+    /// never taken on a gk chain.
+    pub fn open_state_pq(
+        &self,
+        own: &KeptKeys,
+        row: &[u8],
+        conv: &str,
+        owner: &[u8; 16],
+        epoch: u32,
+        me: &[u8; 16],
+    ) -> Result<Zeroizing<[u8; 32]>, LogError> {
+        if row.len() != PQ_ROW_BYTES {
+            return Err(LogError::Malformed);
+        }
+        let (ct_q, sealed) = row.split_at(KEM_CT_BYTES);
+        let ss_q = own
+            .kem
+            .secret_key
+            .decapsulate(&Box::from(ct_q))
+            .map_err(|_| LogError::Malformed)?;
+        let ss_q = Zeroizing::new(ss_q.into_vec());
+        let ctx = pq_ctx(conv, owner, epoch, me);
+        let kek = self.pq_kek(
+            (&self.them, &self.own),
+            ct_q,
+            &own.kem_public(),
+            &ss_q,
+            &ctx,
+        );
+        open_row(&kek, &ctx, sealed)
+    }
+
     /// Whether our direct row to them proves they hold index 0 of `chain`: it
     /// opens at that index, to the start we hold. Never the relay's word for
     /// who holds what.
@@ -486,6 +561,177 @@ pub fn self_open_state(
     epoch: u32,
 ) -> Result<Zeroizing<[u8; 32]>, LogError> {
     open_row(&self_key(own), &state_ctx(conv, me, epoch, me), row)
+}
+
+// ── The kept keys ────────────────────────────────────────────────────────
+
+/// `ser(Kyber1024 public)` and `ser(ct)`: the type byte and 1568 (GROUP-KEY §11.2).
+pub const KEM_PUBLIC_BYTES: usize = 1569;
+const KEM_CT_BYTES: usize = 1569;
+/// A sharer's row of a gk chain's start to a newcomer (`StaticKey::wrap_state_pq`):
+/// `ser(ct_q) (1569) | iv (12) | sealed state + tag (48)`. Every row on a gk chain is one.
+pub const PQ_ROW_BYTES: usize = KEM_CT_BYTES + ROW_BYTES;
+
+/// The account's kept keys: the vault item `item.kept`, which every device of the account
+/// holds and nothing else does (GROUP-KEY §5.10). They keep what is kept under the group key
+/// post-quantum where the log key alone would not:
+///
+/// - `kept`, 32 random bytes: the start of each of our gk chains is self-wrapped under it
+///   for our other devices, never under `self_key`. That one is a function of the log key's
+///   X25519 private half, whose public half the relay stores, so whoever breaks X25519 would
+///   open every such chain from the database alone.
+/// - a Kyber1024 pair: a sharer's row of a gk chain's start to us is sealed under the static
+///   X25519 of the two log keys and a Kyber1024 encapsulation to its public half, which the
+///   relay hands out with our identity's endorsement (`KeptKemPublish`).
+///
+/// Neither changes, as the log key never does: rows under them stay on the relay for as long
+/// as their chains do, and a seat-key rotation (§5.11) would close them to us.
+pub struct KeptKeys {
+    kept: Zeroizing<[u8; 32]>,
+    kem: kem::KeyPair,
+}
+
+#[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+struct KeptWire {
+    kept: [u8; 32],
+    kem_public: Vec<u8>,
+    kem_secret: Vec<u8>,
+}
+
+/// A peer's Kyber1024 kept key, checked: of that type and length.
+#[derive(Clone)]
+pub struct KemKey(kem::PublicKey);
+
+impl KemKey {
+    pub fn new(ser: &[u8]) -> Option<KemKey> {
+        if ser.len() != KEM_PUBLIC_BYTES {
+            return None;
+        }
+        let key = kem::PublicKey::deserialize(ser).ok()?;
+        (key.key_type() == kem::KeyType::Kyber1024).then_some(KemKey(key))
+    }
+
+    fn bytes(&self) -> Box<[u8]> {
+        self.0.serialize()
+    }
+}
+
+fn kem_endorsement(account: &[u8; 16], kem: &[u8]) -> Vec<u8> {
+    let mut m = format!("voipc-keptkem/v1|{}|", hex(account)).into_bytes();
+    m.extend_from_slice(kem);
+    m
+}
+
+/// Whether `identity` endorsed `kem` as `account`'s kept key (`KeptKeys::endorse`), and it is
+/// one.
+pub fn kem_endorsed(identity: &[u8], account: &[u8; 16], kem: &[u8], signature: &[u8]) -> bool {
+    match IdentityKey::decode(identity) {
+        Ok(ik) => {
+            KemKey::new(kem).is_some()
+                && ik
+                    .public_key()
+                    .verify_signature(&kem_endorsement(account, kem), signature)
+        }
+        Err(_) => false,
+    }
+}
+
+impl KeptKeys {
+    pub fn generate() -> KeptKeys {
+        let mut rng = crate::rng();
+        KeptKeys {
+            kept: Zeroizing::new(random()),
+            kem: kem::KeyPair::generate(kem::KeyType::Kyber1024, &mut rng),
+        }
+    }
+
+    /// The vault item's plaintext: postcard of the 32 bytes and the pair as libsignal
+    /// serializes it, in a buffer of its exact size (about 4.8 KB).
+    pub fn to_bytes(&self) -> Zeroizing<Vec<u8>> {
+        let wire = KeptWire {
+            kept: *self.kept,
+            kem_public: self.kem.public_key.serialize().into_vec(),
+            kem_secret: self.kem.secret_key.serialize().into_vec(),
+        };
+        let n = postcard::experimental::serialized_size(&wire).expect("kept keys encode");
+        let mut out = Zeroizing::new(vec![0u8; n]);
+        postcard::to_slice(&wire, &mut out).expect("sized to fit");
+        out
+    }
+
+    /// `None` for what is not one, and for 32 zero bytes: a key nobody draws.
+    pub fn from_bytes(b: &[u8]) -> Option<KeptKeys> {
+        let wire: KeptWire = postcard::from_bytes(b).ok()?;
+        if wire.kept == [0; 32] {
+            return None;
+        }
+        let kem = kem::KeyPair::from_public_and_private(&wire.kem_public, &wire.kem_secret).ok()?;
+        KemKey::new(&wire.kem_public)?;
+        Some(KeptKeys {
+            kept: Zeroizing::new(wire.kept),
+            kem,
+        })
+    }
+
+    /// The Kyber1024 public half, for the relay to hand to sharers.
+    pub fn kem_public(&self) -> Vec<u8> {
+        self.kem.public_key.serialize().into_vec()
+    }
+
+    /// The identity's signature over `kem_public` as `me`'s, which a sharer checks against
+    /// the identity it pinned before sealing a row to it.
+    pub fn endorse(&self, identity: &IdentityKeyPair, me: &[u8; 16]) -> Vec<u8> {
+        identity
+            .private_key()
+            .calculate_signature(&kem_endorsement(me, &self.kem_public()), &mut crate::rng())
+            .expect("sign")
+            .to_vec()
+    }
+
+    fn ctx(conv: &str, me: &[u8; 16], epoch: u32) -> String {
+        format!("voipc-keptwrap/v1|{conv}|{}|{epoch}", hex(me))
+    }
+
+    fn key(&self, ctx: &str) -> Zeroizing<[u8; 32]> {
+        hkdf32(None, &*self.kept, ctx.as_bytes())
+    }
+
+    /// A gk chain's start for our other devices: `iv (12) | sealed state + tag (48)`, as
+    /// `self_wrap_state` is for a 0010 chain, under the kept key and a label of its own.
+    pub fn wrap_state(&self, state: &[u8; 32], conv: &str, me: &[u8; 16], epoch: u32) -> Vec<u8> {
+        let ctx = Self::ctx(conv, me, epoch);
+        seal(&self.key(&ctx), &ctx, state)
+    }
+
+    pub fn open_state(
+        &self,
+        row: &[u8],
+        conv: &str,
+        me: &[u8; 16],
+        epoch: u32,
+    ) -> Result<Zeroizing<[u8; 32]>, LogError> {
+        let ctx = Self::ctx(conv, me, epoch);
+        open_row(&self.key(&ctx), &ctx, row)
+    }
+}
+
+fn pq_ctx(conv: &str, owner: &[u8; 16], epoch: u32, recipient: &[u8; 16]) -> String {
+    format!(
+        "voipc-wrap-pq/v1|{conv}|{}|{epoch}|{}",
+        hex(owner),
+        hex(recipient)
+    )
+}
+
+/// A row nobody opens on a gk chain: an encapsulation to a key nobody keeps and random
+/// bytes, so a relay cannot tell it from a real one.
+pub fn blank_pq_row() -> Vec<u8> {
+    let mut rng = crate::rng();
+    let throwaway = kem::KeyPair::generate(kem::KeyType::Kyber1024, &mut rng);
+    match throwaway.public_key.encapsulate(&mut rng) {
+        Ok((_, ct)) => [&ct[..], &blank_row()].concat(),
+        Err(_) => random::<PQ_ROW_BYTES>().to_vec(),
+    }
 }
 
 // ── Chains ────────────────────────────────────────────────────────────────
@@ -1706,6 +1952,146 @@ mod tests {
             self_open_state(&me, &forged, "c:x", &A, 7).err(),
             Some(LogError::Malformed)
         );
+    }
+
+    /// RV r-attackers:2721: a gk chain's start for our other devices opens under the kept
+    /// keys only, which a new device gets from the vault, never under the log key, and never
+    /// as a 0010 self-wrap or the other way round.
+    #[test]
+    fn a_kept_wrap_opens_under_the_kept_keys_only() {
+        let (kept, lk) = (KeptKeys::generate(), LogKey::generate());
+        let k = epoch_key();
+        let row = kept.wrap_state(&k, "c:x", &A, 9);
+        assert_eq!(
+            row.len(),
+            ROW_BYTES,
+            "as a 0010 self-wrap is: the relay's row"
+        );
+        let again = KeptKeys::from_bytes(&kept.to_bytes()).unwrap();
+        assert_eq!(*again.open_state(&row, "c:x", &A, 9).unwrap(), *k);
+        assert_eq!(again.kem_public(), kept.kem_public());
+        for (who, conv, id, epoch) in [
+            (&KeptKeys::generate(), "c:x", &A, 9),
+            (&kept, "c:y", &A, 9),
+            (&kept, "c:x", &B, 9),
+            (&kept, "c:x", &A, 8),
+        ] {
+            assert_eq!(
+                who.open_state(&row, conv, id, epoch).err(),
+                Some(LogError::Sealed)
+            );
+        }
+        assert!(self_open_state(&lk, &row, "c:x", &A, 9).is_err());
+        let old = self_wrap_state(&lk, &k, "c:x", &A, 9);
+        assert!(kept.open_state(&old, "c:x", &A, 9).is_err());
+        // What is not kept keys
+        assert!(KeptKeys::from_bytes(&[]).is_none());
+        assert!(KeptKeys::from_bytes(&kept.to_bytes()[1..]).is_none());
+        let mut zero = postcard::from_bytes::<KeptWire>(&kept.to_bytes()).unwrap();
+        zero.kept = [0; 32];
+        assert!(KeptKeys::from_bytes(&postcard::to_allocvec(&zero).unwrap()).is_none());
+    }
+
+    /// The kept key a sharer seals to is one the identity endorsed as this account's.
+    #[test]
+    fn a_kept_key_is_taken_only_as_its_identity_endorsed_it() {
+        let ik = IdentityKeyPair::generate(&mut crate::rng());
+        let ik_pub = ik.public_key().serialize();
+        let kept = KeptKeys::generate();
+        let sig = kept.endorse(&ik, &A);
+        assert!(kem_endorsed(&ik_pub, &A, &kept.kem_public(), &sig));
+        assert!(
+            !kem_endorsed(&ik_pub, &B, &kept.kem_public(), &sig),
+            "another account's"
+        );
+        let other = IdentityKeyPair::generate(&mut crate::rng());
+        assert!(!kem_endorsed(
+            &other.public_key().serialize(),
+            &A,
+            &kept.kem_public(),
+            &sig
+        ));
+        let another = KeptKeys::generate();
+        assert!(!kem_endorsed(&ik_pub, &A, &another.kem_public(), &sig));
+        // A log key, or junk, is no kept key, whatever signs it
+        let lk = LogKey::generate().public();
+        let junk_sig = ik
+            .private_key()
+            .calculate_signature(&kem_endorsement(&A, &lk), &mut crate::rng())
+            .unwrap();
+        assert!(!kem_endorsed(&ik_pub, &A, &lk, &junk_sig));
+        assert!(KemKey::new(&kept.kem_public()[..KEM_PUBLIC_BYTES - 1]).is_none());
+    }
+
+    /// RV r-attackers:2721: a sharer's row of a gk chain's start to a newcomer opens only
+    /// with both the static X25519 of the two log keys and the newcomer's kept Kyber1024 key.
+    /// Whoever breaks X25519 has the first from the relay's database, and nothing of the
+    /// second. A row of the static shape alone never opens as one, nor one the other way.
+    #[test]
+    fn a_newcomers_row_of_a_gk_start_needs_its_kept_key_and_the_static_key() {
+        let (w, r, mallory) = (LogKey::generate(), LogKey::generate(), LogKey::generate());
+        let (kept, other) = (KeptKeys::generate(), KeptKeys::generate());
+        let kem = KemKey::new(&kept.kem_public()).unwrap();
+        let to_r = StaticKey::new(&w, &r.public()).unwrap();
+        let from_w = StaticKey::new(&r, &w.public()).unwrap();
+        let k = epoch_key();
+        let row = to_r.wrap_state_pq(&kem, &k, "c:x", &A, 0x5000, &B);
+        assert_eq!(row.len(), PQ_ROW_BYTES);
+        assert_eq!(
+            *from_w
+                .open_state_pq(&kept, &row, "c:x", &A, 0x5000, &B)
+                .unwrap(),
+            *k
+        );
+        let again = KeptKeys::from_bytes(&kept.to_bytes()).unwrap();
+        assert!(from_w
+            .open_state_pq(&again, &row, "c:x", &A, 0x5000, &B)
+            .is_ok());
+        assert_eq!(
+            from_w
+                .open_state_pq(&other, &row, "c:x", &A, 0x5000, &B)
+                .err(),
+            Some(LogError::Sealed),
+            "the static key alone, as a quantum computer has it"
+        );
+        let forged = StaticKey::new(&mallory, &r.public()).unwrap();
+        let by_mallory = forged.wrap_state_pq(&kem, &k, "c:x", &A, 0x5000, &B);
+        assert_eq!(
+            from_w
+                .open_state_pq(&kept, &by_mallory, "c:x", &A, 0x5000, &B)
+                .err(),
+            Some(LogError::Sealed),
+            "the kept key alone: the relay can encapsulate to it"
+        );
+        for (conv, owner, epoch, me) in [
+            ("c:y", &A, 0x5000, &B),
+            ("c:x", &B, 0x5000, &B),
+            ("c:x", &A, 0x5002, &B),
+            ("c:x", &A, 0x5000, &A),
+        ] {
+            assert!(from_w
+                .open_state_pq(&kept, &row, conv, owner, epoch, me)
+                .is_err());
+        }
+        // Static rows and hybrid ones never stand in for each other
+        let static_row = to_r.wrap_state(&k, "c:x", &A, 0x5000, &B);
+        assert_eq!(
+            from_w
+                .open_state_pq(&kept, &static_row, "c:x", &A, 0x5000, &B)
+                .err(),
+            Some(LogError::Malformed)
+        );
+        assert_eq!(
+            from_w.open_state(&row, "c:x", &A, 0x5000, &B).err(),
+            Some(LogError::Malformed)
+        );
+        // A blank is of the same shape and opens for nobody
+        let blank = blank_pq_row();
+        assert_eq!(blank.len(), PQ_ROW_BYTES);
+        assert_eq!(blank[0], row[0], "the KEM's type byte, as a real row's");
+        assert!(from_w
+            .open_state_pq(&kept, &blank, "c:x", &A, 0x5000, &B)
+            .is_err());
     }
 
     #[test]

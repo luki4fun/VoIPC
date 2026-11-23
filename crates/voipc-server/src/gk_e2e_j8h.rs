@@ -14,12 +14,15 @@
 //! database (a stored group needs one), so `Store::slow_commits` (memory groups only) does
 //! not apply. Paused, the clock moves only by the test's own `advance` (`Gate`): tokio does
 //! not jump it to the next timer while the database works (which timed out the pool's
-//! connections under `start_paused`), and each step leaves a millisecond of real time first
-//! for the relay's and the keyholder's work.
+//! connections under `start_paused`). Each step leaves a millisecond of real time first for
+//! the relay's and the keyholder's work, and while some of it is still under way (a store
+//! write on Postgres under load), the clock moves at real time, as a relay's does
+//! (`World::settle`).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use l4f_accounts::store::Store;
 use voipc_crypto::group_key::{Endorsement, GroupKind, MemberId, Origin, SeatKeys};
@@ -40,13 +43,14 @@ pub(super) const CONV: &str = "c:j8hall";
 /// How long a newcomer may wait for its seat while a keyholder's account is online in the
 /// channel again: a Join due and its commit, with room for a fetch's retry.
 const SEATED_WITHIN_MS: u64 = 2 * 60_000;
-/// The same after the set's last entry went for good ("Fast new start", owner 2026-11-19):
-/// the relay waits `REGENESIS_FAST_AFTER_MS` (2 min) from when it saw no keyholder online,
-/// which was before the newcomer came, then a Regenesis (30 s deadline, and a retry 30 s
-/// after a miss), a Join batch (2 s) and its commit (5 s) seat it. Two minutes over the fast
-/// wait: on Postgres under the other tests' load the seat came at 3.0 min (J9N, 1 run in 3),
-/// at about 2.1 min alone. Written out, so the old hour fails it.
-pub(super) const SEATED_AFTER_FAST_MS: u64 = 4 * 60_000;
+/// The same after the set's last entry went for good ("Fast new start", owner 2026-11-19; at
+/// once, J10-B option A, owner 2026-11-22): every entry of the set in force is a connection's
+/// and none is online, so the relay asks a Regenesis as the newcomer comes
+/// (`REGENESIS_FAST_AFTER_MS`, none); the Regenesis (30 s deadline, and a retry 30 s after a
+/// miss), a Join batch (2 s) and its commit (5 s) seat it. Under the old fast wait's 2 min
+/// (the seat came at about 2.1 min alone, 3.0 min on Postgres under load before J10's
+/// `World::settle`), so that wait and the hour both fail it.
+pub(super) const SEATED_AT_ONCE_MS: u64 = 90_000;
 /// How long the tests watch for the newcomer's seat at most: past the 1 h Regenesis.
 pub(super) const WATCH_MS: u64 = 75 * 60_000;
 
@@ -272,32 +276,50 @@ pub(super) async fn handle(
 pub(super) struct OnTask {
     pub(super) app: Arc<Mutex<App>>,
     pub(super) task: tokio::task::JoinHandle<()>,
+    /// Its connection's queue, the frames it has not taken counted in it.
+    tx: ControlTx,
+    /// From a frame or tick taken until what it sends was handed over.
+    busy: Arc<AtomicBool>,
 }
 
 impl OnTask {
     fn run(state: Arc<ServerState>, app: App, tx: ControlTx, mut rx: ControlRx) -> OnTask {
         let sid = app.sid;
         let app = Arc::new(Mutex::new(app));
-        let a = app.clone();
+        let busy = Arc::new(AtomicBool::new(false));
+        let (a, on, queue) = (app.clone(), busy.clone(), tx.clone());
         let task = tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(500));
             loop {
                 let send = tokio::select! {
                     b = rx.recv() => {
                         let Some(b) = b else { return };
+                        on.store(true, Ordering::Relaxed);
                         let f = voipc_protocol::codec::decode_server_msg(&b[4..]).unwrap();
                         let now = state.gk.now();
                         a.lock().unwrap().frame(&f, now)
                     }
                     _ = tick.tick() => {
+                        on.store(true, Ordering::Relaxed);
                         let now = state.gk.now();
                         a.lock().unwrap().tick(now)
                     }
                 };
                 handle(&state, sid, &tx, send).await;
+                on.store(false, Ordering::Relaxed);
             }
         });
-        OnTask { app, task }
+        OnTask {
+            app,
+            task,
+            tx: queue,
+            busy,
+        }
+    }
+
+    /// Nothing queued for it, nothing it took still being handed over.
+    fn idle(&self) -> bool {
+        !self.busy.load(Ordering::Relaxed) && self.tx.queued_bytes() == 0
     }
 
     /// The page goes (a reload, a closed tab): its task stops with its connection.
@@ -329,11 +351,9 @@ impl Gate {
         Gate(Some(tx))
     }
 
-    /// Real time for what the relay and the keyholder's task have to do (their database
-    /// work among it) before the clock moves on by `every` ms: a millisecond for each 100 ms
-    /// of it, one at least. The coarse steps of an hour's watch then leave a store write on
-    /// Postgres, under the load of the other tests, the time it takes (J9N: with a millisecond
-    /// for each 500 ms step, the keyholder's commits fell behind the clock there).
+    /// Real time for what the relay and the keyholder's task have to do before the clock
+    /// moves on by `every` ms: a millisecond for each 100 ms of it, one at least
+    /// (`World::settle` waits on for what is still under way then).
     async fn settle(every: u64) {
         let real = every.div_ceil(100).max(1);
         tokio::task::spawn_blocking(move || std::thread::sleep(Duration::from_millis(real)))
@@ -406,6 +426,10 @@ pub(super) async fn relay(db: &Store) -> Arc<ServerState> {
     state
 }
 
+/// How long the relay's and the keyholder's work may stay under way, in real time, before a
+/// step gives up on it: far past any store write's, so a count that never ends shows.
+const BUSY_MAX: Duration = Duration::from_secs(120);
+
 impl World {
     pub(super) async fn new() -> World {
         let _ = tracing_on();
@@ -431,6 +455,35 @@ impl World {
     pub(super) fn pause(&mut self) {
         tokio::time::pause();
         self.paused = true;
+    }
+
+    /// Before the paused clock moves on by `every` ms: real time for the relay's and the
+    /// keyholder's work (`Gate::settle`), then, while some of it is still under way (an
+    /// actor's turn on a store write, a message in an inbox, a frame the keyholder has not
+    /// taken), the clock moves at real time, as a relay's does while its database works.
+    /// Moving it by the steps' pace meanwhile made a store write's real time 40 to 100 times
+    /// as long on the relay's clock: on Postgres under the other tests' load, a newcomer
+    /// whose Join the relay took at once was seated only when that turn ended, 6 to 20
+    /// minutes on (J10).
+    async fn settle(&self, every: u64) {
+        Gate::settle(every).await;
+        let start = Instant::now();
+        let mut at = start;
+        while self.busy() {
+            assert!(
+                start.elapsed() < BUSY_MAX,
+                "the relay's or the keyholder's work stayed under way for {BUSY_MAX:?}"
+            );
+            Gate::settle(1).await;
+            let now = Instant::now();
+            tokio::time::advance(now - at).await;
+            at = now;
+        }
+    }
+
+    /// Whether the relay or the keyholder's task has work under way.
+    fn busy(&self) -> bool {
+        self.state.gk.busy_for_test() || self.keyholder.as_ref().is_some_and(|k| !k.idle())
     }
 
     /// A connection of `acc` following the channel's group.
@@ -542,7 +595,7 @@ impl World {
         let start = self.now();
         while self.now() < start + ms {
             if self.paused {
-                Gate::settle(every).await;
+                self.settle(every).await;
                 tokio::time::advance(Duration::from_millis(every)).await;
             } else {
                 tokio::time::sleep(Duration::from_millis(every)).await;
@@ -601,8 +654,7 @@ impl World {
 
     /// Newcomer neo comes in; how long its seat takes, watched past the 1 h Regenesis.
     async fn newcomer_waits(&mut self, neo: &Account) -> Option<u64> {
-        self.newcomer_waits_as("neo", neo, SEATED_AFTER_FAST_MS)
-            .await
+        self.newcomer_waits_as("neo", neo, SEATED_AT_ONCE_MS).await
     }
 
     /// Newcomer `name` comes in; how long its seat takes: watched closely for `close` ms,
@@ -638,10 +690,11 @@ pub(super) fn minutes(t: Option<u64>) -> String {
 /// page on its new connection volunteers, but promoting it is a KeyholdersAdd only an entry of
 /// the set can sign. Before "Fast new start" (owner 2026-11-19) the relay waited
 /// `REGENESIS_AFTER_MS` (1 h) before it asked a Regenesis, and members held a Regenesis to
-/// that hour: a newcomer waited about an hour for its seat (J8H measured 60.1 min). A set of
-/// connection entries alone now starts anew 2 minutes on (`rules::regenesis_wait`): the page
-/// on its new connection makes the Regenesis, holds the keys from then on, and the newcomer
-/// is seated within `SEATED_AFTER_FAST_MS`.
+/// that hour: a newcomer waited about an hour for its seat (J8H measured 60.1 min); from then
+/// to J10-B's option A (owner 2026-11-22), 2 minutes. A set of connection entries alone, none
+/// online, now starts anew at once (`rules::regenesis_wait`): the page on its new connection
+/// makes the Regenesis, holds the keys from then on, and the newcomer is seated within
+/// `SEATED_AT_ONCE_MS`.
 #[tokio::test]
 async fn e2e_j8h_a_newcomer_is_seated_soon_after_the_sole_browser_keyholder_reloads() {
     let mut w = World::new().await;
@@ -665,10 +718,10 @@ async fn e2e_j8h_a_newcomer_is_seated_soon_after_the_sole_browser_keyholder_relo
     w.pause();
     let waited = w.newcomer_waits(&neo).await;
     assert!(
-        waited.is_some_and(|t| t <= SEATED_AFTER_FAST_MS),
-        "the newcomer was seated after {} (within {} min wanted); load {:?}",
+        waited.is_some_and(|t| t <= SEATED_AT_ONCE_MS),
+        "the newcomer was seated after {} (within {} s wanted); load {:?}",
         minutes(waited),
-        SEATED_AFTER_FAST_MS / 60_000,
+        SEATED_AT_ONCE_MS / 1000,
         w.load()
     );
     // The page on its new connection started anew and holds the keys: the old entry is gone
@@ -685,8 +738,8 @@ async fn e2e_j8h_a_newcomer_is_seated_soon_after_the_sole_browser_keyholder_relo
 /// page comes back on a new connection with a new pair, and nothing online can sign its
 /// promotion or the old entry's removal. Before "Fast new start" a newcomer waited for the
 /// 1 h Regenesis, as after a reload: every browser-only stored channel stalled its joins and
-/// exits for an hour after each restart. Now it is seated 2 minutes and a settle on, the
-/// page on its new connection the keyholder.
+/// exits for an hour after each restart (2 minutes from "Fast new start" to J10-B's option A).
+/// Now it is seated at once, the page on its new connection the keyholder.
 #[tokio::test]
 async fn e2e_j8h_a_newcomer_is_seated_soon_after_a_relay_restart_of_a_browser_held_channel() {
     let mut w = World::new().await;
@@ -731,10 +784,10 @@ async fn e2e_j8h_a_newcomer_is_seated_soon_after_a_relay_restart_of_a_browser_he
     w.pause();
     let waited = w.newcomer_waits(&neo).await;
     assert!(
-        waited.is_some_and(|t| t <= SEATED_AFTER_FAST_MS),
-        "the newcomer was seated after {} (within {} min wanted); load {:?}",
+        waited.is_some_and(|t| t <= SEATED_AT_ONCE_MS),
+        "the newcomer was seated after {} (within {} s wanted); load {:?}",
         minutes(waited),
-        SEATED_AFTER_FAST_MS / 60_000,
+        SEATED_AT_ONCE_MS / 1000,
         w.load()
     );
     // The page on its new connection started anew and holds the keys: the old entry is gone
@@ -747,7 +800,9 @@ async fn e2e_j8h_a_newcomer_is_seated_soon_after_a_relay_restart_of_a_browser_he
 }
 
 /// The control of the two above, on the same harness: while the browser keyholder stays,
-/// a newcomer two minutes on is seated at once. Its set stays the one entry; nothing waits.
+/// a newcomer two minutes on is seated at once by a Join. Its set stays the one entry, online;
+/// nothing waits, and nothing starts anew: a set with an entry online is never replaced by a
+/// Regenesis, however fast one may come once none is.
 #[tokio::test]
 async fn e2e_j8h_a_newcomer_is_seated_at_once_while_the_sole_browser_keyholder_stays() {
     let mut w = World::new().await;
@@ -769,5 +824,46 @@ async fn e2e_j8h_a_newcomer_is_seated_at_once_while_the_sole_browser_keyholder_s
     assert_eq!(
         (l.keyholders, l.keyholders_online, l.joins_waiting),
         (1, 1, 0)
+    );
+    for m in ["ann", "nan", "neo"] {
+        let anew = w.members[m]
+            .app
+            .events
+            .iter()
+            .any(|e| matches!(e, GkEvent::Anew { .. }));
+        assert!(!anew, "{m} was never told the keys were made anew");
+    }
+}
+
+/// The harness itself (J10): a store write that takes real time, as Postgres can under the
+/// other tests' load, costs the paused clock that real time, as it costs a relay's, not the
+/// steps' pace. Before, each 50 ms step left the relay a millisecond of real time whether its
+/// turn had ended or not: a 3 s write moved the relay's clock about two minutes, and the
+/// newcomer whose Join it was storing waited all of it (J8H's and J9N's newcomers were seated
+/// 6 to 20 minutes on, 1 run in 3 or more on Postgres).
+#[tokio::test]
+async fn e2e_j8h_a_slow_store_write_costs_the_paused_clock_only_its_real_time() {
+    const STALL_MS: u64 = 3_000;
+    let mut w = World::new().await;
+    let kay = Account::new(&w.db, "kay").await;
+    let ann = Account::new(&w.db, "ann").await;
+    let nan = Account::new(&w.db, "nan").await;
+    let neo = Account::new(&w.db, "neo").await;
+    w.started(&kay, &ann, &nan).await;
+    w.pause();
+    // The next commit is neo's Join (its batch closes 2 s on; the head epoch is fresh)
+    let seen = w.state.gk.stall_next_commit_for_test(STALL_MS);
+    let waited = w.newcomer_waits_as("neo", &neo, SEATED_AT_ONCE_MS).await;
+    let (from, to, real) = seen.lock().unwrap().expect("a commit was stalled");
+    let moved = Duration::from_millis(to - from);
+    assert!(
+        moved <= real + Duration::from_millis(500),
+        "the relay's clock moved {moved:?} while its store write took {real:?}"
+    );
+    assert!(
+        waited.is_some_and(|t| t <= STALL_MS + 30_000),
+        "the newcomer was seated after {}; load {:?}",
+        minutes(waited),
+        w.load()
     );
 }

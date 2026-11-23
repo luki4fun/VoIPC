@@ -440,7 +440,12 @@ What is done in the app counts at once.
   when codes are on. Either way the server signs out every other device and
   forgets every remembered one; the device you did it on is remembered again. The
   vault, your identity (and what others pinned of it) and the recovery key stay as
-  they were.
+  they were. So does the vault's own key: a new password, or a new recovery key, seals
+  that key anew and does not replace it. A device that once held it (a remembered
+  device, a lost one, or anyone who once had the password) can still open every later
+  copy of your vault, your new seat keys and kept keys among them, wherever it gets the
+  server's copy; the new password only signs it out here. A way to give the vault a new
+  key at a password change is planned after 1.14.
 - **Only the recovery key resets the password.** Since 1.3 the recovery key also
   derives a reset key; the server keeps its public half and checks every reset
   against it. A remembered device holds the key to your vault, but not this one, so
@@ -503,8 +508,11 @@ What is done in the app counts at once.
   X25519) in its vault, as the item `item.seat_kem`, and publishes their public halves. They
   are made anew every 30 days, at a password change, a recovery-key reset and when a device
   is removed: what a stolen device holds then opens no new epoch once the server takes the old
-  seat out. Your account is seated in a channel that keeps its history (up to `kept_seats`
-  accounts a channel) as soon as one of your devices signs in with a 1.14 app, online or not;
+  seat out, unless it can still read your vault (the vault's key stays the same, above). If
+  someone else publishes seat keys for your account, your app warns, asks you to change your
+  password, and goes above them; the server takes a counter at most 4 ahead each time. Your
+  account is seated in a channel that keeps its history (up to `kept_seats` accounts a
+  channel) as soon as one of your devices signs in with a 1.14 app, online or not;
   kept posts written under the group key before that are not readable to it.
 - **Keyholders.** A desktop app helps hold the keys of the text channels it is in, and hands
   them to new members, unless you turn off *Settings → Help hold keys for text channels*;
@@ -609,8 +617,12 @@ may come from it. So a device that signs in this way needs one of these before i
   typed it there. A typo can be typed again three times; then the old device says no and warns that someone may be in
   between. A code anywhere else, in an error, a message, a notice or another dialog, is not it: a hostile server can run its own side
   of the request and show you the code for that, so say no on the old device. Approving signs that device out here,
-  as any sign-in on another device does. Asking again ends an ask still open. Update the old device first: a device
-  from before this change and a device after it cannot pair;
+  as any sign-in on another device does. Asking again ends an ask still open. The key goes sealed to both an X25519
+  and a Kyber1024 key of the new device, so a recording of the pairing stays closed to a quantum computer (since
+  1.14). A 1.14 device and an older one cannot pair, either way round, and a 1.14 app pairs only through a server
+  on 1.14 or later: it says "Your other device can hand the key over only on a server that runs VoIPC 1.14 or
+  later. Use your recovery key or password here." A pairing made with an earlier app sent the key under X25519
+  alone, and since the vault's key never changes, that recording stays a way in for a quantum computer;
 - **your password**, on an account that has one.
 
 Someone who has only your provider account therefore joins no channel, reads nothing, and does not take your
@@ -699,7 +711,9 @@ From accounts:
   is to the nearest kilobyte, never who is on it. The identities you pinned are items
   too (`pins.0` and on, listed in `item.pins`), each sealed the same way and up to 48 KiB,
   so it can see about how many people you have met, and when you met more. Since 1.14 so are
-  your seat keys (`item.seat_kem`) and how far your devices took each channel's keys
+  your seat keys (`item.seat_kem`), your kept keys (`item.kept`: the key your own chains' starts
+  are kept under, and a Kyber1024 pair, whose public half your app publishes signed by your
+  identity, for rows sharers give you) and how far your devices took each channel's keys
   (`item.gk_floors`, with pages `gkf.0` and on and `gkc.0` and on): it sees when they change,
   and about how many channels and people they cover
 - bans: a keyed hash of each banned address (never the address), and banned
@@ -779,17 +793,24 @@ in [THREAT-MODEL.md](THREAT-MODEL.md)):
 - **guess your password offline**, at the cost above;
 - **decide who is a member** of a channel's log: under the group key a member it
   made up is named by the signed headers to the writers of a gated channel, and in
-  an open one is one more reader; it can also leave one account of its choice
-  unnamed for an epoch, which the keyholder device that seated it warns of. On the
-  live path such a member gets keys only with the notice above, shown on the device
-  that hands the key over;
+  an open one is one more reader; it can also leave accounts of its choice, up to
+  256 each time it asks a keyholder to seat people, unnamed for the epochs opened
+  within about 10 minutes of that ask, which the keyholder device that seated them warns of
+  (unless the server keeps that device on a branch of its own past a later epoch,
+  or walks it back in an open channel, or shows it a new generation, which every
+  member sees as made anew). On the live path such a member gets keys
+  only with the notice above, shown on the device that hands the key over;
 - **keep a writer on an older key of their own** that still reaches somebody who
   left, which helps it only together with that person;
 - **hold a copy for later**: kept copies under the group key reach members in welcomes
-  that use Kyber1024 as well as X25519, but those kept before 1.14, and on the live path,
-  use X25519 alone, so a database copied today could be read by a quantum computer later;
-  and if a keyholder's seed ever leaks, a quantum computer opens the rows under it, about
-  31 days of them at most in a text channel;
+  that use Kyber1024 as well as X25519, and so do their chain starts, kept for your other
+  devices under your kept keys and handed to newcomers by sharers in rows sealed to a
+  Kyber1024 key too. Those kept before 1.14, a voice room's kept chat, and those on the
+  live path use X25519 alone, so a database copied today could be read by a quantum
+  computer later; so could the vault of an account that paired a device with an app
+  before 1.14, from a recording of that pairing. And if a keyholder's seed ever leaks, a
+  quantum computer opens the rows under it, about 31 days of them at most in a text
+  channel;
 - **show display names, pictures and a server name as it likes**: they are its word,
   so they are no proof of who someone is. That is why your app always shows the
   `@name` and the address beside them. Pictures are sanitized on your device first;

@@ -1992,6 +1992,41 @@ fn a_generation_among_the_last_eight_or_begun_before_the_floor_is_refused() {
     assert!(check_new_generation(None, clock(t), &old).is_ok());
 }
 
+/// RV r-hostile:1007 (repair): nine generations started within a few minutes fill the
+/// last-8 list; a new one whose volunteer's clock runs behind, so that its Genesis is dated
+/// before the oldest of the eight, still passes the floor rules (`CLOCK_SLACK` is what a
+/// clock may be off by). What keeps the first, pushed out of the list, from being taken
+/// again is the member's own list of the generations it took (`group_state` test
+/// `a_generation_taken_earlier_is_refused_though_the_last_eight_let_it_go`).
+#[test]
+fn a_new_generation_dated_before_the_last_eight_still_passes_the_floor_rules() {
+    let k = Party::new(acct(1));
+    let gen_n = |n: u8| Group::new(GroupKind::Text, "c:lounge-1", [n; 16]).unwrap();
+    let mut floor: Option<Floor> = None;
+    let mut t = T0;
+    for n in 1..=9u8 {
+        let h = signed(None, genesis_of(&k, &gen_n(n), t, false), &k);
+        let live = Clock {
+            now: t,
+            taken: floor.as_ref().map(|_| t - 30),
+        };
+        assert!(
+            check_new_generation(floor.as_ref(), live, h.header()).is_ok(),
+            "gen {n}"
+        );
+        floor = Some(Floor::after(floor.as_ref(), &h, t));
+        t += 30;
+    }
+    let floor = floor.unwrap();
+    let oldest = floor.gens.iter().map(|(_, at)| *at).min().unwrap();
+    let live = Clock {
+        now: t,
+        taken: Some(t - 30),
+    };
+    let behind = genesis_of(&k, &gen_n(30), oldest - 60, false);
+    assert_eq!(check_new_generation(Some(&floor), live, &behind), Ok(()));
+}
+
 #[test]
 fn a_regenesis_before_an_hour_after_its_parent_is_refused() {
     let (g, k) = (text(), Party::new(acct(1)));
@@ -2020,14 +2055,15 @@ fn a_regenesis_before_an_hour_after_its_parent_is_refused() {
     assert!(check_regenesis(Some(&floor), live, &on_time, &parent).is_err());
 }
 
-// ── "Fast new start" (owner, 2026-11-19) ──────────────────────────────────
+// ── "Fast new start" (owner, 2026-11-19; at once, owner 2026-11-22) ────────
 //
 // A keyholder set of connection entries alone (0x02: a browser's or a guest's pair, gone with
-// its connection) lets a Regenesis come 2 minutes after its parent instead of the hour. The
-// tests write the 2 minutes out (`FAST`), so the old rule (an hour whatever the set) fails them.
+// its connection) lets a Regenesis come at once after its parent, dated no earlier than it,
+// instead of the hour (J10-B option A: 2 minutes before). The tests write the wait out
+// (`FAST`, none), so the hour and the old 2 minutes both fail them.
 
-/// The fast wait, written out.
-const FAST: u64 = 2 * 60;
+/// The fast wait, written out: none.
+const FAST: u64 = 0;
 
 /// A Regenesis by volunteer `vol` over `parent`, dated `time`.
 fn regen_by(vol: &Party, parent: &SignedHeader, time: u64) -> SignedHeader {
@@ -2064,19 +2100,24 @@ fn link_of<'a>(header: &'a SignedHeader, parent: Option<&'a SignedHeader>) -> Wa
 
 /// Every way a member takes a Regenesis over a set of connection entries alone: as a
 /// newcomer walking from the Genesis, walking to its floor, as the start of its walk on
-/// trust, and holding the parent or only its floor with the set beside it. Each takes it 2
-/// minutes after its parent, and none a second sooner.
+/// trust, and holding the parent or only its floor with the set beside it. Each takes it at
+/// once after its parent (the same second), and none dated a second before it.
 #[test]
-fn a_regenesis_over_connection_entries_alone_is_taken_two_minutes_after_its_parent() {
+fn a_regenesis_over_connection_entries_alone_is_taken_at_once_after_its_parent() {
     let ConnHeld {
         vol, gen, fresh, ..
     } = conn_held();
     assert_eq!(gen.header().keyholders[0].origin, Origin::Connection as u8);
     let p_time = fresh.header().time;
-    let early = regen_by(&vol, &fresh, p_time + FAST - 1);
+    let early = regen_by(&vol, &fresh, p_time - 1);
     let on_time = regen_by(&vol, &fresh, p_time + FAST);
-    let now = clock(p_time + FAST + 5);
-    let soon = Refusal::Generation("a Regenesis comes two minutes after its parent");
+    assert_eq!(
+        on_time.header().time,
+        p_time,
+        "the same second as its parent"
+    );
+    let now = clock(p_time + 5);
+    let soon = Refusal::Generation("a Regenesis is earlier than its parent");
     let floor_gen = Floor::after(None, &gen, T0);
     let floor = Floor::after(Some(&floor_gen), &fresh, T0);
 
@@ -2148,14 +2189,17 @@ fn a_regenesis_over_connection_entries_alone_is_taken_two_minutes_after_its_pare
     assert!(check_regenesis_under(None, now, &on_time, &fresh, &gen).is_ok());
     assert_eq!(
         check_regenesis_under(Some(&floor), now, &early, &fresh, &gen).err(),
-        Some(soon)
+        Some(soon.clone())
     );
 
     // A parent that sets keyholders is the set itself: seen without being handed over
     let over_gen = regen_by(&vol, &gen, T0 + FAST);
     assert_eq!(check_link(&gen, &over_gen), Ok(vec![]));
     assert!(check_regenesis(Some(&floor_gen), now, &over_gen, &gen).is_ok());
-    assert!(check_link(&gen, &regen_by(&vol, &gen, T0 + FAST - 1)).is_err());
+    assert_eq!(
+        check_link(&gen, &regen_by(&vol, &gen, T0 - 1)).err(),
+        Some(soon)
+    );
 }
 
 /// One entry that is not a connection's (here a desktop's pair, 0x03) keeps the hour for the
@@ -2256,7 +2300,7 @@ fn a_member_holding_only_its_floor_takes_a_fast_regenesis_under_the_set_it_holds
     // Without the set: the hour (what a member that does not hand it over checks)
     assert_eq!(check_on_floor(&floor, &r).err(), hour.clone());
     assert_eq!(check_regenesis(Some(&floor), now, &r, &fresh).err(), hour);
-    // With it: 2 minutes
+    // With it: at once
     assert_eq!(check_on_floor_under(&floor, &r, &gen), Ok(vec![]));
     assert!(check_regenesis_under(Some(&floor), now, &r, &fresh, &gen).is_ok());
 
@@ -2306,8 +2350,8 @@ fn a_member_holding_only_its_floor_takes_a_fast_regenesis_under_the_set_it_holds
 
 /// The churn bound: a set of connections that a Regenesis itself started keeps the hour for
 /// an hour after that Regenesis, so connections that drop again and again (or a relay that
-/// drops them) start anew at most once an hour. An hour on, the set goes fast again, 2
-/// minutes after its parent.
+/// drops them) start anew at most once an hour. An hour on, the set goes fast again, at once
+/// after its parent.
 #[test]
 fn a_set_a_regenesis_started_keeps_the_hour_for_an_hour() {
     let ConnHeld { vol, fresh, .. } = conn_held();
@@ -2321,8 +2365,8 @@ fn a_set_a_regenesis_started_keeps_the_hour_for_an_hour() {
         "a Regenesis comes an hour after its parent",
     ));
 
-    // Again 2 minutes after its parent, within the hour of r1: refused everywhere
-    let r2 = regen_by(&vol2, &f2, t1 + 240);
+    // Again at once after its parent, within the hour of r1: refused everywhere
+    let r2 = regen_by(&vol2, &f2, t1 + 120 + FAST);
     let now = clock(t1 + 300);
     let floor_r1 = Floor::after(None, &r1, t1);
     let floor_f2 = Floor::after(Some(&floor_r1), &f2, t1);
@@ -2354,18 +2398,18 @@ fn a_set_a_regenesis_started_keeps_the_hour_for_an_hour() {
         now,
         NO_PINS,
     );
-    assert_eq!(started.err(), hour);
+    assert_eq!(started.err(), hour.clone());
 
-    // An hour after r1, 2 minutes after its parent: taken, and not a second sooner
+    // An hour after r1 (its parent 100 s before): taken, and not a second sooner
     let f3 = signed(Some(&r1), next(&r1, Kind::Fresh, t1 + 3500), &vol);
-    let r3 = regen_by(&vol2, &f3, t1 + 3500 + FAST);
-    let r3_early = regen_by(&vol2, &f3, t1 + 3500 + FAST - 1);
-    let now = clock(t1 + 3500 + FAST + 5);
+    let r3 = regen_by(&vol2, &f3, t1 + 3600);
+    let r3_early = regen_by(&vol2, &f3, t1 + 3599);
+    let now = clock(t1 + 3605);
     let floor_f3 = Floor::after(Some(&floor_r1), &f3, t1);
     assert_eq!(check_link_under(&f3, &r3, &r1), Ok(vec![]));
     assert_eq!(check_on_floor_under(&floor_f3, &r3, &r1), Ok(vec![]));
     assert!(check_regenesis_under(Some(&floor_f3), now, &r3, &f3, &r1).is_ok());
-    assert!(check_link_under(&f3, &r3_early, &r1).is_err());
+    assert_eq!(check_link_under(&f3, &r3_early, &r1).err(), hour);
     let walker = check_walk(
         WalkTo::Floor {
             floor: &floor_r1,
@@ -2466,7 +2510,6 @@ fn a_guest_in_a_gated_header_or_connection_seats_are_refused() {
     let fold = fold_names(
         &NamesFrom::Floor(NamesFloor::of(gen.header())),
         &[NamesList::of(with_guest.header())],
-        &[],
         with_guest.header(),
         &knows(T0 + 3),
     );
@@ -2580,7 +2623,7 @@ fn a_writer_holds_until_every_list_since_its_names_floor_folds_to_the_head() {
     let head = heads[2].header();
     let lists = lists_of(&heads);
     let fold =
-        |from: &NamesFrom, lists: &[NamesList]| fold_names(from, lists, &[], head, &knows(T0 + 10));
+        |from: &NamesFrom, lists: &[NamesList]| fold_names(from, lists, head, &knows(T0 + 10));
     let from = NamesFrom::Floor(floor);
     let Ok(Fold::Take {
         floor: moved,
@@ -2683,7 +2726,7 @@ fn a_writer_holds_until_every_list_since_its_names_floor_folds_to_the_head() {
     // An open head names nobody: nothing to fold.
     let open = signed(None, genesis_of(&k, &g, T0, false), &k);
     assert!(matches!(
-        fold_names(&NamesFrom::Start, &[], &[], open.header(), &knows(T0)),
+        fold_names(&NamesFrom::Start, &[], open.header(), &knows(T0)),
         Ok(Fold::Take { shown, .. }) if shown == Shown::default()
     ));
 }
@@ -2699,7 +2742,7 @@ fn a_list_given_another_headers_time_epoch_or_join_does_not_fold() {
     let lists = lists_of(&heads);
     let from = NamesFrom::Floor(NamesFloor::of(gen.header()));
     let head = heads[1].header();
-    let fold = |lists: &[NamesList]| fold_names(&from, lists, &[], head, &knows(T0 + 10));
+    let fold = |lists: &[NamesList]| fold_names(&from, lists, head, &knows(T0 + 10));
     assert!(matches!(fold(&lists), Ok(Fold::Take { .. })), "the control");
     let p = gen.header().names_hash;
     let first = &lists[0];
@@ -2864,7 +2907,6 @@ fn a_failed_fold_keeps_its_names_floor_at_a_signed_place_past_empty_lists() {
     let held = |from: NamesFloor, lists: &[NamesList]| match fold_names(
         &NamesFrom::Floor(from),
         lists,
-        &[],
         j2.header(),
         &knows(T0 + 70),
     ) {
@@ -2884,6 +2926,7 @@ fn a_failed_fold_keeps_its_names_floor_at_a_signed_place_past_empty_lists() {
             epoch: 1,
             join: 9,
             added: vec![],
+            removed: vec![],
         };
         let lists = [real[0].clone(), made_up.clone(), real[2].clone()];
         assert_eq!(held(at_gen, &lists), Some(at_j1), "time {time}");
@@ -2908,7 +2951,7 @@ fn a_failed_fold_holds_the_posts_and_keeps_the_names_floor_before_that_list() {
     let heads = joins(&gen, &lists, &k);
     let names = lists_of(&heads);
     let from = NamesFrom::Floor(floor);
-    let held = fold_names(&from, &names, &[], heads[2].header(), &knows(T0 + 10)).unwrap();
+    let held = fold_names(&from, &names, heads[2].header(), &knows(T0 + 10)).unwrap();
     assert_eq!(
         held,
         Fold::Hold {
@@ -2930,7 +2973,6 @@ fn a_failed_fold_holds_the_posts_and_keeps_the_names_floor_before_that_list() {
         fold_names(
             &from,
             &[NamesList::of(mixed.header())],
-            &[],
             mixed.header(),
             &knows(T0 + 3)
         ),
@@ -2944,37 +2986,46 @@ fn a_failed_fold_holds_the_posts_and_keeps_the_names_floor_before_that_list() {
     // Failing in the first list it folds keeps the floor where it was.
     let from_a = NamesFrom::Floor(NamesFloor::of(heads[0].header()));
     assert!(matches!(
-        fold_names(&from_a, &names[1..], &[], heads[2].header(), &knows(T0 + 10)),
+        fold_names(&from_a, &names[1..], heads[2].header(), &knows(T0 + 10)),
         Ok(Fold::Hold { floor: Some(f), .. }) if f == NamesFloor::of(heads[0].header())
     ));
-    // An opening header after the list names the guest's seat in `removed`.
+    // An opening header after the list names the guest's seat in `removed`:
+    // its list, `removed` and all, steps the head's `names_hash`.
     let mut out = next(&heads[2], Kind::Fresh, T0 + 60);
     out.removed = Removed::List(vec![guest.seat()]);
     let out = signed(Some(&heads[2]), out, &k);
     assert_eq!(check_link(&heads[2], &out), Ok(vec![]));
-    let taken = fold_names(
-        &from_a,
-        &names[1..],
-        std::slice::from_ref(&out),
-        out.header(),
-        &knows(T0 + 61),
-    );
+    assert_ne!(out.header().names_hash, heads[2].header().names_hash);
+    let with_out = [&names[1..], &[NamesList::of(out.header())]].concat();
+    let taken = fold_names(&from_a, &with_out, out.header(), &knows(T0 + 61));
     assert!(
         matches!(&taken, Ok(Fold::Take { shown, floor, .. })
             if shown.named == vec![c.added(1)] && shown.gone == vec![guest.seat()]
                 && *floor == NamesFloor::of(out.header())),
         "named and gone: {taken:?}"
     );
-    // The removal counts only after the list, at or before the head, in the
-    // head's generation.
+    // The relay cannot leave the removal out, nor add it past the head.
+    assert_eq!(
+        fold_names(&from_a, &names[1..], out.header(), &knows(T0 + 61)),
+        Err(Refusal::Names)
+    );
+    assert_eq!(
+        fold_names(&from_a, &with_out, heads[2].header(), &knows(T0 + 61)),
+        Err(Refusal::Names)
+    );
+    // RV q9-q10:211: a removal off the head's chain counts for nothing. A
+    // sibling opening on the same parent that keeps the seat is the head: the
+    // removal's list steps no hash it carries, so it does not fold, and
+    // without it the fold holds. So does one of another generation, or one a
+    // Regenesis the relay signed itself carries.
+    let quiet_out = signed(Some(&heads[2]), next(&heads[2], Kind::Fresh, T0 + 60), &k);
+    assert_eq!(quiet_out.header().names_hash, heads[2].header().names_hash);
+    assert_eq!(
+        fold_names(&from_a, &with_out, quiet_out.header(), &knows(T0 + 61)),
+        Err(Refusal::Names)
+    );
     assert!(matches!(
-        fold_names(
-            &from_a,
-            &names[1..],
-            std::slice::from_ref(&out),
-            heads[2].header(),
-            &knows(T0 + 61)
-        ),
+        fold_names(&from_a, &names[1..], quiet_out.header(), &knows(T0 + 61)),
         Ok(Fold::Hold { .. })
     ));
     let elsewhere = Group::new(GroupKind::Text, "c:lounge-1", [0x22; 16]).unwrap();
@@ -2982,17 +3033,19 @@ fn a_failed_fold_holds_the_posts_and_keeps_the_names_floor_before_that_list() {
     let mut stray = next(&other_gen, Kind::Fresh, T0 + 60);
     stray.removed = Removed::List(vec![guest.seat()]);
     let stray = signed(Some(&other_gen), stray, &k);
-    let quiet_out = signed(Some(&heads[2]), next(&heads[2], Kind::Fresh, T0 + 60), &k);
-    assert!(matches!(
-        fold_names(
-            &from_a,
-            &names[1..],
-            &[stray],
-            quiet_out.header(),
-            &knows(T0 + 61)
-        ),
-        Ok(Fold::Hold { .. })
-    ));
+    let relay = Party::new(acct(0x52));
+    let mut made_up = next(&heads[2], Kind::Regenesis, T0 + 60);
+    made_up.keyholders = vec![relay.entry()];
+    made_up.signer = relay.m;
+    made_up.removed = Removed::List(vec![guest.seat()]);
+    let made_up = signed(Some(&heads[2]), made_up, &relay);
+    for r in [&stray, &made_up] {
+        let lists = [&names[1..], &[NamesList::of(r.header())]].concat();
+        assert_eq!(
+            fold_names(&from_a, &lists, quiet_out.header(), &knows(T0 + 61)),
+            Err(Refusal::Names)
+        );
+    }
     // An opening header that named the seat before the list seated it
     // removes nothing the list put there.
     let mut early = next(&gen, Kind::Fresh, T0 + 60);
@@ -3003,7 +3056,23 @@ fn a_failed_fold_holds_the_posts_and_keeps_the_names_floor_before_that_list() {
         fold_names(
             &NamesFrom::Floor(NamesFloor::of(early.header())),
             &[NamesList::of(late_join.header())],
-            std::slice::from_ref(&early),
+            late_join.header(),
+            &knows(T0 + 63)
+        ),
+        Ok(Fold::Hold {
+            why: Held::Guest(_),
+            ..
+        })
+    ));
+    // Nor when its list is in the fold, before the list that seated it: the
+    // chain folds through it, and the entry still holds.
+    assert!(matches!(
+        fold_names(
+            &NamesFrom::Floor(floor),
+            &[
+                NamesList::of(early.header()),
+                NamesList::of(late_join.header())
+            ],
             late_join.header(),
             &knows(T0 + 63)
         ),
@@ -3030,7 +3099,7 @@ fn a_failed_fold_holds_the_posts_and_keeps_the_names_floor_before_that_list() {
             pins,
             ..knows(T0 + 2000)
         };
-        fold_names(&from, &one_list, &[], one[0].header(), &known)
+        fold_names(&from, &one_list, one[0].header(), &known)
     };
     assert!(
         matches!(fold_with(&history), Ok(Fold::Take { .. })),
@@ -3065,7 +3134,7 @@ fn a_failed_fold_holds_the_posts_and_keeps_the_names_floor_before_that_list() {
         ..knows(T0 + 10)
     };
     assert_eq!(
-        fold_names(&from, &one_list, &[], one[0].header(), &known),
+        fold_names(&from, &one_list, one[0].header(), &known),
         Ok(Fold::Hold {
             why: Held::Counter {
                 seat: a.seat(),
@@ -3077,6 +3146,100 @@ fn a_failed_fold_holds_the_posts_and_keeps_the_names_floor_before_that_list() {
             warnings: vec![],
         })
     );
+}
+
+/// RV q9-q10:211: a list that removes seats steps `names_hash` with its
+/// `removed` list after its `added` one, each as the body encodes it, sorted;
+/// one that removes none keeps the digest of its `added` alone; one that only
+/// removes steps the hash too.
+#[test]
+fn a_removed_list_steps_names_hash_after_the_added_one() {
+    let a = Party::new(acct(20)).added(1);
+    let (x, y) = (Party::new(acct(21)).seat(), Party::new(acct(22)).seat());
+    let p = [7; 32];
+    let both = NamesList {
+        time: T0,
+        epoch: 4,
+        join: 0,
+        added: vec![a],
+        removed: vec![y, x],
+    };
+    let mut gone = vec![x, y];
+    gone.sort_by_key(|s| postcard::to_allocvec(s).unwrap());
+    let by_hand: [u8; 32] = sha2::Sha256::new()
+        .chain_update(postcard::to_allocvec(&Added::List(vec![a])).unwrap())
+        .chain_update(postcard::to_allocvec(&Removed::List(gone)).unwrap())
+        .finalize()
+        .into();
+    assert_eq!(both.step_from(&p).list, by_hand);
+    let added_only = NamesList {
+        removed: vec![],
+        ..both.clone()
+    };
+    assert_eq!(added_only.step_from(&p).list, names_list_digest(&[a]));
+    let removed_only = NamesList {
+        added: vec![],
+        ..both.clone()
+    };
+    assert_ne!(names_step(&p, &removed_only), p);
+    assert_ne!(names_step(&p, &removed_only), names_step(&p, &both));
+    let neither = NamesList {
+        removed: vec![],
+        ..removed_only
+    };
+    assert_eq!(names_step(&p, &neither), p);
+}
+
+/// r-hostile:211, the walk: a names floor moved past a removal on one branch
+/// does not fold to the head of a sibling branch that kept the seat, though
+/// no `added` list differs, since the removal stepped the hash; from the
+/// start, that branch holds.
+#[test]
+fn a_names_floor_past_a_removal_does_not_fold_to_a_branch_that_kept_the_seat() {
+    let (g, k) = (text(), Party::new(acct(1)));
+    let gen = signed(None, genesis_of(&k, &g, T0, true), &k);
+    let guest = Party::new(MemberId::Conn(77));
+    let j = join_of(&gen, &[guest.added(0)], T0 + 2, &k);
+    let mut o = next(&j, Kind::Fresh, T0 + 60);
+    o.removed = Removed::List(vec![guest.seat()]);
+    let o = signed(Some(&j), o, &k);
+    let o2 = signed(Some(&j), next(&j, Kind::Fresh, T0 + 61), &k);
+    let h2 = signed(Some(&o2), next(&o2, Kind::Fresh, T0 + 120), &k);
+    let start = NamesFrom::Floor(NamesFloor::of(gen.header()));
+    let past = fold_names(
+        &start,
+        &lists_of(&[j.clone(), o.clone()]),
+        o.header(),
+        &knows(T0 + 61),
+    );
+    let Ok(Fold::Take { floor, shown, .. }) = past else {
+        panic!("{past:?}")
+    };
+    assert_eq!(
+        (floor, shown.gone),
+        (NamesFloor::of(o.header()), vec![guest.seat()])
+    );
+    assert_eq!(
+        fold_names(
+            &NamesFrom::Floor(floor),
+            &lists_of(std::slice::from_ref(&h2)),
+            h2.header(),
+            &knows(T0 + 121)
+        ),
+        Err(Refusal::Names)
+    );
+    assert!(matches!(
+        fold_names(
+            &start,
+            &lists_of(&[j, o2, h2.clone()]),
+            h2.header(),
+            &knows(T0 + 121)
+        ),
+        Ok(Fold::Hold {
+            why: Held::Guest(_),
+            ..
+        })
+    ));
 }
 
 /// Rule 8 at a fold (D6): a writer that folds its own account's old seat
@@ -3105,7 +3268,6 @@ fn a_writers_own_old_seat_from_before_its_rotation_is_not_flagged_and_after_it_i
         fold_names(
             &NamesFrom::Floor(NamesFloor::of(gen.header())),
             &[NamesList::of(head.header())],
-            &[],
             head.header(),
             &known,
         )
@@ -3159,7 +3321,6 @@ fn a_gone_answer_is_taken_only_with_a_step_ninety_days_old_that_folds_to_the_hea
         fold_names(
             &NamesFrom::Gone { floor, step },
             tail,
-            &[],
             newest.header(),
             &knows(now),
         )
@@ -3213,7 +3374,6 @@ fn a_gone_answer_is_taken_only_with_a_step_ninety_days_old_that_folds_to_the_hea
         fold_names(
             &NamesFrom::Gone { floor, step },
             &[NamesList::of(head.header())],
-            &[],
             head.header(),
             &knows(now),
         )
@@ -3232,7 +3392,6 @@ fn a_gone_answer_is_taken_only_with_a_step_ninety_days_old_that_folds_to_the_hea
     let held = fold_names(
         &NamesFrom::Gone { floor, step },
         &[NamesList::of(bad.header())],
-        &[],
         bad.header(),
         &knows(now),
     );
@@ -3437,40 +3596,65 @@ fn a_reversion_with_an_extra_seat_is_refused_by_the_list_digest() {
         Party::new(acct(2)),
         Party::new(acct(3)),
     );
+    let new_key_same_account = Party::new(acct(2));
+    let parties = [&a, &b, &c, &new_key_same_account];
+    let dh = |s: &SeatRef| {
+        let p = parties.iter().find(|p| p.seat() == *s)?;
+        seat_dh(&p.public.dh_bytes())
+    };
     let old = Version { b: 4, v: 40 };
     let list = [a.seat(), b.seat()];
-    let digest = list_digest(&g, old, &list);
+    let digest = list_digest(&g, old, &list, dh).unwrap();
     assert_eq!(
-        digest,
-        list_digest(&g, old, &[b.seat(), a.seat(), a.seat()])
+        Some(digest),
+        list_digest(&g, old, &[b.seat(), a.seat(), a.seat()], dh)
     );
     assert!(
-        check_reversion(&g, old, &digest, &list, &[a.seat()]).is_ok(),
+        check_reversion(&g, old, &digest, &list, dh, &[a.seat()]).is_ok(),
         "a leaver gone"
     );
     assert_eq!(
-        check_reversion(&g, old, &digest, &list, &[a.seat(), c.seat()]).err(),
+        check_reversion(&g, old, &digest, &list, dh, &[a.seat(), c.seat()]).err(),
         Some(GkError::Forged),
         "a seat that was not in the old version"
     );
     // The relay's list with the extra seat slipped into the old version.
     let padded = [a.seat(), b.seat(), c.seat()];
     assert_eq!(
-        check_reversion(&g, old, &digest, &padded, &padded).err(),
+        check_reversion(&g, old, &digest, &padded, dh, &padded).err(),
         Some(GkError::Sealed)
     );
     assert_ne!(
-        digest,
-        list_digest(&g, Version { b: 4, v: 41 }, &list),
+        Some(digest),
+        list_digest(&g, Version { b: 4, v: 41 }, &list, dh),
         "names its version"
     );
-    assert_ne!(digest, list_digest(&voice_named_alike(), old, &list));
-    let new_key_same_account = Party::new(acct(2));
     assert_ne!(
-        digest,
-        list_digest(&g, old, &[a.seat(), new_key_same_account.seat()]),
+        Some(digest),
+        list_digest(&voice_named_alike(), old, &list, dh)
+    );
+    assert_ne!(
+        Some(digest),
+        list_digest(&g, old, &[a.seat(), new_key_same_account.seat()], dh),
         "new seat keys are a new seat"
     );
+    // RV r-keyholders:118: the same seat records with another X25519 key for a seat make
+    // another digest (the key is bound in full, not by its 8-byte tag), and a seat with no
+    // key makes none
+    let theirs = SeatPair::generate().public();
+    let swapped = |s: &SeatRef| {
+        if *s == b.seat() {
+            seat_dh(&theirs.dh_bytes())
+        } else {
+            dh(s)
+        }
+    };
+    assert_ne!(Some(digest), list_digest(&g, old, &list, swapped));
+    assert_eq!(
+        check_reversion(&g, old, &digest, &list, swapped, &[a.seat()]).err(),
+        Some(GkError::Sealed)
+    );
+    assert_eq!(list_digest(&g, old, &list, |_| None), None);
 }
 
 // ── The keyring ───────────────────────────────────────────────────────────
@@ -3509,6 +3693,10 @@ fn case() -> Case {
             ck: Zeroizing::new([7; 32]),
             exits_upto: 5,
             buckets: vec![bucket(1, Pool::Accounts, 62), bucket(5, Pool::Conns, 4)],
+            rolls: SeedRolls {
+                raised: T0 - 3600,
+                removal: true,
+            },
         },
         deltas: vec![
             KeyringDelta {
@@ -3684,6 +3872,98 @@ fn a_keyring_whose_hash_root_seats_position_seeds_or_confirm_do_not_match_its_he
     let mut c = case();
     c.deltas[1].buckets[0].b = 1;
     refused(c, |_| {}, "a Join makes no new version of an old bucket");
+}
+
+/// RV review of the Q2 fix: the rolls a keyring carries are taken only where its head
+/// allows them: a raise no later than the head, a Genesis or Regenesis's own, and a
+/// removal at a KeyholdersRemove that did not raise the seed.
+#[test]
+fn a_keyring_whose_rolls_its_head_cannot_have_is_refused() {
+    let rolls = |raised, removal| {
+        let mut c = case();
+        c.base.rolls = SeedRolls { raised, removal };
+        c
+    };
+    assert!(
+        take_case(rolls(T0, false), |_| {}).is_ok(),
+        "a raise at the head"
+    );
+    assert!(
+        take_case(rolls(T0 + 1, true), |_| {}).is_err(),
+        "a raise after the head"
+    );
+    let k = Party::new(acct(1));
+    let at = |kind: Kind| HeaderV1 {
+        kind,
+        ..genesis_of(&k, &text(), T0, false)
+    };
+    let r = |raised, removal| SeedRolls { raised, removal };
+    for kind in [Kind::Genesis, Kind::Regenesis] {
+        assert!(r(T0, false).fits(&at(kind)), "{kind:?}: its own");
+        assert!(
+            !r(T0 - 1, false).fits(&at(kind)),
+            "{kind:?}: an earlier raise"
+        );
+        assert!(!r(T0, true).fits(&at(kind)), "{kind:?}: a removal");
+    }
+    let remove = at(Kind::KeyholdersRemove);
+    assert!(r(T0 - 1, true).fits(&remove), "a removal");
+    assert!(r(T0, false).fits(&remove), "a removal that raised the seed");
+    assert!(!r(T0 - 1, false).fits(&remove), "a removal dropped");
+    assert!(r(T0 - 1, false).fits(&at(Kind::Fresh)));
+    assert!(!r(T0 + 1, false).fits(&at(Kind::Fresh)));
+}
+
+/// RV review of the Q2 fix: a keyholder that held the parent's keyring takes only rolls
+/// it counted itself: the same raise at the same seed, a removal kept, a raise since no
+/// earlier than its own head and no later than the new one.
+#[test]
+fn a_keyring_carrying_rolls_this_keyholder_did_not_count_is_refused() {
+    let g = text();
+    let k = Party::new(acct(1));
+    let gen = genesis_of(&k, &g, T0, false);
+    let own_d = [0x0d; 32];
+    let own = HeaderV1 {
+        time: T0 + 100,
+        seed: 2,
+        seed_floor: 1,
+        ..gen.clone()
+    };
+    let counted = SeedRolls {
+        raised: T0 + 50,
+        removal: false,
+    };
+    let next = |kind: Kind, seed: u32, time: u64, parent: [u8; 32]| HeaderV1 {
+        kind,
+        seed,
+        seed_floor: 1,
+        time,
+        parent,
+        ..own.clone()
+    };
+    let r = |raised, removal| SeedRolls { raised, removal };
+    // Its parent: exactly `after`, a removal sealed in early allowed
+    let fresh = next(Kind::Fresh, 2, T0 + 200, own_d);
+    assert!(counted.carried(&own, &own_d, r(T0 + 50, false), &fresh));
+    assert!(counted.carried(&own, &own_d, r(T0 + 50, true), &fresh));
+    assert!(!counted.carried(&own, &own_d, r(T0 + 150, false), &fresh));
+    let remove = next(Kind::KeyholdersRemove, 2, T0 + 200, own_d);
+    assert!(counted.carried(&own, &own_d, r(T0 + 50, true), &remove));
+    assert!(!counted.carried(&own, &own_d, r(T0 + 50, false), &remove));
+    let roll = next(Kind::Fresh, 3, T0 + 200, own_d);
+    assert!(counted.carried(&own, &own_d, r(T0 + 200, false), &roll));
+    assert!(!counted.carried(&own, &own_d, r(T0 + 100, false), &roll));
+    // Later at the same seed: the same raise, a removal it counted kept
+    let later = next(Kind::Fresh, 2, T0 + 900, [0x0e; 32]);
+    assert!(counted.carried(&own, &own_d, r(T0 + 50, false), &later));
+    assert!(!counted.carried(&own, &own_d, r(T0 + 800, false), &later));
+    let removed = r(T0 + 50, true);
+    assert!(!removed.carried(&own, &own_d, r(T0 + 50, false), &later));
+    // Later at a new seed: a raise between the two
+    let rolled = next(Kind::Fresh, 3, T0 + 900, [0x0e; 32]);
+    assert!(counted.carried(&own, &own_d, r(T0 + 500, false), &rolled));
+    assert!(!counted.carried(&own, &own_d, r(T0 + 99, false), &rolled));
+    assert!(!counted.carried(&own, &own_d, r(T0 + 901, false), &rolled));
 }
 
 #[test]
@@ -4555,7 +4835,6 @@ fn turning_gated_on_or_a_genesis_starts_the_names_fold_afresh() {
             fold_names(
                 &from,
                 &[NamesList::of(on.header())],
-                &[],
                 on.header(),
                 &knows(T0 + 60)
             ),
@@ -5434,8 +5713,9 @@ fn a_keyholders_replace_swaps_exactly_its_signers_entry_for_a_newer_pair() {
     let _ = k1_new;
 }
 
-/// §4.3: a KeyholdersReplace never starts or finishes a roll; and it makes
-/// the rows a Fresh makes, never a ratchet.
+/// §4.3: a KeyholdersReplace never starts a roll, and in a text group may
+/// finish one (the validator lets it only past the roll's 24 h, §5.6); and it
+/// makes the rows a Fresh makes, never a ratchet.
 #[test]
 fn a_keyholders_replace_keeps_the_seed_and_makes_rows_only_as_a_fresh_would() {
     let (k1, _, _, add, h) = replace_case();
@@ -5453,7 +5733,7 @@ fn a_keyholders_replace_keeps_the_seed_and_makes_rows_only_as_a_fresh_would() {
         Err(Refusal::Chain("the seed does not follow")),
         "starts a roll"
     );
-    // Over a roll that runs: neither finished nor started anew.
+    // Over a roll that runs: never started anew; finished, structurally.
     let (k1, k2) = (k1, Party::new(acct(2)));
     let g = text();
     let gen = signed(None, genesis_of(&k1, &g, T0, false), &k1);
@@ -5471,7 +5751,8 @@ fn a_keyholders_replace_keeps_the_seed_and_makes_rows_only_as_a_fresh_would() {
     };
     let _ = k2;
     assert!(check_link(&started, &signed(Some(&started), replace_at(2, 1), &k1)).is_ok());
-    for (s, f) in [(2, 2), (3, 2)] {
+    assert!(check_link(&started, &signed(Some(&started), replace_at(2, 2), &k1)).is_ok());
+    for (s, f) in [(3, 2), (3, 3)] {
         assert_eq!(
             check_link(&started, &signed(Some(&started), replace_at(s, f), &k1)),
             Err(Refusal::Chain("the seed does not follow")),
@@ -5573,6 +5854,10 @@ fn a_swap_from_a_device_without_the_old_pair_is_refused_by_the_other_keyholders(
             ck: Zeroizing::new([7; 32]),
             exits_upto: 0,
             buckets: vec![],
+            rolls: SeedRolls {
+                raised: T0,
+                removal: false,
+            },
         },
         buckets: vec![bucket(1, Pool::Accounts, 3), bucket(2, Pool::Accounts, 4)],
     };
@@ -5701,7 +5986,8 @@ fn a_roll_starts_and_finishes_only_at_the_kinds_that_may_in_text_and_in_voice() 
             (KeyholdersAdd, !voice, true, true),
             (KeyholdersRemove, true, !voice, !voice),
             (Join, false, false, true),
-            (KeyholdersReplace, false, false, true),
+            // A Replace finishes a text roll only past its 24 h, which the validator checks
+            (KeyholdersReplace, false, !voice, true),
         ] {
             assert_eq!(ok(kind, 3, 2), start, "{kind:?} starts in {g:?}");
             assert_eq!(ok(kind, 2, 2), finish, "{kind:?} finishes in {g:?}");

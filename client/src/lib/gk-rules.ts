@@ -173,6 +173,19 @@ const WARNINGS: Record<string, (place: string, n: number) => string> = {
   gated_opened: (p) => `${p} was closed to listed readers and is now open.`,
 };
 
+/**
+ * A warning for a channel this server no longer lists (left, removed, or delisted): no chat
+ * shows its lines, so it goes up on its own (RV q4-q5:1782). Null for a kind this build does
+ * not know.
+ */
+export function unlistedLine(w: GkWarning): string | null {
+  const place = "a channel you no longer have";
+  if (w.kind === "unnamed_seats") {
+    return `This device gave the keys of ${place} to ${w.n} ${w.n === 1 ? "person" : "people"} the server then did not list.`;
+  }
+  return WARNINGS[w.kind]?.(place, w.n) ?? null;
+}
+
 /** What becomes of our posts here, if anything is to be said: one line at most. */
 function postLine(place: string, ch: GkChannel): GkLine | null {
   const s = ch.state;

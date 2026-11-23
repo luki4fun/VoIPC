@@ -28,10 +28,10 @@ use super::header::{
 };
 use super::keyring::{keyring_hash_next, keyring_hash_start};
 use super::keys::{tag, Endorsement, Origin, SeatPublic};
-use super::merkle::{list_digest, seat_record, Leaf, Pool, Via, BUCKET_SEATS};
+use super::merkle::{list_digest, seat_dh, seat_record, Leaf, Pool, Via, BUCKET_SEATS};
 use super::rules::{
-    check_form, check_gated, check_keyholder_change, check_link, check_link_under, check_roll,
-    check_signer, check_time, check_versions, check_voice_keyholders, regenesis_wait,
+    behind_ok, check_form, check_gated, check_keyholder_change, check_link, check_link_under,
+    check_roll, check_signer, check_time, check_versions, check_voice_keyholders, regenesis_wait,
     replaced_entry, row_seed, Refusal, RowSeed, SeedRolls,
 };
 use super::timers::{COMMIT_MAX_BYTES, JOIN_BATCH_MAX, MAX_GUEST_KEYHOLDERS, REFRESH_SLICE};
@@ -307,6 +307,9 @@ pub struct GroupView<'a> {
     pub head: Option<HeadView<'a>>,
     /// The head's versions with their lists, sorted by `b`.
     pub leaves: &'a [Listed],
+    /// `ser(SX)` of each seat the relay holds, as it serves it in `EpochLists`: what the list
+    /// digests of the versions a commit makes bind (§11.5). A due's joiners come with theirs.
+    pub dh: &'a dyn Fn(&SeatRef) -> Option<[u8; 33]>,
     /// The newest seed each seated seat holds, as of when the due was
     /// asked (a seed welcome stored meanwhile does not fail the commit).
     pub held: &'a dyn Fn(&SeatRef) -> Option<u32>,
@@ -323,8 +326,9 @@ pub struct GroupView<'a> {
     pub now: u64,
     /// Voice: the user ids in the room.
     pub roster: &'a [u32],
-    /// Since when no keyholder has been online: a Regenesis waits an hour, or 2 minutes
-    /// after a set of connection entries alone (`rules::regenesis_wait`).
+    /// Since when no keyholder has been online: a Regenesis waits an hour, or nothing (only
+    /// that none is online) after a set of connection entries alone
+    /// (`rules::regenesis_wait`).
     pub no_keyholder_since: Option<u64>,
 }
 
@@ -611,7 +615,8 @@ pub fn validate(view: &GroupView, c: &Commit) -> Result<Applied, Bad> {
     } else if let Some(hv) = head {
         // A Regenesis waits what the head's set allows ("Fast new start",
         // `regenesis_wait`): after the parent's `time`, as members check it
-        // (`check_link_under`), and with no keyholder online that long
+        // (`check_link_under`), and with no keyholder online that long (under a set of
+        // connection entries alone, no wait: only none online)
         if h.kind == Kind::Regenesis {
             check_link_under(hv.head, &sh, hv.kh).map_err(link_refusal)?;
             let wait = regenesis_wait(hv.kh.header(), h.time);
@@ -625,7 +630,7 @@ pub fn validate(view: &GroupView, c: &Commit) -> Result<Applied, Bad> {
                     if hour {
                         "a Regenesis only after an hour with no keyholder online"
                     } else {
-                        "a Regenesis only after two minutes with no keyholder online"
+                        "a Regenesis only with no keyholder online"
                     },
                 );
             }
@@ -701,12 +706,20 @@ pub fn validate(view: &GroupView, c: &Commit) -> Result<Applied, Bad> {
             return bad(8, "a drop of a bucket not current, or twice");
         }
     }
+    // Each seat's X25519 key, which every list digest binds (§11.5): a joiner's from its
+    // endorsed keys, any other's as the relay keeps and serves it
+    let joiner_dh: HashMap<SeatRef, [u8; 33]> = due
+        .joiners
+        .iter()
+        .filter_map(|j| Some((j.seat, seat_dh(&j.keys.dh_bytes())?)))
+        .collect();
+    let dh_of = |s: &SeatRef| joiner_dh.get(s).copied().or_else(|| (view.dh)(s));
     let mut made: Vec<Listed> = Vec::with_capacity(c.versions.len());
     for vo in &c.versions {
         if !touched.insert(vo.b) {
             return bad(8, "one bucket twice");
         }
-        made.push(make_version(&g, &by_b, &in_use, vo)?);
+        made.push(make_version(&g, &by_b, &in_use, vo, &dh_of)?);
     }
     let mut after: Vec<(Leaf, &[SeatRef])> = before
         .iter()
@@ -917,6 +930,8 @@ pub fn validate(view: &GroupView, c: &Commit) -> Result<Applied, Bad> {
             (view.held)(s).unwrap_or(0)
         }
     };
+    // A text roll ends at the first opening 24 h after its start (§5.6, RV q1-q2:1210)
+    let ends = ph.is_some_and(|p| h.kind.opens_epoch() && !anew && view.rolls.ends(p, h.time));
     if let Some(p) = ph {
         check_roll(view.rolls, p, h).map_err(|r| refused(12, r))?;
         let started = h.seed > p.seed;
@@ -924,9 +939,18 @@ pub fn validate(view: &GroupView, c: &Commit) -> Result<Applied, Bad> {
         if text_start && p.seed_floor != p.seed {
             return bad(12, "a text roll never starts over a running one");
         }
+        if ends && h.seed_floor < h.seed {
+            return bad(12, "a text seed roll runs past its 24 h");
+        }
+        if h.kind == Kind::KeyholdersReplace && h.seed_floor > p.seed_floor && !ends {
+            return bad(12, "a KeyholdersReplace ends only a roll past its 24 h");
+        }
         if !anew && h.seed_floor > p.seed_floor {
             for (_, list) in &after {
-                if list.iter().any(|s| held_now(s) < h.seed_floor) {
+                if list.iter().any(|s| {
+                    let n = held_now(s);
+                    n < h.seed_floor && !behind_ok(p, n, ends)
+                }) {
                     return if started {
                         bad(13, "a seat on a dropped seed has no seed welcome")
                     } else {
@@ -938,6 +962,7 @@ pub fn validate(view: &GroupView, c: &Commit) -> Result<Applied, Bad> {
     }
 
     // 13: material.
+    let behind = |n: u32| ph.is_some_and(|p| behind_ok(p, n, ends));
     check_material(
         view,
         c,
@@ -947,6 +972,7 @@ pub fn validate(view: &GroupView, c: &Commit) -> Result<Applied, Bad> {
         &placed,
         &joiners,
         &exit_seats,
+        &behind,
     )?;
 
     // 14: the keyring.
@@ -1035,6 +1061,7 @@ fn make_version(
     by_b: &HashMap<u64, &Listed>,
     in_use: &HashSet<u64>,
     vo: &VersionOut,
+    dh: &dyn Fn(&SeatRef) -> Option<[u8; 33]>,
 ) -> Result<Listed, Bad> {
     let current = |from_v: u64| -> Result<&Listed, Bad> {
         match by_b.get(&vo.b) {
@@ -1079,13 +1106,17 @@ fn make_version(
         return bad(8, "accounts and connections share a bucket");
     }
     let at = Version { b: vo.b, v: vo.v };
+    // A seat the relay holds no key for hashes as 33 zero bytes: its leaf is not the
+    // builder's, so rule 9's bucket root refuses the commit
+    let list = list_digest(g, at, &seats, |s| Some(dh(s).unwrap_or([0; 33])))
+        .expect("every seat has a key");
     Ok(Listed {
         leaf: Leaf {
             b: vo.b,
             v: vo.v,
             pool: vo.pool,
             seats: seats.len() as u16,
-            list: list_digest(g, at, &seats),
+            list,
             via,
         },
         seats,
@@ -1172,6 +1203,7 @@ fn check_material(
     placed: &HashMap<SeatRef, Version>,
     joiners: &HashMap<SeatRef, &Joiner>,
     exit_seats: &HashSet<SeatRef>,
+    behind: &dyn Fn(u32) -> bool,
 ) -> Result<(), Bad> {
     let is_new = |s: &SeatRef| joiners.contains_key(s) && placed.contains_key(s);
     let join_like = h.kind == Kind::Join || h.kind.starts_anew();
@@ -1223,7 +1255,8 @@ fn check_material(
     }
 
     // Rows: one packed set per version re-keyed by rows, each row under the
-    // seed its seat holds (or the new one, for a seat welcomed here).
+    // seed its seat holds (or the new one, for a seat welcomed here, and for a
+    // text seat left behind a roll that ended at its 24 h, `behind_ok`).
     let needs_rows = |m: &Listed| match m.leaf.via {
         Via::Ratchet { .. } => false,
         Via::Row if join_like => {
@@ -1252,8 +1285,9 @@ fn check_material(
             let want = if is_new(s) || seed_welcomed.contains(s) {
                 h.seed
             } else {
-                match (view.held)(s).map(|held| row_seed(held, h)) {
-                    Some(RowSeed::Row(x)) => x,
+                match (view.held)(s).map(|held| (held, row_seed(held, h))) {
+                    Some((_, RowSeed::Row(x))) => x,
+                    Some((held, RowSeed::WelcomeFirst(x))) if behind(held) => x,
                     _ => return bad(13, "a row before the seat's seed welcome"),
                 }
             };
@@ -1596,9 +1630,9 @@ mod tests {
         assert_eq!(rule(w.check(&due, vol.by(), &b.commit)), 0);
     }
 
-    /// "Fast new start" (owner, 2026-11-19), written out in seconds so the old rule (an hour
-    /// whatever the set) fails it.
-    const FAST: u64 = 2 * 60;
+    /// "Fast new start" (owner, 2026-11-19), at once (J10-B option A, owner 2026-11-22): its
+    /// wait written out in seconds, none, so the hour and the old 2 minutes both fail it.
+    const FAST: u64 = 0;
 
     fn regenesis_due(w: &World, vol: &Holder) -> Due {
         Due {
@@ -1616,39 +1650,45 @@ mod tests {
         Some(crate::group_key::build::BuildError::Refuse(why))
     }
 
-    const SOON: &str = r#"Generation("a Regenesis comes two minutes after its parent")"#;
+    const SOON: &str = r#"Generation("a Regenesis is earlier than its parent")"#;
     const HOUR: &str = r#"Generation("a Regenesis comes an hour after its parent")"#;
 
     /// Under a set of connection entries alone (a browser's or a guest's pair) the volunteer
-    /// builds a Regenesis 2 minutes after its parent and the relay takes it once no keyholder
-    /// was online that long; neither a second sooner.
+    /// builds a Regenesis at once after its parent, and the relay takes it as soon as no
+    /// keyholder is online (J10-B option A, owner 2026-11-22). A volunteer whose clock is behind
+    /// the parent's dates it at its parent's time; one dated before its parent is refused.
     #[test]
-    fn a_regenesis_over_connection_entries_alone_is_built_and_taken_two_minutes_on() {
+    fn a_regenesis_over_connection_entries_alone_is_built_and_taken_at_once() {
         let mut w = World::start(GroupKind::Text, TEXT_ID, true, false, Holder::conn(3));
         w.join(&refs(&accounts(10, 5)));
         let vol = Holder::conn(9);
         let due = regenesis_due(&w, &vol);
         let head = w.head.clone();
+        let p_time = head.header().time;
         let start =
             |w: &World| World::build_start(&vol, w.kind, w.id, true, &due, w.now, Some(&head));
-        w.now = head.header().time + FAST - 1;
-        assert_eq!(
-            start(&w).err(),
-            refuse("a Regenesis waits two minutes after its parent")
-        );
-        w.now += 1;
+        let time_of = |c: &Commit| {
+            SignedHeader::decode(&c.body, &c.sig, GroupKind::Text, TEXT_ID)
+                .unwrap()
+                .header()
+                .time
+        };
+        w.now = p_time - 1;
+        let lags = start(&w).unwrap();
+        assert_eq!(time_of(&lags.commit), p_time, "dated at its parent's time");
+        w.now = p_time + FAST;
         let b = start(&w).unwrap();
-        w.no_keyholder_since = Some(w.now - FAST + 1);
-        assert_eq!(
-            rule_detail(w.check(&due, vol.by(), &b.commit)),
-            Some((
-                4,
-                "a Regenesis only after two minutes with no keyholder online".into()
-            ))
-        );
+        assert_eq!(time_of(&b.commit), p_time);
+        // Taken only with no keyholder online, and from the moment none is
+        let none_online = Some((4, "a Regenesis only with no keyholder online".into()));
+        w.no_keyholder_since = None;
+        assert_eq!(rule_detail(w.check(&due, vol.by(), &b.commit)), none_online);
+        w.no_keyholder_since = Some(w.now + 1);
+        assert_eq!(rule_detail(w.check(&due, vol.by(), &b.commit)), none_online);
         w.no_keyholder_since = Some(w.now - FAST);
         assert_eq!(rule(w.check(&due, vol.by(), &b.commit)), 0);
-        // Dated a second sooner (a volunteer whose clock lags): refused, as members refuse it
+        // Dated a second before its parent (a volunteer whose clock lags): refused, as members
+        // refuse it
         let mut early = b.commit.clone();
         resign(&w, &mut early, &vol, |h| h.time -= 1);
         assert_eq!(
@@ -1705,7 +1745,7 @@ mod tests {
     }
 
     /// The churn bound at the relay: the set a Regenesis started keeps the hour for an hour
-    /// after it, whatever head the next one is built on; then 2 minutes again.
+    /// after it, whatever head the next one is built on; then at once again.
     #[test]
     fn a_set_a_regenesis_started_is_started_anew_again_only_an_hour_on() {
         let mut w = World::start(GroupKind::Text, TEXT_ID, true, false, Holder::conn(3));
@@ -1740,7 +1780,7 @@ mod tests {
             rule_detail(w.check(&due, vol2.by(), &b.commit)),
             Some((4, HOUR.into()))
         );
-        // An hour after the first, 2 minutes after its parent and with nobody online: taken
+        // An hour after the first, after its parent and with nobody online: taken
         w.now = r1 + REGENESIS_WAIT;
         assert!(w.now >= head.header().time + FAST);
         let b = World::build_start(&vol2, w.kind, w.id, true, &due, w.now, Some(&head)).unwrap();
@@ -1748,9 +1788,9 @@ mod tests {
         assert_eq!(rule(w.check(&due, vol2.by(), &b.commit)), 0);
     }
 
-    /// A volunteer that dates its Regenesis back to its parent's 2 minutes would start the
-    /// churn hour (`REGENESIS_FAST_GAP`) from then, and the next fast new start could come
-    /// minutes on: the relay takes a Regenesis dated at most `CLOCK_SLACK` back (J9 review).
+    /// A volunteer that dates its Regenesis back to its parent's time would start the churn
+    /// hour (`REGENESIS_FAST_GAP`) from then, and the next fast new start could come minutes
+    /// on: the relay takes a Regenesis dated at most `CLOCK_SLACK` back (J9 review).
     #[test]
     fn a_regenesis_dated_further_back_than_the_clock_slack_is_refused() {
         let mut w = World::start(GroupKind::Text, TEXT_ID, true, false, Holder::conn(3));
@@ -2215,15 +2255,16 @@ mod tests {
             "seed_floor raised before every seat holds it"
         );
 
-        // A text roll never starts over a running one.
+        // A text roll never starts over a running one: past its 24 h the builder ends
+        // it instead (§5.6), and the roll this removal makes due starts at the next opening.
         w.promote(Holder::desktop(3));
         w.tick(25 * 3600);
         let due = w.remove_due(1);
         let b = w.opening(&due).unwrap();
         assert_eq!(
-            b.header.header().seed,
-            2,
-            "the builder leaves the running roll be"
+            (b.header.header().seed, b.header.header().seed_floor),
+            (2, 2),
+            "the builder ends the running roll and starts none over it"
         );
         assert_eq!(rule(w.check(&due, by, &b.commit)), 0);
         let mut c = b.commit.clone();
@@ -2234,14 +2275,11 @@ mod tests {
         assert_eq!(rule(w.check(&due, by, &c)), 12);
         w.step(&due, &b);
         w.holders.remove(1);
-
-        // Once every seat holds it, the roll finishes.
-        w.welcome_every_seat();
         let due = w.due(DueKind::Exits);
-        let b = w.opening_by(0, &due, true, None, None).unwrap();
+        let b = w.opening(&due).unwrap();
         assert_eq!(
             (b.header.header().seed, b.header.header().seed_floor),
-            (2, 2)
+            (3, 2)
         );
         assert_eq!(rule(w.check(&due, by, &b.commit)), 0);
     }
@@ -3045,7 +3083,8 @@ mod tests {
         w.promote(Holder::desktop(3));
         w.tick(25 * 3600);
         w.remove(1);
-        w.tick(25 * 3600);
+        // Within its 24 h (§5.6) the running roll keeps its floor
+        w.tick(23 * 3600);
         let due = w.remove_due(1);
         let b = w.opening(&due).unwrap();
         assert_eq!(
@@ -3057,6 +3096,13 @@ mod tests {
         let mut c = b.commit.clone();
         resign(&w, &mut c, &w.holders[0], |h| h.seed_floor = 2);
         assert_eq!(rule(w.check(&due, by, &c)), 12);
+        // Past them it ends there, and a start over it stays refused
+        w.tick(3600);
+        let b = w.opening(&due).unwrap();
+        assert_eq!(
+            (b.header.header().seed, b.header.header().seed_floor),
+            (2, 2)
+        );
         let mut c = b.commit.clone();
         resign(&w, &mut c, &w.holders[0], |h| {
             h.seed = 3;
@@ -3065,6 +3111,63 @@ mod tests {
         assert_eq!(
             detail(w.check(&due, by, &c)),
             "a text roll never starts over a running one"
+        );
+    }
+
+    /// §5.6, RV q1-q2:1210: the validator lets no text roll run past its 24 h. A keyholder
+    /// that counts the roll from later leaves it open there, and is refused; within the 24
+    /// h a floor rise past seats still behind stays refused, and so does a Replace's.
+    #[test]
+    fn a_text_opening_that_leaves_a_roll_open_past_its_24_h_is_refused() {
+        let mut w = World::text(true, false);
+        w.seed_keys = false;
+        w.join(&refs(&accounts(10, 5)));
+        let by = w.holders[0].by();
+        w.promote(Holder::desktop(2));
+        w.tick(25 * 3600);
+        w.remove(1);
+        let started = w.head.header().time;
+
+        w.now = started + crate::group_key::ROLL_GAP - 60;
+        let due = w.due(DueKind::Refresh);
+        let b = w.opening(&due).unwrap();
+        assert_eq!(rule(w.check(&due, by, &b.commit)), 0);
+        let mut c = b.commit.clone();
+        resign(&w, &mut c, &w.holders[0], |h| h.seed_floor = 2);
+        assert_eq!(
+            detail(w.check(&due, by, &c)),
+            "seed_floor rises before every seat holds the seed",
+            "in time"
+        );
+        let new = w.holders[0].rotated();
+        let rd = w.replace_due(&new);
+        let r = w.opening_by(0, &rd, false, Some(&new), None).unwrap();
+        let mut c = r.commit.clone();
+        resign(&w, &mut c, &w.holders[0], |h| h.seed_floor = 2);
+        assert_eq!(rule(w.check(&rd, by, &c)), 12, "a Replace in time");
+
+        w.now = started + crate::group_key::ROLL_GAP;
+        let truth = w.rolls;
+        w.rolls.raised = w.now;
+        let late = w.opening(&due).unwrap();
+        w.rolls = truth;
+        assert_eq!(
+            (late.header.header().seed, late.header.header().seed_floor),
+            (2, 1)
+        );
+        assert_eq!(
+            detail(w.check(&due, by, &late.commit)),
+            "a text seed roll runs past its 24 h"
+        );
+        let b = w.opening(&due).unwrap();
+        assert_eq!(rule(w.check(&due, by, &b.commit)), 0, "the roll ends");
+        assert_eq!(
+            b.ring.base.rolls,
+            SeedRolls {
+                raised: started,
+                removal: false
+            },
+            "the keyring carries the roll's start on"
         );
     }
 

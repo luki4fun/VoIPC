@@ -429,6 +429,11 @@ impl Room {
             stored: self.stored,
             head,
             leaves: &self.leaves,
+            dh: &|s| {
+                self.seats
+                    .get(s)
+                    .and_then(|x| x.pair.dh[..].try_into().ok())
+            },
             held: &held,
             due,
             by,

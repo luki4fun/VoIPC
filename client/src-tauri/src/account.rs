@@ -742,6 +742,7 @@ async fn choose<S: AsyncWrite + Unpin>(
                 return machine.provider_claim();
             }
             ProviderAnswer::Pair => {
+                voipc_crypto::pair::pairs_on(proto)?;
                 write(send, &machine.pair_start()?, proto).await?;
                 return Ok(Vec::new());
             }

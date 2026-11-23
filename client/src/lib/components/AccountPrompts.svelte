@@ -410,6 +410,14 @@
       // A vault item this device will not use as the server holds it (and so
       // never saves over this session).
       listenServer<{ item: string; problem: string }>("vault-problem", (server, d) => {
+        if (d.problem === "replaced") {
+          addNotification(
+            `${fromServer(server)}Security warning: another device published group keys for your account that your vault does not hold. Someone may have your account's keys: change your password, which signs out your other devices. If your account has no password (you sign in with a provider), ask the server's admin to reset your two-factor codes, which removes your remembered devices and signs you out. This device publishes new keys of its own.`,
+            "error",
+            0,
+          );
+          return;
+        }
         if (d.problem === "withheld") {
           addNotification(
             `${fromServer(server)}Security warning: the server has not handed over the list of people's keys that you pinned. Until it does, direct messages, calls and history wait, and it may be keeping that list back on purpose.`,

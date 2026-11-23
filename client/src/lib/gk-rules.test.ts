@@ -13,6 +13,7 @@ import {
   withReaders,
   withState,
   withWarning,
+  unlistedLine,
   type GkChannel,
   type GkState,
 } from "./gk-rules.ts";
@@ -119,6 +120,20 @@ test("each warning kind has its line, and a kind this build does not know says n
   assert.equal(warned("leaver_may_hear")[0].line, "Someone who left may still hear this room.");
   assert.equal(warned("gated_opened")[0].line, "#general was closed to listed readers and is now open.");
   assert.deepEqual(warned("from_a_later_build"), []);
+});
+
+test("a warning for a channel no longer listed is said on its own, without the channel's name", () => {
+  // RV q4-q5:1782: a channel left, removed or delisted shows its lines in no chat
+  assert.equal(
+    unlistedLine({ channel_id: 7, kind: "unnamed_seats", n: 2 }),
+    "This device gave the keys of a channel you no longer have to 2 people the server then did not list.",
+  );
+  assert.equal(
+    unlistedLine({ channel_id: 7, kind: "unnamed_seats", n: 1 }),
+    "This device gave the keys of a channel you no longer have to 1 person the server then did not list.",
+  );
+  assert.equal(unlistedLine({ channel_id: 7, kind: "old_seat_key", n: 0 }), "An old key of your account was listed in a channel you no longer have.");
+  assert.equal(unlistedLine({ channel_id: 7, kind: "from_a_later_build", n: 0 }), null);
 });
 
 test("a warning of a kind already shown replaces it, and goes when waved off", () => {

@@ -265,7 +265,9 @@ impl TryFrom<Path> for gk::PathIn {
 
 impl TryFrom<&gk::NamesListIn> for NamesList {
     type Error = Bad;
-    /// `added` is the postcard of the list and nothing after it, at most `MAX_ADDED`.
+    /// `added` is the postcard of the list and nothing after it, at most `MAX_ADDED`;
+    /// `removed` is empty, or the postcard of its list and nothing after it, at most
+    /// `MAX_REMOVED`.
     fn try_from(l: &gk::NamesListIn) -> Result<NamesList, Bad> {
         gk::names_added_count(&l.added)?;
         let (added, rest) = postcard::take_from_bytes::<Vec<AddedSeat>>(&l.added)
@@ -273,22 +275,41 @@ impl TryFrom<&gk::NamesListIn> for NamesList {
         if !rest.is_empty() {
             return Err(Bad::Value("names list"));
         }
+        let removed = if l.removed.is_empty() {
+            vec![]
+        } else {
+            gk::names_removed_count(&l.removed)?;
+            let (removed, rest) = postcard::take_from_bytes::<Vec<SeatRef>>(&l.removed)
+                .map_err(|_| Bad::Value("names removed"))?;
+            if !rest.is_empty() {
+                return Err(Bad::Value("names removed"));
+            }
+            removed
+        };
         Ok(NamesList {
             time: l.time,
             epoch: l.epoch,
             join: l.join,
             added,
+            removed,
         })
     }
 }
 
 impl From<&NamesList> for gk::NamesListIn {
+    /// Both lists: a `removed` one steps `names_hash` too, so it goes with its place (empty
+    /// for a list that removes nobody).
     fn from(l: &NamesList) -> gk::NamesListIn {
         gk::NamesListIn {
             time: l.time,
             epoch: l.epoch,
             join: l.join,
             added: postcard::to_allocvec(&l.added).expect("a names list encodes"),
+            removed: if l.removed.is_empty() {
+                vec![]
+            } else {
+                postcard::to_allocvec(&l.removed).expect("a names list encodes")
+            },
         }
     }
 }
@@ -659,15 +680,35 @@ mod tests {
             added: (1..=3)
                 .map(|i| Member::numbered(i).joiner().added())
                 .collect(),
+            removed: vec![],
         };
         let wire = gk::NamesListIn::from(&list);
         wire.check().unwrap();
         assert_eq!(NamesList::try_from(&wire).unwrap(), list);
+        assert!(wire.removed.is_empty(), "a list that removes nobody");
         let mut longer = wire.clone();
         longer.added.push(0);
         assert!(NamesList::try_from(&longer).is_err());
         let step = list.step_from(&[9; 32]);
         assert_eq!(NamesStep::from(gk::NamesStepIn::from(&step)), step);
+        // An opening's, `removed` and all: what `names_hash` steps with
+        let gone = NamesList {
+            time: 6,
+            epoch: 3,
+            join: 0,
+            added: vec![],
+            removed: (4..=5).map(|i| Member::numbered(i).seat).collect(),
+        };
+        let wire = gk::NamesListIn::from(&gone);
+        wire.check().unwrap();
+        assert_eq!(gk::names_removed_count(&wire.removed), Ok(2));
+        assert_eq!(NamesList::try_from(&wire).unwrap(), gone);
+        let mut longer = wire.clone();
+        longer.removed.push(0);
+        assert!(NamesList::try_from(&longer).is_err());
+        let mut cut = wire;
+        cut.removed.pop();
+        assert!(NamesList::try_from(&cut).is_err());
     }
 
     /// The relay and the app name a post by these bytes: pinned, so neither side moves alone.

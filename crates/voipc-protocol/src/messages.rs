@@ -519,13 +519,12 @@ pub enum ClientMessage {
         epoch: u32,
         writer: GkWriter,
     },
-    /// The gated `added` lists between two headers, and with `removals` the opening
-    /// headers between that carry `removed` lists: `EpochNamesIn` answers.
+    /// The gated lists between two headers (each Join's `added`, each opening's that
+    /// removes seats with its `removed`): `EpochNamesIn` answers.
     EpochNames {
         group: String,
         from: NamesRef,
         to: NamesRef,
-        removals: bool,
     },
     /// A header past the relay's head, which this member holds.
     EpochFloorAhead { group: String, header: HeaderIn },
@@ -1032,6 +1031,14 @@ pub enum AccountRequest {
         sk: [u8; 8],
         sx: [u8; 8],
         after: Option<Vec<u8>>,
+    },
+    /// This account's Kyber1024 kept key (`item.kept`, 1569 bytes) and its identity's
+    /// signature over it, after the vault save settled: what a sharer seals a newcomer's row
+    /// of a gk chain's start to. `KeptKemStored` answers. The relay sends what it holds of
+    /// these as `KeptKems` right before every `LogKeysFound`.
+    KeptKemPublish {
+        kem: Vec<u8>,
+        sig: Vec<u8>,
     },
 }
 
@@ -1674,6 +1681,15 @@ pub enum AccountReply {
     SeatKeysStored {
         n: u32,
     },
+    /// `SeatKeysPublish` refused: the relay holds other seat keys of this account, `held` as
+    /// they were published (origin 0x01, endorsed by the account's identity), at a counter at
+    /// or above the one offered. Another device's rotation, or keys a holder of the account's
+    /// identity key published that its vault does not hold: the app checks the endorsement
+    /// and its vault, and goes above `held.n` if they are not the account's there. A relay
+    /// cannot name a counter the account's identity never endorsed.
+    SeatKeysBehind {
+        held: EndorsedPair,
+    },
     /// `SelfRowPut` held.
     SelfRowsStored {
         count: u32,
@@ -1692,6 +1708,13 @@ pub enum AccountReply {
     RowMakers {
         makers: Vec<RowMaker>,
         next: Option<Vec<u8>>,
+    },
+    /// `KeptKemPublish` held.
+    KeptKemStored,
+    /// The kept keys of the accounts a `LogKeys` named, for those that have one, sent right
+    /// before its `LogKeysFound` (in pages, at most `KEPT_KEMS_PER_REPLY` each).
+    KeptKems {
+        keys: Vec<KeptKemInfo>,
     },
 }
 
@@ -1982,6 +2005,18 @@ pub struct WrapOut {
     pub epoch: u32,
     pub wrapped: Vec<u8>,
 }
+
+/// An account's Kyber1024 kept key as the relay has it; the client checks the signature
+/// against the identity it pinned for `account` before sealing anything to it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeptKemInfo {
+    pub account: [u8; 16],
+    pub kem: Vec<u8>,
+    pub sig: Vec<u8>,
+}
+
+/// Most `KeptKemInfo` in one `KeptKems` (about 1.65 KB each), under a frame.
+pub const KEPT_KEMS_PER_REPLY: usize = 24;
 
 /// An account's keys as the relay has them; the client checks the
 /// signature against the identity it pinned before using `logkey`.

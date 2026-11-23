@@ -70,6 +70,9 @@ pub const MAX_JOINERS: usize = 256;
 pub const BUCKET_SEATS: usize = 62;
 /// Keyholder entries in one set (§4.2), and so `KRK` welcomes in one commit.
 pub const MAX_KEYHOLDERS: usize = 8;
+/// `InPiece.kh_before` at most: the keyholder headers before the floor's `kh` a member
+/// keeps and the relay sends (RV).
+pub const KH_BEFORE_MOST: usize = 8;
 /// `removed` entries in a gated header (§5.4).
 pub const MAX_REMOVED: usize = 768;
 /// `added` entries in a gated header, and so in one `NamesListIn` (§11.3).
@@ -78,6 +81,10 @@ pub const MAX_ADDED: usize = 256;
 pub const ADDED_SEAT_MAX_BYTES: usize = 17 + 32 + 8 + 8 + 5 + 10;
 /// `NamesListIn.added` at most: the count (2 bytes up to 256) and the entries.
 pub const NAMES_ADDED_MAX_BYTES: usize = 2 + MAX_ADDED * ADDED_SEAT_MAX_BYTES;
+/// One `SeatRef` encoded at most: member id 17, two tags 16.
+pub const SEAT_REF_MAX_BYTES: usize = 17 + 8 + 8;
+/// `NamesListIn.removed` at most: the count (2 bytes up to 768) and the entries.
+pub const NAMES_REMOVED_MAX_BYTES: usize = 2 + MAX_REMOVED * SEAT_REF_MAX_BYTES;
 /// Siblings in an inclusion path at most: a tree of 2^32 leaves (`buckets` is a u32).
 pub const PATH_MAX_SIBLINGS: usize = 32;
 /// One commit, all its parts' encoded bytes together, at most (a full re-key at 100k
@@ -933,20 +940,42 @@ impl KrkIn {
     }
 }
 
-/// One gated header's `added` list at its place (C1's `NamesList`). `added` is the
-/// postcard of C1's `Vec<AddedSeat>`, at most 256 entries, decoded by voipc-crypto.
+/// One gated header's lists at its place (C1's `NamesList`). `added` is the postcard of
+/// C1's `Vec<AddedSeat>`, at most 256 entries; `removed` is empty for a header that removes
+/// nobody, else the postcard of C1's `Vec<SeatRef>`, at most 768 entries, each 33 B. Both
+/// step `names_hash` (§11.3), so an opening that removes seats goes as its bare list too.
+/// Decoded by voipc-crypto.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NamesListIn {
     pub time: u64,
     pub epoch: u32,
     pub join: u32,
     pub added: Vec<u8>,
+    pub removed: Vec<u8>,
 }
 
 impl NamesListIn {
     pub fn check(&self) -> Result<(), Bad> {
-        names_added_count(&self.added).map(|_| ())
+        names_added_count(&self.added)?;
+        names_removed_count(&self.removed).map(|_| ())
     }
+}
+
+/// The entry count of `NamesListIn.removed`: 0 when empty, else the count a postcard
+/// `Vec<SeatRef>` starts with, refused past `MAX_REMOVED`, or when the bytes are longer than
+/// that many entries can be.
+pub fn names_removed_count(removed: &[u8]) -> Result<usize, Bad> {
+    if removed.is_empty() {
+        return Ok(0);
+    }
+    if removed.len() > NAMES_REMOVED_MAX_BYTES {
+        return Err(Bad::TooLarge("names removed"));
+    }
+    let (n, _) = varint_prefix(removed, "names removed count")?;
+    if n > MAX_REMOVED as u64 {
+        return Err(Bad::Count("names removed"));
+    }
+    Ok(n as usize)
 }
 
 /// The entry count a postcard `Vec<AddedSeat>` starts with, refused past `MAX_ADDED`, or
@@ -1030,16 +1059,23 @@ pub struct RowMaker {
 // piece adds no byte. `Parts` takes them.
 
 /// One part of `EpochIn`. Each `Option` sits in any one part, at most once a sequence;
-/// `chain`, `walk` and `self_rows` spread over parts (plan 13). `chain`: contiguous
-/// headers after the floor, oldest first; `walk`: kh links newest first; `kh`: the
-/// header `have.kh` names, on the first answer per connection to a fetch with `have`;
-/// `opening`: the head epoch's opening header when `head` is a Join; `past`: set when
-/// this answers one `at` entry, never taken as a head.
+/// `chain`, `walk`, `kh_before` and `self_rows` spread over parts (plan 13). `chain`:
+/// contiguous headers after the floor, oldest first; `walk`: kh links newest first; `kh`:
+/// the header `have.kh` names, on the first answer per connection to a fetch with `have`;
+/// `kh_before`: with `kh`, the keyholder headers before it, newest first, each the parent
+/// of the one before, back to the parent of the oldest KeyholdersReplace since the
+/// generation's start or its last KeyholdersRemove, and at least `kh`'s parent when `kh`
+/// is a KeyholdersAdd or a KeyholdersReplace; at most `KH_BEFORE_MOST`. They hold the pair
+/// a Replace swapped out, which still keys the versions it kept, and the entries an Add's
+/// or a Replace's `KRK` welcome may come from (RV); `opening`: the head epoch's opening
+/// header when `head` is a Join; `past`: set when this answers one `at` entry, never taken
+/// as a head.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InPiece {
     pub chain: Vec<HeaderIn>,
     pub walk: Vec<WalkLinkIn>,
     pub kh: Option<HeaderIn>,
+    pub kh_before: Vec<HeaderIn>,
     pub head: Option<WalkLinkIn>,
     pub opening: Option<HeaderIn>,
     pub own_join: Option<HeaderIn>,
@@ -1087,14 +1123,13 @@ pub struct KeyringPiece {
     pub stream: Vec<u8>,
 }
 
-/// One part of `EpochNamesIn`: the `added` lists asked or pushed, the signed headers of
-/// pushed gated Joins (`joins`), the opening headers with `removed` lists (`removals`),
-/// and `gone`, the step before the oldest list kept.
+/// One part of `EpochNamesIn`: the lists asked or pushed (the openings that remove seats
+/// among them, `removed` and all), the signed headers of pushed gated Joins (`joins`), and
+/// `gone`, the step before the oldest list kept.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NamesPiece {
     pub lists: Vec<NamesListIn>,
     pub joins: Vec<HeaderIn>,
-    pub removals: Vec<HeaderIn>,
     pub gone: Option<NamesStepIn>,
 }
 
@@ -1493,7 +1528,8 @@ footprint!(
         time,
         epoch,
         join,
-        added
+        added,
+        removed
     },
     GkChainKey {
         owner,
@@ -1520,6 +1556,7 @@ footprint!(
         chain,
         walk,
         kh,
+        kh_before,
         head,
         opening,
         own_join,
@@ -1550,12 +1587,7 @@ footprint!(
         held
     },
     KeyringPiece { krk, stream },
-    NamesPiece {
-        lists,
-        joins,
-        removals,
-        gone
-    },
+    NamesPiece { lists, joins, gone },
     VoiceSeatsPiece { seats, gone, whole },
 );
 
@@ -2305,6 +2337,14 @@ mod tests {
             epoch: 1,
             join: 2,
             added: vec![0],
+            removed: vec![],
+        });
+        rt(&NamesListIn {
+            time: 1_700_000_000,
+            epoch: 3,
+            join: 0,
+            added: vec![0],
+            removed: unhex(&C1_REMOVED[2..]),
         });
         rt(&NamesStepIn {
             before: [1; 32],
@@ -2508,8 +2548,40 @@ mod tests {
             epoch: 1,
             join: 1,
             added: unhex(&f2[2..]),
+            removed: vec![],
         };
         list.check().unwrap();
+    }
+
+    #[test]
+    fn names_count_reads_c1_removed_lists() {
+        // "postcard(removed) list" is `Removed::List`: drop its variant index (01) for the
+        // bare `Vec<SeatRef>`. A list that removes nobody is empty.
+        let removed = unhex(&C1_REMOVED[2..]);
+        assert_eq!(names_removed_count(&removed), Ok(2));
+        assert_eq!(names_removed_count(&[]), Ok(0));
+        assert_eq!(names_removed_count(&[0x80, 0x06]), Ok(MAX_REMOVED));
+        let mut big = vec![0x81, 0x06]; // 769
+        big.extend(vec![0; 100]);
+        assert_eq!(names_removed_count(&big), Err(Bad::Count("names removed")));
+        assert!(matches!(
+            names_removed_count(&[0x80; 3]),
+            Err(Bad::Truncated(_))
+        ));
+        assert_eq!(
+            names_removed_count(&vec![0; NAMES_REMOVED_MAX_BYTES + 1]),
+            Err(Bad::TooLarge("names removed"))
+        );
+        let mut list = NamesListIn {
+            time: 1,
+            epoch: 3,
+            join: 0,
+            added: vec![0],
+            removed,
+        };
+        list.check().unwrap();
+        list.removed = big;
+        assert_eq!(list.check(), Err(Bad::Count("names removed")));
     }
 
     #[test]
@@ -3125,6 +3197,7 @@ mod tests {
             let _ = read_keyring(&bytes, 0, (rng.next() % 4) as u32);
             let _ = commit_keyring(&bytes);
             let _ = names_added_count(&bytes);
+            let _ = names_removed_count(&bytes);
         }
     }
 

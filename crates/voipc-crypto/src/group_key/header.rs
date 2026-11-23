@@ -483,20 +483,37 @@ pub fn keyholder_set_digest(keyholders: &[Keyholder]) -> [u8; 32] {
 /// length, then the entries sorted. A list given unsorted is sorted first, so
 /// it hashes as the header carries it.
 pub fn names_list_digest(added: &[AddedSeat]) -> [u8; 32] {
+    names_lists_digest(added, &[])
+}
+
+/// A step's list digest: `names_list_digest(added)` when `removed` is empty,
+/// else `SHA-256(postcard(added) ‖ postcard(removed))`, each the header field
+/// as the body encodes it (`Added::List`, `Removed::List`, sorted). Both are
+/// self-delimiting, so no list pair hashes as another (RV q9-q10:211: the
+/// removals a writer counts are those the head's `names_hash` binds).
+fn names_lists_digest(added: &[AddedSeat], removed: &[SeatRef]) -> [u8; 32] {
     let mut list = added.to_vec();
     sort_canonical(&mut list);
-    Sha256::digest(encoded(&Added::List(list))).into()
+    let mut h = Sha256::new().chain_update(encoded(&Added::List(list)));
+    if !removed.is_empty() {
+        let mut gone = removed.to_vec();
+        sort_canonical(&mut gone);
+        h.update(encoded(&Removed::List(gone)));
+    }
+    h.finalize().into()
 }
 
 /// One step of `names_hash` (§11.3), with its list already digested:
 ///
 /// ```text
 /// names_hash = SHA-256("voipc-gk/v1/names|" ‖ P ‖ time (u64 BE) ‖ epoch (u32 BE)
-///                      ‖ join (u32 BE) ‖ SHA-256(postcard(added)))
+///                      ‖ join (u32 BE) ‖ SHA-256(postcard(added) [‖ postcard(removed)]))
 /// ```
 ///
 /// `time`, `epoch` and `join` are the header's own, so a list cannot be
 /// moved to another header, and a tail of lists proves the time it covers.
+/// A header that removes seats steps the hash with its `removed` list too,
+/// so the removals a fold counts are the head's own chain's.
 /// A "gone" answer carries the step before the relay's 90-day tail in this
 /// form, since the relay no longer holds that list (§4.4 rule 4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -506,7 +523,8 @@ pub struct NamesStep {
     pub time: u64,
     pub epoch: u32,
     pub join: u32,
-    /// `SHA-256(postcard(added))` of the step's list.
+    /// The step's list digest: `SHA-256(postcard(added))`, with
+    /// `‖ postcard(removed)` inside where the header removes seats.
     pub list: [u8; 32],
 }
 
@@ -525,41 +543,50 @@ impl NamesStep {
     }
 }
 
-/// One header's `added` list with what each step binds it to: the header's
-/// `time`, `epoch` and `join` (§4.4 rule 4, §11.3). What a writer folds, from
-/// the Join headers themselves or from the bare lists the relay sends.
+/// One header's `added` and `removed` lists with what each step binds them
+/// to: the header's `time`, `epoch` and `join` (§4.4 rule 4, §11.3). What a
+/// writer folds, from the headers themselves or from the bare lists the relay
+/// sends (`NamesListIn`, `removed` and all: an opening that removes seats comes
+/// as its bare list too).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NamesList {
     pub time: u64,
     pub epoch: u32,
     pub join: u32,
     pub added: Vec<AddedSeat>,
+    pub removed: Vec<SeatRef>,
 }
 
 impl NamesList {
-    /// The list a header carries, at that header's place.
+    /// The lists a header carries, at that header's place.
     pub fn of(h: &HeaderV1) -> NamesList {
+        let removed = match &h.removed {
+            Removed::List(l) => l.clone(),
+            Removed::Count(_) => vec![],
+        };
         NamesList {
             time: h.time,
             epoch: h.epoch,
             join: h.join,
             added: h.added_list().to_vec(),
+            removed,
         }
+    }
+
+    /// Whether it moves `names_hash` past a start: a name added or removed.
+    pub fn steps(&self) -> bool {
+        !self.added.is_empty() || !self.removed.is_empty()
     }
 
     /// The step this list makes from `before`, taken even when it is empty.
     pub fn step_from(&self, before: &[u8; 32]) -> NamesStep {
-        step_of(before, self.time, self.epoch, self.join, &self.added)
-    }
-}
-
-fn step_of(p: &[u8; 32], time: u64, epoch: u32, join: u32, added: &[AddedSeat]) -> NamesStep {
-    NamesStep {
-        before: *p,
-        time,
-        epoch,
-        join,
-        list: names_list_digest(added),
+        NamesStep {
+            before: *before,
+            time: self.time,
+            epoch: self.epoch,
+            join: self.join,
+            list: names_lists_digest(&self.added, &self.removed),
+        }
     }
 }
 
@@ -570,11 +597,11 @@ pub fn names_start(list: &NamesList) -> [u8; 32] {
     list.step_from(&[0; 32]).hash()
 }
 
-/// `names_hash` at any other header: the parent's, stepped with a non-empty
-/// list, or the parent's unchanged for an empty one. It runs on through a
-/// Regenesis.
+/// `names_hash` at any other header: the parent's, stepped with a list that
+/// adds or removes a name, or the parent's unchanged for one that does
+/// neither. It runs on through a Regenesis.
 pub fn names_step(parent: &[u8; 32], list: &NamesList) -> [u8; 32] {
-    if list.added.is_empty() {
+    if !list.steps() {
         return *parent;
     }
     list.step_from(parent).hash()
@@ -586,15 +613,9 @@ pub fn names_hash(parent: Option<&HeaderV1>, h: &HeaderV1) -> [u8; 32] {
     if !h.gated {
         return [0; 32];
     }
-    let (time, epoch, join, added) = (h.time, h.epoch, h.join, h.added_list());
+    let list = NamesList::of(h);
     match parent {
-        Some(p) if p.gated && h.kind != Kind::Genesis => {
-            if added.is_empty() {
-                p.names_hash
-            } else {
-                step_of(&p.names_hash, time, epoch, join, added).hash()
-            }
-        }
-        _ => step_of(&[0; 32], time, epoch, join, added).hash(),
+        Some(p) if p.gated && h.kind != Kind::Genesis => names_step(&p.names_hash, &list),
+        _ => names_start(&list),
     }
 }

@@ -9,7 +9,9 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use l4f_accounts::store::Store as Db;
 use voipc_crypto::group_key::commit::{HolderRef, Joiner, Listed, Pair, RowsOut, WelcomeOut};
-use voipc_crypto::group_key::timers::{HOLD_MS, KEYHOLDER_SKEW_SECS, MATERIAL_SWEEP_MARGIN_MS};
+use voipc_crypto::group_key::timers::{
+    refresh_ms, HOLD_MS, KEYHOLDER_SKEW_SECS, MATERIAL_SWEEP_MARGIN_MS,
+};
 use voipc_crypto::group_key::tree::BucketTree;
 use voipc_crypto::group_key::{
     seat_record, GroupKind, Kind, Leaf, MemberId, Pool, SeatRef, SignedHeader, Via, MAX_WALK,
@@ -736,6 +738,7 @@ impl Store {
                         epoch: n.epoch,
                         join: n.j,
                         added: n.list,
+                        removed: vec![],
                     },
                     hash: n.names_hash,
                 }),
@@ -795,6 +798,19 @@ impl Store {
         }
         g.rolls = row.head.rolls;
         g.gen_time = row.head.gen_time;
+        // The head epoch's refresh, as the opening that made it set it: a group loaded after
+        // a restart or an idle stop is refreshed once that epoch is due, not only at its next
+        // exit, so a Join seats nobody into an old epoch (§6 "A newcomer")
+        g.next_refresh = Some(
+            opening
+                .header()
+                .time
+                .saturating_mul(1000)
+                .saturating_add(refresh_ms(hd.buckets)),
+        );
+        // Seats a roll that ended at its 24 h left behind get their pages after a restart
+        // too (GROUP-KEY §5.6)
+        g.left_behind = g.seats.values().any(|x| x.seed < hd.seed);
         g.head = Some(Head {
             parent: parent_of(&head),
             kh,
@@ -1207,9 +1223,11 @@ fn keyed(t: KeysTuple) -> Option<([u8; 16], [u8; 32], Pair)> {
 
 /// A page of the eager seats of a stored group's new start (plan 2d): the accounts that keep
 /// `conv`'s log with published seat keys and an identity key, after `after`, by account.
+/// Only keys the relay first held at `since` (unix ms) or later (`eager_all`).
 pub async fn eager_page(
     store: &Db,
     conv: &str,
+    since: u64,
     after: Option<&[u8; 16]>,
     limit: u32,
 ) -> Result<Vec<([u8; 16], Joiner)>> {
@@ -1218,11 +1236,13 @@ pub async fn eager_page(
             "SELECT k.account, k.n, k.kem, k.dh, k.made, k.sig, i.identity_key
              FROM voipc_members m JOIN voipc_gk_seatkeys k ON k.account = m.account AND k.current
              JOIN voipc_identity i ON i.account = m.account
-             WHERE m.conv = $1 AND m.account > $2 ORDER BY m.account LIMIT $3",
+             WHERE m.conv = $1 AND m.account > $2 AND k.published >= $4
+             ORDER BY m.account LIMIT $3",
         )
         .bind(conv)
         .bind(after.map_or(&[][..], |a| &a[..]))
         .bind(i64::from(limit))
+        .bind(i64::try_from(since).unwrap_or(i64::MAX))
         .fetch_all(pool)
         .await?
     });

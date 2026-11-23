@@ -2,10 +2,14 @@
 // `gk-*` events that `gkListeners` names, for App.svelte's `listenServer`; ChatPanel draws the
 // lines (gk-rules.ts), the member list the keyholders. Gone with the connection, as the ids are.
 
+import { get } from "svelte/store";
+import { channels } from "./channels.js";
+import { addNotification } from "./notifications.js";
 import { scoped } from "./scoped.js";
 import {
   dismissed,
   emptyGk,
+  unlistedLine,
   withAnew,
   withDropped,
   withHolders,
@@ -34,7 +38,13 @@ export const gkListeners = {
   "gk-readers": (server: string, e: GkReaders) => apply(server, e.channel_id, (ch) => withReaders(ch, e)),
   "gk-keyholders": (server: string, e: GkKeyholders) => apply(server, e.channel_id, (ch) => withHolders(ch, e)),
   "gk-anew": (server: string, e: GkAnew) => apply(server, e.channel_id, (ch) => withAnew(ch, e)),
-  "gk-warning": (server: string, e: GkWarning) => apply(server, e.channel_id, (ch) => withWarning(ch, e)),
+  "gk-warning": (server: string, e: GkWarning) => {
+    // A channel no longer listed shows its lines in no chat: said on its own, until closed
+    const listed = get(channels.of(server)).some((c) => c.channel_id === e.channel_id);
+    const alone = listed ? null : unlistedLine(e);
+    if (alone) addNotification(alone, "warning", 0);
+    else apply(server, e.channel_id, (ch) => withWarning(ch, e));
+  },
 };
 
 /** Waves off one of a channel's lines (`GkLine.key`). */

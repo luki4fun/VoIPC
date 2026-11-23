@@ -444,6 +444,10 @@ fn main() {
         ck: ck.clone(),
         exits_upto: 123_456,
         buckets: buckets.clone(),
+        rolls: SeedRolls {
+            raised: T0,
+            removal: false,
+        },
     };
     let base_plain = postcard::to_allocvec(&base).expect("encodes").len();
     let base_sealed = seal_base(&g, s, &ks_real, &krk, &base);
@@ -558,7 +562,7 @@ fn main() {
     let floor = NamesFrom::Floor(NamesFloor::of(gated_gen.header()));
     let one = [NamesList::of(join.header())];
     b.run("Names fold, 1 list of 256", Some(256 * entry_bytes), || {
-        let fold = fold_names(&floor, &one, &[], join.header(), &known).expect("folds");
+        let fold = fold_names(&floor, &one, join.header(), &known).expect("folds");
         assert!(matches!(fold, Fold::Take { .. }));
     });
     b.run("names_list_digest, 256", None, || names_list_digest(&names));
@@ -586,6 +590,7 @@ fn main() {
             epoch: 1,
             join: j as u32 + 1,
             added: sorted(l),
+            removed: vec![],
         };
         acc = names_step(&acc, &list);
         lists.push(list);
@@ -609,7 +614,7 @@ fn main() {
         "Names fold, 391 lists, 100k names",
         Some(SEATS as usize * entry_bytes),
         || {
-            let fold = fold_names(&floor, &lists, &[], &big_head, &big_known).expect("folds");
+            let fold = fold_names(&floor, &lists, &big_head, &big_known).expect("folds");
             assert!(matches!(fold, Fold::Take { .. }));
         },
     );

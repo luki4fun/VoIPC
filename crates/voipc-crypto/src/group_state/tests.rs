@@ -644,6 +644,35 @@ fn a_keyholder_entry_under_an_old_counter_is_refused() {
     }
 }
 
+/// RV r-keyholders:773, repair round: a member that only reads the group counts no counter from
+/// a KeyholdersReplace it takes. The counter book is the account's, across groups, and a reader
+/// holding the new counter would refuse, in another group, the Add that promotes the old pair
+/// honestly while its Replace is still out there, and read that group no more. The keyholders
+/// of this group refuse the old pair by what they kept of this group (holder.rs `desk_floor`).
+#[test]
+fn a_replace_a_reader_takes_counts_no_counter_toward_the_account() {
+    let mut w = World::text(false, false);
+    let mut d = seated_guest(&mut w, 20);
+    let before = d.pins.seen(&[1; 16]);
+    let new = w.holders[0].rotated();
+    let due = w.replace_due(&new);
+    let b = w.opening_by(0, &due, false, Some(&new), None).unwrap();
+    w.step(&due, &b);
+    w.holders[0] = new;
+    assert_eq!(w.head.header().kind, Kind::KeyholdersReplace);
+    d.take(push(&w), w.now);
+    assert_eq!(
+        d.keying.groups[TEXT_ID].floor.as_ref().unwrap().d,
+        w.head.d(),
+        "taken"
+    );
+    assert_eq!(
+        d.pins.seen(&[1; 16]),
+        before,
+        "a reader's book is as it was"
+    );
+}
+
 // ── posts ──
 
 /// §5.8: a post goes under the head epoch, its first with the writer's blob, and opens for
@@ -796,6 +825,237 @@ fn an_exit_holds_posts_until_an_opening_header_covers_it() {
     assert_eq!(sent.len(), 1, "{:?}", out.events);
     assert_eq!(sent[0].2, w.head.header().epoch);
     assert!(sent[0].0.is_some(), "a new epoch, a new chain");
+}
+
+/// RV q7:1489: a Regenesis seats its volunteer alone, so the exits a writer heard of before
+/// it are dealt with, though its `exits_upto` (the relay drops what it did not carry) stays
+/// below them. Seated again by a Join, the writer posts, not holding for ever.
+#[test]
+fn a_regenesis_ends_the_hold_of_an_exit_it_left_behind() {
+    use crate::group_key::build::world::Holder;
+    let mut w = World::text(true, false);
+    let mut d = Device::guest(20);
+    let out = d.track(TEXT_ID, GroupKind::Text, VaultFloor::None);
+    let j = d.joiner(&out, None);
+    let seat = j.seat;
+    let b = join(&mut w, vec![j.clone()]);
+    let genesis = w.kh.clone();
+    d.take(piece(&w, &b, &seat, &[&genesis]), w.now);
+    assert!(d.keying.current_epoch(TEXT_ID).is_some());
+    let gen = w.head.header().gen;
+    // Told of an exit the Regenesis will leave behind
+    let exit = ServerMessage::EpochExit {
+        group: TEXT_ID.into(),
+        gen,
+        seq: 1,
+    };
+    d.frame(&exit, w.now);
+    // An hour with no keyholder online: a volunteer starts anew on the head
+    w.tick(3600);
+    w.no_keyholder_since = Some(w.now - 3600);
+    let v = Holder::desktop(2);
+    let due = Due {
+        joiners: vec![v.seat.joiner()],
+        volunteer: Some(v.candidate()),
+        ..w.due(DueKind::Regenesis)
+    };
+    let parent = w.head.clone();
+    let b = World::build_start(
+        &v,
+        GroupKind::Text,
+        TEXT_ID,
+        true,
+        &due,
+        w.now,
+        Some(&parent),
+    )
+    .unwrap();
+    let a = w.check(&due, v.by(), &b.commit).unwrap();
+    w.take(&due, a, &b);
+    w.holders = vec![v];
+    assert_eq!(w.head.header().kind, Kind::Regenesis);
+    assert_eq!(w.head.header().gen, gen, "the same generation");
+    assert!(w.head.header().exits_upto < 1, "it carried no exit");
+    let regen = gk::InPiece {
+        head: Some(gk::WalkLinkIn {
+            header: header_in(&w.head),
+            parent: Some(header_in(&parent)),
+        }),
+        pushed: true,
+        ..Default::default()
+    };
+    let out = d.take(regen, w.now);
+    assert_eq!(
+        d.keying.groups[TEXT_ID].floor.as_ref().map(|f| f.d),
+        Some(w.head.d()),
+        "it took the Regenesis: {:?}",
+        out.events
+    );
+    // A Join seats it again, in the Regenesis's epoch
+    let b = join(&mut w, vec![j]);
+    d.take(piece(&w, &b, &seat, &[]), w.now);
+    assert_eq!(
+        d.keying.current_epoch(TEXT_ID).map(|e| e.epoch),
+        Some(w.head.header().epoch)
+    );
+    let out = d.post(1, b"after", w.now * 1000);
+    assert_eq!(posted(&out).len(), 1, "{:?}", out.events);
+}
+
+/// RV q7:1489 (repair): a Regenesis whose take is put off (here the vault floor; a fetch for
+/// a keyholder header alike) ends the hold of the exits heard before it came in, not of one
+/// heard after: that is a seat seated since, which holds the Regenesis's epoch key.
+#[test]
+fn a_regenesis_taken_late_keeps_an_exit_heard_after_it_came_in() {
+    use crate::group_key::build::world::Holder;
+    let mut w = World::text(true, false);
+    let mut d = Device::guest(20);
+    let out = d.track(TEXT_ID, GroupKind::Text, VaultFloor::None);
+    let j = d.joiner(&out, None);
+    let seat = j.seat;
+    let b = join(&mut w, vec![j.clone()]);
+    let genesis = w.kh.clone();
+    d.take(piece(&w, &b, &seat, &[&genesis]), w.now);
+    let gen = w.head.header().gen;
+    let exit = |seq: u64| ServerMessage::EpochExit {
+        group: TEXT_ID.into(),
+        gen,
+        seq,
+    };
+    // Told of an exit the Regenesis will leave behind
+    d.frame(&exit(1), w.now);
+    w.tick(3600);
+    w.no_keyholder_since = Some(w.now - 3600);
+    let v = Holder::desktop(2);
+    let due = Due {
+        joiners: vec![v.seat.joiner()],
+        volunteer: Some(v.candidate()),
+        ..w.due(DueKind::Regenesis)
+    };
+    let parent = w.head.clone();
+    let b = World::build_start(
+        &v,
+        GroupKind::Text,
+        TEXT_ID,
+        true,
+        &due,
+        w.now,
+        Some(&parent),
+    )
+    .unwrap();
+    let a = w.check(&due, v.by(), &b.commit).unwrap();
+    w.take(&due, a, &b);
+    w.holders = vec![v];
+    let regen = gk::InPiece {
+        head: Some(gk::WalkLinkIn {
+            header: header_in(&w.head),
+            parent: Some(header_in(&parent)),
+        }),
+        pushed: true,
+        ..Default::default()
+    };
+    // Its push comes in but waits; an exit of a seat seated since comes behind it
+    d.keying.groups.get_mut(TEXT_ID).unwrap().vault_pending = true;
+    d.take(regen, w.now);
+    d.frame(&exit(2), w.now);
+    d.keying.groups.get_mut(TEXT_ID).unwrap().vault_pending = false;
+    d.tick(w.now * 1000);
+    assert_eq!(
+        d.keying.groups[TEXT_ID].floor.as_ref().map(|f| f.d),
+        Some(w.head.d()),
+        "it took the Regenesis"
+    );
+    let b = join(&mut w, vec![j]);
+    d.take(piece(&w, &b, &seat, &[]), w.now);
+    let out = d.post(1, b"at once", w.now * 1000 + 1_000);
+    assert_eq!(posted(&out).len(), 1, "the exit left behind holds nothing");
+    let out = d.post(2, b"later", w.now * 1000 + EXIT_HOLD_MS + 1_000);
+    assert!(
+        posted(&out).is_empty(),
+        "the later exit holds once 46 s old: {:?}",
+        out.events
+    );
+}
+
+/// RV r-members:55 (repair): the relay refuses a reader's first chain under the epoch before
+/// the head (`OLD_EPOCH`) while that epoch's writers may still post under it for `HOLD_MS`.
+/// The refused member fetches the head and holds its own posts until then, but keeps the
+/// epoch's key: a post still coming under it opens.
+#[test]
+fn an_old_epoch_refusal_keeps_the_key_for_posts_still_coming_under_it() {
+    let mut w = World::text(false, false);
+    let mut a = seated_guest(&mut w, 20);
+    let mut b = seated_guest(&mut w, 21);
+    a.take(push(&w), w.now);
+    b.take(push(&w), w.now);
+    let (blob, ct, epoch) = posted(&a.post(1, b"still", w.now * 1000))[0].clone();
+    let refused = ServerMessage::EpochRefused {
+        group: TEXT_ID.into(),
+        what: gk::refused_what::POST,
+        why: gk::refused_why::OLD_EPOCH,
+        detail: String::new(),
+    };
+    let out = b.frame(&refused, w.now);
+    assert_eq!(fetches(&out), 1, "it fetches the head");
+    let got = b.frame(&post_in(&w, &a, blob, ct, epoch), w.now);
+    assert_eq!(got.posts.len(), 1, "a post under the epoch still opens");
+    assert!(
+        posted(&b.post(2, b"mine", w.now * 1000)).is_empty(),
+        "its own posts wait for the head"
+    );
+    let out = b.take(push(&w), w.now);
+    assert_eq!(posted(&out).len(), 1, "the head taken, the post goes");
+}
+
+/// RV r-hostile:1007 (repair): nine new generations within a few minutes push the first out
+/// of the floor's list of the last 8; the relay showing it again is refused all the same,
+/// as one this member took. A new generation dated no later than the eight still goes (a
+/// volunteer's clock may run behind by up to `CLOCK_SLACK`).
+#[test]
+fn a_generation_taken_earlier_is_refused_though_the_last_eight_let_it_go() {
+    use crate::group_key::build::world::Holder;
+    let mut d = Device::guest(20);
+    let out = d.track(TEXT_ID, GroupKind::Text, VaultFloor::None);
+    let j = d.joiner(&out, None);
+    let seat = j.seat;
+    let start = |i: u8| {
+        let mut w = World::start(
+            GroupKind::Text,
+            TEXT_ID,
+            true,
+            false,
+            Holder::desktop(10 + i),
+        );
+        let b = join(&mut w, vec![j.clone()]);
+        let genesis = w.kh.clone();
+        let p = piece(&w, &b, &seat, &[&genesis]);
+        (w.head.header().gen, w.head.d(), p)
+    };
+    let floor_d = |d: &Device| d.keying.groups[TEXT_ID].floor.as_ref().map(|f| f.d);
+    let mut first = None;
+    for i in 0..9 {
+        let (gen, head, p) = start(i);
+        first.get_or_insert((gen, p.clone()));
+        let out = d.take(p, T0);
+        assert_eq!(
+            floor_d(&d),
+            Some(head),
+            "generation {i} taken: {:?}",
+            out.events
+        );
+    }
+    let (gen1, again) = first.unwrap();
+    let held = d.keying.groups[TEXT_ID].floor.clone().unwrap();
+    assert!(!held.took_gen(&gen1), "the list of the last 8 let it go");
+    d.take(again, T0);
+    assert_eq!(floor_d(&d), Some(held.d), "not taken again");
+    let (_, head, p) = start(9);
+    d.take(p, T0);
+    assert_eq!(
+        floor_d(&d),
+        Some(head),
+        "a new one dated as the eight still goes"
+    );
 }
 
 /// The plan's review: an exit of an older generation never holds a writer of a new one (a
@@ -1011,6 +1271,67 @@ fn an_endorsement_far_from_its_join_time_is_refused_and_a_rotation_keeps_its_mad
     );
 }
 
+/// RV q8-q11 (257): a vault seat's (0x01) `made` was never checked, so one dated ten years
+/// ahead raised the account's counter with that time: rule 8 then flagged none of its lower
+/// counters for ten years. It counts from the time it was met.
+#[test]
+fn a_rotation_dated_ahead_counts_from_when_it_was_met() {
+    let ik = IdentityKeyPair::generate(&mut crate::rng());
+    let keys = crate::group_key::SeatPair::generate().public();
+    let a = [5; 16];
+    let at = T0 + 100_000;
+    let ahead = at + 10 * 365 * 24 * 60 * 60;
+    let e = Endorsement::sign(
+        &ik,
+        Origin::VaultSeat,
+        MemberId::Account(a),
+        5,
+        ahead,
+        &keys,
+    )
+    .unwrap();
+    let mut book = MemoryPins::default();
+    assert_eq!(take_endorsement(&mut book, Some(a), &e, at), Ok(()));
+    assert_eq!(book.seen(&a), Some(Seen { n: 5, made: at }));
+    let day = 24 * 60 * 60;
+    assert_eq!(
+        crate::group_key::counter_flagged(4, at + day, book.seen(&a)),
+        Some(5),
+        "a lower counter a day later is flagged"
+    );
+}
+
+/// RV repair (257): a writer folding a gated group's names raised a named account's counter
+/// with its vault seat's own `made`, so a rotation dated ahead and met first at a fold
+/// stopped rule 8 at that member for the account's lower counters until then. It counts
+/// from when it was met there too.
+#[test]
+fn a_rotation_dated_ahead_met_at_a_fold_counts_from_when_it_was_met() {
+    let mut w = World::text(false, true);
+    let keys = SeatKeys::generate(1, T0);
+    let copy = seat_keys::copy(&keys);
+    let mut d = Device::account(20, [7; 16], keys);
+    let out = d.track(TEXT_ID, GroupKind::Text, VaultFloor::None);
+    let j = d.joiner(&out, Some(&copy));
+    let seat = j.seat;
+    let b = join(&mut w, vec![j]);
+    let genesis = w.kh.clone();
+    d.take(piece(&w, &b, &seat, &[&genesis]), w.now);
+    assert!(d.keying.current_epoch(TEXT_ID).is_some());
+    let (b_acct, ten_years) = ([9; 16], 10 * 365 * 24 * 60 * 60);
+    let ahead = SeatKeys::generate(5, w.now + ten_years);
+    let e = Device::account(21, b_acct, seat_keys::copy(&ahead));
+    let ik = e.ik.public_key().public_key_bytes().try_into().unwrap();
+    d.pins.pin_new(b_acct, ik, 0);
+    join(&mut w, vec![e.joiner(&GkOut::default(), Some(&ahead))]);
+    d.take(push(&w), w.now);
+    let out = d.post(1, b"hello", w.now * 1000);
+    assert_eq!(posted(&out).len(), 1, "{:?}", out.events);
+    let seen = d.pins.seen(&b_acct).expect("raised at the fold");
+    assert_eq!(seen.n, 5);
+    assert!(seen.made <= w.now + CLOCK_SLACK, "{} {}", seen.made, w.now);
+}
+
 fn keyholder(m: MemberId, n: u32, ik: u8) -> Keyholder {
     Keyholder {
         m,
@@ -1087,6 +1408,7 @@ fn local_floors_of_another_run_go_at_start() {
         floor,
         kh: None,
         head: None,
+        kh_chain: vec![],
         names: None,
         taken: T0,
     };
@@ -1644,113 +1966,144 @@ fn self_rows_of(
 /// of its choosing, and a row of that pair under it to our seat's version, on a real push of a
 /// Join whose key we hold. The push is taken, but its key came through no row of the relay's:
 /// no self-row seals the relay's `s_m` (the binding alone trusts a self-row's, `kept.rs`).
+/// RV repair: the relay's pair is now refused as no keyholder of the set (`maker_ok`), so the
+/// same is tried from an entry of the set (a maker `maker_ok` passes: an Add's pair, a
+/// Replace's old one), under the seed the head reached: the J8K gate keeps its `BK` and
+/// `s_m` out (its self-row for that seed went already).
 #[test]
 fn no_self_row_is_written_for_a_seed_welcomes_s_m_whose_row_keyed_no_confirmed_seal() {
     use crate::group_key::{seed_welcome, Them, Version};
-    let mut w = World::text(true, false);
-    let keys = SeatKeys::generate(1, T0);
-    let (mut d, seat, b) = seated_account(&mut w, &keys, &[]);
-    let x = b.commit.welcomes.iter().find(|x| x.seat == seat).unwrap();
-    w.join(&[&crate::group_key::build::world::Member::account(8)]);
-    let relay = relay_pair();
-    let public = keys.pair.public();
-    let to = Them {
-        m: MemberId::Account([7; 16]),
-        keys: &public,
-    };
-    let (s2, s_m, bk) = (x.s + 1, [0x33; 32], [0x5a; 32]);
-    let at = Version { b: x.b, v: x.v };
-    let mut p = push(&w);
-    p.seed_welcome = Some(gk::SeedWelcomeIn {
-        s: s2,
-        from: relay.by().into(),
-        bytes: seed_welcome(&w.g, s2, &relay.me(), &to, &s_m).unwrap(),
-    });
-    let row = crate::group_key::RowBase::keyholder_side(&w.g, s2, &relay.me(), &to, &s_m)
-        .unwrap()
-        .row(at, &bk);
-    p.seat = Some(gk::SeatKeying {
-        b: x.b,
-        base_v: x.v,
-        s: s2,
-        from: relay.by().into(),
-        welcome: None,
-        row: Some(row),
-        ratchets: vec![],
-    });
-    let out = d.take(p, w.now);
-    assert_eq!(
-        d.keying.current_epoch(TEXT_ID).map(|e| e.epoch),
-        Some(w.head.header().epoch),
-        "the push is taken"
-    );
-    assert_eq!(
-        self_rows_of(&w, &out, &seat, &keys, &s_m),
-        vec![],
-        "no self-row for the relay's s_m"
-    );
+    for in_set in [false, true] {
+        let mut w = World::text(true, false);
+        let keys = SeatKeys::generate(1, T0);
+        let (mut d, seat, b) = seated_account(&mut w, &keys, &[]);
+        let x = b.commit.welcomes.iter().find(|x| x.seat == seat).unwrap();
+        w.join(&[&crate::group_key::build::world::Member::account(8)]);
+        let relay = relay_pair();
+        let (by, s2) = if in_set {
+            (&w.holders[0], x.s)
+        } else {
+            (&relay, x.s + 1)
+        };
+        let public = keys.pair.public();
+        let to = Them {
+            m: MemberId::Account([7; 16]),
+            keys: &public,
+        };
+        let (s_m, bk) = ([0x33; 32], [0x5a; 32]);
+        let at = Version { b: x.b, v: x.v };
+        let mut p = push(&w);
+        p.seed_welcome = Some(gk::SeedWelcomeIn {
+            s: s2,
+            from: by.by().into(),
+            bytes: seed_welcome(&w.g, s2, &by.me(), &to, &s_m).unwrap(),
+        });
+        let row = crate::group_key::RowBase::keyholder_side(&w.g, s2, &by.me(), &to, &s_m)
+            .unwrap()
+            .row(at, &bk);
+        p.seat = Some(gk::SeatKeying {
+            b: x.b,
+            base_v: x.v,
+            s: s2,
+            from: by.by().into(),
+            welcome: None,
+            row: Some(row),
+            ratchets: vec![],
+        });
+        let out = d.take(p, w.now);
+        assert_eq!(
+            d.keying.current_epoch(TEXT_ID).map(|e| e.epoch),
+            Some(w.head.header().epoch),
+            "the push is taken (in set {in_set})"
+        );
+        assert_eq!(
+            self_rows_of(&w, &out, &seat, &keys, &s_m),
+            vec![],
+            "no self-row for the forged s_m (in set {in_set})"
+        );
+        let held = d.keying.groups[TEXT_ID].bks.get(&(x.b, x.v)).map(|k| **k);
+        assert_ne!(
+            held,
+            Some(bk),
+            "the forged BK is not kept (in set {in_set})"
+        );
+    }
 }
 
 /// J8K review: a welcome's `s_m` and `BK` are the member's only once the seal they opened
 /// gave a key that passed `confirm`. A relay rides a welcome of its own pair to our seat's
 /// version (under our seed, an `s_m` and `BK` of its choosing) and a seal under that `BK` on a
 /// real push of a Join: its key fails `confirm`, and nothing of the welcome is kept. At the
-/// next opening our bucket is re-keyed by a row under the real `s_m`, and it opens.
+/// next opening our bucket is re-keyed by a row under the real `s_m`, and it opens. RV repair:
+/// the relay's pair is now refused as no keyholder of the set (`maker_ok`), so the same is
+/// tried from an entry of the set: it is `confirm` that keeps its `s_m` and `BK` out.
 #[test]
 fn a_welcome_whose_seal_fails_confirm_leaves_the_seats_s_m_as_it_was() {
     use crate::group_key::{seal, seat_welcome, Epoch, Them, Version};
-    let mut w = World::text(true, false);
-    let keys = SeatKeys::generate(1, T0);
-    let other = crate::group_key::build::world::Member::account(8);
-    let (mut d, seat, b) = seated_account(&mut w, &keys, &[&other]);
-    assert_eq!(
-        w.bucket_of(&seat),
-        w.bucket_of(&other.seat),
-        "one bucket: its exit re-keys ours by a row"
-    );
-    let x = b.commit.welcomes.iter().find(|x| x.seat == seat).unwrap();
-    w.join(&[&crate::group_key::build::world::Member::account(9)]);
-    let relay = relay_pair();
-    let public = keys.pair.public();
-    let to = Them {
-        m: MemberId::Account([7; 16]),
-        keys: &public,
-    };
-    let (s_m, bk, ck) = ([0x33; 32], [0x5a; 32], [0xa5; 32]);
-    let at = Version { b: x.b, v: x.v };
-    let ep = Epoch {
-        e: w.head.header().epoch,
-        d_e: w.head.d_e(),
-    };
-    let mut p = push(&w);
-    p.seat = Some(gk::SeatKeying {
-        b: x.b,
-        base_v: x.v,
-        s: x.s,
-        from: relay.by().into(),
-        welcome: Some(seat_welcome(&w.g, x.s, at, &relay.me(), &to, &s_m, &bk).unwrap()),
-        row: None,
-        ratchets: vec![],
-    });
-    p.seal = Some(seal(&w.g, &ep, at, &bk, &ck));
-    let out = d.take(p, w.now);
-    assert!(out.self_rows.is_empty(), "no self-row for the relay's s_m");
-    // The next opening: its row to our seat is under the real `s_m`
-    let due = w.exits(&[other.seat], DueKind::Exits);
-    let opened = w.open(&due);
-    let p = piece(&w, &opened, &seat, &[]);
-    assert!(
-        p.seat
-            .as_ref()
-            .is_some_and(|k| k.row.is_some() && k.s == x.s),
-        "keyed by a row under our seed"
-    );
-    d.take(p, w.now);
-    assert_eq!(
-        d.keying.current_epoch(TEXT_ID).map(|e| e.epoch),
-        Some(w.head.header().epoch),
-        "the opening's key, by our s_m"
-    );
+    for in_set in [false, true] {
+        let mut w = World::text(true, false);
+        let keys = SeatKeys::generate(1, T0);
+        let other = crate::group_key::build::world::Member::account(8);
+        let (mut d, seat, b) = seated_account(&mut w, &keys, &[&other]);
+        assert_eq!(
+            w.bucket_of(&seat),
+            w.bucket_of(&other.seat),
+            "one bucket: its exit re-keys ours by a row"
+        );
+        let x = b.commit.welcomes.iter().find(|x| x.seat == seat).unwrap();
+        w.join(&[&crate::group_key::build::world::Member::account(9)]);
+        let relay = relay_pair();
+        let by = if in_set { &w.holders[0] } else { &relay };
+        let public = keys.pair.public();
+        let to = Them {
+            m: MemberId::Account([7; 16]),
+            keys: &public,
+        };
+        let (s_m, bk, ck) = ([0x33; 32], [0x5a; 32], [0xa5; 32]);
+        let at = Version { b: x.b, v: x.v };
+        let ep = Epoch {
+            e: w.head.header().epoch,
+            d_e: w.head.d_e(),
+        };
+        let mut p = push(&w);
+        p.seat = Some(gk::SeatKeying {
+            b: x.b,
+            base_v: x.v,
+            s: x.s,
+            from: by.by().into(),
+            welcome: Some(seat_welcome(&w.g, x.s, at, &by.me(), &to, &s_m, &bk).unwrap()),
+            row: None,
+            ratchets: vec![],
+        });
+        p.seal = Some(seal(&w.g, &ep, at, &bk, &ck));
+        let out = d.take(p, w.now);
+        assert!(
+            out.self_rows.is_empty(),
+            "no self-row for the forged s_m (in set {in_set})"
+        );
+        let held = d.keying.groups[TEXT_ID].bks.get(&(x.b, x.v)).map(|k| **k);
+        assert_ne!(
+            held,
+            Some(bk),
+            "the forged BK is not kept (in set {in_set})"
+        );
+        // The next opening: its row to our seat is under the real `s_m`
+        let due = w.exits(&[other.seat], DueKind::Exits);
+        let opened = w.open(&due);
+        let p = piece(&w, &opened, &seat, &[]);
+        assert!(
+            p.seat
+                .as_ref()
+                .is_some_and(|k| k.row.is_some() && k.s == x.s),
+            "keyed by a row under our seed"
+        );
+        d.take(p, w.now);
+        assert_eq!(
+            d.keying.current_epoch(TEXT_ID).map(|e| e.epoch),
+            Some(w.head.header().epoch),
+            "the opening's key, by our s_m (in set {in_set})"
+        );
+    }
 }
 
 /// A seed welcome's `s_m` alone in a piece (a seed page, R1 `seeded`) waits for a row under
@@ -1817,4 +2170,588 @@ fn a_seed_welcome_alone_waits_for_its_row_and_the_self_row_seals_the_confirmed_s
         vec![(x.s, true)],
         "its self-row seals the s_m the key came through"
     );
+}
+
+// ── a keying's maker, a keyholder entry of the set (RV) ──
+
+/// A relay's welcome to our seat's version, under seed `s`, with `s_m` and `BK` of its
+/// choosing, and the seal under that `BK` of `ck`: what the relay sends with the head.
+#[allow(clippy::too_many_arguments)]
+fn forged_keying(
+    w: &World,
+    seat: &SeatRef,
+    keys: &SeatKeys,
+    from: &crate::group_key::build::world::Holder,
+    s: u32,
+    s_m: &[u8; 32],
+    bk: &[u8; 32],
+    ck: &[u8; 32],
+) -> gk::InPiece {
+    use crate::group_key::{seal, seat_welcome, Epoch, Them, Version};
+    let leaves: Vec<Leaf> = w.leaves.iter().map(|l| l.leaf).collect();
+    let i = w
+        .leaves
+        .iter()
+        .position(|l| l.seats.contains(seat))
+        .unwrap();
+    let at = Version {
+        b: leaves[i].b,
+        v: leaves[i].v,
+    };
+    let public = keys.pair.public();
+    let to = Them {
+        m: seat.m,
+        keys: &public,
+    };
+    let ep = Epoch {
+        e: w.head.header().epoch,
+        d_e: w.head.d_e(),
+    };
+    gk::InPiece {
+        head: Some(link(&w.head)),
+        pushed: true,
+        leaf: Some(leaves[i].into()),
+        path: Some(inclusion_path(&leaves, i).unwrap().try_into().unwrap()),
+        seal: Some(seal(&w.g, &ep, at, bk, ck)),
+        seat: Some(gk::SeatKeying {
+            b: at.b,
+            base_v: at.v,
+            s,
+            from: from.by().into(),
+            welcome: Some(seat_welcome(&w.g, s, at, &from.me(), &to, s_m, bk).unwrap()),
+            row: None,
+            ratchets: vec![],
+        }),
+        ..Default::default()
+    }
+}
+
+/// The `BK` our seat holds of the version the head names for it.
+fn held_bk(w: &World, d: &Device, seat: &SeatRef) -> Option<[u8; 32]> {
+    let l = w
+        .leaves
+        .iter()
+        .find(|l| l.seats.contains(seat))
+        .unwrap()
+        .leaf;
+    d.keying.groups[TEXT_ID].bks.get(&(l.b, l.v)).map(|k| **k)
+}
+
+/// RV (member.rs `key_in`): a relay that holds a seat in the group knows the epoch's `CK`.
+/// Its welcome to our seat's version, from a pair of its own, with an `s_m` and `BK` of its
+/// choosing and the seal of the real `CK` under that `BK`, passes `confirm`: the maker is
+/// what binds it. It is refused before it opens: our `BK` stays, and no self-row seals its
+/// `s_m` (the binding alone counts a self-row's `s_m` as our own, `kept.rs`), under our
+/// seed or one above the head's.
+#[test]
+fn a_welcome_from_a_pair_in_no_set_is_refused_though_its_seal_confirms() {
+    let mut w = World::text(true, false);
+    let keys = SeatKeys::generate(1, T0);
+    let (mut d, seat, _) = seated_account(&mut w, &keys, &[]);
+    // The relay's seat: it holds the epoch's key
+    let next = w.join(&[&crate::group_key::build::world::Member::account(8)]);
+    let before = held_bk(&w, &d, &seat).expect("our seat's BK");
+    let s = w.head.header().seed;
+    let relay = relay_pair();
+    for s in [s, s + 1] {
+        let p = forged_keying(
+            &w,
+            &seat,
+            &keys,
+            &relay,
+            s,
+            &[0x33; 32],
+            &[0x5a; 32],
+            &next.ck,
+        );
+        let out = d.take(p, w.now);
+        assert_eq!(
+            d.keying.current_epoch(TEXT_ID).map(|e| e.epoch),
+            Some(w.head.header().epoch),
+            "the head is taken"
+        );
+        assert_eq!(
+            held_bk(&w, &d, &seat),
+            Some(before),
+            "our BK stays, seed {s}"
+        );
+        assert!(out.self_rows.is_empty(), "no self-row, seed {s}");
+    }
+}
+
+/// RV (member.rs `key_in`): a KeyholdersRemove re-keys every bucket, so nothing after it
+/// comes from an entry it removed. A removed desktop whose account keeps an entry still
+/// signs as that account; with a seat's `CK` its old pair's welcome would pass `confirm`.
+/// The member holds the set that pair was in (the Add before), and still refuses it.
+#[test]
+fn a_welcome_from_a_removed_keyholders_pair_is_refused_though_the_set_it_was_in_is_held() {
+    let mut w = World::text(true, false);
+    let keys = SeatKeys::generate(1, T0);
+    let (mut d, seat, _) = seated_account(&mut w, &keys, &[]);
+    w.promote(crate::group_key::build::world::Holder::desktop(2));
+    d.take(push(&w), w.now);
+    let add = w.kh.clone();
+    assert!(d.keying.groups[TEXT_ID].kh_seen.contains_key(&add.d()));
+    // The other keyholder removes the first
+    w.holders.swap(0, 1);
+    let due = w.remove_due(1);
+    let removed = w.opening(&due).unwrap();
+    w.step(&due, &removed);
+    let gone = w.holders.remove(1);
+    d.take(piece(&w, &removed, &seat, &[]), w.now);
+    assert_eq!(
+        d.keying.current_epoch(TEXT_ID).map(|e| e.epoch),
+        Some(w.head.header().epoch),
+        "the removal's key, by its row"
+    );
+    let before = held_bk(&w, &d, &seat).expect("our seat's BK");
+    let s = w.head.header().seed;
+    let p = forged_keying(
+        &w,
+        &seat,
+        &keys,
+        &gone,
+        s,
+        &[0x33; 32],
+        &[0x5a; 32],
+        &removed.ck,
+    );
+    let out = d.take(p, w.now);
+    assert_eq!(held_bk(&w, &d, &seat), Some(before), "our BK stays");
+    assert!(out.self_rows.is_empty(), "no self-row");
+}
+
+/// RV, the control: a KeyholdersReplace keeps the versions it does not re-key, with the
+/// old pair's welcomes. One opens after it: on this device, on a restart from what it kept
+/// (`LocalFloor::kh_chain`), on a new device of the account, which walks from the Genesis,
+/// and on a browser that starts from its vault floor at the Replace, by the set before it
+/// the relay sends with the floor's `kh` (`InPiece::kh_before`); without that set it opens
+/// nothing there.
+#[test]
+fn a_version_the_old_pair_welcomed_opens_after_its_replace_after_a_restart_and_on_a_new_device() {
+    let mut w = World::text(true, false);
+    let keys = SeatKeys::generate(1, T0);
+    let (mut d, seat, b) = seated_account(&mut w, &keys, &[]);
+    let x = b.commit.welcomes.iter().find(|x| x.seat == seat).unwrap();
+    let old = w.holders[0].by();
+    let genesis = w.kh.clone();
+    let new = w.holders[0].rotated();
+    let due = w.replace_due(&new);
+    let rb = w.opening_by(0, &due, false, Some(&new), None).unwrap();
+    w.step(&due, &rb);
+    w.holders[0] = new;
+    assert_eq!(w.head.header().kind, Kind::KeyholdersReplace);
+    assert!(
+        w.leaves.iter().any(|l| (l.leaf.b, l.leaf.v) == (x.b, x.v)),
+        "our version is kept"
+    );
+    let keyed = |walk: &[&SignedHeader]| {
+        let mut p = piece(&w, &rb, &seat, walk);
+        p.seat = Some(gk::SeatKeying {
+            b: x.b,
+            base_v: x.v,
+            s: x.s,
+            from: old.into(),
+            welcome: Some(x.bytes.clone()),
+            row: None,
+            ratchets: vec![],
+        });
+        p
+    };
+    d.take(keyed(&[]), w.now);
+    let at_head = |d: &Device| d.keying.current_epoch(TEXT_ID).map(|e| e.epoch);
+    assert_eq!(at_head(&d), Some(w.head.header().epoch), "this device");
+    let mut again = Device::account(20, [7; 16], seat_keys::copy(&keys));
+    again.keying.local = d.keying.local().cloned();
+    again.track(TEXT_ID, GroupKind::Text, VaultFloor::None);
+    again.take(keyed(&[]), w.now);
+    assert_eq!(
+        at_head(&again),
+        Some(w.head.header().epoch),
+        "after a restart"
+    );
+    let mut fresh = Device::account(21, [7; 16], seat_keys::copy(&keys));
+    fresh.track(TEXT_ID, GroupKind::Text, VaultFloor::None);
+    fresh.take(keyed(&[&genesis]), w.now);
+    assert_eq!(at_head(&fresh), Some(w.head.header().epoch), "a new device");
+    let floor = d.keying.groups[TEXT_ID].floor.clone().unwrap();
+    assert_eq!(floor.kh, rb.header.d(), "the vault floor names the Replace");
+    for sent in [true, false] {
+        // A browser keeps no local floor: it starts from the vault's
+        let mut web = Device::account(22, [7; 16], seat_keys::copy(&keys));
+        web.track(
+            TEXT_ID,
+            GroupKind::Text,
+            VaultFloor::Some(Box::new(floor.clone()), None),
+        );
+        let mut p = keyed(&[]);
+        p.kh = Some(header_in(&rb.header));
+        if sent {
+            p.kh_before = vec![header_in(&genesis)];
+        }
+        web.take(p, w.now);
+        let want = sent.then_some(w.head.header().epoch);
+        assert_eq!(
+            at_head(&web),
+            want,
+            "a browser's vault floor, the set sent {sent}"
+        );
+    }
+}
+
+/// RV (member.rs `take_header`, `moved_to`): a Regenesis a member takes as a walk link, not
+/// as the head (it was away, or the relay pushed it to nobody), is told as made anew, by
+/// its volunteer; and the set in force is told, as at a head that sets it. The control: the
+/// same Regenesis taken as the head tells both too.
+#[test]
+fn a_regenesis_taken_on_a_walk_is_told_as_made_anew_and_its_set_named() {
+    for as_head in [false, true] {
+        let mut w = World::text(true, false);
+        let keys = SeatKeys::generate(1, T0);
+        let copy = seat_keys::copy(&keys);
+        let mut d = Device::account(20, [7; 16], keys);
+        let out = d.track(TEXT_ID, GroupKind::Text, VaultFloor::None);
+        let j = d.joiner(&out, Some(&copy));
+        let seat = j.seat;
+        let b = join(&mut w, vec![j]);
+        let genesis = w.kh.clone();
+        d.take(piece(&w, &b, &seat, &[&genesis]), w.now);
+        let parent = w.head.clone();
+        w.tick(3600);
+        w.no_keyholder_since = Some(w.now - 3600);
+        let vol = crate::group_key::build::world::Holder::desktop(9);
+        let due = Due {
+            joiners: vec![vol.seat.joiner()],
+            volunteer: Some(vol.candidate()),
+            ..w.due(DueKind::Regenesis)
+        };
+        let rb = World::build_start(&vol, w.kind, w.id, true, &due, w.now, Some(&parent)).unwrap();
+        w.holders = vec![vol];
+        w.step(&due, &rb);
+        let regen = w.head.clone();
+        let mut events = vec![];
+        if as_head {
+            let mut p = push(&w);
+            p.head.as_mut().unwrap().parent = Some(header_in(&parent));
+            events.extend(d.take(p, w.now).events);
+        }
+        let j = d.joiner(&out, Some(&copy));
+        let jb = join(&mut w, vec![j]);
+        let mut p = piece(&w, &jb, &seat, &[]);
+        if !as_head {
+            p.walk = vec![gk::WalkLinkIn {
+                header: header_in(&regen),
+                parent: Some(header_in(&parent)),
+            }];
+        }
+        events.extend(d.take(p, w.now).events);
+        assert_eq!(
+            d.keying.groups[TEXT_ID].floor.as_ref().unwrap().d,
+            w.head.d(),
+            "taken, as head {as_head}"
+        );
+        let by = Some(w.holders[0].m);
+        assert!(
+            events.contains(&GkEvent::Anew {
+                channel_id: TEXT,
+                by
+            }),
+            "made anew, as head {as_head}: {events:?}"
+        );
+        assert!(
+            events.contains(&GkEvent::Keyholders {
+                channel_id: TEXT,
+                holders: vec![by]
+            }),
+            "its set, as head {as_head}: {events:?}"
+        );
+    }
+}
+
+/// RV (member.rs `tell_keyholders`): the set in force is told once a run, whatever header
+/// came first: after a restart the first head is a Join under the same set, and the app's
+/// "Keys held by" list, gone with the connection, is told again. Not again at the next.
+#[test]
+fn a_restarted_member_is_told_the_set_in_force_once_a_run() {
+    let mut w = World::text(true, false);
+    let keys = SeatKeys::generate(1, T0);
+    let copy = seat_keys::copy(&keys);
+    let mut d = Device::account(20, [7; 16], keys);
+    let out = d.track(TEXT_ID, GroupKind::Text, VaultFloor::None);
+    let j = d.joiner(&out, Some(&copy));
+    let seat = j.seat;
+    let b = join(&mut w, vec![j]);
+    let genesis = w.kh.clone();
+    d.take(piece(&w, &b, &seat, &[&genesis]), w.now);
+    let told = |out: &GkOut| {
+        out.events
+            .iter()
+            .filter(|e| matches!(e, GkEvent::Keyholders { .. }))
+            .count()
+    };
+    let mut again = Device::account(20, [7; 16], seat_keys::copy(&copy));
+    again.keying.local = d.keying.local().cloned();
+    again.track(TEXT_ID, GroupKind::Text, VaultFloor::None);
+    w.join(&[&crate::group_key::build::world::Member::account(8)]);
+    assert_eq!(w.head.header().kind, Kind::Join);
+    assert_eq!(
+        told(&again.take(push(&w), w.now)),
+        1,
+        "told at the first head"
+    );
+    w.join(&[&crate::group_key::build::world::Member::account(9)]);
+    assert_eq!(told(&again.take(push(&w), w.now)), 0, "not again");
+    assert_eq!(
+        again.keying.groups[TEXT_ID].floor.as_ref().unwrap().d,
+        w.head.d()
+    );
+}
+
+/// RV (member.rs `key_in`, §7 Q11): a holder of the account's `IK` and no keyholder pair
+/// of the set (a vault thief, another device of the account) signs a Fresh as the
+/// account's entry, which rule 2 takes, and keys our version by rows from a pair of its
+/// own. The header's signer chose its `CK`, so `confirm` passes: the maker is what binds
+/// it. The relay names the pair it came from; it is in no set, so nothing opens.
+#[test]
+fn a_fresh_the_accounts_ik_signed_with_rows_from_a_pair_in_no_set_is_refused() {
+    let mut w = World::text(true, false);
+    let keys = SeatKeys::generate(1, T0);
+    let (mut d, seat, _) = seated_account(&mut w, &keys, &[]);
+    let entry = w.holders[0].by();
+    // Same member id and `IK`, a pair of its own
+    let thief = w.holders[0].rotated();
+    w.holders[0] = thief;
+    // Every version is over an hour old: the Fresh re-keys ours by a row
+    w.tick(3700);
+    let due = w.due(DueKind::Refresh);
+    let b = w.opening(&due).unwrap();
+    assert_eq!(b.header.header().kind, Kind::Fresh);
+    assert_eq!(
+        b.header.header().signer,
+        entry.m,
+        "signed as the account's entry"
+    );
+    // The relay takes it as from the entry's pair, and names the thief's to the member
+    let a = w.check(&due, entry, &b.commit).unwrap();
+    w.take(&due, a, &b);
+    let p = piece(&w, &b, &seat, &[]);
+    assert!(p.seat.as_ref().is_some_and(|k| k.row.is_some()), "a row");
+    assert_ne!(p.seat.as_ref().unwrap().from.kx, entry.kx);
+    d.take(p, w.now);
+    assert_eq!(
+        d.keying.current_epoch(TEXT_ID).map(|e| e.epoch),
+        None,
+        "the Fresh's key is not taken"
+    );
+    assert_eq!(
+        d.keying.groups[TEXT_ID].floor.as_ref().unwrap().d,
+        w.head.d(),
+        "its header is"
+    );
+}
+
+// ── RV q9-q10:211, r-hostile:211: removals off the head's chain ──
+
+/// A gated writer (account `[7; 16]`) whose fold fails on a pin: account 30 is seated by a
+/// Join (with account 31) under an `IK` this device did not pin, and the post it then makes
+/// is held.
+fn held_on_a_pin(w: &mut World) -> (Device, SeatRef, crate::group_key::build::world::Member) {
+    let keys = SeatKeys::generate(1, T0);
+    let (mut d, seat, _) = seated_account(w, &keys, &[]);
+    let x = crate::group_key::build::world::Member::account(30);
+    let y = crate::group_key::build::world::Member::account(31);
+    d.pins.pin_new([30; 16], [0xee; 32], 0);
+    w.join(&[&x, &y]);
+    d.take(push(w), w.now);
+    let out = d.post(1, b"hi", w.now * 1000);
+    assert!(posted(&out).is_empty(), "held");
+    assert!(
+        out.events.contains(&GkEvent::State {
+            channel_id: TEXT,
+            state: GkState::Held(HeldWhy::Pin)
+        }),
+        "{:?}",
+        out.events
+    );
+    (d, seat, x)
+}
+
+/// `EpochNamesIn` with each header's lists at its place, `removed` and all.
+fn names_answer(lists: &[&SignedHeader]) -> ServerMessage {
+    ServerMessage::EpochNamesIn {
+        group: TEXT_ID.into(),
+        part: 0,
+        last: true,
+        piece: gk::NamesPiece {
+            lists: lists
+                .iter()
+                .map(|h| gk::NamesListIn::from(&crate::group_key::NamesList::of(h.header())))
+                .collect(),
+            ..Default::default()
+        },
+    }
+}
+
+/// RV q9-q10:211 and r-hostile:211: a removal counted at a fold only for being signed by a
+/// set this device holds, on any chain. A relay asks the keyholder for the exit (`O`), keeps
+/// that commit back, and has it make a Fresh on the same parent instead (`O2`), which keeps
+/// the seat. Sent `O` with the names, the writer took the seat as named and gone and posted
+/// under `O2`'s key, which the seat holds. `O`'s `removed` steps a hash `O2` does not carry.
+#[test]
+fn a_removal_off_the_heads_chain_does_not_release_a_held_fold() {
+    let mut w = World::text(true, true);
+    let (mut d, seat, x) = held_on_a_pin(&mut w);
+    let exit = w.exits(&[x.seat], DueKind::Exits);
+    let o = w.opening(&exit).unwrap();
+    let o2 = w.open(&w.due(DueKind::Refresh));
+    assert_eq!(o.header.header().parent, o2.header.header().parent);
+    assert_ne!(o.header.header().names_hash, o2.header.header().names_hash);
+    // Before the head, and after it
+    d.frame(&names_answer(&[&o.header]), w.now);
+    let out = d.take(piece(&w, &o2, &seat, &[]), w.now);
+    assert!(d.keying.current_epoch(TEXT_ID).is_some(), "O2's key opened");
+    assert!(posted(&out).is_empty(), "a sibling's removal: still held");
+    let out = d.frame(&names_answer(&[&o.header]), w.now);
+    assert!(posted(&out).is_empty(), "{:?}", out.events);
+    let out = d.tick(w.now * 1000 + CHECK_WAIT_MS);
+    assert!(posted(&out).is_empty());
+    let out = d.post(2, b"again", w.now * 1000 + CHECK_WAIT_MS);
+    assert!(posted(&out).is_empty());
+}
+
+/// RV q9-q10:211: a Regenesis lists its own signer as the set, so `check_signer` took one the
+/// relay made under an `IK` of its own. As a removal it released the held fold.
+#[test]
+fn a_removal_the_relay_made_up_does_not_release_a_held_fold() {
+    let mut w = World::text(true, true);
+    let (mut d, seat, x) = held_on_a_pin(&mut w);
+    let o2 = w.open(&w.due(DueKind::Refresh));
+    d.take(piece(&w, &o2, &seat, &[]), w.now);
+    let r_ik = IdentityKeyPair::generate(&mut crate::rng());
+    let rm = MemberId::Account([0x52; 16]);
+    let mut entry = w.kh.header().keyholders[0];
+    entry.m = rm;
+    entry.ik = crate::group_key::build::world::raw_ik(&r_ik);
+    let mut hd = o2.header.header().clone();
+    hd.kind = Kind::Regenesis;
+    hd.keyholders = vec![entry];
+    hd.signer = rm;
+    hd.removed = Removed::List(vec![x.seat]);
+    let forged = SignedHeader::sign(hd, &r_ik).unwrap();
+    let out = d.frame(&names_answer(&[&forged]), w.now);
+    assert!(posted(&out).is_empty(), "a made-up removal: still held");
+    let out = d.post(2, b"again", w.now * 1000 + CHECK_WAIT_MS);
+    assert!(posted(&out).is_empty());
+}
+
+/// r-hostile:211, the walk: a removal taken as the head counted after a walk to a head on a
+/// branch that kept the seat (the same `names_hash` as before the removal, no `added` between).
+#[test]
+fn a_removal_taken_before_a_walk_to_another_branch_does_not_release_a_held_fold() {
+    let mut w = World::text(true, true);
+    let (mut d, seat, x) = held_on_a_pin(&mut w);
+    let exit = w.exits(&[x.seat], DueKind::Exits);
+    let o = w.opening(&exit).unwrap();
+    // The relay pushes `O` alone: taken link by link, its key not sent
+    d.take(
+        gk::InPiece {
+            head: Some(link(&o.header)),
+            pushed: true,
+            ..Default::default()
+        },
+        w.now,
+    );
+    assert_eq!(
+        d.keying.groups[TEXT_ID].head.as_ref().map(|h| h.d()),
+        Some(o.header.d())
+    );
+    let _o2 = w.open(&w.due(DueKind::Refresh));
+    let h2 = w.open(&w.due(DueKind::Refresh));
+    let out = d.take(piece(&w, &h2, &seat, &[]), w.now);
+    assert_eq!(
+        d.keying.groups[TEXT_ID].head.as_ref().map(|h| h.d()),
+        Some(h2.header.d()),
+        "walked to the other branch"
+    );
+    assert!(posted(&out).is_empty(), "still held");
+    // The relay answers with that branch's lists, and with `O` again
+    let j = w.head.clone();
+    for lists in [vec![&j], vec![&o.header, &j]] {
+        let out = d.frame(&names_answer(&lists), w.now);
+        assert!(posted(&out).is_empty(), "{:?}", out.events);
+    }
+}
+
+/// The honest removal, taken link by link with its key, releases the fold, and the post goes
+/// under it; so does every post after, across a walk along the same chain (a reconnect).
+#[test]
+fn a_removal_on_the_heads_chain_releases_a_held_fold_for_good() {
+    let mut w = World::text(true, true);
+    let (mut d, seat, x) = held_on_a_pin(&mut w);
+    let exit = w.exits(&[x.seat], DueKind::Exits);
+    let o = w.open(&exit);
+    let out = d.take(piece(&w, &o, &seat, &[]), w.now);
+    assert_eq!(posted(&out).len(), 1, "{:?}", out.events);
+    let out = d.post(2, b"again", w.now * 1000);
+    assert_eq!(posted(&out).len(), 1);
+    w.open(&w.due(DueKind::Refresh));
+    let h3 = w.open(&w.due(DueKind::Refresh));
+    d.take(piece(&w, &h3, &seat, &[]), w.now);
+    let out = d.post(3, b"walked", w.now * 1000);
+    assert_eq!(posted(&out).len(), 1, "{:?}", out.events);
+}
+
+/// A held writer walked past the removal, as after a reconnect, never took it: its fold asks
+/// for the lists, the removal's among them, whose `removed` list steps the hash, and posts
+/// once they come.
+#[test]
+fn a_held_writer_walked_past_the_removal_asks_for_it_and_posts() {
+    let mut w = World::text(true, true);
+    let (mut d, seat, x) = held_on_a_pin(&mut w);
+    let exit = w.exits(&[x.seat], DueKind::Exits);
+    let o = w.open(&exit);
+    w.open(&w.due(DueKind::Refresh));
+    let h3 = w.open(&w.due(DueKind::Refresh));
+    let out = d.take(piece(&w, &h3, &seat, &[]), w.now);
+    assert!(posted(&out).is_empty(), "the removal's list is not in");
+    let asked = out
+        .send
+        .iter()
+        .chain(d.post(2, b"again", w.now * 1000).send.iter())
+        .any(|m| matches!(m, ClientMessage::EpochNames { .. }));
+    assert!(
+        asked,
+        "the lists, the openings that remove seats among them"
+    );
+    let out = d.frame(&names_answer(&[&o.header]), w.now);
+    assert_eq!(posted(&out).len(), 2, "{:?}", out.events);
+}
+
+/// Review of RV q9-q10:211, the lists: an answer's list at a place is taken over any list
+/// there before it, so a made-up one (a Join's list given a `removed` it never had) holds
+/// the fold only until the relay answers honestly. It stuck: a removal header's whole list
+/// was kept over the bare one with the same time and `added`, for the rest of the
+/// connection.
+#[test]
+fn a_made_up_list_at_a_joins_place_holds_the_fold_only_until_an_honest_answer() {
+    let mut w = World::text(true, true);
+    let keys = SeatKeys::generate(1, T0);
+    let (mut d, seat, _) = seated_account(&mut w, &keys, &[]);
+    let x = crate::group_key::build::world::Member::account(30);
+    let j = w.join(&[&x]).header;
+    let h = w.open(&w.due(DueKind::Refresh));
+    // Walked past `J`: its list is not in, and the post waits for it
+    let out = d.take(piece(&w, &h, &seat, &[]), w.now);
+    assert!(posted(&out).is_empty());
+    let out = d.post(1, b"hi", w.now * 1000);
+    assert!(posted(&out).is_empty(), "J's list is not in");
+    // The relay's made-up list at `J`'s place: `J`'s own, with a removal
+    let mut hd = j.header().clone();
+    hd.removed = Removed::List(vec![seat]);
+    let made_up = SignedHeader::sign(hd, &IdentityKeyPair::generate(&mut crate::rng())).unwrap();
+    let out = d.frame(&names_answer(&[&made_up]), w.now);
+    assert!(posted(&out).is_empty(), "the made-up list does not fold");
+    // Then the honest answer
+    let out = d.frame(&names_answer(&[&j]), w.now);
+    assert_eq!(posted(&out).len(), 1, "{:?}", out.events);
 }

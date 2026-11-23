@@ -11,6 +11,7 @@ use voipc_crypto::group_key::tree::BucketTree;
 use voipc_crypto::group_key::{seat_record, Kind, SeatRef, SignedHeader};
 use voipc_protocol::gk::{
     FloorRef, HeaderIn, InPiece, LeafIn, PathIn, RatchetStep, SeatKeying, WalkLinkIn,
+    KH_BEFORE_MOST,
 };
 
 /// Keyholder headers of a generation by `D`, a Regenesis with its parent.
@@ -39,6 +40,37 @@ pub fn link(sh: &SignedHeader, parent: Option<&SignedHeader>) -> WalkLinkIn {
         header: header_in(sh),
         parent: parent.map(header_in),
     }
+}
+
+/// The keyholder headers before `kh`, newest first: back to the parent of the oldest
+/// KeyholdersReplace since the generation's start or its last KeyholdersRemove, and at
+/// least `kh`'s own parent when `kh` is a KeyholdersAdd or a KeyholdersReplace; none
+/// else; at most `KH_BEFORE_MOST` (RV). A version a Replace kept is still keyed by the
+/// pair it swapped out, which only the sets before it name, and a member takes a keying
+/// only from a pair of a set it holds; a keyholder opens an Add's or a Replace's `KRK`
+/// welcome only as from an entry of the set before it. A browser that starts from its
+/// vault floor holds the floor's `kh` and no set before it.
+pub fn kh_before(khs: &Khs, kh: &SignedHeader) -> Vec<HeaderIn> {
+    let mut out = Vec::new();
+    let mut need = 0;
+    let mut at = kh;
+    while out.len() < KH_BEFORE_MOST {
+        let h = at.header();
+        if h.kind.starts_anew() || h.kind == Kind::KeyholdersRemove {
+            break;
+        }
+        let Some((parent, _)) = khs.get(&h.kh_parent) else {
+            break;
+        };
+        out.push(header_in(parent));
+        let own = out.len() == 1 && h.kind == Kind::KeyholdersAdd;
+        if own || h.kind == Kind::KeyholdersReplace {
+            need = out.len();
+        }
+        at = parent;
+    }
+    out.truncate(need);
+    out
 }
 
 /// What the plain-post check needs (rule 1f.1): the head's generation and epoch, and when
@@ -75,6 +107,9 @@ pub struct HeadSnapshot {
     pub tree: Arc<BucketTree>,
     pub vers: Arc<HashMap<(u64, u64), Ver>>,
     pub seals: Arc<HashMap<(u64, u64), Vec<u8>>>,
+    /// Pages go on past the floor (`GroupState::left_behind`): a seat with no seed welcome
+    /// under the head's seed is put first in the next one, as while a roll runs.
+    pub left_behind: bool,
 }
 
 impl HeadSnapshot {
@@ -158,12 +193,15 @@ impl HeadSnapshot {
         };
         let kh = have
             .filter(|f| f.gen == self.gen() && kh_sent != Some(f.kh))
-            .and_then(|f| self.khs.get(&f.kh))
-            .map(|(sh, _)| header_in(sh));
+            .and_then(|f| self.khs.get(&f.kh));
+        let kh_before = kh
+            .map(|(sh, _)| kh_before(&self.khs, sh))
+            .unwrap_or_default();
         InPiece {
             chain: chain.unwrap_or_default(),
             walk,
-            kh,
+            kh: kh.map(|(sh, _)| header_in(sh)),
+            kh_before,
             head: Some(link(&self.head, self.parent.as_ref())),
             opening: (h.kind == Kind::Join).then(|| header_in(&self.opening)),
             ..InPiece::default()
@@ -292,5 +330,132 @@ impl HeadSnapshot {
         let (l, i) = self.version_of(seat)?;
         let ver = self.vers.get(&(l.leaf.b, l.leaf.v))?;
         Some((l.leaf.b, ver.base_v, i))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use voipc_crypto::generate_identity_key_pair;
+    use voipc_crypto::group_key::{
+        Added, GroupKind, HeaderV1, Keyholder, Kind, MemberId, Origin, Removed, SignedHeader,
+    };
+    use voipc_crypto::IdentityKeyPair;
+    use voipc_protocol::gk::KH_BEFORE_MOST;
+
+    use super::{header_in, kh_before, Khs};
+
+    fn raw(ik: &IdentityKeyPair) -> [u8; 32] {
+        ik.public_key().public_key_bytes().try_into().unwrap()
+    }
+
+    /// A desktop entry of account `a` with its own pair.
+    fn entry(a: u8, ik: &IdentityKeyPair, n: u32) -> Keyholder {
+        Keyholder {
+            m: MemberId::Account([a; 16]),
+            u: None,
+            origin: Origin::Desktop as u8,
+            n,
+            ik: raw(ik),
+            kx: raw(&generate_identity_key_pair()),
+            tag_kk: [a; 8],
+        }
+    }
+
+    /// A keyholder header of `kind` after `parent`, setting `set`.
+    fn kh(
+        kind: Kind,
+        parent: Option<&SignedHeader>,
+        mut set: Vec<Keyholder>,
+        ik: &IdentityKeyPair,
+    ) -> SignedHeader {
+        set.sort_by_key(|k| postcard::to_allocvec(k).unwrap());
+        let epoch = parent.map_or(1, |p| p.header().epoch + 1);
+        let d = parent.map_or([0; 32], SignedHeader::d);
+        let h = HeaderV1 {
+            group_kind: GroupKind::Text,
+            group: "c:snap".into(),
+            gen: [1; 16],
+            epoch,
+            join: 0,
+            kind,
+            time: 1_000 + u64::from(epoch),
+            parent: d,
+            epoch_parent: [0; 32],
+            kh_parent: d,
+            signer: set[0].m,
+            keyholders: set,
+            gated: false,
+            seed: 1,
+            seed_floor: 1,
+            exits_upto: 0,
+            seats: 1,
+            buckets: 1,
+            conn_seats: 0,
+            bucket_root: [0; 32],
+            keyring_hash: [0; 32],
+            names_hash: [0; 32],
+            added: Added::Count(0),
+            removed: Removed::Count(0),
+            confirm: [0; 32],
+        };
+        SignedHeader::sign(h, ik).unwrap()
+    }
+
+    /// RV: with the floor's `kh` the relay sends the sets before it a member needs to take
+    /// a keying from a pair a Replace swapped out, and a keyholder an Add's or a Replace's
+    /// `KRK` welcome: back to the oldest Replace's parent, the parent of an Add or Replace
+    /// `kh` itself, and nothing past a KeyholdersRemove or the generation's start.
+    #[test]
+    fn the_sets_before_the_floors_kh_go_back_to_the_oldest_replaces_parent() {
+        let ik = generate_identity_key_pair();
+        let (a, b) = (entry(1, &ik, 1), entry(2, &ik, 1));
+        let mut a2 = entry(1, &ik, 2);
+        a2.tag_kk = [9; 8];
+        let genesis = kh(Kind::Genesis, None, vec![a], &ik);
+        let add = kh(Kind::KeyholdersAdd, Some(&genesis), vec![a, b], &ik);
+        let replace = kh(Kind::KeyholdersReplace, Some(&add), vec![a2, b], &ik);
+        let add2 = kh(
+            Kind::KeyholdersAdd,
+            Some(&replace),
+            vec![a2, b, entry(3, &ik, 1)],
+            &ik,
+        );
+        let remove = kh(Kind::KeyholdersRemove, Some(&add2), vec![a2, b], &ik);
+        let add3 = kh(
+            Kind::KeyholdersAdd,
+            Some(&remove),
+            vec![a2, b, entry(4, &ik, 1)],
+            &ik,
+        );
+        let khs: Khs = [&genesis, &add, &replace, &add2, &remove, &add3]
+            .into_iter()
+            .map(|h| (h.d(), (h.clone(), None)))
+            .collect();
+        let sent = |h: &SignedHeader| kh_before(&khs, h);
+        assert_eq!(sent(&genesis), vec![], "a start has none before it");
+        assert_eq!(sent(&add), vec![header_in(&genesis)], "an Add's parent");
+        assert_eq!(sent(&replace), vec![header_in(&add)], "a Replace's parent");
+        assert_eq!(
+            sent(&add2),
+            vec![header_in(&replace), header_in(&add)],
+            "back to the Replace's parent"
+        );
+        assert_eq!(sent(&remove), vec![], "a Remove re-keyed every bucket");
+        assert_eq!(sent(&add3), vec![header_in(&remove)], "not past the Remove");
+        // A Replace further back than `KH_BEFORE_MOST` sets is out of reach: an Add `kh`
+        // still gets its own parent
+        let mut at = replace.clone();
+        let mut more = khs.clone();
+        for i in 0..KH_BEFORE_MOST as u8 + 2 {
+            let mut set = at.header().keyholders.clone();
+            set.truncate(2);
+            set.push(entry(10 + i, &ik, 1));
+            at = kh(Kind::KeyholdersAdd, Some(&at), set, &ik);
+            more.insert(at.d(), (at.clone(), None));
+        }
+        assert_eq!(
+            kh_before(&more, &at),
+            vec![header_in(&more[&at.header().kh_parent].0)]
+        );
     }
 }

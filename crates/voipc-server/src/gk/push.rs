@@ -93,6 +93,7 @@ pub fn epoch_in(group: &str, whole: InPiece) -> Vec<ServerMessage> {
         chain,
         walk,
         kh,
+        kh_before,
         head,
         opening,
         own_join,
@@ -124,6 +125,7 @@ pub fn epoch_in(group: &str, whole: InPiece) -> Vec<ServerMessage> {
     cut.option(seed_welcome, |p, x| p.seed_welcome = Some(x));
     cut.list(chain, |p, x| p.chain.push(x));
     cut.list(walk, |p, x| p.walk.push(x));
+    cut.list(kh_before, |p, x| p.kh_before.push(x));
     cut.list(self_rows, |p, x| p.self_rows.push(x));
     parts(cut.done(), |part, last, piece| ServerMessage::EpochIn {
         group: group.to_string(),
@@ -220,17 +222,11 @@ pub fn keyring_in(
 
 /// `EpochNamesIn` for `group`, in parts.
 pub fn names_in(group: &str, whole: NamesPiece) -> Vec<ServerMessage> {
-    let NamesPiece {
-        lists,
-        joins,
-        removals,
-        gone,
-    } = whole;
+    let NamesPiece { lists, joins, gone } = whole;
     let mut cut = Cut::new(NamesPiece::default(), group);
     cut.option(gone, |p, x| p.gone = Some(x));
     cut.list(lists, |p, x| p.lists.push(x));
     cut.list(joins, |p, x| p.joins.push(x));
-    cut.list(removals, |p, x| p.removals.push(x));
     parts(cut.done(), |part, last, piece| {
         ServerMessage::EpochNamesIn {
             group: group.to_string(),

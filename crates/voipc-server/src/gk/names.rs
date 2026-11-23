@@ -2,20 +2,23 @@
 //! list, the list of each header a fold may start from (a Genesis, a Regenesis, the opening
 //! that turned `gated` on: §11.3, plan 2g "the gate-on opening is both 0 and 1"), and each
 //! opening header that carries a `removed` list, kept `NAMES_KEPT` by the relay's clock, with
-//! the step before the oldest list kept (a "gone" answer, §4.4 rule 4). Stored groups keep
-//! the same in `voipc_gk_names` and load it back (2e "state is in the store").
+//! the step before the oldest list kept (a "gone" answer, §4.4 rule 4). A `removed` list
+//! steps `names_hash` as an `added` one does, so such a header is a step of its own, and its
+//! list goes bare among the others, `removed` and all: 33 B a seat and its place, as §8
+//! counts an exit. Stored groups keep the same in `voipc_gk_names` and load it back (2e
+//! "state is in the store").
 //!
 //! `EpochNames.from` is the writer's names floor, which it has folded already: the relay
 //! answers from it inclusive (a list at `from` itself is one the writer skips), so a fold
 //! from the start may ask from `(gated_start - 1, 0)` or `(0, 0)` (C3b names.rs says the
 //! same).
 
+use std::collections::BTreeMap;
+
 use voipc_crypto::group_key::{
     names_start, NamesList, NamesStep, Removed, SignedHeader, NAMES_KEPT,
 };
 use voipc_protocol::gk::{NamesListIn, NamesPiece, NamesRef, NamesStepIn};
-
-use super::snapshot::header_in;
 
 /// One kept list: its generation, the list, and the header's `names_hash` (the hash after
 /// it), from which the step before the oldest is made when it is swept.
@@ -110,6 +113,39 @@ impl Names {
         self.step = step;
     }
 
+    /// Every list of `gen` this relay holds that `keep` takes by its place, in order, each
+    /// with the hash after it: the kept lists, and the headers carrying `removed`, whose
+    /// list (`removed` and all, as it steps the hash) stands over a kept one at its place
+    /// (a start header that removes seats is both).
+    fn merged(
+        &self,
+        gen: &[u8; 16],
+        keep: impl Fn(u32, u32) -> bool,
+    ) -> BTreeMap<(u32, u32), (NamesListIn, [u8; 32])> {
+        let mut all = BTreeMap::new();
+        for k in self.lists.iter().filter(|k| k.gen == *gen) {
+            if keep(k.list.epoch, k.list.join) {
+                all.insert((k.list.epoch, k.list.join), (k.list.clone(), k.hash));
+            }
+        }
+        for (_, h) in self.removals.iter().filter(|(g, _)| g == gen) {
+            let hd = h.header();
+            if keep(hd.epoch, hd.join) {
+                let list = NamesListIn::from(&NamesList::of(hd));
+                all.insert((hd.epoch, hd.join), (list, hd.names_hash));
+            }
+        }
+        all
+    }
+
+    /// Every step of `gen`'s hash this relay holds, in order, each with the hash after it.
+    fn steps(&self, gen: &[u8; 16]) -> Vec<(NamesList, [u8; 32])> {
+        self.merged(gen, |_, _| true)
+            .into_values()
+            .filter_map(|(l, hash)| Some((NamesList::try_from(&l).ok()?, hash)))
+            .collect()
+    }
+
     /// Drops what is older than `NAMES_KEPT` at `now` (unix s), and another generation's;
     /// the step of the newest list dropped that moved the hash is kept for "gone" answers.
     pub fn sweep(&mut self, gen: &[u8; 16], now: u64) {
@@ -122,22 +158,16 @@ impl Names {
             .as_ref()
             .map_or([0; 32], |(_, s)| NamesStep::from(*s).hash());
         let mut made = None;
-        for k in &self.lists {
-            if k.gen != *gen {
-                continue;
-            }
-            if k.list.time >= floor {
+        for (list, hash) in self.steps(gen) {
+            if list.time >= floor {
                 break;
             }
-            let Ok(list) = NamesList::try_from(&k.list) else {
-                continue;
-            };
-            let start = names_start(&list) == k.hash;
-            if start || k.hash != before {
+            let start = names_start(&list) == hash;
+            if start || hash != before {
                 let from = if start { [0; 32] } else { before };
                 made = Some(NamesStepIn::from(&list.step_from(&from)));
             }
-            before = k.hash;
+            before = hash;
         }
         self.lists.retain(|k| k.gen == *gen && k.list.time >= floor);
         self.removals
@@ -162,37 +192,20 @@ impl Names {
         self.swept.take()
     }
 
-    /// The lists from `from` to `to`, and with `removals` the headers carrying `removed`
-    /// lists between; "gone" with the step before the oldest kept list when `from` lies
-    /// before that step (lists it needs were swept).
-    pub fn answer(&self, from: &NamesRef, to: &NamesRef, removals: bool) -> NamesPiece {
+    /// The lists from `from` to `to`, the openings between that remove seats among them;
+    /// "gone" with the step before the oldest kept list when `from` lies before that step
+    /// (lists it needs were swept).
+    pub fn answer(&self, from: &NamesRef, to: &NamesRef) -> NamesPiece {
         let gone = self
             .step
             .as_ref()
             .filter(|(g, s)| *g == from.gen && (from.epoch, from.join) < (s.epoch, s.join))
             .map(|(_, s)| *s);
+        let lists = self.merged(&from.gen, |epoch, join| {
+            at(&from.gen, epoch, join, from) && upto(epoch, join, to)
+        });
         NamesPiece {
-            lists: self
-                .lists
-                .iter()
-                .filter(|k| {
-                    at(&k.gen, k.list.epoch, k.list.join, from)
-                        && upto(k.list.epoch, k.list.join, to)
-                })
-                .map(|k| k.list.clone())
-                .collect(),
-            removals: if removals {
-                self.removals
-                    .iter()
-                    .filter(|(g, h)| {
-                        let h = h.header();
-                        at(g, h.epoch, h.join, from) && upto(h.epoch, h.join, to)
-                    })
-                    .map(|(_, h)| header_in(h))
-                    .collect()
-            } else {
-                vec![]
-            },
+            lists: lists.into_values().map(|(l, _)| l).collect(),
             gone,
             ..NamesPiece::default()
         }

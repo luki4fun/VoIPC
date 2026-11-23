@@ -278,6 +278,8 @@ impl AccountSession {
         let key_set = upgrade.as_ref().map(|_| "");
         first.extend(upgrade);
         sync.set_protocol(proto);
+        // The kept key goes before anything joins a log, so a sharer answering us finds it
+        first.extend(sync.kem_first());
         let signed_in = json!({
             "name": signed.name,
             "relay_id": hex(&signed.relay_id),
@@ -981,10 +983,14 @@ impl AccountSession {
 
     // ── the group key (plan 3d, 3e) ──
 
-    /// `ServerMessage::GroupKeys`: the floors are read and the seat keys made, rotated or
-    /// published. The seat keys go to `GkStart::seat_keys` (`Actions::seat_keys`).
-    pub fn gk_on(&mut self, on: bool) -> Actions {
-        let mut a = Actions::sending(self.sync.gk_on(on));
+    /// `ServerMessage::GroupKeys`, at the relay's clock `relay_clock` (unix seconds): the
+    /// floors are read and the seat keys made, rotated or published. The seat keys go to
+    /// `GkStart::seat_keys` (`Actions::seat_keys`). `reset`: the first sign-in with the group
+    /// key on since a reset with the recovery key, whose seat keys rotate before anything
+    /// else (§5.11): the old keys are neither published again nor handed to `GroupKeying`
+    /// (RV q8-q11). The host's one way in, so none can rotate after the old keys went out.
+    pub fn gk_begin(&mut self, on: bool, relay_clock: u64, reset: bool) -> Actions {
+        let mut a = Actions::sending(self.sync.gk_begin(on, relay_clock, reset));
         self.gk_news(&mut a);
         a
     }
@@ -1024,8 +1030,7 @@ impl AccountSession {
         Actions::sending(self.sync.seat_keys_wanted())
     }
 
-    /// The seat keys rotate (§5.11): on a password change and a device removed by itself, and
-    /// by the host after a sign-in that used the recovery key.
+    /// The seat keys rotate (§5.11): on a password change and a device removed by itself.
     pub fn seat_keys_rotate(&mut self) -> Actions {
         let mut a = Actions::sending(self.sync.seat_keys_rotate());
         self.gk_news(&mut a);
@@ -3136,7 +3141,7 @@ mod tests {
     fn a_password_change_or_a_removed_device_rotates_the_seat_keys() {
         let (mut s, _) = session(false, false);
         let item = crate::group_key::ITEM_SEAT_KEM;
-        assert_eq!(sends(&s.gk_on(true), "VaultPut"), 1);
+        assert_eq!(sends(&s.gk_begin(true, 0, false), "VaultPut"), 1);
         let a = s.on_reply(&AccountReply::VaultStored {
             k: item.into(),
             version: 1,

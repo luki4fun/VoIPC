@@ -241,8 +241,10 @@ WantedBy=multi-user.target
   at its next start every channel with a key starts a new generation and its members are seated again, as after the
   switch to the group key (§10a has what a re-seat costs). Members' apps see the new start as made anew. If it is
   forgotten, an app whose keys are ahead of the database proves it with a signed header the relay can check, and the relay
-  starts that channel anew itself, at most once an hour; for a copy older than the channel's current generation it cannot
-  check that, and only warns in the Load tab ("a member reports it ahead of this database"). What kept history the copy
+  starts that channel anew itself, at most once an hour, only on a header signed by one of the channel's keyholders now;
+  for a copy older than the channel's current generation it cannot check that, and only warns in the Load tab ("a member
+  reports it ahead of this database"), and it warns the same for a header signed by a keyholder the copy does not hold
+  or no longer counts among them. What kept history the copy
   holds stays readable.
 - **A restore puts back whoever left or was removed since the copy.** Their seat returns with the rest. On the live path
   writers' apps hand them keys again at their next post, each named as it happens; under the group key they are seated
@@ -555,7 +557,11 @@ real community meets first are these:
   of it. At 100,000 members and the default, that is estimated at 1.6 to 6 GB a channel, by how often epochs change
   ([GROUP-KEY.md](GROUP-KEY.md) §5.10); it was not measured yet.
 - **What a writer's keys take is counted against `quota_mb`**, a seat's row at half. So seat rows on disk are bounded by
-  accounts times that figure, and nothing evicts them: a writer over it stops being kept.
+  accounts times that figure, and nothing evicts them: a writer over it stops being kept. Under the group key, the rows a
+  writer who shares history gives newcomers (1,629 B at each of its chains no link reaches) are not counted: the relay
+  keeps them only for newcomers it owes an answer, and bounds them per seat taken instead, to those chains plus 4 rows:
+  about 8.1 KB at 5 such chains, and at most about 1.4 GB from one sharer that makes chains on purpose, at the default
+  `quota_mb` ([GROUP-KEY.md](GROUP-KEY.md) §8).
 - **A person's pins fit about 32,000 accounts,** in 56 pages of 48 KiB outside the sign-in message, read after it: at 2000 pins
   about 170 KB down at a sign-in, and nothing at a reconnect if the app stayed up and no page moved. People met only in open
   channels stop at half of that. A relay below protocol 21 keeps one item, about 560.
@@ -718,9 +724,11 @@ about what it holds in memory and in the database. It shows a commit as soon as 
 a moment before their apps take it. Its warnings name the channel: no keyholder online for some minutes, keys
 late (no new epoch for 70 minutes), missed deadlines, and a member reporting the channel ahead of this database (a restore
 without `db new-incarnation`, §7). On a relay with accounts, a text channel that keeps its history (not an anonymous one or one
-that hides its members) waits, when its keyholders are all away, before a volunteer starts its keys anew: 2 minutes
-where every keyholder was a browser or a guest, unless a new start began that set within the hour, else an hour. Other
-text channels, voice rooms, and every channel on a relay without accounts start anew at once.
+that hides its members) waits, when its keyholders are all away, before a volunteer starts its keys anew: not at all
+where every keyholder was a browser or a guest (a volunteer starts anew as soon as none is online and someone waits to be
+seated or to leave), unless a new start began that set within the hour, else an hour. Other text channels, voice rooms,
+and every channel on a relay without accounts start anew at once. A channel whose keyholders changed 2048 times starts
+anew too, once, so that every member can still follow its keys.
 
 ```sh
 cargo build -p voipc-server --release --bin voipc-server --examples

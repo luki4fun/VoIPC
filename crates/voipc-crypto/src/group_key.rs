@@ -74,8 +74,8 @@ pub use keys::{
     ITEM_SEAT_KEM,
 };
 pub use merkle::{
-    bucket_root, check_reversion, inclusion_path, leaf_hash, list_digest, path_ok, seat_record,
-    Leaf, Path, Pool, Via, BUCKET_SEATS,
+    bucket_root, check_reversion, inclusion_path, leaf_hash, list_digest, path_ok, seat_dh,
+    seat_record, Leaf, Path, Pool, Via, BUCKET_SEATS,
 };
 pub use rules::{
     check_above, check_added, check_counters, check_form, check_gated, check_keyholder_change,
@@ -136,8 +136,11 @@ pub const REGENESIS_WAIT: u64 = 60 * 60;
 /// when every entry of the keyholder set in force is a connection entry
 /// (origin 0x02, a browser's or a guest's pair, which goes with its
 /// connection and never comes back online), within `REGENESIS_FAST_GAP`'s
-/// bound (`rules::regenesis_wait`). Every Regenesis waits at least this long.
-pub const REGENESIS_FAST_WAIT: u64 = 2 * 60;
+/// bound (`rules::regenesis_wait`). None (J10-B option A, owner 2026-11-22;
+/// 2 minutes before): once no such entry is online nothing can seat a
+/// newcomer, and what is written meanwhile would never be its, so a
+/// Regenesis may come at once, dated at or after its parent's `time`.
+pub const REGENESIS_FAST_WAIT: u64 = 0;
 /// The churn bound of the fast wait: a set of connection entries that a
 /// Regenesis itself started less than this long before keeps the full hour,
 /// so connections that drop again and again start anew at most once an hour.

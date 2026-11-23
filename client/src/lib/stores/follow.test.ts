@@ -8,7 +8,7 @@ const { invoked } = await import("./node-stores.mjs");
 const { autoJoinTextChannels, forgetAutoJoinAsk, hasNsfwConsent, giveNsfwConsent, isLeft, markKicked } = await import("./channel-ui.ts");
 const { channels } = await import("./channels.ts");
 const { activeTextChannelId, authorsHere, peerName, joinedTextChannelIds, addChannelMessage, channelMessages, chatKey, dmMessages, noteChannelUnseen, noteNeverOpened, clearChannelUnread, unseenChannels } = await import("./chat.ts");
-const { channelRosters, exchangedKey, goneFrom, noteJoin, noteLeft, onlineById, patchRosters, requestAllRosters, setRoster, textSeats } = await import("./rosters.ts");
+const { channelRosters, exchangedKey, goneFrom, noteJoin, noteLeft, onlineById, patchRosters, requestAllRosters, setCounts, setRoster, textSeats } = await import("./rosters.ts");
 const { clearSweeps, joinedMade, noteMade, noteMemberGone, onSweepPage, refreshList, setSweepQuiet, startSweeps, sweepForAsker } = await import("./sweep.ts");
 const { askSharers, channelOpened, forgetHandOff, handOffAnswered, handOffs, reopenAfterDrop, sharersOf } = await import("./handoff.ts");
 const { channelRings, clearRing, flushMarks, forgetRings, lightRing, moveRead, noteLastPost, ringBack, ringForPost } = await import("./marks.ts");
@@ -201,6 +201,26 @@ test("a flag that comes while the join waits in the batch is on the row the batc
   patchRosters(s, 11, { shares_history: false }, (id) => id !== 500);
   assert.equal(flag(12), false);
   assert.equal(flag(11), true);
+});
+
+test("a count from the relay while a join or leave waits in the batch is not moved again", () => {
+  const s = server();
+  channels.of(s).set([voice(500, { user_count: 1 })]);
+  setRoster(s, 500, [person(1, { channel_id: 500 })]);
+  // Bob's join is in the batch; the relay's count, with him in it, comes before the flush
+  noteJoin(s, person(2, { channel_id: 500 }));
+  mock.timers.tick(100);
+  setCounts(s, [[500, 2]]);
+  mock.timers.tick(300);
+  assert.equal(get(channels.peek(s))[0].user_count, 2, "not 3");
+  assert.deepEqual(get(channelRosters.peek(s)).get(500)!.map((u) => u.user_id), [1, 2]);
+  // His leave the same way
+  noteLeft(s, 500, 2);
+  mock.timers.tick(100);
+  setCounts(s, [[500, 1]]);
+  mock.timers.tick(300);
+  assert.equal(get(channels.peek(s))[0].user_count, 1, "not 0");
+  assert.deepEqual(get(channelRosters.peek(s)).get(500)!.map((u) => u.user_id), [1]);
 });
 
 test("a join applies after a list that came before it, and twice counts once", () => {

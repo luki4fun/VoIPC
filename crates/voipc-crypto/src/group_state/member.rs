@@ -30,6 +30,8 @@ const KEYS_KEPT: usize = 2;
 const KH_SEEN_MOST: usize = 64;
 /// Digests of the headers last taken, met again below the floor without a word (`recent`).
 const RECENT_MOST: usize = 16;
+/// Generations taken while this member was held (`gens_run`), at most.
+const GENS_RUN_MOST: usize = 64;
 /// Seed welcomes' `s_m` waiting for a row (`Member::pend_s_m`): per seat and seed, and
 /// seats and seeds.
 const PENDING_PER_SEED: usize = 4;
@@ -126,6 +128,16 @@ pub(super) struct Member {
     pub(super) names: super::names::Names,
     /// The last state told, so each is told once.
     pub(super) told: Option<GkState>,
+    /// The relay refused a post as under too old an epoch (`OLD_EPOCH`): no post goes, and no
+    /// key counts as the head's, until a head is taken. The keys stay, for posts under them
+    /// that come still (`HOLD_MS`).
+    old_epoch: bool,
+    /// Every generation taken while this member was held, newest last: one the floor's list
+    /// of the last 8 let go is not taken again either (§5.7).
+    gens_run: Vec<[u8; 16]>,
+    /// The keyholder header whose set was last told (`GkEvent::Keyholders`): once a run, and
+    /// again at each change of the set in force, however it was reached.
+    kh_told: Option<[u8; 32]>,
 }
 
 /// A seat keying's `BK` of the version it reaches (`Member::key_in`), and what it came by.
@@ -213,6 +225,9 @@ impl Member {
             reader: Default::default(),
             names: Default::default(),
             told: None,
+            old_epoch: false,
+            gens_run: Vec::new(),
+            kh_told: None,
         };
         if let Some(l) = local {
             let kh = l.kh.and_then(|(body, sig)| {
@@ -220,6 +235,13 @@ impl Member {
                     .ok()
                     .filter(|h| h.d() == l.floor.kh)
             });
+            if let Some(k) = &kh {
+                m.kh_seen.insert(k.d(), k.clone());
+                m.take_before(
+                    k,
+                    l.kh_chain.iter().map(|(b, s)| (b.as_slice(), s.as_slice())),
+                );
+            }
             m.kh = kh;
             m.floor_hdr = l.head.and_then(|(body, sig)| {
                 check_form(&body, &sig, m.t.kind, &m.t.group)
@@ -266,8 +288,82 @@ impl Member {
                 .or(self.floor_hdr.as_ref())
                 .filter(|h| self.floor.as_ref().is_some_and(|f| f.d == h.d()))
                 .map(|h| (h.body().to_vec(), h.sig().to_vec())),
+            kh_chain: self
+                .kh_before()
+                .into_iter()
+                .take(gk::KH_BEFORE_MOST)
+                .map(|k| (k.body().to_vec(), k.sig().to_vec()))
+                .collect(),
             names: self.names.floor,
             taken: self.taken.unwrap_or(0),
+        })
+    }
+
+    /// Keyholder headers before `kh`, newest first (`LocalFloor::kh_chain`,
+    /// `InPiece::kh_before`), each held for its digest alone: the one its child names as
+    /// `kh_parent`, so the header held vouches for every one before it. Up to the first that
+    /// is not that, and at most `KH_BEFORE_MOST`.
+    fn take_before<'a>(
+        &mut self,
+        kh: &SignedHeader,
+        before: impl IntoIterator<Item = (&'a [u8], &'a [u8])>,
+    ) {
+        let gen = kh.header().gen;
+        let mut want = kh.header().kh_parent;
+        for (body, sig) in before.into_iter().take(gk::KH_BEFORE_MOST) {
+            let Some(h) = check_form(body, sig, self.t.kind, &self.t.group)
+                .ok()
+                .filter(|h| {
+                    h.d() == want && h.header().gen == gen && h.header().kind.sets_keyholders()
+                })
+            else {
+                break;
+            };
+            want = h.header().kh_parent;
+            self.kh_seen.insert(h.d(), h);
+        }
+    }
+
+    /// The keyholder headers held before the floor's, newest first, each the parent of the
+    /// one before: back to the generation's start or its last KeyholdersRemove, or to the
+    /// first not held.
+    pub(super) fn kh_before(&self) -> Vec<&SignedHeader> {
+        let mut chain = Vec::new();
+        let mut at = self.kh.as_ref();
+        while let Some(k) = at {
+            let h = k.header();
+            if h.kind.starts_anew()
+                || h.kind == Kind::KeyholdersRemove
+                || chain.len() > KH_SEEN_MOST
+            {
+                break;
+            }
+            at = self
+                .kh_seen
+                .get(&h.kh_parent)
+                .filter(|p| p.header().gen == h.gen);
+            chain.extend(at);
+        }
+        chain
+    }
+
+    /// Whether the entry `(m, kx)` may have made a welcome or row this member takes at the
+    /// head: one of the set in force, or of a set before it back to the generation's start
+    /// or its last KeyholdersRemove, which re-keys every bucket (§4.3). A KeyholdersReplace
+    /// keeps the versions it does not re-key, with the old pair's welcomes and rows; nothing
+    /// in force since such a start came from an entry that left. The relay names the maker,
+    /// so a welcome or row from any other pair (its own, a thief's with only the account's
+    /// `IK`, a removed keyholder's) is refused before it opens: `confirm` alone binds only a
+    /// `CK`, which a relay holding a seat knows, and a header's signer chooses (RV).
+    fn maker_ok(&self, head: &SignedHeader, m: MemberId, kx: &[u8; 32]) -> bool {
+        let Some(kh) = self.kh.as_ref().filter(|k| k.d() == head.kh()) else {
+            return false;
+        };
+        std::iter::once(kh).chain(self.kh_before()).any(|k| {
+            k.header()
+                .keyholders
+                .iter()
+                .any(|e| e.m == m && e.kx == *kx)
         })
     }
 
@@ -277,7 +373,7 @@ impl Member {
 
     /// The head epoch's key, if held.
     pub(super) fn current_key(&self) -> Option<&EpochKey> {
-        let f = self.floor.as_ref()?;
+        let f = self.floor.as_ref().filter(|_| !self.old_epoch)?;
         self.keys
             .last()
             .filter(|k| k.gen == f.gen && k.epoch == f.epoch && k.d_e == f.d_e)
@@ -523,7 +619,7 @@ impl Member {
         match (what, why) {
             // The head moved past the epoch a post went under: ask, and send again under it
             (gk::refused_what::POST, gk::refused_why::OLD_EPOCH) => {
-                self.keys.clear();
+                self.old_epoch = true;
                 self.writer.resend_after_old_epoch();
                 self.fetching = None;
                 self.fetch(who, c.now, out);
@@ -599,13 +695,17 @@ impl Member {
             kept.past_in(who, self, &p, c, out);
             return;
         }
+        self.writer.piece_in();
         if self.vault_pending || !c.pins.ready() {
             self.waiting = Some(p);
             return;
         }
         let was = self.floor.as_ref().map(|f| f.d);
         match self.take_headers(who, duty, &p, c, out) {
-            Ok(Took::Head) => {}
+            Ok(Took::Head) => {
+                self.writer.piece_taken();
+                self.old_epoch = false;
+            }
             // An answer built before a push it overtook: nothing in it is ours to take
             Ok(Took::Stale) => return,
             Err(Stop::NeedKh) => {
@@ -679,6 +779,19 @@ impl Member {
                 }
             }
         }
+        // The sets before the floor's that a kept version's maker may be in (`maker_ok`): a
+        // device that starts from its vault floor holds none of them
+        if let Some(k) = self
+            .kh
+            .clone()
+            .filter(|k| self.floor.as_ref().is_some_and(|f| f.kh == k.d()))
+        {
+            let before = p
+                .kh_before
+                .iter()
+                .map(|h| (h.body.as_slice(), h.sig.as_slice()));
+            self.take_before(&k, before);
+        }
         let mut walk = Vec::with_capacity(p.walk.len());
         for l in &p.walk {
             let parent = l.parent.as_ref().map(|h| self.decode(h)).transpose()?;
@@ -722,6 +835,8 @@ impl Member {
             }
             self.take_header(who, duty, h, parent.as_ref(), &walk, c, out)?;
         }
+        // The set in force, once a run: also at a floor met again, or a `kh` that came alone
+        self.tell_keyholders(out);
         if let Some(o) = &p.opening {
             let o = self.decode(o)?;
             let head = self.head.as_ref().map(SignedHeader::header);
@@ -881,9 +996,16 @@ impl Member {
                         .ok_or(Stop::NeedKh)?;
                     let w = check_walk(WalkTo::Floor { floor: f, kh }, &links, head, clock, &pin)?;
                     signers.extend(w.signers);
-                    if hd.kind == Kind::Regenesis {
-                        anew = Some(hd.signer);
-                    }
+                    // A new start the walk crossed is told as one taken as the head: the
+                    // newest (the walk comes newest first). Members away at it, or a relay
+                    // that pushed it to none, would otherwise never be told (§5.6, RV)
+                    anew = if hd.kind == Kind::Regenesis {
+                        Some(hd.signer)
+                    } else {
+                        walk.iter()
+                            .find(|(x, _)| x.header().kind == Kind::Regenesis)
+                            .map(|(x, _)| x.header().signer)
+                    };
                     let mut walked: Vec<&SignedHeader> = vec![kh];
                     walked.extend(walk.iter().rev().map(|(x, _)| x));
                     (set_named(&walked, &hd.kh_parent), walked, false)
@@ -921,6 +1043,12 @@ impl Member {
                 }
             }
         };
+        // A generation taken before while this member was held, though the floor's list of
+        // the last 8 let it go: within `CLOCK_SLACK` of the floor the time rule alone lets
+        // it back (§5.7)
+        if prev.as_ref().is_some_and(|f| f.gen != hd.gen) && self.gens_run.contains(&hd.gen) {
+            return Err(Refusal::Generation("a generation this device took already").into());
+        }
         warnings.extend(check_gated(hd, None)?);
         // Rule 6: a gated floor reports the group open however its head was reached (a walk,
         // a new generation), not only at the opening header that turned it
@@ -1001,6 +1129,12 @@ impl Member {
         let hd = h.header();
         let new_gen = prev.as_ref().is_none_or(|f| f.gen != hd.gen);
         if new_gen {
+            if !self.gens_run.contains(&hd.gen) {
+                self.gens_run.push(hd.gen);
+                if self.gens_run.len() > GENS_RUN_MOST {
+                    self.gens_run.remove(0);
+                }
+            }
             // A generation's keys are its own
             self.keys.clear();
             self.bks.clear();
@@ -1011,25 +1145,47 @@ impl Member {
             self.kh_seen.clear();
             self.leaf = None;
         }
-        // Our own entry swapped by a Replace this device did not make (§5.11)
-        if hd.kind == Kind::KeyholdersReplace {
-            if let (Some(kh), Some(own)) = (self.kh.as_ref(), duty.own_kx(&self.t.group)) {
-                if let Ok(swap) = crate::group_key::replaced_entry(&kh.header().keyholders, hd) {
-                    if swap.swaps(&own) && swap.new.kx != own {
-                        out.send.push(ClientMessage::KeyholdResign {
-                            group: self.t.group.clone(),
-                            entry: Some(swap.new.kx),
-                        });
-                        out.events.push(GkEvent::Warning {
-                            channel_id: self.t.channel_id,
-                            kind: Warn::EntrySwapped,
-                            n: 0,
-                        });
-                    }
+        // Our own entry swapped by a Replace this device did not make (§5.11): the head, or
+        // one a walk crossed (a device away at it, under an honest relay, RV); any pair of
+        // ours the set may name, the old one too while our own rotation is out (its Replace
+        // swaps it for our new pair, which is no swap we did not make)
+        let own = duty.own_kxs(who, self.t.kind);
+        if !own.is_empty() {
+            let mut steps: Vec<(&SignedHeader, &SignedHeader)> = walked
+                .windows(2)
+                .map(|w| (&w[0], &w[1]))
+                .filter(|(_, l)| l.header().kind == Kind::KeyholdersReplace)
+                .collect();
+            if hd.kind == Kind::KeyholdersReplace {
+                let parent = walked
+                    .iter()
+                    .chain(self.kh.as_ref())
+                    .find(|k| k.d() == hd.kh_parent);
+                steps.extend(parent.map(|p| (p, h)));
+            }
+            for (parent, link) in steps {
+                let Ok(swap) =
+                    crate::group_key::replaced_entry(&parent.header().keyholders, link.header())
+                else {
+                    continue;
+                };
+                if own.iter().any(|k| swap.swaps(k)) && !own.contains(&swap.new.kx) {
+                    out.send.push(ClientMessage::KeyholdResign {
+                        group: self.t.group.clone(),
+                        entry: Some(swap.new.kx),
+                    });
+                    out.events.push(GkEvent::Warning {
+                        channel_id: self.t.channel_id,
+                        kind: Warn::EntrySwapped,
+                        n: 0,
+                    });
                 }
             }
         }
         let floor = Floor::after(prev.as_ref(), h, gen_time);
+        if let Some(k) = self.kh.as_ref().filter(|_| !new_gen) {
+            self.kh_seen.insert(k.d(), k.clone());
+        }
         for k in walked.iter().filter(|k| k.header().gen == hd.gen) {
             self.kh_seen.insert(k.d(), k.clone());
         }
@@ -1049,12 +1205,17 @@ impl Member {
                 .expect("not empty");
             self.kh_seen.remove(&oldest);
         }
-        if hd.kind.sets_keyholders() {
-            let show = self.t.shows_names();
-            out.events.push(GkEvent::Keyholders {
-                channel_id: self.t.channel_id,
-                holders: hd.keyholders.iter().map(|k| show.then_some(k.m)).collect(),
-            });
+        // A Regenesis of this generation past the floor, the head or one the walk took
+        let past = |k: &SignedHeader| {
+            let x = k.header();
+            x.gen == hd.gen
+                && x.kind == Kind::Regenesis
+                && prev
+                    .as_ref()
+                    .is_some_and(|f| f.gen == hd.gen && (x.epoch, x.join) > (f.epoch, f.join))
+        };
+        if !new_gen && (past(h) || walked.iter().any(past)) {
+            self.writer.started_anew(hd.gen);
         }
         if hd.kind.opens_epoch() {
             self.opened = Some(hd.time);
@@ -1078,6 +1239,34 @@ impl Member {
                 .push((self.t.group.clone(), floor.clone(), self.names.floor));
         }
         self.floor = Some(floor);
+        self.tell_keyholders(out);
+    }
+
+    /// The set in force, told when it is not the one last told this run (§5.6): a member
+    /// that walked past a keyholder change, or took a Join first, or met its floor again
+    /// after a restart is told it as one that took the header setting it (RV).
+    fn tell_keyholders(&mut self, out: &mut GkOut) {
+        let Some(k) = self
+            .kh
+            .as_ref()
+            .filter(|k| self.floor.as_ref().is_some_and(|f| f.kh == k.d()))
+        else {
+            return;
+        };
+        if self.kh_told == Some(k.d()) {
+            return;
+        }
+        self.kh_told = Some(k.d());
+        let show = self.t.shows_names();
+        out.events.push(GkEvent::Keyholders {
+            channel_id: self.t.channel_id,
+            holders: k
+                .header()
+                .keyholders
+                .iter()
+                .map(|e| show.then_some(e.m))
+                .collect(),
+        });
     }
 
     /// The names floor moved (a fold): kept with the floor, locally and in the vault.
@@ -1132,7 +1321,11 @@ impl Member {
             }
         }
         // A seed welcome's `s_m` binds only the maker the relay names: it is ours once a row
-        // under it opened to the key of a seal that passed `confirm`, and waits till then
+        // under it, from a maker of the set (`maker_ok`), opened to the key of a seal that
+        // passed `confirm`, and waits till then. Neither its maker nor its seed is checked: a
+        // row from a keyholder opens under the true `s_m` alone, a seat keeps the seed welcome
+        // of a keyholder removed since (a Remove re-keys by rows under the seed it holds), and
+        // one pushed ahead of its header waits as before
         let mut seeded = None;
         if let Some(sw) = &p.seed_welcome {
             sw.check().map_err(|_| bad("seed welcome"))?;
@@ -1162,6 +1355,13 @@ impl Member {
         if let Some(sk) = &p.seat {
             sk.check().map_err(|_| bad("seat keying"))?;
             let from = Holder::from_raw(sk.from.m.into(), &sk.from.kx).map_err(|_| bad("kx"))?;
+            let made = sk.welcome.is_some() || sk.row.is_some();
+            if made && !self.maker_ok(&head, sk.from.m.into(), &sk.from.kx) {
+                return Err(bad("a welcome or row from no keyholder of the set"));
+            }
+            if made && sk.s > hd.seed {
+                return Err(bad("a keying under a seed the head has not reached"));
+            }
             let base = Version {
                 b: sk.b,
                 v: sk.base_v,
@@ -1425,7 +1625,8 @@ pub(super) fn new_entries_ok(
 }
 
 /// The parts of one `EpochIn` as one (plan 13): each `Option` field from the one part that
-/// carries it, refused when two do; `chain`, `walk` and `self_rows` in part order.
+/// carries it, refused when two do; `chain`, `walk`, `kh_before` and `self_rows` in part
+/// order.
 pub(super) fn merge_in(parts: Vec<InPiece>) -> Result<InPiece, gk::Bad> {
     fn once<T>(into: &mut Option<T>, from: Option<T>, what: &'static str) -> Result<(), gk::Bad> {
         match (into.is_some(), from) {
@@ -1441,6 +1642,7 @@ pub(super) fn merge_in(parts: Vec<InPiece>) -> Result<InPiece, gk::Bad> {
     for p in parts {
         w.chain.extend(p.chain);
         w.walk.extend(p.walk);
+        w.kh_before.extend(p.kh_before);
         w.self_rows.extend(p.self_rows);
         once(&mut w.kh, p.kh, "kh twice")?;
         once(&mut w.head, p.head, "head twice")?;
@@ -1456,6 +1658,9 @@ pub(super) fn merge_in(parts: Vec<InPiece>) -> Result<InPiece, gk::Bad> {
     }
     if w.seal.as_ref().is_some_and(|s| s.len() != gk::SEAL_BYTES) {
         return Err(gk::Bad::Length("seal"));
+    }
+    if w.kh_before.len() > gk::KH_BEFORE_MOST {
+        return Err(gk::Bad::Count("kh_before"));
     }
     Ok(w)
 }

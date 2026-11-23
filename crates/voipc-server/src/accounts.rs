@@ -2963,7 +2963,8 @@ pub async fn handle_request(
             return Ok(());
         }
         AccountRequest::PairApprove { pair, wrapped } => {
-            if wrapped.len() <= 256 {
+            // Hybrid since 26 (RV g4 review): a Kyber1024 ciphertext as well
+            if wrapped.len() <= voipc_crypto::pair::WRAPPED_LEN {
                 relay
                     .pair_event(user.id, pair, provider::PairEvent::Wrapped(wrapped))
                     .await;
@@ -3052,9 +3053,25 @@ pub async fn handle_request(
         AccountRequest::LogKeyPublish { logkey, sig } => {
             log::publish(&relay, user.id, &logkey, &sig).await?
         }
-        AccountRequest::LogKeys { accounts } => log::keys(&relay, &accounts)
-            .await
-            .unwrap_or_else(|e| read_failed("LogKeys", e)),
+        AccountRequest::LogKeys { accounts } => {
+            // Their kept keys first, so a sharer holds them by the time it holds the log keys.
+            // Kept keys not read fail the answer, which the app asks again: the log keys alone
+            // would have a sharer seal a newcomer a blank for good (RV g4 review)
+            match log::kept_kems(&relay, &accounts).await {
+                Ok(pages) => {
+                    for kems in pages {
+                        let _ = crate::session::send_msg(tx, &ServerMessage::Account(kems));
+                    }
+                    log::keys(&relay, &accounts)
+                        .await
+                        .unwrap_or_else(|e| read_failed("LogKeys", e))
+                }
+                Err(e) => read_failed("LogKeys", e),
+            }
+        }
+        AccountRequest::KeptKemPublish { kem, sig } => {
+            log::publish_kem(&relay, user.id, &kem, &sig).await?
+        }
         AccountRequest::EpochPut { conv, epoch, wraps } => {
             let (out, told) = log::epoch_put(&relay, user.id, &conv, epoch, &wraps).await?;
             // A direct conversation's news, told the moment its writer goes by a pseudonym,
@@ -3514,20 +3531,46 @@ async fn seat_keys_publish(
         ));
     }
     let n = keys.n;
-    if !gk::put_seat_keys(relay.store(), &user.0, &keys).await? {
-        // A signature is new each time (its nonce): the same keys are the same counter,
-        // keys and time
-        let held = gk::seat_keys(relay.store(), &user.0).await?;
-        let same = held
-            .is_some_and(|k| (k.n, &k.kem, &k.dh, k.made) == (n, &keys.kem, &keys.dh, keys.made));
-        return Ok(if same {
-            AccountReply::SeatKeysStored { n }
-        } else {
-            refused(
+    match gk::put_seat_keys_or(relay.store(), &user.0, &keys).await? {
+        gk::SeatKeysPut::Stored => {}
+        gk::SeatKeysPut::Behind(top) => {
+            // A signature is new each time (its nonce): the same keys are the same counter,
+            // keys and time
+            let held = gk::seat_keys(relay.store(), &user.0).await?;
+            return Ok(match held {
+                Some(k) if (k.n, &k.kem, &k.dh, k.made) == (n, &keys.kem, &keys.dh, keys.made) => {
+                    AccountReply::SeatKeysStored { n }
+                }
+                // Other keys at or above this counter: another device's rotation, or keys
+                // this device's vault does not hold (a device with the account's identity key
+                // published them). The app checks their endorsement and its vault and, if
+                // they are not the account's there, warns and goes above them (RV q8-q11)
+                Some(k) => AccountReply::SeatKeysBehind {
+                    held: voipc_protocol::gk::EndorsedPair {
+                        origin: voipc_protocol::gk::origin::VAULT_SEAT,
+                        u: 0,
+                        kem: k.kem,
+                        dh: k.dh,
+                        n: k.n,
+                        made: k.made,
+                        sig: k.sig,
+                    },
+                },
+                None => refused(
+                    "SeatKeysPublish",
+                    &format!("This account's seat keys are at counter {top} already."),
+                ),
+            });
+        }
+        gk::SeatKeysPut::Skips(top) => {
+            return Ok(refused(
                 "SeatKeysPublish",
-                "Those seat keys are older than this account's.",
-            )
-        });
+                &format!(
+                    "Those seat keys skip too far past this account's counter ({top}): at most {} above it.",
+                    gk::SEAT_KEYS_STEP
+                ),
+            ));
+        }
     }
     state.gk.on_seat_keys(user.0, pair, ik).await;
     Ok(AccountReply::SeatKeysStored { n })

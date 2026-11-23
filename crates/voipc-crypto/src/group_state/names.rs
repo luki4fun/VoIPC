@@ -1,8 +1,10 @@
 //! A writer's fold of a gated group's names (§4.4 rule 4, 3f): before every post, every
-//! `added` list from its names floor to the head folds by C1's `fold_names`, each entry
-//! checked against the pins and counters as they stood then. A list missing is asked for
-//! (`EpochNames`); a fold that holds asks for the removals after it; a names floor from an
-//! earlier gated period of the generation folds from the start (C1 note 1).
+//! list from its names floor to the head folds by C1's `fold_names`, each entry checked
+//! against the pins and counters as they stood then, and passed where a later opening on the
+//! chain removed its seat. A list missing is asked for (`EpochNames`); the openings that
+//! remove seats come among the lists, `removed` and all, since those lists step
+//! `names_hash` too (RV q9-q10:211), so only the head's own chain's removals fold. A names
+//! floor from an earlier gated period of the generation folds from the start (C1 note 1).
 //!
 //! `EpochNames.from` is exclusive here: the names floor, folded already. The relay answers
 //! from it inclusive (a list at `from` is skipped), so a fold from the start asks from
@@ -10,6 +12,7 @@
 //! keeps that opening's list (R1 names.rs says the same).
 
 use std::collections::BTreeMap;
+use std::ops::Bound;
 
 use voipc_protocol::gk::{self, NamesPiece, Part, Parts, Seq};
 use voipc_protocol::messages::ClientMessage;
@@ -18,8 +21,8 @@ use super::member::Member;
 use super::{GkCtx, GkEvent, GkOut, GkState, HeldWhy, Warn, Who};
 use crate::group_key::timers::CHECK_WAIT_MS;
 use crate::group_key::{
-    check_form, check_signer, fold_names, names_start, Fold, GroupKind, Held, Known, NamesFloor,
-    NamesFrom, NamesList, NamesStep, Refusal, Removed, SignedHeader, Warning,
+    fold_names, names_start, names_step, Fold, GroupKind, HeaderV1, Held, Known, NamesFloor,
+    NamesFrom, NamesList, NamesStep, Refusal, SignedHeader, Warning,
 };
 
 /// What a fold says to a writer.
@@ -35,12 +38,10 @@ pub(super) enum Folded {
 /// One group's names, as a writer holds them.
 pub(super) struct Names {
     pub(super) floor: Option<NamesFloor>,
-    /// The generation `lists` and `removals` are of.
+    /// The generation `lists` are of.
     gen: [u8; 16],
-    /// Lists since the names floor, by `(epoch, join)`.
+    /// Lists since the names floor, by `(epoch, join)`: an opening's with its `removed`.
     lists: BTreeMap<(u32, u32), NamesList>,
-    /// Opening headers with `removed` lists, each signed by a set this device holds.
-    removals: Vec<SignedHeader>,
     /// A "gone" answer: the step before the relay's 90-day tail.
     gone: Option<NamesStep>,
     /// The epoch of the opening header that last turned the group gated, where seen.
@@ -48,9 +49,8 @@ pub(super) struct Names {
     parts: Parts<(), NamesPiece>,
     /// When the last `EpochNames` went (ms), until answered.
     asked: Option<u64>,
-    /// The last ask, `(from, to, removals)`, and when it went (ms), answered or not.
-    last: Option<((gk::NamesRef, gk::NamesRef, bool), u64)>,
-    asked_removals: bool,
+    /// The last ask, `(from, to)`, and when it went (ms), answered or not.
+    last: Option<((gk::NamesRef, gk::NamesRef), u64)>,
     /// An answer came and the fold from the names floor still did not reach the head: the
     /// floor is from an earlier gated period (C1 note 1), so the fold starts over.
     from_start: bool,
@@ -68,13 +68,11 @@ impl Default for Names {
             floor: None,
             gen: [0; 16],
             lists: BTreeMap::new(),
-            removals: Vec::new(),
             gone: None,
             gated_start: None,
             parts: Parts::new(Seq::Names),
             asked: None,
             last: None,
-            asked_removals: false,
             from_start: false,
             answered: false,
             refused: false,
@@ -84,7 +82,7 @@ impl Default for Names {
 }
 
 impl Names {
-    /// A header taken: its list, a removal, and where a gated period starts.
+    /// A header taken: its list (`added` and `removed`), and where a gated period starts.
     pub(super) fn header_taken(
         &mut self,
         h: &SignedHeader,
@@ -94,7 +92,6 @@ impl Names {
         if hd.gen != self.gen {
             self.gen = hd.gen;
             self.lists.clear();
-            self.removals.clear();
             self.gated_start = None;
             self.gone = None;
             self.from_start = false;
@@ -107,9 +104,6 @@ impl Names {
         }
         if hd.gated {
             self.lists.insert((hd.epoch, hd.join), NamesList::of(hd));
-        }
-        if hd.kind.opens_epoch() && matches!(&hd.removed, Removed::List(l) if !l.is_empty()) {
-            self.removals.push(h.clone());
         }
         if self.floor.is_none() {
             // Where a device with no names floor starts, fetching nothing before it
@@ -150,6 +144,22 @@ impl Names {
         }
     }
 
+    /// Whether the lists at hand step `names_hash` from `hash`, the value at `from`, to the
+    /// one `head` carries: the head's names run through that place with that value, so
+    /// every list up to it is the head's too (§11.3). One list left out, changed or made up
+    /// fails it. What a keyholder shows a walked-to head stands on its Join by (RV
+    /// q4-q5:1790), where no signed `parent` links lead to it.
+    pub(super) fn reaches(&self, from: (u32, u32), hash: [u8; 32], head: &HeaderV1) -> bool {
+        if !head.gated || head.gen != self.gen || (head.epoch, head.join) <= from {
+            return false;
+        }
+        let upto = (head.epoch, head.join);
+        let lists = self
+            .lists
+            .range((Bound::Excluded(from), Bound::Included(upto)));
+        lists.fold(hash, |acc, (_, l)| names_step(&acc, l)) == head.names_hash
+    }
+
     /// The relay refused names for good (`NOT_MEMBER`, `OFF`): no more asks this gated period.
     pub(super) fn refused(&mut self) {
         self.asked = None;
@@ -182,8 +192,13 @@ impl Names {
     }
 }
 
-/// `EpochNamesIn`: lists, removals and a "gone" step. Pushed gated Joins come back as an
-/// `EpochIn` chain for the member to take like any header.
+/// `EpochNamesIn`: lists and a "gone" step. Pushed gated Joins come back as an `EpochIn`
+/// chain for the member to take like any header.
+///
+/// Each list goes in at its place over whatever was there: the fold takes a list only where
+/// it steps the hash the head carries, so a made-up one (another branch's, or a removal the
+/// relay signed itself, RV q9-q10:211, r-hostile:211) holds the fold only until an honest
+/// answer puts the head's own list there.
 pub(super) fn names_in(m: &mut Member, pieces: Vec<NamesPiece>) -> Option<gk::InPiece> {
     let n = &mut m.names;
     n.asked = None;
@@ -200,23 +215,6 @@ pub(super) fn names_in(m: &mut Member, pieces: Vec<NamesPiece>) -> Option<gk::In
         if let Some(step) = p.gone {
             n.gone = Some(NamesStep::from(step));
         }
-        for r in &p.removals {
-            if r.check().is_err() {
-                continue;
-            }
-            let Ok(h) = check_form(&r.body, &r.sig, m.t.kind, &m.t.group) else {
-                continue;
-            };
-            // A removal counts only signed by a keyholder set this device holds
-            let signed = m
-                .kh_seen
-                .get(&h.header().kh_parent)
-                .is_some_and(|set| check_signer(&h, Some(set), &|_| None).is_ok());
-            let hd = h.header();
-            if signed && hd.gen == n.gen && hd.kind.opens_epoch() && !n.removals.contains(&h) {
-                n.removals.push(h);
-            }
-        }
         joins.extend(p.joins);
     }
     (!joins.is_empty()).then(|| gk::InPiece {
@@ -226,11 +224,11 @@ pub(super) fn names_in(m: &mut Member, pieces: Vec<NamesPiece>) -> Option<gk::In
     })
 }
 
-/// Asks for the lists from where the fold starts to the head, and with `removals` the
-/// opening headers between that remove someone. At most one out, again after 10 s; the same
-/// ask again after 10 s too, answered or not: its answer would come back the same, and a fold
-/// it did not settle (a voice room folds at every answer) would ask once per round trip.
-fn ask(m: &mut Member, removals: bool, c: &GkCtx, out: &mut GkOut) {
+/// Asks for the lists from where the fold starts to the head, the openings between that
+/// remove someone among them. At most one out, again after 10 s; the same ask again after
+/// 10 s too, answered or not: its answer would come back the same, and a fold it did not
+/// settle (a voice room folds at every answer) would ask once per round trip.
+fn ask(m: &mut Member, c: &GkCtx, out: &mut GkOut) {
     let Some(head) = m.head.as_ref() else {
         return;
     };
@@ -258,18 +256,16 @@ fn ask(m: &mut Member, removals: bool, c: &GkCtx, out: &mut GkOut) {
         epoch: hd.epoch,
         join: hd.join,
     };
-    let this = (from, to, removals);
+    let this = (from, to);
     if n.last.is_some_and(|(last, at)| last == this && recent(at)) {
         return;
     }
     n.asked = Some(c.now);
     n.last = Some((this, c.now));
-    n.asked_removals |= removals;
     out.send.push(ClientMessage::EpochNames {
         group: m.t.group.clone(),
         from,
         to,
-        removals,
     });
 }
 
@@ -311,7 +307,7 @@ pub(super) fn fold(m: &mut Member, who: &Who, c: &mut GkCtx, out: &mut GkOut) ->
             own: who.account,
             now: c.secs(),
         };
-        fold_names(&from, &lists, &m.names.removals, hd, &known)
+        fold_names(&from, &lists, hd, &known)
     };
     let show = m.t.shows_names();
     match folded {
@@ -323,13 +319,14 @@ pub(super) fn fold(m: &mut Member, who: &Who, c: &mut GkCtx, out: &mut GkOut) ->
             moved(m, floor, who, out);
             readers(m, &shown, show, out);
             warn(m, &warnings, out);
-            // Counters met at a fold: a text seat's entry is its vault seat (0x01)
+            // Counters met at a fold: a text seat's entry is its vault seat (0x01), whose
+            // `made` counts no later than now, as a keyholder's (`take_endorsement`)
             if m.t.kind == GroupKind::Text {
                 for a in shown.named.iter().filter(|a| !shown.unchecked.contains(a)) {
                     if let Some(account) = a.m.account() {
                         let seen = crate::group_key::Seen {
                             n: a.n,
-                            made: a.made,
+                            made: a.made.min(c.secs()),
                         };
                         c.pins.raise(account, seen, true);
                     }
@@ -348,9 +345,8 @@ pub(super) fn fold(m: &mut Member, who: &Who, c: &mut GkCtx, out: &mut GkOut) ->
             }
             readers(m, &shown, show, out);
             warn(m, &warnings, out);
-            if !m.names.asked_removals {
-                ask(m, true, c, out);
-            }
+            // Every list to the head is in, its removals with it: only a later head can
+            // remove the seat, and its header brings its list
             let why = match why {
                 Held::Guest(_) => HeldWhy::Guest,
                 Held::Pin(_) => HeldWhy::Pin,
@@ -362,13 +358,13 @@ pub(super) fn fold(m: &mut Member, who: &Who, c: &mut GkCtx, out: &mut GkOut) ->
         Err(Refusal::Names) if m.names.answered && !m.names.from_start => {
             m.names.from_start = true;
             m.names.answered = false;
-            ask(m, false, c, out);
+            ask(m, c, out);
             Folded::Wait
         }
         Err(why) => {
             tracing::debug!(group = %m.t.group, ?why, "names do not fold yet");
             m.names.answered = false;
-            ask(m, false, c, out);
+            ask(m, c, out);
             Folded::Wait
         }
     }
@@ -384,7 +380,6 @@ fn moved(m: &mut Member, floor: NamesFloor, who: &Who, out: &mut GkOut) {
     n.lists.retain(|at, _| *at > (floor.epoch, floor.join));
     n.from_start = false;
     n.gone = None;
-    n.asked_removals = false;
     m.save_names(who, out);
 }
 
@@ -501,9 +496,9 @@ mod tests {
             now: j.header().time,
         };
         let lists = |n: &Names| n.lists.values().cloned().collect::<Vec<_>>();
-        assert!(fold_names(&n.from(&gen), &lists(&n), &[], j.header(), &known).is_err());
+        assert!(fold_names(&n.from(&gen), &lists(&n), j.header(), &known).is_err());
         n.opening_seen(&o);
         assert_eq!(n.gated_start, Some(o.header().epoch));
-        assert!(fold_names(&n.from(&gen), &lists(&n), &[], j.header(), &known).is_ok());
+        assert!(fold_names(&n.from(&gen), &lists(&n), j.header(), &known).is_ok());
     }
 }

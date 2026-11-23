@@ -782,7 +782,8 @@ fn frames_for(msg: &ClientMessage, proto: u32) -> Result<Vec<Vec<u8>>, ProtocolE
             | AccountRequest::EpochChainStart { .. }
             | AccountRequest::EpochChainKeys { .. }
             | AccountRequest::SelfRowsList { .. }
-            | AccountRequest::RowMakers { .. },
+            | AccountRequest::RowMakers { .. }
+            | AccountRequest::KeptKemPublish { .. },
         ) if proto < 26 => Err(ProtocolError::NotOnThisRelay(proto)),
         ClientMessage::EmoteAdd { emote } if proto == 14 => old(postcard::to_allocvec(&(
             EMOTE_ADD,
@@ -2301,6 +2302,10 @@ mod tests {
                 sk: [0; 8],
                 sx: [0; 8],
                 after: None,
+            }),
+            ClientMessage::Account(AccountRequest::KeptKemPublish {
+                kem: vec![],
+                sig: vec![],
             }),
         ];
         for msg in &msgs {

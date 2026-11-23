@@ -228,6 +228,14 @@ CREATE TABLE IF NOT EXISTS voipc_gk_chains (
   sealed BLOB NOT NULL
 );
 CREATE INDEX IF NOT EXISTS voipc_gk_chains_epoch ON voipc_gk_chains (grp, gen, epoch);
+-- An account's Kyber1024 kept key (`item.kept`) and its identity's signature over it: what a
+-- sharer seals a newcomer's row of a gk chain's start to, beside the X25519 of the log keys.
+CREATE TABLE IF NOT EXISTS voipc_log_kems (
+  account BLOB NOT NULL PRIMARY KEY REFERENCES acct_users (id) ON DELETE CASCADE,
+  kem BLOB NOT NULL,
+  sig BLOB NOT NULL,
+  updated_at BIGINT NOT NULL
+);
 -- An account's self-rows (`kind` 0) and history rows (1), per seed and seat. No foreign key: the
 -- tombstone sweep takes them.
 CREATE TABLE IF NOT EXISTS voipc_gk_self (
@@ -255,3 +263,6 @@ CREATE TABLE IF NOT EXISTS voipc_gk_seatkeys (
   PRIMARY KEY (account, n)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS voipc_gk_seatkeys_current ON voipc_gk_seatkeys (account) WHERE current;
+-- How many rows on the owner's gk chains an answer owed to the recipient has had: a sharer's
+-- rows to newcomers are not charged to its quota, and this bounds them (GK_ROWS_SLACK past its gk tops).
+ALTER TABLE voipc_pending ADD COLUMN gk_rows INTEGER NOT NULL DEFAULT 0;

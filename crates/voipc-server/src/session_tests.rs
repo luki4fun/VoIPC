@@ -5331,6 +5331,105 @@ async fn register_with(
     (c, info, m.finish().unwrap())
 }
 
+/// RV r-attackers:2721: an account's kept key (`item.kept`) is taken only as its identity
+/// endorsed it, and goes to whoever asks for its log key, right before it: a sharer holds it by
+/// the time it seals a newcomer's row of a gk chain's start.
+#[tokio::test]
+async fn a_kept_key_goes_right_before_the_log_keys_and_only_as_its_identity_endorsed_it() {
+    use voipc_crypto::log::{kem_endorsed, KeptKeys, LogKey};
+    let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+    let (mut alice, _, alice_id) = register_with(&state, "alice").await;
+    let (mut bob, b, bob_id) = register_with(&state, "bob").await;
+    let ask = |r: AccountRequest| ClientMessage::Account(r);
+    let lk = LogKey::generate();
+    bob.send(&ask(AccountRequest::LogKeyPublish {
+        logkey: lk.public(),
+        sig: lk.endorse(&bob_id.identity),
+    }))
+    .await;
+    bob.expect("stored", |m| reply(m).is_some()).await;
+    let kept = KeptKeys::generate();
+    for (sig, ok) in [
+        (kept.endorse(&alice_id.identity, &b.id), false),
+        (kept.endorse(&bob_id.identity, &[9; 16]), false),
+        (kept.endorse(&bob_id.identity, &b.id), true),
+    ] {
+        bob.send(&ask(AccountRequest::KeptKemPublish {
+            kem: kept.kem_public(),
+            sig,
+        }))
+        .await;
+        let got = bob.expect("kept", |m| reply(m).is_some()).await;
+        assert_eq!(
+            matches!(got, ServerMessage::Account(AccountReply::KeptKemStored)),
+            ok,
+            "{got:?}"
+        );
+    }
+    alice
+        .send(&ask(AccountRequest::LogKeys {
+            accounts: vec![b.id],
+        }))
+        .await;
+    let ServerMessage::Account(AccountReply::KeptKems { keys }) =
+        alice.expect("kems", |m| reply(m).is_some()).await
+    else {
+        panic!("not the kept keys first")
+    };
+    assert_eq!((keys.len(), keys[0].account), (1, b.id));
+    let ServerMessage::Account(AccountReply::LogKeysFound { keys: found }) =
+        alice.expect("keys", |m| reply(m).is_some()).await
+    else {
+        panic!("then the log keys")
+    };
+    assert!(kem_endorsed(
+        &found[0].identity,
+        &b.id,
+        &keys[0].kem,
+        &keys[0].sig
+    ));
+    assert_eq!(keys[0].kem, kept.kem_public());
+}
+
+/// RV g4 review (accounts.rs:3057): kept keys that could not be read fail the whole `LogKeys`,
+/// which the app asks again. Answered with the log keys alone, a sharer asks once more, seals
+/// a blank, and the newcomer's wait ends for good with no row.
+#[tokio::test]
+async fn kept_keys_that_cannot_be_read_fail_the_log_keys_answer() {
+    use voipc_crypto::log::LogKey;
+    let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+    let (mut alice, _, _) = register_with(&state, "alice").await;
+    let (mut bob, b, bob_id) = register_with(&state, "bob").await;
+    let ask = |r: AccountRequest| ClientMessage::Account(r);
+    let lk = LogKey::generate();
+    bob.send(&ask(AccountRequest::LogKeyPublish {
+        logkey: lk.public(),
+        sig: lk.endorse(&bob_id.identity),
+    }))
+    .await;
+    bob.expect("stored", |m| reply(m).is_some()).await;
+    crate::accounts::raw(
+        state.accounts.as_ref().unwrap(),
+        "DROP TABLE voipc_log_kems",
+    )
+    .await
+    .unwrap();
+    alice
+        .send(&ask(AccountRequest::LogKeys {
+            accounts: vec![b.id],
+        }))
+        .await;
+    let got = alice.expect("an answer", |m| reply(m).is_some()).await;
+    assert!(
+        matches!(
+            &got,
+            ServerMessage::Account(AccountReply::Error { request, reason })
+                if request == "LogKeys" && reason.contains("slow down")
+        ),
+        "{got:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_dm_kept_for_somebody_offline_reaches_them_sealed_end_to_end() {
     use voipc_crypto::log::{
@@ -41336,7 +41435,6 @@ mod group_key {
                 group: group.clone(),
                 from: at,
                 to: at,
-                removals: false,
             },
         ] {
             ann.send(&msg).await;
@@ -41548,7 +41646,6 @@ mod group_key {
                     epoch: 1,
                     join: 0,
                 },
-                removals: false,
             },
             ClientMessage::EpochFetch {
                 group: group.clone(),
@@ -41876,9 +41973,28 @@ mod kept_group_key {
             .clone()
     }
 
+    /// The keys a `SeatKeysBehind` says the relay holds, at their counter, once their
+    /// endorsement checks under the account's identity.
+    fn behind(
+        out: &AccountReply,
+        ik: &voipc_crypto::IdentityKeyPair,
+        account: [u8; 16],
+    ) -> Option<(u32, SeatPublic)> {
+        let AccountReply::SeatKeysBehind { held } = out else {
+            return None;
+        };
+        let m = voipc_protocol::gk::GkMember::Account(account);
+        let pair = voipc_crypto::group_key::wire::pair(held, m).ok()?;
+        let origin = voipc_crypto::group_key::Origin::VaultSeat;
+        (pair.endorsement.origin == origin
+            && pair.endorsement.verify(ik.identity_key(), &pair.keys))
+        .then_some((held.n, pair.keys))
+    }
+
     /// `SeatKeysPublish` (§5.11): held at a counter above every earlier one, current from
     /// then; the same keys again (another device of the account, signed anew) are held
-    /// already; other keys at a counter not above it, or keys that are none, are refused.
+    /// already; other keys at a counter not above it are refused with the keys held, as the
+    /// account's identity endorsed them (`SeatKeysBehind`), and keys that are none are refused.
     #[tokio::test]
     async fn seat_keys_are_held_at_a_higher_counter_and_the_same_keys_again_are_held_already() {
         let (state, _db) = gk_relay_state(None).await;
@@ -41900,7 +42016,8 @@ mod kept_group_key {
                     "{n}: {out:?}"
                 ),
                 false => assert!(
-                    matches!(&out, AccountReply::Error { request, .. } if request == "SeatKeysPublish"),
+                    behind(&out, &ik, info.id)
+                        .is_some_and(|(n, k)| n == 1 && k.tag_kem() == keys.tag_kem()),
                     "{n}: {out:?}"
                 ),
             }
@@ -41922,6 +42039,61 @@ mod kept_group_key {
             ask(&mut c, none).await,
             AccountReply::Error { reason, .. } if reason == "malformed"
         ));
+    }
+
+    /// RV q8-q11: the relay took any counter above the account's, so a holder of the
+    /// account's identity key (a lost signed-in device) could publish seat keys at
+    /// `u32::MAX`. Every group then seats them, and no later rotation of the account's own
+    /// devices could go above them: the account was locked out of its group text for good.
+    /// A publish moves the counter by at most `SEAT_KEYS_STEP` (from 0 for the first), and
+    /// one behind is told the keys held, so the app can go above them.
+    #[tokio::test]
+    async fn seat_keys_cannot_jump_the_counter_past_the_next_steps() {
+        let (state, _db) = gk_relay_state(None).await;
+        let (mut c, info) = register(&state, "kim").await;
+        let ik = real_identity(&state, info.id).await;
+        let [a, b, t, d] = [(); 4].map(|_| SeatPair::generate().public());
+        let step = crate::accounts::gk::SEAT_KEYS_STEP;
+        let skips = |out: &AccountReply| {
+            matches!(out, AccountReply::Error { request, reason }
+                if request == "SeatKeysPublish" && reason.contains("skip"))
+        };
+        // The first keys too: at most a step above 0
+        let out = ask(&mut c, publish(&ik, info.id, u32::MAX, 100, &t)).await;
+        assert!(skips(&out), "{out:?}");
+        let out = ask(&mut c, publish(&ik, info.id, 1, 100, &a)).await;
+        assert!(
+            matches!(out, AccountReply::SeatKeysStored { n: 1 }),
+            "{out:?}"
+        );
+        for n in [1_000_000, u32::MAX, 2 + step] {
+            let out = ask(&mut c, publish(&ik, info.id, n, 200, &t)).await;
+            assert!(skips(&out), "{n}: {out:?}");
+        }
+        let relay = state.accounts.clone().unwrap();
+        let held = crate::accounts::gk::seat_keys(relay.store(), &info.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(held.n, 1, "the jumps are not held");
+        // A thief's keys at the most it can step: the account's own device, behind, is told
+        // them, endorsed, and goes above them
+        let out = ask(&mut c, publish(&ik, info.id, 1 + step, 300, &t)).await;
+        assert!(
+            matches!(out, AccountReply::SeatKeysStored { n } if n == 1 + step),
+            "{out:?}"
+        );
+        let out = ask(&mut c, publish(&ik, info.id, 2, 300, &b)).await;
+        assert!(
+            behind(&out, &ik, info.id)
+                .is_some_and(|(n, k)| n == 1 + step && k.tag_kem() == t.tag_kem()),
+            "{out:?}"
+        );
+        let out = ask(&mut c, publish(&ik, info.id, 2 + step, 400, &d)).await;
+        assert!(
+            matches!(out, AccountReply::SeatKeysStored { n } if n == 2 + step),
+            "{out:?}"
+        );
     }
 
     /// Plan 2d: old seat keys offered again are refused. An identity reset wipes the

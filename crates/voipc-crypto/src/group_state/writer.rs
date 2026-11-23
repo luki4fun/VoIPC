@@ -91,8 +91,14 @@ struct Chain {
 #[derive(Default)]
 pub(super) struct Writing {
     held: VecDeque<HeldPost>,
-    /// Exits named to writers (`EpochExit`): generation, sequence, when (ms).
-    exits: Vec<([u8; 16], u64, u64)>,
+    /// Exits named to writers (`EpochExit`): generation, sequence, when (ms), and how many
+    /// exits had been heard before it.
+    exits: Vec<([u8; 16], u64, u64, u64)>,
+    /// How many exits were heard (the order they came in).
+    heard: u64,
+    /// How many exits had been heard when the head piece being taken came in: one put off (a
+    /// fetch for its keyholder header, the vault) is taken after exits that came behind it.
+    piece_at: Option<u64>,
     chain: Option<Chain>,
     sent: VecDeque<SentPost>,
     hold: Option<Hold>,
@@ -123,9 +129,21 @@ impl Writing {
     /// `EpochExit`: posts hold once it is 46 s old without an opening header that covers it.
     /// The chain goes on: the leaver holds this epoch's key anyway (spec 5.4).
     pub(super) fn exit(&mut self, gen: [u8; 16], seq: u64, now: u64) {
-        if !self.exits.iter().any(|(g, s, _)| *g == gen && *s == seq) {
-            self.exits.push((gen, seq, now));
+        if !self.exits.iter().any(|(g, s, _, _)| *g == gen && *s == seq) {
+            self.exits.push((gen, seq, now, self.heard));
+            self.heard += 1;
         }
+    }
+
+    /// A head piece came in, to take now or once what it waits for is in: the first one
+    /// not yet taken marks which exits came before it (`started_anew`).
+    pub(super) fn piece_in(&mut self) {
+        self.piece_at.get_or_insert(self.heard);
+    }
+
+    /// A head piece was taken.
+    pub(super) fn piece_taken(&mut self) {
+        self.piece_at = None;
     }
 
     /// An opening header (or a new generation) was taken: the exits it covers are done. A new
@@ -133,11 +151,22 @@ impl Writing {
     /// exit of the old generation would otherwise hold every post.
     pub(super) fn opened(&mut self, gen: [u8; 16], exits_upto: u64, new_gen: bool) {
         if new_gen {
-            self.exits.retain(|(g, _, _)| *g == gen);
+            self.exits.retain(|(g, _, _, _)| *g == gen);
             self.chain = None;
         }
         self.exits
-            .retain(|(g, seq, _)| *g != gen || *seq > exits_upto);
+            .retain(|(g, seq, _, _)| *g != gen || *seq > exits_upto);
+    }
+
+    /// A Regenesis of `gen` was taken: it seats its volunteer alone, and every other seat
+    /// comes back only through a Join, so each exit of `gen` heard before it is dealt with.
+    /// The relay drops those it did not carry (none can be carried once its seat sits in
+    /// no leaf), and its `exits_upto` stays below them: kept, they would hold every post.
+    /// An exit heard after the piece that brought it came in is one of a seat seated since
+    /// (the relay pushes a new start before it tells any later exit) and stays.
+    pub(super) fn started_anew(&mut self, gen: [u8; 16]) {
+        let before = self.piece_at.unwrap_or(self.heard);
+        self.exits.retain(|(g, _, _, n)| *g != gen || *n >= before);
     }
 
     /// The relay refused a post as under too old an epoch: whatever went under it in the last
@@ -176,7 +205,7 @@ impl Writing {
     pub(super) fn exit_holds(&self, gen: &[u8; 16], now: u64) -> bool {
         self.exits
             .iter()
-            .any(|(g, _, at)| g == gen && now >= at.saturating_add(EXIT_HOLD_MS))
+            .any(|(g, _, at, _)| g == gen && now >= at.saturating_add(EXIT_HOLD_MS))
     }
 }
 

@@ -33,6 +33,9 @@ use crate::gk::store::Store;
 
 const ID: &str = "r:00112233445566778899aabbccddeeff:7";
 
+#[path = "gk_rv_g6.rs"]
+mod rv_g6;
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1747,6 +1750,207 @@ async fn the_account_hooks_seat_an_account_eagerly_and_exit_its_seat_at_a_rotati
     drop_db(&file);
 }
 
+/// An account with seat keys `seat1` at counter 1, seated in stored group `c:lounge` by a
+/// guest keyholder `k`'s Join, and the account's identity: what a rotation starts from.
+async fn an_account_seated_in_a_stored_group() -> (
+    l4f_accounts::store::Store,
+    std::path::PathBuf,
+    Net,
+    [u8; 16],
+    IdentityKeyPair,
+    SeatPair,
+) {
+    let (db, file) = scratch_db().await;
+    let inc = crate::accounts::gk::gk_start(&db, true)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut net = Net::new();
+    net.groups.attach(db.clone(), inc);
+    let id = net.groups.id_for(7, Some("lounge"));
+    let a = l4f_accounts::model::AccountId::new();
+    db.create_user(
+        &l4f_accounts::model::NewUser {
+            id: a,
+            username: "ann".into(),
+            display_name: "ann".into(),
+            email_pending: None,
+            password_hash: None,
+            created_at: l4f_accounts::util::now(),
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let ann = voipc_crypto::generate_identity_key_pair();
+    let seat1 = SeatPair::generate();
+    let e1 = vault_seat(&ann, a.0, 1, &seat1);
+    crate::accounts::gk::put_seat_keys(
+        &db,
+        &a.0,
+        &crate::accounts::gk::SeatKeys {
+            n: 1,
+            kem: seat1.public().kem_bytes().into(),
+            dh: seat1.public().dh_bytes().into(),
+            made: e1.made,
+            sig: e1.sig.to_vec(),
+            published: now_ms(),
+        },
+    )
+    .await
+    .unwrap();
+    let k = net.guest(7, &id);
+    net.volunteer(&k).await;
+    net.groups.on_log_join("lounge", a.0, raw(&ann)).await;
+    let out = net.frames(k.sid, 50).await;
+    let (due, piece) = dues(&out, k.sid)
+        .pop()
+        .expect("a Genesis for the eager seat");
+    let joiner = Joiner::try_from(&piece.joins[0]).unwrap();
+    let st = Start {
+        kind: GroupKind::Text,
+        id: &id,
+        me: k.me(),
+        ik: &k.ik,
+        entry: k.entry(),
+        joiners: &[&joiner],
+        gated: false,
+        stored: true,
+        now: net.groups.now() / 1000,
+    };
+    let b = build_genesis(&st, &mut RowBases::new()).unwrap();
+    net.commit(k.sid, &id, due, &b).await;
+    let head = b.header.clone();
+    let mut h = Holds {
+        ring: b.ring,
+        krk: b.krk,
+        cache: RowBases::new(),
+    };
+    let out = net.frames(k.sid, 2_500).await;
+    let (due, piece) = dues(&out, k.sid)
+        .pop()
+        .expect("a Join of the account's seat");
+    let b = join_on(&k, &id, &head, &mut h, &piece, true, net.groups.now());
+    let gen = b.header.header().gen;
+    net.commit(k.sid, &id, due, &b).await;
+    let seat = seat1.public().seat(MemberId::Account(a.0));
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if !net.groups.row_makers(&id, &gen, &seat).await.is_empty() {
+            break;
+        }
+    }
+    (db, file, net, a.0, ann, seat1)
+}
+
+/// `pair`'s vault-seat endorsement (0x01) by `ik` for `account`, at counter `n`.
+fn vault_seat(ik: &IdentityKeyPair, account: [u8; 16], n: u32, pair: &SeatPair) -> Endorsement {
+    Endorsement::sign(
+        ik,
+        Origin::VaultSeat,
+        MemberId::Account(account),
+        n,
+        now_ms() / 1000,
+        &pair.public(),
+    )
+    .unwrap()
+}
+
+/// RV repair (q8-q11): a holder of the account's identity key published its own keys, and
+/// every group where the account sat began to re-seat it under them: its seat exits, the
+/// thief's waits. The account's app, mid-rotation, went above them with its own keys again
+/// under a higher counter. Where those keys still sat, the relay sent nothing (the seat is
+/// the same), so the thief's seat waiting there was seated at the next commit. A rotation
+/// now drops the seats below its counter still waiting, there too.
+#[tokio::test]
+async fn the_same_keys_again_above_a_thiefs_drop_the_thiefs_seat_still_waiting() {
+    let (_db, file, net, a, ann, seat1) = an_account_seated_in_a_stored_group().await;
+    let thief = SeatPair::generate();
+    let pair = Pair {
+        keys: thief.public(),
+        endorsement: vault_seat(&ann, a, 2, &thief),
+    };
+    net.groups.on_seat_keys(a, pair, raw(&ann)).await;
+    let row = stats_until(&net, 7, |r| (r.exits_waiting, r.joins_waiting) == (1, 1)).await;
+    assert_eq!(
+        (row.exits_waiting, row.joins_waiting),
+        (1, 1),
+        "the account's seat exits, the thief's waits"
+    );
+    let pair = Pair {
+        keys: seat1.public(),
+        endorsement: vault_seat(&ann, a, 3, &seat1),
+    };
+    net.groups.on_seat_keys(a, pair, raw(&ann)).await;
+    let row = stats_until(&net, 7, |r| r.joins_waiting == 0).await;
+    assert_eq!(row.joins_waiting, 0, "the thief's seat waits no more");
+    drop_db(&file);
+}
+
+/// The rotation's drop takes only the account's seats below its counter, waiting or being
+/// seated: not another account's, not its own at the counter or above.
+#[test]
+fn a_rotation_drops_only_the_accounts_seats_below_its_counter() {
+    let mut g = new_group(true);
+    let mut out = vec![];
+    let now = now_ms();
+    let a = [2; 16];
+    let ik = voipc_crypto::generate_identity_key_pair();
+    let joiner = |n: u32, account: [u8; 16]| {
+        let pair = SeatPair::generate();
+        Joiner {
+            seat: pair.public().seat(MemberId::Account(account)),
+            ik: raw(&ik),
+            keys: pair.public(),
+            endorsement: vault_seat(&ik, account, n, &pair),
+            returning: false,
+        }
+    };
+    let (low, at, other) = (joiner(4, a), joiner(5, a), joiner(1, [3; 16]));
+    for j in [&low, &at, &other] {
+        let account = j.seat.m.account().unwrap();
+        g.eager(j.clone(), account, now, &mut out);
+    }
+    assert_eq!(g.joins.len(), 3);
+    g.supersede(&a, 5, now, &mut out);
+    assert!(!g.joins.has(&low.seat), "below");
+    assert!(g.joins.has(&at.seat) && g.joins.has(&other.seat));
+}
+
+/// RV repair: a thief's publish and the account's own above it each walk the account's
+/// conversations in `on_seat_keys`, at once. Where the account's rotation came first, the
+/// thief's eager seat queued after it waited, and was seated at the next commit. A seat
+/// below a rotation the group heard of is not queued; an older rotation heard late moves
+/// nothing back.
+#[test]
+fn a_seat_below_a_rotation_heard_is_not_queued_after_it() {
+    let mut g = new_group(true);
+    let mut out = vec![];
+    let now = now_ms();
+    let a = [2; 16];
+    let ik = voipc_crypto::generate_identity_key_pair();
+    let joiner = |n: u32| {
+        let pair = SeatPair::generate();
+        Joiner {
+            seat: pair.public().seat(MemberId::Account(a)),
+            ik: raw(&ik),
+            keys: pair.public(),
+            endorsement: vault_seat(&ik, a, n, &pair),
+            returning: false,
+        }
+    };
+    g.supersede(&a, 5, now, &mut out);
+    let (late, at) = (joiner(4), joiner(5));
+    g.eager(late.clone(), a, now, &mut out);
+    g.eager(at.clone(), a, now, &mut out);
+    assert!(!g.joins.has(&late.seat), "below the rotation");
+    assert!(g.joins.has(&at.seat), "at it");
+    g.supersede(&a, 3, now, &mut out);
+    let late = joiner(4);
+    g.eager(late.clone(), a, now, &mut out);
+    assert!(!g.joins.has(&late.seat), "still below");
+}
+
 #[test]
 fn every_exit_cause_has_its_own_code() {
     let all = [
@@ -2633,7 +2837,7 @@ async fn the_opening_that_turns_the_gate_on_keeps_its_names_list() {
         epoch: o.header().epoch,
         join: 0,
     };
-    let lists = g.names.answer(&all, &to, false).lists;
+    let lists = g.names.answer(&all, &to).lists;
     assert_eq!(
         lists.iter().map(|l| (l.epoch, l.join)).collect::<Vec<_>>(),
         vec![(o.header().epoch, 0)],
@@ -2687,7 +2891,7 @@ async fn a_stored_group_loads_its_names_lists_and_answers_gone_before_its_step()
         epoch: 1,
         join: 0,
     };
-    let a = again.names.answer(&from, &to, false);
+    let a = again.names.answer(&from, &to);
     assert_eq!(a.lists.len(), 1, "the list, from the database");
     let gone = a.gone.expect("a floor before the step: gone");
     assert_eq!((gone.before, gone.epoch, gone.join), ([3; 32], 0, 5));
@@ -2696,7 +2900,7 @@ async fn a_stored_group_loads_its_names_lists_and_answers_gone_before_its_step()
         epoch: 0,
         join: 5,
     };
-    assert!(again.names.answer(&after, &to, false).gone.is_none());
+    assert!(again.names.answer(&after, &to).gone.is_none());
     drop_db(&file);
 }
 
@@ -2715,6 +2919,7 @@ fn a_names_sweep_keeps_the_step_before_the_oldest_list_kept() {
         epoch: 3,
         join: 0,
         added: vec![],
+        removed: vec![],
     };
     let h0 = names_start(&start);
     let join = NamesList {
@@ -2722,12 +2927,14 @@ fn a_names_sweep_keeps_the_step_before_the_oldest_list_kept() {
         epoch: 3,
         join: 1,
         added: vec![],
+        removed: vec![],
     };
     let kept = NamesList {
         time: now,
         epoch: 4,
         join: 0,
         added: vec![],
+        removed: vec![],
     };
     let mut n = Names::default();
     n.restore(
@@ -2765,9 +2972,114 @@ fn a_names_sweep_keeps_the_step_before_the_oldest_list_kept() {
         epoch: 4,
         join: 0,
     };
-    let a = n.answer(&from, &to, false);
+    let a = n.answer(&from, &to);
     assert_eq!(a.gone, Some(step));
     assert_eq!(a.lists.len(), 1);
+}
+
+/// RV q9-q10:211: a `removed` list steps `names_hash` too, so the sweep counts a header that
+/// carries one among the steps. The newest swept here is a removal: the step kept before the
+/// oldest list kept is its, and the fold from it reaches the hash the next list carries.
+#[test]
+fn a_names_sweep_counts_a_removal_among_the_steps() {
+    use crate::gk::names::{Kept, Names};
+    use voipc_crypto::group_key::{
+        names_start, names_step, Added, HeaderV1, NamesList, NamesStep, Removed, SignedHeader,
+        NAMES_KEPT,
+    };
+    let gen = [1; 16];
+    let now = 1_000_000_000;
+    let old = now - NAMES_KEPT - 10;
+    let start = NamesList {
+        time: old,
+        epoch: 3,
+        join: 0,
+        added: vec![],
+        removed: vec![],
+    };
+    let h0 = names_start(&start);
+    let gone = SeatRef {
+        m: MemberId::Account([5; 16]),
+        tag_sk: [1; 8],
+        tag_sx: [2; 8],
+    };
+    let mut hd = HeaderV1 {
+        group_kind: GroupKind::Text,
+        group: "c:lounge-4".into(),
+        gen,
+        epoch: 4,
+        join: 0,
+        kind: Kind::Fresh,
+        time: old + 1,
+        parent: [9; 32],
+        epoch_parent: [0; 32],
+        kh_parent: [8; 32],
+        signer: MemberId::Conn(1),
+        keyholders: vec![],
+        gated: true,
+        seed: 1,
+        seed_floor: 1,
+        exits_upto: 1,
+        seats: 1,
+        buckets: 1,
+        conn_seats: 0,
+        bucket_root: [0; 32],
+        keyring_hash: [0; 32],
+        names_hash: [0; 32],
+        added: Added::List(vec![]),
+        removed: Removed::List(vec![gone]),
+        confirm: [0; 32],
+    };
+    hd.names_hash = names_step(&h0, &NamesList::of(&hd));
+    let h1 = hd.names_hash;
+    assert_ne!(h1, h0, "the removal steps the hash");
+    let removal = SignedHeader::sign(hd, &voipc_crypto::generate_identity_key_pair()).unwrap();
+    let kept = NamesList {
+        time: now,
+        epoch: 4,
+        join: 1,
+        added: vec![],
+        removed: vec![],
+    };
+    let mut n = Names::default();
+    n.restore(
+        vec![
+            Kept {
+                gen,
+                list: (&start).into(),
+                hash: h0,
+            },
+            Kept {
+                gen,
+                list: (&kept).into(),
+                hash: h1,
+            },
+        ],
+        vec![(gen, removal.clone())],
+        None,
+    );
+    // A writer gets the removal's list among the others, `removed` and all, as it steps
+    // the hash
+    let at = |epoch, join| gk::NamesRef { gen, epoch, join };
+    let a = n.answer(&at(3, 0), &at(4, 1));
+    let list = |l: &NamesList| gk::NamesListIn::from(l);
+    assert_eq!(
+        a.lists,
+        vec![
+            list(&start),
+            list(&NamesList::of(removal.header())),
+            list(&kept)
+        ]
+    );
+    assert_eq!(
+        names_step(&h0, &NamesList::try_from(&a.lists[1]).unwrap()),
+        h1
+    );
+    n.sweep(&gen, now);
+    let step = n.take_swept().expect("a step");
+    assert_eq!((step.epoch, step.join, step.before), (4, 0, h0));
+    assert_eq!(NamesStep::from(step).hash(), h1, "the removal's step");
+    assert_eq!(names_step(&NamesStep::from(step).hash(), &kept), h1);
 }
 
 /// Finding: the relay never told an account's sessions how a rotation's re-seat went, so
@@ -2977,6 +3289,144 @@ async fn new_start_eagerly(kept_seats: u32) {
         "the account is queued eagerly (kept_seats {kept_seats})"
     );
     assert_eq!(joins.len(), 2);
+    net.groups.on_purge(&id);
+    drop_db(&file);
+}
+
+/// An account that keeps `id`'s log, offline, with its identity and seat keys first held by
+/// the relay at `published` (unix ms), and its seat pair.
+async fn log_member(
+    db: &l4f_accounts::store::Store,
+    id: &str,
+    name: &str,
+    published: u64,
+) -> ([u8; 16], SeatPair) {
+    let a = l4f_accounts::model::AccountId::new();
+    db.create_user(
+        &l4f_accounts::model::NewUser {
+            id: a,
+            username: name.into(),
+            display_name: name.into(),
+            email_pending: None,
+            password_hash: None,
+            created_at: l4f_accounts::util::now(),
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let ik = voipc_crypto::generate_identity_key_pair();
+    let seat = SeatPair::generate();
+    let e = Endorsement::sign(
+        &ik,
+        Origin::VaultSeat,
+        MemberId::Account(a.0),
+        1,
+        published / 1000,
+        &seat.public(),
+    )
+    .unwrap();
+    assert!(crate::accounts::gk::put_seat_keys(
+        db,
+        &a.0,
+        &crate::accounts::gk::SeatKeys {
+            n: 1,
+            kem: seat.public().kem_bytes().into(),
+            dh: seat.public().dh_bytes().into(),
+            made: e.made,
+            sig: e.sig.to_vec(),
+            published,
+        },
+    )
+    .await
+    .unwrap());
+    let ik = [&[0x05u8][..], &raw(&ik)].concat();
+    exec(
+        db,
+        format!(
+            "INSERT INTO voipc_identity (account, identity_key, updated_at) VALUES ({}, {}, 0)",
+            blob(db, &a.0),
+            blob(db, &ik)
+        ),
+    )
+    .await;
+    exec(
+        db,
+        format!(
+            "INSERT INTO voipc_members (conv, account, joined_at) VALUES ('{id}', {}, 0)",
+            blob(db, &a.0)
+        ),
+    )
+    .await;
+    (a.0, seat)
+}
+
+/// RV r-attackers: every new start (Genesis, Regenesis) queued every log member with seat
+/// keys, so an account whose seat had expired after 90 days offline was seated again with
+/// its old keys and 90 more days, at each new start: the expiry was never final, for the
+/// account or a thief of its old vault. An account that signs in rotates seat keys older than
+/// 30 days, so keys first published more than 120 days ago are an account gone over 90
+/// days: a new start leaves it out (it is seated again when it comes back and fetches), and
+/// still queues one that signed in lately.
+#[tokio::test]
+async fn a_new_start_does_not_seat_again_an_account_gone_longer_than_the_seat_expiry() {
+    let (db, file) = scratch_db().await;
+    let inc = crate::accounts::gk::gk_start(&db, true)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut net = Net::new();
+    net.groups.attach(db.clone(), inc);
+    let id = net.groups.id_for(7, Some("c:den"));
+    let day = 24 * 60 * 60 * 1000;
+    let (gone, gone_seat) = log_member(&db, &id, "ann", now_ms() - 121 * day).await;
+    let (here, here_seat) = log_member(&db, &id, "bob", now_ms() - 119 * day).await;
+    let gone_seat: gk::GkSeat = gone_seat.public().seat(MemberId::Account(gone)).into();
+    let here_seat: gk::GkSeat = here_seat.public().seat(MemberId::Account(here)).into();
+    // A guest's fetch starts the group: the volunteer's Genesis
+    let k = net.guest(7, &id);
+    net.volunteer(&k).await;
+    let p = net.guest(7, &id);
+    net.fetch(&p, &id).await;
+    let out = net.frames(k.sid, 50).await;
+    let (due, piece) = dues(&out, k.sid).pop().expect("a Genesis");
+    assert_eq!(piece.kind, gk::due::GENESIS);
+    let joiner = Joiner::try_from(&piece.joins[0]).unwrap();
+    let st = Start {
+        kind: GroupKind::Text,
+        id: &id,
+        me: k.me(),
+        ik: &k.ik,
+        entry: k.entry(),
+        joiners: &[&joiner],
+        gated: false,
+        stored: true,
+        now: net.groups.now() / 1000,
+    };
+    let b = build_genesis(&st, &mut RowBases::new()).unwrap();
+    net.commit(k.sid, &id, due, &b).await;
+    let (due, piece) = due_within(&mut net, k.sid, 10_000).await.expect("a Join");
+    assert_eq!(piece.kind, gk::due::JOIN);
+    let mut joins: Vec<gk::GkSeat> = piece.joins.iter().map(|j| j.seat).collect();
+    // The members are read beside the actor: one may go in the Join after it
+    if !joins.contains(&here_seat) {
+        let mut h = Holds {
+            ring: b.ring,
+            krk: b.krk,
+            cache: RowBases::new(),
+        };
+        let j = join_on(&k, &id, &b.header, &mut h, &piece, true, net.groups.now());
+        net.commit(k.sid, &id, due, &j).await;
+        let (_, next) = due_within(&mut net, k.sid, 10_000)
+            .await
+            .expect("the next Join");
+        joins.extend(next.joins.iter().map(|j| j.seat));
+    }
+    assert!(joins.contains(&here_seat), "a member seen lately is queued");
+    assert!(
+        !joins.contains(&gone_seat),
+        "a member gone over the seat expiry is not seated again"
+    );
     net.groups.on_purge(&id);
     drop_db(&file);
 }
@@ -3795,7 +4245,7 @@ async fn an_accounts_first_seat_keys_seat_it_eagerly_in_its_conversations_stored
     let seat: gk::GkSeat = ann.seat().into();
     assert!(piece.joins.iter().any(|j| j.seat == seat));
     // The page `eager_all` reads of them names the same account
-    let page = crate::gk::store::eager_page(&db, &id, None, 10)
+    let page = crate::gk::store::eager_page(&db, &id, 0, None, 10)
         .await
         .unwrap();
     assert_eq!(page.iter().map(|(x, _)| *x).collect::<Vec<_>>(), vec![a]);
@@ -4198,6 +4648,69 @@ async fn a_page_asks_no_seat_on_its_way_out_and_a_seat_no_seed_welcome_can_reach
     let mut out = vec![];
     g.ask_page(vec![], vec![(gone, cause::ROTATION)], now, &mut out);
     assert!(g.exits.has(&gone), "it exits, so the roll can end");
+}
+
+/// GROUP-KEY §5.6, RV q1-q2:1210: a text roll ends 24 h after its start whatever the relay
+/// says. A day on, with no page taken, the keyholder's next opening raises the floor though
+/// every seat is behind, the relay takes it, and its pages go on until each seat holds the
+/// seed.
+#[tokio::test]
+async fn a_text_roll_ends_at_its_24_h_and_the_pages_go_on_for_the_seats_behind() {
+    let store = Store::memory();
+    let (mut g, k, mut h, people, mut now) = seated_group_back(&store, 25 * 3_600_000).await;
+    g.rolls.removal = true;
+    now += 61_000;
+    let mut out = vec![];
+    g.tick(now, &mut out);
+    let (due, piece) = dues(&out, 1).pop().expect("a refresh");
+    let b = opening(&g, &k, &mut h, &piece, now);
+    let mut out = vec![];
+    let t = send(&mut g, 1, due, &b, now, &mut out).expect("taken");
+    land(&mut g, &store, t, now, &mut out).await;
+    h.took(b);
+    assert!(g.roll_runs(), "the refresh started a roll");
+    let started = g.head.as_ref().unwrap().sh.header().time;
+    assert_eq!(g.rolls.raised, started);
+
+    now += 86_400_000;
+    let mut out = vec![];
+    g.tick(now, &mut out);
+    let (due, piece) = dues(&out, 1).pop().expect("a refresh");
+    assert!(!piece.finish, "every seat is behind");
+    let b = opening(&g, &k, &mut h, &piece, now);
+    let mut out = vec![];
+    let t = send(&mut g, 1, due, &b, now, &mut out).expect("taken");
+    land(&mut g, &store, t, now, &mut out).await;
+    let hd = g.head.as_ref().unwrap().sh.header().clone();
+    assert_eq!((hd.seed, hd.seed_floor), (2, 2), "the roll ended");
+    assert!(!g.roll_runs() && g.paging() && g.left_behind);
+    assert!(g.snapshot().unwrap().left_behind);
+    let want = g.page_wanted(now).expect("the pages go on");
+    for p in &people {
+        assert!(want.contains(&p.seat()));
+    }
+    g.seed_wanted(people[0].seat());
+    assert!(
+        g.seed_first.contains(&people[0].seat()),
+        "first in the next page"
+    );
+    // A seat that fetches behind is asked at once, not at the next 10 s scan: a member
+    // reading waits one page for the new epoch, not the sweep
+    g.next_page = now + 10_000;
+    assert_eq!(g.page_wanted(now), Some(vec![people[0].seat()]));
+
+    // Each seat holds the seed: the next paced scan ends the sweep
+    let all: Vec<(SeatRef, Vec<u8>)> = g.seats.keys().map(|s| (*s, vec![])).collect();
+    let mut out = vec![];
+    let by = HolderRef {
+        m: k.m(),
+        kx: k.wire().kx(),
+    };
+    g.seeded(by, 2, &all, now, &mut out);
+    g.seed_first.clear();
+    now += 60_000;
+    assert_eq!(g.page_wanted(now), None);
+    assert!(!g.left_behind && !g.paging());
 }
 
 /// Review 8: a rotation exited the old seat in stored groups only, so in a memory group it
@@ -5291,4 +5804,299 @@ async fn a_voice_posts_writer_is_named_by_its_epochs_gate_not_the_channels() {
         Ok(())
     );
     assert!(kept(&g, gated.epoch, a.m()));
+}
+
+/// Review of RV q9-q10:211: every names answer carries the removals between, so each must
+/// cost what §8 budgets, 33 B per exit plus its place: a whole header (0.4 KB) for each of
+/// §8's 100 exit openings an hour at 100k put a writer that posts every 14 days past
+/// `NAMES_IN_MAX_BYTES`, so it never folded again. A removal goes as its bare list.
+#[test]
+fn a_names_answer_carries_each_removal_at_the_cost_of_its_seats() {
+    use crate::gk::names::{Kept, Names};
+    use voipc_crypto::group_key::{
+        names_start, names_step, Added, HeaderV1, NamesList, Removed, SignedHeader,
+    };
+    use voipc_protocol::gk::NAMES_IN_MAX_BYTES;
+    let gen = [1; 16];
+    let t = 1_000_000_000;
+    let start = NamesList {
+        time: t,
+        epoch: 3,
+        join: 0,
+        added: vec![],
+        removed: vec![],
+    };
+    let mut hash = names_start(&start);
+    let ik = voipc_crypto::generate_identity_key_pair();
+    let mut removals = vec![];
+    const N: u32 = 16;
+    for i in 0..N {
+        let mut hd = HeaderV1 {
+            group_kind: GroupKind::Text,
+            group: "c:lounge-4".into(),
+            gen,
+            epoch: 4 + i,
+            join: 0,
+            kind: Kind::Fresh,
+            time: t + 36 * u64::from(i + 1),
+            parent: [9; 32],
+            epoch_parent: [0; 32],
+            kh_parent: [8; 32],
+            signer: MemberId::Account([3; 16]),
+            keyholders: vec![],
+            gated: true,
+            seed: 1,
+            seed_floor: 1,
+            exits_upto: u64::from(i + 1),
+            seats: 100_000,
+            buckets: 1613,
+            conn_seats: 0,
+            bucket_root: [0; 32],
+            keyring_hash: [0; 32],
+            names_hash: [0; 32],
+            added: Added::List(vec![]),
+            removed: Removed::List(vec![SeatRef {
+                m: MemberId::Account([5 + i as u8; 16]),
+                tag_sk: [1; 8],
+                tag_sx: [2; 8],
+            }]),
+            confirm: [0; 32],
+        };
+        hd.names_hash = names_step(&hash, &NamesList::of(&hd));
+        hash = hd.names_hash;
+        removals.push((gen, SignedHeader::sign(hd, &ik).unwrap()));
+    }
+    let mut n = Names::default();
+    let first = names_start(&start);
+    n.restore(
+        vec![Kept {
+            gen,
+            list: (&start).into(),
+            hash: first,
+        }],
+        removals,
+        None,
+    );
+    let at = |epoch, join| gk::NamesRef { gen, epoch, join };
+    let bytes = |p: &gk::NamesPiece| postcard::to_allocvec(p).unwrap().len();
+    let bare = bytes(&n.answer(&at(3, 0), &at(3, 0)));
+    let all = bytes(&n.answer(&at(3, 0), &at(4 + N, 0)));
+    let each = (all - bare) / N as usize;
+    assert!(each <= 33 + 31, "{each} B for a removal of one seat");
+    // And they are the steps: the fold from the start reaches the last removal's hash
+    let a = n.answer(&at(3, 0), &at(4 + N, 0));
+    let folded = a.lists[1..].iter().fold(first, |acc, l| {
+        names_step(&acc, &NamesList::try_from(l).unwrap())
+    });
+    assert_eq!(folded, hash);
+    // 14 days of §8's exits at 100k, one seat each, stay well inside the cap
+    assert!(
+        each * 100 * 24 * 14 < NAMES_IN_MAX_BYTES / 4,
+        "{each} B a removal"
+    );
+}
+
+/// J10-B option A (owner 2026-11-22): a stored group whose keyholder set in force holds
+/// connection entries alone (here a guest's pair), none online, is asked a Regenesis as soon
+/// as a seat waits, on that turn: its wait (`regenesis_at`) ends when the relay saw no
+/// keyholder online, not 2 minutes on. The control: with the keyholder online the newcomer
+/// waits for a Join, and nothing starts anew.
+#[tokio::test]
+async fn a_connection_held_stored_group_with_no_keyholder_online_is_asked_a_regenesis_at_once() {
+    let store = Store::memory();
+    let newcomer = Person::guest(4);
+    let asked = |out: &[Out], sid: UserId| -> Vec<u8> {
+        dues(out, sid).into_iter().map(|(_, p)| p.kind).collect()
+    };
+
+    // The control: the keyholder is online
+    let (mut g, k, _h, people, mut now) = seated_group(&store).await;
+    g.stored = true;
+    g.follow(newcomer.sid, None);
+    let mut out = vec![];
+    assert_eq!(
+        g.fetch(newcomer.sid, newcomer.fetch(), now, &mut out),
+        Fetched::Not
+    );
+    assert_eq!(g.regenesis_at(), None, "a keyholder is online");
+    now += 2_000;
+    g.tick(now, &mut out);
+    assert_eq!(asked(&out, k.sid), vec![gk::due::JOIN], "a Join seats it");
+    for p in &people {
+        assert!(asked(&out, p.sid).is_empty(), "nothing starts anew");
+    }
+
+    // The keyholder goes, its entry the set's only one
+    let (mut g, k, _h, people, now) = seated_group(&store).await;
+    g.stored = true;
+    let set = &g.head.as_ref().unwrap().kh.header().keyholders;
+    assert_eq!(set.len(), 1);
+    assert_eq!(set[0].origin, Origin::Connection as u8);
+    let mut out = vec![];
+    g.volunteer(k.sid, None, now, &mut out);
+    assert_eq!(
+        g.regenesis_at(),
+        Some(now),
+        "from when no keyholder was online"
+    );
+    let v = &people[0];
+    g.volunteer(
+        v.sid,
+        Some(v.volunteer(gk::platform::DESKTOP)),
+        now,
+        &mut out,
+    );
+    g.follow(newcomer.sid, None);
+    let mut out = vec![];
+    assert_eq!(
+        g.fetch(newcomer.sid, newcomer.fetch(), now, &mut out),
+        Fetched::Not
+    );
+    assert_eq!(
+        asked(&out, v.sid),
+        vec![gk::due::REGENESIS],
+        "a Regenesis at once"
+    );
+}
+
+/// A volunteer's Regenesis for the due `piece`, on its clock `now` (ms).
+fn regenesis(g: &GroupState, v: &Person, piece: &DuePiece, now: u64) -> Built {
+    let joiner = Joiner::try_from(&piece.joins[0]).unwrap();
+    let exits: Vec<Exit> = piece.exits.iter().cloned().map(Exit::from).collect();
+    let st = Start {
+        kind: GroupKind::Text,
+        id: ID,
+        me: v.me(),
+        ik: &v.ik,
+        entry: v.entry(),
+        joiners: &[&joiner],
+        gated: piece.gated,
+        stored: g.stored,
+        now: now / 1000,
+    };
+    let head = &g.head.as_ref().unwrap().sh;
+    voipc_crypto::group_key::build::build_regenesis(
+        &st,
+        head,
+        &exits,
+        piece.exits_upto,
+        &mut RowBases::new(),
+    )
+    .unwrap()
+}
+
+/// An Exits opening of `seated_group`'s keyholder `k`, people[1]'s exit, landed at the
+/// relay's `now` (returned) and built on the keyholder's clock `ahead` ms ahead of it.
+async fn an_opening_landed(
+    g: &mut GroupState,
+    store: &Store,
+    k: &Person,
+    h: &mut Holds,
+    people: &[Person],
+    mut now: u64,
+    ahead: u64,
+) -> u64 {
+    let mut out = vec![];
+    g.leave(people[1].sid, cause::LEAVE, now, &mut out);
+    now += 3 * 20 + 2_000;
+    let mut out = vec![];
+    g.tick(now, &mut out);
+    let (due, piece) = dues(&out, k.sid).pop().expect("an exits due");
+    assert_eq!(piece.kind, gk::due::EXITS);
+    let b = opening(g, k, h, &piece, now + ahead);
+    let mut out = vec![];
+    let t = send(g, k.sid, due, &b, now, &mut out).expect("taken");
+    land(g, store, t, now, &mut out).await;
+    assert_eq!(g.last_opening, now);
+    now
+}
+
+/// J10-B option A (repair): under a set of connection entries alone, a head dated ahead of
+/// the relay's clock (its keyholder's clock runs ahead, within `KEYHOLDER_SKEW_SECS`) does
+/// not hold back the at-once Regenesis. The volunteer dates it at its parent's `time`, which
+/// is later than its own clock, and the relay takes it. Only the hour counts from the head's
+/// `time`.
+#[tokio::test]
+async fn an_at_once_regenesis_waits_for_no_head_dated_ahead_of_the_relay_clock() {
+    let store = Store::memory();
+    let newcomer = Person::guest(4);
+    let (mut g, k, mut h, people, now) = seated_group(&store).await;
+    g.stored = true;
+    let ahead = 180_000;
+    let mut now = an_opening_landed(&mut g, &store, &k, &mut h, &people, now, ahead).await;
+    let parent = g.head.as_ref().unwrap().sh.header().time;
+    assert_eq!(
+        parent,
+        (now + ahead) / 1000,
+        "dated on the keyholder's clock"
+    );
+    // Past the gap after that opening, the keyholder goes and a seat waits
+    now += 2_000;
+    let mut out = vec![];
+    g.volunteer(k.sid, None, now, &mut out);
+    assert_eq!(g.regenesis_at(), Some(now), "not the head's time");
+    let v = &people[0];
+    g.volunteer(
+        v.sid,
+        Some(v.volunteer(gk::platform::DESKTOP)),
+        now,
+        &mut out,
+    );
+    g.follow(newcomer.sid, None);
+    let mut out = vec![];
+    assert_eq!(
+        g.fetch(newcomer.sid, newcomer.fetch(), now, &mut out),
+        Fetched::Not
+    );
+    let (due, piece) = dues(&out, v.sid).pop().expect("a Regenesis at once");
+    assert_eq!(piece.kind, gk::due::REGENESIS);
+    // The volunteer on the relay's clock
+    let b = regenesis(&g, v, &piece, now);
+    assert_eq!(b.header.header().time, parent, "dated at its parent's time");
+    let mut out = vec![];
+    let t = send(&mut g, v.sid, due, &b, now, &mut out).expect("taken");
+    land(&mut g, &store, t, now, &mut out).await;
+    let hd = g.head.as_ref().unwrap().sh.header();
+    assert_eq!((hd.kind, hd.time), (Kind::Regenesis, parent));
+}
+
+/// J10-B option A (repair): the at-once Regenesis keeps the relay's gap between openings
+/// (`EPOCH_MIN_GAP_MS`, §4.1 "at most one opening commit per group every 2 s"). A sole
+/// keyholder that goes half a second after its opening landed leaves the Regenesis to
+/// `last_opening + EPOCH_MIN_GAP_MS`, and the actor wakes for it then.
+#[tokio::test]
+async fn an_at_once_regenesis_comes_no_sooner_than_the_gap_after_the_last_opening() {
+    use voipc_crypto::group_key::timers::EPOCH_MIN_GAP_MS;
+    let store = Store::memory();
+    let newcomer = Person::guest(4);
+    let (mut g, k, mut h, people, now) = seated_group(&store).await;
+    g.stored = true;
+    let opened = an_opening_landed(&mut g, &store, &k, &mut h, &people, now, 0).await;
+    let now = opened + 500;
+    let mut out = vec![];
+    g.volunteer(k.sid, None, now, &mut out);
+    let v = &people[0];
+    g.volunteer(
+        v.sid,
+        Some(v.volunteer(gk::platform::DESKTOP)),
+        now,
+        &mut out,
+    );
+    g.follow(newcomer.sid, None);
+    let mut out = vec![];
+    assert_eq!(
+        g.fetch(newcomer.sid, newcomer.fetch(), now, &mut out),
+        Fetched::Not
+    );
+    assert!(dues(&out, v.sid).is_empty(), "not within the gap");
+    let at = opened + EPOCH_MIN_GAP_MS;
+    assert_eq!(g.regenesis_at(), Some(at));
+    assert_eq!(g.wake(now), Some(at), "the actor wakes for it");
+    let mut out = vec![];
+    g.tick(at - 1, &mut out);
+    assert!(dues(&out, v.sid).is_empty(), "not a millisecond early");
+    let mut out = vec![];
+    g.tick(at, &mut out);
+    let kinds: Vec<u8> = dues(&out, v.sid).into_iter().map(|(_, p)| p.kind).collect();
+    assert_eq!(kinds, vec![gk::due::REGENESIS], "once the gap is out");
 }

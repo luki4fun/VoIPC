@@ -5,8 +5,9 @@ All notable changes to VoIPC are documented here.
 ## [1.14.0] - not released yet
 
 Protocol 26: a 1.14 relay admits only 1.14 apps, so update the apps first. A 1.14 app still talks to 1.13 relays and
-older ones, down to 1.0 (protocol 25 was a step on the way here and never shipped). Media edges speak a version of their
-own (pool 1): update a relay before its edges. One database migration (`0013_group_keys.sql`), and l4f-accounts 0.15.
+older ones, down to 1.0 (protocol 25 was a step on the way here and never shipped). Bugs found and fixed during 1.14's
+own development, which no release carried, are not listed. Media edges speak a version of their own (pool 1): update a
+relay before its edges. One database migration (`0013_group_keys.sql`), and l4f-accounts 0.15.
 **Text channels and voice rooms move to a group epoch key, which weakens several security claims** (Security, below).
 No outside cryptographer has reviewed it.
 
@@ -16,35 +17,96 @@ No outside cryptographer has reviewed it.
   advisory. A relay with `group_key = false` keeps 1.13's paths, and their promises:
   - **A stolen device reads recorded live text back to the last seat-key rotation**, not the last hour. A channel's keys
     reach its members through seat keys each account keeps in its vault, made anew every 30 days and at a password
-    change, a recovery-key reset and a removed device.
+    change, a recovery-key reset and a removed device. The vault's own key never changes, though: whoever once held it
+    (a remembered device, a thief, someone who had the password) reads each later rotation wherever it gets the relay's
+    copy of the vault. A password change signs it out, and does not change that key (accepted for 1.14, owner
+    2026-11-22; a recovery slot that lets it change is planned).
   - **A held key lasts until the next epoch**: at most 5 minutes (one in the smallest channels) under an honest relay,
-    and up to 70 minutes under a hostile one, in a channel of any size. On the live path a writer ended its own chain by
-    age, which no relay could stretch, so small channels lose most.
+    up to twice that while people keep joining, and up to 70 minutes under a hostile one, in a channel of any size. On
+    the live path a writer ended its own chain by age, which no relay could stretch, so small channels lose most.
   - **Writers no longer name each new reader themselves.** In a gated channel the signed headers name every new reader
     to each writer seated before them: before that writer's next post under an honest relay, and before its first post
     in a later epoch (70 minutes at most) under a hostile one, with no name skipped. A member who only reads is not shown
-    them, and in an open channel nobody is named. A relay can also give one account of its choice an epoch's key with no
-    header naming it, for that epoch; the keyholder device that seated it warns.
+    them, and in an open channel nobody is named. A relay can also give up to 256 accounts of its choice, each time it
+    asks a keyholder to seat people, the keys of the epochs opened within about 10 minutes of that ask, with no header
+    naming them. The keyholder device that seated them warns, unless the relay keeps that device on a branch of its own
+    past a later epoch, or walks it back in an open channel, or shows it a new generation, which every member sees as
+    made anew (accepted for 1.14, owner 2026-11-22; a key per join is planned).
   - **An account that only goes offline stays seated** until it leaves, rotates its keys at its next sign-in, or 90 days
-    pass unused, and a relay that keeps feeding it the epochs lets it read them all when it is back. A guest's seat ends
-    with its connection.
+    pass unused, and a relay that keeps feeding it the epochs lets it read them all when it is back. A new start of a
+    channel's keys seats it again only within 120 days of its keys, so its seat ends at most 210 days after its last
+    sign-in. A guest's seat ends with its connection.
   - **A new party holds each channel's keys**: the keyholders, named in the member list, whose online times show. Like
     any member a keyholder reads what the channel carries and can give its keys away. If a keyholder's seed leaks, a
-    quantum computer with the recordings opens the rows under it: about 31 days of them at most in a text channel. A
-    desktop's keyholder pair lives in `gk_local.bin` beside its settings, readable by your user only and not encrypted.
-  - **Newcomers read up to 5 minutes back** (60 s in the smallest channels) under an honest relay, and up to 70 minutes
-    under a hostile one, where the live path gave about 60 s.
-  - **Where only browsers and guests hold a channel's keys, a hostile relay can have them made anew every few minutes**,
-    by dropping their connections (the fast new start, below). It reads and forges nothing by it, and a channel with a
-    desktop keyholder keeps the hour.
+    quantum computer with the recordings opens the rows under it: about 31 days of them at most in a text channel,
+    whatever the relay does, since keyholders end a new seed's roll a day after it starts. A desktop's keyholder pair
+    lives in `gk_local.bin` beside its settings, readable by your user only and not encrypted. With *Help hold keys* on
+    (the default, guests included), a browser tells the relay when its page is hidden or shown, and the offers tell
+    desktops from phones.
+  - **Whoever holds an account's identity key can, with the relay, add a keyholder of its own unseen**: the other
+    keyholders refuse its keys, but members take them, and no device warns. Whoever holds that key is the account, and
+    admins and the relay are trusted to keep a channel going (owner, 2026-11-22). A removed desktop whose account has
+    another keyholder still holds that key.
+  - **Newcomers read up to 5 minutes back** (60 s in the smallest channels) under an honest relay, up to twice that
+    while people keep joining, and up to 70 minutes under a hostile one, where the live path gave about 60 s.
+  - **Where only browsers and guests hold a channel's keys, a hostile relay can have them made anew at once**, by
+    dropping their connections (the fast new start, below), and again within seconds through a hand-over: no faster than
+    it could already, by asking any volunteer to start the channel's keys anew. It reads and forges nothing by it, and a
+    channel with a desktop keyholder keeps the hour.
   - **In an anonymous room** everyone is seated by their connection, so a writer's key there is taken on trust as a
     guest's is; the signed headers still name each keyholder's account, which the app does not show.
-  - Stronger: kept copies under the group key reach their readers in welcomes that use Kyber1024 as well as X25519
-    (copies from before stay X25519 only); writers no longer upload a session start for each reader; two voice senders
-    never share a media key and nonce, whatever ids are handed out; a desktop or phone app refuses a channel's keys
-    rolled back below what it saw.
+  - Stronger: kept copies under the group key need Kyber1024 as well as X25519 to open, their chain starts and the
+    rows a sharer gives newcomers included (owner, 2026-11-21: the final review found both still X25519 only), through
+    the account's kept keys, a new vault item (`item.kept`); copies from before the switch, and a voice room's kept chat,
+    stay X25519 only. Pairing a new device hands the vault key over sealed to its Kyber1024 key as well; an account that
+    paired a device with an earlier app sent that key under X25519 alone, and since it never changes, that account's
+    vault stays open to a quantum computer holding the recording. Writers no longer upload a session start for each
+    reader; two voice senders never share a media key and nonce, whatever ids are handed out; a desktop or phone app
+    refuses a channel's keys rolled back below what it saw.
 - **No outside cryptographer has reviewed the group key** (owner, 2026-11-17). It had adversarial reviews of our own
-  while it was built, one more works through GROUP-KEY.md §7 against the code before the release, and then the owner's.
+  while it was built, and one more before the release (2026-11-21) worked through GROUP-KEY.md §7 against the code:
+  of its 50 findings, 29 were confirmed (7 high), and each is fixed below or decided by the owner. §7 gives its answers.
+  The owner's review comes last.
+- **What that review found, fixed in 1.14.** Each fix has tests of its own (GROUP-KEY.md §7 names them).
+  - A member took a channel's keys from whichever keyholder the relay named, and a relay seating a member of its own
+    could make others keep a key it chose. Members now take keys only from a keyholder of the signed set, and
+    keyholders seal keys only to keys whose owner's identity signed them, a seat's whole X25519 key included (a relay
+    could grind a key to match an 8-byte tag).
+  - A keyholder took another keyholder's keyring change from whoever the relay named; it now checks who made it
+    against the signed headers, also after a reconnect. A device sees its own keyholder entry swapped by someone else
+    also on a walk, after a restart and during its own key change. A replaced desktop pair is not promoted again by a
+    keyholder that has seen its successor.
+  - In a gated channel a relay could have a device promoted to keyholder whose account was seated nowhere, so no
+    writer was shown its name. A keyholder now checks that the candidate's account holds a seat.
+  - A writer counted a reader as gone on a removal from another branch, or one the relay made up. Removals now count
+    only where the signed names hash of the head carries them.
+  - A keyholder device that seated people the server then did not list was not told when the relay walked it past
+    onto another branch, or when the channel went from its list. It is now, but for the cases above.
+  - For a minute after a new epoch opened, a member that had only read the one before could still start writing under
+    it, on a chain whoever just left could open. That is now refused, and the app posts again under the new epoch.
+  - A relay could hold a text channel's seed roll open for good. Keyholders now end it a day after it starts, whatever
+    the relay says, and roll a 30-day seed; a member still on the old seed gets the new one by the relay's pages, and
+    reads no new epoch until then (accepted, owner 2026-11-22).
+  - A thief with one session could publish seat keys at the top counter and lock the account out of channel text. The
+    relay now takes a counter at most 4 above the account's and tells the app its keys are behind; the app warns, asks
+    for a password change, and goes above them.
+  - A new start of a channel's keys seated again accounts gone longer than the seat expiry; now only within 120 days.
+    Memory-only channels never expired a seat that only went offline; now after 90 days.
+  - After a relay restart, a stored channel asked no refresh, so newcomers read its epoch from however far back. It does
+    now, a keyholder declines to seat a newcomer into an epoch older than 70 minutes, and a refresh a whole period late
+    goes before a join.
+  - A long-lived channel could outgrow what a member walks, locking newcomers out; its keys now start anew first. A
+    removed keyholder could force a new start every hour by a proof of a restore; that proof now counts only from the
+    current keyholders, and one from a keyholder the restored database does not know warns the admins, where it was
+    dropped unseen.
+  - A relay that started 8 new generations of a channel's keys within 10 minutes could roll a desktop or phone app back
+    into one it took before. The app now refuses each of the last 64 it took since it began following the channel.
+  - In a voice room where nobody writes, the warning that someone who left may still hear never came; every member is
+    now told each exit. A new start of a channel's keys met on a walk is now told as made anew, and a writer's hold for
+    an exit it left behind ends.
+  - Seat keys dated ahead switched the counter check off; they now count from when they were met.
+  - After a recovery-key reset an app could hand its channels the seat keys from before the rotation the reset asks
+    for. It now rotates them first; that a reset asks for one is still held in memory only (Known, below).
 
 ### Added
 - **The group epoch key in every text channel and voice room** (`group_key = true`, [GROUP-KEY.md](docs/GROUP-KEY.md)).
@@ -61,14 +123,23 @@ No outside cryptographer has reviewed it.
     while hidden, so the call goes on while it holds keys.
   - **What the app says** in the channel: its keys are late; nobody who holds them is online, and a message was not sent;
     keys were made anew, and by whom; new readers of a gated channel, by name. And it warns when this device gave the
-    channel's keys to people the server then did not list, when an old key of your account was listed, when the server's
-    keys are older than what this device saw, and when someone who left may still hear a room.
-  - **Fast new start** (owner, 2026-11-19). When every keyholder of a channel is a browser or a guest and none is
-    online, as after the only browser holding its keys reloads or the relay restarts, a volunteer starts its keys anew
-    after 2 minutes, where it waited an hour. Members check that from the signed headers. A set of keyholders a new start
-    began keeps the hour for an hour, and one with a desktop always does.
+    channel's keys to people the server then did not list (also for a channel you no longer have), when an old key of
+    your account was listed, when another device published channel keys for your account that your vault does not hold
+    (change your password), when the server's keys are older than what this device saw, and when someone who left may
+    still hear a room.
+  - **Fast new start** (owner, 2026-11-19; at once since 2026-11-22). When every keyholder of a channel is a browser or
+    a guest and none is online, as after the only browser holding its keys reloads or the relay restarts, a volunteer
+    starts its keys anew at once, where it waited an hour, so someone who joins meanwhile reads what is written then.
+    Members check that from the signed headers. A set of keyholders a new start began keeps the hour for an hour, and
+    one with a desktop always does. A volunteer that was never seated is first sent the channel's head, so it can make
+    the new start.
   - **Kept history under the group key.** A writer's chain lives inside one epoch and is sealed once to the epoch key,
-    for every reader at once. A post's kept copy is filed the moment the relay answers that it took the post
+    for every reader at once. Its start is kept for the writer's other devices under the account's kept keys
+    (`item.kept`, made at the first sign-in with 1.14), and a writer who shares history gives each newcomer a row of
+    1,629 B at each of its chains no link reaches, sealed to the newcomer's kept Kyber1024 key as well as X25519. Those
+    rows are not charged to the sharer's quota. The relay keeps them only for newcomers the sharer owes an answer, at
+    most its chains no link reaches plus 4 for each (GROUP-KEY.md §8 bounds those), and files a chain's link only to
+    the writer's highest chain. A post's kept copy is filed the moment the relay answers that it took the post
     (`EpochPostTaken`), under the epoch the post went under, and a post the relay refused is never kept. A page closed
     within about one round trip of posting can still lose the kept copy; its live readers got the post. `kept_seats`
     (5000) is now cheap to raise, and `kept_window` bounds the key material as well as the messages.
@@ -99,6 +170,11 @@ No outside cryptographer has reviewed it.
   OPERATING.md §10a and §10b.
 
 ### Changed
+- **Pairing a new device from another of yours needs 1.14 on both and on the server.** The vault key now goes sealed to
+  the new device's Kyber1024 key as well as its X25519 key (Security, above). A 1.14 device and an older one cannot pair:
+  the older one's key is refused, or the two show different codes, and nothing is handed over. A 1.14 app pairs only
+  through a server at 1.14 or later, and says so instead of asking; the recovery key and the password still work
+  everywhere.
 - **One channel message holds at most 16 KiB, everywhere**: text channels and voice rooms, the group key on or off. The
   composer stops a longer one before it goes and says why, and one refused anyway is marked on its row: "Not sent: one
   message holds at most 16 KiB." A voice room's chat could run to 60 KiB before. Direct messages keep that limit.
@@ -172,6 +248,31 @@ No outside cryptographer has reviewed it.
   browser lanes of test-web.sh (Chromium, and a Chromium and Firefox pair). The desktop apps and Android were not tried
   against it by hand yet, nor keyholders on machines of their own, nor how long a browser's stepped builds take on a busy
   page against the 4 s a keyholder has for an exit's commit.
+- **Planned after 1.14**, from the final review and the owner's decisions of 2026-11-22: a key per join, which ends the
+  unnamed accounts a relay can seat for up to about 80 minutes per keyholder ask; an asymmetric hybrid recovery slot,
+  so that a password change can give the vault a new key; and a deeper review of the group key by a stronger model, in
+  the manner of an outside review, postponed. None of these is an outside cryptographer's review.
+- **Left open by the final review** (GROUP-KEY.md §7): an exit batch that rides a keyholder change waits for its 60 s
+  deadline, so a leaver may read up to 46 s then; a hostile keyholder with the relay can list an account at a counter of
+  its choosing, so writers in gated channels where that account sits hold their posts, and its devices warn falsely; a
+  keyholder's refusal of a header with a seat that fails its checks does not stick across a walk; for an account a
+  keyholder never pinned,
+  the relay can still get a seed welcome to a key of its own at about 2^64 work divided by the seats; after an
+  account's identity changes, keyholders with no pin for it decline whole seed pages; the rotation a recovery-key reset
+  asks for is held in memory only; a promotion in a gated channel checks the candidate's account is seated, not its
+  identity key; an honest relay can promote a desktop's old pair while its new one is on the way, which stalls
+  keyholders that know the new one; a quantum attacker that also holds a seat in the epoch can plant keys in a welcome.
+  The desktop sender's screen-share nonces rest on its encoder never returning two packets of one kind in one call,
+  which was not checked on hardware. There is no end-to-end test of a keyholder's pair swap through the relay, nor of a
+  seed roll ended at its 24 h.
+- **Kept keys** (`item.kept`): if an account first signs in with 1.14 and joins a channel's history within one vault
+  round trip, a sharer that answers twice before the relay has its kept key gives it nothing at those chains. A vault
+  that loses `item.kept` does not get the rows made to the old one again. A sharer's rows to newcomers cost the relay
+  1,629 B per newcomer at each of its chains no link reaches, and up to 4 more, where a 60 B row once did; a sharer
+  that makes such chains on purpose can raise that to about 1.4 GB per newcomer at the default quota (GROUP-KEY.md §8).
+  That bound is a little loose in two ways: two sessions answering one newcomer at the same moment can each store
+  about one row past it (the per-answer count is read outside the write's transaction), and the quota counts a chain
+  start's 60 B self-wrap but not its 60 B group-key seal, so a chain costs its writer about 61 B, not 121 B.
 
 ## [1.13.0] - release candidate
 

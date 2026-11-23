@@ -32,6 +32,7 @@ use tracing::warn;
 use voipc_crypto::group_key::commit::{Joiner, Pair, ReplaceAsk};
 use voipc_crypto::group_key::timers::{
     ACTOR_IDLE_MS, INBOX_MAX_BYTES, MATERIAL_SWEEP_MS, OPEN_PER_CONN_BYTES, SEAT_EXPIRY_SECS,
+    SEAT_KEYS_ROTATE_SECS,
 };
 use voipc_crypto::group_key::{seat_record, GroupKind, SeatRef};
 use voipc_protocol::gk::{
@@ -97,6 +98,12 @@ enum Msg {
         joiner: Joiner,
         account: [u8; 16],
     },
+    /// `account` rotated to counter `n`: its seats below it not yet seated go
+    /// (`GroupState::supersede`).
+    Supersede {
+        account: [u8; 16],
+        n: u32,
+    },
     Volunteer {
         sid: UserId,
         v: Option<Volunteer>,
@@ -154,7 +161,6 @@ enum Msg {
         sid: UserId,
         from: NamesRef,
         to: NamesRef,
-        removals: bool,
     },
     FloorAhead {
         sid: UserId,
@@ -328,7 +334,7 @@ fn send_live(
         let h = start(shared, id, kind, channel);
         #[cfg(test)]
         shared.stop_between(&h);
-        match h.tx.send((msg, 0)) {
+        match queue(shared, &h, (msg, 0)) {
             Ok(()) => return true,
             Err(mpsc::error::SendError((m, _))) => msg = m,
         }
@@ -348,7 +354,7 @@ fn send_current(shared: &Shared, id: &str, msg: Msg) -> bool {
         let Some(h) = shared.map.get(id).map(|h| h.clone()) else {
             return false;
         };
-        match h.tx.send((msg, 0)) {
+        match queue(shared, &h, (msg, 0)) {
             Ok(()) => return true,
             Err(mpsc::error::SendError((m, _))) => msg = m,
         }
@@ -389,6 +395,7 @@ fn stop_idle(shared: &Shared, h: &Arc<Handle>, rx: &mut Inbox) -> Option<(Arc<Ha
         return None;
     }
     let (next, next_rx) = h.successor();
+    // Each still counted as work under way from its first queueing (`queue`)
     for (m, charge) in left {
         next.inbox.fetch_add(charge, Ordering::Relaxed);
         let _ = next.tx.send((m, charge));
@@ -412,7 +419,7 @@ fn start(shared: &Arc<Shared>, id: &str, kind: GroupKind, channel: ChannelId) ->
             if channel != 0 && s.channel_id != channel {
                 s.channel_id = channel;
                 let gated = shared.gated.contains(&channel);
-                let _ = h.tx.send((Msg::Gate { gated }, 0));
+                let _ = queue(shared, &h, (Msg::Gate { gated }, 0));
             }
             drop(s);
             return h;
@@ -473,6 +480,82 @@ pub struct Shared {
     /// send, with this `go`.
     #[cfg(test)]
     stop_between: Mutex<Option<Arc<tokio::sync::Notify>>>,
+    /// Tests: the work under way (`Busy`).
+    #[cfg(test)]
+    work: Arc<AtomicUsize>,
+    /// Tests: the next commit's store write takes this long in real time first.
+    #[cfg(test)]
+    stall: Mutex<Option<(u64, Stalled)>>,
+}
+
+/// Tests: what a stalled store write saw (`stall_next_commit_for_test`): the relay's clock
+/// at its start and at its end, and the real time it took.
+#[cfg(test)]
+pub type Stalled = Arc<Mutex<Option<(u64, u64, Duration)>>>;
+
+/// One piece of the relay's work under way: an actor's turn (with the message it takes) or
+/// a task of the relay's own (an eager read, a sweep). Tests count them (`Shared::work`):
+/// one that pauses tokio's clock moves it only at real time while any is under way
+/// (gk_e2e_j8h.rs `World::settle`), as a relay's clock moves while its database works.
+/// Nothing outside tests.
+#[cfg(test)]
+struct Busy(Arc<AtomicUsize>);
+#[cfg(not(test))]
+struct Busy;
+
+impl Busy {
+    /// Work starting now.
+    fn start(shared: &Shared) -> Busy {
+        #[cfg(test)]
+        shared.work.fetch_add(1, Ordering::Relaxed);
+        Busy::taken(shared)
+    }
+
+    /// The work a queued message was counted as (`queue`), from its turn on.
+    #[cfg(test)]
+    fn taken(shared: &Shared) -> Busy {
+        Busy(shared.work.clone())
+    }
+
+    #[cfg(not(test))]
+    fn taken(_: &Shared) -> Busy {
+        Busy
+    }
+}
+
+#[cfg(test)]
+impl Drop for Busy {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Queues `m` in `h`'s inbox: work under way until the turn that takes it ends (`Busy`).
+/// The inbox's own send, the message given back by a closed one (`stop_idle`).
+#[cfg_attr(not(test), allow(unused_variables))]
+#[allow(clippy::result_large_err)]
+fn queue(
+    shared: &Shared,
+    h: &Handle,
+    m: (Msg, usize),
+) -> Result<(), mpsc::error::SendError<(Msg, usize)>> {
+    #[cfg(test)]
+    shared.work.fetch_add(1, Ordering::Relaxed);
+    let sent = h.tx.send(m);
+    #[cfg(test)]
+    if sent.is_err() {
+        shared.work.fetch_sub(1, Ordering::Relaxed);
+    }
+    sent
+}
+
+/// Tests: an ended actor's inbox, what was queued in it dropped with its work (`Busy`).
+#[cfg(test)]
+fn drop_inbox(shared: &Shared, rx: &mut Inbox) {
+    rx.close();
+    while rx.try_recv().is_ok() {
+        let _ = Busy::taken(shared);
+    }
 }
 
 /// Tests: `(reached, go)` of an idle stop's gate.
@@ -598,6 +681,10 @@ impl Groups {
                 idle_gate: Mutex::default(),
                 #[cfg(test)]
                 stop_between: Mutex::default(),
+                #[cfg(test)]
+                work: Arc::default(),
+                #[cfg(test)]
+                stall: Mutex::default(),
             }),
             by_channel: DashMap::new(),
             follows: DashMap::new(),
@@ -683,7 +770,7 @@ impl Groups {
             }
             let charge = if lane { 0 } else { bytes };
             h.inbox.fetch_add(charge, Ordering::Relaxed);
-            match h.tx.send((msg, charge)) {
+            match queue(&self.shared, &h, (msg, charge)) {
                 Ok(()) => return true,
                 Err(mpsc::error::SendError((m, _))) => {
                     h.inbox.fetch_sub(charge, Ordering::Relaxed);
@@ -988,8 +1075,23 @@ impl Groups {
         // the old seat sits), so no seat sits whose keys no seed welcome can reach
         for h in self.shared.map.iter() {
             if h.kind == GroupKind::Text && !h.store.stored() {
-                let _ = h.tx.send((Msg::Rotated { account, keep: new }, 0));
+                let _ = queue(
+                    &self.shared,
+                    h.value(),
+                    (Msg::Rotated { account, keep: new }, 0),
+                );
             }
+        }
+        // Where the new seat sits already (the same keys again, above keys another holder of
+        // the account's identity published): nothing exits it, so the seats it went above,
+        // still waiting there, go (RV q8-q11). A seat waits only in a live group
+        let again: HashSet<&String> = seats
+            .iter()
+            .filter(|(_, _, s)| s.seat == seat_record(&new))
+            .map(|(grp, _, _)| grp)
+            .collect();
+        for id in again {
+            let _ = send_current(&self.shared, id, Msg::Supersede { account, n });
         }
         for id in &groups {
             let channel = self.channel_of(id);
@@ -1045,6 +1147,8 @@ impl Groups {
                     continue;
                 }
                 let channel = self.channel_of(&id);
+                // No seat here: the seats it went above may wait here still
+                self.post_live(&id, GroupKind::Text, channel, Msg::Supersede { account, n });
                 let eager = Msg::Eager {
                     joiner: joiner.clone(),
                     account,
@@ -1429,7 +1533,8 @@ async fn answer(
     if let Some(s) = p.seat.as_ref().filter(|k| k.row.is_some()).map(|k| k.s) {
         p.seed_welcome = h.store.seed_welcome(&h.id, &gen, seat, s).await;
     }
-    let rolls = hd.seed_floor < hd.seed;
+    // Pages go on past a roll that ended at its 24 h with seats behind (§5.6)
+    let rolls = hd.seed_floor < hd.seed || snap.left_behind;
     if rolls && p.seed_welcome.as_ref().is_none_or(|w| w.s != hd.seed) {
         p.seed_welcome = h
             .store
@@ -1479,7 +1584,11 @@ async fn actor(
         let idle_at = idle_since.map(|t| t + shared.idle_ms());
         let next = [wake, idle_at].into_iter().flatten().min();
         let msg = tokio::select! {
-            _ = h.stop.notified() => return,
+            _ = h.stop.notified() => {
+                #[cfg(test)]
+                drop_inbox(&shared, &mut rx);
+                return;
+            }
             m = rx.recv() => match m {
                 Some((m, charge)) => {
                     h.inbox.fetch_sub(charge, Ordering::Relaxed);
@@ -1496,6 +1605,11 @@ async fn actor(
                     None => std::future::pending().await,
                 }
             } => None,
+        };
+        // The turn's work: the message's from when it was queued, a timer's from now
+        let _turn = match msg {
+            Some(_) => Busy::taken(&shared),
+            None => Busy::start(&shared),
         };
         let now = clock.now();
         let mark = g.due_mark();
@@ -1565,6 +1679,8 @@ async fn actor(
                 #[cfg(test)]
                 shared.at_idle_gate().await;
                 let Some((next, next_rx)) = stop_idle(&shared, &h, &mut rx) else {
+                    #[cfg(test)]
+                    drop_inbox(&shared, &mut rx);
                     return;
                 };
                 (h, rx) = (next, next_rx);
@@ -1701,25 +1817,37 @@ const EAGER_PAGE: u32 = 256;
 
 /// After a stored group's Genesis or Regenesis: every account that keeps its conversation's
 /// log with published seat keys is queued eagerly, online or not (plan 2d "Eager seats"),
-/// since they never send `LogJoin` again. Read a page at a time off the actor, at most
-/// `kept_seats`, each page queued to it.
+/// since they never send `LogJoin` again; not one whose keys the relay first held more than
+/// the seat expiry and a rotation's age ago (120 days). Read a page at a time off the actor,
+/// at most `kept_seats`, each page queued to it.
 fn eager_all(shared: &Arc<Shared>, h: &Handle, kept_seats: usize) {
     let Store::Db(db) = &*h.store else {
         return;
     };
+    // Only accounts that signed in within the seat expiry (RV r-attackers): one gone longer
+    // has seat keys first published more than the expiry and a rotation's age ago (the app
+    // rotates them at a sign-in once they are that old). Its seat expired or would have, so
+    // a new start must not hand it the next 90 days; it is seated again when it fetches
+    let since = shared
+        .clock
+        .now()
+        .saturating_sub((SEAT_EXPIRY_SECS + SEAT_KEYS_ROTATE_SECS) * 1000);
+    let busy = Busy::start(shared);
     let (db, shared, conv) = (db.clone(), Arc::downgrade(shared), h.id.clone());
     tokio::spawn(async move {
+        let _busy = busy;
         let mut after: Option<[u8; 16]> = None;
         let mut queued = 0;
         while queued < kept_seats {
             // The group id is its conversation's (`stored_id`), as `voipc_members` names it
-            let page = match store::eager_page(&db.db, &conv, after.as_ref(), EAGER_PAGE).await {
-                Ok(p) => p,
-                Err(e) => {
-                    warn!(group = %conv, "reading the eager seats failed: {e}");
-                    return;
-                }
-            };
+            let page =
+                match store::eager_page(&db.db, &conv, since, after.as_ref(), EAGER_PAGE).await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!(group = %conv, "reading the eager seats failed: {e}");
+                        return;
+                    }
+                };
             let full = page.len() == EAGER_PAGE as usize;
             queued += page.len();
             after = page.last().map(|(a, _)| *a);
@@ -1762,6 +1890,7 @@ async fn handle_msg(
             g.leave(sid, cause, now, out)
         }
         Msg::AccountExit { account, cause } => g.account_exit(&account, cause, now, out),
+        Msg::Supersede { account, n } => g.supersede(&account, n, now, out),
         Msg::Eager { joiner, account } => {
             let seat = joiner.seat;
             g.eager(joiner, account, now, out);
@@ -1797,6 +1926,8 @@ async fn handle_msg(
             let Some(t) = g.commit_part(sid, due, part, last, piece, bytes, now, out) else {
                 return;
             };
+            #[cfg(test)]
+            shared.stall_commit().await;
             match h.store.commit(g, &t, now).await {
                 Ok(()) => {
                     let dealt: Vec<SeatRef> = t
@@ -1872,12 +2003,7 @@ async fn handle_msg(
             epoch,
             writer,
         } => g.blobs(sid, gen, epoch, writer, out),
-        Msg::Names {
-            sid,
-            from,
-            to,
-            removals,
-        } => g.names(sid, &from, &to, removals, out),
+        Msg::Names { sid, from, to } => g.names(sid, &from, &to, out),
         Msg::FloorAhead { sid, header } => g.floor_ahead(sid, &header, now, out),
         Msg::Gate { gated } => g.set_gate(gated, now, out),
         Msg::Anonymous { anonymous } => g.room_anonymous(anonymous, now, out),
@@ -1926,7 +2052,12 @@ async fn handle_msg(
                 g.eager(joiner, account, now, out);
             }
         }
-        Msg::Sweep { daily } => h.store.sweep_live(g, now, daily).await,
+        Msg::Sweep { daily } => {
+            h.store.sweep_live(g, now, daily).await;
+            if daily && !g.stored {
+                g.expire_away(now, out);
+            }
+        }
         Msg::Expire(seats) => g.expire(&seats, now, out),
         Msg::Rotated { account, keep } => g.rotated(&account, &keep, now, out),
     }
@@ -1953,6 +2084,7 @@ async fn sweeper(shared: std::sync::Weak<Shared>) {
         if daily {
             daily_at = now + DAY_MS;
         }
+        let _busy = Busy::start(&shared);
         sweep(&shared, now, daily).await;
     }
 }
@@ -1964,7 +2096,7 @@ async fn sweeper(shared: std::sync::Weak<Shared>) {
 /// group's actor), and seats unused for 90 days exit (their group's actor is started).
 async fn sweep(shared: &Arc<Shared>, now: u64, daily: bool) {
     for h in shared.map.iter() {
-        let _ = h.tx.send((Msg::Sweep { daily }, 0));
+        let _ = queue(shared, h.value(), (Msg::Sweep { daily }, 0));
     }
     let Some(db) = shared.db.get() else {
         return;
@@ -2017,6 +2149,19 @@ async fn sweep(shared: &Arc<Shared>, now: u64, daily: bool) {
 
 #[cfg(test)]
 impl Shared {
+    /// A store write that takes real time first (`stall_next_commit_for_test`): off the
+    /// runtime's thread, as a database's round trips are.
+    async fn stall_commit(&self) {
+        let Some((ms, seen)) = self.stall.lock().unwrap().take() else {
+            return;
+        };
+        let (from, real) = (self.clock.now(), std::time::Instant::now());
+        tokio::task::spawn_blocking(move || std::thread::sleep(Duration::from_millis(ms)))
+            .await
+            .unwrap();
+        *seen.lock().unwrap() = Some((from, self.clock.now(), real.elapsed()));
+    }
+
     /// The idle stop's gate, once: `reached` told, then it waits for `go`.
     async fn at_idle_gate(&self) {
         let gate = self.idle_gate.lock().unwrap().take();
@@ -2070,6 +2215,21 @@ impl Groups {
     /// One sweep now, as the timer runs it.
     pub async fn sweep_for_test(&self, daily: bool) {
         sweep(&self.shared, self.now(), daily).await;
+    }
+
+    /// Whether the relay has work under way: a message queued for an actor or its turn, an
+    /// actor's timer turn, an eager read, a sweep (`Busy`).
+    pub fn busy_for_test(&self) -> bool {
+        self.shared.work.load(Ordering::Relaxed) > 0
+    }
+
+    /// The next commit's store write takes `ms` of real time first, as Postgres can under
+    /// load: what the relay's clock read at its start and at its end, and the real time it
+    /// took.
+    pub fn stall_next_commit_for_test(&self, ms: u64) -> Stalled {
+        let seen = Stalled::default();
+        *self.shared.stall.lock().unwrap() = Some((ms, seen.clone()));
+        seen
     }
 }
 

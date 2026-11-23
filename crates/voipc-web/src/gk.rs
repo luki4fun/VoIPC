@@ -156,17 +156,14 @@ impl Gk {
         let mut account = None;
         let mut seat_keys = None;
         if let Some(link) = self.account.clone() {
-            // After a reset with the recovery key, once the keys are on (§5.11)
+            // After a reset with the recovery key, once the keys are on, before anything else
+            // (§5.11)
             let rotate = s.on && link.take_reset();
             let on = self.with_session(|session| {
-                let mut a = session.gk_on(s.on);
-                if rotate {
-                    let r = session.seat_keys_rotate();
-                    a.send.extend(r.send);
-                    a.emit.extend(r.emit);
-                    a.seat_keys = r.seat_keys.or(a.seat_keys.take());
-                }
-                (session.account_id(), a)
+                (
+                    session.account_id(),
+                    session.gk_begin(s.on, s.clock, rotate),
+                )
             });
             if let Some((id, mut a)) = on {
                 account = Some(id);

@@ -371,6 +371,7 @@ mod tests {
             roster: vec![3],
             no_keyholder_since: None,
             seq: 0,
+            seed_keys: true,
         };
         w.take(&due, a, &built);
         w
@@ -648,8 +649,10 @@ mod tests {
         assert_eq!(lie.voice[0].own.0, MemberId::Conn(20), "not ours: writer_m");
     }
 
-    /// A refused post clears the keys until the refetch brings them back: a roster that moved
-    /// meanwhile goes with them then, though their epoch went out before, at its switch time.
+    /// With no key held (as after a take that brought none, until the refetch brings it), a
+    /// roster that moved meanwhile goes with the keys then, though their epoch went out
+    /// before, at its switch time. A refused post (`OLD_EPOCH`) no longer drops the keys
+    /// (RV r-members:55): a roster that moves after one goes at once.
     #[test]
     fn a_roster_that_moved_while_no_key_was_held_goes_once_the_key_is_back() {
         let mut w = room();
@@ -659,13 +662,7 @@ mod tests {
         let b = join(&mut w, vec![j]);
         let genesis = w.kh.clone();
         let first = d.take(piece(&w, &b, &seat, &[&genesis]), w.now).voice;
-        let refused = ServerMessage::EpochRefused {
-            group: VOICE_ID.into(),
-            what: gk::refused_what::POST,
-            why: gk::refused_why::OLD_EPOCH,
-            detail: String::new(),
-        };
-        d.frame(&refused, w.now * 1000);
+        d.keying.groups.get_mut(VOICE_ID).unwrap().keys.clear();
         let them = w.holders[0].seat.seat;
         let roster = voice_seats(vec![(3, gk_seat(&them)), (20, gk_seat(&seat))]);
         assert!(
@@ -679,6 +676,18 @@ mod tests {
         assert_eq!(v.seats.len(), 2);
         assert_eq!(v.switch_at, first[0].switch_at);
         assert!(d.tick(w.now * 1000 + 2000).voice.is_empty(), "once");
+        let refused = ServerMessage::EpochRefused {
+            group: VOICE_ID.into(),
+            what: gk::refused_what::POST,
+            why: gk::refused_why::OLD_EPOCH,
+            detail: String::new(),
+        };
+        d.frame(&refused, w.now * 1000 + 3000);
+        assert_eq!(
+            d.frame(&roster, w.now * 1000 + 3000).voice.len(),
+            1,
+            "a refused post keeps the keys"
+        );
     }
 
     /// §5.9 "voice never stops": an exit no opening covered in 46 s is told once; the keys
@@ -802,7 +811,6 @@ mod tests {
             piece: gk::NamesPiece {
                 lists,
                 joins: vec![],
-                removals: vec![],
                 gone: None,
             },
         };

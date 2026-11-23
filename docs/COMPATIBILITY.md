@@ -23,7 +23,7 @@ nobody checks, so a new one comes with its test.
 
   | Relay | What a 1.14 app does not offer there |
   |---|---|
-  | 1.13 (24) | the group key: text channels there use the live path and voice rooms the 3N join, as in 1.13; edges: viewers there are served by the relay itself. That relay sends the lobby whole, as it always did, and the app reads it so |
+  | 1.13 (24) | the group key: text channels there use the live path and voice rooms the 3N join, as in 1.13; edges: viewers there are served by the relay itself. That relay sends the lobby whole, as it always did, and the app reads it so. Approving a new device from another (pairing): its vault-key wrap is hybrid since 1.14 and too large for an older relay, so the app says it needs a server on 1.14 and sends nothing (`PAIR_PQ_SINCE`); the recovery key and the password still work |
   | 1.12 (23) | dropping a device's old key when the device is remembered again: there it stays until the relay's 90-day sweep |
   | 1.12.0-rc.1 (22) | a restriction's parts: a voice-only mute during the new-member wait reads as a time-out there, until the wait ends |
   | 1.11 (21) | a sign-in bound to its connection (device key, provider, reset) and a password that never leaves the device: there they go as in 1.11; an admin step's refusal ends every step waiting, not only its own |
@@ -38,6 +38,10 @@ nobody checks, so a new one comes with its test.
   | 1.0 (12) | files, emotes and stickers, edits, reactions, pins, forwards, a new recovery key |
 
   The browser always loads the page of the relay it connects to, so it always matches.
+- **Pairing across versions (1.14).** A 1.14 device and a device from before 1.14 cannot pair, either way round: the
+  newer one refuses the older one's key, or the two show different codes, and nothing is handed over. The person sees
+  the usual wrong-code or someone-may-be-trying-codes ending, which says nothing about versions. Update both devices,
+  or use the recovery key or the password.
 - A refused client is told why:
   - a client at protocol 12 or later gets `ServerMessage::Refused { code, server_protocol,
     server_version, text }`, with `code` 1 (`REFUSED_VERSION`) for a protocol mismatch. The app
@@ -241,14 +245,20 @@ and an older app leaves an item it does not know alone. So what an account newly
 - The vault item `item.seat_kem`: the account's seat keys (a Kyber1024 and an X25519 pair, the self key, when they were
   made and their counter), about 4.9 KB, 9.7 KB while a rotation keeps the old ones. Every device of the account reads it;
   an older app leaves it alone.
+- The vault item `item.kept`: the account's kept keys (32 random bytes and a Kyber1024 pair, which never change), about
+  4.8 KB, made at the account's first sign-in with 1.14. Kept chain starts under the group key and sharers' rows to this
+  account open with them. An older app leaves it alone.
 - The vault item `item.gk_floors`, the index of the floor pages: `gkf.0` to `gkf.15` (each stored channel's rollback floor
   and names floor) and `gkc.0` to `gkc.31` (the highest seat-key counter seen per account, and when each pin was first
   seen), up to 48 KiB a page, in a namespace of their own on the relay (`voipc.gkfloors`), read one at a time after sign-in
   like the pins' pages.
 - `gk_local.bin` in the data directory of the desktop and phone apps (0600): each relay's floors, a desktop keyholder's own
-  pair and the seats it sealed that no header named yet, and a guest's highest counters. It is not encrypted at rest.
+  pair and the seats it sealed that no header named yet, with the head each stands on, per channel it holds keys in each
+  account's highest desktop counter, beside each floor up to 8 keyholder headers before it, and a guest's highest
+  counters. It is not encrypted at rest. A file in an older 1.14 development format is set aside and started anew.
   Lost, a device falls back to the vault floor or to the rule for no floor.
-- The accounts database: migration `0013_group_keys.sql` adds the `voipc_gk_*` tables. The relay keeps `gk_incarnation`
+- The accounts database: migration `0013_group_keys.sql` adds the `voipc_gk_*` tables, `voipc_log_kems` (each account's
+  kept Kyber1024 key) and the column `voipc_pending.gk_rows`. The relay keeps `gk_incarnation`
   and `gk_switch` in `voipc_meta`, written at its first start with the key on and by `db new-incarnation`.
   Only stored channels are there; anonymous rooms, channels that hide their members, voice rooms and relays without
   accounts keep it all in memory.
@@ -315,8 +325,12 @@ a stolen device reads recorded live text back to the last seat-key rotation (30 
 the last hour; a held key lasts until the next epoch, up to 70 minutes under a hostile relay, in a
 channel of any size; writers no longer name each new reader themselves, the signed headers name them
 to writers in gated channels only; an account that only goes offline stays seated until it leaves,
-rotates or expires after 90 days; keyholders are a new party; and newcomers read up to 5 minutes
-back under an honest relay, 70 under a hostile one. They are in the CHANGELOG's Security entry for
+rotates or expires after 90 days unused (at most 210 days after its last sign-in); keyholders are a
+new party, and whoever holds an account's identity key can, with the relay, add one of its own that
+members take unwarned; and newcomers read up to 5 minutes back under an honest relay, up to twice
+that while people keep joining, 70 under a hostile one. Whoever once held an account's vault key
+reads its later seat keys wherever it gets the relay's copy of the vault, after a password change
+too. They are in the CHANGELOG's Security entry for
 1.14, for one advisory. `group_key = false` keeps the claims as they were.
 
 **Break detection:**

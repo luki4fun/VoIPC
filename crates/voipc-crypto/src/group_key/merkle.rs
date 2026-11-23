@@ -206,19 +206,47 @@ fn records(seats: &[SeatRef]) -> Vec<[u8; 33]> {
     r
 }
 
-/// `list(b,v) = SHA-256(len(c) u32 BE ‖ c ‖ records)`, `c = ctx(list; k,
-/// group, gen, b, v)`, the records sorted and each once, as `log.rs`
-/// `list_digest` does. The context makes one set of people in two groups,
-/// or two versions, two digests.
-pub fn list_digest(g: &Group, at: Version, seats: &[SeatRef]) -> [u8; 32] {
+/// A list entry (§11.5), 66 bytes: the seat record, then `ser(SX)` (33), the seat's X25519
+/// public key in full. The record's `tag_sx` is 8 bytes: a relay may grind a key of its own
+/// to it (about 2^64 / N tries over N seats), so the digest binds the key itself.
+fn list_entry(seat: &SeatRef, dh: &[u8; 33]) -> [u8; 66] {
+    let mut e = [0u8; 66];
+    e[..33].copy_from_slice(&seat_record(seat));
+    e[33..].copy_from_slice(dh);
+    e
+}
+
+/// `list(b,v) = SHA-256(len(c) u32 BE ‖ c ‖ entries)`, `c = ctx(list; k, group, gen, b, v)`,
+/// each entry a seat record and that seat's `ser(SX)` (`list_entry`), sorted and each once.
+/// The context makes one set of people in two groups, or two versions, two digests.
+///
+/// `dh` gives each seat's `ser(SX)`: the key it was seated with (a joiner's endorsed key),
+/// or the one a list carried that an older digest already bound. `None` when one has none.
+pub fn list_digest(
+    g: &Group,
+    at: Version,
+    seats: &[SeatRef],
+    dh: impl Fn(&SeatRef) -> Option<[u8; 33]>,
+) -> Option<[u8; 32]> {
+    let mut entries = seats
+        .iter()
+        .map(|s| dh(s).map(|d| list_entry(s, &d)))
+        .collect::<Option<Vec<[u8; 66]>>>()?;
+    entries.sort_unstable();
+    entries.dedup();
     let c = list_ctx(g, at);
     let mut h = Sha256::new();
     h.update((c.len() as u32).to_be_bytes());
     h.update(c.as_bytes());
-    for r in records(seats) {
-        h.update(r);
+    for e in entries {
+        h.update(e);
     }
-    h.finalize().into()
+    Some(h.finalize().into())
+}
+
+/// A seat's `ser(SX)` as `list_digest` takes it: `None` unless it is 33 bytes.
+pub fn seat_dh(dh: &[u8]) -> Option<[u8; 33]> {
+    dh.try_into().ok()
 }
 
 /// Before a keyholder re-versions, merges or re-keys a bucket (§5.3): the
@@ -230,9 +258,10 @@ pub fn check_reversion(
     old: Version,
     old_digest: &[u8; 32],
     old_list: &[SeatRef],
+    dh: impl Fn(&SeatRef) -> Option<[u8; 33]>,
     new_list: &[SeatRef],
 ) -> Result<(), GkError> {
-    if list_digest(g, old, old_list) != *old_digest {
+    if list_digest(g, old, old_list, dh) != Some(*old_digest) {
         return Err(GkError::Sealed);
     }
     let had = records(old_list);

@@ -239,7 +239,10 @@ pub enum EndorsementBad {
 /// (0x02, 0x03) is made within `CLOCK_SLACK` of `at`, since it is made just before its join,
 /// and one dated far from it would move a counter's time where rule 8 never, or always,
 /// flags; rule 8. One that passes counts toward its account's highest (P3 finding 5): a vault
-/// seat's (0x01) `made` is its rotation's.
+/// seat's (0x01) `made` is its rotation's, made before it could be met, so one dated after `at`
+/// counts from `at`: a rotation dated ahead (a fast clock, or a holder of the account's
+/// identity key) would otherwise stop rule 8 flagging the account's lower counters until
+/// then (RV q8-q11).
 pub fn take_endorsement(
     pins: &mut dyn GkPins,
     account: Option<[u8; 16]>,
@@ -263,7 +266,7 @@ pub fn take_endorsement(
     }
     let seen = Seen {
         n: e.n,
-        made: e.made,
+        made: if rotation { e.made.min(at) } else { e.made },
     };
     pins.raise(account, seen, rotation);
     Ok(())
@@ -300,6 +303,12 @@ pub struct LocalFloor {
     /// relay restored from an old backup answers below the floor (§5.7).
     #[serde(default)]
     pub head: Option<(Vec<u8>, Vec<u8>)>,
+    /// The keyholder headers before `kh`, newest first, back to the generation's start or
+    /// its last KeyholdersRemove (at most 8): the sets a welcome's or row's maker may come
+    /// from (`Member::maker_ok`), and a KRK welcome's (`holder.rs` `krk_makers`), after a
+    /// restart (RV).
+    #[serde(default)]
+    pub kh_chain: Vec<(Vec<u8>, Vec<u8>)>,
     pub names: Option<NamesFloor>,
     /// When this device took it, by its own clock (unix seconds).
     pub taken: u64,

@@ -20,6 +20,7 @@ use super::ctx::{keyring_ctx, Group, KeyringWord, Version, KEYRING_HASH_LABEL};
 use super::derive::confirm_ok;
 use super::header::{keyholder_set_digest, SignedHeader};
 use super::merkle::{bucket_root, Leaf, Pool, Via, BUCKET_SEATS};
+use super::rules::SeedRolls;
 use super::{encode_secret, nonzero, open_derived, seal_derived, GkError};
 
 /// One bucket version as keyholders hold it (§11.6), sorted by `b`.
@@ -88,6 +89,12 @@ pub struct KeyringBase {
     pub ck: Zeroizing<[u8; 32]>,
     pub exits_upto: u64,
     pub buckets: Vec<KeyringBucket>,
+    /// The seed rolls as of this epoch's opening header (§5.6): the `time` of
+    /// the header that last raised `seed`, and whether a keyholder was removed
+    /// since. Carried here, where the relay can neither read nor change it, so a
+    /// keyholder that takes its keyring fresh counts a roll's 24 h and a seed's
+    /// 30 days from the truth (RV review of the Q2 fix).
+    pub rolls: SeedRolls,
 }
 
 /// The buckets a Join commit added at `(e, j)`.
@@ -198,6 +205,9 @@ impl Keyring {
 ///   delta at its own position `j`;
 /// - the base's `gen` and `epoch` are the head's and its `join` is 0; its
 ///   `seeds` hold exactly `seed_floor..=seed`; each delta's `join` is its `j`;
+/// - its `rolls` raise no later than the head's `time`: at a Genesis or a
+///   Regenesis, the head's own with no removal; at a KeyholdersRemove, a
+///   removal unless that header raised the seed itself;
 /// - its `ck` passes the head's `confirm`;
 /// - the root over its versions is the head's `bucket_root`, and the seats,
 ///   versions and connection-pool seats add up to the head's counts.
@@ -242,6 +252,9 @@ pub fn take_keyring(
     }
     for (_, seed) in &base.seeds {
         nonzero(seed)?;
+    }
+    if !base.rolls.fits(h) {
+        return Err(GkError::Sealed);
     }
     nonzero(&base.ck)?;
     if !confirm_ok(g, h.epoch, h.join, &base.ck, &h.confirm) {

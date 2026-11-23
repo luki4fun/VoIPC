@@ -152,6 +152,7 @@ mod tests {
             },
             kh: Some((vec![1, 2, 3], vec![4; 64])),
             head: None,
+            kh_chain: vec![(vec![8, 9], vec![5; 64])],
             names: Some(NamesFloor {
                 gen: [3; 16],
                 epoch,

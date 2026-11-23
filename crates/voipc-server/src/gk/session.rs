@@ -220,18 +220,8 @@ impl Groups {
                     self.refuse(sid, &group, refused_what::BLOB, refused_why::RATE);
                 }
             }
-            ClientMessage::EpochNames {
-                group,
-                from,
-                to,
-                removals,
-            } => {
-                let msg = Msg::Names {
-                    sid,
-                    from,
-                    to,
-                    removals,
-                };
+            ClientMessage::EpochNames { group, from, to } => {
+                let msg = Msg::Names { sid, from, to };
                 if !self.post(&group, msg, SMALL, false) {
                     self.refuse(sid, &group, refused_what::NAMES, refused_why::RATE);
                 }

@@ -27,6 +27,17 @@
 //! headers H2 and H3 on that rule, a three-list names fold, and a
 //! KeyholdersReplace H5 with its keys, contexts, row and endorsements.
 //!
+//! RV (2026-11-21) made each list-digest entry a seat record and that seat's `ser(SX)`
+//! (§11.5). The script's third run took that rule into `list_digest` alone, with `ser(SX)`
+//! inputs of its own for the made-up seats (B's `05 ‖ b3×32`, g:42's `05 ‖ c3×32`), and gave
+//! the two list digests again and what hashes them (the leaves, roots, paths and keyring
+//! parts). Those values are no longer from an author who had not read this code.
+//!
+//! The RV review of the Q2 fix (2026-11-22) ended the keyring base with its seed rolls
+//! (`rolls: SeedRolls { raised, removal }`, §11.6). The script's fourth run (same day) took
+//! the two fields into the base alone, with inputs `raised = 1699913600`, `removal = true`,
+//! and gave the base, its seal and the four keyring hashes again; no other value changed.
+//!
 //! The script's inputs: group `c:kat`, kind `t` (`v` for the media key and
 //! one context), generation `run(0x01)[..16]` = `0102…10`; `s` = 2, `e` = 7,
 //! `j` = 3; `(b, v)` = `(0x0123456789abcdef, 3)`, `v'` = `0xfedcba9876543210`;
@@ -847,21 +858,32 @@ impl In {
         RowBase::member_side(&self.t, S, &me, &from, &self.s_m()).unwrap()
     }
 
+    /// `ser(SX)` of each seat the lists name (§11.5): `m`'s is `ser(SX_m.pub)`; the made-up
+    /// seats B and g:42 have `05 ‖ b3×32` and `05 ‖ c3×32`.
+    fn dh_of(&self, s: &SeatRef) -> Option<[u8; 33]> {
+        let made_up = |x: u8| {
+            let mut d = [x; 33];
+            d[0] = 0x05;
+            d
+        };
+        if *s == self.seat_ref() {
+            seat_dh(&self.seat.dh_bytes())
+        } else if *s == b_seat(self) {
+            Some(made_up(0xb3))
+        } else if *s == g42() {
+            Some(made_up(0xc3))
+        } else {
+            None
+        }
+    }
+
     /// The five leaves, sorted by `b` as a u64: `L0`..`L4`.
     fn leaves(&self) -> [Leaf; 5] {
-        let list_kat = list_digest(
-            &self.t,
-            self.at,
-            &[
-                SeatRef {
-                    m: self.k,
-                    tag_sk: [0xb1; 8],
-                    tag_sx: [0xb2; 8],
-                },
-                self.seat_ref(),
-            ],
-        );
-        let list_conn = list_digest(&self.t, Version { b: 200, v: 17 }, &[g42()]);
+        let dh = |s: &SeatRef| self.dh_of(s);
+        let list_kat = list_digest(&self.t, self.at, &[b_seat(self), self.seat_ref()], dh)
+            .expect("every seat has a key");
+        let list_conn = list_digest(&self.t, Version { b: 200, v: 17 }, &[g42()], dh)
+            .expect("every seat has a key");
         let leaf = |b, v, pool, seats, list, via| Leaf {
             b,
             v,
@@ -898,6 +920,15 @@ impl In {
                 Via::Ratchet { from: V_RATCHET },
             ),
         ]
+    }
+}
+
+/// The seat B of the list vectors: `K`'s member id with made-up tags.
+fn b_seat(i: &In) -> SeatRef {
+    SeatRef {
+        m: i.k,
+        tag_sk: [0xb1; 8],
+        tag_sx: [0xb2; 8],
     }
 }
 
@@ -1073,17 +1104,14 @@ fn contexts(i: &In, py: &mut Py) {
 }
 
 fn lists_and_roots(i: &In, py: &mut Py) {
-    let b_seat = SeatRef {
-        m: i.k,
-        tag_sk: [0xb1; 8],
-        tag_sx: [0xb2; 8],
-    };
+    let b = b_seat(i);
+    let dh = |s: &SeatRef| i.dh_of(s);
     // Given as [B, A, B]: sorted and each once.
-    let list = list_digest(&i.t, i.at, &[b_seat, i.seat_ref(), b_seat]);
+    let list = list_digest(&i.t, i.at, &[b, i.seat_ref(), b], dh).unwrap();
     py.check("list(b,v)", hex(&list));
     py.check(
         "list(200,17) conns",
-        hex(&list_digest(&i.t, Version { b: 200, v: 17 }, &[g42()])),
+        hex(&list_digest(&i.t, Version { b: 200, v: 17 }, &[g42()], dh).unwrap()),
     );
     let leaves = i.leaves();
     for (leaf, name) in leaves.iter().zip([
@@ -1310,6 +1338,10 @@ fn keyring_vectors(i: &In, py: &mut Py) {
             bucket(&leaves[0], [0x0b; 32], 1_699_990_000),
             bucket(&leaves[2], run(0x80), 1_699_996_400),
         ],
+        rolls: SeedRolls {
+            raised: 1_699_913_600,
+            removal: true,
+        },
     };
     let plain = postcard::to_allocvec(&base).unwrap();
     py.check("keyring base plaintext", hex(&plain));
@@ -1605,6 +1637,7 @@ fn names_headers(i: &In, py: &mut Py) -> SignedHeader {
         epoch: 1,
         join: 0,
         added: list2.clone(),
+        removed: vec![],
     };
     py.check(
         "names step preimage H2 (Genesis)",
@@ -1707,6 +1740,7 @@ fn names_fold(py: &mut Py, h3: &SignedHeader) -> [u8; 32] {
         epoch: 1,
         join: 2,
         added: vec![fill_seat(4, 0x44, 0x41, 3, TIME + 20)],
+        removed: vec![],
     };
     let unsorted = vec![
         fill_seat(7, 0x77, 0x71, 1, TIME + 350),
@@ -1720,12 +1754,14 @@ fn names_fold(py: &mut Py, h3: &SignedHeader) -> [u8; 32] {
         epoch: 2,
         join: 1,
         added: unsorted,
+        removed: vec![],
     };
     let f3 = NamesList {
         time: TIME + 3600,
         epoch: 4,
         join: 1,
         added: vec![fill_seat(6, 0x66, 0x61, 7, TIME + 3500)],
+        removed: vec![],
     };
     let floor = NamesFloor::of(h3.header());
     let mut acc = floor.names_hash;
@@ -1765,6 +1801,7 @@ fn names_fold(py: &mut Py, h3: &SignedHeader) -> [u8; 32] {
         epoch: p.epoch,
         join: p.join,
         added: l.added.clone(),
+        removed: vec![],
     };
     let moved = names_step(&after_f1, &at(&f2, &f3));
     py.check(
@@ -1795,6 +1832,7 @@ fn names_fold(py: &mut Py, h3: &SignedHeader) -> [u8; 32] {
         epoch,
         join: 0,
         added: vec![],
+        removed: vec![],
     };
     let lists = [
         f1.clone(),
@@ -1811,8 +1849,7 @@ fn names_fold(py: &mut Py, h3: &SignedHeader) -> [u8; 32] {
         own: None,
         now: TIME + 3700,
     };
-    let fold =
-        |lists: &[NamesList]| fold_names(&NamesFrom::Floor(floor), lists, &[], &head, &known);
+    let fold = |lists: &[NamesList]| fold_names(&NamesFrom::Floor(floor), lists, &head, &known);
     match fold(&lists) {
         Ok(Fold::Take { floor, shown, .. }) => {
             assert_eq!(floor, NamesFloor::of(&head));
@@ -2278,11 +2315,11 @@ const PY: &[(&str, &str)] = &[
     ),
     (
         "list(b,v)",
-        "3d641aaedf83fb0452e3b04920492ceb243357e9f1fe5ec7dc10107d9ebad9c0",
+        "9d56dea6421bff7f2bde79ab962b335938ef216aa8f8a9f56942ec4dbfe09f06",
     ),
     (
         "list(200,17) conns",
-        "7e5454bd7ac08c1c2e678b03fe0fb9491d1ba9cbc924cf7ea68003c1ff0f445e",
+        "1949bdd186d8416349bd1a9adb1ef15f73ea59392bcdeba47e3eceee00c24da7",
     ),
     (
         "leaf L0 postcard",
@@ -2290,11 +2327,11 @@ const PY: &[(&str, &str)] = &[
     ),
     (
         "leaf L1 postcard",
-        "c8011101017e5454bd7ac08c1c2e678b03fe0fb9491d1ba9cbc924cf7ea68003c1ff0f445e00",
+        "c8011101011949bdd186d8416349bd1a9adb1ef15f73ea59392bcdeba47e3eceee00c24da700",
     ),
     (
         "leaf L2 postcard",
-        "ef9bafcdf8acd191010300023d641aaedf83fb0452e3b04920492ceb243357e9f1fe5ec7dc10107d9ebad9c00102",
+        "ef9bafcdf8acd191010300029d56dea6421bff7f2bde79ab962b335938ef216aa8f8a9f56942ec4dbfe09f060102",
     ),
     (
         "leaf L3 postcard",
@@ -2306,27 +2343,27 @@ const PY: &[(&str, &str)] = &[
     ),
     (
         "leaf_hash L2",
-        "407be068d383a17ddd7e52a2207d90f56330441a122b2a9063336139e36be9a7",
+        "7c418fd182d943a69071e6594590ea8c8f8f0120eb7ca4f1da733174899559f9",
     ),
     (
         "bucket_root (5 leaves)",
-        "d30c172035d6261ce7fa4df9e644d43dde02ffff54edfaf9cbbb6abe50b2d517",
+        "28077f720b50d5fe1a9a3921dc95979fdca30325f0bac4a4ecc43b1ead24d5fd",
     ),
     (
         "Merkle path for leaf 2 of 5",
-        "a6f25225fe6f9934e1637632d26ae097bb8ceaaacc37c1defa2ce103f9eea42f,f0088c1699ae3d83e63e57bb42ceaf562701c9df95b0df6c985caa3168b236da,fbbe6d6a5bc4419c976382a24c10606de8d115a921b5ec4c965787cb52e6b72c",
+        "a6f25225fe6f9934e1637632d26ae097bb8ceaaacc37c1defa2ce103f9eea42f,762e5e3dd851f63a8538e1ff2c70549333317e3ff3cdcc8a91eb3a53681dd38e,fbbe6d6a5bc4419c976382a24c10606de8d115a921b5ec4c965787cb52e6b72c",
     ),
     (
         "Merkle path for leaf 4 of 5",
-        "02d9a62c64bfbce0885613cceeeb13196533c8f0209e4a3b36bffea923c4d693",
+        "021741217e34215ce5f88158f1a59400247c5322a4ad925cb600ce2b33dab3da",
     ),
     (
         "bucket_root (1 leaf: L2)",
-        "407be068d383a17ddd7e52a2207d90f56330441a122b2a9063336139e36be9a7",
+        "7c418fd182d943a69071e6594590ea8c8f8f0120eb7ca4f1da733174899559f9",
     ),
     (
         "bucket_root (3 leaves: L0..L2)",
-        "0ddff2dc55f50c24cff7457edb62dcdea584236f26bfba99004ad219aef3d1c6",
+        "ad97b564ac5a45af73429718ce413d7036a49d2ddc62c604945c72b54afc2297",
     ),
     (
         "bucket_root (no leaves)",
@@ -2442,19 +2479,19 @@ const PY: &[(&str, &str)] = &[
     ),
     (
         "keyring base plaintext",
-        "0102030405060708090a0b0c0d0e0f10070002015e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e02000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f0c020110003ea0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0000b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0bf093cfaa06ef9bafcdf8acd191010300023d641aaedf83fb0452e3b04920492ceb243357e9f1fe5ec7dc10107d9ebad9c00102808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9ff0c5cfaa06",
+        "0102030405060708090a0b0c0d0e0f10070002015e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e02000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f0c020110003ea0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0000b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0bf093cfaa06ef9bafcdf8acd191010300029d56dea6421bff7f2bde79ab962b335938ef216aa8f8a9f56942ec4dbfe09f060102808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9ff0c5cfaa0680bfcaaa0601",
     ),
     (
         "keyring base (sealed)",
-        "0c0d0e0f101112131415161750532ff7eea85167046f401adde9aaf017feabb527fb13b36c93e81467648ca5adb41bb1009adec4199c5f41b5ab6b95a2561ce65f53aff94737a664c979fef6a97f898f6dbb651f1a4a53324d9d64a6b06a8ed0587cfc4255d7b4ac2bad055e3e0b22424322701ee2dd81ae115968e7e1faa07bd0482f5580c81e14128cf7887e82805a64874b8a22219d223b16c2c7ff2a82e681b0f3ba0af95aa09aebc818a5351f2f43241485dacb839eef51c21c539e073b43ddfe95efd4cb4f881d08dbf97599b04fb128e13aa712abacecd43288db1e6553fdee6dd185907f841624f53a0df024cade7f3a08feaff7ba6179d4392a63dbdd88ebfffee6e4206548f6e5e36c3d2b7476f4b764ed1630fbff3a1d0a8c134b8ffaea9e4a19226fc07e7afa9ed3170b",
+        "0c0d0e0f101112131415161750532ff7eea85167046f401adde9aaf017feabb527fb13b36c93e81467648ca5adb41bb1009adec4199c5f41b5ab6b95a2561ce65f53aff94737a664c979fef6a97f898f6dbb651f1a4a53324d9d64a6b06a8ed0587cfc4255d7b4ac2bad055e3e0b22424322701ee2dd81ae115968e7e1faa07bd0482f5580c81e14128cf7887e82805a64874b8a22219d223b16c2c7ff2a82e681b0f3ba0af95aa09aebc818a5351f2f43241485dacb839eef51c21c539e073b43ddfe95efd4cb4f881d08dbf97599b04fb128e13aa712abac4ce6f6804686612884d3a43333f260360af883b954f6d3f86b2dc638dff5b17c6179d4392a63dbdd88ebfffee6e4206548f6e5e36c3d2b7476f4b764ed1630fbff3a1d0a8c134b705273b916e5aaef98dfd0173765e319ab7ee9767ab5",
     ),
     (
         "H_7,0",
-        "7017e5d1fe1f9a1cfd2fe71f004c1d7724fc1d1c02e4db9b3a18c851b510ac95",
+        "d1ac0512fe1a63416dbfeb568ad6378df36c7444579fac6c78a5c16d2b177e72",
     ),
     (
         "keyring delta 1 plaintext",
-        "0101c8011101017e5454bd7ac08c1c2e678b03fe0fb9491d1ba9cbc924cf7ea68003c1ff0f445e000c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c80e2cfaa06",
+        "0101c8011101011949bdd186d8416349bd1a9adb1ef15f73ea59392bcdeba47e3eceee00c24da7000c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c80e2cfaa06",
     ),
     (
         "keyring delta 1 key",
@@ -2462,11 +2499,11 @@ const PY: &[(&str, &str)] = &[
     ),
     (
         "keyring delta 1 (sealed)",
-        "0c0d0e0f1011121314151617f8ca5bcf16a039648e5d881206458fe1991e2dc2fafc6449f0b033ea1f61b9173109340760dc3439fbfe06648701591d4fdf47cd37c458b3f7a682a00407362f102c541fd2612df6c8e5b35fff1cb5bf1ff1fff9359d150170e5a0c8ac",
+        "0c0d0e0f1011121314151617f8ca5bcf16a0390393b4e4ee1e88f086438fb4e7ebb472270140c108f64563cf8fc41bf8add5cd39fbfe06648701591d4fdf47cd37c458b3f7a682a00407362f102c541fd2612df6c8e5b35fffcc32cb3b65481bb46327e231abcf0790",
     ),
     (
         "H_7,1",
-        "485760e74c47a8175bccf731143db1e435e5fe866a8f249f48994c9f383e6fb7",
+        "312a31ee01771271c5cb71e67f19e2e6b354dac8d5ed9381f23c8c6d6a091278",
     ),
     (
         "keyring delta 2 plaintext",
@@ -2482,7 +2519,7 @@ const PY: &[(&str, &str)] = &[
     ),
     (
         "H_7,2",
-        "43d39992879990976fa7d6dcaf6a34215e3ead4e9f37396b744f83229e261475",
+        "a447a8d2090a335b7a429819171edb0fccfbb1f2969277a456a2e8c627b05609",
     ),
     (
         "keyring delta 3 plaintext",
@@ -2498,7 +2535,7 @@ const PY: &[(&str, &str)] = &[
     ),
     (
         "H_7,3",
-        "5d1ac838c092cfe4aa594756494151592487d091b5b71b510f7270555636eb0d",
+        "17eb349ba05c269d4d5695b5c4ea416d9bfdb22217b858b7ae59709e56dc5a47",
     ),
     (
         "header H1 body",

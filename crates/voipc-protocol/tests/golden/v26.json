@@ -822,6 +822,17 @@
         }
       },
       "56": {
+        "SeatKeysBehind": {
+          "STRUCT": [
+            {
+              "held": {
+                "TYPENAME": "EndorsedPair"
+              }
+            }
+          ]
+        }
+      },
+      "57": {
         "SelfRowsStored": {
           "STRUCT": [
             {
@@ -830,7 +841,7 @@
           ]
         }
       },
-      "57": {
+      "58": {
         "EpochChainKeys": {
           "STRUCT": [
             {
@@ -846,7 +857,7 @@
           ]
         }
       },
-      "58": {
+      "59": {
         "SelfRows": {
           "STRUCT": [
             {
@@ -866,7 +877,7 @@
           ]
         }
       },
-      "59": {
+      "60": {
         "RowMakers": {
           "STRUCT": [
             {
@@ -880,6 +891,22 @@
               "next": {
                 "OPTION": {
                   "SEQ": "U8"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "61": {
+        "KeptKemStored": "UNIT"
+      },
+      "62": {
+        "KeptKems": {
+          "STRUCT": [
+            {
+              "keys": {
+                "SEQ": {
+                  "TYPENAME": "KeptKemInfo"
                 }
               }
             }
@@ -1805,6 +1832,22 @@
                 "OPTION": {
                   "SEQ": "U8"
                 }
+              }
+            }
+          ]
+        }
+      },
+      "53": {
+        "KeptKemPublish": {
+          "STRUCT": [
+            {
+              "kem": {
+                "SEQ": "U8"
+              }
+            },
+            {
+              "sig": {
+                "SEQ": "U8"
               }
             }
           ]
@@ -5451,9 +5494,6 @@
               "to": {
                 "TYPENAME": "NamesRef"
               }
-            },
-            {
-              "removals": "BOOL"
             }
           ]
         }
@@ -6522,6 +6562,13 @@
         }
       },
       {
+        "kh_before": {
+          "SEQ": {
+            "TYPENAME": "HeaderIn"
+          }
+        }
+      },
+      {
         "head": {
           "OPTION": {
             "TYPENAME": "WalkLinkIn"
@@ -6678,6 +6725,28 @@
       },
       {
         "returning": "BOOL"
+      }
+    ]
+  },
+  "KeptKemInfo": {
+    "STRUCT": [
+      {
+        "account": {
+          "TUPLEARRAY": {
+            "CONTENT": "U8",
+            "SIZE": 16
+          }
+        }
+      },
+      {
+        "kem": {
+          "SEQ": "U8"
+        }
+      },
+      {
+        "sig": {
+          "SEQ": "U8"
+        }
       }
     ]
   },
@@ -7074,6 +7143,11 @@
         "added": {
           "SEQ": "U8"
         }
+      },
+      {
+        "removed": {
+          "SEQ": "U8"
+        }
       }
     ]
   },
@@ -7088,13 +7162,6 @@
       },
       {
         "joins": {
-          "SEQ": {
-            "TYPENAME": "HeaderIn"
-          }
-        }
-      },
-      {
-        "removals": {
           "SEQ": {
             "TYPENAME": "HeaderIn"
           }

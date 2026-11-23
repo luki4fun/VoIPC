@@ -2283,9 +2283,39 @@ fn seat_keys_of(t: SeatKeysTuple) -> Result<SeatKeys> {
     })
 }
 
+/// How far one publish may move an account's seat-key counter: above every earlier counter of
+/// the account, by at most this (from 0 for its first). The app rotates one step at a time and
+/// at most a step or two may never reach the relay, so this never stops an honest device; it
+/// stops one that holds the account's identity key from jumping to the top of the counter
+/// (`u32::MAX`), where no later rotation of the account's own devices could go above it and
+/// heal the theft (RV q8-q11).
+pub const SEAT_KEYS_STEP: u32 = 4;
+
+/// What `put_seat_keys_or` did with seat keys offered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeatKeysPut {
+    /// Held, current from now on.
+    Stored,
+    /// Refused: the account's keys are at this counter, at or above the one offered.
+    Behind(u32),
+    /// Refused: the counter offered is more than `SEAT_KEYS_STEP` above the account's (this).
+    Skips(u32),
+}
+
 /// New seat keys, current from now on. `false`: their counter is not above every earlier one
-/// of the account, so they are refused (old keys offered again).
+/// of the account, or too far above it (`put_seat_keys_or`), so they are refused.
+#[cfg(test)]
 pub async fn put_seat_keys(store: &Store, account: &[u8; 16], k: &SeatKeys) -> Result<bool> {
+    Ok(put_seat_keys_or(store, account, k).await? == SeatKeysPut::Stored)
+}
+
+/// New seat keys, current from now on if their counter is above every earlier one of the
+/// account by at most `SEAT_KEYS_STEP`; else why not, with the account's highest counter.
+pub async fn put_seat_keys_or(
+    store: &Store,
+    account: &[u8; 16],
+    k: &SeatKeys,
+) -> Result<SeatKeysPut> {
     let made = count(k.made, "made")?;
     let published = count(k.published, "published")?;
     Ok(write_tx!(store, tx => {
@@ -2303,8 +2333,12 @@ pub async fn put_seat_keys(store: &Store, account: &[u8; 16], k: &SeatKeys) -> R
             .bind(&account[..])
             .fetch_one(&mut *tx)
             .await?;
-        if top.is_some_and(|t| t >= i64::from(k.n)) {
-            return Ok(false);
+        let top = top.map_or(0, |t| u32::try_from(t).unwrap_or(u32::MAX));
+        if top >= k.n {
+            return Ok(SeatKeysPut::Behind(top));
+        }
+        if k.n - top > SEAT_KEYS_STEP {
+            return Ok(SeatKeysPut::Skips(top));
         }
         sqlx::query("UPDATE voipc_gk_seatkeys SET current = FALSE WHERE account = $1 AND current")
             .bind(&account[..])
@@ -2323,7 +2357,7 @@ pub async fn put_seat_keys(store: &Store, account: &[u8; 16], k: &SeatKeys) -> R
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
-        true
+        SeatKeysPut::Stored
     }))
 }
 

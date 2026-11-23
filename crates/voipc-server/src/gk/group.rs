@@ -18,12 +18,13 @@ use voipc_crypto::group_key::commit::{
 use voipc_crypto::group_key::timers::{
     deadline_ms, refresh_ms, regenesis_after_ms, BLOBS_PER_WRITER, BLOB_MAX_BYTES,
     DEADLINE_SLOW_MS, EPOCH_AGE_MAX_SECS, EPOCH_MIN_GAP_MS, FLOOR_AHEAD_GAP_SECS, OPEN_COMMIT_MS,
-    OPEN_PER_CONN_BYTES, OPEN_PER_RELAY_BYTES, REGENESIS_AFTER_MS, REGENESIS_FAST_AFTER_MS,
-    RETRY_ALL_MISSED_MS, SEED_PAGE_EVERY_MS, SEED_PAGE_SEATS,
+    OPEN_PER_CONN_BYTES, OPEN_PER_RELAY_BYTES, REFRESH_MS, REGENESIS_AFTER_MS,
+    REGENESIS_FAST_AFTER_MS, RETRY_ALL_MISSED_MS, SEAT_EXPIRY_SECS, SEED_PAGE_EVERY_MS,
+    SEED_PAGE_SEATS,
 };
 use voipc_crypto::group_key::tree::BucketTree;
 use voipc_crypto::group_key::{
-    GroupKind, Kind, MemberId, SeatRef, SeedRolls, SignedHeader, SEED_MAX_AGE,
+    GroupKind, Keyholder, Kind, MemberId, SeatRef, SeedRolls, SignedHeader, SEED_MAX_AGE,
 };
 use voipc_protocol::gk::{
     self, refused_what, refused_why, stale, wait, CommitPiece, DuePiece, FloorRef, GkWriter,
@@ -203,6 +204,14 @@ pub struct Taken {
 /// How many headers stay in a row behind the head beside its epoch's (§4.4).
 const RECENT: usize = 64;
 
+/// Keyholder headers a generation keeps before it starts anew (`ask`): a walk back to its
+/// start stays within a member's `MAX_WALK` links, with room for the keyholder changes made
+/// until a volunteer can start the new one. Past `MAX_WALK` a device with no floor, or one
+/// whose floor is far behind, could never take the head again in this generation.
+pub const KH_RESTART: usize = voipc_crypto::group_key::MAX_WALK / 2;
+/// How soon a long chain's new generation is asked again after nobody took it.
+pub const KH_RESTART_RETRY_MS: u64 = 10 * 60_000;
+
 pub struct GroupState {
     pub id: String,
     pub kind: GroupKind,
@@ -262,16 +271,28 @@ pub struct GroupState {
     /// Seats behind a running roll that fetched: first in the next page, without waiting
     /// for its pace.
     pub seed_first: HashSet<SeatRef>,
+    /// A text roll ended at its 24 h with seats still behind the head's seed (GROUP-KEY
+    /// §5.6): the pages go on until each holds it or exits, as while a roll runs. Cleared
+    /// by a paced scan that finds none behind.
+    pub left_behind: bool,
     /// The keyholder that declined the last page: the next goes to another if one is online.
     page_declined: Option<UserId>,
     /// Memory seats whose welcome is gone, re-joining once their exit is taken (2b).
     pub rejoins: Vec<Waiting>,
+    /// The highest seat-key counter each account rotated to, as `supersede` heard it: an
+    /// eager seat of it below that comes late and is not queued.
+    superseded: HashMap<[u8; 16], u32>,
     /// Eager seats queued at most (`kept_seats`).
     pub kept_seats: usize,
     /// The device each volunteering session named, for its entry (plan 2d).
     pub devices: HashMap<UserId, Vec<u8>>,
     /// Admin warnings by kind: the text and when it was raised (plan 2j).
     pub warns: HashMap<u8, (String, u64)>,
+    /// A memory text group's account seats that no session holds, since when (relay ms):
+    /// their 90-day expiry, which a stored group reads from its database (§5.4).
+    pub away: HashMap<SeatRef, u64>,
+    /// When a long keyholder chain's new generation may be asked (again) (relay ms).
+    pub kh_restart_at: u64,
 }
 
 impl GroupState {
@@ -324,11 +345,15 @@ impl GroupState {
             page: None,
             next_page: 0,
             seed_first: HashSet::new(),
+            left_behind: false,
             page_declined: None,
             rejoins: vec![],
+            superseded: HashMap::new(),
             kept_seats: KEPT_SEATS,
             devices: HashMap::new(),
             warns: HashMap::new(),
+            away: HashMap::new(),
+            kh_restart_at: 0,
         }
     }
 
@@ -422,8 +447,12 @@ impl GroupState {
         if let Some(seat) = m.seat {
             let offline =
                 cause == cause::DISCONNECT && !seat.m.is_conn() && self.kind == GroupKind::Text;
-            if !offline && !self.members.values().any(|o| o.seat == Some(seat)) {
-                self.exit(seat, cause, now, out);
+            if !self.members.values().any(|o| o.seat == Some(seat)) {
+                if !offline {
+                    self.exit(seat, cause, now, out);
+                } else if !self.stored {
+                    self.away.insert(seat, now);
+                }
             }
         }
         if rostered {
@@ -521,8 +550,9 @@ impl GroupState {
         self.ask(now, out);
     }
 
-    /// A seat enters the open exit batch; writers of the epoch hear of it at once (1f.6).
-    /// A seat a due out is seating exits once that lands.
+    /// A seat enters the open exit batch; writers of the epoch hear of it at once (1f.6),
+    /// and in a voice room every seated member, who all hear the room under the epoch's key
+    /// whether they wrote or not (§5.9). A seat a due out is seating exits once that lands.
     pub fn exit(&mut self, seat: SeatRef, cause: u8, now: u64, out: &mut Vec<Out>) {
         self.joins.take(&seat);
         if !self.seats.contains_key(&seat) {
@@ -544,8 +574,10 @@ impl GroupState {
             return;
         }
         let seq = self.exits.add(seat, s.b, cause, now);
+        let voice = self.kind == GroupKind::Voice;
+        let seats = &self.seats;
         for (sid, m) in self.members.iter_mut() {
-            if m.writer {
+            if m.writer || (voice && m.seat.is_some_and(|s| seats.contains_key(&s))) {
                 m.told = m.told.max(seq);
                 out.push(Out(
                     *sid,
@@ -665,9 +697,44 @@ impl GroupState {
         Fetched::Not
     }
 
+    /// A seat-key rotation of `account` to counter `n` (`Groups::on_seat_keys`): its seats at
+    /// a lower counter (0x01) not yet seated go, and one a due out seats exits once it lands.
+    /// Keys published before the rotation, a thief's among them, are not seated after it
+    /// where nothing exits the account (no seat of it here, or the same keys again above
+    /// another's, RV q8-q11). Once a rotation, so a walk of the queue. Eager seats below it
+    /// queued later are not taken (`eager`): two rotations' walks may cross.
+    pub fn supersede(&mut self, account: &[u8; 16], n: u32, now: u64, out: &mut Vec<Out>) {
+        let top = self.superseded.entry(*account).or_insert(n);
+        *top = (*top).max(n);
+        let n = *top;
+        let below = |j: &Joiner| {
+            j.seat.m.account() == Some(*account)
+                && j.endorsement.origin == voipc_crypto::group_key::Origin::VaultSeat
+                && j.endorsement.n < n
+        };
+        let seating: Vec<SeatRef> = self
+            .dues
+            .iter()
+            .flat_map(|d| &d.due.joiners)
+            .filter(|j| below(j))
+            .map(|j| j.seat)
+            .collect();
+        for s in seating {
+            self.exit(s, cause::ROTATION, now, out);
+        }
+        self.joins.retain(|w| !below(&w.joiner));
+    }
+
     /// An eager seat (plan 2d): queued with no session waiting for it.
     pub fn eager(&mut self, joiner: Joiner, account: [u8; 16], now: u64, out: &mut Vec<Out>) {
         if self.seats.contains_key(&joiner.seat) {
+            return;
+        }
+        // Below a rotation heard already (`supersede`): another walk's, late
+        let e = &joiner.endorsement;
+        if e.origin == voipc_crypto::group_key::Origin::VaultSeat
+            && self.superseded.get(&account).is_some_and(|n| e.n < *n)
+        {
             return;
         }
         // At most `kept_seats` eager seats wait (plan 2d), however many sources queue them
@@ -826,6 +893,8 @@ impl GroupState {
             self.ask_start(Kind::Genesis, wanted, now, out);
             return;
         }
+        // A generation whose keyholder chain grew long (`KH_RESTART`) starts anew
+        let long = self.khs.len() >= KH_RESTART;
         if self.holders.online(&self.vols).is_empty() {
             self.no_keyholder_since.get_or_insert(now);
             if (wanted || self.exits.waiting() > 0) && self.dues.is_empty() {
@@ -836,7 +905,9 @@ impl GroupState {
                         self.ask_start(Kind::Genesis, true, now, out);
                     }
                 } else if self.regenesis_at().is_some_and(|t| now >= t) {
-                    self.ask_start(Kind::Regenesis, true, now, out);
+                    // A long chain starts a new generation instead: a Regenesis adds to it
+                    let kind = if long { Kind::Genesis } else { Kind::Regenesis };
+                    self.ask_start(kind, true, now, out);
                 }
             }
             return;
@@ -868,6 +939,18 @@ impl GroupState {
         }
         if !self.dues.is_empty() {
             return;
+        }
+        // A long chain, with a keyholder online: a new generation though nobody waits. Past
+        // `MAX_WALK` links a device with no floor, or one whose floor is far behind, could
+        // never take the head again. The head is served until the Genesis lands, and what
+        // else is due goes on when nobody takes it (asked again `KH_RESTART_RETRY_MS` on)
+        if long && now >= self.kh_restart_at {
+            self.kh_restart_at = now.saturating_add(KH_RESTART_RETRY_MS);
+            warn!(group = %self.id, headers = self.khs.len(), "the keyholder chain is long: a new generation");
+            self.ask_start(Kind::Genesis, true, now, out);
+            if !self.dues.is_empty() {
+                return;
+            }
         }
         let Some((due, only)) = self.next_due_kind(now) else {
             return;
@@ -923,7 +1006,10 @@ impl GroupState {
     }
 
     /// The due wanted now by priority: Remove > Promote > Replace > Exits > Join > Gate >
-    /// Refresh. With the session it must go to, if only one may take it.
+    /// Refresh, but in a text group a Refresh a whole refresh period late goes before a Join:
+    /// a newcomer is never seated into an epoch a keyholder's absence or a join storm let age
+    /// past two refresh periods (§6 "A newcomer"). With the session it must go to, if only
+    /// one may take it.
     fn next_due_kind(&mut self, now: u64) -> Option<(Due, Option<UserId>)> {
         let gap_ok = now >= self.last_opening + EPOCH_MIN_GAP_MS;
         let seats = self.seats.len();
@@ -1028,7 +1114,20 @@ impl GroupState {
                 return Some((self.exits_due(DueKind::Exits), None));
             }
         }
-        if self.joins.closes_at(self.kind).is_some_and(|t| now >= t) {
+        // A Join goes before a Refresh that is due (lazy seating: a newcomer opens the post
+        // that made it ask), but not once the Refresh is a whole refresh period late: a join
+        // storm or a keyholder's absence never lets the epoch a newcomer is seated into age
+        // past two of them. Text only: a voice room keeps no posts to read back
+        let r = self
+            .head
+            .as_ref()
+            .map_or(REFRESH_MS, |h| refresh_ms(h.sh.header().buckets));
+        let refresh_late = gap_ok
+            && self.kind == GroupKind::Text
+            && self
+                .next_refresh
+                .is_some_and(|t| now >= t.saturating_add(r));
+        if !refresh_late && self.joins.closes_at(self.kind).is_some_and(|t| now >= t) {
             let due = Due {
                 joiners: self.joins.batch().into_iter().map(|w| w.joiner).collect(),
                 ..Due::of(DueKind::Join, self.head_gated())
@@ -1050,11 +1149,14 @@ impl GroupState {
     }
 
     /// When a stored group with no keyholder online may be asked a Regenesis (relay ms):
-    /// once the wait the head's set allows is out, counted from when no keyholder was
-    /// online and from the head's own `time`, as the volunteer and every member count it
-    /// (`regenesis_after_ms`, "Fast new start": 2 min for a set of connection entries
-    /// alone that no Regenesis started in the last hour, else the hour). `None` with a
-    /// keyholder online, or no head.
+    /// once the wait the head's set allows is out (`regenesis_after_ms`, "Fast new start").
+    /// The hour counts from when no keyholder was online and from the head's own `time`,
+    /// as the volunteer and every member count it (`time ≥ parent.time + wait`). None, for
+    /// a set of connection entries alone that no Regenesis started in the last hour, counts
+    /// from when no keyholder was online alone: the volunteer dates the Regenesis no
+    /// earlier than the head (`build_regenesis`), so a head dated ahead of the relay's
+    /// clock holds nothing back. And never within the gap after the last opening
+    /// (`EPOCH_MIN_GAP_MS`, as every opening). `None` with a keyholder online, or no head.
     pub fn regenesis_at(&self) -> Option<u64> {
         let since = self.no_keyholder_since?;
         let head = self.head.as_ref()?;
@@ -1065,11 +1167,16 @@ impl GroupState {
             .time
             .saturating_add(voipc_crypto::group_key::REGENESIS_FAST_GAP)
             .saturating_mul(1000);
-        let fast = base.saturating_add(REGENESIS_FAST_AFTER_MS);
+        let fast = since.saturating_add(REGENESIS_FAST_AFTER_MS);
+        let from = |wait: u64| if wait == 0 { since } else { base };
         [fast, fast.max(gap), base.saturating_add(REGENESIS_AFTER_MS)]
             .into_iter()
-            .filter(|t| *t >= base.saturating_add(regenesis_after_ms(set, *t)))
+            .filter(|t| {
+                let wait = regenesis_after_ms(set, *t);
+                *t >= from(wait).saturating_add(wait)
+            })
             .min()
+            .map(|t| t.max(self.last_opening.saturating_add(EPOCH_MIN_GAP_MS)))
     }
 
     /// A Genesis (no generation, or a new one due) or a Regenesis, to the best volunteer.
@@ -1095,6 +1202,14 @@ impl GroupState {
             DueKind::Genesis
         };
         let joiner = v.seat.clone().expect("checked");
+        // A Regenesis builds on the head (its parent), which a volunteer never seated was
+        // never shown: the head from its floor first, as a fetch's answer would carry it
+        if dk == DueKind::Regenesis && !self.seats.contains_key(&joiner.seat) {
+            let have = self.members.get(&v.sid).and_then(|m| m.have);
+            if let Some(snap) = self.snapshot() {
+                self.pushed(out, v.sid, snap.head_piece(have.as_ref(), None, false));
+            }
+        }
         let mut due = self.exits_due(dk);
         due.gated = self.gate;
         due.joiners = vec![joiner];
@@ -1247,6 +1362,7 @@ impl GroupState {
             stored: self.stored,
             head,
             leaves: &self.leaves,
+            dh: &|s| self.seats.get(s).map(|x| x.dh),
             held: &held,
             due: &d.due,
             by: d.by,
@@ -1378,6 +1494,12 @@ impl GroupState {
             .map(|x| x.sh.header())
             .filter(|x| x.gen == h.gen)
             .map(|x| x.seed);
+        let was_floor = self
+            .head
+            .as_ref()
+            .map(|x| x.sh.header())
+            .filter(|x| x.gen == h.gen)
+            .map(|x| x.seed_floor);
         let before_online: Vec<UserId> = self
             .members
             .iter()
@@ -1551,9 +1673,16 @@ impl GroupState {
         if self.page.as_ref().is_some_and(|p| p.seed != h.seed) {
             self.page = None;
         }
-        if h.seed_floor == h.seed {
+        // A roll that ended at its 24 h may leave seats behind: their pages go on (§5.6)
+        let ended = h.seed_floor == h.seed && was_floor.is_some_and(|f| f < h.seed_floor);
+        if h.kind.starts_anew() {
+            self.left_behind = false;
+        } else if ended {
+            self.left_behind = self.seats.values().any(|x| x.seed < h.seed);
+        }
+        if h.seed_floor == h.seed && !self.left_behind {
             self.seed_first.clear();
-        } else if was_seed.is_some_and(|w| w < h.seed) {
+        } else if was_seed.is_some_and(|w| w < h.seed) || (ended && self.left_behind) {
             self.next_page = now;
         }
         let seats = &self.seats;
@@ -1763,7 +1892,7 @@ impl GroupState {
     /// later timer asks again, so the actor never wakes for it in a loop.
     pub fn wake(&self, ticked: u64) -> Option<u64> {
         let seats = self.seats.len() as u64;
-        let paging = self.roll_runs() && self.page.is_none();
+        let paging = self.paging() && self.page.is_none();
         // Once the gap after an opening ends, `ask` may start what waited for it (exits, a
         // removal, a promotion, a resign, a replace)
         let asks = [
@@ -1772,6 +1901,7 @@ impl GroupState {
             Some(self.last_opening + EPOCH_MIN_GAP_MS),
             self.regenesis_at().filter(|_| self.stored),
             paging.then_some(self.next_page),
+            (self.khs.len() >= KH_RESTART).then_some(self.kh_restart_at),
         ];
         [
             self.dues.iter().map(|d| d.deadline).min(),
@@ -2013,6 +2143,14 @@ impl GroupState {
             m: by.into(),
             u: sid,
         };
+        // Under the epoch before the head, only a writer of it (pushed the opening) may start
+        // another chain for `HOLD_MS`: a member that only read it was never pushed the
+        // opening nor told of the exit it covers, and its first chain there would be one the
+        // leaver opens (§5.4). Refused `OLD_EPOCH`, it fetches and writes under the head.
+        let old = self.head_view().is_some_and(|v| epoch != v.epoch);
+        if old && self.kind == GroupKind::Text && !self.blobs.contains_key(&(epoch, w)) {
+            return Err(refused_why::OLD_EPOCH);
+        }
         let kept = self.blobs.entry((epoch, w)).or_default();
         if kept.len() >= BLOBS_PER_WRITER {
             return Err(refused_why::THIRD_BLOB);
@@ -2072,14 +2210,7 @@ impl GroupState {
     }
 
     /// `EpochNames` (gated groups only).
-    pub fn names(
-        &self,
-        sid: UserId,
-        from: &NamesRef,
-        to: &NamesRef,
-        removals: bool,
-        out: &mut Vec<Out>,
-    ) {
+    pub fn names(&self, sid: UserId, from: &NamesRef, to: &NamesRef, out: &mut Vec<Out>) {
         if !self.members.contains_key(&sid) {
             self.refuse(out, sid, refused_what::NAMES, refused_why::NOT_MEMBER);
         } else if !self.head_gated() {
@@ -2087,14 +2218,17 @@ impl GroupState {
         } else {
             out.push(Out(
                 sid,
-                push::names_in(&self.id, self.names.answer(from, to, removals)),
+                push::names_in(&self.id, self.names.answer(from, to)),
             ));
         }
     }
 
-    /// `EpochFloorAhead` (plan 2d): a header past the head, signed by a keyholder this
-    /// generation had, starts a new generation (at most one an hour). A generation the
-    /// relay does not know changes nothing.
+    /// `EpochFloorAhead` (plan 2d): a header past the head, signed by a keyholder in the
+    /// head's set, starts a new generation (at most one an hour). One signed by an entry an
+    /// earlier set of the generation had (removed, swapped out, or a set a Regenesis
+    /// replaced) starts nothing: honouring it would let a removed keyholder force a re-seat
+    /// every hour (§5.7). That, a generation the relay does not know, or a signer it holds no
+    /// key of warns its admins: a restore that lost what members took looks so.
     pub fn floor_ahead(&mut self, sid: UserId, header: &HeaderIn, now: u64, out: &mut Vec<Out>) {
         if !self.members.contains_key(&sid) {
             return;
@@ -2112,12 +2246,27 @@ impl GroupState {
             );
             return;
         }
-        let signer = self
-            .khs
-            .values()
-            .flat_map(|(k, _)| k.header().keyholders.iter())
-            .find(|k| k.m == h.signer && sh.verify(&k.ik));
-        if signer.is_none() || (h.epoch, h.join) <= (hd.epoch, hd.join) {
+        if (h.epoch, h.join) <= (hd.epoch, hd.join) {
+            return;
+        }
+        let signed = |k: &Keyholder| k.m == h.signer && sh.verify(&k.ik);
+        if !head.kh.header().keyholders.iter().any(signed) {
+            // Either is what a restore that lost a later keyholder change looks like (an
+            // entry promoted again after the backup keeps its IK), or a removed keyholder's
+            // fork: the admins are told, and only the operator starts anew
+            let known = self
+                .khs
+                .values()
+                .flat_map(|(k, _)| k.header().keyholders.iter())
+                .any(signed);
+            let text = if known {
+                "a member reports a header past this database's head, signed by a keyholder \
+                 no longer in its set"
+            } else {
+                "a member reports a header past this database's head, signed by a keyholder \
+                 it holds no key of"
+            };
+            self.warn(warn_kind::AHEAD, text.into(), now);
             return;
         }
         if self
@@ -2165,12 +2314,18 @@ impl GroupState {
         })
     }
 
-    /// The seats the next seed-welcome page asks, when one is wanted now: a roll runs, no
-    /// page is out, a keyholder is online, and a seat behind fetched (those alone, at
-    /// once) or the 10 s pace allows a scan of every seat. A seat already exiting is not
-    /// asked. At most `SEED_PAGE_SEATS`.
+    /// Whether seed-welcome pages are asked: while a roll runs, and after one that ended
+    /// at its 24 h while seats were still behind (`left_behind`, §5.6).
+    pub fn paging(&self) -> bool {
+        self.roll_runs() || (self.left_behind && self.head.is_some())
+    }
+
+    /// The seats the next seed-welcome page asks, when one is wanted now: pages are asked
+    /// (`paging`), no page is out, a keyholder is online, and a seat behind fetched (those
+    /// alone, at once) or the 10 s pace allows a scan of every seat. A seat already exiting
+    /// is not asked. At most `SEED_PAGE_SEATS`.
     pub fn page_wanted(&mut self, now: u64) -> Option<Vec<SeatRef>> {
-        if !self.roll_runs() || self.page.is_some() || self.holders.online(&self.vols).is_empty() {
+        if !self.paging() || self.page.is_some() || self.holders.online(&self.vols).is_empty() {
             return None;
         }
         let paced = now >= self.next_page;
@@ -2205,6 +2360,11 @@ impl GroupState {
         if seats.is_empty() {
             if paced {
                 self.next_page = now + SEED_PAGE_EVERY_MS;
+                // No seat is behind any more: the sweep after a roll that ended at its
+                // 24 h is done (one on its way out keeps it going until its exit lands)
+                if !self.roll_runs() && !self.seats.values().any(|x| x.seed < s) {
+                    self.left_behind = false;
+                }
             }
             return None;
         }
@@ -2217,7 +2377,7 @@ impl GroupState {
         let Some(s) = self.head.as_ref().map(|h| h.sh.header().seed) else {
             return;
         };
-        if self.roll_runs() && self.seats.get(&seat).is_some_and(|x| x.seed < s) {
+        if self.paging() && self.seats.get(&seat).is_some_and(|x| x.seed < s) {
             self.seed_first.insert(seat);
         }
     }
@@ -2436,6 +2596,29 @@ impl GroupState {
         self.ask(now, out);
     }
 
+    /// The daily sweep of a memory text group: an account seat no session has held for
+    /// `SEAT_EXPIRY_SECS` exits, as a stored group's does by its `last_use` (§5.4).
+    pub fn expire_away(&mut self, now: u64, out: &mut Vec<Out>) {
+        let held: HashSet<SeatRef> = self.members.values().filter_map(|m| m.seat).collect();
+        let seats = &self.seats;
+        self.away
+            .retain(|s, _| seats.contains_key(s) && !held.contains(s));
+        let before = now.saturating_sub(SEAT_EXPIRY_SECS * 1000);
+        let gone: Vec<SeatRef> = self
+            .away
+            .iter()
+            .filter(|(_, t)| **t <= before)
+            .map(|(s, _)| *s)
+            .collect();
+        if gone.is_empty() {
+            return;
+        }
+        for s in &gone {
+            self.away.remove(s);
+        }
+        self.expire(&gone, now, out);
+    }
+
     /// Seats unused for 90 days exit (the daily sweep), unless a session holds one now.
     pub fn expire(&mut self, seats: &[SeatRef], now: u64, out: &mut Vec<Out>) {
         for s in seats {
@@ -2506,6 +2689,7 @@ impl GroupState {
             + self.seals.len() * 120
             + (self.recent.len() + self.khs.len()) * 1200
             + self.members.len() * 160
+            + self.away.len() * 64
             + (self.joins.len() + self.rejoins.len() + self.conn_keys.len()) * 1400;
         n as u64
     }
@@ -2523,6 +2707,7 @@ impl GroupState {
             tree: self.tree.clone(),
             vers: Arc::new(self.vers.clone()),
             seals: Arc::new(self.seals.clone()),
+            left_behind: self.left_behind,
         })
     }
 

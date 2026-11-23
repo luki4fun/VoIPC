@@ -113,7 +113,9 @@ pub const REFRESH_SLICE: usize = 12;
 pub const REGENESIS_AFTER_MS: u64 = REGENESIS_WAIT * SEC;
 /// …or after this long when every entry of the set in force is a connection
 /// entry, none of which can come back online ("Fast new start", owner
-/// 2026-11-19), unless a Regenesis started that set in the last hour.
+/// 2026-11-19), unless a Regenesis started that set in the last hour: none
+/// (J10-B option A, owner 2026-11-22), the Regenesis is asked as soon as no
+/// keyholder is online and a seat waits.
 pub const REGENESIS_FAST_AFTER_MS: u64 = REGENESIS_FAST_WAIT * SEC;
 
 /// How long the relay waits with no keyholder online before it asks a
@@ -153,6 +155,10 @@ pub const SEED_WELCOMES_A_FRAME: usize = 33;
 
 /// A seat not used (fetch or post) this long exits (daily sweep).
 pub const SEAT_EXPIRY_SECS: u64 = 90 * DAY_SECS;
+/// An account's seat keys rotate at this age, and at a sign-in once older (§5.11): keys
+/// first published longer ago than this and `SEAT_EXPIRY_SECS` together belong to an account
+/// that has not signed in for `SEAT_EXPIRY_SECS`, which a new start seats no more.
+pub const SEAT_KEYS_ROTATE_SECS: u64 = 30 * DAY_SECS;
 /// A seat's last use is written at most this often.
 pub const SEAT_USE_WRITE_SECS: u64 = DAY_SECS;
 /// At most this many writer blobs per writer and epoch…
@@ -242,15 +248,16 @@ mod tests {
         assert_eq!(EPOCH_AGE_MAX_SECS, 70 * 60);
         assert_eq!(EPOCH_MIN_GAP_MS, 2_000);
         assert_eq!(REGENESIS_AFTER_MS, 3_600_000);
-        assert_eq!(REGENESIS_FAST_AFTER_MS, 120_000);
+        assert_eq!(REGENESIS_FAST_AFTER_MS, 0);
         assert_eq!(GATED_EXIT_BATCH, 768);
     }
 
-    /// "Fast new start": the relay asks a Regenesis after 2 minutes under a set of
-    /// connection entries alone, after the hour under a set with a desktop's pair, and
-    /// after the hour too while the set is one a Regenesis started less than an hour ago.
+    /// "Fast new start": the relay asks a Regenesis at once under a set of connection
+    /// entries alone (J10-B option A, owner 2026-11-22; 2 minutes before), after the hour
+    /// under a set with a desktop's pair, and after the hour too while the set is one a
+    /// Regenesis started less than an hour ago.
     #[test]
-    fn a_regenesis_is_asked_after_two_minutes_under_connection_entries_alone_else_after_the_hour() {
+    fn a_regenesis_is_asked_at_once_under_connection_entries_alone_else_after_the_hour() {
         use crate::group_key::{Keyholder, Kind, MemberId, Origin};
         let entry = |origin: Origin, b: u8| Keyholder {
             m: MemberId::Account([b; 16]),
@@ -294,11 +301,11 @@ mod tests {
         let mixed = vec![entry(Origin::Connection, 1), entry(Origin::Desktop, 3)];
         assert_eq!(
             regenesis_after_ms(&set(Kind::KeyholdersAdd, conn.clone()), now),
-            120_000
+            0
         );
         assert_eq!(
             regenesis_after_ms(&set(Kind::Genesis, conn.clone()), now),
-            120_000
+            0
         );
         assert_eq!(
             regenesis_after_ms(&set(Kind::KeyholdersAdd, mixed), now),
@@ -315,7 +322,7 @@ mod tests {
         let regen = set(Kind::Regenesis, conn);
         assert_eq!(regenesis_after_ms(&regen, now), 3_600_000);
         assert_eq!(regenesis_after_ms(&regen, (t0 + 3599) * 1000), 3_600_000);
-        assert_eq!(regenesis_after_ms(&regen, (t0 + 3600) * 1000), 120_000);
+        assert_eq!(regenesis_after_ms(&regen, (t0 + 3600) * 1000), 0);
     }
 
     #[test]

@@ -741,7 +741,7 @@ async fn file(conn: &GkLink, copies: Vec<(KeptCopy, GkEpoch)>) {
 
 /// `GroupKeys`: the group key starts, on the path the frame after `Authenticated` chose.
 /// The account's seat keys come along, and after a reset with the recovery key they rotate
-/// (3e): the first sign-in after one does it.
+/// (3e): the first sign-in after one does it, before anything else (`AccountSession::gk_begin`).
 pub(crate) async fn group_keys(conn: &GkLink, on: bool, run: [u8; 16], clock: u64) {
     {
         let sig = conn.lock();
@@ -751,12 +751,10 @@ pub(crate) async fn group_keys(conn: &GkLink, on: bool, run: [u8; 16], clock: u6
     }
     let state = conn.app.state::<AppState>();
     let mut first = None;
-    let mut rotated = None;
     let mut account = None;
     if let Some(link) = &conn.account {
         let mut session = link.session();
         account = Some(session.account_id());
-        first = Some(session.gk_on(on));
         let reset = (conn.server.to_string(), session.name().to_string());
         let rotate = on
             && state
@@ -764,9 +762,7 @@ pub(crate) async fn group_keys(conn: &GkLink, on: bool, run: [u8; 16], clock: u6
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .remove(&reset);
-        if rotate {
-            rotated = Some(session.seat_keys_rotate());
-        }
+        first = Some(session.gk_begin(on, clock, rotate));
     }
     let seat_keys = first.as_mut().and_then(|a| a.seat_keys.take());
     let scope = conn.lock().gk.scope.clone();
@@ -806,7 +802,7 @@ pub(crate) async fn group_keys(conn: &GkLink, on: bool, run: [u8; 16], clock: u6
         return;
     };
     carry_out(conn, out).await;
-    for a in first.into_iter().chain(rotated) {
+    if let Some(a) = first {
         account_news(conn, a).await;
     }
     conn.wake();

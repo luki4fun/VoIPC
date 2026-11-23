@@ -35,8 +35,9 @@ use super::{ask, AccountSync, Event, Fetch, Outgoing, LOST_AFTER_TICKS, MAX_REKE
 use crate::group_key::{chain_seal, open_chain_seal, Epoch, Group, GroupKind, MemberId};
 use crate::group_state::GkEpoch;
 use crate::log::{
-    blank_row, bucket_id, chain_epoch, epoch_key, epoch_parts, open_chain_entry, seal_chain_entry,
-    self_open_state, self_wrap_state, Bucket, Chain, ListedSeat, StaticKey, MAX_CHAIN,
+    blank_pq_row, blank_row, bucket_id, chain_epoch, epoch_key, epoch_parts, open_chain_entry,
+    seal_chain_entry, self_open_state, self_wrap_state, Bucket, Chain, ListedSeat, LogError,
+    StaticKey, MAX_CHAIN, PQ_ROW_BYTES,
 };
 
 type Id = [u8; 16];
@@ -63,6 +64,8 @@ const MAX_JOIN_MANY: usize = 512;
 const FRAME_BYTES: usize = 56 * 1024;
 /// Rows in one such frame, at 78 B a row, and wraps of a version before chains, at 110 B.
 const ROWS_PER_FRAME: usize = FRAME_BYTES / 80;
+/// And rows on a gk chain, each a hybrid one (`PQ_ROW_BYTES`, and at most 32 B around it).
+const PQ_ROWS_PER_FRAME: usize = FRAME_BYTES / (PQ_ROW_BYTES + 32);
 pub(super) const WRAPS_PER_FRAME: usize = FRAME_BYTES / 112;
 /// Readers a writer takes the relay's word for: where the pins stop anyway. Paged, the ids
 /// would otherwise let a relay name a million people for a writer to upload a row to.
@@ -128,6 +131,15 @@ fn blank_at(chain: u32, top: u32) -> u32 {
         0
     } else {
         top
+    }
+}
+
+/// A row nobody opens, of the shape `chain`'s rows have: a hybrid one on a gk chain.
+fn blank_for(chain: u32) -> Vec<u8> {
+    if is_gk(chain) {
+        blank_pq_row()
+    } else {
+        blank_row()
     }
 }
 
@@ -516,6 +528,20 @@ impl AccountSync {
         Some(key)
     }
 
+    /// The start of our own `chain` out of its self-wrap: a gk chain's under the kept key
+    /// (`log::KeptKeys`), a 0010 one's under the log key. The log key's private half is a
+    /// function of its public one, which the relay holds, to whoever breaks X25519.
+    fn own_start(&self, conv: &str, chain: u32, row: &[u8]) -> Option<Key> {
+        let epoch = chain_at(chain, 0)?;
+        if is_gk(chain) {
+            self.kept_keys()?
+                .open_state(row, conv, &self.me, epoch)
+                .ok()
+        } else {
+            self_open_state(&self.logkey, row, conv, &self.me, epoch).ok()
+        }
+    }
+
     fn own_ask(
         &mut self,
         conv: &str,
@@ -577,7 +603,10 @@ impl AccountSync {
             return out;
         }
         if let Some(ep) = self.gk_wanted(conv, w) {
-            self.make_gk_chain(conv, w, &ep, &mut out);
+            // A kept key made this run waits for the vault: another device's may win it
+            if !self.kept_unsettled {
+                self.make_gk_chain(conv, w, &ep, &mut out);
+            }
             return out;
         }
         if !w.standing_read && self.read_standing(conv, w, &mut out) {
@@ -1307,6 +1336,45 @@ impl AccountSync {
         self.send_next_frame(conv, w, out);
     }
 
+    /// Whether an answer to `joiners` waits, as a sharer whose answer holds a gk chain's start
+    /// (one no link reaches): for our kept key, made this run, to be in the vault; or for a
+    /// joiner's kept key, asked for once more with its log key, as it may have been published
+    /// a moment after it joined. A joiner without one past that gets a blank there.
+    fn gk_tops_wait(
+        &mut self,
+        w: &Writer,
+        joiners: &BTreeSet<Id>,
+        out: &mut Vec<ClientMessage>,
+    ) -> bool {
+        let linked: BTreeSet<u32> = w.chains.values().filter_map(|c| c.older).collect();
+        let gk_top = w
+            .chains
+            .values()
+            .any(|c| c.done && is_gk(c.chain) && !linked.contains(&c.chain));
+        if !gk_top {
+            return false;
+        }
+        if self.kept_unsettled {
+            return true;
+        }
+        let missing: Vec<Id> = joiners
+            .iter()
+            .filter(|j| self.peers.get(*j).is_some_and(|p| p.kem.is_none()))
+            .filter(|j| !self.kem_misses.contains(*j))
+            .copied()
+            .collect();
+        if missing.is_empty() {
+            return false;
+        }
+        for j in &missing {
+            self.kem_misses.insert(*j);
+            self.peers.remove(j);
+            self.asked_keys.remove(j);
+        }
+        out.extend(self.ask_keys(missing));
+        true
+    }
+
     /// Who joined and waits for our answer. With the switch and the right on: the start of
     /// each chain no link reaches, so one row and the links open all we kept. Otherwise a
     /// fresh step: they read from there.
@@ -1337,6 +1405,9 @@ impl AccountSync {
                 self.fetching.insert(conv.to_string(), Fetch::Wraps);
                 out.push(self.ask_wraps(conv));
             }
+            return;
+        }
+        if self.share && self.gk_tops_wait(w, &joiners, out) {
             return;
         }
         self.joiners.remove(conv);
@@ -1374,15 +1445,16 @@ impl AccountSync {
                 });
             }
         }
+        // Every top, however many: a gk chain links back only while its device shares, so
+        // each epoch a device posted in without sharing leaves one, and nothing else reaches
+        // what it holds. The relay keeps a row at each: it counts our tops (RV g4 review2).
         let linked: BTreeSet<u32> = w.chains.values().filter_map(|c| c.older).collect();
         let tops: Vec<(u32, u32, Key)> = w
             .chains
             .values()
             .filter(|c| c.done && !linked.contains(&c.chain))
             .filter_map(|c| {
-                let start =
-                    self_open_state(&self.logkey, &c.self_wrap, conv, &me, chain_at(c.chain, 0)?)
-                        .ok()?;
+                let start = self.own_start(conv, c.chain, &c.self_wrap)?;
                 Some((c.chain, c.top, start))
             })
             .collect();
@@ -1394,45 +1466,75 @@ impl AccountSync {
             .rfind(|c| c.done)
             .map(|c| (c.chain, c.top))
             .filter(|_| tops.is_empty());
-        for chunk in people.chunks(ROWS_PER_FRAME) {
-            for (i, (chain, top, start)) in tops.iter().enumerate() {
-                let (Some(at_top), Some(at_start)) = (chain_at(*chain, *top), chain_at(*chain, 0))
-                else {
-                    continue;
-                };
-                let last = i + 1 == tops.len();
+        // A gk chain's start goes to a newcomer only by a hybrid row, to its kept key as well
+        // as its log key: whoever breaks X25519 opens a row of the static shape alone from
+        // the relay's database, and every older chain by the links with it. Without a kept
+        // key a newcomer gets a blank there, as one without a log key does. Every row of one
+        // person comes before the frame that ends their wait, the last top's.
+        let row_to = |s: &Self, j: &Id, key: &StaticKey, chain: u32, start: &Key| {
+            let at_start = chain_at(chain, 0)?;
+            if !is_gk(chain) {
+                return Some(key.wrap_state(start, conv, &me, at_start, j));
+            }
+            let kem = s.peers.get(j)?.kem.as_ref()?;
+            Some(key.wrap_state_pq(kem, start, conv, &me, at_start, j))
+        };
+        for (i, (chain, top, start)) in tops.iter().enumerate() {
+            let Some(at_top) = chain_at(*chain, *top) else {
+                continue;
+            };
+            let last = i + 1 == tops.len();
+            let per_frame = if is_gk(*chain) {
+                PQ_ROWS_PER_FRAME
+            } else {
+                ROWS_PER_FRAME
+            };
+            for chunk in people.chunks(per_frame) {
                 let wraps: Vec<ChainRow> = chunk
                     .iter()
-                    .filter_map(|(j, key)| match key {
-                        Some(key) => Some(ChainRow {
-                            recipient: *j,
-                            index: 0,
-                            wrapped: key.wrap_state(start, conv, &me, at_start, j),
-                        }),
-                        None => last.then(|| ChainRow {
-                            recipient: *j,
-                            index: blank_at(*chain, *top),
-                            wrapped: blank_row(),
-                        }),
+                    .filter_map(|(j, key)| {
+                        let row = key.as_ref().and_then(|k| row_to(self, j, k, *chain, start));
+                        match row {
+                            Some(wrapped) => Some(ChainRow {
+                                recipient: *j,
+                                index: 0,
+                                wrapped,
+                            }),
+                            None => last.then(|| ChainRow {
+                                recipient: *j,
+                                index: blank_at(*chain, *top),
+                                wrapped: blank_for(*chain),
+                            }),
+                        }
                     })
                     .collect();
                 if !wraps.is_empty() {
                     w.frames.push_back(rows_frame(conv, at_top, wraps, last));
                 }
             }
-            if let Some((chain, top)) = fallback {
-                if let Some(at_top) = chain_at(chain, top) {
+        }
+        if let Some((chain, top)) = fallback {
+            if let Some(at_top) = chain_at(chain, top) {
+                let per_frame = if is_gk(chain) {
+                    PQ_ROWS_PER_FRAME
+                } else {
+                    ROWS_PER_FRAME
+                };
+                for chunk in people.chunks(per_frame) {
                     let wraps = chunk
                         .iter()
                         .map(|(j, _)| ChainRow {
                             recipient: *j,
                             index: blank_at(chain, top),
-                            wrapped: blank_row(),
+                            wrapped: blank_for(chain),
                         })
                         .collect();
                     w.frames.push_back(rows_frame(conv, at_top, wraps, true));
                 }
             }
+        }
+        for (j, _) in &people {
+            self.kem_misses.remove(j);
         }
         if !w.frames.is_empty() {
             w.done = Some(Done::Rows {
@@ -2188,15 +2290,25 @@ impl AccountSync {
         for k in rows {
             let mut opened: Vec<(u32, Key)> = Vec::new();
             if owner == me {
-                if let (Some(row), Some(epoch)) = (&k.self_wrap, chain_at(chain, 0)) {
-                    if let Ok(s) = self_open_state(&self.logkey, row, conv, &me, epoch) {
-                        opened.push((0, s));
-                    }
+                if let Some(s) = k
+                    .self_wrap
+                    .as_ref()
+                    .and_then(|r| self.own_start(conv, chain, r))
+                {
+                    opened.push((0, s));
                 }
             } else {
+                // On a gk chain only a sharer's hybrid row opens (`wrap_state_pq`)
                 if let (Some((i, row)), Some(sk)) = (&k.direct, self.static_key(&owner)) {
                     if let Some(epoch) = chain_at(chain, *i) {
-                        if let Ok(s) = sk.open_state(row, conv, &owner, epoch, &me) {
+                        let state = if !is_gk(chain) {
+                            sk.open_state(row, conv, &owner, epoch, &me)
+                        } else if let Some(own) = self.kept_keys() {
+                            sk.open_state_pq(own, row, conv, &owner, epoch, &me)
+                        } else {
+                            Err(LogError::Sealed)
+                        };
+                        if let Ok(s) = state {
                             opened.push((*i, s));
                         }
                     }
@@ -2718,12 +2830,19 @@ impl AccountSync {
             owner: &me,
             chain,
         };
-        let self_wrap = self_wrap_state(&self.logkey, &start, conv, &me, chain << 1);
+        // For our other devices under the kept key, never the log key (§5.10): its private
+        // half is a function of its public one, which the relay holds
+        let Some(kept) = self.kept_keys() else {
+            self.outbox.retain(|o| o.conv != conv);
+            self.later.push(Event::NotKept {
+                reason: "Your kept key could not be read on this device.".into(),
+            });
+            return;
+        };
+        let self_wrap = kept.wrap_state(&start, conv, &me, chain << 1);
         let older = w.highest(true).filter(|_| self.share).and_then(|n| {
             let c = w.chains.get(&n)?;
-            let start =
-                self_open_state(&self.logkey, &c.self_wrap, conv, &me, chain_at(n, 0)?).ok()?;
-            Some((n, start))
+            Some((n, self.own_start(conv, n, &c.self_wrap)?))
         });
         let link = older.as_ref().map(|(n, s)| (*n, at.link(&start, *n, s)));
         let (index, state) = match link {

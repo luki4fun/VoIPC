@@ -50,11 +50,11 @@ use super::keyring::{
     KeyringBucket, KeyringDelta,
 };
 use super::keys::{agree, tag, Me, SeatPublic, Them};
-use super::merkle::{bucket_root, list_digest, Leaf, Pool, Via, BUCKET_SEATS};
-use super::rules::{Refusal, SeedRolls};
+use super::merkle::{bucket_root, list_digest, seat_dh, Leaf, Pool, Via, BUCKET_SEATS};
+use super::rules::{behind_ok, Refusal, SeedRolls};
 use super::timers::{BUCKET_AGE_MAX_SECS, JOIN_BATCH_MAX, REFRESH_SLICE};
 use super::welcome::{keyring_welcome, seed_welcome, Drawn};
-use super::{GkError, REGENESIS_WAIT, ROW_BYTES};
+use super::{GkError, ROW_BYTES};
 
 /// A bucket under this many seats is small (§5.3, as `sync/chains.rs`).
 pub const SMALL_SEATS: usize = 16;
@@ -73,6 +73,9 @@ pub enum BuildError {
     Header(Refusal),
     /// What the due asks, this keyholder may not sign (it declines).
     Refuse(&'static str),
+    /// The due's candidate fails a check only the build can make (it declines `CANDIDATE`,
+    /// which counts toward no removal of this keyholder).
+    Candidate(&'static str),
 }
 
 impl From<GkError> for BuildError {
@@ -190,6 +193,8 @@ pub struct Holding<'a> {
     /// The newest seed each seat holds, as the relay said with the due.
     /// `Sync`, so a build in steps (`steps`) stays `Send`.
     pub held: &'a (dyn Fn(&SeatRef) -> Option<u32> + Sync),
+    /// The rolls at `head`: `ring`'s own (`KeyringBase::rolls`), and a removal the
+    /// relay says is due. What a new keyring seals carries on from these.
     pub rolls: SeedRolls,
     pub stored: bool,
 }
@@ -468,7 +473,8 @@ async fn seat_joiners(
                     v: at.v,
                     pool,
                     seats: chunk.len() as u16,
-                    list: list_digest(g, at, chunk),
+                    list: list_digest(g, at, chunk, |s| seat_dh(&by_seat.get(s)?.keys.dh_bytes()))
+                        .ok_or(GkError::Malformed)?,
                     via: Via::Row,
                     bk,
                     made: now,
@@ -586,11 +592,13 @@ pub fn build_genesis(st: &Start, cache: &mut RowBases) -> Result<Built, BuildErr
     build_anew(st, None, cache)
 }
 
-/// A Regenesis (§4.3): after an hour with no keyholder online (2 minutes
-/// for a set of connection entries alone, `rules::regenesis_wait`), the next
-/// epoch of the same generation under a new seed that every seat is
-/// welcomed to anew, as Join commits seat them. `exits` is the closed batch
-/// the due carries, if any.
+/// A Regenesis (§4.3): after an hour with no keyholder online (at once for a
+/// set of connection entries alone, `rules::regenesis_wait`), the next epoch
+/// of the same generation under a new seed that every seat is welcomed to
+/// anew, as Join commits seat them. It is dated at the volunteer's clock, or
+/// at its parent's `time` where that is later (as every opening is): a
+/// Regenesis never comes before its parent. `exits` is the closed batch the
+/// due carries, if any.
 pub fn build_regenesis(
     st: &Start,
     head: &SignedHeader,
@@ -609,7 +617,7 @@ fn build_anew(
     if st.entry.kx != raw_kx(&st.me) || st.entry.m != st.me.m {
         return Err(BuildError::Refuse("the entry is not this pair's"));
     }
-    let (gen, epoch, s, parent_d, kh_parent, upto, kind, removed) = match parent {
+    let (gen, epoch, s, parent_d, kh_parent, upto, kind, removed, time) = match parent {
         None => (
             crate::aead::random::<16>(),
             1,
@@ -619,24 +627,27 @@ fn build_anew(
             0,
             Kind::Genesis,
             vec![],
+            st.now,
         ),
         Some((p, exits, upto)) => {
             let ph = p.header();
+            // Never before its parent: a volunteer whose clock is behind the parent's maker's
+            // dates it at the parent's `time`, now that a set of connection entries alone
+            // waits nothing
+            let time = st.now.max(ph.time);
             // The wait its set in force allows (`regenesis_wait`, "Fast new start"): known
-            // here where the head sets keyholders; else the shortest, and the volunteer's own
-            // check (`validate`, over the keyholder header in force it holds) holds it to
-            // the rest
+            // here where the head sets keyholders; else the shortest, none, and the
+            // volunteer's own check (`validate`, over the keyholder header in force it holds)
+            // holds it to the rest
             let wait = if ph.kind.sets_keyholders() {
-                super::regenesis_wait(ph, st.now)
+                super::regenesis_wait(ph, time)
             } else {
                 super::REGENESIS_FAST_WAIT
             };
-            if st.now < ph.time.saturating_add(wait) {
-                return Err(BuildError::Refuse(if wait >= REGENESIS_WAIT {
-                    "a Regenesis waits an hour after its parent"
-                } else {
-                    "a Regenesis waits two minutes after its parent"
-                }));
+            if time < ph.time.saturating_add(wait) {
+                return Err(BuildError::Refuse(
+                    "a Regenesis waits an hour after its parent",
+                ));
             }
             let upto = if exits.is_empty() {
                 ph.exits_upto
@@ -652,6 +663,7 @@ fn build_anew(
                 upto,
                 Kind::Regenesis,
                 exits.iter().map(|e| e.seat).collect(),
+                time,
             )
         }
     };
@@ -677,6 +689,10 @@ fn build_anew(
         ck: ck.clone(),
         exits_upto: upto,
         buckets: buckets.clone(),
+        rolls: SeedRolls {
+            raised: st.now,
+            removal: false,
+        },
     };
     let sealed = seal_base(&g, s, &ks, &krk, &base);
     let (added, removed) = names(
@@ -691,7 +707,7 @@ fn build_anew(
         epoch,
         join: 0,
         kind,
-        time: st.now,
+        time,
         parent: parent_d,
         epoch_parent: [0; 32],
         kh_parent,
@@ -1106,7 +1122,11 @@ pub struct OpeningAsk<'a> {
 /// A Fresh, KeyholdersAdd, KeyholdersRemove or KeyholdersReplace on the
 /// head. A new `CK` every attempt; seeds by §5.6 (a text roll only when none
 /// runs, open choice 23); a seat on a seed the new floor drops gets its seed
-/// welcome before any row.
+/// welcome before any row. A text roll ends at the first opening 24 h after
+/// its start, whatever the relay says (RV q1-q2:1210): a seat behind it, or
+/// already behind the head's floor, gets its seed welcome here where the relay
+/// sent its keys, and else its row under the commit's seed, which it opens once
+/// the relay's sweep brings the welcome (`behind_ok`).
 pub fn build_opening(
     hold: &Holding,
     ask: &OpeningAsk,
@@ -1207,7 +1227,10 @@ pub async fn opening_in_steps(
     } else {
         (head.seed, head.seed_floor)
     };
-    if !start && ask.finish && ask.kind != Kind::KeyholdersReplace {
+    // §5.6 "24 h to finish": a text roll ends here once it is a day old, by its start
+    // as the keyring carries it (RV q1-q2:1210)
+    let ends = !start && hold.rolls.ends(head, time);
+    if !start && (ends || (ask.finish && ask.kind != Kind::KeyholdersReplace)) {
         floor = s;
     }
     let new_seed = start.then(|| Zeroizing::new(crate::aead::random::<32>()));
@@ -1262,12 +1285,12 @@ pub async fn opening_in_steps(
             .iter()
             .find(|kb| kb.version() == at)
             .expect("planned from the keyring");
-        if list_digest(g, at, &seats) != kb.list || seats.len() != usize::from(kb.seats) {
+        let keys: HashMap<SeatRef, &[u8]> = list.iter().map(|l| (l.seat, &l.dh[..])).collect();
+        let digest = list_digest(g, at, &seats, |s| seat_dh(keys.get(s)?));
+        if digest != Some(kb.list) || seats.len() != usize::from(kb.seats) {
             return Err(GkError::Sealed.into());
         }
-        for l in list {
-            dh.insert(l.seat, &l.dh);
-        }
+        dh.extend(keys);
         lists.insert(at.b, seats);
         steps::unit().await;
     }
@@ -1278,10 +1301,31 @@ pub async fn opening_in_steps(
             ));
         }
     }
+    // §5.6: the candidate is seated (RV q4-q5:748). In a gated text group a seat needs a
+    // name in `added`, which the relay cannot make, and the promoted pair gets the keyring:
+    // a candidate seated nowhere would read every post on the relay's word. A KeyholdersAdd
+    // reads every bucket's list but those of buckets every seat leaves, and a seat leaving in
+    // this commit is no seat. This binds the candidate's account id, not its `IK`: that is
+    // the pin's, or taken on trust where this device has none (`candidate_ok`). (An open
+    // group's relay may seat anyone; a voice room's keyholders are its roster's, §5.9.)
+    if let (Kind::KeyholdersAdd, Some(c)) = (ask.kind, ask.candidate) {
+        let seated = lists.iter().any(|(b, seats)| {
+            let exiting = exit_by_b.get(b);
+            seats
+                .iter()
+                .any(|s| s.m == c.m && !exiting.is_some_and(|x| x.contains(s)))
+        });
+        if kind_g == GroupKind::Text && (ask.gated || head.gated) && !seated {
+            return Err(BuildError::Candidate("the candidate is seated nowhere"));
+        }
+    }
 
-    // Who holds which seed after: seats on a dropped seed get a seed welcome.
+    // Who holds which seed after: seats on a dropped seed get a seed welcome. In a
+    // text group a seat behind a roll ending here, or left behind one, gets it only
+    // where the relay sent its keys; else its row is under `s` with none (§5.6)
     let held_of = |seat: &SeatRef| (hold.held)(seat);
     let mut seed_welcomed: HashSet<SeatRef> = HashSet::new();
+    let mut unwelcomed: HashSet<SeatRef> = HashSet::new();
     for (b, seats) in &lists {
         let exiting = exit_by_b.get(b);
         for seat in seats {
@@ -1290,6 +1334,13 @@ pub async fn opening_in_steps(
             }
             match held_of(seat) {
                 Some(n) if n >= floor => {}
+                Some(n) if behind_ok(head, n, ends) => {
+                    if ask.seed_seats.contains_key(seat) {
+                        seed_welcomed.insert(*seat);
+                    } else {
+                        unwelcomed.insert(*seat);
+                    }
+                }
                 Some(_) if start => {
                     seed_welcomed.insert(*seat);
                 }
@@ -1299,7 +1350,7 @@ pub async fn opening_in_steps(
         steps::unit().await;
     }
     let seed_of = |seat: &SeatRef| -> Result<u32, BuildError> {
-        if seed_welcomed.contains(seat) {
+        if seed_welcomed.contains(seat) || unwelcomed.contains(seat) {
             return Ok(s);
         }
         match held_of(seat) {
@@ -1352,7 +1403,8 @@ pub async fn opening_in_steps(
             Step::Ratchet => {
                 let seats = lists[&kb.b].clone();
                 let v = ids.version();
-                let list = list_digest(g, Version { b: kb.b, v }, &seats);
+                let list = list_digest(g, Version { b: kb.b, v }, &seats, |s| seat_dh(dh.get(s)?))
+                    .ok_or(GkError::Sealed)?;
                 let nb = kb.ratcheted(g, e, v, list);
                 versions.push(VersionOut {
                     b: kb.b,
@@ -1427,6 +1479,7 @@ pub async fn opening_in_steps(
         ck: ck.clone(),
         exits_upto: upto,
         buckets: after.clone(),
+        rolls: hold.rolls.at(ask.kind, start, time),
     };
     let sealed = seal_base(g, s, &ks, &krk, &base);
     steps::unit().await;
@@ -1501,7 +1554,13 @@ pub async fn opening_in_steps(
         }
     }
     let mut seed_welcomes = Vec::new();
-    if let Some(new_seed) = &new_seed {
+    if !seed_welcomed.is_empty() {
+        // Under `s`: the seed this commit draws, or the head's at a roll that ends here
+        let seed_s = seeds
+            .iter()
+            .find(|(n, _)| *n == s)
+            .map(|(_, k)| k)
+            .ok_or(BuildError::Refuse("the keyring does not hold a live seed"))?;
         let mut ordered: Vec<SeatRef> = seed_welcomed.iter().copied().collect();
         list_order(&mut ordered);
         for seat in ordered {
@@ -1512,7 +1571,7 @@ pub async fn opening_in_steps(
             if keys.seat(seat.m) != seat {
                 return Err(GkError::Forged.into());
             }
-            let s_m = member_secret(g, s, new_seed, &seat);
+            let s_m = member_secret(g, s, seed_s, &seat);
             let to = Them { m: seat.m, keys };
             seed_welcomes.push(SeedWelcomeOut {
                 seat,
@@ -1633,7 +1692,8 @@ impl Rekeying<'_> {
                 v,
                 pool,
                 seats: seats.len() as u16,
-                list: list_digest(self.g, at, seats),
+                list: list_digest(self.g, at, seats, |s| seat_dh(self.dh.get(s)?))
+                    .ok_or(GkError::Sealed)?,
                 via: Via::Row,
                 bk,
                 made,
@@ -2109,6 +2169,9 @@ pub(crate) mod world {
         pub roster: Vec<u32>,
         pub no_keyholder_since: Option<u64>,
         pub seq: u64,
+        /// Whether an opening due brings the seats' KEM keys (`EpochDue.seed_seats`): an
+        /// honest relay sends them with a voice Remove only.
+        pub seed_keys: bool,
     }
 
     pub(crate) fn copy_ring(r: &Keyring) -> Keyring {
@@ -2186,6 +2249,7 @@ pub(crate) mod world {
                 stored,
                 head: None,
                 leaves: &[],
+                dh: &|_| None,
                 held: &held,
                 due,
                 by,
@@ -2248,6 +2312,7 @@ pub(crate) mod world {
                 roster,
                 no_keyholder_since: None,
                 seq: 0,
+                seed_keys: true,
             };
             w.take(&due, a, &built);
             w
@@ -2283,6 +2348,7 @@ pub(crate) mod world {
                     kh: &self.kh,
                 }),
                 leaves: &self.leaves,
+                dh: &|s| seat_dh(&self.keys.get(s)?.dh_bytes()),
                 held: &held,
                 due,
                 by,
@@ -2461,6 +2527,7 @@ pub(crate) mod world {
                     me: r.me(),
                     entry: r.entry(w.kind),
                 });
+                let none = HashMap::new();
                 let ask = OpeningAsk {
                     kind: due.kind.header_kind(),
                     exits: &due.exits,
@@ -2471,7 +2538,7 @@ pub(crate) mod world {
                     remove: due.remove,
                     replace,
                     finish,
-                    seed_seats: &w.keys,
+                    seed_seats: if w.seed_keys { &w.keys } else { &none },
                     pairs: &pairs,
                     now: w.now,
                 };
@@ -2596,6 +2663,7 @@ mod tests {
     use crate::group_key::merkle::inclusion_path;
     use crate::group_key::tree::BucketTree;
     use crate::group_key::welcome::{open_keyring_welcome, open_seat_welcome, open_seed_welcome};
+    use crate::group_key::{ROLL_GAP, SEED_MAX_AGE};
 
     fn accounts(from: u32, n: u32) -> Vec<Member> {
         (from..from + n).map(Member::numbered).collect()
@@ -2668,15 +2736,22 @@ mod tests {
             ..w.due(DueKind::Regenesis)
         };
         let head = w.head.clone();
-        w.tick(60);
-        assert_eq!(
-            World::build_start(&vol, w.kind, w.id, true, &due, w.now, Some(&head)).err(),
-            Some(BuildError::Refuse(
-                "a Regenesis waits two minutes after its parent"
-            ))
-        );
         // The set in force holds a desktop's pair, which the builder does not see under a
-        // Join head: it makes the commit, and the volunteer's own check refuses it
+        // Join head: it makes the commit (the shortest wait, none since J10-B, owner
+        // 2026-11-22), and the volunteer's own check refuses it, a minute on or half an hour
+        let hour = Some((
+            4,
+            r#"Generation("a Regenesis comes an hour after its parent")"#.to_string(),
+        ));
+        w.tick(60);
+        let early = World::build_start(&vol, w.kind, w.id, true, &due, w.now, Some(&head)).unwrap();
+        w.no_keyholder_since = Some(w.now - 60);
+        assert_eq!(
+            w.check(&due, vol.by(), &early.commit)
+                .err()
+                .map(|b| (b.rule, b.detail)),
+            hour
+        );
         w.tick(1740);
         let early = World::build_start(&vol, w.kind, w.id, true, &due, w.now, Some(&head)).unwrap();
         w.no_keyholder_since = Some(w.now - 1800);
@@ -2684,10 +2759,7 @@ mod tests {
             w.check(&due, vol.by(), &early.commit)
                 .err()
                 .map(|b| (b.rule, b.detail)),
-            Some((
-                4,
-                r#"Generation("a Regenesis comes an hour after its parent")"#.into()
-            ))
+            hour
         );
         w.tick(1800);
         w.no_keyholder_since = Some(w.now - 3600);
@@ -3199,6 +3271,150 @@ mod tests {
         w.step(&rm, &retry);
     }
 
+    fn seeds(b: &Built) -> (u32, u32) {
+        let h = b.header.header();
+        (h.seed, h.seed_floor)
+    }
+
+    /// The seeds a commit's rows are under.
+    fn rows_under(b: &Built) -> HashSet<u64> {
+        b.made
+            .iter()
+            .filter_map(|m| m.rows.as_ref().map(|r| (r, m.seats.len())))
+            .flat_map(|(r, n)| (0..n).map(move |i| r.row(i).unwrap().1))
+            .collect()
+    }
+
+    /// A text roll that a removal started, with seats 10..80 (two buckets) on seed 1, a
+    /// day after the last start; the second keyholder is gone. Gives the start's `time`,
+    /// and the people.
+    fn roll_held_open(w: &mut World) -> (u64, Vec<Member>) {
+        let people = accounts(10, 70);
+        w.join(&refs(&people));
+        w.promote(Holder::desktop(9));
+        w.tick(ROLL_GAP);
+        w.remove(1);
+        assert_eq!((w.head.header().seed, w.head.header().seed_floor), (2, 1));
+        (w.head.header().time, people)
+    }
+
+    /// §5.6, RV q1-q2:1210: a text roll ends 24 h after its start, whatever the relay says.
+    /// The relay here never says it may finish, names every seat as still on seed 1 and
+    /// sends no keys for seed welcomes. Within the 24 h the roll runs as it always did. A
+    /// day on, the next opening raises the floor and makes every row under seed 2, and so
+    /// does every opening after it; each seat opens its row once the relay's sweep brings
+    /// its seed welcome.
+    #[test]
+    fn a_text_roll_the_relay_holds_open_ends_24_h_after_its_start() {
+        let mut w = World::text(true, false);
+        w.seed_keys = false;
+        let (started, people) = roll_held_open(&mut w);
+
+        w.now = started + ROLL_GAP - 60;
+        let due = w.due(DueKind::Refresh);
+        let b = w.opening(&due).unwrap();
+        assert_eq!(seeds(&b), (2, 1), "within the day the relay's word holds");
+        assert_eq!(rows_under(&b), HashSet::from([1]));
+        w.step(&due, &b);
+
+        w.now = started + ROLL_GAP;
+        let due = w.due(DueKind::Refresh);
+        let b = w.opening(&due).unwrap();
+        assert_eq!(seeds(&b), (2, 2), "the roll ends at its 24 h");
+        assert_eq!(rows_under(&b), HashSet::from([2]), "no row under seed 1");
+        assert!(b.commit.seed_welcomes.is_empty(), "the relay sent no keys");
+        w.step(&due, &b);
+        assert!(w.held.values().any(|n| *n == 1), "seats still behind");
+
+        w.tick(2 * 3600);
+        let due = w.due(DueKind::Refresh);
+        let b = w.opening(&due).unwrap();
+        assert_eq!(seeds(&b), (2, 2));
+        assert_eq!(
+            rows_under(&b),
+            HashSet::from([2]),
+            "a seat behind the floor gets its row under the head's seed"
+        );
+        w.step(&due, &b);
+
+        // The sweep's seed welcome under seed 2 opens each row
+        let k = w.holders[0].holder();
+        let seed = Zeroizing::new(*w.ring.seed(2).unwrap());
+        let mut opened = 0;
+        for p in &people {
+            let Some(m) = b.made.iter().find(|m| m.seats.contains(&p.seat)) else {
+                continue;
+            };
+            let i = m.seats.iter().position(|x| *x == p.seat).unwrap();
+            let (row, under) = m.rows.as_ref().unwrap().row(i).unwrap();
+            assert_eq!(under, 2);
+            let s_m = member_secret(&w.g, 2, &seed, &p.seat);
+            let rb = RowBase::member_side(&w.g, 2, &p.me(), &k, &s_m).unwrap();
+            assert_eq!(*rb.open_row(m.bucket.version(), row).unwrap(), *m.bucket.bk);
+            opened += 1;
+        }
+        assert!(opened > 0);
+    }
+
+    /// The same with the seats' keys in the due: each seat still on seed 1 that the ending
+    /// commit makes a row to gets its seed welcome in it, under seed 2.
+    #[test]
+    fn a_text_roll_ending_at_its_24_h_gives_seed_welcomes_where_the_keys_came() {
+        let mut w = World::text(true, false);
+        let (started, people) = roll_held_open(&mut w);
+        w.now = started + ROLL_GAP;
+        let due = w.due(DueKind::Refresh);
+        let b = w.opening(&due).unwrap();
+        assert_eq!(seeds(&b), (2, 2));
+        assert_eq!(rows_under(&b), HashSet::from([2]));
+        assert!(!b.commit.seed_welcomes.is_empty());
+        rows_open_under_the_seed_welcomes(&w, &b, &people);
+        w.step(&due, &b);
+    }
+
+    /// §5.6: a seed the relay keeps in use for 30 days by holding its roll open. The roll
+    /// ends at the first opening past its 24 h; the opening after it starts the roll the
+    /// seed's age makes due, though the relay never asks for one, and every seat still on
+    /// seed 1 gets its row under the new seed.
+    #[test]
+    fn a_seed_the_relay_keeps_past_30_days_rolls_at_the_opening_after_its_roll_ends() {
+        let mut w = World::text(true, false);
+        w.seed_keys = false;
+        let (started, _) = roll_held_open(&mut w);
+        assert!(!w.rolls.removal, "no roll due but by age");
+        w.now = started + SEED_MAX_AGE;
+        let due = w.due(DueKind::Refresh);
+        let b = w.opening(&due).unwrap();
+        assert_eq!(seeds(&b), (2, 2));
+        w.step(&due, &b);
+        w.tick(60);
+        let due = w.due(DueKind::Refresh);
+        let b = w.opening(&due).unwrap();
+        assert_eq!(seeds(&b), (3, 2), "the 30-day roll starts");
+        assert_eq!(rows_under(&b), HashSet::from([3]), "every seat was behind");
+        w.step(&due, &b);
+    }
+
+    /// A KeyholdersReplace past a roll's 24 h ends it too; within them it never does.
+    #[test]
+    fn a_keyholders_replace_ends_a_roll_only_past_its_24_h() {
+        let mut w = World::text(true, false);
+        w.seed_keys = false;
+        let (started, _) = roll_held_open(&mut w);
+        let new = w.holders[0].rotated();
+        let due = w.replace_due(&new);
+        w.now = started + ROLL_GAP - 60;
+        let b = w.opening_by(0, &due, true, Some(&new), None).unwrap();
+        assert_eq!(seeds(&b), (2, 1), "in time it finishes nothing");
+        w.now = started + ROLL_GAP;
+        let b = w.opening_by(0, &due, false, Some(&new), None).unwrap();
+        assert_eq!(seeds(&b), (2, 2));
+        assert_eq!(rows_under(&b), HashSet::from([2]));
+        w.step(&due, &b);
+        w.holders[0] = new;
+        assert_eq!(w.head.header().kind, Kind::KeyholdersReplace);
+    }
+
     #[test]
     fn a_join_rebased_across_a_new_generation_makes_everything_again() {
         let mut w = World::text(false, false);
@@ -3691,6 +3907,58 @@ mod tests {
         });
         assert_eq!(ran.steps, 1);
         assert_eq!(Some(ran.units), units);
+    }
+
+    /// RV r-keyholders:118: a list that gives a seat another X25519 key than the one it was
+    /// seated with is not the list the keyring names. The digest binds `ser(SX)` in full, so
+    /// the 8-byte `tag_sx` (about 2^64 / N tries to match) is not what keeps the relay from
+    /// putting a key of its own into the rows of a re-key.
+    #[test]
+    fn a_rekey_refuses_a_list_that_gives_a_seat_another_x25519_key() {
+        let mut w = World::text(true, false);
+        let people = accounts(10, 5);
+        w.join(&refs(&people));
+        // The relay serves people[1] with a key of its own; the exit makes its bucket re-key
+        // to a keyholder that did not seat it (no row base kept from the Join)
+        let theirs = crate::group_key::keys::SeatPair::generate().public();
+        w.keys.insert(people[1].seat, theirs);
+        w.cache = RowBases::new();
+        let due = w.exits(&[people[0].seat], DueKind::Exits);
+        let r = w.opening_by(0, &due, true, None, None);
+        assert_eq!(
+            r.err(),
+            Some(BuildError::Key(GkError::Sealed)),
+            "the list is refused by its digest, before any row"
+        );
+    }
+
+    /// RV q4-q5:748: in a gated group a KeyholdersAdd promotes only a seated candidate
+    /// (§5.6). The candidate's pair gets the keyring and every post from its promotion on,
+    /// and a seat there needs a name in `added`, which the relay cannot make; the candidate
+    /// is the relay's word. A seat leaving in the same commit is no seat.
+    #[test]
+    fn a_gated_promotion_of_a_candidate_seated_nowhere_is_refused() {
+        let mut w = World::text(true, true);
+        w.join(&refs(&accounts(10, 3)));
+        let cand = Holder::desktop(9);
+        let unseated = w.promote_due(&cand);
+        assert_eq!(
+            w.opening(&unseated).err(),
+            Some(BuildError::Candidate("the candidate is seated nowhere"))
+        );
+        // Seated by an honest Join, but leaving in the commit that would promote it
+        w.join(&[&cand.seat]);
+        let leaving = Due {
+            candidate: Some(cand.candidate()),
+            ..w.exits(&[cand.seat.seat], DueKind::Promote)
+        };
+        assert_eq!(
+            w.opening(&leaving).err(),
+            Some(BuildError::Candidate("the candidate is seated nowhere"))
+        );
+        // Seated and staying: promoted
+        let due = w.promote_due(&cand);
+        assert!(w.opening(&due).is_ok());
     }
 
     #[test]

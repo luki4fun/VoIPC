@@ -227,6 +227,12 @@ export function rosterAccount(server: string, id: number): UserInfo["account"] {
 
 /** How many stand in each channel, as the relay counted (`channel-counts`, protocol 25). */
 export function setCounts(server: string, counts: [number, number][]): void {
+  // A join or leave still in the batch came before this count, and the relay counted it
+  // already. Added on after the count, it is counted twice, and the relay says a count again
+  // only when it moves: a room of two read 3 until somebody came or went.
+  const entry = pending.get(server);
+  if (entry?.timer != null) clearTimeout(entry.timer);
+  flush(server);
   const by = new Map(counts);
   channels.of(server).update((chs) =>
     chs.some((c) => by.has(c.channel_id) && by.get(c.channel_id) !== c.user_count)

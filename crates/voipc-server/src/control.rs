@@ -88,6 +88,12 @@ impl ControlTx {
         self.tx.is_closed()
     }
 
+    /// Tests: the bytes queued that the writer has not taken yet.
+    #[cfg(test)]
+    pub fn queued_bytes(&self) -> usize {
+        self.queued.load(Ordering::Relaxed)
+    }
+
     /// Never waits: callers hold shard guards of the session map. A broadcast hands
     /// every recipient a clone of one `Bytes`, not a copy.
     pub fn try_send(&self, data: Bytes) -> Result<(), ControlError> {

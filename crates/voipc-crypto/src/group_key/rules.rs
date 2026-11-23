@@ -19,9 +19,10 @@
 //!   guest, pin and counter checks as they stood at that time, or was removed
 //!   by a later opening header;
 //! - no Regenesis is taken sooner after its parent than its set in force
-//!   allows (`regenesis_wait`: an hour, or two minutes for a set of
-//!   connection entries alone that no Regenesis started in the last hour), or
-//!   after a parent that is not genuine and at or above the floor; a device
+//!   allows (`regenesis_wait`: an hour, or at once, at or after its parent's
+//!   `time`, for a set of connection entries alone that no Regenesis started
+//!   in the last hour), or after a parent that is not genuine and at or above
+//!   the floor; a device
 //!   that holds a floor and cannot see the set in force waits the hour; and
 //!   no generation is taken that this device took already, or that began
 //!   before it last saw the group.
@@ -34,8 +35,7 @@ use serde::{Deserialize, Serialize};
 
 use super::ctx::{MemberId, SeatRef};
 use super::header::{
-    AddedSeat, HeaderV1, Keyholder, Kind, NamesList, NamesStep, Removed, SignedHeader,
-    MAX_KEYHOLDERS,
+    AddedSeat, HeaderV1, Keyholder, Kind, NamesList, NamesStep, SignedHeader, MAX_KEYHOLDERS,
 };
 use super::keys::{Holder, Origin};
 use super::merkle::{Leaf, Via};
@@ -496,7 +496,9 @@ pub fn check_voice_keyholders(
 /// - In a voice group the slot does not apply: a KeyholdersRemove always
 ///   starts a roll, and a Fresh or a KeyholdersAdd never does (either may
 ///   finish one).
-/// - A Join and a KeyholdersReplace keep both.
+/// - A Join keeps both. A KeyholdersReplace keeps `seed`; in a text group it
+///   may also finish a roll, which the validator lets it only once the roll
+///   is 24 h old (`SeedRolls::ends`).
 fn seeds_follow(p: &HeaderV1, h: &HeaderV1) -> bool {
     let start = p.seed.checked_add(1) == Some(h.seed) && h.seed_floor == p.seed;
     let keep = h.seed == p.seed && (h.seed_floor == p.seed_floor || h.seed_floor == h.seed);
@@ -506,6 +508,7 @@ fn seeds_follow(p: &HeaderV1, h: &HeaderV1) -> bool {
         (Kind::Regenesis, GroupKind::Text) => {
             p.seed.checked_add(1) == Some(h.seed) && h.seed_floor == h.seed
         }
+        (Kind::KeyholdersReplace, GroupKind::Text) => keep,
         (Kind::Join | Kind::KeyholdersReplace, _) => same,
         (Kind::KeyholdersRemove, GroupKind::Voice) => start,
         (Kind::Fresh | Kind::KeyholdersAdd, GroupKind::Voice) => keep,
@@ -664,13 +667,15 @@ pub fn connection_only(set: &[Keyholder]) -> bool {
 
 /// How long a Regenesis dated `time` waits after its parent (§4.3, §5.7),
 /// under `set`, the keyholder header its `kh_parent` names (the set in
-/// force). "Fast new start" (owner, 2026-11-19):
+/// force). "Fast new start" (owner, 2026-11-19; at once, owner 2026-11-22):
 ///
-/// - `REGENESIS_FAST_WAIT`, 2 minutes, when every entry of the set is a
-///   connection entry (`connection_only`). Such an entry dies with its
-///   connection: after the sole browser keyholder's reload, or any relay
-///   restart, none can ever come back online, and the hour would only stall
-///   the group's joins and exits.
+/// - `REGENESIS_FAST_WAIT`, none, when every entry of the set is a
+///   connection entry (`connection_only`): the Regenesis comes at once, dated
+///   at or after its parent's `time`. Such an entry dies with its connection:
+///   after the sole browser keyholder's reload, or any relay restart, none can
+///   ever come back online, the hour would only stall the group's joins and
+///   exits, and any wait at all loses a newcomer what is written meanwhile
+///   (J10-B: it is never seated in that epoch).
 /// - `REGENESIS_WAIT`, the hour, for a set with any other entry: a desktop's
 ///   pair (0x03) comes back with its device, so its set is not replaced
 ///   within the hour.
@@ -681,8 +686,8 @@ pub fn connection_only(set: &[Keyholder]) -> bool {
 ///
 /// What it reads is all in the signed headers, so every member checks it
 /// itself. A relay can still drop every connection of such a set and have a
-/// volunteer start anew after 2 minutes: a new seed and keyring, no read and
-/// no forge.
+/// volunteer start anew at once: a new seed and keyring, no read and no
+/// forge, and then the churn bound's hour.
 pub fn regenesis_wait(set: &HeaderV1, time: u64) -> u64 {
     let churn = set.kind == Kind::Regenesis && time < set.time.saturating_add(REGENESIS_FAST_GAP);
     if connection_only(&set.keyholders) && !churn {
@@ -728,12 +733,14 @@ impl<'a> SetSeen<'a> {
     }
 }
 
-/// What a member says of a Regenesis that came before `wait` was out.
+/// What a member says of a Regenesis that came before `wait` was out. The
+/// waits are the hour and none (`REGENESIS_FAST_WAIT`): under none, it is one
+/// dated before its parent.
 fn too_soon(wait: u64) -> Refusal {
     Refusal::Generation(if wait >= REGENESIS_WAIT {
         "a Regenesis comes an hour after its parent"
     } else {
-        "a Regenesis comes two minutes after its parent"
+        "a Regenesis is earlier than its parent"
     })
 }
 
@@ -1052,8 +1059,8 @@ pub fn check_regenesis(
 
 /// `check_regenesis` under the set in force, `set`: the keyholder header
 /// `regen.kh_parent` names, which a member holds beside its floor (§5.7). The
-/// Regenesis waits what `regenesis_wait` says of that set: 2 minutes for one
-/// of connection entries alone, else the hour.
+/// Regenesis waits what `regenesis_wait` says of that set: nothing for one of
+/// connection entries alone (at or after its parent's `time`), else the hour.
 pub fn check_regenesis_under(
     floor: Option<&Floor>,
     clock: Clock,
@@ -1110,6 +1117,14 @@ pub const SEED_MAX_AGE: u64 = 30 * 24 * 60 * 60;
 /// (`check_roll`). Members need neither: they check the structure alone
 /// (`check_link`).
 ///
+/// Keyholders carry them in the keyring (`KeyringBase::rolls`, sealed under
+/// `KRK` and bound by the head's `keyring_hash`), so a keyholder that takes
+/// its keyring fresh (a new connection, a promotion) counts from the true
+/// raise and removal, never from the head it took: no relay can restart a
+/// roll's 24 h or a seed's 30 days, or drop a removal, by ending connections
+/// (RV review of the Q2 fix, 2026-11-22). A keyholder that held the parent's
+/// keyring takes only what it counted itself (`SeedRolls::carried`).
+///
 /// A generation's start counts as the start of its first seed's roll: for
 /// the 30-day age, as §5.6 says ("for seed 1, the Genesis"), and for the
 /// one-a-day slot too, which §5.6 counts "from the last roll start" without
@@ -1136,9 +1151,18 @@ impl SeedRolls {
     /// due: two removals while a roll is due share it. A removal after a
     /// raise, even while that roll still runs, makes the next one due.
     pub fn after(self, p: &HeaderV1, h: &HeaderV1) -> SeedRolls {
-        if h.kind == Kind::Genesis || h.seed > p.seed {
-            SeedRolls::at_start(h)
-        } else if h.kind == Kind::KeyholdersRemove {
+        self.at(h.kind, h.seed > p.seed, h.time)
+    }
+
+    /// `after` for a header of `kind` at `time` that raises the seed (`rises`)
+    /// or not: what a builder seals into the keyring it makes for that header.
+    pub fn at(self, kind: Kind, rises: bool, time: u64) -> SeedRolls {
+        if kind == Kind::Genesis || rises {
+            SeedRolls {
+                raised: time,
+                removal: false,
+            }
+        } else if kind == Kind::KeyholdersRemove {
             SeedRolls {
                 removal: true,
                 ..self
@@ -1146,6 +1170,51 @@ impl SeedRolls {
         } else {
             self
         }
+    }
+
+    /// Whether a keyring at head `h` may carry these (`take_keyring`): a raise
+    /// no later than `h`; at a Genesis or a Regenesis, its own with no removal;
+    /// at a KeyholdersRemove, a removal unless `h` raised the seed itself.
+    pub fn fits(&self, h: &HeaderV1) -> bool {
+        self.raised <= h.time
+            && match h.kind {
+                k if k.starts_anew() => *self == SeedRolls::at_start(h),
+                Kind::KeyholdersRemove => self.removal || self.raised == h.time,
+                _ => true,
+            }
+    }
+
+    /// Whether `new`, the rolls a keyring at `h` carries, may be taken by a
+    /// keyholder that counted `self` at `own`, an earlier header of the same
+    /// generation whose keyring it held (§3.7, as `check_carried` for seeds):
+    /// at the same seed, the same raise, and a removal it counted kept; at
+    /// `h`'s parent, exactly what `after` gives, but that a removal the relay
+    /// said was due (`EpochDue.roll_due`) may have been sealed in early. A
+    /// raise since `own` is `h`'s or between them, so no later than `h` and no
+    /// earlier than `own`. So no keyring, a KeyholdersReplace from a pair the
+    /// others never saw included, puts off a roll this keyholder counted.
+    pub fn carried(self, own: &HeaderV1, own_d: &[u8; 32], new: SeedRolls, h: &HeaderV1) -> bool {
+        let removal_kept = new.removal || !self.removal;
+        if h.parent == *own_d {
+            let want = self.after(own, h);
+            return new.raised == want.raised && (new.removal || !want.removal);
+        }
+        if h.seed == own.seed {
+            new.raised == self.raised && removal_kept
+        } else {
+            new.raised >= own.time && new.raised <= h.time
+        }
+    }
+
+    /// §5.6 "24 h to finish" (RV q1-q2:1210): whether a text roll running at
+    /// `p` (`seed_floor < seed`, started at `raised`) ends at an opening commit
+    /// of `time`: at the first one at least `ROLL_GAP` after its start, whatever
+    /// the relay says of the seats. Not a voice room's: each removal there
+    /// rolls at once.
+    pub fn ends(&self, p: &HeaderV1, time: u64) -> bool {
+        p.group_kind == GroupKind::Text
+            && p.seed_floor < p.seed
+            && time >= self.raised.saturating_add(ROLL_GAP)
     }
 
     /// Whether a roll is due at `time`: a removal since the last raise, or,
@@ -1207,12 +1276,28 @@ pub enum RowSeed {
 /// `held` is the newest seed the seat was given a welcome under; `head` the
 /// header the rows are made for. At the commit that starts a roll, every seat
 /// still holds the old seed, which the new floor keeps, so its rows use it.
+///
+/// In a text group a seat may be behind the floor with no seed welcome in the
+/// commit: it was left behind by a roll that ended at its 24 h (`SeedRolls::ends`),
+/// or this commit ends one. Its row is then under the head's seed, and it opens
+/// that row once the relay's sweep brings its seed welcome (`behind_ok`).
 pub fn row_seed(held: u32, head: &HeaderV1) -> RowSeed {
     if (head.seed_floor..=head.seed).contains(&held) {
         RowSeed::Row(held)
     } else {
         RowSeed::WelcomeFirst(head.seed)
     }
+}
+
+/// §5.6: whether, in a commit over parent `p`, a seat holding seed `held` below
+/// the commit's floor may go without its seed welcome in that commit, its row under
+/// the commit's seed. In a text group: a seat already behind `p`'s floor (a roll
+/// ended at its 24 h before the seat had its welcome; at a start, `p`'s floor is its
+/// seed), or any seat behind a roll this commit ends at its 24 h (`ends`). Never in a
+/// voice room, and never for a seat that a roll finishing in time would drop: a
+/// commit finishes one in time only once every seat holds the seed.
+pub fn behind_ok(p: &HeaderV1, held: u32, ends: bool) -> bool {
+    p.group_kind == GroupKind::Text && (held < p.seed_floor || ends)
 }
 
 // ── §4.3: the versions each kind makes ────────────────────────────────────
@@ -1520,28 +1605,27 @@ fn check_entry(
     }
 }
 
-/// Whether an opening header after a list at `epoch`, at or before the head
-/// and in its generation, names `seat` in `removed`. The writer took each of
-/// `removals` as any header (rules 1–3); one that is not such a header here
-/// counts for nothing.
-fn removed_after(removals: &[SignedHeader], head: &HeaderV1, epoch: u32, seat: &SeatRef) -> bool {
-    removals.iter().map(SignedHeader::header).any(|r| {
-        r.gen == head.gen
-            && r.kind.opens_epoch()
-            && r.epoch > epoch
-            && r.epoch <= head.epoch
-            && matches!(&r.removed, Removed::List(l) if l.contains(seat))
-    })
+/// Whether an opening header's list after the list at `epoch` names `seat`
+/// in `removed`. `later` are the lists after that one in the fold, each of
+/// them stepped into the hash the head carries (its own `removed` list too),
+/// so only a removal on the head's own chain counts (RV q9-q10:211): one from
+/// another branch, or one the relay made up, steps no hash the head names.
+/// An opening is a list at `join` 0.
+fn removed_after(later: &[NamesList], epoch: u32, seat: &SeatRef) -> bool {
+    later
+        .iter()
+        .any(|r| r.join == 0 && r.epoch > epoch && r.removed.contains(seat))
 }
 
 /// Rule 4: a writer's fold, before each post in a gated group (and, in a
 /// gated voice room, every member's, as the Join headers come).
 ///
-/// `lists` are every `added` list between `from` and `head`, the head the
-/// writer posts under, in order, each with its own header's `time`, `epoch`
-/// and `join`, from the Join headers or the bare lists (`EpochNamesIn`).
-/// `removals` are the opening headers between that carry `removed` lists,
-/// which the relay sends after a failed fold.
+/// `lists` are every list between `from` and `head`, the head the writer
+/// posts under, in order, each with its own header's `time`, `epoch` and
+/// `join`, from the headers or the bare lists (`EpochNamesIn`): each Join's
+/// `added`, and each opening's that adds or removes a name, with its
+/// `removed`. An entry that fails is passed by a later opening's list on the
+/// chain that removes its seat.
 ///
 /// - `Err(Names)`: the lists do not fold from `from` to the head's
 ///   `names_hash`, or are out of order or past the head. A list left out,
@@ -1557,7 +1641,6 @@ fn removed_after(removals: &[SignedHeader], head: &HeaderV1, epoch: u32, seat: &
 pub fn fold_names(
     from: &NamesFrom,
     lists: &[NamesList],
-    removals: &[SignedHeader],
     head: &HeaderV1,
     known: &Known,
 ) -> Result<Fold, Refusal> {
@@ -1599,7 +1682,7 @@ pub fn fold_names(
     // empty; the hash binds its place, so no other list can stand in for it,
     // and no list at all leaves 0³², which no gated head carries.
     let from_start = matches!(from, NamesFrom::Start);
-    let steps = |i: usize, l: &NamesList| (from_start && i == 0) || !l.added.is_empty();
+    let steps = |i: usize, l: &NamesList| (from_start && i == 0) || l.steps();
     // The hash after each list: the chain must reach the head's, and each
     // value on the way is then the one its header carries.
     let mut acc = start;
@@ -1642,7 +1725,7 @@ pub fn fold_names(
                     shown.named.push(*a);
                     shown.unchecked.push(*a);
                 }
-                Entry::Failed(_) if removed_after(removals, head, l.epoch, &a.seat()) => {
+                Entry::Failed(_) if removed_after(&lists[i + 1..], l.epoch, &a.seat()) => {
                     shown.gone.push(a.seat());
                 }
                 Entry::Failed(why) => {

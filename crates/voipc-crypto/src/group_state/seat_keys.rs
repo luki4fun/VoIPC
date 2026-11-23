@@ -12,7 +12,7 @@ use crate::group_key::commit::Pair;
 use crate::group_key::{Endorsement, GroupKind, Me, MemberId, Origin, SeatKeys, SeatPair};
 
 /// An account's seat keys rotate at this age, and at sign-in once older (§5.11).
-pub(crate) const ROTATE_AFTER_SECS: u64 = 30 * 24 * 60 * 60;
+pub(crate) const ROTATE_AFTER_SECS: u64 = crate::group_key::timers::SEAT_KEYS_ROTATE_SECS;
 
 /// The connection's seat pair and its endorsement, once made.
 #[derive(Default)]
@@ -125,12 +125,69 @@ pub(crate) fn publish(
     }
 }
 
+/// Whether `held`, seat keys the relay says it holds for `account` (`SeatKeysBehind`), are
+/// a vault seat (0x01) of `account` that its `identity` endorsed: a relay alone cannot name a
+/// counter the account never published, and the app's would follow it to the top, where no
+/// rotation goes on (RV q8-q11).
+pub(crate) fn held_endorsed(
+    held: &gk::EndorsedPair,
+    identity: &IdentityKeyPair,
+    account: [u8; 16],
+) -> bool {
+    crate::group_key::wire::pair(held, gk::GkMember::Account(account)).is_ok_and(|p| {
+        p.endorsement.origin == Origin::VaultSeat
+            && p.endorsement.verify(identity.identity_key(), &p.keys)
+    })
+}
+
+/// Whether `held` are these keys, as `publish` sends them (a signature is new each time).
+pub(crate) fn held_is(held: &gk::EndorsedPair, keys: &SeatKeys) -> bool {
+    let public = keys.pair.public();
+    (held.n, held.made) == (keys.n, keys.made)
+        && held.kem[..] == public.kem_bytes()[..]
+        && held.dh[..] == public.dh_bytes()[..]
+}
+
 /// Whether seat keys made at `made` are due to rotate at `now` (unix seconds).
 pub(crate) fn due(keys: &SeatKeys, now: u64) -> bool {
     now >= keys.made.saturating_add(ROTATE_AFTER_SECS)
 }
 
+/// Keys made more than this past our clock count as dated ahead (`dated_ahead`). A day, so
+/// clocks a little apart do not rotate each other's keys.
+const MADE_AHEAD_SECS: u64 = 24 * 60 * 60;
+
+/// Whether seat keys were made more than a day past `now` (unix seconds; `AccountSync` reads
+/// it at the later of this device's clock and the relay's): a rotation on a clock far ahead,
+/// or keys a holder of the account's identity key dated so. `due` alone would stop every
+/// device's 30-day rotation until then (RV q8-q11), so they rotate at a sign-in
+/// (`AccountSync::gk_on`), and only there.
+pub(crate) fn dated_ahead(keys: &SeatKeys, now: u64) -> bool {
+    keys.made > now.saturating_add(MADE_AHEAD_SECS)
+}
+
 /// A copy of seat keys (they hold private keys, so they are no `Clone`).
 pub(crate) fn copy(keys: &SeatKeys) -> SeatKeys {
     SeatKeys::from_bytes(&keys.to_bytes()).expect("seat keys encode and decode")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RV q8-q11 (257): `due` reads only `made + 30 days`, so keys dated a year ahead (a fast
+    /// clock at a rotation, or a holder of the account's identity key) stopped every device's
+    /// 30-day rotation for that year. Keys dated more than a day ahead are `dated_ahead`, and
+    /// rotate at a sign-in; a clock a little ahead is not.
+    #[test]
+    fn seat_keys_dated_ahead_rotate_at_a_sign_in() {
+        let now = 1_700_000_000;
+        let day = 24 * 60 * 60;
+        let ahead = SeatKeys::generate(1, now + 365 * day);
+        assert!(!due(&ahead, now + 31 * day) && dated_ahead(&ahead, now + 31 * day));
+        let soon = SeatKeys::generate(1, now + 60 * 60);
+        assert!(!due(&soon, now) && !dated_ahead(&soon, now));
+        assert!(!due(&SeatKeys::generate(1, now - 29 * day), now));
+        assert!(due(&SeatKeys::generate(1, now - 30 * day), now));
+    }
 }

@@ -12,6 +12,8 @@ use crate::{envelope, MediaKey};
 use voipc_protocol::types::VaultBlob;
 
 const RELAY: [u8; 16] = [0x5a; 16];
+/// The X25519 key the fuzzed relay holds for every seat, which its list digests bind.
+const SEAT_DH: [u8; 33] = [5; 33];
 
 /// What a channel member sends inside a Signal message: chat envelopes,
 /// history payloads (JSON) and media keys.
@@ -121,7 +123,8 @@ pub fn fuzz_pair(data: &[u8]) {
         rest = b;
         a
     };
-    let (commitment, ephemeral, blind, nonce) = (take(32), take(33), take(32), take(32));
+    let (commitment, ephemeral, blind, nonce) =
+        (take(32), take(pair::EPHEMERAL_LEN), take(32), take(32));
     let wrapped = rest;
     let _ = pair::code(commitment, nonce, ephemeral);
     let _ = pair::reveal_ok(commitment, ephemeral, blind);
@@ -158,7 +161,7 @@ pub fn fuzz_group(data: &[u8]) {
         /// The keyholder header the keyring's head names.
         genesis: SignedHeader,
         /// The same Genesis with its one entry a connection's pair (0x02): a Regenesis over
-        /// it may come 2 minutes on ("Fast new start").
+        /// it may come at once ("Fast new start").
         conn_genesis: SignedHeader,
     }
     static FIXED: OnceLock<Fixed> = OnceLock::new();
@@ -362,9 +365,8 @@ pub fn fuzz_group(data: &[u8]) {
             own: Some([1; 16]),
             now: u64::MAX,
         };
-        let lists = [NamesList::of(h.header())];
-        let removals = std::slice::from_ref(&h);
-        let _ = fold_names(&NamesFrom::Start, &lists, removals, h.header(), &known);
+        let lists = [NamesList::of(h.header()), NamesList::of(h.header())];
+        let _ = fold_names(&NamesFrom::Start, &lists, h.header(), &known);
         let names_floor = NamesFloor::of(h.header());
         let step = lists[0].step_from(&[0; 32]);
         for from in [
@@ -374,7 +376,7 @@ pub fn fuzz_group(data: &[u8]) {
                 step,
             },
         ] {
-            let _ = fold_names(&from, &lists, removals, h.header(), &known);
+            let _ = fold_names(&from, &lists, h.header(), &known);
         }
         let _ = take_keyring(g, &h, &h, &key, body, &[]);
     }
@@ -614,7 +616,8 @@ impl<'a> FuzzGroup<'a> {
             v: 1,
             pool: Pool::Accounts,
             seats: 1,
-            list: list_digest(&g, Version { b: 1, v: 1 }, &seats),
+            list: list_digest(&g, Version { b: 1, v: 1 }, &seats, |_| Some(SEAT_DH))
+                .expect("every seat has a key"),
             via: Via::Row,
         };
         FuzzGroup {
@@ -638,6 +641,7 @@ impl<'a> FuzzGroup<'a> {
                 kh: self.genesis,
             }),
             leaves: &self.leaves,
+            dh: &|_| Some(SEAT_DH),
             held: &|_| Some(1),
             due: &self.due,
             by: self.by,
@@ -722,7 +726,7 @@ impl<'a> FuzzGroup<'a> {
                 v: vo.v,
                 pool: vo.pool,
                 seats: u16::try_from(seats.len()).unwrap_or(u16::MAX),
-                list: list_digest(&g, at, &seats),
+                list: list_digest(&g, at, &seats, |_| Some(SEAT_DH)).unwrap_or_default(),
                 via,
             });
         }
@@ -1004,8 +1008,9 @@ mod tests {
             seed_floor: 2,
             ..p.clone()
         };
+        // At its parent's time: the fast new start waits nothing (J10-B, owner 2026-11-22)
         let fast = HeaderV1 {
-            time: 1 + 2 * 60,
+            time: 1,
             ..regen.clone()
         };
         for (kind, h, rule) in [
@@ -1026,7 +1031,7 @@ mod tests {
             let got = validate(&view, &fg.resigned(&c).unwrap()).err();
             assert_eq!(got.as_ref().map(|b| b.rule), rule, "{kind:?}: {got:?}");
         }
-        // "Fast new start": a Regenesis 2 minutes after a Genesis whose one entry is a
+        // "Fast new start": a Regenesis at once after a Genesis whose one entry is a
         // connection's pair runs to the last rule too; after the desktop's, rule 4 stops it.
         let conn = SignedHeader::sign(conn_genesis(&ik, &holder), &ik).unwrap();
         for (set, rule) in [(&conn, Some(14)), (&genesis, Some(4))] {
