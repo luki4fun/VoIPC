@@ -426,7 +426,7 @@ start_page alice talker "&channel=e2e&textchannel=e2e-text&dm=bob&admin=e2e-admi
 # invite link" passes on a channel he created himself).
 # alice logs early-chat-sent once her message is in her own history, and only after her text
 # channel and its first line (made after it, on her hidden page, they once took 18 s; and her
-# schedule then runs from 6 s after bob is seated, so a late bob meets all of it: selftest.ts). With
+# schedule then runs from 4 s after bob is seated, so a late bob meets all of it: selftest.ts). With
 # UDP blocked she gives up on QUIC first, which took a cold runner over 30 s.
 for _ in $(seq 1 900); do
   if grep -q 'SELFTEST early-chat-sent' "$WORK/alice.log"; then break; fi
@@ -447,7 +447,7 @@ if [ "$GK" = 1 ] && [ "$BROWSER_ALICE" = chromium ] && [ "${EXPECT_LADDER:-}" !=
   grep -qa 'SELFTEST page-visibility.*hidden' "$WORK/alice.log" ||
     echo "warning: alice's page never said it was hidden — bob starts anyway"
 fi
-start_page bob listener "&textchannel=e2e-text&dm=alice&expect_kick=1&watch=1$SHARE_PARAMS&pos=-3,0,0$(via "$TRANSPORT_BOB")#channel=e2e" \
+start_page bob listener "&textchannel=e2e-text&dm=alice&expect_kick=1$([ "$FILE_KIB" != 0 ] && printf '&expect_file=1')&watch=1$SHARE_PARAMS&pos=-3,0,0$(via "$TRANSPORT_BOB")#channel=e2e" \
   "$WORK/bob.log" "$BROWSER_BOB"
 
 deadline=$(( $(date +%s) + DURATION / 1000 + 30 ))

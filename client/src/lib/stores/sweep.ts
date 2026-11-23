@@ -26,8 +26,11 @@ const PAGES_MOST = 256;
 const WAITING_MOST = 64;
 
 interface Run {
-  /** Channels to ask, the current one first. */
+  /** Which run it is: an asker knows which one is theirs. */
+  no: number;
+  /** Channels to ask, the current one first, and those whose list it has had. */
   queue: number[];
+  done: number[];
   /** Pages so far of the current one, and who was gone since it began. */
   people: UserInfo[];
   gone: Set<number>;
@@ -42,6 +45,14 @@ interface Run {
   stuck: ReturnType<typeof setTimeout>;
 }
 
+/** A hand-off that waits to see whether its asker is on a list. */
+interface Waiter {
+  at: number;
+  retry: () => void;
+  /** The run after which they are looked at: a sweep out when they asked, else the next. */
+  run: number;
+}
+
 interface Sweeps {
   /** The first `TextJoined` came: the schedule runs. */
   started: boolean;
@@ -49,10 +60,11 @@ interface Sweeps {
   lastAt: number;
   lastBytes: number;
   run: Run | null;
+  /** Runs begun so far: one under way is the last. */
+  runs: number;
   /** Quiet channels are not swept: opening one tells the relay anyway. */
   quiet: ReadonlySet<number>;
-  /** Hand-offs that wait to see whether their asker is on the next list. */
-  waiting: { at: number; retry: () => void }[];
+  waiting: Waiter[];
   /** Text channels this person made, until their join: their list is asked then. */
   made: Set<number>;
 }
@@ -61,7 +73,7 @@ const sweeps = new Map<string, Sweeps>();
 
 function stateOf(server: string): Sweeps {
   let s = sweeps.get(server);
-  if (!s) sweeps.set(server, (s = { started: false, timer: null, lastAt: 0, lastBytes: 0, run: null, quiet: new Set(), waiting: [], made: new Set() }));
+  if (!s) sweeps.set(server, (s = { started: false, timer: null, lastAt: 0, lastBytes: 0, run: null, runs: 0, quiet: new Set(), waiting: [], made: new Set() }));
   return s;
 }
 
@@ -74,7 +86,7 @@ function toSweep(server: string, s: Sweeps): number[] {
 }
 
 function ask(server: string, channelId: number, after: number): void {
-  invoke("request_channel_page", { server, channelId, after }).catch(() => finishRun(server));
+  invoke("request_channel_page", { server, channelId, after }).catch(() => finishRun(server, true));
 }
 
 function arm(server: string, s: Sweeps, ms: number): void {
@@ -88,18 +100,25 @@ function startRun(server: string, queue: number[], scheduled: boolean): void {
     clearTimeout(s.timer);
     s.timer = null;
   }
-  if (s.run) {
+  const run = s.run;
+  if (run) {
     // Inside what is under way, next after the page it waits for
-    s.run.queue.splice(1, 0, ...queue.filter((id) => !s.run!.queue.includes(id)));
-    s.run.scheduled ||= scheduled;
+    run.queue.splice(1, 0, ...queue.filter((id) => !run.queue.includes(id)));
+    // A Refresh someone asked during becomes this sweep, which nothing follows at once: what it
+    // asked may be from before them, so it is asked again at the end
+    if (scheduled && !run.scheduled && s.waiting.some((w) => w.run > run.no)) {
+      const again = [...run.done, run.queue[0]];
+      run.queue.push(...again.filter((id, i) => again.indexOf(id) === i && !run.queue.includes(id, 1)));
+    }
+    run.scheduled ||= scheduled;
     return;
   }
-  s.run = { queue, people: [], gone: new Set(), pages: 0, after: 0, bytes: 0, scheduled, asked: queue.length > 0, stuck: setTimeout(() => finishRun(server), STUCK_MS) };
+  s.run = { no: ++s.runs, queue, done: [], people: [], gone: new Set(), pages: 0, after: 0, bytes: 0, scheduled, asked: queue.length > 0, stuck: setTimeout(() => finishRun(server, true), STUCK_MS) };
   if (queue.length === 0) finishRun(server);
   else ask(server, queue[0], 0);
 }
 
-function finishRun(server: string): void {
+function finishRun(server: string, gaveUp = false): void {
   const s = sweeps.get(server);
   const run = s?.run;
   if (!s || !run) return;
@@ -114,9 +133,15 @@ function finishRun(server: string): void {
     // nothing is no sweep, and ten minutes on would leave the next one's list empty that long
     arm(server, s, firstSweepDelay(Math.random()));
   }
-  const waiting = s.waiting;
-  s.waiting = [];
-  for (const w of waiting) if (Date.now() - w.at < WAIT_MS) w.retry();
+  const now = Date.now();
+  const waiting = s.waiting.filter((w) => now - w.at < WAIT_MS);
+  // A Refresh's page may have gone before an ask that came while it was out: who asked then waits
+  // for a sweep, which starts now. Never after a sweep, which costs the budget, nor after a run
+  // the relay left unanswered
+  const follow = !run.scheduled && !gaveUp;
+  s.waiting = follow ? waiting.filter((w) => w.run > run.no) : [];
+  for (const w of waiting) if (!follow || w.run <= run.no) w.retry();
+  if (s.waiting.length > 0) startRun(server, toSweep(server, s), true);
 }
 
 /** The first `TextJoined` of a connection: the sweeps start. */
@@ -147,15 +172,19 @@ export function joinedMade(server: string, ids: readonly number[]): void {
 
 /**
  * A stranger asks for a channel's chat. They may have just arrived, so the whole next sweep
- * moves up if its budget lets it, and never that one page, which would name the channel. If
- * it does not, or they are not on it, they get no answer.
+ * moves up if its budget lets it, and never that one page, which would name the channel. With
+ * a Refresh out, its page may have gone before their ask: that sweep starts once it is in. With
+ * a sweep out, that one is theirs, though a page it asked before them may not have them yet:
+ * one more at once would let a relay double what the budget lets it make us ask. If the budget
+ * holds it back, or they are not on it, no answer.
  */
 export function sweepForAsker(server: string, retry: () => void): void {
   const s = stateOf(server);
-  if (!s.run?.scheduled && !mayMoveUp(Date.now() - s.lastAt, s.lastBytes)) return;
+  const run = s.run;
+  if (!run?.scheduled && !mayMoveUp(Date.now() - s.lastAt, s.lastBytes)) return;
   if (s.waiting.length >= WAITING_MOST) s.waiting.shift();
-  s.waiting.push({ at: Date.now(), retry });
-  if (!s.run?.scheduled) startRun(server, toSweep(server, s), true);
+  s.waiting.push({ at: Date.now(), retry, run: run?.scheduled ? run.no : s.runs + 1 });
+  if (!run) startRun(server, toSweep(server, s), true);
 }
 
 /** A page came. False when no sweep asked it: the rest of a list too long for one frame. */
@@ -166,7 +195,7 @@ export function onSweepPage(
   const run = sweeps.get(server)?.run;
   if (!run || run.queue[0] !== page.channel_id) return false;
   clearTimeout(run.stuck);
-  run.stuck = setTimeout(() => finishRun(server), STUCK_MS);
+  run.stuck = setTimeout(() => finishRun(server, true), STUCK_MS);
   const online = onlineById(server);
   const known = get(channelRosters.peek(server)).get(page.channel_id) ?? [];
   const ids = page.ids ?? [];
@@ -191,7 +220,7 @@ export function onSweepPage(
     else next.delete(page.channel_id);
     return next;
   });
-  run.queue.shift();
+  run.done.push(run.queue.shift()!);
   run.people = [];
   run.gone = new Set();
   run.pages = 0;

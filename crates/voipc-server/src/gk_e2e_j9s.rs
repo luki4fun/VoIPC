@@ -275,7 +275,11 @@ impl World {
 /// 256 and 44 (`JOIN_BATCH_MAX`), each built one unit of work a step: a step for each seat's
 /// agreement and row, one for its welcome, one for each seal. The relay takes each commit,
 /// every guest holds the epoch key, and a post opens for another guest.
-#[tokio::test]
+///
+/// On tokio's paused clock, so the relay's 5 s Join deadline counts the test's own time, not
+/// how fast a machine builds 256 seats: a debug build takes 5.7 s of one core here, and beside
+/// two CPU-heavy tests on CI it lost that race (run 45269717018, stales [4, 2, 2]).
+#[tokio::test(start_paused = true)]
 async fn e2e_j9s_a_keyholder_stepping_at_a_zero_budget_seats_300_guests_and_they_read() {
     let mut w = World {
         relay: Relay::new(),

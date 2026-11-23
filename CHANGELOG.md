@@ -248,6 +248,11 @@ No outside cryptographer has reviewed it.
   two pieces with anything else in between, and read the rest as garbage. Relay and app now build with a fork of it
   carrying the fix (upstream issue #331), until upstream releases one. With the relay held to 2 cores and 1000 clients:
   8 connects failed in 5 runs before, none in 11 after.
+- **A request for a channel's history could go unanswered** when it reached an app while its Refresh of that channel's
+  member list was under way (one also runs when you join a channel, so two people joining together hit it): the list
+  could be from before the asker joined, and the Refresh then counted as the sweep, so no new one came for minutes. The
+  app now looks again only at a list asked after the request: a whole sweep follows the Refresh, within the sweep's
+  usual budget.
 
 ### Known
 - Watching through an edge was tested in Chromium (the `EDGE=1` lane of test-web.sh, in CI). Firefox, the desktop

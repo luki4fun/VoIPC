@@ -437,6 +437,97 @@ test("the sweep's budget holds it back, and then there is no answer", () => {
   clearSweeps(s);
 });
 
+test("an asker who comes while a Refresh is out is looked at after a whole sweep asked after them", () => {
+  const s = server();
+  swept(s);
+  startSweeps(s, 0.9);
+  // The page of 2 went out before they joined it, and comes back without them
+  refreshList(s, 2);
+  const seen: boolean[] = [];
+  sweepForAsker(s, () => seen.push(get(channelRosters.peek(s)).get(2)!.some((u) => u.user_id === 9)));
+  onSweepPage(s, { channel_id: 2, rows: [person(1)], next: 0 });
+  assert.deepEqual(seen, [], "not on a page asked before them");
+  // Then the whole sweep, from its first channel: never that one page alone
+  assert.deepEqual(asked("request_channel_page").map((a) => a.channelId), [2, 2]);
+  onSweepPage(s, { channel_id: 2, rows: [person(1), person(9)], next: 0 });
+  onSweepPage(s, { channel_id: 3, rows: [], next: 0 });
+  assert.deepEqual(seen, []);
+  onSweepPage(s, { channel_id: 4, rows: [], next: 0 });
+  assert.deepEqual(seen, [true]);
+  clearSweeps(s);
+});
+
+test("an asker during a sweep is looked at when it is in, and no sweep follows it at once", () => {
+  const s = server();
+  swept(s);
+  startSweeps(s, 0);
+  mock.timers.tick(1);
+  let retried = 0;
+  onSweepPage(s, { channel_id: 2, rows: [], next: 0 });
+  sweepForAsker(s, () => retried++);
+  onSweepPage(s, { channel_id: 3, rows: [], next: 0 });
+  assert.equal(retried, 0);
+  onSweepPage(s, { channel_id: 4, rows: [], next: 0 });
+  assert.equal(retried, 1);
+  // One more at once would let a relay double what the budget lets it make us ask
+  assert.equal(asked("request_channel_page").length, 3);
+  invoked().length = 0;
+  mock.timers.tick(599_000);
+  assert.equal(asked("request_channel_page").length, 0, "the next is ten minutes on");
+  mock.timers.tick(1000);
+  assert.equal(asked("request_channel_page").length, 1);
+  clearSweeps(s);
+});
+
+test("a Refresh a sweep came due in is that sweep: what it asked before an asker is asked again at its end", () => {
+  const s = server();
+  swept(s);
+  startSweeps(s, 0.4);
+  refreshList(s, 3);
+  const seen: boolean[] = [];
+  sweepForAsker(s, () => seen.push(get(channelRosters.peek(s)).get(3)!.some((u) => u.user_id === 9)));
+  mock.timers.tick(24_000);
+  onSweepPage(s, { channel_id: 3, rows: [], next: 0 });
+  onSweepPage(s, { channel_id: 2, rows: [], next: 0 });
+  onSweepPage(s, { channel_id: 4, rows: [], next: 0 });
+  assert.deepEqual(seen, [], "3 went before them");
+  onSweepPage(s, { channel_id: 3, rows: [person(9)], next: 0 });
+  assert.deepEqual(seen, [true]);
+  // Inside the sweep it became, and nothing follows it at once
+  assert.deepEqual(asked("request_channel_page").map((a) => a.channelId), [3, 2, 4, 3]);
+  clearSweeps(s);
+});
+
+test("a Refresh the relay leaves unanswered is followed by no sweep", () => {
+  const s = server();
+  swept(s);
+  startSweeps(s, 0.9);
+  refreshList(s, 2);
+  mock.timers.tick(1000);
+  let retried = 0;
+  sweepForAsker(s, () => retried++);
+  mock.timers.tick(29_000);
+  assert.equal(retried, 1, "looked at, as before");
+  assert.equal(asked("request_channel_page").length, 1);
+  clearSweeps(s);
+});
+
+test("a Refresh whose ask fails is followed by no sweep", async () => {
+  const s = server();
+  swept(s);
+  startSweeps(s, 0.9);
+  (globalThis as any).__answer = (command: string) => {
+    if (command === "request_channel_page") throw new Error("connection gone");
+  };
+  refreshList(s, 2);
+  let retried = 0;
+  sweepForAsker(s, () => retried++);
+  await new Promise((done) => setImmediate(done));
+  assert.equal(retried, 1, "looked at, as before");
+  assert.equal(asked("request_channel_page").length, 1);
+  clearSweeps(s);
+});
+
 test("a person's Refresh asks that channel alone and keeps the schedule", () => {
   const s = server();
   swept(s);

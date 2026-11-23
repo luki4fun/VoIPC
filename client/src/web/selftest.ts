@@ -19,6 +19,7 @@
 //   admin=<token>        wrap-up: log in as admin and kick the user in `kick`
 //   kick=<username>      the user the admin kicks
 //   expect_kick=1        wrap-up: wait (up to 10 s) to be kicked
+//   expect_file=1        wrap-up: wait (up to 20 s) for the talker's file offer and fetch it
 //   share=1              share a screen (a synthetic canvas stands in for the
 //                        display, so headless browsers need no real capture)
 //   watch=1              watch the first peer that starts sharing
@@ -96,8 +97,10 @@ function log(line: string, data?: unknown) {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-/** How long after the listener is seated the talker's schedule starts (see its loop). */
-const TALKER_LAG_MS = 6000;
+/** How long after the listener is seated the talker's schedule starts (see its loop): with this
+ *  loop's tick, 4.3-4.5 s, where every lane ran before the clock (3.6-5.8 s, soak 45226171956).
+ *  6 s put her file offer within 0.4 s of the end of his 15 s, and once past it (soak 45269825608). */
+const TALKER_LAG_MS = 4000;
 
 async function sha256(bytes: Uint8Array): Promise<string> {
   const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes as Uint8Array<ArrayBuffer>));
@@ -124,6 +127,7 @@ export async function run(params: URLSearchParams): Promise<void> {
   const ownPosition = params.get("pos");
   const spatialTest = params.get("spatialtest") as "2d" | "3d" | null;
   const fileKib = Number(params.get("file") ?? 0);
+  const expectFile = params.has("expect_file");
   const talkMs = Number(params.get("talk_ms") ?? 4000);
   // The server id every server-scoped command names: the address we connect with
   const server = window.location.host;
@@ -584,11 +588,13 @@ export async function run(params: URLSearchParams): Promise<void> {
 
     // The talker's schedule (share at 3 s, chat at 4, talk at 5, the end at
     // `duration`) runs from TALKER_LAG_MS after the listener took his seat, so
-    // by then he holds the room's key and has joined the text channel (his own
-    // 6 s), however late his browser came up. Every lane was tuned on that
-    // shape, when the text channel's 6 s creation sat between his start and
-    // her loop; once that moved before it, a late bob (the lossy lane 3-8 s,
-    // the capped one 10-14 s) would have met a talker already half done.
+    // by then he holds the room's key and has joined the text channel, however
+    // late his browser came up. Every lane was tuned on that shape, when the
+    // text channel's 6 s creation sat between his start and her loop; once
+    // that moved before it, a late bob (the lossy lane 3-8 s, the capped one
+    // 10-14 s) would have met a talker already half done. His own main phase
+    // still ends `duration` after his start, so the lag is what her share,
+    // talk and file have of it.
     // The seat's time comes from the event, not this loop's tick, which a
     // hidden page's timers stretch.
     if (role === "talker" && !clockSet && peers.length > 0) {
@@ -724,6 +730,9 @@ export async function run(params: URLSearchParams): Promise<void> {
     await invoke("stop_spatial_test").catch(() => {});
   }
 
+  // The talker's file may still be on its way when this side's main phase ends: wait for its
+  // offer, then for the fetch, rather than have the wrap-up's kick cut it (soak 45269825608)
+  if (expectFile) for (let i = 0; i < 200 && !fileTransfer; i++) await sleep(100);
   if (fileTransfer) await Promise.race([fileTransfer, sleep(60_000)]);
   if (fileWindow) {
     const [from, to] = fileWindow;
