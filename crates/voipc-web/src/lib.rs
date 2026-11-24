@@ -381,10 +381,11 @@ impl SignalClient {
         self.core.keying.live_set_quiet(&channels, quiet);
     }
 
-    /// Takes over what an earlier connection of this account kept.
+    /// Takes over what an earlier connection of this account kept: its sessions, and what it
+    /// read.
     #[wasm_bindgen(js_name = liveAdoptKept)]
     pub fn live_adopt_kept(&mut self, kept: KeptSessions) {
-        self.core.keying.live_adopt_kept(kept.inner);
+        self.core.live_adopt_kept(kept.inner);
     }
 
     /// The pages of pins are out: no key job until `livePinsIn`.
@@ -771,8 +772,8 @@ fn gk_out(out: gk::Out) -> Result<JsValue, JsError> {
     ]))
 }
 
-/// Sessions with accounts, between one connection of an account to a server and its next.
-/// They stay in this page's memory (`voipc_crypto::KeptSessions`).
+/// Sessions with accounts, between one connection of an account to a server and its next,
+/// and what was read on it. They stay in this page's memory (`voipc_crypto::KeptSessions`).
 #[wasm_bindgen]
 pub struct KeptSessions {
     inner: voipc_crypto::KeptSessions,

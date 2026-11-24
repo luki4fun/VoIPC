@@ -2755,3 +2755,160 @@ fn a_made_up_list_at_a_joins_place_holds_the_fold_only_until_an_honest_answer() 
     let out = d.frame(&names_answer(&[&j]), w.now);
     assert_eq!(posted(&out).len(), 1, "{:?}", out.events);
 }
+
+// ── What was read stays read (review 5) ──
+
+/// A relay that refuses a writer's post `RATE` makes it go again on a new chain, the same
+/// envelope, which opens (a reader drops a repeated envelope). Five such chains read, and
+/// libsignal holds the first no more: replayed with its blob, the post that started it
+/// installs it afresh at its first position, and would open again. What was read stays read,
+/// by the key the chain signs with, and the writer's next post still opens.
+#[test]
+fn a_post_read_once_stays_read_when_the_relay_forces_new_chains() {
+    let mut w = World::text(false, false);
+    let mut a = seated_guest(&mut w, 20);
+    let mut b = seated_guest(&mut w, 21);
+    a.take(push(&w), w.now);
+    let t = w.now * 1000;
+    let (blob, ct, epoch) = posted(&a.post(1, b"one", t))[0].clone();
+    assert!(blob.is_some());
+    let first = post_in(&w, &a, blob, ct, epoch);
+    assert_eq!(b.frame(&first, w.now).posts.len(), 1);
+    for i in 1..=5u64 {
+        a.frame(
+            &refused(gk::refused_what::POST, gk::refused_why::RATE),
+            w.now,
+        );
+        let again = posted(&a.tick(t + i * 1_000));
+        assert_eq!(again.len(), 1);
+        let (blob, ct, epoch) = again[0].clone();
+        assert!(blob.is_some(), "a new chain");
+        let got = b.frame(&post_in(&w, &a, blob, ct, epoch), w.now);
+        assert_eq!(got.posts.len(), 1, "the same envelope on a new chain opens");
+        assert_eq!(got.posts[0].envelope, b"one");
+    }
+    assert!(
+        b.frame(&first, w.now).posts.is_empty(),
+        "a post read once opened again"
+    );
+    let (blob, ct, epoch) = posted(&a.post(2, b"two", t + 9_000))[0].clone();
+    assert!(blob.is_none(), "the chain goes on");
+    let got = b.frame(&post_in(&w, &a, blob, ct, epoch), w.now);
+    assert_eq!(got.posts.len(), 1);
+    assert_eq!(got.posts[0].envelope, b"two");
+}
+
+/// The same once the store let the record go, as `evict` lets one go past its limit: the
+/// post that started the chain, replayed with its blob, installs it afresh and would open
+/// again. A new chain after it still opens.
+#[test]
+fn a_post_read_once_stays_read_when_the_store_let_its_record_go() {
+    let mut w = World::text(false, false);
+    let mut a = seated_guest(&mut w, 20);
+    let mut b = seated_guest(&mut w, 21);
+    a.take(push(&w), w.now);
+    let t = w.now * 1000;
+    let (blob, ct, epoch) = posted(&a.post(1, b"one", t))[0].clone();
+    let first = post_in(&w, &a, blob, ct, epoch);
+    assert_eq!(b.frame(&first, w.now).posts.len(), 1);
+    b.st.sender_key.keys.clear();
+    assert!(
+        b.frame(&first, w.now).posts.is_empty(),
+        "a post read once opened again after its record went"
+    );
+    a.frame(
+        &refused(gk::refused_what::POST, gk::refused_why::RATE),
+        w.now,
+    );
+    let again = posted(&a.tick(t + 1_000));
+    assert_eq!(again.len(), 1, "one again, on a new chain");
+    let (blob, ct, epoch) = again[0].clone();
+    let got = b.frame(&post_in(&w, &a, blob, ct, epoch), w.now);
+    assert_eq!(got.posts.len(), 1);
+    assert_eq!(got.posts[0].envelope, b"one");
+}
+
+/// A member who opens a writer's blob, as every member can, seals the writer's key message in
+/// its own blob and sends the writer's post first, as its own: the reader shows it as the
+/// member's, as it did before 1.14, and the writer's own copy still opens, once (review 6).
+/// What was read is kept by chain and by the writer the blob binds (`Signer::under`).
+#[test]
+fn a_chain_passed_off_by_another_member_leaves_the_writers_post_unread() {
+    use crate::group_key::{open_writer_blob, writer_blob, Epoch, Group, MemberId, Writer};
+    let mut w = World::text(false, false);
+    let mut a = seated_guest(&mut w, 20);
+    let mut b = seated_guest(&mut w, 21);
+    let c = seated_guest(&mut w, 22);
+    a.take(push(&w), w.now);
+    let t = w.now * 1000;
+    let (blob, ct, epoch) = posted(&a.post(1, b"one", t))[0].clone();
+    let blob = blob.expect("a new chain");
+    let e = c.keying.current_epoch(TEXT_ID).expect("seated");
+    assert_eq!(e.epoch, epoch);
+    let g = Group::new(GroupKind::Text, TEXT_ID, e.gen).unwrap();
+    let ep = Epoch {
+        e: e.epoch,
+        d_e: e.d_e,
+    };
+    let as_a = Writer {
+        m: MemberId::Conn(20),
+        u: 20,
+    };
+    let as_c = Writer {
+        m: MemberId::Conn(22),
+        u: 22,
+    };
+    let opened = open_writer_blob(&g, &ep, &as_a, &e.ck, &blob).unwrap();
+    let passed_off = writer_blob(&g, &ep, &as_c, &e.ck, &c.ik, &opened.skdm).unwrap();
+    let got = b.frame(&post_in(&w, &c, Some(passed_off), ct.clone(), epoch), w.now);
+    assert_eq!(got.posts.len(), 1, "as the member's");
+    let own = post_in(&w, &a, Some(blob), ct, epoch);
+    let got = b.frame(&own, w.now);
+    assert_eq!(
+        got.posts.len(),
+        1,
+        "the writer's own copy, after the member's"
+    );
+    assert_eq!(got.posts[0].envelope, b"one");
+    assert!(b.frame(&own, w.now).posts.is_empty(), "and once only");
+}
+
+/// A reader on new stores, with what it read taken over, as both apps hand it over at a
+/// reconnect (`KeptSessions`): the chain it read goes on opening from its blob, past what was
+/// read; the same envelopes on a new chain open; only the post read before is refused.
+#[test]
+fn a_reader_on_new_stores_with_what_it_read_reads_on() {
+    let mut w = World::text(false, false);
+    let mut a = seated_guest(&mut w, 20);
+    let mut b = seated_guest(&mut w, 21);
+    a.take(push(&w), w.now);
+    let t = w.now * 1000;
+    let (blob, ct, epoch) = posted(&a.post(1, b"one", t))[0].clone();
+    let first = post_in(&w, &a, blob.clone(), ct, epoch);
+    assert_eq!(b.frame(&first, w.now).posts.len(), 1);
+    let kept = b.st.sender_key.kept_reads();
+    b.st = SignalStores::new(&b.ik, b.u);
+    b.st.sender_key.adopt_reads(kept);
+    // The chain goes on; its blob comes as an honest relay answers the ask for it
+    let (none, ct, epoch) = posted(&a.post(2, b"two", t + 1))[0].clone();
+    assert!(none.is_none(), "the same chain");
+    let got = b.frame(&post_in(&w, &a, blob, ct, epoch), w.now);
+    let opened: Vec<Vec<u8>> = got.posts.into_iter().map(|p| p.envelope).collect();
+    assert_eq!(opened, vec![b"two".to_vec()]);
+    assert!(
+        b.frame(&first, w.now).posts.is_empty(),
+        "read on the last stores"
+    );
+    a.frame(
+        &refused(gk::refused_what::POST, gk::refused_why::RATE),
+        w.now,
+    );
+    let again = posted(&a.tick(t + 1_000));
+    assert_eq!(again.len(), 2);
+    let opened: Vec<Vec<u8>> = again
+        .into_iter()
+        .flat_map(|(blob, ct, epoch)| b.frame(&post_in(&w, &a, blob, ct, epoch), w.now).posts)
+        .map(|p| p.envelope)
+        .collect();
+    assert_eq!(opened, vec![b"one".to_vec(), b"two".to_vec()]);
+}

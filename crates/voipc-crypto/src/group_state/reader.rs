@@ -2,13 +2,13 @@
 //! waits, at most 256 a group for 60 s, and the keys are fetched), its writer's blob (attached,
 //! or asked with `EpochBlobWanted`), `IK_w` against the pin of the account it names or, for a
 //! connection writer, the key that connection first signed with, the sender key installed,
-//! and the post's prefix.
+//! and the post's prefix. A post read once never opens again (`group::open_once`).
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 
 use libsignal_protocol::{
-    group_decrypt, process_sender_key_distribution_message, DeviceId, ProtocolAddress,
+    process_sender_key_distribution_message, DeviceId, ProtocolAddress,
     SenderKeyDistributionMessage, SenderKeyMessage,
 };
 use voipc_protocol::gk;
@@ -254,31 +254,32 @@ fn open(
         }
     }
     let id = dist(&g, &ep);
-    match SenderKeyMessage::try_from(&ciphertext[..]) {
-        Ok(s) if s.distribution_id() == id => {}
+    let message = match SenderKeyMessage::try_from(&ciphertext[..]) {
+        Ok(s) if s.distribution_id() == id => s,
         _ => return Err(None),
-    }
+    };
     let addr = address(&w);
-    let plain =
-        match ready(async { Ok(group_decrypt(ciphertext, &mut st.sender_key, &addr).await?) }) {
-            Ok(p) => p,
-            Err(e) if crate::group::lacks_key(&e) => {
-                if let Entry::Vacant(e) = m.reader.asked.entry((*gen, *epoch, w.m, w.u)) {
-                    e.insert(c.now);
-                    out.send.push(ClientMessage::EpochBlobWanted {
-                        group: m.t.group.clone(),
-                        gen: *gen,
-                        epoch: *epoch,
-                        writer: gk::GkWriter {
-                            m: w.m.into(),
-                            u: w.u,
-                        },
-                    });
-                }
-                return Err(Some(Wait::Blob));
+    // A post read once is refused for good, even with its chain installed afresh from the
+    // blob it carries, once libsignal let that chain's state go (`group::open_once`)
+    let plain = match ready(crate::group::open_once(st, &addr, &message, true)) {
+        Ok(p) => p,
+        Err(e) if crate::group::lacks_key(&e) => {
+            if let Entry::Vacant(e) = m.reader.asked.entry((*gen, *epoch, w.m, w.u)) {
+                e.insert(c.now);
+                out.send.push(ClientMessage::EpochBlobWanted {
+                    group: m.t.group.clone(),
+                    gen: *gen,
+                    epoch: *epoch,
+                    writer: gk::GkWriter {
+                        m: w.m.into(),
+                        u: w.u,
+                    },
+                });
             }
-            Err(_) => return Err(None),
-        };
+            return Err(Some(Wait::Blob));
+        }
+        Err(_) => return Err(None),
+    };
     let Ok(body) = open_post(gen, &ep, &plain) else {
         return Err(None);
     };

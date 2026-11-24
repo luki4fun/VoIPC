@@ -229,7 +229,15 @@ pub async fn connect_to_server(
                     .unwrap_or_else(PoisonError::into_inner)
                     .remove(&key);
                 if let Some(kept) = kept {
-                    sig.channels.live_adopt_kept(kept);
+                    // The stores are made before the sign-in (`init_signal`): what that
+                    // connection read goes into them, with its sessions
+                    let SignalState {
+                        stores, channels, ..
+                    } = &mut *sig;
+                    match stores.as_mut() {
+                        Some(stores) => channels.live_adopt_kept(stores, kept),
+                        None => warn!("no Signal stores to take the kept sessions over"),
+                    }
                 }
                 let kept = state
                     .kept_pins
@@ -727,7 +735,8 @@ pub async fn teardown(
         release_holds(app);
     }
     tell_undelivered(app, server, &connection);
-    keep_sessions(state, server, &connection);
+    keep_pins_and_floors(state, server, &connection);
+    let proto = connection.tcp_tx.proto();
     // Held posts are given up and told, a keyholder resigns, the floors are kept
     crate::gk_net::end(&crate::gk_net::GkLink::of(app, server, &connection)).await;
 
@@ -766,10 +775,26 @@ pub async fn teardown(
     // Give the writer task a moment to flush the disconnect message
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    // Now abort remaining background tasks
-    for task in connection.tasks {
+    // Now abort remaining background tasks, and wait for them to stop: the sessions and what
+    // was read go to the next connection only once nothing reads here any more. A relay may
+    // hold a post back until it sees the Disconnect, and one read after the copy would open
+    // again there (review 6).
+    for task in &connection.tasks {
         task.abort();
     }
+    let until = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+    for task in connection.tasks {
+        if tokio::time::timeout_at(until, task).await.is_err() {
+            warn!("a connection task did not stop within 500 ms of its abort");
+        }
+    }
+    keep_sessions(
+        state,
+        server,
+        connection.account.as_deref(),
+        proto,
+        &connection.signal,
+    );
 
     // Drop voice/video/screen-audio channels (the aborted mixer task
     // owned and released the playback stream)
@@ -812,20 +837,24 @@ fn tell_undelivered(app: &tauri::AppHandle, server: &str, connection: &ActiveCon
     }
 }
 
-/// An account's sessions, for its next connection to this server. They stay in memory, a
-/// week at most: a disconnect the person chose wipes them (`commands::disconnect`).
-fn keep_sessions(state: &AppState, server: &str, connection: &ActiveConnection) {
-    let Some(link) = &connection.account else {
+/// An account's sessions and what was read, for its next connection to this server. They stay
+/// in memory, a week at most: a disconnect the person chose wipes them
+/// (`commands::disconnect`). Called once the connection's tasks stopped (`teardown`).
+fn keep_sessions(
+    state: &AppState,
+    server: &str,
+    link: Option<&crate::account::AccountLink>,
+    proto: u32,
+    signal: &std::sync::Mutex<SignalState>,
+) {
+    let Some(link) = link else {
         return;
     };
-    if connection.tcp_tx.proto() < LIVE_PATH_SINCE {
+    if proto < LIVE_PATH_SINCE {
         return;
     }
     let now = voipc_crypto::time::now_millis();
-    let mut sig = connection
-        .signal
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
+    let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
     let SignalState {
         stores, channels, ..
     } = &mut *sig;
@@ -839,6 +868,18 @@ fn keep_sessions(state: &AppState, server: &str, connection: &ActiveConnection) 
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .insert((server.to_string(), account), kept);
+}
+
+/// An account's pins and group-key floors, for its next connection to this server, as
+/// `keep_sessions` keeps its sessions.
+fn keep_pins_and_floors(state: &AppState, server: &str, connection: &ActiveConnection) {
+    let Some(link) = &connection.account else {
+        return;
+    };
+    if connection.tcp_tx.proto() < LIVE_PATH_SINCE {
+        return;
+    }
+    let account = link.session().account_id();
     if let Some(pins) = link.session().keep_pins() {
         state
             .kept_pins

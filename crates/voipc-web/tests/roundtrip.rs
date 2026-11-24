@@ -693,7 +693,7 @@ mod live {
         let kept = w.live_keep_sessions(NOW);
         assert_eq!(kept.len(), 1, "an account's session goes on");
         let mut again = follower(5);
-        again.keying.live_adopt_kept(kept);
+        again.live_adopt_kept(kept);
 
         again
             .live_post(CH, envelope("m2", "second", None), NOW + 1)
@@ -719,6 +719,88 @@ mod live {
         w.live_next_frame(NOW, false);
         open(&mut w, 1, &mut r, 2);
         assert!(w.live_keep_sessions(NOW).is_empty());
+    }
+
+    /// What a reader read goes with the sessions it keeps, into the stores of its next
+    /// connection: a wrap the relay held back from before (an ask it made up) opens there, and
+    /// the post read before does not open again (review 6).
+    #[test]
+    fn what_was_read_goes_with_the_kept_sessions() {
+        const WRITER: [u8; 16] = [8; 16];
+        let wrap = |frame: Option<ClientMessage>| {
+            let Some(ClientMessage::DistributeSenderKeys { keys, .. }) = frame else {
+                panic!("a wrap: {frame:?}");
+            };
+            let (_, message_type, ciphertext) = keys.into_iter().next().unwrap();
+            ServerMessage::TextKeyReceived {
+                channel_id: CH,
+                from: 1,
+                account: Some(WRITER),
+                message_type,
+                ciphertext,
+            }
+        };
+        let (mut w, mut r) = (follower(1), follower(2));
+        w.live_post(CH, envelope("m1", "first", None), NOW).unwrap();
+        let out = w.live_frame(0, &keys_owed(vec![row(2, None)]), NOW);
+        let post = post_to_reader(&out.send[0], 1);
+        assert!(r.live_frame(0, &post, NOW).emit.is_empty());
+        assert!(matches!(
+            w.live_next_frame(NOW, false),
+            Some(ClientMessage::OpenSessions { .. })
+        ));
+        let hello = r.live_frame(
+            0,
+            &ServerMessage::SessionAsked {
+                channel_id: CH,
+                from: 1,
+                account: Some(WRITER),
+                name: "w".into(),
+                bundle: w.bundle().unwrap().prekey_bundle,
+            },
+            NOW,
+        );
+        let [ClientMessage::SessionHello {
+            message_type,
+            ciphertext,
+            ..
+        }] = &hello.send[..]
+        else {
+            panic!("no hello: {:?}", hello.send);
+        };
+        w.live_frame(
+            0,
+            &ServerMessage::SessionHello {
+                from: 2,
+                message_type: *message_type,
+                ciphertext: ciphertext.clone(),
+            },
+            NOW,
+        );
+        let first = wrap(w.live_next_frame(NOW, false));
+        assert_eq!(shown(&r.live_frame(0, &first, NOW)), vec!["first"]);
+
+        // An ask the relay made up in the reader's name, and the wrap it keeps
+        w.live_frame(
+            0,
+            &ServerMessage::KeyWanted {
+                channel_id: CH,
+                from: 2,
+                reset: false,
+            },
+            NOW,
+        );
+        let held = wrap(w.live_next_frame(NOW, false));
+
+        let kept = r.live_keep_sessions(NOW);
+        assert_eq!(kept.len(), 1, "the writer's session goes on");
+        let mut again = follower(12);
+        again.live_adopt_kept(kept);
+        assert!(shown(&again.live_frame(0, &held, NOW + 1)).is_empty());
+        assert!(
+            shown(&again.live_frame(0, &post, NOW + 1)).is_empty(),
+            "a post read before the reconnect opened again"
+        );
     }
 
     /// An ask and its answer: both pass the relay as direct messages, and are known for what

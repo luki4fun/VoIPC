@@ -108,13 +108,30 @@ No outside cryptographer has reviewed it.
   - Seat keys dated ahead switched the counter check off; they now count from when they were met.
   - After a recovery-key reset an app could hand its channels the seat keys from before the rotation the reset asks
     for. It now rotates them first; that a reset asks for one is still held in memory only (Known, below).
-- **On a relay with `group_key = false` (or one from before 1.14), a relay could show you a post you had already read**,
-  and an old edit or reaction with it. It had to hold back keys and hand them over late, together with a made-up key
-  request: five keys before, one key during 1.14's development. The app now remembers what it read on a connection and
-  refuses it a second time. Two ways around this are left, as before, and both need a key the relay held back and a
-  writer with an account. One is the relay naming that account under another id. The other is a reconnect. Nothing
-  becomes readable that was not readable already. A writer also hands one reader at most 5 keys at a time, which
-  bounds what a made-up request costs, and keeps every key message under the size limit.
+- **A relay could show you a post you had already read**, and an old edit or reaction with it. On a relay with
+  `group_key = false` (or one from before 1.14) it had to hold back a key and hand it over late: with a made-up key
+  request (five keys before, one during 1.14's development), by naming the writer's account under another id, or after
+  a reconnect. Under the group key it only had to refuse the writer's post five times, each time sending it on a new
+  chain, and then replay the first post with the key that comes with it. The app now remembers what it read, by the
+  key each writer's chain is signed with, which no relay can rename, and refuses a post it already read. This holds on
+  both paths, under any id the relay gives the writer, and, for an account, across a reconnect that keeps its
+  sessions, on both apps. What it still gives up:
+  - Past 100,000 chains read, the one read least lately is forgotten. That takes about 17 MB of memory a connection,
+    25 MB at most, and as much again while it is kept for the next connection. A relay can get there on its own: it
+    can start new chains with a guest or a seat it makes up, or refuse one writer's post again and again. A review
+    did it in about half a minute of the app's time and 40 MB sent to it, and those posts show as one message.
+    Closing this needs a limit on what a chain first seen late may bring, which is planned for 1.15.
+  - On a chain with more than 8 gaps, a post that arrives late into an old gap is refused. Only a relay delivers out
+    of order.
+  - A fresh start remembers nothing: a disconnect you chose, a restart, a reload of the browser app, and every
+    reconnect of a guest. On the old path no key from before opens there. Under the group key a relay can show such
+    a connection a post of an epoch it has the key for once more, as it can show one to a new device.
+  - On the old path, suppose a member hands you another writer's key as their own, then sends you that writer's post
+    before the writer's key reaches you. You see the post under the member's name, and the writer's own copy is
+    refused. Under the group key both show, as before 1.14.
+
+  Nothing becomes readable that was not readable already. A writer also hands one reader at most 5 keys at a time,
+  which bounds what a made-up request costs, and keeps every key message under the size limit.
 
 ### Added
 - **The group epoch key in every text channel and voice room** (`group_key = true`, [GROUP-KEY.md](docs/GROUP-KEY.md)).

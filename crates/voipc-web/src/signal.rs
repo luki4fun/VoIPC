@@ -250,6 +250,11 @@ impl SignalCore {
         self.keying.live_keep_sessions(&self.stores, now)
     }
 
+    /// What an earlier connection kept: its sessions, and into these stores what it read.
+    pub fn live_adopt_kept(&mut self, kept: KeptSessions) {
+        self.keying.live_adopt_kept(&mut self.stores, kept);
+    }
+
     pub fn live_drop_kept_session(&mut self, user_id: u32) -> bool {
         self.keying
             .live_drop_kept_session(&mut self.stores, user_id)

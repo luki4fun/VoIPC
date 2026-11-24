@@ -390,12 +390,13 @@ const WRAP_MOST_BYTES: usize = 4 * 1024;
 /// `SenderKeyRecord::add_sender_key_state` in rust/protocol/src/sender_keys.rs keeps to by
 /// dropping the state least lately taken, to make room for a key it does not hold. A key it
 /// holds keeps its state; one it does not starts afresh at that key's position. What was read
-/// stays read either way, at the reader, which keeps that apart from libsignal's states
-/// (`group::decrypt_group_message`): a key a relay held back and lets go late, or hands
-/// again, opens nothing read before, on this connection and under the same writer id (the
-/// two ways left are in stores.rs, "What was read"). So a hand-off, and a frame, carries one reader at most
-/// this many keys: with more, one would drop another handed with it, for nothing, and a relay's
-/// made-up ask costs five keys a reader at most. The newest chains that owe them, the oldest
+/// stays read either way, at the reader, which keeps that apart from libsignal's states, by
+/// the key each chain signs with (`group::open_once`, stores.rs "What was read"): a key a
+/// relay held back and lets go late, or hands again, opens nothing read before, under
+/// whichever id the relay names the writer by, and after a reconnect that kept the sessions
+/// (`KeptSessions`), within `READ_CHAINS` chains read since. So a hand-off, and a frame,
+/// carries one reader at most this many keys: with more, one would drop another handed with
+/// it, for nothing, and a relay's made-up ask costs five keys a reader at most. The newest chains that owe them, the oldest
 /// first and the current chain last, so it is the last a later key drops. A chain older than
 /// those is not handed, though it still owes them: posts of it they still hold may not open.
 const MAX_SENDER_KEY_STATES: usize = 5;
@@ -919,16 +920,23 @@ impl ChannelKeying {
         }
     }
 
-    /// Takes over what an earlier connection of this account kept (`live_keep_sessions`).
-    pub fn live_adopt_kept(&mut self, kept: KeptSessions) {
+    /// Takes over what an earlier connection of this account kept (`live_keep_sessions`):
+    /// its sessions, and into `stores` what it read, so a key of then the relay held back
+    /// opens nothing read then (`group::open_once`).
+    pub fn live_adopt_kept(&mut self, stores: &mut SignalStores, mut kept: KeptSessions) {
+        stores
+            .sender_key
+            .adopt_reads(std::mem::take(&mut kept.reads));
         self.live.kept = kept;
     }
 
     /// What this connection hands to the next: every session with an account, by account,
-    /// over what it took over and did not use. Called before the stores go. A guest passes
-    /// nothing on, and calls nothing.
+    /// over what it took over and did not use, and what was read here, its own included.
+    /// Called before the stores go. A guest passes nothing on, and calls nothing.
     pub fn live_keep_sessions(&mut self, stores: &SignalStores, now: u64) -> KeptSessions {
         let mut kept = std::mem::take(&mut self.live.kept);
+        // A copy: a frame the host still feeds this connection before the end reads by it
+        kept.reads = stores.sender_key.kept_reads();
         // Oldest id first: a peer who reconnected here is the same account twice, and the
         // later session is the one both ends hold.
         let mut sessions: Vec<(u32, &[u8])> = stores.session.by_user().collect();
@@ -2488,9 +2496,15 @@ struct KeptSession {
 /// ids change, the identity keys a session's MAC binds do not. Both apps up, and a writer's
 /// return costs 176 B a reader, not a new session. A reader that restarted fails the
 /// wrap, and heals by one reset. Never on disk, wiped at sign-out, none for a guest.
+///
+/// What was read goes with them (stores.rs, "What was read"): a wrap a relay made within a
+/// round and held back opens by a kept session for as long as that lives, a week, and with
+/// it a chain read before, installed afresh; what this connection read refuses its posts on
+/// the next one too. Both apps move this whole, as they move the sessions.
 #[derive(Default)]
 pub struct KeptSessions {
     rows: HashMap<[u8; 16], KeptSession>,
+    reads: crate::stores::Reads,
 }
 
 impl KeptSessions {
@@ -2530,10 +2544,12 @@ impl KeptSessions {
         }
     }
 
+    /// Sessions kept, what was read aside.
     pub fn len(&self) -> usize {
         self.rows.len()
     }
 
+    /// No session kept, what was read aside.
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }
@@ -3024,7 +3040,7 @@ mod tests {
                 let kept = old.k.live_keep_sessions(&old.stores, now);
                 let mut d = Device::new(new, old.account, old.identity);
                 if keep {
-                    d.k.live_adopt_kept(kept);
+                    d.k.live_adopt_kept(&mut d.stores, kept);
                 }
                 d.k.live_start(now);
                 self.devices.insert(new, d);
@@ -4450,6 +4466,212 @@ mod tests {
             }
             // The control: nothing held back
             assert_eq!(replay_after_late_keys(6, 0..0, 5), (1, 1, 5));
+        }
+
+        // ── What was read, under another id and across a reconnect (review 5) ──
+
+        fn shown_at(net: &Net, at: u32, text: &str) -> usize {
+            net.devices[&at]
+                .shown()
+                .iter()
+                .filter(|s| *s == text)
+                .count()
+        }
+
+        /// 1's post, as a relay that names 1's account under `id` sends it.
+        fn post_as(net: &Net, id: u32, ciphertext: Vec<u8>) -> ServerMessage {
+            ServerMessage::TextPost {
+                channel_id: CH,
+                user_id: id,
+                username: "user1".into(),
+                account: Some([1u8; 16]),
+                is_admin: false,
+                is_moderator: false,
+                ciphertext,
+                timestamp: net.now,
+            }
+        }
+
+        /// One wrap of a `DistributeSenderKeys`: its reader, kind and ciphertext.
+        type Wrap = (u32, u8, Vec<u8>);
+
+        /// 1's wrap to a reader, as a relay that names 1's account under `id` hands it.
+        fn key_as(id: u32, (_, message_type, ciphertext): Wrap) -> ServerMessage {
+            ServerMessage::TextKeyReceived {
+                channel_id: CH,
+                from: id,
+                account: Some([1u8; 16]),
+                message_type,
+                ciphertext,
+            }
+        }
+
+        /// 1 posts p0 and 3 reads it. A relay makes up an ask from 3 and keeps the wrap it
+        /// brings: p0's round message, at its first position. Back: 1's posts, and that wrap.
+        fn a_wrap_of_what_3_read() -> (Net, Vec<Vec<u8>>, Vec<Wrap>) {
+            let mut net = Net::with(&[1, 2, 3]);
+            net.now += 1_000;
+            net.post(1, "p0");
+            net.pump();
+            assert_eq!(net.devices[&3].shown(), vec!["p0"]);
+            net.hold_wraps = true;
+            net.tell(1, wanted_by(3));
+            net.pump();
+            net.hold_wraps = false;
+            let mut to_3 = Vec::new();
+            for (_, m) in std::mem::take(&mut net.held_wraps) {
+                if let ClientMessage::DistributeSenderKeys { keys, .. } = m {
+                    to_3.extend(keys.into_iter().filter(|(id, ..)| *id == 3));
+                }
+            }
+            assert_eq!(to_3.len(), 1, "p0's round message");
+            let posts = sealed_posts(&net, 1);
+            (net, posts, to_3)
+        }
+
+        /// A relay names 1's account under 11, nobody's id: p0 first, so 3 notes 11 as 1's
+        /// next id, then the wrap it kept as from 11, which moves 3's session with 1 there
+        /// (`find_session`) and installs p0's chain afresh in the record of user 11 (review 5).
+        /// What 3 read is known by the key that chain signs with, which no relay can rename:
+        /// p0 opens no second time, and is refused as a duplicate is.
+        #[test]
+        fn a_writer_named_under_another_id_opens_nothing_read_again() {
+            let (mut net, posts, kept) = a_wrap_of_what_3_read();
+            raw_post(&mut net, 3, 1, posts[0].clone());
+            net.pump();
+            assert_eq!(shown_at(&net, 3, "p0"), 1, "under its own id: refused");
+            let rings = net.devices[&3].events("channel-ring");
+            let post = post_as(&net, 11, posts[0].clone());
+            net.tell(3, post);
+            net.pump();
+            for key in kept {
+                net.tell(3, key_as(11, key));
+            }
+            net.pump();
+            assert_eq!(
+                shown_at(&net, 3, "p0"),
+                1,
+                "a post read once opened again under another id"
+            );
+            assert_eq!(
+                net.devices[&3].events("channel-ring"),
+                rings + 1,
+                "the key opened, and the post it held was refused"
+            );
+        }
+
+        /// The same with nothing made up: the relay hands 3 the round's only wrap, and p0, as
+        /// from 11, then p0 as from 1, which waits for a key under 1. 3's own ask at ten
+        /// seconds brings p0's round message again, under 1: p0 still shows once.
+        #[test]
+        fn a_writer_named_under_two_ids_shows_a_post_once() {
+            let mut net = Net::with(&[1, 2, 3]);
+            net.now += 1_000;
+            net.hold_wraps = true;
+            net.post(1, "p0");
+            net.pump();
+            net.hold_wraps = false;
+            let mut to_3 = Vec::new();
+            for (from, m) in std::mem::take(&mut net.held_wraps) {
+                if let ClientMessage::DistributeSenderKeys { channel_id, keys } = m {
+                    let (mine, rest): (Vec<_>, Vec<_>) =
+                        keys.into_iter().partition(|(id, ..)| *id == 3);
+                    to_3.extend(mine);
+                    let keys = rest;
+                    net.deliver(
+                        from,
+                        ClientMessage::DistributeSenderKeys { channel_id, keys },
+                    );
+                }
+            }
+            // p0 as the relay sent it to 3 under 1 goes: it comes again below
+            net.devices
+                .get_mut(&3)
+                .unwrap()
+                .inbox
+                .retain(|m| !matches!(m, ServerMessage::TextPost { .. }));
+            net.pump();
+            let posts = sealed_posts(&net, 1);
+            let post = post_as(&net, 11, posts[0].clone());
+            net.tell(3, post);
+            net.pump();
+            for key in to_3 {
+                net.tell(3, key_as(11, key));
+            }
+            net.pump();
+            assert_eq!(shown_at(&net, 3, "p0"), 1, "as from 11");
+            raw_post(&mut net, 3, 1, posts[0].clone());
+            net.pump();
+            let asked = net.devices[&3].wrote(is_wanted);
+            net.now += KEY_WANTED_AFTER_MS;
+            net.tick();
+            assert!(
+                net.devices[&3].wrote(is_wanted) > asked,
+                "3 asked 1 for the key"
+            );
+            assert_eq!(
+                shown_at(&net, 3, "p0"),
+                1,
+                "a post read once opened again under the writer's first id"
+            );
+        }
+
+        /// 3's app comes back as 13, and the relay hands 13 the wrap it kept from before,
+        /// then replays p0 (review 5). With the sessions kept, what 3 read came along with
+        /// them, so p0 opens no second time; without, the wrap opens nothing. Either way 13
+        /// reads on.
+        #[test]
+        fn a_reconnect_keeps_what_was_read_with_the_sessions() {
+            for keep in [true, false] {
+                let (mut net, posts, kept) = a_wrap_of_what_3_read();
+                net.now += 1_000;
+                net.reconnect(3, 13, keep);
+                net.devices.get_mut(&13).unwrap().k.join_text(CH);
+                for key in kept {
+                    net.tell(13, key_as(1, key));
+                }
+                net.pump();
+                raw_post(&mut net, 13, 1, posts[0].clone());
+                net.pump();
+                assert_eq!(
+                    shown_at(&net, 13, "p0"),
+                    0,
+                    "kept {keep}: a post read before the reconnect opened again"
+                );
+                net.post(1, "p1");
+                net.pump();
+                assert_eq!(net.devices[&13].shown(), vec!["p1"], "kept {keep}");
+            }
+        }
+
+        /// What came along is no reason to refuse what an honest relay brings: a reader back
+        /// with its sessions kept reads the chain it read before on, a new one after an exit,
+        /// and its writer's chain once the writer is back too, and nothing rings.
+        #[test]
+        fn a_reader_back_with_what_it_read_reads_on_and_nothing_rings() {
+            let mut net = Net::with(&[1, 2, 3]);
+            net.now += 1_000;
+            net.post(1, "p0");
+            net.post(1, "p1");
+            net.pump();
+            assert_eq!(net.devices[&3].shown(), vec!["p0", "p1"]);
+            net.now += 1_000;
+            net.reconnect(3, 13, true);
+            net.devices.get_mut(&13).unwrap().k.join_text(CH);
+            net.post(1, "p2");
+            net.pump();
+            exit_lands(&mut net, 1);
+            net.now += 1_000;
+            net.post(1, "p3");
+            net.pump();
+            net.now += 1_000;
+            net.reconnect(1, 11, true);
+            net.devices.get_mut(&11).unwrap().k.join_text(CH);
+            net.post(11, "p4");
+            net.pump();
+            assert_eq!(net.devices[&13].shown(), vec!["p2", "p3", "p4"]);
+            assert_eq!(net.devices[&13].events("channel-ring"), 0);
+            assert_eq!(net.devices[&2].shown(), vec!["p0", "p1", "p2", "p3", "p4"]);
         }
 
         /// Asks a relay made up, 64 of them from 2 and 3 in turn, in a browser call: each

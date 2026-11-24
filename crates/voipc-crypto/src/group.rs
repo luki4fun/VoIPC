@@ -6,8 +6,8 @@
 
 use libsignal_protocol::{
     create_sender_key_distribution_message, group_decrypt, group_encrypt,
-    process_sender_key_distribution_message, SenderKeyDistributionMessage, SenderKeyMessage,
-    SignalProtocolError,
+    process_sender_key_distribution_message, ProtocolAddress, SenderKeyDistributionMessage,
+    SenderKeyMessage, SignalProtocolError,
 };
 use uuid::Uuid;
 
@@ -122,16 +122,11 @@ pub fn lacks_key(error: &anyhow::Error) -> bool {
 /// inside the ciphertext, so without this a relay could re-label a message
 /// from one channel as another and every client would believe it.
 ///
-/// A message read once is refused after, with libsignal's own
-/// `DuplicatedMessage(chain id, position)`, even once libsignal dropped the
-/// chain's state and the same key brought it back afresh, where it would open
-/// again for a relay replaying it (`VoipcSenderKeyStore::was_read`). It holds on
-/// this connection, for the user id the relay names the sender by (stores.rs,
-/// "What was read", has the two ways left). Every
-/// caller takes that as it takes libsignal's duplicate: the live path rings and
-/// shows nothing (`channel_state` `text_post`, `open_held`), the old path shows
-/// its "decryption failed" line (native `handle_encrypted_channel_message`,
-/// web `onEncryptedChannelMessage`). Only a message that opened counts as read.
+/// A message read once is refused after (`open_once`), with libsignal's own
+/// `DuplicatedMessage(chain id, position)`. Every caller takes that as it takes
+/// libsignal's duplicate: the live path rings and shows nothing (`channel_state`
+/// `text_post`, `open_held`), the old path shows its "decryption failed" line
+/// (native `handle_encrypted_channel_message`, web `onEncryptedChannelMessage`).
 pub async fn decrypt_group_message(
     stores: &mut SignalStores,
     sender_user_id: u32,
@@ -145,19 +140,47 @@ pub async fn decrypt_group_message(
     if message.distribution_id() != distribution_id {
         anyhow::bail!("message was encrypted for a different channel than it arrived in");
     }
+    open_once(stores, &sender_address, &message, false).await
+}
+
+/// libsignal's `group_decrypt` of `message` from `sender`, which refuses a message read
+/// before with libsignal's own `DuplicatedMessage(chain id, position)`, whatever libsignal
+/// holds by then (stores.rs, "What was read"): once libsignal dropped the chain's state, or
+/// the store its record, and the same key brought it back afresh; under another sender id
+/// the relay names its writer by; and on a later connection that took over this one's
+/// sessions (`KeptSessions`). Within the bounds there (`READ_CHAINS`, `READ_RUNS`). Only a
+/// message that opened counts as read, by the key its chain signs with, from the state
+/// libsignal opened it by. Both paths open by it: this module's (`decrypt_group_message`)
+/// and the group key's (group_state/reader.rs `open`), which passes `by_writer`: its
+/// sender's name is bound by the writer's blob, so a chain is kept read under it too
+/// (`Signer::under`).
+pub(crate) async fn open_once(
+    stores: &mut SignalStores,
+    sender: &ProtocolAddress,
+    message: &SenderKeyMessage,
+    by_writer: bool,
+) -> anyhow::Result<Vec<u8>> {
     let (chain_id, iteration) = (message.chain_id(), message.iteration());
-    if stores
+    let distribution_id = message.distribution_id();
+    let signer = stores
         .sender_key
-        .was_read(&sender_address, distribution_id, chain_id, iteration)
-    {
+        .signer_of(sender, distribution_id, chain_id)?
+        .map(|signer| {
+            if by_writer {
+                signer.under(sender.name())
+            } else {
+                signer
+            }
+        });
+    if signer.is_some_and(|signer| stores.sender_key.was_read(&signer, iteration)) {
         return Err(SignalProtocolError::DuplicatedMessage(chain_id, iteration).into());
     }
-
-    let plaintext = group_decrypt(ciphertext, &mut stores.sender_key, &sender_address).await?;
-    stores
-        .sender_key
-        .mark_read(&sender_address, distribution_id, chain_id, iteration);
-
+    let plaintext = group_decrypt(message.serialized(), &mut stores.sender_key, sender).await?;
+    // Opened by a state not found above: with nothing to keep it read by, not let through
+    let Some(signer) = signer else {
+        return Err(SignalProtocolError::InvalidSenderKeySession { distribution_id }.into());
+    };
+    stores.sender_key.mark_read(signer, iteration);
     Ok(plaintext)
 }
 
@@ -330,6 +353,126 @@ mod tests {
             ready(decrypt_group_message(&mut b, alice, 7, &post)).unwrap(),
             b"post"
         );
+    }
+
+    /// A relay that names the writer under another id installs the same key in a new record
+    /// (`ChannelKeying::find_session` moves the reader's session there, review 5): what was
+    /// read on that chain stays read, by the key it signs with, and what was not still opens.
+    #[test]
+    fn a_post_read_once_stays_read_under_another_sender_id() {
+        let (alice, bob) = (1, 2);
+        let mut a = stores_for(alice);
+        let mut b = stores_for(bob);
+        let first = ready(create_distribution_message(&mut a, alice, 7)).unwrap();
+        ready(process_distribution_message(&mut b, alice, 7, &first)).unwrap();
+        let read = ready(encrypt_group_message(&mut a, alice, 7, b"read")).unwrap();
+        let unread = ready(encrypt_group_message(&mut a, alice, 7, b"unread")).unwrap();
+        ready(decrypt_group_message(&mut b, alice, 7, &read)).unwrap();
+        ready(process_distribution_message(&mut b, 11, 7, &first)).unwrap();
+        assert!(
+            is_duplicate(ready(decrypt_group_message(&mut b, 11, 7, &read))),
+            "a post read once opened again under another id"
+        );
+        assert_eq!(
+            ready(decrypt_group_message(&mut b, 11, 7, &unread)).unwrap(),
+            b"unread"
+        );
+    }
+
+    /// What one connection read goes over to the next (`KeptSessions`): a key from before,
+    /// handed to the new stores, opens nothing read then, and what was not read still opens.
+    #[test]
+    fn what_was_read_goes_over_to_the_next_stores() {
+        let (alice, bob) = (1, 2);
+        let mut a = stores_for(alice);
+        let mut b = stores_for(bob);
+        let first = ready(create_distribution_message(&mut a, alice, 7)).unwrap();
+        ready(process_distribution_message(&mut b, alice, 7, &first)).unwrap();
+        let read = ready(encrypt_group_message(&mut a, alice, 7, b"read")).unwrap();
+        let unread = ready(encrypt_group_message(&mut a, alice, 7, b"unread")).unwrap();
+        ready(decrypt_group_message(&mut b, alice, 7, &read)).unwrap();
+        let mut again = stores_for(bob);
+        again.sender_key.adopt_reads(b.sender_key.kept_reads());
+        ready(process_distribution_message(&mut again, alice, 7, &first)).unwrap();
+        assert!(
+            is_duplicate(ready(decrypt_group_message(&mut again, alice, 7, &read))),
+            "a post read on the last connection opened again"
+        );
+        assert_eq!(
+            ready(decrypt_group_message(&mut again, alice, 7, &unread)).unwrap(),
+            b"unread"
+        );
+    }
+
+    /// A writer's record, its chain signing with another key pair: as a new chain that drew
+    /// the id of an old one would (31 random bits, libsignal's `chain_id`).
+    fn under_another_signing_key(record: &[u8], public: &[u8]) -> Vec<u8> {
+        let pair = libsignal_protocol::KeyPair::generate(&mut crate::rng());
+        let at = record
+            .windows(public.len())
+            .position(|w| w == public)
+            .expect("the record holds its public key");
+        let mut out = record.to_vec();
+        out[at..at + public.len()].copy_from_slice(&pair.public_key.serialize());
+        // storage.proto `SenderSigningKey`: the private half follows, field 2, 32 bytes
+        let private = at + public.len();
+        assert_eq!(out[private..private + 2], [0x12, 0x20]);
+        out[private + 2..private + 34].copy_from_slice(&pair.private_key.serialize());
+        out
+    }
+
+    /// Two chains under one chain id are two chains: a post at a position read on the first
+    /// opens on the second, which signs with another key.
+    #[test]
+    fn a_new_chain_under_an_old_chain_id_is_not_taken_as_read() {
+        let (alice, bob) = (1, 2);
+        let mut a = stores_for(alice);
+        let mut b = stores_for(bob);
+        let first = ready(create_distribution_message(&mut a, alice, 7)).unwrap();
+        let key = sender_key_key_of(alice, 7);
+        let record = a.sender_key.keys[&key].clone();
+        ready(process_distribution_message(&mut b, alice, 7, &first)).unwrap();
+        let read = ready(encrypt_group_message(&mut a, alice, 7, b"read")).unwrap();
+        ready(decrypt_group_message(&mut b, alice, 7, &read)).unwrap();
+        // The same chain id and chain key from the start, under a new signing key
+        let public = SenderKeyDistributionMessage::try_from(&first[..])
+            .unwrap()
+            .signing_key()
+            .unwrap()
+            .serialize();
+        let mut restarted = stores_for(alice);
+        restarted
+            .sender_key
+            .keys
+            .insert(key, under_another_signing_key(&record, &public));
+        let again = ready(create_distribution_message(&mut restarted, alice, 7)).unwrap();
+        let (one, two) = (
+            SenderKeyDistributionMessage::try_from(&first[..]).unwrap(),
+            SenderKeyDistributionMessage::try_from(&again[..]).unwrap(),
+        );
+        assert_eq!(one.chain_id().unwrap(), two.chain_id().unwrap());
+        assert_ne!(one.signing_key().unwrap(), two.signing_key().unwrap());
+        ready(process_distribution_message(&mut b, alice, 7, &again)).unwrap();
+        let other = ready(encrypt_group_message(&mut restarted, alice, 7, b"other")).unwrap();
+        assert_eq!(
+            SenderKeyMessage::try_from(&other[..]).unwrap().iteration(),
+            SenderKeyMessage::try_from(&read[..]).unwrap().iteration()
+        );
+        let opened = ready(decrypt_group_message(&mut b, alice, 7, &other));
+        assert!(
+            opened.as_ref().is_ok_and(|p| p == b"other"),
+            "a post on another chain was taken as read: {opened:?}"
+        );
+    }
+
+    fn sender_key_key_of(user: u32, channel: u32) -> String {
+        let a = user_address(user);
+        format!(
+            "{}.{}::{}",
+            a.name(),
+            a.device_id(),
+            channel_distribution_id(channel)
+        )
     }
 
     /// After a member leaves, the sender rotates: whoever processed the new
