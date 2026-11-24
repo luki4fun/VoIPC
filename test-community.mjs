@@ -1117,11 +1117,19 @@ async function lane() {
   await openChat(plain, "lobby-chat");
   await waitFor(plain, leaveRow);
   await plain.evaluate(`window.__voipc_said.splice(0); 0`);
+  const catHeardFrom = await cat.evaluate(`window.__voipc_heard.length`);
   await plain.evaluate(`${leaveRow}.click()`);
-  // Rule 5: once her LeaveChannel is out, past the barrier the relay has done it, and what it told
-  // the writer of it (her chain ends at its next post) is in at cathy's
+  // Rule 5: once her LeaveChannel is out, past the barrier the relay has done it. It tells the
+  // writer only on its own once-a-second tick (ChannelExits), which no barrier orders: a post
+  // inside that second went on the old chain (soak 45269825608, 2 of 5 runs with the key off,
+  // whose readers the app still answers now, channel_state.rs). Without the group key her chain
+  // ends at the next post once that is in, so she waits for it; with it, no chain is hers
   await waitFor(plain, sentKind("LeaveChannel"));
   check("past oskar and cathy's barrier", await barrier(SERVER, plain, cat));
+  if (!GROUP_KEY) {
+    const exits = `window.__voipc_heard.slice(${catHeardFrom}).some(([tag]) => tag === "ChannelExits")`;
+    check("the relay told the writer someone left", await seen(cat, exits, 5_000));
+  }
   // Soak run 43620651318: paula's page held this post a minute with no key that opened it ("Nobody
   // online shares it"), a second after her sign-in, and nothing told which step of the hand-off
   // failed: the browser build logs none of it. A miss prints what reached her and what cathy
@@ -1138,6 +1146,7 @@ async function lane() {
         .then((s) => s.slice(0, 4000), (e) => `(${e.message.slice(0, 200)})`);
     console.log(`--- paula heard since cathy's post: ${await frames(held, "__voipc_heard", heardFrom)}`);
     console.log(`--- cathy sent since her post: ${await frames(cat, "__voipc_said", saidFrom)}`);
+    console.log(`--- cathy heard since oskar left (tag, channel, ms): ${await frames(cat, "__voipc_heard", catHeardFrom)}`);
     console.log(`--- paula's page said: ${held.net.said.join(" | ") || "nothing"}`);
     console.log(`--- cathy's page said: ${cat.net.said.join(" | ") || "nothing"}`);
     throw new Error(`paula never read cathy's post past the leave\n${await diagnose(held)}`);

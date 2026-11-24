@@ -176,7 +176,7 @@ export function sessionOrSigningIn(server: string): Session | null {
 
 // A test build's way to hand a session a frame no honest relay sends (test-provider.mjs),
 // to see which frames came and what went, and to cut a link (test-community.mjs).
-const heard: [string, number | string | undefined][] = [];
+const heard: [string, number | string | undefined, number][] = [];
 const said: unknown[] = [];
 /** A test build's record of what the group key told the page (`gk-*`), and of posts marked not
  *  sent: [when, event, its data], the latest few hundred. */
@@ -194,7 +194,9 @@ if (__SELFTEST__) {
     __voipc_barrier: unknown;
   };
   // Resolves once the relay answered a Ping sent now: it handled everything this page
-  // sent before, and whatever it passed on is in the other side's queue (the lanes' rule 5)
+  // sent before, and whatever it passed on is in the other side's queue (the lanes' rule 5).
+  // Not what it sends on its own ticks (ChannelExits, ChannelCounts): a lane waits for those
+  // where they matter (soak 45269825608)
   page.__voipc_barrier = (server: string) =>
     new Promise<boolean>((resolve) => {
       const session = sessionFor(server);
@@ -852,8 +854,9 @@ export class Session implements SessionContext, AccountHost {
     if (!frameGoesOn(msg, this.signedIn, this.account?.midPairing ?? false)) return;
     if (__SELFTEST__) {
       const [tag, b] = typeof msg === "string" ? [msg, null] : Object.entries(msg as Record<string, Body>)[0];
-      // `GroupKeys` with whether the relay runs the key: a lane run with GK=0 checks it took
-      heard.push([tag, tag === "GroupKeys" ? (b?.on ? "on" : "off") : (b?.channel_id ?? b?.user?.channel_id)]);
+      // `GroupKeys` with whether the relay runs the key: a lane run with GK=0 checks it took.
+      // When it came last, for a lane's dump of what reached a page in which order
+      heard.push([tag, tag === "GroupKeys" ? (b?.on ? "on" : "off") : (b?.channel_id ?? b?.user?.channel_id), Date.now()]);
     }
     if (this.signedIn && this.signal.liveHoldsFrame(payload)) {
       if (this.pinHeld.length >= wasm().pinHeldMost()) this.pinHeld.shift();

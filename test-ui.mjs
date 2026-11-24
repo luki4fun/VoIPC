@@ -25,7 +25,7 @@ import { createHmac } from "node:crypto";
 import { mkdtempSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { HANG_MS, barrier, openTab, probe, seen, sentKind, sleep, waitFor as waitUntil } from "./test-cdp.mjs";
+import { HANG_MS, barrier, diagnose, openTab, probe, seen, sentKind, sleep, waitFor as waitUntil } from "./test-cdp.mjs";
 
 const PORT = process.argv[2] ?? "19987";
 /** The relay, as every page names it (connect() types 127.0.0.1 and PORT). */
@@ -341,7 +341,9 @@ async function answerFirstRun(tab, who, timeoutMs = 15_000) {
     }
     await sleep(150);
   }
-  check(`${who}: the first-run dialogs are answered`, false, JSON.stringify(seen));
+  // With the page's failed loads and last warnings: soak 45269825608 lost a twin's wasm body
+  // ("Response body loading was aborted") and nothing said which network error it was
+  check(`${who}: the first-run dialogs are answered`, false, `${JSON.stringify(seen)}\n${await diagnose(tab)}`);
 }
 
 /**
@@ -1551,13 +1553,14 @@ check(
   // second message really goes to the server instead of waiting in a queue
   await say("hello twin");
   let delivered = false;
+  let why = "";
   try {
     await waitFor(second, `[...document.querySelectorAll(".dm-name")].some((e) => e.title === "${twin}#0420")`);
     delivered = true;
-  } catch {
-    // reported below
+  } catch (e) {
+    why = String(e?.message ?? e).slice(0, 3000);
   }
-  check("a direct message to a twin arrives", delivered);
+  check("a direct message to a twin arrives", delivered, why);
   check("with no complaint", !(await first.evaluate(notDelivered)));
 
   await serverMenu(second, "Disconnect");

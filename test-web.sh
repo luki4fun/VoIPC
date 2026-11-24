@@ -113,6 +113,13 @@ on_exit() {
     kept="$KEEP_LOGS/test-web-$(date +%H%M%S)-$$"
     mkdir -p "$kept" 2>/dev/null &&
       find "$WORK" -maxdepth 1 -type f \( -name '*.txt' -o -name '*.log' \) -exec cp {} "$kept/" \; 2>/dev/null || true
+    # The UI browsers' network logs, only when the UI lane failed: soak 45269825608 lost a wasm
+    # body there ("Response body loading was aborted") and only a NetLog names why
+    if grep -qs "FAIL the UI regression test" "$WORK/fails.txt"; then
+      for f in "$WORK"/ui-netlog-*.json; do
+        [ -s "$f" ] && gzip -c "$f" > "$kept/$(basename "$f").gz" 2>/dev/null || true
+      done
+    fi
   fi
   if [ -n "${WORK:-}" ]; then rm -rf "$WORK" 2>/dev/null || true; fi
 }
@@ -678,6 +685,7 @@ elif [ "$BROWSER_ALICE" = chromium ] || [ "$BROWSER_BOB" = chromium ]; then
     "$CHROME" --headless=new --no-sandbox --disable-gpu --ignore-certificate-errors \
       --use-fake-ui-for-media-stream --use-fake-device-for-media-stream \
       --autoplay-policy=no-user-gesture-required --disable-background-timer-throttling \
+      --log-net-log="$WORK/ui-netlog-$cdp.json" \
       --remote-debugging-port="$cdp" --user-data-dir="$WORK/profile-ui-$cdp" about:blank > "$WORK/ui-browser-$cdp.log" 2>&1 &
     ui_browsers+=($!)
     for _ in $(seq 1 50); do

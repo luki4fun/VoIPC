@@ -35,7 +35,9 @@
 //     `kill -9` on the relay halfway, then the command, which must `exec` a new relay, and
 //     everyone returns at `reconnectDelay`'s spread. It exits non-zero if a line does not
 //     hold. What it cannot see: a post that waited for a lost wrap asks again in a real
-//     app (`KeyWanted`); here it only counts as expired.
+//     app (`KeyWanted`); here it only counts as expired. And a wrap here opens its whole
+//     chain, where an app's opens from its round's position on: a reader a chain named whose
+//     round has gone gets the current position there, and misses what went before it.
 //
 // The relay needs `max_users` above N. Load clients share the machine with it,
 // so CPU times are the relay's own, and latencies are an upper bound.
@@ -752,7 +754,10 @@ const WRAP_BYTES: usize = 176;
 const OPENS_A_FRAME: usize = 256;
 const OPEN_WAIT_MS: u64 = 1_000;
 const WRAP_FRAME_BYTES: usize = 56 * 1024;
+/// The most a wrap is counted at, before a reader's keys go in a frame: a pre-key message's.
+const WRAP_MOST_BYTES: usize = 4 * 1024;
 const HOLD_MS: u64 = 60_000;
+const ROUND_LIFE_MS: u64 = 60_000;
 const HELLO_BURST: f64 = 128.0;
 const HELLOS_A_SECOND: f64 = 2.0;
 const PREKEY_REFILL: usize = 50;
@@ -891,12 +896,80 @@ fn dummy_wrap(chain: u32) -> Vec<u8> {
     ct
 }
 
+/// What a queued wrap or ask to open is for, as `channel_state`'s `For`: the key of the chain
+/// with this number, or whatever the channel's chains still owe them (a hello came).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum For {
+    Chain(u32),
+    Owed,
+}
+
+impl For {
+    fn covers(self, chain: u32) -> bool {
+        match self {
+            For::Chain(number) => number == chain,
+            For::Owed => true,
+        }
+    }
+}
+
+/// `channel_state`'s `Wraps`: a reader once a channel, in the order first owed, what else is
+/// owed them there joining their place, so a frame touches only the readers it takes.
+#[derive(Default)]
+struct Wraps {
+    order: VecDeque<(u32, u32)>,
+    whats: HashMap<(u32, u32), Vec<For>>,
+}
+
+impl Wraps {
+    fn push(&mut self, channel_id: u32, id: u32, what: For) {
+        match self.whats.entry((channel_id, id)) {
+            std::collections::hash_map::Entry::Occupied(mut whats) => {
+                let whats = whats.get_mut();
+                if what == For::Owed {
+                    *whats = vec![For::Owed];
+                } else if !whats.contains(&what) && !whats.contains(&For::Owed) {
+                    whats.push(what);
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(whats) => {
+                whats.insert(vec![what]);
+                self.order.push_back((channel_id, id));
+            }
+        }
+    }
+
+    fn front(&self) -> Option<(u32, u32)> {
+        self.order.front().copied()
+    }
+
+    fn front_whats(&self) -> &[For] {
+        self.front()
+            .and_then(|key| self.whats.get(&key))
+            .map_or(&[][..], Vec::as_slice)
+    }
+
+    fn pop_front(&mut self) {
+        if let Some(key) = self.order.pop_front() {
+            self.whats.remove(&key);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.order.is_empty()
+    }
+}
+
 /// One writer in one channel: `Writing` of `channel_state`, and no key in it.
 #[derive(Default)]
 struct WriterChannel {
     chain: u32,
     started: Option<u64>,
     named: HashSet<u32>,
+    /// When each round began, and whom it named.
+    rounds: Vec<(u64, HashSet<u32>)>,
+    /// Rounds of chains that ended: the chain, until when, and whom it named.
+    retired: Vec<(u32, u64, HashSet<u32>)>,
     exited: bool,
     check_out: bool,
     owed: Vec<u32>,
@@ -913,6 +986,72 @@ impl WriterChannel {
         age >= chain_age_limit(self.named.len())
             || (self.exited && age >= exit_gap(self.named.len()))
     }
+
+    /// `Writing::chain_answers`: whom it named, while it is not over; past an exit's gap
+    /// alone, whom a round still live named; past its age, nobody.
+    fn chain_answers(&self, id: u32, now: u64) -> bool {
+        let Some(started) = self.started else {
+            return false;
+        };
+        if !self.named.contains(&id) {
+            return false;
+        }
+        if !self.over(now) {
+            return true;
+        }
+        now.saturating_sub(started) < chain_age_limit(self.named.len())
+            && self
+                .rounds
+                .iter()
+                .any(|(at, named)| named.contains(&id) && now.saturating_sub(*at) < ROUND_LIFE_MS)
+    }
+
+    /// `Writing::hand_off`: the chains whose key a hand-off to `id` for any of `whats` carries
+    /// now, the oldest first. An ended chain's while a round of it that named them lives. Of
+    /// the chains that owe them, the newest `SENDER_KEY_STATES` alone, then whichever `whats`
+    /// covers: the current chain last.
+    fn hand_off(&self, id: u32, whats: &[For], now: u64) -> Vec<u32> {
+        let mut chains: Vec<u32> = Vec::new();
+        for (chain, until, named) in &self.retired {
+            if now < *until && named.contains(&id) && !chains.contains(chain) {
+                chains.push(*chain);
+            }
+        }
+        if self.chain_answers(id, now) {
+            chains.push(self.chain);
+        }
+        let older = chains.len().saturating_sub(SENDER_KEY_STATES);
+        chains.drain(..older);
+        chains.retain(|chain| whats.iter().any(|what| what.covers(*chain)));
+        chains
+    }
+
+    fn answers(&self, id: u32, what: For, now: u64) -> bool {
+        !self.hand_off(id, &[what], now).is_empty()
+    }
+
+    /// The next chain, as `live_post` and `keys_owed` start one (`Writing::end_chain`): the
+    /// live rounds of this one go on answering whom they named, till their life or this
+    /// chain's age ends.
+    fn new_chain(&mut self, now: u64, tally: &FollowTally) {
+        self.retired.retain(|(_, until, _)| now < *until);
+        if let Some(started) = self.started {
+            let limit = started.saturating_add(chain_age_limit(self.named.len()));
+            for (at, named) in std::mem::take(&mut self.rounds) {
+                let until = at.saturating_add(ROUND_LIFE_MS).min(limit);
+                if now < until {
+                    self.retired.push((self.chain, until, named));
+                }
+            }
+        }
+        self.started = None;
+        self.named.clear();
+        self.rounds.clear();
+        self.exited = false;
+        self.chain += 1;
+        self.job_up = 0;
+        tally.add(|t| &t.new_chains);
+    }
 }
 
 #[derive(Default)]
@@ -920,8 +1059,8 @@ struct WriterState {
     channels: Vec<u32>,
     at: HashMap<u32, WriterChannel>,
     sessions: HashSet<u32>,
-    opens: VecDeque<(u32, u32)>,
-    wraps: VecDeque<(u32, u32)>,
+    opens: VecDeque<(u32, u32, For)>,
+    wraps: Wraps,
     awaiting: HashSet<u32>,
     open_frame: usize,
     opens_sent_at: u64,
@@ -944,12 +1083,7 @@ impl WriterState {
         }
         let restart = w.over(now);
         if restart {
-            w.started = None;
-            w.named.clear();
-            w.exited = false;
-            w.chain += 1;
-            w.job_up = 0;
-            tally.add(|t| &t.new_chains);
+            w.new_chain(now, tally);
         }
         w.check_out = true;
         w.waiting.push_back(now);
@@ -959,7 +1093,8 @@ impl WriterState {
         })
     }
 
-    /// `keys_owed` and `start_round`: the posts go before anything else does.
+    /// `keys_owed` and `start_round`: the posts go before anything else does. An answer that
+    /// finds the chain over asks for everyone again instead, and the posts wait for that one.
     #[allow(clippy::too_many_arguments)]
     fn owed(
         &mut self,
@@ -979,11 +1114,27 @@ impl WriterState {
             return;
         }
         w.check_out = false;
+        if w.started.is_some() && w.over(now) {
+            w.owed.clear();
+            w.new_chain(now, tally);
+            w.check_out = true;
+            out.push(ClientMessage::KeyCheck {
+                channel_id,
+                restart: true,
+            });
+            return;
+        }
         w.started.get_or_insert(now);
         let mut owed = std::mem::take(&mut w.owed);
         owed.retain(|id| *id != own);
         owed.sort_unstable();
         w.named.extend(owed.iter().copied());
+        if !owed.is_empty() {
+            w.rounds
+                .retain(|(at, _)| now.saturating_sub(*at) < ROUND_LIFE_MS);
+            w.retired.retain(|(_, until, _)| now < *until);
+            w.rounds.push((now, owed.iter().copied().collect()));
+        }
         for sent in w.waiting.drain(..) {
             tally.add(|t| &t.posts_up);
             out.push(ClientMessage::SendEncryptedChannelMessage {
@@ -991,22 +1142,24 @@ impl WriterState {
                 ciphertext: dummy_post(sent, w.chain),
             });
         }
+        let chain = For::Chain(w.chain);
         for id in owed {
             if self.sessions.contains(&id) {
-                self.wraps.push_back((channel_id, id));
+                self.wraps.push(channel_id, id, chain);
             } else {
-                self.opens.push_back((channel_id, id));
+                self.opens.push_back((channel_id, id, chain));
             }
         }
     }
 
-    /// `session_hello`: a wrap for every chain of ours that named them.
+    /// `session_hello`: a wrap for every chain of ours that still answers them, an ended
+    /// one's too.
     fn hello(&mut self, from: u32, now: u64) {
         self.sessions.insert(from);
         self.awaiting.remove(&from);
         for (channel_id, w) in &self.at {
-            if w.named.contains(&from) && !w.over(now) {
-                self.wraps.push_back((*channel_id, from));
+            if w.answers(from, For::Owed, now) {
+                self.wraps.push(*channel_id, from, For::Owed);
             }
         }
     }
@@ -1014,23 +1167,31 @@ impl WriterState {
     /// `live_next_frame`, with `next_ask` and `job_over` left out: nobody asks for chat here,
     /// and the refill goes as soon as the relay says it runs low.
     fn next_frame(&mut self, now: u64, tally: &FollowTally) -> Option<ClientMessage> {
-        while let Some(&(channel_id, _)) = self.wraps.front() {
+        while let Some((channel_id, _)) = self.wraps.front() {
+            // `next_wraps`: all a reader waits for in the channel goes as one hand-off, in the
+            // first frame that takes them, and whole, or first in the next frame
             let mut keys = Vec::new();
             let mut bytes = 0;
-            while let Some(&(channel, id)) = self.wraps.front() {
+            while let Some((channel, id)) = self.wraps.front() {
                 if channel != channel_id || keys.len() >= WRAPS_A_FRAME || bytes >= WRAP_FRAME_BYTES
                 {
                     break;
                 }
-                self.wraps.pop_front();
-                let Some(w) = self.at.get(&channel) else {
-                    continue;
-                };
-                if w.over(now) || !w.named.contains(&id) {
-                    continue;
+                let chains: Vec<u32> = self
+                    .at
+                    .get(&channel)
+                    .map_or_else(Vec::new, |w| w.hand_off(id, self.wraps.front_whats(), now));
+                if !keys.is_empty()
+                    && (keys.len() + chains.len() > WRAPS_A_FRAME
+                        || bytes + chains.len() * WRAP_MOST_BYTES > WRAP_FRAME_BYTES)
+                {
+                    break;
                 }
-                bytes += WRAP_BYTES + 8;
-                keys.push((id, 2u8, dummy_wrap(w.chain)));
+                self.wraps.pop_front();
+                for chain in chains {
+                    bytes += WRAP_BYTES + 8;
+                    keys.push((id, 2u8, dummy_wrap(chain)));
+                }
             }
             if !keys.is_empty() {
                 tally
@@ -1049,23 +1210,24 @@ impl WriterState {
         if !answered && now.saturating_sub(self.opens_sent_at) < OPEN_WAIT_MS {
             return None;
         }
-        while let Some(&(channel_id, _)) = self.opens.front() {
+        while let Some(&(channel_id, ..)) = self.opens.front() {
             let mut targets = Vec::new();
-            while let Some(&(channel, id)) = self.opens.front() {
+            let mut asked = HashSet::new();
+            while let Some(&(channel, id, what)) = self.opens.front() {
                 if channel != channel_id || targets.len() >= OPENS_A_FRAME {
                     break;
                 }
                 self.opens.pop_front();
-                if self
+                let owed = self
                     .at
                     .get(&channel)
-                    .is_some_and(|w| !w.over(now) && w.named.contains(&id))
-                {
+                    .is_some_and(|w| w.answers(id, what, now));
+                if owed && asked.insert(id) {
                     targets.push(id);
                 }
             }
             if !targets.is_empty() {
-                self.awaiting = targets.iter().copied().collect();
+                self.awaiting = asked;
                 self.open_frame = targets.len();
                 self.opens_sent_at = now;
                 if let Some(w) = self.at.get_mut(&channel_id) {
@@ -1099,10 +1261,17 @@ impl WriterState {
 
 type HeldPost = (u64, u32, u64);
 
+/// Chains a reader holds of one writer in one channel, the last taken first: libsignal's
+/// `MAX_SENDER_KEY_STATES`, which a key taken again moves to the front. And so the most keys
+/// a writer hands one reader in one hand-off or frame (`channel_state`'s own).
+const SENDER_KEY_STATES: usize = 5;
+
 /// What a reader holds of a client's run: `channel_state`'s reader, and no key in it.
 #[derive(Default)]
 struct ReaderState {
-    keys: HashMap<(u32, u32), u32>,
+    /// By writer and channel: the chains whose key came, newest first. A chain's key opens
+    /// that chain's posts only, so a post lost to a restart stays lost here too.
+    keys: HashMap<(u32, u32), VecDeque<u32>>,
     /// By writer and channel: sent, its chain, when it arrived.
     held: HashMap<(u32, u32), Vec<HeldPost>>,
     hello_spent: f64,
@@ -1336,12 +1505,14 @@ async fn follow_once(c: &FollowClient) -> Result<(), Error> {
                             .get(..4)
                             .and_then(|b| b.try_into().ok())
                             .map_or(0, u32::from_le_bytes);
-                        let held = reader.keys.entry((from, channel_id)).or_insert(0);
-                        *held = chain.max(*held);
-                        let held = *held;
+                        let held = reader.keys.entry((from, channel_id)).or_default();
+                        held.retain(|on| *on != chain);
+                        held.truncate(SENDER_KEY_STATES - 1);
+                        held.push_front(chain);
+                        let held = &*held;
                         if let Some(posts) = reader.held.get_mut(&(from, channel_id)) {
                             posts.retain(|(sent, on, _)| {
-                                if *on > held {
+                                if !held.contains(on) {
                                     return true;
                                 }
                                 note_opened(tally, (from, channel_id, *on), *sent, now);
@@ -1352,8 +1523,8 @@ async fn follow_once(c: &FollowClient) -> Result<(), Error> {
                     ServerMessage::TextPost { channel_id, user_id, ciphertext, .. } => {
                         tally.add(|t| &t.posts_in);
                         if let Some((sent, chain)) = read_post(&ciphertext) {
-                            let key = reader.keys.get(&(user_id, channel_id)).copied().unwrap_or(0);
-                            if key >= chain {
+                            let key = reader.keys.get(&(user_id, channel_id));
+                            if key.is_some_and(|held| held.contains(&chain)) {
                                 tally.post_ms.lock().unwrap().push(now.saturating_sub(sent));
                             } else {
                                 reader

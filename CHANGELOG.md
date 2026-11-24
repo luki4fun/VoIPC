@@ -108,6 +108,13 @@ No outside cryptographer has reviewed it.
   - Seat keys dated ahead switched the counter check off; they now count from when they were met.
   - After a recovery-key reset an app could hand its channels the seat keys from before the rotation the reset asks
     for. It now rotates them first; that a reset asks for one is still held in memory only (Known, below).
+- **On a relay with `group_key = false` (or one from before 1.14), a relay could show you a post you had already read**,
+  and an old edit or reaction with it. It had to hold back keys and hand them over late, together with a made-up key
+  request: five keys before, one key during 1.14's development. The app now remembers what it read on a connection and
+  refuses it a second time. Two ways around this are left, as before, and both need a key the relay held back and a
+  writer with an account. One is the relay naming that account under another id. The other is a reconnect. Nothing
+  becomes readable that was not readable already. A writer also hands one reader at most 5 keys at a time, which
+  bounds what a made-up request costs, and keeps every key message under the size limit.
 
 ### Added
 - **The group epoch key in every text channel and voice room** (`group_key = true`, [GROUP-KEY.md](docs/GROUP-KEY.md)).
@@ -253,6 +260,11 @@ No outside cryptographer has reviewed it.
   could be from before the asker joined, and the Refresh then counted as the sweep, so no new one came for minutes. The
   app now looks again only at a list asked after the request: a whole sweep follows the Refresh, within the sweep's
   usual budget.
+- **On a relay with `group_key = false` (or one from before 1.14), a post could stay locked for someone still in the
+  channel** when another person left just as it went out. The relay sends its word that someone left once a second,
+  and that word could reach the writer between the post and its key. The writer then refused the key to readers it had
+  already named, so they waited for the writer's next post. Now the writer still hands that key, for up to 60 s, to
+  whoever it named, and later posts go on a new key. CI hit this in 1 to 5 runs in 100.
 
 ### Known
 - Watching through an edge was tested in Chromium (the `EDGE=1` lane of test-web.sh, in CI). Firefox, the desktop

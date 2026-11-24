@@ -444,7 +444,8 @@ export const sentPost = `(${sentKind("#75")} || ${sentKind("#27")})`;
  * `__voipc_barrier`). After it, everything the earlier tabs sent has been handled, and what
  * the relay passed on from it is in the later tabs' queues and recorded (`__voipc_heard`).
  * Only for what an app sends as part of a step: a send behind an app's own timer is not
- * covered. False: a tab had no session there.
+ * covered, nor what the relay sends on its own ticks (ChannelExits, ChannelCounts: wait for
+ * those). False: a tab had no session there.
  */
 export async function barrier(server, ...tabs) {
   for (const tab of tabs) {
