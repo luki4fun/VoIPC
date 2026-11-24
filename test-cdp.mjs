@@ -216,9 +216,15 @@ export async function openTab(cdpPort, opts = {}) {
   // says so (test-web.sh counts it); what the broken load threw is not the page's error.
   // A file that failed for a reason of its own (a reset, a close, a timeout) is the relay's or the
   // link's: once one has, no ERR_FAILED alongside it loads the tab again either.
+  // Nor what the document that lost it threw, whatever file it names: soak 45445910136 lost
+  // core-*.js, and the broken page's dynamic import of ui-prefs-*.js (which needs it) failed
+  // under that chunk's name. `doc` counts the tab's documents (a navigation clears every
+  // context); entries already in `errors` stay, as lanes count from an index into it.
   const verifierFailed = new Set();
   let reloaded = false;
   let ownCause = false;
+  let doc = 0;
+  let brokenDoc = -1;
   const ownAsset = (url) => {
     try {
       return new URL(url).pathname.startsWith("/assets/");
@@ -270,16 +276,20 @@ export async function openTab(cdpPort, opts = {}) {
         verifierFailed.add(url);
         if (!reloaded) {
           reloaded = true;
+          brokenDoc = doc;
           console.log(`NOTE chrome lost a file of the page (${p.errorText} ${url}): the tab loads again`);
           send("Page.reload", { ignoreCache: true }).catch(() => {});
         }
       }
+    } else if (msg.method === "Runtime.executionContextsCleared") {
+      doc++;
     } else if (msg.method === "Runtime.exceptionThrown") {
       // A rejection with a plain object describes itself as "Object": its
       // preview and where it was thrown are what make the report readable (detailed)
       const d = p.exceptionDetails;
       const at = d.stackTrace?.callFrames?.[0] ?? (d.url ? { url: d.url, lineNumber: d.lineNumber ?? 0 } : null);
       if (foreign(at?.url)) return;
+      if (doc === brokenDoc) return;
       if (byVerifier(`${d.text ?? ""} ${d.exception?.description ?? ""}`)) return;
       // A file that did not load says why it did not, from the network's side
       const why = /dynamically imported module|preload CSS/.test(`${d.exception?.description}`)
@@ -294,6 +304,7 @@ export async function openTab(cdpPort, opts = {}) {
     if (msg.method === "Runtime.consoleAPICalled" && p.type === "error" && consoleErrors) {
       const at = p.stackTrace?.callFrames?.[0];
       if (foreign(at?.url)) return;
+      if (doc === brokenDoc) return;
       if (byVerifier(p.args.map((a) => a.value ?? a.description ?? "").join(" "))) return;
       // test-ui's lines never had the prefix, test-move's always did
       errors.push(`${detailed ? "" : "console: "}${p.args.map((a) => a.value ?? (preview(a) || a.description) ?? "").join(" ")}${where(at)}`);
