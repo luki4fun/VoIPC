@@ -29,6 +29,8 @@ import {
 } from "../../lib/share-rules";
 import type { SessionContext, ShareApi, VideoCodec } from "./types";
 import { audio } from "./audio";
+import { PACE_GATE_MS } from "../../lib/video-pacer";
+import { traceFrame } from "./share-trace";
 
 /** Encoder candidates in preference order: first one that really encodes wins. */
 const ENCODER_CANDIDATES: { codec: VideoCodec; webCodec: string }[] = [
@@ -55,6 +57,13 @@ const MAX_ENCODER_FAILURES = 3;
 
 /** The ladder's last changes, kept for the self-test (capped-link lane). */
 const LADDER_STEPS_KEPT = 64;
+/**
+ * Our own uplink found queued steps the ladder down without its 3 s hold, which waits out the
+ * viewers' reports of one loss: the find is ours and comes once (lib/video-pacer.ts), and the
+ * share is paced at the link's rate from then on. A step from the start level goes at once,
+ * one after a step waits this long for the step before to show.
+ */
+const UPLINK_STEP_HOLD_MS = 1000;
 
 /** Chromium reads the capture track directly; Firefox goes through a <video>. */
 function hasTrackProcessor(): boolean {
@@ -120,6 +129,10 @@ export class ShareSender implements ShareApi {
 
   private framesSent = 0;
   private bytesSent = 0;
+  /** Frames not encoded because the pacer held more than PACE_GATE_MS (self-test). */
+  private pacedSkips = 0;
+  /** The last find of our own uplink queued that the ladder took (performance.now() ms). */
+  private uplinkSeenAt = 0;
 
   get available(): boolean {
     return (
@@ -220,6 +233,7 @@ export class ShareSender implements ShareApi {
     this.lastChange = "start";
     this.lossAt = 0;
     this.steps = [];
+    this.pacedSkips = 0;
 
     ctx.sendControl({
       StartScreenShare: { source: "browser", resolution: this.shareHeight, codec: this.codec },
@@ -281,6 +295,9 @@ export class ShareSender implements ShareApi {
     this.dropDeltasUntilKey = false;
     this.encoderFailures = 0;
     this.firstChunkUs = null;
+    // Sent as it comes until the link shows a queue (transport, lib/video-pacer.ts)
+    this.ctx?.uplinkReset();
+    this.uplinkSeenAt = 0;
     // Its video starts one level low and climbs once the link carries it
     // (nextLevel); a level the ladder stepped below that stays, and its quiet
     // counts again from now: time with nobody watching tells nothing of the link.
@@ -408,6 +425,8 @@ export class ShareSender implements ShareApi {
    */
   private onTick(): void {
     if (!this.encoding) return;
+    // The uplink's judge and pacer on this clock too, which a hidden tab does not clamp
+    this.ctx?.uplinkTick();
     const video = this.videoEl;
     if (video && video.readyState >= 2) {
       let frame: VideoFrame | null = null;
@@ -486,6 +505,15 @@ export class ShareSender implements ShareApi {
     if (!encoder || encoder.state !== "configured") return;
     // A backlog in the encoder means we cannot keep up: skip this frame.
     if (encoder.encodeQueueSize > 2) return;
+    // Our uplink queued, so video is paced at what it delivers, and more waits for the pacer
+    // than that lets out soon (or, on the TCP fallback, in the socket ahead of a ping): the
+    // encoder is over the link (WebCodecs has no VBV), so this frame is skipped, and the next
+    // one, or the tick's repeat, comes once that went out. Never a frame dropped after
+    // encoding: the deltas after it would go too. Unpaced, nothing waits there.
+    if (ctx.videoQueuedMs() > PACE_GATE_MS) {
+      this.pacedSkips++;
+      return;
+    }
 
     const keyFrame = this.wantKey();
     try {
@@ -636,6 +664,23 @@ export class ShareSender implements ShareApi {
   /** Step the quality ladder when the loss picture changed (mod.rs adapt). */
   private adapt(): void {
     const now = performance.now();
+    // Our own uplink found queued: loss to the ladder, as network.rs congestion_task's is,
+    // and a step down now rather than after the hold (UPLINK_STEP_HOLD_MS)
+    const queuedAt = this.ctx?.uplinkQueuedAt() ?? 0;
+    if (queuedAt > this.uplinkSeenAt) {
+      this.uplinkSeenAt = queuedAt;
+      if (__SELFTEST__) console.info(`own uplink queued ${Math.round(queuedAt - this.startedAt)} ms into the share: counted as loss`);
+      this.lossAt = Math.max(this.lossAt, queuedAt);
+      const hold = this.lastChange === "start" ? 0 : UPLINK_STEP_HOLD_MS;
+      if (this.level < LEVELS.length - 1 && now - this.levelChangedAt >= hold) {
+        this.setLevel(this.level + 1, "down");
+        this.reconfigure();
+        console.info(
+          `screen share quality level ${this.level}: ${Math.round(this.currentBitrate() / 1000)} kbps, ${this.currentFps()} fps (own uplink queued)`,
+        );
+        return;
+      }
+    }
     const lossAge = this.lossAt === 0 ? Number.MAX_SAFE_INTEGER : now - this.lossAt;
     // Nothing has crossed the link yet (no media key, a still screen): no quiet to count
     const since = this.lastChange === "start" && !this.sentSinceStart ? 0 : now - this.levelChangedAt;
@@ -656,6 +701,24 @@ export class ShareSender implements ShareApi {
     const at = Math.round(this.levelChangedAt - this.startedAt);
     this.steps.push({ at, t: Date.now(), level, change });
     if (this.steps.length > LADDER_STEPS_KEPT) this.steps.shift();
+  }
+
+  /** Frames the pacer's gate skipped since the share started (self-test). */
+  pacedSkipCount(): number {
+    return this.pacedSkips;
+  }
+
+  /**
+   * Each time this share found its uplink queued (self-test): ms since it started, delivered and
+   * paced kbps, the link's least and the floor past it (ms), 1 if it was what was still out.
+   */
+  uplinkFinds(): number[][] {
+    return (this.ctx?.uplinkFinds() ?? []).map(([at, delivered, paced, ...rest]) => [
+      Math.round(at - this.startedAt),
+      Math.round(delivered / 1000),
+      Math.round(paced / 1000),
+      ...rest,
+    ]);
   }
 
   /** The ladder's changes since the share started (self-test). */
@@ -710,7 +773,9 @@ export class ShareSender implements ShareApi {
       console.warn(`video encryption failed (frame ${frameId}):`, e);
       return;
     }
-    if (!ctx.sendVideoFrame(body, key)) {
+    const sent = ctx.sendVideoFrame(body, key);
+    if (__SELFTEST__) traceFrame(body.length, key, this.level, sent, ctx.videoBacklog(), ctx.videoQueuedMs());
+    if (!sent) {
       // Our uplink is the bottleneck: the ladder treats it as loss, like the
       // native sender's full video channel does.
       this.lossAt = performance.now();

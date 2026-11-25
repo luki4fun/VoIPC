@@ -179,6 +179,8 @@ grep -qs SELFTEST client/dist-web/assets/*.js ||
 TCP_PORT="${TCP_PORT:-19987}"
 DURATION="${DURATION:-15000}"
 SHARE_PARAMS="&share_res=${SHARE_RES:-480}&share_fps=${SHARE_FPS:-15}&share_noise=${SHARE_NOISE:-0}"
+# The capped-link lane also prints what its share and voice did on the way (share-trace.ts)
+if [ "${EXPECT_LADDER:-}" = 1 ]; then SHARE_PARAMS="$SHARE_PARAMS&trace=1"; fi
 # alice sends bob a file this size (KiB) while she talks; 0 sends none
 FILE_KIB="${FILE_KIB:-10240}"
 WORK="$(mktemp -d)"
@@ -482,8 +484,10 @@ extract() { grep -ao 'SELFTEST .*' "$1" | sed 's/", source:.*$//; s/\\"/"/g' > "
 extract "$WORK/alice.log" "$WORK/alice.txt"
 extract "$WORK/bob.log" "$WORK/bob.txt"
 echo "--- self-test: $blank_loads blank first load(s) tried again"
-echo "--- alice"; cat "$WORK/alice.txt"
-echo "--- bob";   cat "$WORK/bob.txt"
+# The capped-link lane's raw trace rows (share-trace.ts) stay in the kept files: what they say
+# is printed below, in one line
+echo "--- alice"; grep -v '^SELFTEST trace-' "$WORK/alice.txt" || true
+echo "--- bob";   grep -v '^SELFTEST trace-' "$WORK/bob.txt" || true
 
 fail=0
 : > "$WORK/fails.txt"
@@ -636,6 +640,32 @@ if [ "${EXPECT_LADDER:-}" = 1 ]; then
     console.log(stepped ? "PASS" : "FAIL", "the quality ladder of alice stepped down under the cap");
   ' "$WORK/alice.txt" "$WORK/bob.txt" "${TALK_MS:-4000}")
   echo "--- capped link: $(head -1 <<< "$ladder")"
+  # What lay behind those numbers (share-trace.ts, test builds): alice's voice as bob got it in
+  # the same 4 s, and her share's first 4 s as it went to her link
+  echo "--- capped link trace: $(node -e '
+    const fs = require("fs");
+    const lines = (f) => fs.readFileSync(f, "utf8").split("\n");
+    const body = (l) => JSON.parse(l.slice(l.indexOf(" ", 9) + 1, l.lastIndexOf(" @")));
+    const rows = (f, what) => lines(f).filter((l) => l.startsWith(`SELFTEST trace-${what} `)).flatMap(body);
+    const A = process.argv[1], B = process.argv[2];
+    const ladder = lines(A).filter((l) => l.startsWith("SELFTEST share-ladder ")).map(body).pop() ?? { steps: [] };
+    const videoAt = (ladder.steps.find((s) => s.change === "start") ?? { t: 0 }).t;
+    const talk = lines(A).find((l) => l.startsWith("SELFTEST transmit-started"));
+    const from = Math.max(videoAt, talk ? +talk.slice(talk.lastIndexOf("@") + 1) : 0);
+    const heard = new Map();
+    for (const [, seq, at] of rows(B, "voice-in")) heard.set(seq, at);
+    const out = rows(A, "voice-out").filter(([, at]) => at >= from && at < from + 4000);
+    const late = out.filter(([seq]) => heard.has(seq)).map(([seq, at]) => heard.get(seq) - at).sort((x, y) => x - y);
+    const pick = (xs, q) => (xs.length ? Math.round(xs[Math.min(xs.length - 1, Math.floor(q * xs.length))]) : null);
+    const frames = rows(A, "frames").filter(([at]) => at >= videoAt && at < videoAt + 4000);
+    const closed = rows(A, "writes").filter(([at, , , end]) => at >= videoAt && at < videoAt + 4000 && end > 0).map(([at, , , end]) => end - at).sort((x, y) => x - y);
+    console.log(JSON.stringify({
+      voice: { sent: out.length, never_came: out.filter(([seq]) => !heard.has(seq)).length, one_way_ms: { p50: pick(late, 0.5), p90: pick(late, 0.9), max: pick(late, 1) } },
+      video_first_4s: { frames: frames.filter((f) => f[4]).length, kbps: Math.round(frames.filter((f) => f[4]).reduce((n, f) => n + f[1], 0) * 8 / 4000), keys: frames.filter((f) => f[2]).length,
+        stream_done_ms: { p50: pick(closed, 0.5), max: pick(closed, 1) } },
+      paced_skips: ladder.paced_skips ?? null,
+    }));
+  ' "$WORK/alice.txt" "$WORK/bob.txt" 2>&1 | head -1)"
   while read -r verdict what; do
     echo "$verdict $what"
     if [ "$verdict" != PASS ]; then echo "FAIL $what" >> "$WORK/fails.txt"; fail=1; fi
@@ -807,7 +837,7 @@ if [ "$fail" -ne 0 ]; then
   annotate "test-web $BROWSER_ALICE -> $BROWSER_BOB" "$(
     cat "$WORK/fails.txt"
     echo "--- UDP packets dropped for a full socket buffer during this run: $udp_dropped"
-    echo "--- alice"; tail -20 "$WORK/alice.txt"
-    echo "--- bob";   tail -20 "$WORK/bob.txt")"
+    echo "--- alice"; grep -v '^SELFTEST trace-' "$WORK/alice.txt" | tail -20
+    echo "--- bob";   grep -v '^SELFTEST trace-' "$WORK/bob.txt" | tail -20)"
 fi
 exit $fail

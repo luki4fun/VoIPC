@@ -253,10 +253,70 @@ No outside cryptographer has reviewed it.
   on a small uplink, it filled the link for the seconds before the first loss report came back, and voice lost frames
   meanwhile. A climb that meets loss steps back at once instead of after 3 s. On a link with room, a share reaches
   full quality about 5 s after its first frames. Measured on a 6 Mbit/s link with a 720p30 share whose picture does
-  not compress (Known, below): voice lost 1.1-2.3 % over 15 s of talk where it lost 2.3-2.5 %, and 3.6-7.6 % in the
-  first 4 s as the share started, where it lost 4.9-7.2 % (this machine, 4 cores, 4 runs against 2).
+  not compress: voice lost 1.1-2.3 % over 15 s of talk where it lost 2.3-2.5 %, and 3.6-7.6 % in the first 4 s as the
+  share started, where it lost 4.9-7.2 % (this machine, 4 cores, 4 runs against 2). In the browser, a watch on its
+  own uplink took the rest (Fixed, below).
 
 ### Fixed
+- **Voice lost frames for the first seconds of a screen share from the browser on an uplink too small for it**, and CI's
+  capped-link lane was red for it (4.3-8.3 % in the first 4 s, in 6 runs of 6). A browser's video encoder keeps to no
+  rate: WebCodecs has no VBV, and Chromium's software H.264 encoder sends what the picture costs whatever bitrate it is
+  asked for, in every bitrate mode, "constant" too (on the lane's moving picture 3.2 Mbit/s at 720p30 with 1.8 or 3.0
+  asked, 8.4 at 1080p30 with 3 or 5). All of it went to the link at once, and a link smaller than that queued it for the
+  3-4 s until a viewer's report stepped the share down: voice came 170-350 ms late where it takes 50, up to 650, and
+  much of what the listener counted lost came too late to play. The browser now watches its own uplink, as the desktop
+  apps do: over WebTransport by how long the relay takes to ack each frame, how many frames are still out unacked and
+  how fast the acks come back (Chromium has no WebTransport `getStats`), over the TCP fallback by a ping through the
+  tunnel three times a second while video goes out (the socket's queue shows in nothing a page can read). A queue is
+  video backing up while the link delivers at a steady rate, its own: over WebTransport the rate the acks come back at,
+  over the TCP fallback the rate between two pongs with video sent between their pings, both of which waited behind a
+  queue. Two other things back video up and do not count: a new connection's slow start, whose rate doubles each round
+  trip (on a 300 ms round trip a QUIC path's first frames' acks take 0.7-1.3 s, and a TCP connection's window of ten
+  segments takes four or five round trips to carry a share's first keyframe), and a path that stalls both ways for a
+  moment, as Wi-Fi can, after acks that came on time. While there is no queue, the share goes out as before, as fast as
+  it comes. Once there is one,
+  the share steps down at once instead of after the ladder's 3 s hold, and goes out paced at what the link was seen to
+  deliver (half of that for up to a second, to drain what queued), rising slowly while the encoder wants more; the
+  browser encodes no new frame while more than 100 ms of video waits, so an encoder over the link sends fewer frames,
+  never broken ones. Over the TCP fallback what waits in the socket ahead of the oldest ping still out counts too,
+  from the share's start on: voice there waits behind little more than that before any queue is found, and a slow
+  start holds the encoder only while it lasts. After 2 s paced with no queue found, the share goes out unpaced again
+  to see whether the link still needs pacing; each time that finds the queue again within 3 s, the next try waits
+  twice as long, up to 8 s. Voice and control never wait for it. This machine (4 cores), each run followed by one of
+  the code before this change on the same lane:
+  - CI's capped lane (6 Mbit/s): voice lost 0-0.53 % in the first 4 s in 3 runs (3.2-6.0 % in the 3 runs before) and
+    0-0.13 % over the whole share (0.8-1.5 %), and came 46-47 ms after it was sent, 79 at most. The share stepped down
+    0.62-0.67 s after its video started (3.1 s).
+  - 4.5 Mbit/s: 0-1.7 % in the first 4 s in 2 runs (7.5-10.0 %), 0-0.4 % over the share (2.0-2.4 %), the step down
+    0.64-0.65 s after the video started (4.2-4.3 s).
+  - 3 Mbit/s, a link below the start level: 5.7-10.5 % in the first 4 s in 2 runs (13.9-19.3 %), 3.2-3.6 % over the
+    share (6.8-9.9 %), the step down 0.67-0.91 s after the video started (4.3-4.8 s), and the viewer drew 9-10 pictures
+    a second (6.5-7.5).
+  - The TCP fallback under the 6 Mbit/s cap: 0 % in the first 4 s in 2 runs (11.0-13.8 %), 0-0.13 % over the share
+    (7.9-10.0 %), the step down 1.3-1.8 s after the video started (24-40 s). With the loopback's MTU at 1500 bytes
+    (the lanes' 65536 gives TCP a first window of 640 KB): 0.5 % in the first 4 s (20.1 %), 0.3 % over the share
+    (14.2 %), the step down 1.4 s in.
+  - Links with room over the TCP fallback, with the loopback's MTU at 1500 bytes, against the run before: a 300 ms round
+    trip with the capped lane's picture 0.94-1.00 of its pictures in each 10 s (2 runs), with the 1080p30 one
+    0.99-1.16 and voice 0 % in the first 4 s (0.6-1.4 %); a 120 ms round trip with the 1080p30 one 1.00-1.01, with the
+    capped lane's picture 0.99-1.03 in 2 runs and 0.88 in a third, in whose 4th second the tunnel stood still for
+    1.4 s (voice 6.6 % in the first 4 s there, 0 % before). None found a queue; the hold on what waits in the socket
+    skipped 1-39 frames a run. At the loopback's own MTU, where TCP carried much less on a 300 ms round trip (the viewer
+    drew 2-8 pictures a second before), the shares that lost 26-35 % of voice over their talk before lost 0.4 % at
+    720p30, with no queue found and the viewer drawing 25-30 pictures a second, and 2.9 % at 1080p30, one queue found
+    at 2.0 Mbit/s, drawing 9-15.
+  - A cap that lifts 15 s into a 1080p30 share of that picture: from the lift on the viewer drew 0.99-1.18 times the
+    pictures of the run before in each 10 s, unpaced again 3.5 s after the lift; under the cap voice lost 3.5 % (6.7 %).
+  - Links with room, the viewer's pictures in each 10 s against the run before: a 300 ms round trip with the capped
+    lane's picture 0.95-1.01 (2 runs), with a 1080p30 one that costs 8.4 Mbit/s 0.94-1.00 in 1 run and 0.83-0.99 in
+    another (its first 10 s, in which a new path refuses some 20 of that share's streams before and after this change),
+    a 200 ms round trip with that one 0.95-0.99, no delay at 1080p30 1.00 over QUIC and the TCP fallback and at 1080p60
+    over the TCP fallback 1.00, with no frame refused. None of these found a queue. A 100 ms round trip with the 1080p30
+    picture drew 0.50-2.00 of the run before in 3 runs and found no queue either: the viewer's loss reports at its start
+    stepped that share down 3.1 s in, in 2 runs of 3 before this change and 2 of 3 after. With a 200 ms stall every 10 s
+    (netem, 0.2 s each) no run found a queue either (6 runs); the viewer's own loss reports step that share down at some
+    of the stalls, before and after this change alike, so its 10 s windows came out 0.51-1.97 of the run before. The
+    lossy lane found one in 1 run of 3 (Known, below).
 - **Many people signing in at once stopped the relay signing anyone in.** Past 32 sign-ins at once it told the next
   one it was busy, after its whole handshake, and the app came back with another: 50,000 accounts arriving after a
   restart went from 390 sign-ins a second to 10. A sign-in now waits its turn for up to 10 s.
@@ -286,17 +346,49 @@ No outside cryptographer has reviewed it.
 ### Known
 - Watching through an edge was tested in Chromium (the `EDGE=1` lane of test-web.sh, in CI). Firefox, the desktop
   apps and Android were not tried yet, nor an edge or a viewer on another machine.
-- **Voice still loses frames when a screen share starts on a link too small for it**: 3.6-7.6 % in the first 4 s, over
-  the capped-link lane's 2 % (4.0-8.4 % on CI's runners in 6 runs, where the whole share lost 1.2-2.5 %, so the lane's
-  check over all of it is red in some runs too: 2 of the 6). Most of it falls in the first second the video flows, and some of it is the start
-  itself, not the link: on a far link with no cap at all one run lost 2.2 %. Tried and left out of 1.14 (2026-11-23):
-  the desktop's own-uplink watch, ported to the browser (Chromium 156 has no WebTransport `getStats`, so it timed
-  pings) steps the share down sooner but lost as much voice; fewer video frames in flight halved the loss on the
-  capped link but throttled a healthy far one. Chromium's software H.264 encoder sends 2-20 times the share's bitrate
-  on dense moving detail (the lane's random blocks, or a faint grain), so on such a picture only the halved frame rate
-  two levels down lightens the link. The lower start was measured in Chromium only; in the desktop apps it is
-  unit-tested and builds for Linux and Windows, but no real capture ran it yet, and on encoders that cannot change
-  their rate in place (the hardware ones) each level change rebuilds the encoder and sends a keyframe, the climb too.
+- **The browser share's uplink watch was measured in Chromium**, a Firefox sharer only under the 6 Mbit/s cap and in
+  the Firefox lanes (H.264, on this machine: the capped-link lane at 6, 4.5 and 3 Mbit/s over QUIC and the TCP
+  fallback, a cap that lifts, far links with room, delay spikes, and the lossy, TCP, edge and Firefox lanes). **Over
+  WebTransport a Firefox sharer keeps the share's behaviour from before this change**: Firefox resolves a WebTransport
+  stream's close at once (0-4 ms on a 40 ms round trip), not when the relay acked it, so the watch never sees a queue
+  there. Under the 6 Mbit/s cap a Firefox sharer (VP9) lost 3.6 % of voice over its talk with no queue found (3.8 %
+  before). **Over the TCP fallback a Firefox sharer runs the ping watch, its pacing and the hold on what waits in the
+  socket as Chromium does**: under the 6 Mbit/s cap, with a Chromium viewer on QUIC, it lost 0.8 % of voice over its
+  talk with one queue found 3.0 s after its video started (2.9 % before, in one run each), and the uncapped
+  Firefox-over-TCP lane passes; no other link was tried with it. A real screen's picture and a real Wi-Fi link were
+  not tried; the stalls measured are netem's, 200 ms for 0.2 s every 10 s. A sharer's tab hidden for 6.5 minutes under
+  the cap from the share's start lost 0.05 % of voice (0.25 %).
+- **What queues before the watch finds it still costs voice.** Over WebTransport it waits for three windows of the
+  link's own steady delivery, each 200 ms, three of the shortest round trips the link has shown or two of its own gaps
+  between acks, whichever is longest: three, so that a slow start's acks, which come in bursts a round trip apart,
+  cannot pass for a link's own rate, and two gaps, so that a link one frame takes 300 ms or more to cross (720p30 at
+  about 350 kbit/s, 1080p30 at 930) fills each window; such a link is found 1.8-3.4 s into the share (unit-modelled,
+  never found before). On a small link the frames handed meanwhile take a second or more to cross, and voice waits
+  behind them: at 3 Mbit/s 5.7-10.5 % (13.9-19.3 % before) in the first 4 s of talk, and a 1080p30 share of that
+  picture under the 6 Mbit/s cap 8.1 % (11.2 % before), 3.5 % over its 15 s of talk (6.7 %). Each find counts as loss
+  for the ladder, so a link too small for the bottom level is found again every few seconds as the pacing rises or a
+  try unpaced meets the queue. The climb, 30 s into a share, still finds the link too small and steps back: in the 4 s
+  after it voice lost 3.1 % over WebTransport and 6.6 % over the TCP fallback, one run each. The lossy lane (5 % loss,
+  40 ms either way) found a queue that was not one in 1 run of 3: its acks come 40-120 ms late at random and the least
+  is the luckiest of them; the share was already at its lowest level there. On a far link with room the share's start
+  itself still costs some voice, as before this change, since the watch finds no queue there: on a 300 ms round trip
+  with the 1080p30 picture 0-1.7 % in the first 4 s of talk over WebTransport in 3 runs (0-1.6 % before; one earlier
+  run lost 2.2 %).
+- **Over the TCP fallback the watch needs the pongs of three pings**, the last two of which waited behind a queue with
+  video sent between them, so it finds a queue 1.3-1.8 s after the video starts in the capped lane, and its pings take
+  3 of the 55 voice packets a second the relay lets each sender send. Until then only the encoder's hold keeps video
+  from piling up in the socket, and it sees a queue a round trip late: on a 300 ms round trip with TCP carrying less
+  than the share (the loopback's own MTU, Fixed above), a 1080p30 share's voice came up to 2.8 s late in its first 2 s
+  and 74 of 200 packets were dropped behind the socket in the next second, 25 % in the first 4 s of talk (35 %
+  before); 720p30 lost 1.9 % there (27 %). A hold on a tunnel that stood still lasts as long as it does (1.4 s in one
+  run: no frames sent meanwhile, voice up to 1.1 s late behind what was sent before it). A ping whose pong the relay
+  dropped holds the encoder until the next ping's pong and times nothing after 2 s, nor once a new share's video
+  starts. The 1500-byte-MTU rows are this machine's loopback with netem, no real long path.
+- **The desktop apps' share does not watch its uplink the browser's way.** Their encoders keep to the level's rate
+  themselves (VBV, up to half a second of it in one frame), QUIC paces what they send, and their uplink watch reads
+  QUIC's round trip. The lower start is unit-tested there and builds for Linux and Windows, but no real capture ran it
+  yet, and on encoders that cannot change their rate in place (the hardware ones) each level change rebuilds the
+  encoder and sends a keyframe, the climb too.
 - **The group key ran in end-to-end tests** of the relay with the apps' own key code, on SQLite and Postgres, and in the
   browser lanes of test-web.sh (Chromium, and a Chromium and Firefox pair). The desktop apps and Android were not tried
   against it by hand yet, nor keyholders on machines of their own, nor how long a browser's stepped builds take on a busy

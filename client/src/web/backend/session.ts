@@ -26,6 +26,7 @@ import { Files, originOf, sanitizeImage } from "./files";
 import { Emotes, emoteLimitsOf } from "./emotes";
 import { motionOf } from "./media";
 import { postsMarks } from "./posts-marks";
+import { traceVoice } from "./share-trace";
 import { asksBundles, ChannelListParts, GkPump, gkPathAfter, gkPosts, gkRuns, KeptByAccount, LivePump, ReadyClock, yieldTask, type GkPath } from "./live";
 
 /** Bound for the authentication response (network.rs CONNECT_TIMEOUT). */
@@ -615,6 +616,7 @@ export class Session implements SessionContext, AccountHost {
   }
 
   sendDatagram(bytes: Uint8Array): void {
+    if (__SELFTEST__) traceVoice(bytes, true);
     this.transport?.sendDatagram(bytes);
   }
 
@@ -624,6 +626,30 @@ export class Session implements SessionContext, AccountHost {
 
   videoBacklog(): number {
     return this.transport?.videoBacklog() ?? 0;
+  }
+
+  videoQueuedMs(): number {
+    return this.transport?.videoQueuedMs() ?? 0;
+  }
+
+  uplinkQueuedAt(): number {
+    return this.transport?.uplinkQueuedAt() ?? 0;
+  }
+
+  uplinkReset(): void {
+    this.transport?.uplinkReset();
+  }
+
+  uplinkTick(): void {
+    const transport = this.transport;
+    if (!transport?.uplinkTick()) return;
+    // A Ping like the keepalive's: its sequence is the time, and the relay echoes it
+    const stamp = nowU32();
+    transport.sendProbe(wasm().buildPingPacket(this.sessionId, stamp), stamp);
+  }
+
+  uplinkFinds(): number[][] {
+    return this.transport?.uplinkFinds() ?? [];
   }
 
   /** An already encoded control payload (the account sign-in makes its own). */
@@ -883,6 +909,7 @@ export class Session implements SessionContext, AccountHost {
    * media modules decrypt with *its* keys and mix by *its* session ids.
    */
   onDatagram(bytes: Uint8Array): void {
+    if (__SELFTEST__) traceVoice(bytes, false);
     switch (bytes[0]) {
       case 0x05:
         if (this === voiceOwner) audio.onVoicePacket(bytes);
@@ -922,7 +949,10 @@ export class Session implements SessionContext, AccountHost {
     }
     const rtt = (nowU32() - sent) >>> 0;
     // Guard against clock weirdness producing huge values
-    if (rtt < 60_000) this.emit("latency-update", { ms: rtt, tcp: this.transport?.tcp ?? false });
+    if (rtt >= 60_000) return;
+    // A probe of a share's uplink (uplinkTick) is the sharer's, not the latency shown
+    if (this.transport?.uplinkPong(sent, rtt)) return;
+    this.emit("latency-update", { ms: rtt, tcp: this.transport?.tcp ?? false });
   }
 
   /** network.rs handle_server_message. */

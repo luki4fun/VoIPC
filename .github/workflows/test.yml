@@ -459,12 +459,19 @@ jobs:
       # the ladder check fails: that is the control that it measures the cap, not the picture.
       # TALK_MS: alice talks across the share's start and its first climb. Voice is gated
       # over the first 4 s of her talk as the share starts (the bar as it was measured, over a
-      # 4 s talk) and over all of it: 4.9-7.2 % / 2.3-2.5 % with the share starting at full
-      # quality, 3.6-7.6 % / 1.1-2.3 % one level low (4 cores here, 2026-11-23; on the runners
-      # 4.0-8.4 % / 1.2-2.5 % in 6 runs, soak 45226171956), so both can be red, the first in
-      # every run so far: its loss comes in the first second the video flows.
-      # SHARE_NOISE's blocks make the encoder send past its bitrate, so only a level's halved
-      # frame rate lightens the link (CHANGELOG 1.14 Known, with what was tried).
+      # 4 s talk) and over all of it. SHARE_NOISE's blocks make Chromium's encoder send what they
+      # cost, whatever bitrate it is asked for (3.2 Mbit/s at 720p30), which filled the link for
+      # 3-4 s: 1.6-8.6 % / 0.4-2.1 % on 4 cores here in 6 runs, 4.3-8.3 % / 1.1-2.0 % on the
+      # runners (6 runs: CI 45375049972, soak 45375328410). The browser watches its own uplink now
+      # (lib/video-pacer.ts UplinkControl): once three 200 ms windows of frame acks show the link
+      # delivering at its own steady rate it finds the queue, 0.62-0.67 s after the video starts
+      # here, steps down at once, paces the share at what the link delivers and, 2 s later with
+      # no queue found, sends it unpaced again (the 15 fps level fits this link): 0-0.53 % /
+      # 0-0.13 % here in 3 runs (2026-11-24). Its climb, 30 s in and outside the talk, finds the
+      # link too small again and steps back; in the 4 s after it voice lost 3.1 % in a longer run.
+      # The "capped link trace" line says where voice went: one-way delay, packets that
+      # never came, and the share's first 4 s as it went out (share-trace.ts; the raw rows in the
+      # kept alice.txt and bob.txt); the share-ladder line in alice's output lists each find.
       - name: Capped link (netem rate)
         if: ${{ !cancelled() && matrix.part == 'lanes' }}
         timeout-minutes: 15

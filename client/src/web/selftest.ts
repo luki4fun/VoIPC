@@ -30,6 +30,9 @@
 //                        viewer's canvas draws) for the capped-link lane; the
 //                        sharer logs its quality ladder's changes (share-ladder), and
 //                        the viewer its voice counters as they move (voice-tick)
+//   trace=1              log what share-trace.ts kept at the end (trace-* lines): the
+//                        sharer's frames as they went to the link, voice packets out
+//                        and in, and the main thread's late moments (capped-link lane)
 //   proximity=off|2d|3d  proximity mode for a channel this run creates
 //   pos=<x,y,z>          stand here (metres) and share the position with the
 //                        channel, so peers receive a position beacon
@@ -45,6 +48,7 @@ import { listen } from "@tauri-apps/api/event";
 import { parseInviteFragment } from "../lib/invite";
 import { checkGoldenValues, testLabel, type ProximityMode } from "../lib/spatial";
 import { share, type ShareSender } from "./backend/share";
+import { traceFrames, traceLag, traceLagStart, traceVoiceIn, traceVoiceOut, traceWrites } from "./backend/share-trace";
 
 interface ChannelInfo { channel_id: number; name: string; text?: boolean }
 interface UserInfo { user_id: number; username: string; channel_id: number; is_screen_sharing?: boolean }
@@ -129,6 +133,7 @@ export async function run(params: URLSearchParams): Promise<void> {
   const fileKib = Number(params.get("file") ?? 0);
   const expectFile = params.has("expect_file");
   const talkMs = Number(params.get("talk_ms") ?? 4000);
+  const trace = params.get("trace") === "1";
   // The server id every server-scoped command names: the address we connect with
   const server = window.location.host;
 
@@ -671,6 +676,7 @@ export async function run(params: URLSearchParams): Promise<void> {
         });
         log("share-started", { resolution: shareRes, fps: shareFps });
         startShareWindows();
+        if (trace) traceLagStart();
       } catch (e) {
         log("error", { message: `share: ${String(e)}` });
       }
@@ -697,6 +703,7 @@ export async function run(params: URLSearchParams): Promise<void> {
           await invoke("watch_screen_share", { sharerUserId: target });
           log("watch-requested", { sharer: target });
           startShareWindows();
+          if (trace) traceLagStart();
         } catch (e) {
           log("error", { message: `watch: ${String(e)}` });
         }
@@ -753,6 +760,17 @@ export async function run(params: URLSearchParams): Promise<void> {
   }
 
   if (shareWindows !== null) clearInterval(shareWindows);
+  // The capped-link lane's trace (share-trace.ts), in lines of 200 rows
+  if (trace) {
+    const dump = (what: string, rows: number[][]) => {
+      for (let i = 0; i < rows.length; i += 200) log(`trace-${what}`, rows.slice(i, i + 200));
+    };
+    dump("frames", traceFrames);
+    dump("writes", traceWrites);
+    dump("voice-out", traceVoiceOut);
+    dump("voice-in", traceVoiceIn);
+    dump("lag", traceLag);
+  }
   if (doShare || doWatch) {
     try {
       const [sent, bytesSent, recv, dropped, bytesRecv, resolution] =
@@ -772,7 +790,11 @@ export async function run(params: URLSearchParams): Promise<void> {
       log("error", { message: `screenshare-stats: ${String(e)}` });
     }
     // Each change of the sharer's quality ladder, ms after the share started
-    if (doShare) log("share-ladder", { steps: (share as ShareSender).ladderSteps() });
+    if (doShare) log("share-ladder", {
+        steps: (share as ShareSender).ladderSteps(),
+        paced_skips: (share as ShareSender).pacedSkipCount(),
+        uplink: (share as ShareSender).uplinkFinds(),
+      });
     if (doShare) await invoke("stop_screen_share").catch(() => {});
   }
 

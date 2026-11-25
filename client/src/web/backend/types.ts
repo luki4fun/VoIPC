@@ -81,6 +81,19 @@ export interface SessionContext {
   sendVideoFrame(body: Uint8Array, key: boolean): boolean;
   /** Video frames still being written to the uplink (0 when not connected). */
   videoBacklog(): number;
+  /**
+   * How long the video waiting for the pacer takes to go out, in ms (0 while unpaced); on the
+   * TCP fallback with what waits in the socket ahead of the oldest ping still out.
+   */
+  videoQueuedMs(): number;
+  /** When our own uplink was last found queued (performance.now() ms), 0 never (lib/video-pacer.ts). */
+  uplinkQueuedAt(): number;
+  /** A share's video starts: sent unpaced, its uplink judged afresh. */
+  uplinkReset(): void;
+  /** The sharer's tick (a worker's clock): judge the uplink, time it with a ping where that is how. */
+  uplinkTick(): void;
+  /** Each time this share found its uplink queued (self-test): UplinkControl.finds. */
+  uplinkFinds(): number[][];
   /** Encode + send a ClientMessage (externally-tagged object or unit-variant string). */
   sendControl(msg: unknown): void;
   /**
