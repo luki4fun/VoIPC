@@ -24,15 +24,20 @@ use voipc_video::convert;
 mod linux;
 #[cfg(target_os = "linux")]
 pub use linux::{
-    enumerate_displays, enumerate_windows, request_screencast, spawn_capture_task, CaptureSession,
+    enumerate_displays, enumerate_windows, share_session, spawn_capture_task, x11_parent,
+    CaptureSession,
 };
 
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(target_os = "windows")]
+mod windows_preview;
+#[cfg(target_os = "windows")]
 pub use windows::{
     enumerate_displays, enumerate_windows, request_screencast, spawn_capture_task, CaptureSession,
 };
+#[cfg(target_os = "windows")]
+pub use windows_preview::source_picture;
 
 // ── Android stubs ────────────────────────────────────────────────────────
 
@@ -297,23 +302,63 @@ const STEP_DOWN_HOLD_MS: u64 = 3_000;
 /// Loss-free time (and time since the last change) before stepping back up.
 #[cfg(not(target_os = "android"))]
 const STEP_UP_AFTER_MS: u64 = 30_000;
-
-/// Next ladder level given the age of the last loss signal and the time
-/// since the last level change (both in ms).
+/// Where a share's video starts: one level below its configured quality.
 #[cfg(not(target_os = "android"))]
-fn next_level(level: u8, loss_age_ms: u64, since_change_ms: u64) -> u8 {
+pub(super) const START_LEVEL: u8 = 1;
+/// Loss-free time from the start of a share's video before its first climb.
+#[cfg(not(target_os = "android"))]
+const FIRST_CLIMB_MS: u64 = 5_000;
+
+/// The ladder's last change: the share's video starting, a climb, or a step down.
+#[cfg(not(target_os = "android"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Change {
+    Start,
+    Up,
+    Down,
+}
+
+/// Next ladder level given the age of the last loss signal, the time since the
+/// last level change (both in ms) and what that change was (share-rules.ts
+/// nextLevel, verbatim). A share's video starts at [`START_LEVEL`]: started at
+/// full quality, it overloaded a small uplink for the seconds before the first
+/// loss report came back, and voice lost frames meanwhile (capped-link lane,
+/// 2026-11-23). The first climb comes once the link has carried the start
+/// [`FIRST_CLIMB_MS`] with no loss at all (counted from the first frame out).
+/// Once a loss came after the start, climbs wait [`STEP_UP_AFTER_MS`] of quiet,
+/// as every later climb does. A climb that meets loss goes back at once,
+/// without the hold, so a link too small for the level above pays one loss
+/// report for trying it.
+#[cfg(not(target_os = "android"))]
+fn next_level(level: u8, loss_age_ms: u64, since_change_ms: u64, last: Change) -> u8 {
     let max = (LEVELS.len() - 1) as u8;
     if loss_age_ms < LOSS_RECENT_MS {
-        if since_change_ms >= STEP_DOWN_HOLD_MS && level < max {
+        if level < max && (last == Change::Up || since_change_ms >= STEP_DOWN_HOLD_MS) {
             level + 1
         } else {
             level
         }
-    } else if loss_age_ms >= STEP_UP_AFTER_MS && since_change_ms >= STEP_UP_AFTER_MS && level > 0 {
+    } else if level == 0 {
+        level
+    } else if last == Change::Start && loss_age_ms >= since_change_ms {
+        // No loss since the video started (any loss is older than the start)
+        if since_change_ms >= FIRST_CLIMB_MS {
+            level - 1
+        } else {
+            level
+        }
+    } else if loss_age_ms >= STEP_UP_AFTER_MS && since_change_ms >= STEP_UP_AFTER_MS {
         level - 1
     } else {
         level
     }
+}
+
+/// Bitrate (kbps) and frame rate of `level` for a share configured at `kbps` and `fps`.
+#[cfg(not(target_os = "android"))]
+pub(super) fn level_rate(kbps: u32, fps: u32, level: u8) -> (u32, u32) {
+    let (scale, divisor) = LEVELS[level as usize];
+    (((kbps as f32) * scale) as u32, (fps / divisor).max(1))
 }
 
 #[cfg(all(test, not(target_os = "android")))]
@@ -322,23 +367,101 @@ mod ladder_tests {
 
     #[test]
     fn steps_down_on_recent_loss_with_hold_and_up_after_quiet() {
+        use Change::*;
         // Fresh loss, long since the last change: one step down
-        assert_eq!(next_level(0, 100, 10_000), 1);
+        assert_eq!(next_level(0, 100, 10_000, Down), 1);
         // A burst of reports within the hold time is one step, not many
-        assert_eq!(next_level(1, 100, 500), 1);
+        assert_eq!(next_level(1, 100, 500, Down), 1);
         // Never past the last rung
-        assert_eq!(next_level(3, 100, 10_000), 3);
+        assert_eq!(next_level(3, 100, 10_000, Down), 3);
         // Loss just stopped: hold the level
-        assert_eq!(next_level(2, 5_000, 5_000), 2);
+        assert_eq!(next_level(2, 5_000, 5_000, Down), 2);
         // Quiet long enough (and not right after a change): climb one rung
-        assert_eq!(next_level(2, 31_000, 31_000), 1);
-        assert_eq!(next_level(2, 31_000, 1_000), 2);
+        assert_eq!(next_level(2, 31_000, 31_000, Down), 1);
+        assert_eq!(next_level(2, 31_000, 1_000, Down), 2);
         // Level 0 with no loss ever (loss_ms = 0 → huge age) stays put
-        assert_eq!(next_level(0, u64::MAX, 60_000), 0);
+        assert_eq!(next_level(0, u64::MAX, 60_000, Up), 0);
         // Every rung keeps at least 1 fps and a positive bitrate
         for (scale, divisor) in LEVELS {
             assert!(scale > 0.0 && divisor >= 1);
         }
+    }
+
+    /// share-rules.test.ts "a share starts one level low...", the same cases.
+    #[test]
+    fn a_share_starts_one_level_low_climbs_after_quiet_and_a_climb_meeting_loss_goes_back() {
+        use Change::*;
+        assert_eq!(START_LEVEL, 1);
+        assert_eq!(level_rate(3000, 30, START_LEVEL), (1800, 30));
+        let never = u64::MAX;
+        assert_eq!(
+            next_level(START_LEVEL, never, 4_999, Start),
+            1,
+            "not before 5 s"
+        );
+        assert_eq!(
+            next_level(START_LEVEL, never, 5_000, Start),
+            0,
+            "5 s without loss"
+        );
+        // A loss after the start, 3 s ago and over now: no quick climb on that link
+        assert_eq!(next_level(START_LEVEL, 3_000, 6_000, Start), 1);
+        // A loss from before this video started does not count
+        assert_eq!(next_level(START_LEVEL, 9_000, 6_000, Start), 0);
+        // Loss at the start level steps down with the hold, as any loss does
+        assert_eq!(next_level(START_LEVEL, 100, 1_000, Start), 1);
+        assert_eq!(next_level(START_LEVEL, 100, 3_000, Start), 2);
+        // The climb met loss: back at once, without the hold
+        assert_eq!(next_level(0, 100, 200, Up), 1);
+        assert_eq!(
+            next_level(1, 100, 200, Down),
+            1,
+            "the next step down holds again"
+        );
+        // After a climb back from loss, the next climb waits the long quiet
+        assert_eq!(next_level(1, 10_000, 10_000, Down), 1);
+        assert_eq!(next_level(1, 30_000, 30_000, Down), 0);
+        // A loss in the start's first second, none since: the long quiet, never stuck at 60 %
+        assert_eq!(next_level(START_LEVEL, 40_000, 41_000, Start), 0);
+        assert_eq!(next_level(START_LEVEL, 599_500, 600_000, Start), 0);
+        assert_eq!(next_level(START_LEVEL, 29_999, 30_500, Start), 1);
+        // A loss at the very moment the video started counts as before it
+        assert_eq!(next_level(START_LEVEL, 5_000, 5_000, Start), 0);
+        // Start at level 0 (a rebuild at the video's start failed): nothing to climb
+        assert_eq!(next_level(0, never, 60_000, Start), 0);
+        assert_eq!(next_level(0, 100, 3_000, Start), 1);
+        // After a successful climb above level 0, the next one waits the long quiet
+        assert_eq!(next_level(2, 10_000, 10_000, Up), 2);
+        assert_eq!(next_level(2, 30_000, 30_000, Up), 1);
+    }
+
+    /// The browser sharer's rule gives the same table (share-rules.test.ts, same grid and
+    /// order): a change to one sharer's rule alone fails here or there.
+    #[test]
+    fn next_level_gives_the_table_the_browser_sharer_is_held_to() {
+        const AGES: [u64; 9] = [
+            100,
+            1_999,
+            2_000,
+            3_000,
+            4_999,
+            5_000,
+            6_000,
+            30_000,
+            1_000_000_000_000,
+        ];
+        let mut got = String::new();
+        for level in 0..LEVELS.len() as u8 {
+            for age in AGES {
+                for since in AGES {
+                    for change in [Change::Start, Change::Up, Change::Down] {
+                        got.push(char::from(b'0' + next_level(level, age, since, change)));
+                    }
+                }
+            }
+        }
+        let want = include_str!("../../../src/lib/share-ladder-grid.txt").trim();
+        assert_eq!(got, want);
     }
 
     /// Indices of the arrivals `run_encode_loop` encodes, on a fake clock
@@ -411,6 +534,11 @@ pub(crate) struct FrameProcessor {
     /// Ladder level currently applied to the encoder.
     pub level: u8,
     pub level_changed: Instant,
+    /// What the last level change was (`next_level`).
+    pub last_change: Change,
+    /// A frame went out since the video started: until one does, the first
+    /// climb's quiet does not count.
+    pub sent_since_start: bool,
     pub video_tx: mpsc::Sender<Vec<u8>>,
     pub session_id: u32,
     pub media_key: Arc<std::sync::Mutex<voipc_crypto::MediaKeyRing>>,
@@ -535,14 +663,28 @@ impl FrameProcessor {
     /// fails.
     fn adapt(&mut self) {
         let loss_age = epoch_ms().saturating_sub(self.loss_ms.load(Ordering::Relaxed));
-        let since_change = self.level_changed.elapsed().as_millis() as u64;
-        let next = next_level(self.level, loss_age, since_change);
+        // Nothing has crossed the link yet (no media key, a still screen): no quiet to count
+        let since_change = if self.last_change == Change::Start && !self.sent_since_start {
+            0
+        } else {
+            self.level_changed.elapsed().as_millis() as u64
+        };
+        let next = next_level(self.level, loss_age, since_change, self.last_change);
         if next == self.level {
             return;
         }
-        let (scale, divisor) = LEVELS[next as usize];
-        let kbps = ((self.base_bitrate_kbps as f32) * scale) as u32;
-        let fps = (self.base_fps / divisor).max(1);
+        let change = if next < self.level {
+            Change::Up
+        } else {
+            Change::Down
+        };
+        self.set_level(next, change);
+    }
+
+    /// Applies ladder level `next` to the encoder: in place where it can, else
+    /// a rebuild. Keeps the old encoder (and level) if the rebuild fails.
+    fn set_level(&mut self, next: u8, change: Change) {
+        let (kbps, fps) = level_rate(self.base_bitrate_kbps, self.base_fps, next);
         // In place where the encoder can, without the IDR a rebuild forces
         // into the congested link (H3-08)
         if self.encoder.set_rate(kbps, fps) {
@@ -554,6 +696,7 @@ impl FrameProcessor {
                 "screen share quality level changed in place"
             );
             self.level = next;
+            self.last_change = change;
             self.level_changed = Instant::now();
             return;
         }
@@ -579,8 +722,13 @@ impl FrameProcessor {
                     "screen share quality level changed"
                 );
                 self.level = next;
+                self.last_change = change;
             }
-            Err(e) => warn!("could not rebuild the encoder for level {next}: {e}"),
+            Err(e) => {
+                warn!("could not rebuild the encoder for level {next}: {e}");
+                // Counted as tried, so a step back after a climb holds too
+                self.last_change = Change::Down;
+            }
         }
         // Also after a failure, so the rebuild is not retried every frame
         self.level_changed = Instant::now();
@@ -609,6 +757,18 @@ impl FrameProcessor {
         let watched = self.viewers.load(Ordering::Relaxed) > 0;
         if watched && !self.watched {
             self.keyframe_requested.store(true, Ordering::Relaxed);
+            // Its video starts one level low and climbs once the link carries
+            // it (`next_level`); a level the ladder stepped below that stays, and
+            // its quiet counts again from now: time with nobody watching tells
+            // nothing of the link.
+            if self.level <= START_LEVEL {
+                if self.level != START_LEVEL {
+                    self.set_level(START_LEVEL, Change::Start);
+                }
+                self.last_change = Change::Start;
+                self.sent_since_start = false;
+            }
+            self.level_changed = Instant::now();
         }
         self.watched = watched;
         if !watched {
@@ -958,6 +1118,13 @@ impl FrameProcessor {
             }
         }
 
+        // The first frame out since the video started: the first climb's quiet counts from here
+        if !self.sent_since_start {
+            self.sent_since_start = true;
+            if self.last_change == Change::Start {
+                self.level_changed = Instant::now();
+            }
+        }
         self.frames_sent.fetch_add(1, Ordering::Relaxed);
         self.bytes_sent.fetch_add(total_bytes, Ordering::Relaxed);
         sent_key
@@ -1169,6 +1336,7 @@ pub fn render_frame(
     app_handle: &tauri::AppHandle,
     buffers: &mut FrameDecodeBuffers,
 ) {
+    let started = std::time::Instant::now();
     voipc_video::to_jpeg_ycbcr(
         &mut frame.i420_data,
         frame.width as usize,
@@ -1184,6 +1352,7 @@ pub fn render_frame(
         subsamp: turbojpeg::Subsamp::Sub2x2,
     };
 
+    let converted = std::time::Instant::now();
     let jpeg_data = match buffers.compressor.compress_yuv_to_vec(yuv_image) {
         Ok(data) => data,
         Err(e) => {
@@ -1191,9 +1360,11 @@ pub fn render_frame(
             return;
         }
     };
+    let compressed = std::time::Instant::now();
 
     let b64 = base64::engine::general_purpose::STANDARD.encode(&jpeg_data);
-    let data_url = format!("data:image/jpeg;base64,{}", b64);
+    let url = format!("data:image/jpeg;base64,{}", b64);
+    let (seq, at_ms) = crate::view_timing::stamp();
     // Only to the window that draws it: the pop-out while one is open, the
     // main window otherwise. `emit` went to every window, so a popped-out
     // share was serialised and delivered twice a frame — once to a main
@@ -1203,8 +1374,271 @@ pub fn render_frame(
     } else {
         "main"
     };
-    let _ = app_handle.emit_to(target, "screenshare-frame", &data_url);
+    let _ = app_handle.emit_to(
+        target,
+        "screenshare-frame",
+        &SharedFrame { url, seq, at_ms },
+    );
+    crate::view_timing::rendered(
+        converted - started,
+        compressed - converted,
+        compressed.elapsed(),
+    );
+}
+
+/// A shown frame as the WebView gets it: the picture, its number, and the wall-clock ms
+/// it went out at, for `report_view_timing`.
+#[derive(serde::Serialize)]
+struct SharedFrame {
+    url: String,
+    seq: u64,
+    at_ms: u64,
+}
+
+// ── Share picker pictures (Windows; pure, so they test anywhere) ───────────
+
+/// A picker tile's picture: the source's still as a JPEG data URL, and a window's icon as a
+/// PNG one, the tile's picture when there is no still (minimised, protected, one colour).
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct SourcePicture {
+    pub picture: Option<String>,
+    pub icon: Option<String>,
+}
+
+/// The largest a picker tile's picture is made.
+pub(crate) const PREVIEW_MAX: (u32, u32) = (320, 180);
+
+/// The size a source's picture is drawn at: within `PREVIEW_MAX`, its aspect kept, never
+/// larger than the source, at least one pixel a side.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn preview_size(w: u32, h: u32) -> (u32, u32) {
+    if w == 0 || h == 0 {
+        return (1, 1);
+    }
+    let (mw, mh) = PREVIEW_MAX;
+    let scale = (mw as f64 / w as f64).min(mh as f64 / h as f64).min(1.0);
+    let fit = |v: u32| ((v as f64 * scale).round() as u32).max(1);
+    (fit(w), fit(h))
+}
+
+/// A BGRA picture made smaller by area averaging: each output pixel is the mean of the source
+/// pixels it covers, so text and edges blur instead of flickering in and out.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn downscale_bgra(
+    src: &[u8],
+    w: usize,
+    h: usize,
+    stride: usize,
+    ow: usize,
+    oh: usize,
+) -> Vec<u8> {
+    let mut out = vec![0u8; ow * oh * 4];
+    if w == 0 || h == 0 || ow == 0 || oh == 0 || src.len() < stride * (h - 1) + w * 4 {
+        return out;
+    }
+    for oy in 0..oh {
+        let (y0, y1) = (oy * h / oh, ((oy + 1) * h / oh).max(oy * h / oh + 1).min(h));
+        for ox in 0..ow {
+            let (x0, x1) = (ox * w / ow, ((ox + 1) * w / ow).max(ox * w / ow + 1).min(w));
+            let mut sum = [0u32; 4];
+            for y in y0..y1 {
+                let row = &src[y * stride..];
+                for x in x0..x1 {
+                    for (c, s) in sum.iter_mut().enumerate() {
+                        *s += row[x * 4 + c] as u32;
+                    }
+                }
+            }
+            let n = ((y1 - y0) * (x1 - x0)) as u32;
+            let o = (oy * ow + ox) * 4;
+            for c in 0..4 {
+                out[o + c] = (sum[c] / n) as u8;
+            }
+        }
+    }
+    out
+}
+
+/// Whether a picture is (nearly) one colour: black from a minimised, protected or GPU-only
+/// window says nothing, and the tile shows the window's icon instead. Samples a 16x16 grid.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn one_colour(bgra: &[u8], w: usize, h: usize) -> bool {
+    if w == 0 || h == 0 || bgra.len() < w * h * 4 {
+        return true;
+    }
+    let at = |x: usize, y: usize| {
+        let o = (y * w + x) * 4;
+        [bgra[o], bgra[o + 1], bgra[o + 2]]
+    };
+    let first = at(0, 0);
+    (0..16).all(|j| {
+        (0..16).all(|i| {
+            let p = at(i * (w - 1) / 15, j * (h - 1) / 15);
+            (0..3).all(|c| p[c].abs_diff(first[c]) <= 6)
+        })
+    })
+}
+
+/// A tile's picture as a JPEG data URL, or None for one that says nothing (`one_colour`).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn preview_url(bgra: &[u8], w: usize, h: usize) -> Option<String> {
+    if one_colour(bgra, w, h) {
+        return None;
+    }
+    let image = turbojpeg::Image {
+        pixels: bgra,
+        width: w,
+        pitch: w * 4,
+        height: h,
+        format: turbojpeg::PixelFormat::BGRA,
+    };
+    let jpeg = turbojpeg::compress(image, 80, turbojpeg::Subsamp::Sub2x2).ok()?;
+    Some(format!(
+        "data:image/jpeg;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(&*jpeg)
+    ))
 }
 
 /// The pop-out viewer's window label (commands.rs `open_share_popout`).
 pub const POPOUT_LABEL: &str = "screenshare-popout";
+
+#[cfg(test)]
+mod picker_tests {
+    use super::*;
+
+    #[test]
+    fn a_tile_fits_its_box_and_keeps_the_aspect() {
+        assert_eq!(preview_size(1920, 1080), (320, 180));
+        assert_eq!(preview_size(2560, 1440), (320, 180));
+        assert_eq!(preview_size(1080, 1920), (101, 180), "portrait");
+        assert_eq!(preview_size(3440, 1440), (320, 134), "ultra-wide");
+        assert_eq!(preview_size(200, 100), (200, 100), "never enlarged");
+        assert_eq!(preview_size(0, 50), (1, 1));
+    }
+
+    #[test]
+    fn a_smaller_picture_is_the_mean_of_what_it_covers() {
+        // 4x2, a stride with padding: left half black, right half white
+        let mut src = vec![9u8; 20 * 2];
+        for y in 0..2 {
+            for x in 0..4 {
+                let v = if x < 2 { 0 } else { 255 };
+                src[y * 20 + x * 4..y * 20 + x * 4 + 4].copy_from_slice(&[v, v, v, 255]);
+            }
+        }
+        assert_eq!(
+            downscale_bgra(&src, 4, 2, 20, 2, 1),
+            vec![0, 0, 0, 255, 255, 255, 255, 255]
+        );
+        // Everything into one pixel: grey
+        assert_eq!(
+            downscale_bgra(&src, 4, 2, 20, 1, 1),
+            vec![127, 127, 127, 255]
+        );
+        assert_eq!(
+            downscale_bgra(&src[..10], 4, 2, 20, 1, 1),
+            vec![0; 4],
+            "too short: blank"
+        );
+    }
+
+    #[test]
+    fn a_picture_of_one_colour_says_nothing() {
+        let black = vec![0u8; 64 * 36 * 4];
+        assert!(one_colour(&black, 64, 36));
+        assert_eq!(preview_url(&black, 64, 36), None);
+        let mut ramp = black.clone();
+        for (i, p) in ramp.chunks_mut(4).enumerate() {
+            p[1] = (i % 64 * 4) as u8;
+        }
+        assert!(!one_colour(&ramp, 64, 36));
+        assert!(
+            preview_url(&ramp, 64, 36).is_some_and(|u| u.starts_with("data:image/jpeg;base64,"))
+        );
+        // Noise of a few levels (a nearly black window) is still one colour
+        let mut dim = black;
+        dim[4 * 70] = 5;
+        assert!(one_colour(&dim, 64, 36));
+    }
+}
+
+#[cfg(all(test, not(target_os = "android")))]
+mod group_key_tests {
+    use super::*;
+    use crate::network::tests::{voice_keys, Epoch, ROOM};
+    use voipc_crypto::MediaKeyRing;
+
+    /// Whether a screen-audio packet opens under `ring`, read as the datagram receiver
+    /// reads one (`ScreenShareAudioPacket::from_bytes`, then `open_media`).
+    fn opens(ring: &std::sync::Mutex<MediaKeyRing>, bytes: &[u8]) -> bool {
+        let p = ScreenShareAudioPacket::from_bytes(bytes).unwrap();
+        let opened = crate::network::open_media(
+            &mut ring.lock().unwrap(),
+            ROOM,
+            0x15,
+            p.session_id,
+            p.stream_id,
+            p.key_id,
+            (p.sequence, 0),
+            &p.opus_data,
+        );
+        p.encrypted && opened.is_some_and(|o| o.is_ok())
+    }
+
+    /// Plan part 5: a share's audio goes under its sharer's own key from the room's epoch
+    /// key, with no change to the share's send site (`current()`, the ring's stream). Every
+    /// member the roster seats opens it; after a leave the share goes on under the next
+    /// epoch, which the leaver cannot open.
+    #[test]
+    fn under_the_group_key_a_shares_audio_opens_for_the_room_and_not_for_a_leaver() {
+        let e1: Epoch = (1, rand::random(), rand::random());
+        let e2: Epoch = (2, rand::random(), rand::random());
+        let rings: Vec<Arc<std::sync::Mutex<MediaKeyRing>>> =
+            (0..3).map(|_| Arc::default()).collect();
+        let take = |sid: u32, epochs: &[Epoch], roster: &[u32]| {
+            let keys = voice_keys(sid, epochs, roster);
+            let ring = &rings[sid as usize - 1];
+            assert!(ring.lock().unwrap().install_gk(&keys, ROOM));
+        };
+        for sid in 1..=3 {
+            take(sid, &[e1], &[1, 2, 3]);
+        }
+        let (audio_tx, mut audio_rx) = mpsc::channel(8);
+        let mut share = AudioProcessor {
+            encoder: Some(
+                voipc_audio::encoder::Encoder::new_screen_audio(SCREEN_AUDIO_BITRATE).unwrap(),
+            ),
+            accumulator: Vec::new(),
+            sequence: 0,
+            session_id: 1,
+            start_time: Instant::now(),
+            audio_tx,
+            active: Arc::new(AtomicBool::new(true)),
+            audio_enabled: Arc::new(AtomicBool::new(true)),
+            packet_count: Arc::default(),
+            sample_rate: 48_000,
+            channels: 1,
+            media_key: rings[0].clone(),
+            channel_id: Arc::new(AtomicU32::new(ROOM)),
+            resampler: None,
+            mono_buf: Vec::new(),
+            viewers: Arc::new(AtomicU32::new(2)),
+        };
+        let tone: Vec<u8> = (0..SCREEN_AUDIO_FRAME_SIZE)
+            .flat_map(|i| ((i as f32 / 8.0).sin() * 0.25).to_ne_bytes())
+            .collect();
+
+        share.process(&tone);
+        let first = audio_rx.try_recv().unwrap();
+        assert!(opens(&rings[1], &first) && opens(&rings[2], &first));
+
+        // Member 3 leaves: the opening's epoch reaches the sharer and member 2 only
+        take(1, &[e1, e2], &[1, 2]);
+        take(2, &[e1, e2], &[1, 2]);
+        share.process(&tone);
+        let next = audio_rx.try_recv().unwrap();
+        assert_eq!(ScreenShareAudioPacket::from_bytes(&next).unwrap().key_id, 2);
+        assert!(opens(&rings[1], &next), "the room hears the share go on");
+        assert!(!opens(&rings[2], &next), "the leaver does not");
+    }
+}

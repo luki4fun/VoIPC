@@ -79,6 +79,13 @@ pub struct AppState {
     /// The same for their pins (`voipc_crypto::sync::KeptPins`): a reconnect reads again only
     /// the pages whose generation moved. Memory only.
     pub kept_pins: std::sync::Mutex<HashMap<(String, [u8; 16]), voipc_crypto::sync::KeptPins>>,
+    /// The same for their group key floors (`voipc_crypto::sync::KeptGkFloors`). Memory only.
+    pub kept_gk: std::sync::Mutex<HashMap<(String, [u8; 16]), voipc_crypto::sync::KeptGkFloors>>,
+    /// `gk_local.bin`: what this device keeps of the group key, per relay and account.
+    pub gk_local: crate::gk_local::Store,
+    /// Accounts whose password was reset with the recovery key, by server and name: their
+    /// seat keys rotate at the next sign-in that reaches the group key (plan 3e).
+    pub gk_rotate: std::sync::Mutex<HashSet<(String, String)>>,
     /// On mobile data, as the front end last said (`commands::set_metered`).
     pub metered: AtomicBool,
     /// A move from Discord: a bot's token in RAM and the run it drives, by server id.
@@ -216,6 +223,10 @@ impl AppState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retain(|(kept_on, _), _| kept_on != server);
+        self.kept_gk
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|(kept_on, _), _| kept_on != server);
     }
 
     pub fn new() -> Self {
@@ -229,6 +240,9 @@ impl AppState {
             connect_locks: std::sync::Mutex::new(HashMap::new()),
             kept_sessions: std::sync::Mutex::new(HashMap::new()),
             kept_pins: std::sync::Mutex::new(HashMap::new()),
+            kept_gk: std::sync::Mutex::new(HashMap::new()),
+            gk_local: crate::gk_local::Store::new(None),
+            gk_rotate: std::sync::Mutex::new(HashSet::new()),
             metered: AtomicBool::new(false),
             #[cfg(not(target_os = "android"))]
             import: Arc::default(),
@@ -411,6 +425,8 @@ pub struct SignalState {
     pub direct_held: bool,
     /// A channel list too long for one frame, until its last.
     pub channel_parts: ChannelListParts<voipc_protocol::types::ChannelInfo>,
+    /// The group epoch key (protocol 26): this connection's groups (`gk_net`).
+    pub gk: crate::gk_net::GkNet,
 }
 
 /// The frames a list too long for one comes in, and at the last of them the list. A relay can
@@ -608,7 +624,7 @@ pub struct ActiveConnection {
     /// a join, a voice channel's creation, an accepted invite, a game's
     /// `hello`. Only such an ask lets this server take voice (network.rs
     /// `take_voice_ask`).
-    pub voice_asked_at: Arc<AtomicU64>,
+    pub voice_asked_at: Arc<crate::network::VoiceAsks>,
     /// Sender for control messages (framed, onto the control stream).
     pub tcp_tx: crate::network::ControlTx,
     /// The relay account this connection signed in with; `None` for a guest.

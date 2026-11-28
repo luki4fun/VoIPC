@@ -26,14 +26,15 @@
     viewingVoice,
   } from "../../stores/channels.js";
   import { channelRosters } from "../../stores/rosters.js";
-  import { rosterForRow } from "../../roster-rules.js";
-  import { userId, isAdmin, serverAddress, serverKey } from "../../stores/connection.js";
+  import { rosterForRow, shownMarks } from "../../roster-rules.js";
+  import { userId, isAdmin, isDeafened, isMuted, serverAddress, serverKey } from "../../stores/connection.js";
   import { account } from "../../stores/account.js";
   import { blocked, blockedMember } from "../../stores/blocks.js";
   import { isBlocked } from "../../block-rules.js";
   import { restrictions } from "../../stores/restrictions.js";
   import { markTitle } from "../../restrict-rules.js";
   import { showChatPane } from "../../stores/platform.js";
+  import { lookUpNames } from "../../stores/lobby.js";
   import {
     activeDmUserId,
     activeDmUsername,
@@ -88,6 +89,16 @@
   // own, and listing them twice would say they are in two places at once.
   // Which channels are listed at all: stores/roster.ts `visibleChannels`
   const groups = $derived(groupChannels($visibleChannels, $channelLayout));
+  // Who a conversation is with, if they stand in the lobby (protocol 25): asked again each minute
+  let dmTick = $state(0);
+  $effect(() => {
+    void dmTick;
+    lookUpNames($serverAddress, $dmList.map(({ convo }) => convo.username));
+  });
+  $effect(() => {
+    const every = setInterval(() => dmTick++, 60_000);
+    return () => clearInterval(every);
+  });
   const foldedIds = $derived($uiPrefs.folded_categories[serverKey($serverAddress)] ?? []);
   /** What a folded category's heading says is waiting in it. */
   const unreadIn = (g: ChannelGroup) =>
@@ -244,6 +255,8 @@
       {#if members.length > 0}
         <div class="nested">
           {#each members as member (member.user_id)}
+            <!-- The own row's marks are this device's, not the relay's word (dive 6 F11) -->
+            {@const marks = shownMarks(member, $userId, $isMuted, $isDeafened)}
             <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
             <div
               class="nested-member"
@@ -258,14 +271,14 @@
               {#if $blockedMember(member)}
                 <span class="blocked-mark" role="img" title="You blocked this person" aria-label="You blocked this person"><Icon name="ban" size={12} /></span>
               {/if}
-              {#if member.is_muted}
+              {#if marks.muted}
                 <span class="status-icon muted" title="Muted"><Icon name="mic-off" size={12} /></span>
               {/if}
               {#if $restrictions.has(member.user_id)}
                 {@const held = markTitle($restrictions.get(member.user_id)!, Date.now())}
                 <span class="status-icon restricted-mark" role="img" title={held} aria-label={held}><Icon name="hourglass" size={12} /></span>
               {/if}
-              {#if member.is_deafened}
+              {#if marks.deafened}
                 <span class="status-icon deafened" title="Deafened"><Icon name="headphones-off" size={12} /></span>
               {/if}
               {#if member.is_screen_sharing}

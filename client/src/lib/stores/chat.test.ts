@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { get } from "svelte/store";
 
 await import("./node-stores.mjs");
-const { MAX_MESSAGES } = await import("../chat-rules.ts");
+const { MAX_MESSAGES, TOO_LARGE_REASON, fromArchived, handOffOf, notSentLine, toArchived } = await import("../chat-rules.ts");
 const {
   addChannelLineAtTop,
   addChannelMessage,
@@ -24,6 +24,7 @@ const {
   ensureAwayDm,
   fileStoredChannelMessage,
   fileStoredDm,
+  markNotSent,
   mergeChannelHistory,
   populateFromArchive,
   quietBlockedDms,
@@ -266,4 +267,58 @@ test("a line at the top of a full channel pushes out the oldest, never the newes
   assert.equal(after[0].kind, "notice", "the line is on top");
   assert.equal(after.at(-1)!.content, `m${MAX_MESSAGES - 1}`, "the newest row stays");
   assert.equal(after[1].content, "m1", "the oldest went");
+});
+
+// ── What a reader keeps of a long message (D-7) ───────────────────────────────
+
+test("a message's text past 16 KiB is kept cut to 16 KiB on every way in to the store (D-7)", () => {
+  // The relay holds a channel post to 16 KiB sealed, but a direct message or a member's
+  // hand-off to 60 KiB: a modified client's longer text is cut here, live, stored, handed
+  // on, and as an edit's new text
+  const long = `long${"z".repeat(20_000)}`;
+  const cut = 16 * 1024;
+  freshRoom();
+  reset(false);
+  addChannelMessage(S, ROOM, spam("live", { content: long }));
+  fileStoredChannelMessage(S, ROOM, spam("stored", { content: long }));
+  mergeChannelHistory(S, ROOM, [spam("handed", { content: long })], "ann");
+  addChannelMessage(S, ROOM, spam("edited", { content: "short" }));
+  applyChannelEvent(S, ROOM, { event: { kind: "edit", target: "edited" }, by: { user_id: 9, username: "dan", account: "dd".repeat(16) }, at: Date.now(), content: long }, false);
+  const lengths = Object.fromEntries(
+    roomRows()
+      .filter((m: { id?: string }) => m.id)
+      .map((m: { id?: string; content: string }) => [m.id, m.content.length]),
+  );
+  // A hand-off keeps less still (`sanitizeHistory`): at most is what this is about
+  assert.ok(lengths.handed > 0 && lengths.handed <= cut, String(lengths.handed));
+  assert.deepEqual({ ...lengths, handed: cut }, { live: cut, stored: cut, handed: cut, edited: cut });
+  addDmMessage(S, ME, 5, "bobby", ME, message(long, 10));
+  fileStoredDm(S, stored(long, 11), own, undefined, undefined);
+  assert.deepEqual(texts().map((t: string) => t.length), [cut, cut]);
+});
+
+// ── A post of ours that never went (item J9W-1) ──────────────────────────────
+
+test("our own post that never went is marked not sent, its row shown before or after the word", () => {
+  // The backend refuses a post the relay would refuse as too large, sealed (the relay's
+  // refusal names no message, so the row stayed shown as sent). The browser's own row comes
+  // first; the desktop says so before `send_channel_message` shows the row
+  freshRoom();
+  reset(false);
+  const mine = (id: string) => ({ user_id: ME, username: "me", content: "big", timestamp: Date.now(), id });
+  addChannelMessage(S, ROOM, mine("first"));
+  markNotSent(S, ROOM, "first", ME, TOO_LARGE_REASON);
+  markNotSent(S, ROOM, "later", ME, TOO_LARGE_REASON);
+  addChannelMessage(S, ROOM, mine("later"));
+  // Someone else's row under the same id (an id is its writer's to choose) is not ours
+  addChannelMessage(S, ROOM, spam("theirs"));
+  markNotSent(S, ROOM, "theirs", ME, TOO_LARGE_REASON);
+  addChannelMessage(S, ROOM, mine("fine"));
+  const marks = Object.fromEntries(roomRows().map((m: { id?: string; not_sent?: string }) => [m.id, m.not_sent ?? null]));
+  assert.deepEqual(marks, { first: TOO_LARGE_REASON, later: TOO_LARGE_REASON, theirs: null, fine: null });
+  assert.equal(notSentLine(TOO_LARGE_REASON), "Not sent: one message holds at most 16 KiB.");
+  // Never handed on as history, and kept marked across a restart
+  assert.deepEqual(handOffOf(roomRows()).map((m: { id?: string }) => m.id), ["theirs", "fine"]);
+  const back = fromArchived(toArchived(roomRows()[0]));
+  assert.equal(back.not_sent, TOO_LARGE_REASON);
 });

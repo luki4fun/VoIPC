@@ -12,12 +12,17 @@
 //!   read them to be told to update: the start of `Authenticate`, `AuthError`
 //!   and `Refused`. Their bytes are written out below;
 //! - the media packets are laid out by hand, not by serde, so their bytes are
-//!   written out too.
+//!   written out too;
+//! - the media edge pool (1.15) has a version of its own, `pool::POOL_VERSION`, kept
+//!   the same way in `golden/pool-v<N>.json`, with the same switch to record it. Its
+//!   `Hello` and `Refused` start the same in every pool version.
 
 use serde_reflection::{Tracer, TracerConfig};
 use voipc_protocol::codec::{encode_client_msg, encode_server_msg, MAX_MSG_SIZE, PROTOCOL_VERSION};
 use voipc_protocol::error::ProtocolError;
+use voipc_protocol::gk::{GkMember, VersionMake};
 use voipc_protocol::messages::*;
+use voipc_protocol::pool::{self, CoreMsg, EdgeMsg, EdgeViewMsg, TicketBody, ViewerMsg};
 use voipc_protocol::types::*;
 use voipc_protocol::video::{ScreenShareAudioPacket, VideoPacket};
 use voipc_protocol::voice::VoicePacket;
@@ -55,6 +60,8 @@ fn traced_format() -> String {
         ArchiveAction,
         ArchiveScope,
         ArchiveTarget,
+        GkMember,
+        VersionMake,
     );
     let registry = tracer
         .registry()
@@ -82,6 +89,90 @@ fn the_wire_format_matches_its_protocol_version() {
         "the wire format changed but PROTOCOL_VERSION is still {PROTOCOL_VERSION}: bump it in codec.rs, \
          say what changed there, and record the new format with VOIPC_WRITE_GOLDEN=1 \
          (an older golden/v<N>.json is history: never edit it)"
+    );
+}
+
+/// The pool's wire, traced as the client protocol's is.
+fn traced_pool_format() -> String {
+    let mut tracer = Tracer::new(TracerConfig::default());
+    tracer.trace_simple_type::<EdgeMsg>().unwrap();
+    tracer.trace_simple_type::<CoreMsg>().unwrap();
+    tracer.trace_simple_type::<ViewerMsg>().unwrap();
+    tracer.trace_simple_type::<EdgeViewMsg>().unwrap();
+    tracer.trace_simple_type::<TicketBody>().unwrap();
+    serde_json::to_string_pretty(&tracer.registry().unwrap()).unwrap() + "\n"
+}
+
+#[test]
+fn pool_format_matches_pool_version() {
+    let dir = format!("{}/tests/golden", env!("CARGO_MANIFEST_DIR"));
+    let path = format!("{dir}/pool-v{}.json", pool::POOL_VERSION);
+    let now = traced_pool_format();
+    if std::env::var_os("VOIPC_WRITE_GOLDEN").is_some() {
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, &now).unwrap();
+        return;
+    }
+    let recorded = std::fs::read_to_string(&path).unwrap_or_else(|_| {
+        panic!(
+            "no recorded format for pool version {}: record it with VOIPC_WRITE_GOLDEN=1",
+            pool::POOL_VERSION
+        )
+    });
+    assert!(
+        recorded == now,
+        "the pool's wire changed but POOL_VERSION is still {}: bump it in pool.rs and record \
+         the new format with VOIPC_WRITE_GOLDEN=1 (an older golden/pool-v<N>.json is history: \
+         never edit it). A core admits only its own pool version, so upgrade the core first",
+        pool::POOL_VERSION
+    );
+}
+
+/// Read by every pool version before and after this one to say "wrong version", and a
+/// viewer's hello, which the browser builds through wasm and transport.test.ts pins too.
+#[test]
+fn what_says_wrong_pool_version_never_changes() {
+    // Hello is variant 0 and starts with the pool version, which the core reads from an
+    // edge of any version (`pool::hello_version`)
+    let hello = EdgeMsg::Hello {
+        pool_version: 300,
+        name: "e1".into(),
+        proof: [0; 32],
+        public_host: "h".into(),
+        public_port: 1,
+        cert_hashes: vec![],
+        max_viewers: 1,
+        egress_mbit: 1,
+        max_shares: 1,
+        version: String::new(),
+    };
+    let bytes = pool::encode_edge_msg(&hello).unwrap();
+    assert!(
+        hex(&bytes[4..]).starts_with("00ac02"),
+        "Hello's start moved"
+    );
+    assert_eq!(pool::hello_version(&bytes[4..]), Some(300));
+
+    // Refused is variant 1 and starts with the pool version (`pool::refused_version`)
+    let refused = CoreMsg::Refused {
+        pool_version: 1,
+        reason: "t".into(),
+    };
+    let bytes = pool::encode_core_msg(&refused).unwrap();
+    assert_eq!(hex(&bytes), "0000000401010174", "Refused moved");
+    assert_eq!(pool::refused_version(&bytes[4..]), Some(1));
+
+    let viewer = ViewerMsg::Hello {
+        ticket: vec![1, 2, 3],
+    };
+    assert_eq!(
+        hex(&pool::encode_viewer_msg(&viewer).unwrap()),
+        "000000050003010203",
+        "a viewer's hello moved: transport.test.ts pins the same bytes"
+    );
+    assert_eq!(
+        (pool::POOL_PATH, pool::VIEW_PATH),
+        ("/voipc-edge", "/voipc-view")
     );
 }
 

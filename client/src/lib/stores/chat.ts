@@ -830,12 +830,45 @@ export function onPostsHidden(server: string, wire: readonly (Omit<PostsMark, "a
   markChannels(server, addMarks(new Map(), marks));
 }
 
+/** Not-sent marks whose row had not come yet (a backend may say so before it shows the row):
+ *  by conversation and message id, the writer's user id and why. A few, the oldest go first. */
+const notSentEarly = new Map<string, { userId: number; reason: string }>();
+const NOT_SENT_EARLY_MOST = 32;
+
+/**
+ * Our own post `id` in `channelName` never went (`channel-not-sent`): the relay would have
+ * refused it, and its refusal would name no message. Its row, shown as sent, says so instead,
+ * now or when it comes. Only a row of `userId`'s (ours): an id is the writer's to choose, and
+ * someone else's row may carry the same one.
+ */
+export function markNotSent(server: string, channelName: string, id: string, userId: number, reason: string): void {
+  const key = chatKey(server, channelName);
+  const rows = get(channelMessages).get(key) ?? [];
+  if (!rows.some((m) => m.id === id && m.user_id === userId)) {
+    notSentEarly.set(`${key}\u0000${id}`, { userId, reason });
+    while (notSentEarly.size > NOT_SENT_EARLY_MOST) notSentEarly.delete(notSentEarly.keys().next().value!);
+    return;
+  }
+  channelMessages.update((map) => {
+    const list = map.get(key);
+    if (!list) return map;
+    map.set(key, list.map((m) => (m.id === id && m.user_id === userId ? { ...m, not_sent: reason } : m)));
+    return new Map(map);
+  });
+  scheduleSave();
+}
+
 /** Returns whether it was new, and is there to be told of. `held`: it waited for its key,
  *  so it goes in at its own time, no further back than the wait, and not at the end. */
 export function addChannelMessage(server: string, channelName: string, msg: ChatMessage, held_ = false): boolean {
   const key = chatKey(server, channelName);
   if (held(get(channelMessages).get(key), msg)) return false;
   msg = marked(bounded(msg), postsMarks.get(server));
+  const early = msg.id === undefined ? undefined : notSentEarly.get(`${key}\u0000${msg.id}`);
+  if (early && early.userId === msg.user_id) {
+    notSentEarly.delete(`${key}\u0000${msg.id}`);
+    msg = { ...msg, not_sent: early.reason };
+  }
   noteReceived(server, msg);
   channelMessages.update((map) => {
     const existing = map.get(key) ?? [];

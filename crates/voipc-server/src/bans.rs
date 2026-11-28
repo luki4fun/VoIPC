@@ -331,6 +331,13 @@ pub fn page(state: &ServerState, admin: bool, search: &str, offset: u32) -> Serv
 /// deleted where they are kept.
 pub async fn load(state: &ServerState) -> Result<()> {
     let now = now_secs();
+    // At start, before a ban from the shell takes anyone out of the logs: from here the
+    // accounts paths tell the group keys who is out (C4)
+    if let Some(relay) = &state.accounts {
+        relay.bind_gk(&state.gk);
+        // The identity resets the shell made (`reclaim`), which reached no group there
+        relay.gk_shell_resets().await?;
+    }
     let fresh: Vec<(Key, Ban)> = if let Some(relay) = &state.accounts {
         relay.ban_rows(now).await?
     } else if state.bans_file.is_some() {

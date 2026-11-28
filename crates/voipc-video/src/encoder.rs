@@ -5,7 +5,7 @@ use ffmpeg::util::frame::video::Video;
 use ffmpeg::{Dictionary, Rational};
 use ffmpeg_next as ffmpeg;
 use std::sync::Once;
-use tracing::info;
+use tracing::{info, warn};
 use voipc_protocol::types::VideoCodec;
 
 static FFMPEG_INIT: Once = Once::new();
@@ -31,6 +31,96 @@ pub struct Encoder {
     fps: u32,
     /// libx264 takes a new rate on the open context (see [`Encoder::set_rate`]).
     in_place: bool,
+    /// VAAPI's device and frame pool: each NV12 frame is uploaded into it before encoding.
+    #[cfg(target_os = "linux")]
+    vaapi: Option<Vaapi>,
+}
+
+/// A VAAPI device on one render node and its pool of NV12 surfaces (1.13, Track 4).
+#[cfg(target_os = "linux")]
+struct Vaapi {
+    device: *mut ffmpeg::ffi::AVBufferRef,
+    frames: *mut ffmpeg::ffi::AVBufferRef,
+}
+
+#[cfg(target_os = "linux")]
+impl Vaapi {
+    /// The device on `node` and an NV12 pool of `width` x `height`.
+    fn open(node: &str, width: u32, height: u32) -> Result<Vaapi> {
+        use ffmpeg::ffi::*;
+        let node = std::ffi::CString::new(node)?;
+        let mut device = std::ptr::null_mut();
+        // SAFETY: FFmpeg's own constructors; every failure path unrefs what it made
+        unsafe {
+            let r = av_hwdevice_ctx_create(
+                &mut device,
+                AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
+                node.as_ptr(),
+                std::ptr::null_mut(),
+                0,
+            );
+            if r < 0 || device.is_null() {
+                bail!("no VAAPI device ({r})");
+            }
+            let mut frames = av_hwframe_ctx_alloc(device);
+            if frames.is_null() {
+                av_buffer_unref(&mut device);
+                bail!("no VAAPI frame pool");
+            }
+            let fc = (*frames).data as *mut AVHWFramesContext;
+            (*fc).format = AVPixelFormat::AV_PIX_FMT_VAAPI;
+            (*fc).sw_format = AVPixelFormat::AV_PIX_FMT_NV12;
+            (*fc).width = width as i32;
+            (*fc).height = height as i32;
+            (*fc).initial_pool_size = 4;
+            let r = av_hwframe_ctx_init(frames);
+            if r < 0 {
+                av_buffer_unref(&mut frames);
+                av_buffer_unref(&mut device);
+                bail!("VAAPI frame pool refused ({r})");
+            }
+            Ok(Vaapi { device, frames })
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Vaapi {
+    fn drop(&mut self) {
+        // SAFETY: our own references; the codec context holds its own to the pool
+        unsafe {
+            ffmpeg::ffi::av_buffer_unref(&mut self.frames);
+            ffmpeg::ffi::av_buffer_unref(&mut self.device);
+        }
+    }
+}
+
+// SAFETY: the buffers are reference-counted by FFmpeg and used from the one thread that owns
+// the encoder at a time, as the codec context itself is.
+#[cfg(target_os = "linux")]
+unsafe impl Send for Vaapi {}
+
+/// The render nodes a VAAPI device is looked for on, in order: a hybrid machine's first node
+/// is often a GPU whose VAAPI driver only decodes (NVIDIA's), so every one is tried, but an
+/// NVIDIA node is never opened (`vaapi_may_encode`).
+#[cfg(target_os = "linux")]
+fn render_nodes() -> impl Iterator<Item = String> {
+    (128..=135)
+        .map(|n| format!("renderD{n}"))
+        .filter(|node| {
+            let driver = std::fs::read_link(format!("/sys/class/drm/{node}/device/driver")).ok();
+            vaapi_may_encode(driver.as_ref().and_then(|d| d.file_name()?.to_str()))
+        })
+        .map(|node| format!("/dev/dri/{node}"))
+}
+
+/// Whether a render node whose kernel driver is `driver` may be opened for a VAAPI encoder.
+/// Not NVIDIA's: its VAAPI driver only decodes, and loading it starts CUDA from inside the
+/// dynamic loader, which deadlocked against a CUDA start on another thread (NVENC opening,
+/// seen in the tests, 1.13: loader lock against libcuda's lock).
+#[cfg(target_os = "linux")]
+fn vaapi_may_encode(driver: Option<&str>) -> bool {
+    driver != Some("nvidia")
 }
 
 // SAFETY: The FFmpeg encoder context is not Send by default due to raw pointers,
@@ -86,16 +176,38 @@ fn set_rate_control_opts(opts: &mut Dictionary, bitrate_kbps: u32, fps: u32) {
 
 /// Hardware encoders to try before falling back to software encoding.
 /// Order: NVIDIA → Intel Quick Sync → AMD, then software fallback.
+/// On Linux, VAAPI last: Intel and AMD through Mesa or the Intel media driver (1.13).
 const HW_ENCODERS_H264: &[(&str, &str)] = &[
     ("h264_nvenc", "NVIDIA NVENC"),
     ("h264_qsv", "Intel Quick Sync"),
     ("h264_amf", "AMD AMF"),
+    #[cfg(target_os = "linux")]
+    ("h264_vaapi", "VAAPI"),
 ];
 const HW_ENCODERS_H265: &[(&str, &str)] = &[
     ("hevc_nvenc", "NVIDIA NVENC"),
     ("hevc_qsv", "Intel Quick Sync"),
     ("hevc_amf", "AMD AMF"),
+    #[cfg(target_os = "linux")]
+    ("hevc_vaapi", "VAAPI"),
 ];
+
+/// `VOIPC_VIDEO_ENCODER=<FFmpeg encoder name>`: the one encoder to try, for tests and support
+/// (`h264_qsv`, `h264_vaapi`, `libx264`, …). A name of the other codec is not this share's,
+/// and is left out with a warning.
+fn forced_encoder(var: Option<&str>, video_codec: VideoCodec) -> Option<String> {
+    let name = var.map(str::trim).filter(|n| !n.is_empty())?;
+    let fits = match video_codec {
+        VideoCodec::H264 => name.starts_with("h264_") || name == "libx264",
+        VideoCodec::H265 => name.starts_with("hevc_") || name == "libx265",
+        VideoCodec::Vp8 | VideoCodec::Vp9 => false,
+    };
+    if !fits {
+        warn!("VOIPC_VIDEO_ENCODER={name} is not a {video_codec:?} encoder: left out");
+        return None;
+    }
+    Some(name.to_owned())
+}
 
 impl Encoder {
     /// Create an encoder for `codec` (H.264 or H.265).
@@ -128,11 +240,34 @@ impl Encoder {
 
         init_ffmpeg();
 
+        // One encoder by name, then software with a warning (never a dead share)
+        let forced = forced_encoder(
+            std::env::var("VOIPC_VIDEO_ENCODER").ok().as_deref(),
+            video_codec,
+        );
+        let forced_list;
+        let hw_list = match forced.as_deref() {
+            Some(name) if name == sw_name => &[][..],
+            Some(name) => {
+                forced_list = [(name, "the forced (VOIPC_VIDEO_ENCODER)")];
+                &forced_list[..]
+            }
+            None => hw_list,
+        };
+
         // Try hardware encoders first — they're 10-50x faster than software.
         for &(name, label) in hw_list {
             if let Some(codec) = encoder::find_by_name(name) {
-                match Self::try_open_hw(codec, name, video_codec, width, height, bitrate_kbps, fps)
-                {
+                #[cfg(target_os = "linux")]
+                let opened = if name.ends_with("_vaapi") {
+                    Self::try_open_vaapi(codec, name, video_codec, width, height, bitrate_kbps, fps)
+                } else {
+                    Self::try_open_hw(codec, name, video_codec, width, height, bitrate_kbps, fps)
+                };
+                #[cfg(not(target_os = "linux"))]
+                let opened =
+                    Self::try_open_hw(codec, name, video_codec, width, height, bitrate_kbps, fps);
+                match opened {
                     Ok(enc) => {
                         info!("{video_codec:?} encoder: using {label} hardware encoder ({name})");
                         return Ok(enc);
@@ -144,6 +279,9 @@ impl Encoder {
             }
         }
 
+        if forced.as_deref().is_some_and(|n| n != sw_name) {
+            warn!("{video_codec:?} encoder: the forced one did not open: {sw_name} instead");
+        }
         // Fall back to the software encoder.
         let enc = Self::open_software(sw_name, video_codec, width, height, bitrate_kbps, fps)?;
         info!("{video_codec:?} encoder: using {sw_name} software encoder");
@@ -259,7 +397,142 @@ impl Encoder {
             pixel_format,
             fps,
             in_place: false,
+            #[cfg(target_os = "linux")]
+            vaapi: None,
         })
+    }
+
+    /// VAAPI on the first render node that opens it (`render_nodes`), with and then without
+    /// `low_power` (Intel's low-power entrypoint; AMD has none).
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::too_many_arguments)]
+    fn try_open_vaapi(
+        codec: ffmpeg::Codec,
+        name: &str,
+        video_codec: VideoCodec,
+        width: u32,
+        height: u32,
+        bitrate_kbps: u32,
+        fps: u32,
+    ) -> Result<Self> {
+        let mut last_err = anyhow!("{name}: no render node");
+        for node in render_nodes().filter(|n| std::path::Path::new(n).exists()) {
+            for low_power in [true, false] {
+                match Self::open_vaapi_on(
+                    codec,
+                    name,
+                    video_codec,
+                    width,
+                    height,
+                    bitrate_kbps,
+                    fps,
+                    &node,
+                    low_power,
+                ) {
+                    Ok(enc) => {
+                        info!("{video_codec:?} encoder: VAAPI on {node} (low power {low_power})");
+                        return Ok(enc);
+                    }
+                    Err(e) => last_err = anyhow!("{node}: {e:#}"),
+                }
+            }
+        }
+        Err(last_err)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::too_many_arguments)]
+    fn open_vaapi_on(
+        codec: ffmpeg::Codec,
+        name: &str,
+        video_codec: VideoCodec,
+        width: u32,
+        height: u32,
+        bitrate_kbps: u32,
+        fps: u32,
+        node: &str,
+        low_power: bool,
+    ) -> Result<Self> {
+        let vaapi = Vaapi::open(node, width, height)?;
+        let mut encoder = codec::context::Context::new_with_codec(codec)
+            .encoder()
+            .video()
+            .context("failed to create encoder context")?;
+        encoder.set_width(width);
+        encoder.set_height(height);
+        encoder.set_format(Pixel::VAAPI);
+        encoder.set_time_base(Rational::new(1, fps as i32));
+        encoder.set_frame_rate(Some(Rational::new(fps as i32, 1)));
+        encoder.set_bit_rate(bitrate_kbps as usize * 1000);
+        encoder.set_max_b_frames(0);
+        tag_colour(&mut encoder);
+        // SAFETY: the context takes its own reference to the pool
+        unsafe {
+            (*encoder.as_mut_ptr()).hw_frames_ctx = ffmpeg::ffi::av_buffer_ref(vaapi.frames);
+        }
+        let mut opts = Dictionary::new();
+        set_rate_control_opts(&mut opts, bitrate_kbps, fps);
+        // VBR capped at the rate: CBR pads a still screen with filler (H3-06)
+        opts.set("rc_mode", "VBR");
+        opts.set("async_depth", "1");
+        if low_power {
+            opts.set("low_power", "1");
+        }
+        if video_codec == VideoCodec::H264 {
+            opts.set("profile", "high");
+        }
+        let encoder = encoder
+            .open_with(opts)
+            .with_context(|| format!("{name}: failed to open"))?;
+        Ok(Self {
+            encoder,
+            codec: video_codec,
+            width,
+            height,
+            frame_index: 0,
+            // What the caller hands: NV12, uploaded in `send`
+            pixel_format: Pixel::NV12,
+            fps,
+            in_place: false,
+            vaapi: Some(vaapi),
+        })
+    }
+
+    /// A frame to the encoder; with VAAPI uploaded into a surface first, its time and its
+    /// picture type (a forced IDR) carried along.
+    fn send(&mut self, frame: &Video) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        if let Some(vaapi) = &self.vaapi {
+            use ffmpeg::ffi::*;
+            // SAFETY: a frame from the pool, freed on every path; `frame` is a valid NV12 frame
+            unsafe {
+                let mut hw = av_frame_alloc();
+                if hw.is_null() {
+                    bail!("{:?} encoder: no frame", self.codec);
+                }
+                let r = av_hwframe_get_buffer(vaapi.frames, hw, 0);
+                let r = if r < 0 {
+                    r
+                } else {
+                    av_hwframe_transfer_data(hw, frame.as_ptr(), 0)
+                };
+                if r < 0 {
+                    av_frame_free(&mut hw);
+                    bail!("{:?} encoder: VAAPI upload failed ({r})", self.codec);
+                }
+                (*hw).pts = (*frame.as_ptr()).pts;
+                (*hw).pict_type = (*frame.as_ptr()).pict_type;
+                let r = avcodec_send_frame(self.encoder.as_mut_ptr(), hw);
+                av_frame_free(&mut hw);
+                if r < 0 {
+                    bail!("{:?} encoder: failed to send frame ({r})", self.codec);
+                }
+            }
+            return Ok(());
+        }
+        self.encoder
+            .send_frame(frame)
+            .with_context(|| format!("{:?} encoder: failed to send frame", self.codec))
     }
 
     /// Open the libx264/libx265 software encoder with ultrafast + zerolatency settings.
@@ -323,6 +596,8 @@ impl Encoder {
             pixel_format: Pixel::YUV420P,
             fps,
             in_place: name == "libx264",
+            #[cfg(target_os = "linux")]
+            vaapi: None,
         })
     }
 
@@ -410,9 +685,7 @@ impl Encoder {
             }
         }
 
-        self.encoder
-            .send_frame(&frame)
-            .with_context(|| format!("{:?} encoder: failed to send frame", self.codec))?;
+        self.send(&frame)?;
 
         let mut frames = Vec::new();
         let mut packet = ffmpeg::Packet::empty();
@@ -454,9 +727,7 @@ impl Encoder {
             frame.set_kind(ffmpeg::picture::Type::None);
         }
 
-        self.encoder
-            .send_frame(frame)
-            .with_context(|| format!("{:?} encoder: failed to send frame", self.codec))?;
+        self.send(frame)?;
 
         let mut frames = Vec::new();
         let mut packet = ffmpeg::Packet::empty();
@@ -539,6 +810,31 @@ mod tests {
 
     /// Both codecs a native client can encode.
     const NATIVE: [VideoCodec; 2] = [VideoCodec::H264, VideoCodec::H265];
+
+    #[test]
+    fn a_forced_encoder_is_taken_only_for_its_own_codec() {
+        let h264 = VideoCodec::H264;
+        assert_eq!(
+            forced_encoder(Some("h264_vaapi"), h264).as_deref(),
+            Some("h264_vaapi")
+        );
+        assert_eq!(
+            forced_encoder(Some(" libx264 "), h264).as_deref(),
+            Some("libx264")
+        );
+        assert_eq!(
+            forced_encoder(Some("hevc_qsv"), VideoCodec::H265).as_deref(),
+            Some("hevc_qsv")
+        );
+        assert_eq!(
+            forced_encoder(Some("hevc_qsv"), h264),
+            None,
+            "another codec's"
+        );
+        assert_eq!(forced_encoder(Some("libx265"), h264), None);
+        assert_eq!(forced_encoder(Some(""), h264), None);
+        assert_eq!(forced_encoder(None, h264), None);
+    }
 
     #[test]
     fn encoder_new_valid() {
@@ -702,6 +998,78 @@ mod tests {
             let mut normal = Decoder::new(codec).unwrap();
             assert!(!normal.decode(&frames[0].data).unwrap().is_empty());
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_nvidia_render_node_is_never_opened_for_vaapi() {
+        assert!(!vaapi_may_encode(Some("nvidia")));
+        for driver in [
+            Some("i915"),
+            Some("xe"),
+            Some("amdgpu"),
+            Some("radeon"),
+            None,
+        ] {
+            assert!(vaapi_may_encode(driver), "{driver:?}");
+        }
+    }
+
+    /// VAAPI where the machine has it (a CI runner does not, and then there is nothing to
+    /// check): it opens on a render node that encodes (not one that only decodes), a forced
+    /// keyframe is a real IDR with its parameter sets, and the decoder reads the stream back.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn vaapi_encodes_where_there_is_a_device() {
+        init_ffmpeg();
+        let Some(codec) = encoder::find_by_name("h264_vaapi") else {
+            return;
+        };
+        let (w, h) = (640usize, 480usize);
+        let Ok(mut enc) = Encoder::try_open_vaapi(
+            codec,
+            "h264_vaapi",
+            VideoCodec::H264,
+            w as u32,
+            h as u32,
+            1500,
+            30,
+        ) else {
+            eprintln!("no VAAPI encoder on this machine");
+            return;
+        };
+        assert_eq!(enc.pixel_format(), Pixel::NV12, "the caller hands NV12");
+        let mut frames = Vec::new();
+        for pts in 0..10i64 {
+            // A ramp that moves, so deltas are not empty
+            let mut i420 = vec![128u8; w * h + 2 * (w / 2) * (h / 2)];
+            for (i, y) in i420[..w * h].iter_mut().enumerate() {
+                *y = ((i % w + pts as usize * 8) % 220 + 16) as u8;
+            }
+            frames.extend(enc.encode(&i420, pts, pts == 0 || pts == 6).unwrap());
+        }
+        let idr = |d: &[u8]| {
+            d.windows(4)
+                .any(|x| x[0] == 0 && x[1] == 0 && x[2] == 1 && x[3] & 0x1f == 5)
+        };
+        let keys: Vec<_> = frames.iter().filter(|f| f.is_keyframe).collect();
+        assert!(
+            keys.len() >= 2,
+            "a second forced keyframe: {} keyframes",
+            keys.len()
+        );
+        for k in &keys {
+            assert!(
+                idr(&k.data) && sps_present(VideoCodec::H264, &k.data),
+                "a real IDR with its SPS"
+            );
+        }
+        let mut dec = Decoder::new(VideoCodec::H264).unwrap();
+        let decoded: usize = frames
+            .iter()
+            .map(|f| dec.decode(&f.data).unwrap().len())
+            .sum();
+        assert!(decoded >= 8, "decoded {decoded} of {}", frames.len());
     }
 
     /// nal type 7 (H.264 SPS) / 33 (HEVC SPS) somewhere in an Annex B frame.

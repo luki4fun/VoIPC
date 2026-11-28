@@ -17,12 +17,14 @@
   // `.users`, which test-ui.mjs counts as the channel's members.
 
   import { avatarStyle } from "../../avatar.js";
-  import { userId } from "../../stores/connection.js";
-  import { groupStyles, viewingVoice } from "../../stores/channels.js";
+  import { isDeafened, isMuted, userId } from "../../stores/connection.js";
+  import { channels, groupStyles, viewingVoice } from "../../stores/channels.js";
+  import { lobby, moreLobby, REST_SECTION, searchLobby, watchLobby } from "../../stores/lobby.js";
   import { speakingUsers } from "../../stores/users.js";
   import { blockedMember } from "../../stores/blocks.js";
   import { restrictions } from "../../stores/restrictions.js";
   import { markTitle } from "../../restrict-rules.js";
+  import { shownMarks } from "../../roster-rules.js";
   import { audibleIds } from "../../stores/room.js";
   import {
     displayChannelCreatorId,
@@ -37,8 +39,10 @@
     openTextHere,
   } from "../../stores/roster.js";
   import { olderRelay } from "../../stores/relay.js";
-  import { livePath } from "../../relay-rules.js";
+  import { lazyLobby, livePath } from "../../relay-rules.js";
   import { refreshList } from "../../stores/sweep.js";
+  import { gkChannels } from "../../stores/gk.js";
+  import { holdersLine } from "../../gk-rules.js";
   import { serverAddress } from "../../stores/scoped.js";
   import { openShare, openUserMenu } from "../../stores/user-menu.js";
   import { memberMenu } from "../../actions/member-menu.js";
@@ -48,8 +52,51 @@
   import MemberName from "../MemberName.svelte";
   import type { UserInfo } from "../../types.js";
 
+  // The lobby on a big relay (protocol 25): its rows come a page at a time as the list
+  // scrolls, how many stand there comes counted, and a search asks the relay by name.
+  const lazy = $derived(lazyLobby($olderRelay?.protocol ?? null));
+  const lobbyCount = $derived($channels.find((c) => c.channel_id === 0)?.user_count ?? 0);
+  const inLobby = $derived($displayChannelId === 0 && !$isPreviewing);
+  /** The lobby's list is on screen: as the channel's, or as the box under it. */
+  const lobbyShown = $derived(lazy && !$isPreviewing && (inLobby || lobbyCount > 0));
+  let search = $state("");
+  let searchTimer: ReturnType<typeof setTimeout> | undefined;
+  const wanted = $derived(search.trim().toLowerCase());
+  const matches = (u: UserInfo) => !lazy || !wanted || u.username.toLowerCase().startsWith(wanted);
+  function onSearch() {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => searchLobby($serverAddress, search), 250);
+  }
+  /** How many a section of the lobby holds: the relay's count on a big relay, else the rows. */
+  function counted(key: string, rows: number, ofLobby: boolean): number {
+    if (!ofLobby || !lazy || wanted) return rows;
+    const rank = key === "rest" ? REST_SECTION : key.startsWith("group-") ? Number(key.slice(6)) : NaN;
+    return $lobby.sections.find(([r]) => r === rank)?.[1] ?? rows;
+  }
+  /** The next page once the list's end comes into view. */
+  function nearEnd(node: HTMLElement) {
+    const seen = new IntersectionObserver((es) => {
+      if (es.some((e) => e.isIntersecting)) moreLobby($serverAddress);
+    });
+    seen.observe(node);
+    return { destroy: () => seen.disconnect() };
+  }
+  // While it is on screen, its joins come by name (a small lobby's)
+  $effect(() => {
+    if (!lobbyShown) return;
+    const server = $serverAddress;
+    watchLobby(server, true);
+    return () => watchLobby(server, false);
+  });
+  // The first page, once it shows
+  $effect(() => {
+    if (lobbyShown && !$lobby.asked && !$lobby.done && $lobby.next === null && $lobby.total === 0) {
+      moreLobby($serverAddress);
+    }
+  });
+
   const live = $derived($displayUsers.filter((u) => u.is_screen_sharing));
-  const rest = $derived($displayUsers.filter((u) => !u.is_screen_sharing));
+  const rest = $derived($displayUsers.filter((u) => !u.is_screen_sharing && (!inLobby || matches(u))));
 
   // "In voice" only when that is what the list is: a text channel's members are
   // subscribers, each standing in a voice channel of their own, and the lobby's
@@ -66,9 +113,12 @@
     ...(live.length > 0 ? [{ key: "live", label: "Live", members: live }] : []),
     ...sectionsOf(rest, $groupStyles, restLabel),
   ]);
-  const idleGroups = $derived(sectionsOf($idleUsers, $groupStyles, "Online"));
+  const idleGroups = $derived(sectionsOf($idleUsers.filter(matches), $groupStyles, "Online"));
   /** A channel whose list comes by the sweep, so it is as old as that. */
   const byList = $derived(!$isPreviewing && !!$displayChannel?.text && !$openTextHere && livePath($olderRelay?.protocol ?? null));
+
+  /** Who holds this channel's keys (plan 3h), named as the room shows them. */
+  const keysHeldBy = $derived(holdersLine($gkChannels.get($displayChannelId)?.holders ?? []));
 
   function menu(user: UserInfo, e: MouseEvent, idle: boolean) {
     e.preventDefault();
@@ -78,6 +128,9 @@
 </script>
 
 <aside class="user-list modern">
+  {#if keysHeldBy}
+    <div class="hidden-note keys-held">{keysHeldBy}</div>
+  {/if}
   {#if $hideMembers && !$isPreviewing}
     <div class="hidden-note">Members are hidden here — people appear while they speak</div>
   {:else if byList}
@@ -87,23 +140,35 @@
     </div>
   {/if}
 
+  {#if lobbyShown && inLobby}
+    {@render lobbySearch()}
+  {/if}
   <div class="users">
     {#each groups as group (group.key)}
-      <div class="group-label">{group.label} — {group.members.length}</div>
+      <div class="group-label">{group.label} — {counted(group.key, group.members.length, inLobby && group.key !== "live")}</div>
       {#each group.members as user (user.user_id)}
         {@render member(user, !$isPreviewing && $viewingVoice, true)}
       {/each}
     {/each}
+    {#if lobbyShown && inLobby && !$lobby.done}
+      <div class="more" use:nearEnd>{$lobby.asked ? "Loading…" : ""}</div>
+    {/if}
   </div>
 
-  {#if $idleUsers.length > 0}
+  {#if $idleUsers.length > 0 || (lobbyShown && !inLobby)}
     <div class="idle-users">
+      {#if lobbyShown && !inLobby}
+        {@render lobbySearch()}
+      {/if}
       {#each idleGroups as group (group.key)}
-        <div class="group-label">{group.label} — {group.members.length}</div>
+        <div class="group-label">{group.label} — {counted(group.key, group.members.length, true)}</div>
         {#each group.members as user (user.user_id)}
           {@render member(user, false, false)}
         {/each}
       {/each}
+      {#if lobbyShown && !inLobby && !$lobby.done}
+        <div class="more" use:nearEnd>{$lobby.asked ? "Loading…" : ""}</div>
+      {/if}
     </div>
   {/if}
 
@@ -112,10 +177,24 @@
   {/if}
 </aside>
 
+<!-- The search over who is online, on a relay that sends the lobby in pages -->
+{#snippet lobbySearch()}
+  <input
+    class="lobby-search"
+    type="search"
+    placeholder={`Search ${lobbyCount} online`}
+    aria-label="Search who is online"
+    bind:value={search}
+    oninput={onSearch}
+  />
+{/snippet}
+
 <!-- One row. `inCall` is whether this list is the call's: speaking and the
      game's culling are about the people we hear, and nobody else. `inChannel`
      is whether it is the channel on screen's, which is what the crown is about. -->
 {#snippet member(user: UserInfo, inCall: boolean, inChannel: boolean)}
+  <!-- The own row's marks are this device's, not the relay's word (dive 6 F11) -->
+  {@const marks = shownMarks(user, $userId, $isMuted, $isDeafened)}
   <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
   <div
     class="user"
@@ -152,14 +231,14 @@
         <span class="you">(you)</span>
       {/if}
     </span>
-    {#if user.is_muted}
+    {#if marks.muted}
       <span class="status-icon muted" title="Muted"><Icon name="mic-off" size={14} /></span>
     {/if}
     {#if $restrictions.has(user.user_id)}
       {@const held = markTitle($restrictions.get(user.user_id)!, Date.now())}
       <span class="status-icon restricted-mark" role="img" title={held} aria-label={held}><Icon name="hourglass" size={14} /></span>
     {/if}
-    {#if user.is_deafened}
+    {#if marks.deafened}
       <span class="status-icon deafened" title="Deafened"><Icon name="headphones-off" size={14} /></span>
     {/if}
     <!-- Watching is the call's, as in the menu: one click instead of two -->
@@ -221,6 +300,19 @@
 
   /* Below the channel's members, capped so a busy lobby cannot push them off
      screen; it scrolls on its own. */
+  .lobby-search {
+    margin: 4px 8px 8px;
+    padding: 4px 8px;
+    width: calc(100% - 16px);
+    box-sizing: border-box;
+  }
+  .more {
+    min-height: 8px;
+    padding: 4px 8px;
+    color: var(--text-secondary);
+    font-size: var(--fs-micro);
+  }
+
   .idle-users {
     max-height: 40%;
     overflow-y: auto;

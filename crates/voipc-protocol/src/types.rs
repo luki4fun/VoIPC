@@ -19,6 +19,122 @@ pub type SessionId = u32;
 /// Sequence number for voice packets, monotonically increasing per sender.
 pub type SequenceNumber = u32;
 
+/// Where a page of the lobby ended (protocol v25): its section's rank (`u16::MAX` for
+/// nobody's section), the name in lower case, and the id, in the order the list is in.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct LobbyCursor {
+    pub section: u16,
+    pub name: String,
+    pub user_id: UserId,
+}
+
+/// What a relay carries now, for its admin's Load view (protocol v25).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LoadReport {
+    pub online: u32,
+    pub max_users: u32,
+    /// Standing in a channel other than the lobby.
+    pub in_rooms: u32,
+    /// Standing in the lobby, and up to how many its list's watchers hear each join.
+    pub lobby: u32,
+    pub live_lobby: u32,
+    pub shares: Vec<ShareLoad>,
+    /// Video sent, counted at each share's resolution, and what `[media]` allows (kbit/s).
+    pub video_kbps: u64,
+    pub video_budget_kbps: u64,
+    pub rss_mib: u32,
+    pub cpu_secs: u64,
+    /// Datagrams the kernel dropped on the relay's UDP socket since it started.
+    pub udp_dropped: u64,
+    /// The last minute's refusals, failed setups and ended sessions, one line each.
+    pub last_minute: Vec<String>,
+    /// What the admin should look at, in plain words; empty when all is well.
+    pub warnings: Vec<String>,
+    /// The media edges of `[pool]`, linked or not (protocol v26); empty without a pool, and
+    /// from a relay at 25, so the Load view shows no Edges table then.
+    pub edges: Vec<EdgeLoad>,
+    /// The groups with a key (protocol v26); empty with the key off, and from a relay at 25
+    /// or older.
+    pub groups: Vec<GroupLoad>,
+}
+
+/// One screen share, for `LoadReport`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ShareLoad {
+    pub channel_id: ChannelId,
+    pub sharer: String,
+    /// Everyone watching, those on edges included.
+    pub viewers: u32,
+    /// The most one share may have (`[media] share_viewers`), of the viewers the relay
+    /// serves itself.
+    pub cap: u32,
+    /// What it may send each viewer at its resolution.
+    pub kbps: u32,
+    /// Of `viewers`, how many an edge serves (protocol v26).
+    pub on_edges: u32,
+}
+
+/// One media edge of `[pool]`, for `LoadReport` (protocol v26). The counts are what the
+/// relay assigned; `egress_kbps` to `rss_mib` are what the edge last reported, which is
+/// `report_age_secs` old.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct EdgeLoad {
+    pub name: String,
+    /// Where viewers reach it, `host:port`.
+    pub address: String,
+    pub online: bool,
+    /// The pool version it linked with, or last asked for when it was refused.
+    pub pool_version: u32,
+    pub viewers: u32,
+    pub max_viewers: u32,
+    pub shares: u32,
+    pub max_shares: u32,
+    /// Video assigned to it, counted at each share's resolution, and what it may send.
+    pub kbps: u64,
+    pub budget_kbps: u64,
+    /// What it says it sent.
+    pub egress_kbps: u64,
+    pub frames_dropped: u64,
+    pub cpu_secs: u64,
+    pub rss_mib: u32,
+    pub report_age_secs: u32,
+}
+
+/// One group with its key, for `LoadReport` (protocol v26). `kind` is a
+/// `gk::group_kind` code; `last_commit_secs` is how long ago its head moved.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct GroupLoad {
+    pub channel_id: ChannelId,
+    pub kind: u8,
+    pub seats: u32,
+    pub keyholders: u32,
+    pub keyholders_online: u32,
+    pub last_commit_secs: u32,
+    pub joins_waiting: u32,
+    pub exits_waiting: u32,
+    pub missed_deadlines: u32,
+    pub mem_bytes: u64,
+    pub db_bytes: u64,
+}
+
+/// Where a viewer fetches a share from a media edge (`ServerMessage::WatchAt`, protocol
+/// v26). The app connects to `https://{host}:{port}/voipc-view` (`pool::VIEW_PATH`),
+/// trusting only a certificate of these hashes, and shows the edge the ticket, which the
+/// relay sealed for that edge alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdgeView {
+    /// A DNS name or a bare IP literal: an IPv6 one has no brackets.
+    pub host: String,
+    pub port: u16,
+    /// SHA-256 of the edge's certificates, newest first, 1 to `pool::MAX_CERT_HASHES`.
+    pub cert_hashes: Vec<[u8; 32]>,
+    /// Opaque to the app, at most `pool::MAX_TICKET_BYTES`.
+    pub ticket: Vec<u8>,
+}
+
+/// The most `ClientMessage::LookupUsers` asks at once, ids, names and accounts together.
+pub const MAX_LOOKUP: usize = 64;
+
 /// Information about a connected user.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserInfo {

@@ -10,6 +10,11 @@ publish = false
 name = "voipc-server"
 path = "src/main.rs"
 
+# Its unit tests (the smoke check's lines) run with the crate's tests
+[[example]]
+name = "group_load"
+test = true
+
 [dependencies]
 voipc-protocol = { workspace = true }
 tokio = { workspace = true }
@@ -57,7 +62,7 @@ unicode-normalization = "0.1"
 #   l4f-accounts = { path = "../l4f-accounts" }
 # to the workspace Cargo.toml while you need it; commit neither that nor the
 # Cargo.lock it changes.
-l4f-accounts = { git = "https://github.com/luki4fun/l4f-accounts.git", tag = "v0.14.1", features = ["postgres", "sqlite", "oauth"] }
+l4f-accounts = { git = "https://github.com/luki4fun/l4f-accounts.git", tag = "v0.15.0", features = ["postgres", "sqlite", "oauth"] }
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "sqlite", "migrate", "macros"] }
 
 # The self-update (`[update]`, update.rs), all already in the lock through the
@@ -77,3 +82,5 @@ unicode-security = "0.1.2"
 # The importer's own driver and its stand-in Discord, against the real relay: no socket to
 # Discord, and nothing of it in the relay's binary.
 voipc-import = { path = "../voipc-import", features = ["mock"] }
+# Paused time, for tests of what the relay's own slow writes do to its deadlines
+tokio = { workspace = true, features = ["test-util"] }

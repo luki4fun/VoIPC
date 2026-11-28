@@ -11,12 +11,13 @@
 
   import { avatarStyle } from "../../avatar.js";
   import { shortName } from "../../username.js";
-  import { userId } from "../../stores/connection.js";
+  import { isDeafened, isMuted, userId } from "../../stores/connection.js";
   import { restrictions } from "../../stores/restrictions.js";
   import { markTitle } from "../../restrict-rules.js";
   import { speakingUsers } from "../../stores/users.js";
   import { audibleIds } from "../../stores/room.js";
   import { isCulled } from "../../stores/roster.js";
+  import { shownMarks } from "../../roster-rules.js";
   import { openShare } from "../../stores/user-menu.js";
   import { watchingUserId } from "../../stores/screenshare.js";
   import { memberMenu } from "../../actions/member-menu.js";
@@ -33,6 +34,8 @@
   let { user, small = false }: Props = $props();
 
   const self = $derived(user.user_id === $userId);
+  // The own tile's marks are this device's, not the relay's word (dive 6 F11)
+  const marks = $derived(shownMarks(user, $userId, $isMuted, $isDeafened));
   const talking = $derived($speakingUsers.has(user.user_id));
   const culled = $derived(isCulled(user.user_id, $audibleIds, $userId, false));
   const watched = $derived($watchingUserId === user.user_id);
@@ -40,8 +43,8 @@
   const state = $derived(
     [
       talking ? "talking" : null,
-      user.is_muted ? "muted" : null,
-      user.is_deafened ? "deafened" : null,
+      marks.muted ? "muted" : null,
+      marks.deafened ? "deafened" : null,
       $restrictions.has(user.user_id) ? "held back on this server" : null,
       user.is_screen_sharing ? "sharing their screen" : null,
       culled ? "out of earshot in the game" : null,
@@ -65,9 +68,9 @@
       <MemberName username={user.username} account={user.account} />{#if self}<span class="you">(you)</span>{/if}
     </span>
     <span class="marks" aria-hidden="true">
-      {#if user.is_muted}<span class="mark" title="Muted"><Icon name="mic-off" size={small ? 12 : 14} /></span>{/if}
+      {#if marks.muted}<span class="mark" title="Muted"><Icon name="mic-off" size={small ? 12 : 14} /></span>{/if}
       {#if $restrictions.has(user.user_id)}{@const held = markTitle($restrictions.get(user.user_id)!, Date.now())}<span class="mark restricted-mark" role="img" title={held} aria-label={held}><Icon name="hourglass" size={small ? 12 : 14} /></span>{/if}
-      {#if user.is_deafened}<span class="mark" title="Deafened"><Icon name="headphones-off" size={small ? 12 : 14} /></span>{/if}
+      {#if marks.deafened}<span class="mark" title="Deafened"><Icon name="headphones-off" size={small ? 12 : 14} /></span>{/if}
     </span>
   </div>
   {#if user.is_screen_sharing && !watched}

@@ -13,15 +13,19 @@ nobody checks, so a new one comes with its test.
 **1.x keeps:**
 - A relay admits a client exactly when their `PROTOCOL_VERSION` is equal (12 in 1.0, 13 in
   1.3, 14 in 1.4, 15 in 1.5, 16 in 1.7, 17 in 1.8, 18 in 1.9, 19 in 1.10, 21 in 1.11, 20 in its rc.1 only,
-  23 in 1.12, 22 in its rc.1 only). The app version is informational only.
+  23 in 1.12, 22 in its rc.1 only, 24 in 1.13, 26 in 1.14). 1.13 was never released (its changes
+  ship in 1.14), and 25 was a step on 1.14's own branch, never released either; `compat.rs` still
+  has its shapes. The app version is informational only.
 - **Since 1.6, an app talks to relays from its own protocol down to `OLDEST_RELAY_PROTOCOL`**
-  (`crates/voipc-protocol/src/compat.rs`; 12 in 1.6 to 1.11), never fewer than three protocols back.
+  (`crates/voipc-protocol/src/compat.rs`; 12 in 1.6 to 1.14), never fewer than three protocols back.
   It asks with its own; a relay of an older protocol refuses with its own (below), and the app
   connects again speaking that one. It shows a banner there, and holds back what that relay's
   other apps could not read:
 
-  | Relay | What a 1.12 app does not offer there |
+  | Relay | What a 1.14 app does not offer there |
   |---|---|
+  | 1.13 (24, never released) | the group key: text channels there use the live path and voice rooms the 3N join, as before 1.14; edges: viewers there are served by the relay itself. That relay sends the lobby whole, as it always did, and the app reads it so. Approving a new device from another (pairing): its vault-key wrap is hybrid since 1.14 and too large for an older relay, so the app says it needs a server on 1.14 and sends nothing (`PAIR_PQ_SINCE`); the recovery key and the password still work |
+  | 1.12 (23) | dropping a device's old key when the device is remembered again: there it stays until the relay's 90-day sweep |
   | 1.12.0-rc.1 (22) | a restriction's parts: a voice-only mute during the new-member wait reads as a time-out there, until the wait ends |
   | 1.11 (21) | a sign-in bound to its connection (device key, provider, reset) and a password that never leaves the device: there they go as in 1.11; an admin step's refusal ends every step waiting, not only its own |
   | 1.11.0-rc.1 (20) | the *Share history* privilege: there the switch alone decides |
@@ -35,6 +39,10 @@ nobody checks, so a new one comes with its test.
   | 1.0 (12) | files, emotes and stickers, edits, reactions, pins, forwards, a new recovery key |
 
   The browser always loads the page of the relay it connects to, so it always matches.
+- **Pairing across versions (1.14).** A 1.14 device and a device from before 1.14 cannot pair, either way round: the
+  newer one refuses the older one's key, or the two show different codes, and nothing is handed over. The person sees
+  the usual wrong-code or someone-may-be-trying-codes ending, which says nothing about versions. Update both devices,
+  or use the recovery key or the password.
 - A refused client is told why:
   - a client at protocol 12 or later gets `ServerMessage::Refused { code, server_protocol,
     server_version, text }`, with `code` 1 (`REFUSED_VERSION`) for a protocol mismatch. The app
@@ -51,6 +59,14 @@ nobody checks, so a new one comes with its test.
   - the start of `Authenticate` (`username`, `protocol_version`);
   - `AuthError`;
   - `Refused`, its variant index and its `u16` code.
+- **The media edge pool (relay ↔ edge, since 1.14) has a version of its own,** `POOL_VERSION` in
+  `crates/voipc-protocol/src/pool.rs` (1 in 1.14). A relay links only edges of its own pool version,
+  whatever their releases; a client protocol bump leaves it alone, and any change to the pool's
+  messages or its ticket bumps it. An edge of another pool version is refused and told which version
+  the relay speaks, and its viewers are served by the relay until it is updated: update the relay
+  first, then its edges ([OPERATING.md](OPERATING.md) §10b). Frozen for good, so either side can say
+  "wrong version": `EdgeMsg::Hello` is variant 0 and `CoreMsg::Refused` variant 1, each with
+  `pool_version` as its first field.
 
 **May change:** any other layout, but only together with a protocol bump, and only in a minor or
 major release, never in a patch. A bump adds the older shape of every message it changes to
@@ -63,12 +79,14 @@ out of servers that have not upgraded yet.
   `golden/v<N>.json`, and the frozen messages and the media packet headers against bytes
   written out in the test.
 - Any change with the same `PROTOCOL_VERSION` fails it.
+- The same for the pool: `pool_format_matches_pool_version` compares it against
+  `golden/pool-v<N>.json`, and `what_says_wrong_pool_version_never_changes` holds the frozen bytes.
 - `compat.rs`'s tests fail when a message's layout at an older protocol differs from today's
   and `RESHAPED` does not name it, and when an old shape there differs from its golden file.
 - The nightly `old-relays` job runs the released 1.0, 1.3, 1.4, 1.6, 1.7.0-rc.1, 1.11.0-rc.1
-  (protocol 20) and 1.11.0 relays and speaks to each in its own protocol (`voice_load`). A release
-  joins the list once it is tagged. 1.8 to 1.10 were never tagged, so protocols 17 to 19 have no
-  relay there.
+  (protocol 20), 1.11.0 and 1.12.0 relays and speaks to each in its own protocol (`voice_load`). A
+  release joins the list once it is tagged. 1.8 to 1.10 were never tagged, so protocols 17 to 19
+  have no relay there, and neither has 25.
 - **Since 1.12 an app's sign-in is bound to its TLS session** (`voipc_crypto::bind`): the relay must
   end TLS itself. A proxy that passes TLS through is fine; one that ends it in front of the TCP
   fallback makes every app sign-in over that fallback fail (a guest connects as before).
@@ -147,6 +165,28 @@ removes it) and `unclaimed_days` (90, 0 is never) in `[accounts]`. An older rela
 `AdminBans` and `AdminListBans` stay in the enums for relays before protocol 20: an app at 20 sends
 `AdminBansPage` to a relay at 20 and `AdminListBans` below it.
 
+**What changed in 1.14:** `live_lobby` (2000) and `group_key` (true) at the top; a new `[media]`
+section (`share_viewers` 100, `video_egress_mbit` 1000, `voice_room` 250); `db_connections` (32) and
+`password_sign_ins_per_15min` (1000) in `[accounts]`; a new `[pool]` section (`edges` empty, so no
+edges and their path not served; `local_first` 8), and a new file `edge.toml` for the new
+`voipc-server -c edge.toml edge` role (its keys are in [OPERATING.md](OPERATING.md) §10b). With
+edges, `[media] share_viewers` caps the viewers the relay serves itself, and its edges carry the
+rest; without, it means what it did. An older relay refuses each of them. A new command, `db
+new-incarnation`, belongs to every restore of the database ([OPERATING.md](OPERATING.md) §7).
+- **`group_key` is the second key whose default changes behaviour**, as `[files]` was in 1.3: on,
+  every text channel and voice room uses the group epoch key ([GROUP-KEY.md](GROUP-KEY.md)), and the
+  relay refuses the old key paths there. `group_key = false` keeps the paths of 1.12, and still
+  serves, read-only, what was kept under the group key. It is read at start. Turning it on again
+  after a run with it off starts every channel's keys anew, a full re-seat of every group, so it is
+  a way back from a fault, not a setting to flip often.
+- **The switch gap.** On a relay with accounts, an account is seated for a channel's kept history
+  from the first time one of its devices signs in with a 1.14 app, which publishes its seat keys.
+  Kept channel posts written under the group key before then are not readable to it. What was kept
+  before the update stays readable as before, and reaches newcomers through members who share
+  history.
+- **One channel message holds at most 16 KiB** on every path, the key on or off, voice rooms too: a
+  1.12 relay let a voice room's chat run to its 60 KiB frame. Direct messages keep that.
+
 **An older relay on a newer config:** it refuses the unknown key, never ignores it, so a relay
 cannot silently run without a setting it was given. The JSON files stay lenient: a rewrite of
 `channels.json` keeps keys it does not know.
@@ -172,9 +212,12 @@ storage, the accounts database, the kept-message log and its crypto labels.
   Clearing or deleting the history in the app removes these copies too.
 - Shipped database migrations are append-only and never edited.
 - The crypto labels are frozen: `voipc-vault-item/v1|`, `voipc-log/v1|`, `voipc-wrap/v1|`,
-  `voipc-channel/v1|`, and from protocol 21 `voipc-log/v2|`, `voipc-wrap/v2|`, `voipc-chain/v1/`,
-  `voipc-seat/v1|`, `voipc-list/v1|`, `voipc-seal/v1|`, `voipc-vlink/v1|`, the HKDF infos and the
-  AADs. A new scheme gets a new label beside the old one, and the old one stays readable.
+  `voipc-channel/v1|`, from protocol 21 `voipc-log/v2|`, `voipc-wrap/v2|`, `voipc-chain/v1/`,
+  `voipc-seat/v1|`, `voipc-list/v1|`, `voipc-seal/v1|`, `voipc-vlink/v1|`, and from protocol 26
+  every `voipc-gk/v1/` context of the group key ([GROUP-KEY.md](GROUP-KEY.md) §11, its known-answer
+  vectors in `group_key/kat.rs`), the HKDF infos and the AADs. A new scheme gets a new label beside
+  the old one, and the old one stays readable. The 0010 tables of kept history stay readable under
+  the group key until `kept_window` or `retention_days` sweeps them.
 
 **An older build on newer data** refuses it and never writes over it:
 
@@ -185,6 +228,7 @@ storage, the accounts database, the kept-message log and its crypto labels.
 | TOFU pins | an unreadable file is kept, and self-signed servers are refused until it is reset |
 | vault items | read-only for the session, with a warning (item `0x02` + `gen`) |
 | browser IndexedDB | refused by its version check |
+| `gk_local.bin` (1.14) | read as empty, and never written over |
 | accounts database | sqlx refuses a database with migrations it does not know |
 
 A downgrade is not supported, but it is safe: nothing is destroyed.
@@ -197,6 +241,43 @@ and an index there says pins are out of reach, since that relay has no frame for
 **A new vault item** needs no protocol and no new `ITEM_FORMAT`: `VaultPut` takes any name on every relay down to 12,
 and an older app leaves an item it does not know alone. So what an account newly keeps goes in an item of its own
 (`item.blocks` since 1.10). `item.prefs` is positional: a field added to it would make every saved copy unreadable.
+
+**The group key's data (1.14).**
+- The vault item `item.seat_kem`: the account's seat keys (a Kyber1024 and an X25519 pair, the self key, when they were
+  made and their counter), about 4.9 KB, 9.7 KB while a rotation keeps the old ones. Every device of the account reads it;
+  an older app leaves it alone.
+- The browser's IndexedDB database `voipc-gk-mirror` (version 1, store `mirrors`): per relay id and account name, the
+  seat-key counters a signed-in account's pages checked or raised (up to about 32,000 accounts), as postcard bytes with
+  their own format version (1), relay id and account id, sealed with AES-GCM under the wrapping key in `voipc-accounts`
+  (which stays at version 1), with the row's id as additional data. A newer database version is not opened (the
+  counters then last the page), and a row in a newer format is neither read nor written over. Lost, the page has only
+  the vault's pages.
+- The vault item `item.kept`: the account's kept keys (32 random bytes and a Kyber1024 pair, which never change), about
+  4.8 KB, made at the account's first sign-in with 1.14. Kept chain starts under the group key and sharers' rows to this
+  account open with them. An older app leaves it alone.
+- The vault item `item.gk_floors`, the index of the floor pages: `gkf.0` to `gkf.15` (each stored channel's rollback floor
+  and names floor) and `gkc.0` to `gkc.31` (the highest seat-key counter seen per account, and when each pin was first
+  seen), up to 48 KiB a page, in a namespace of their own on the relay (`voipc.gkfloors`), read one at a time after sign-in
+  like the pins' pages.
+- `gk_local.bin` in the data directory of the desktop and phone apps (0600): each relay's floors, a desktop keyholder's own
+  pair and the seats it sealed that no header named yet, with the head each stands on, per channel it holds keys in each
+  account's highest desktop counter, beside each floor up to 8 keyholder headers before it, a guest's highest
+  counters, and for a signed-in account the seat-key counters that device checked or raised (up to about 32,000
+  accounts), the id of the group each text channel was last followed under, and nothing else. It is not encrypted at
+  rest. Version 2 (1.14) reads a version 1 file; a file in an older 1.14 development format is set aside and started
+  anew.
+  Lost, a device falls back to the vault floor or to the rule for no floor.
+- The accounts database: migration `0013_group_keys.sql` adds the `voipc_gk_*` tables, `voipc_log_kems` (each account's
+  kept Kyber1024 key) and the column `voipc_pending.gk_rows`. Migration `0014_group_keys_restart.sql` (after rc.1)
+  adds `voipc_gk_eager` (each eager seat asked, kept until it is seated or dropped), `voipc_gk_exit_asks` (each exit
+  of an account's seats asked ahead of its group: a log leave, a gate, a new password, a kick or leave of the channel;
+  kept until the exit is written) and the columns `voipc_gk_holders.forced` (a keyholder entry whose removal is
+  proposed outright), `voipc_gk_groups.eager_after` (how far a new start's eager seats were asked) and
+  `voipc_gk_groups.moved_back` (the generation a channel's group id came back onto: a new one is due while the head is
+  of it). The relay keeps `gk_incarnation`
+  and `gk_switch` in `voipc_meta`, written at its first start with the key on and by `db new-incarnation`.
+  Only stored channels are there; anonymous rooms, channels that hide their members, voice rooms and relays without
+  accounts keep it all in memory.
 
 **Going back from 1.3 to 1.0.** A 1.3 app does not connect to a 1.0 relay, and the desktop
 updater only ever moves forward, so a user whose server stays on 1.0 had to go back by hand.
@@ -245,7 +326,8 @@ loads the page its relay serves. The relay's side is in [OPERATING.md](OPERATING
 - `crates/voipc-server/tests/migrations.rs`: a shipped migration's hash may not change;
 - a "newer than me" test per format.
 
-Each release adds its own fixture directories (a release-checklist step).
+Each release adds its own fixture directories (a release-checklist step). 1.14's, with the group key's vault items,
+`gk_local.bin` and a database at `0014`, are still to be written.
 
 ## 5. Security claims
 
@@ -253,6 +335,19 @@ Each release adds its own fixture directories (a release-checklist step).
 
 **May change:** a claim may get stronger. Weakening one needs a published GitHub security
 advisory and a "Security" entry in the CHANGELOG. It never happens silently.
+
+**1.14 weakens several, for the group key** ([GROUP-KEY.md](GROUP-KEY.md) §6, the claims marked (W)):
+a stolen device reads recorded live text back to the last seat-key rotation (30 days at most), not
+the last hour; a held key lasts until the next epoch, up to 70 minutes under a hostile relay, in a
+channel of any size; writers no longer name each new reader themselves, the signed headers name them
+to writers in gated channels only; an account that only goes offline stays seated until it leaves,
+rotates or expires after 90 days unused (at most 210 days after its last sign-in); keyholders are a
+new party, and whoever holds an account's identity key can, with the relay, add one of its own that
+members take unwarned; and newcomers read up to 5 minutes back under an honest relay, up to twice
+that while people keep joining, 70 under a hostile one. Whoever once held an account's vault key
+reads its later seat keys wherever it gets the relay's copy of the vault, after a password change
+too. They are in the CHANGELOG's Security entry for
+1.14, for one advisory. `group_key = false` keeps the claims as they were.
 
 **Break detection:**
 - every row of `docs/THREAT-MODEL.md` names the code and tests that hold it;

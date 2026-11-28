@@ -23,7 +23,7 @@ import { mkdirSync, mkdtempSync, openSync, rmSync, writeFileSync } from "node:fs
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { barrier, frameSummary, loadPage, openTab, probe, seen, sentKind, sleep, startChromium, waitFor } from "./test-cdp.mjs";
+import { barrier, frameSummary, loadPage, openTab, probe, seen, sentKind, sentPost, sleep, startChromium, waitFor } from "./test-cdp.mjs";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.argv[2] ?? 49992);
@@ -66,7 +66,8 @@ spawnSync(
 );
 writeFileSync(
   join(WORK, "server.toml"),
-  `host = "127.0.0.1"
+  // GK=0 (test-web.sh's switch): the relay with the group key off, on the old paths
+  `${process.env.GK === "0" ? "group_key = false\n" : ""}host = "127.0.0.1"
 tcp_port = ${PORT}
 udp_port = ${PORT}
 cert_path = "server.crt"
@@ -718,13 +719,19 @@ async function lane() {
   await waitFor(fay, `document.querySelector(".join-text-btn")`);
   await fay.evaluate(`document.querySelector(".join-text-btn").click()`);
   await waitFor(fay, `document.querySelector(".input-bar .chat-input")`);
-  // Her compose box comes with the relay's TextJoined, so his post's key check names her.
-  // His list is not what decides it: a text join tells nobody, and only a sweep would show
-  // her there before he posts (a random moment in the first minute, then ten minutes on)
+  // Her compose box comes with the relay's TextJoined. His list is not what decides whether
+  // she reads him: a text join tells nobody, and only a sweep would show her there (a random
+  // moment in the first minute, then ten minutes on)
   check("the maker's own list is there at once", await seen(gus, listRow("gus")), await pageText(gus));
   await say(gus, "only gus holds this");
   await waitFor(fay, lastMessage("only gus holds this"), 30_000);
-  check("handing her his key puts her on his list", await seen(gus, listRow("fay")), await pageText(gus));
+  // Nor does his post put her on it under the group key: a writer names no reader there (her
+  // seat is the keyholder's commit, which only "Keys held by" shows), and the list is the last
+  // sweep's, "up to ten minutes ago". It used to pass by a race: her history ask, coming after
+  // his post, moved his sweep up; when his sweep budget held that back, nothing listed her for
+  // 90 s (soak 45226171956). Refresh is how 1.14 asks who is here now, so it is asked once
+  await gus.evaluate(`document.querySelector(".user-list.modern .refresh-list").click()`);
+  check("after she reads him, his Refresh lists her", await seen(gus, listRow("fay")), await pageText(gus));
   await fay.evaluate(`${notesRow}.parentElement.querySelector('.settings-icon[title^="Leave this channel"]').click()`);
   await waitFor(gus, `!${listRow("fay")}`);
   await waitFor(han, notesRow);
@@ -1021,8 +1028,8 @@ async function lane() {
     await waitFor(tab, `document.querySelector(".react-item")`);
     await tab.evaluate(`window.__voipc_said.splice(0); 0`);
     await tab.evaluate(`document.querySelector(".react-item").click()`);
-    // The event is written out before its post goes, a raw #27 after the key check
-    await waitFor(tab, sentKind("#27"));
+    // The event is written out before its post goes, raw (sentPost) after the key check
+    await waitFor(tab, sentPost);
     await tab.evaluate(`JSON.stringify = window.__stringify; 0`);
   };
   await sendsHide(ivy, "something fine");

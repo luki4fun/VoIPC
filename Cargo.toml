@@ -15,7 +15,7 @@ members = [
 exclude = ["crates/voipc-web", "crates/voipc-opus-wasm", "crates/voipc-media-wasm", "fuzz"]
 
 [workspace.package]
-version = "1.12.0"
+version = "1.14.0-rc.2"
 edition = "2021"
 license = "MIT"
 # The toolchain CI tests with (rust-toolchain.toml)
@@ -52,3 +52,12 @@ debug = "line-tables-only"
 
 [profile.dev.package."*"]
 debug = false
+
+# wtransport 0.7.2 drops half-read control-stream frames, closing about 2 connects in 1000
+# on a busy relay (upstream issue #331; test: settings_split_by_the_session_request_still_open_the_session
+# in crates/voipc-server/src/web.rs). The fork is upstream's 0.7.2 tag plus that one fix.
+# The nightly job wtransport-fork says when upstream releases again; then this block goes,
+# or the fork's commit moves onto the release. It must stay a 0.7.x version, or cargo
+# quietly ignores it.
+[patch.crates-io]
+wtransport = { git = "https://github.com/luki4fun/wtransport.git", tag = "0.7.2-voipc.1" }

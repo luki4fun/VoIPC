@@ -8,11 +8,19 @@
 //     What a real client pays for end-to-end keys in a channel of that many.
 //     The relay is not involved in any of it, so the run below cannot show it.
 //
-//   community_load run 500 127.0.0.1:9987 [relay-pid]
-//     N guests connect, then all join one text channel at once, then chat.
+//   community_load run 500 127.0.0.1:9987 [relay-pid] [--rate R] [--idle S]
+//     N guests connect, R a second (50), then all join one text channel at once, then chat.
 //     Reports latency, what was lost, and with the pid the relay's RSS and CPU.
+//     `--idle S` stops after connecting and holds everyone S seconds instead: the
+//     relay's memory per connection, and who it loses while nothing happens.
 //     The load clients hold no keys: their ciphertext is a timestamp and padding,
 //     relayed verbatim, so this measures the relay and nothing else.
+//     `--accounts` signs in seeded accounts `acct<i>` with their device keys instead of
+//     guests: the sign-in storm after a restart, database and all.
+//
+//   community_load seed 50000 postgres://…
+//     That many accounts, each with a remembered device, in the relay's database (start the
+//     relay on it once first: it makes the tables). Seeding again skips who is there.
 //
 //   community_load channels 300 > channels.json
 //     That many text channels everyone follows, for the relay `follow` runs against.
@@ -27,7 +35,9 @@
 //     `kill -9` on the relay halfway, then the command, which must `exec` a new relay, and
 //     everyone returns at `reconnectDelay`'s spread. It exits non-zero if a line does not
 //     hold. What it cannot see: a post that waited for a lost wrap asks again in a real
-//     app (`KeyWanted`); here it only counts as expired.
+//     app (`KeyWanted`); here it only counts as expired. And a wrap here opens its whole
+//     chain, where an app's opens from its round's position on: a reader a chain named whose
+//     round has gone gets the current position there, and misses what went before it.
 //
 // The relay needs `max_users` above N. Load clients share the machine with it,
 // so CPU times are the relay's own, and latencies are an upper bound.
@@ -42,7 +52,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, watch, Notify};
 
-use load_common::{connect, connect_with, enc, next_message, Error};
+use load_common::{connect, connect_account, connect_with, enc, load_device, next_message, Error};
 use voipc_crypto::channel_state::{chain_age_limit, exit_gap, WRAPS_A_FRAME};
 use voipc_crypto::{group, prekey, session, SignalStores};
 use voipc_protocol::codec::{encode_server_msg, CONTROL_MSGS_PER_SEC, MAX_MSG_SIZE};
@@ -58,6 +68,14 @@ const CHAT_MESSAGES: u64 = 20;
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
+    // Only when asked: with `RUST_LOG=quinn_proto=debug` each line names its client
+    if std::env::var_os("RUST_LOG").is_some() {
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_writer(std::io::stderr)
+            .with_ansi(false)
+            .init();
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("frames") => frames(),
@@ -66,11 +84,28 @@ async fn main() -> Result<(), Error> {
             rustls::crypto::ring::default_provider()
                 .install_default()
                 .expect("crypto provider");
-            let pid = args.get(3).map(|p| p.parse()).transpose()?;
+            let pid = args
+                .get(3)
+                .filter(|p| !p.starts_with("--"))
+                .map(|p| p.parse())
+                .transpose()?;
             let server = args.get(2).map_or("127.0.0.1:9987", String::as_str);
-            run(number(args.get(1), 100)?, server, pid).await
+            let flag = |name: &str| -> Result<Option<f64>, Error> {
+                let Some(i) = args.iter().position(|a| a == name) else {
+                    return Ok(None);
+                };
+                Ok(Some(args.get(i + 1).ok_or("a flag without its value")?.parse()?))
+            };
+            let rate = flag("--rate")?.unwrap_or(50.0);
+            let idle = flag("--idle")?;
+            ACCOUNTS.store(args.iter().any(|a| a == "--accounts"), Ordering::Relaxed);
+            run(number(args.get(1), 100)?, server, pid, rate, idle).await
         }
         Some("channels") => channels_file(number(args.get(1), 300)?),
+        Some("seed") => {
+            let url = args.get(2).ok_or("seed N database-url")?;
+            seed(number(args.get(1), 1000)?, url).await
+        }
         Some("follow") => {
             rustls::crypto::ring::default_provider()
                 .install_default()
@@ -78,7 +113,7 @@ async fn main() -> Result<(), Error> {
             follow(FollowArgs::parse(&args[1..])?).await
         }
         _ => Err(
-            "usage: community_load frames | crypto [N] | run [N] [host:port] [relay-pid] | channels [N] | follow N host:port relay-pid [--writers W] [--rate R] [--each C] [--seconds S] [--churn J] [--leave] [--wave \"command\"]".into(),
+            "usage: community_load frames | crypto [N] | run [N] [host:port] [relay-pid] [--rate R] [--idle S] [--accounts] | seed N database-url | channels [N] | follow N host:port relay-pid [--writers W] [--rate R] [--each C] [--seconds S] [--churn J] [--leave] [--wave \"command\"]".into(),
         ),
     }
 }
@@ -281,6 +316,8 @@ async fn crypto(n: usize) -> Result<(), Error> {
 struct Tally {
     up: AtomicUsize,
     refused: AtomicUsize,
+    /// Clients that were in and then lost their connection.
+    lost: AtomicUsize,
     /// Everything the relay sent, all clients together.
     messages: AtomicU64,
     connect_ms: Mutex<Vec<u64>>,
@@ -325,7 +362,13 @@ async fn settle(tally: &Tally, limit: Duration) {
     }
 }
 
-async fn run(n: usize, server: &str, pid: Option<u32>) -> Result<(), Error> {
+async fn run(
+    n: usize,
+    server: &str,
+    pid: Option<u32>,
+    rate: f64,
+    idle: Option<f64>,
+) -> Result<(), Error> {
     let tally = Arc::new(Tally {
         roster: Mutex::new(vec![None; n]),
         ..Tally::default()
@@ -347,13 +390,22 @@ async fn run(n: usize, server: &str, pid: Option<u32>) -> Result<(), Error> {
             .await;
             if let Err(e) = result {
                 // A count, or thousands of lines; the first few say why.
-                if tally.refused.fetch_add(1, Ordering::Relaxed) < 3 {
-                    eprintln!("client {index}: {e}");
+                if tally.roster.lock().unwrap()[index].is_none() {
+                    if tally.refused.fetch_add(1, Ordering::Relaxed) < 3 {
+                        eprintln!("client {index}: {e}");
+                    }
+                } else if tally.lost.fetch_add(1, Ordering::Relaxed) < 5 {
+                    let at = clock.elapsed().as_secs_f64();
+                    eprintln!("client {index} lost at {at:.1} s: {e}");
                 }
             }
         });
-        // Paced as people arriving, not as an attack on the connect limits
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Paced as people arriving, not as an attack on the connect limits; past 100 a second
+        // in batches each 10 ms, since a sleep takes a millisecond at least
+        let batch = ((rate / 100.0).ceil() as usize).max(1);
+        if (index + 1) % batch == 0 {
+            tokio::time::sleep(Duration::from_secs_f64(batch as f64 / rate)).await;
+        }
     }
     let limit = Duration::from_secs(60 + n as u64 / 10);
     let started = Instant::now();
@@ -362,17 +414,26 @@ async fn run(n: usize, server: &str, pid: Option<u32>) -> Result<(), Error> {
     {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    settle(&tally, limit).await;
+    // Idle, the relay's pings never let the count stand still: nothing to settle
+    if idle.is_none() {
+        settle(&tally, limit).await;
+    }
     let up = tally.up.load(Ordering::Relaxed);
     if up == 0 {
         return Err("no client connected: is the relay up?".into());
     }
     let after_connect = pid.and_then(relay_stats);
     println!(
-        "connected {up}, refused {}, General lists received {}, relay {after_connect:?}",
+        "connected {up} in {:.1} s, refused {}, tried again: busy {}, other {}, General lists received {}, relay {after_connect:?}",
+        clock.elapsed().as_secs_f64(),
         tally.refused.load(Ordering::Relaxed),
+        load_common::BUSY_RETRIES.load(Ordering::Relaxed),
+        load_common::OTHER_RETRIES.load(Ordering::Relaxed),
         tally.general_lists.load(Ordering::Relaxed),
     );
+    if let Some(secs) = idle {
+        return hold(&tally, up, pid, Duration::from_secs_f64(secs)).await;
+    }
 
     // Everyone joins at once: what the first evening after a move looks like
     let before_join = tally.messages.load(Ordering::Relaxed);
@@ -428,6 +489,94 @@ async fn run(n: usize, server: &str, pid: Option<u32>) -> Result<(), Error> {
     Ok(())
 }
 
+/// `run --accounts`: seeded accounts sign in, not guests.
+static ACCOUNTS: AtomicBool = AtomicBool::new(false);
+
+/// `seed`: accounts `acct0..n`, each with `load_device`'s key remembered, 32 at a time.
+async fn seed(n: usize, url: &str) -> Result<(), Error> {
+    use l4f_accounts::model::{AccountId, Credential, NewUser};
+    let store = Arc::new(l4f_accounts::store::Store::connect(url).await?);
+    let (made, skipped) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let started = Instant::now();
+    let mut workers = tokio::task::JoinSet::new();
+    const AT_ONCE: usize = 32;
+    for w in 0..AT_ONCE {
+        let (store, made, skipped) = (store.clone(), made.clone(), skipped.clone());
+        workers.spawn(async move {
+            for index in (w..n).step_by(AT_ONCE) {
+                let id = AccountId::new();
+                let user = NewUser {
+                    id,
+                    username: format!("acct{index}"),
+                    display_name: format!("acct{index}"),
+                    email_pending: None,
+                    password_hash: None,
+                    created_at: l4f_accounts::util::now(),
+                };
+                if store.create_user(&user, None).await.is_err() {
+                    skipped.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                let (device_id, _, public) = load_device(index);
+                let device = Credential {
+                    kind: "devkey".into(),
+                    ext_id: device_id.to_vec(),
+                    user_id: id,
+                    public_key: Some(public),
+                    alg: 0,
+                    sign_count: 0,
+                    flags: 0,
+                    name: "community_load".into(),
+                    created_at: l4f_accounts::util::now(),
+                    last_used_at: None,
+                    public: false,
+                };
+                store.insert_credential(&device).await?;
+                made.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok::<(), Error>(())
+        });
+    }
+    while let Some(done) = workers.join_next().await {
+        done??;
+    }
+    println!(
+        "seeded {} accounts in {:.1} s, {} were there",
+        made.load(Ordering::Relaxed),
+        started.elapsed().as_secs_f64(),
+        skipped.load(Ordering::Relaxed),
+    );
+    Ok(())
+}
+
+/// `--idle`: everyone stays connected and quiet; RSS and losses every ten seconds.
+async fn hold(tally: &Tally, up: usize, pid: Option<u32>, secs: Duration) -> Result<(), Error> {
+    let started = Instant::now();
+    let mut rss = pid.and_then(relay_stats);
+    while started.elapsed() < secs {
+        tokio::time::sleep(Duration::from_secs(10).min(secs)).await;
+        rss = pid.and_then(relay_stats).or(rss);
+        println!(
+            "{:>5.0} s: {} lost, relay {rss:?}",
+            started.elapsed().as_secs_f64(),
+            tally.lost.load(Ordering::Relaxed),
+        );
+    }
+    let mut connect_ms = tally.connect_ms.lock().unwrap().clone();
+    let (mib, kib_each) = match rss {
+        Some((mib, _)) => (mib.to_string(), (mib * 1024 / up.max(1) as u64).to_string()),
+        None => ("?".into(), "?".into()),
+    };
+    println!("| clients | connect p95 ms | held s | lost | relay RSS MiB | KiB a client |");
+    println!(
+        "| {up} | {} | {:.0} | {} | {mib} | {kib_each} |",
+        percentile(&mut connect_ms, 95),
+        secs.as_secs_f64(),
+        tally.lost.load(Ordering::Relaxed),
+    );
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn client(
     index: usize,
@@ -440,7 +589,11 @@ async fn client(
     mut chat_rx: watch::Receiver<u64>,
 ) -> Result<(), Error> {
     let started = Instant::now();
-    let c = connect(index, server).await?;
+    let c = if ACCOUNTS.load(Ordering::Relaxed) {
+        connect_account(index, server).await?
+    } else {
+        connect(index, server).await?
+    };
     tally
         .connect_ms
         .lock()
@@ -601,7 +754,10 @@ const WRAP_BYTES: usize = 176;
 const OPENS_A_FRAME: usize = 256;
 const OPEN_WAIT_MS: u64 = 1_000;
 const WRAP_FRAME_BYTES: usize = 56 * 1024;
+/// The most a wrap is counted at, before a reader's keys go in a frame: a pre-key message's.
+const WRAP_MOST_BYTES: usize = 4 * 1024;
 const HOLD_MS: u64 = 60_000;
+const ROUND_LIFE_MS: u64 = 60_000;
 const HELLO_BURST: f64 = 128.0;
 const HELLOS_A_SECOND: f64 = 2.0;
 const PREKEY_REFILL: usize = 50;
@@ -740,12 +896,80 @@ fn dummy_wrap(chain: u32) -> Vec<u8> {
     ct
 }
 
+/// What a queued wrap or ask to open is for, as `channel_state`'s `For`: the key of the chain
+/// with this number, or whatever the channel's chains still owe them (a hello came).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum For {
+    Chain(u32),
+    Owed,
+}
+
+impl For {
+    fn covers(self, chain: u32) -> bool {
+        match self {
+            For::Chain(number) => number == chain,
+            For::Owed => true,
+        }
+    }
+}
+
+/// `channel_state`'s `Wraps`: a reader once a channel, in the order first owed, what else is
+/// owed them there joining their place, so a frame touches only the readers it takes.
+#[derive(Default)]
+struct Wraps {
+    order: VecDeque<(u32, u32)>,
+    whats: HashMap<(u32, u32), Vec<For>>,
+}
+
+impl Wraps {
+    fn push(&mut self, channel_id: u32, id: u32, what: For) {
+        match self.whats.entry((channel_id, id)) {
+            std::collections::hash_map::Entry::Occupied(mut whats) => {
+                let whats = whats.get_mut();
+                if what == For::Owed {
+                    *whats = vec![For::Owed];
+                } else if !whats.contains(&what) && !whats.contains(&For::Owed) {
+                    whats.push(what);
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(whats) => {
+                whats.insert(vec![what]);
+                self.order.push_back((channel_id, id));
+            }
+        }
+    }
+
+    fn front(&self) -> Option<(u32, u32)> {
+        self.order.front().copied()
+    }
+
+    fn front_whats(&self) -> &[For] {
+        self.front()
+            .and_then(|key| self.whats.get(&key))
+            .map_or(&[][..], Vec::as_slice)
+    }
+
+    fn pop_front(&mut self) {
+        if let Some(key) = self.order.pop_front() {
+            self.whats.remove(&key);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.order.is_empty()
+    }
+}
+
 /// One writer in one channel: `Writing` of `channel_state`, and no key in it.
 #[derive(Default)]
 struct WriterChannel {
     chain: u32,
     started: Option<u64>,
     named: HashSet<u32>,
+    /// When each round began, and whom it named.
+    rounds: Vec<(u64, HashSet<u32>)>,
+    /// Rounds of chains that ended: the chain, until when, and whom it named.
+    retired: Vec<(u32, u64, HashSet<u32>)>,
     exited: bool,
     check_out: bool,
     owed: Vec<u32>,
@@ -762,6 +986,72 @@ impl WriterChannel {
         age >= chain_age_limit(self.named.len())
             || (self.exited && age >= exit_gap(self.named.len()))
     }
+
+    /// `Writing::chain_answers`: whom it named, while it is not over; past an exit's gap
+    /// alone, whom a round still live named; past its age, nobody.
+    fn chain_answers(&self, id: u32, now: u64) -> bool {
+        let Some(started) = self.started else {
+            return false;
+        };
+        if !self.named.contains(&id) {
+            return false;
+        }
+        if !self.over(now) {
+            return true;
+        }
+        now.saturating_sub(started) < chain_age_limit(self.named.len())
+            && self
+                .rounds
+                .iter()
+                .any(|(at, named)| named.contains(&id) && now.saturating_sub(*at) < ROUND_LIFE_MS)
+    }
+
+    /// `Writing::hand_off`: the chains whose key a hand-off to `id` for any of `whats` carries
+    /// now, the oldest first. An ended chain's while a round of it that named them lives. Of
+    /// the chains that owe them, the newest `SENDER_KEY_STATES` alone, then whichever `whats`
+    /// covers: the current chain last.
+    fn hand_off(&self, id: u32, whats: &[For], now: u64) -> Vec<u32> {
+        let mut chains: Vec<u32> = Vec::new();
+        for (chain, until, named) in &self.retired {
+            if now < *until && named.contains(&id) && !chains.contains(chain) {
+                chains.push(*chain);
+            }
+        }
+        if self.chain_answers(id, now) {
+            chains.push(self.chain);
+        }
+        let older = chains.len().saturating_sub(SENDER_KEY_STATES);
+        chains.drain(..older);
+        chains.retain(|chain| whats.iter().any(|what| what.covers(*chain)));
+        chains
+    }
+
+    fn answers(&self, id: u32, what: For, now: u64) -> bool {
+        !self.hand_off(id, &[what], now).is_empty()
+    }
+
+    /// The next chain, as `live_post` and `keys_owed` start one (`Writing::end_chain`): the
+    /// live rounds of this one go on answering whom they named, till their life or this
+    /// chain's age ends.
+    fn new_chain(&mut self, now: u64, tally: &FollowTally) {
+        self.retired.retain(|(_, until, _)| now < *until);
+        if let Some(started) = self.started {
+            let limit = started.saturating_add(chain_age_limit(self.named.len()));
+            for (at, named) in std::mem::take(&mut self.rounds) {
+                let until = at.saturating_add(ROUND_LIFE_MS).min(limit);
+                if now < until {
+                    self.retired.push((self.chain, until, named));
+                }
+            }
+        }
+        self.started = None;
+        self.named.clear();
+        self.rounds.clear();
+        self.exited = false;
+        self.chain += 1;
+        self.job_up = 0;
+        tally.add(|t| &t.new_chains);
+    }
 }
 
 #[derive(Default)]
@@ -769,8 +1059,8 @@ struct WriterState {
     channels: Vec<u32>,
     at: HashMap<u32, WriterChannel>,
     sessions: HashSet<u32>,
-    opens: VecDeque<(u32, u32)>,
-    wraps: VecDeque<(u32, u32)>,
+    opens: VecDeque<(u32, u32, For)>,
+    wraps: Wraps,
     awaiting: HashSet<u32>,
     open_frame: usize,
     opens_sent_at: u64,
@@ -793,12 +1083,7 @@ impl WriterState {
         }
         let restart = w.over(now);
         if restart {
-            w.started = None;
-            w.named.clear();
-            w.exited = false;
-            w.chain += 1;
-            w.job_up = 0;
-            tally.add(|t| &t.new_chains);
+            w.new_chain(now, tally);
         }
         w.check_out = true;
         w.waiting.push_back(now);
@@ -808,7 +1093,8 @@ impl WriterState {
         })
     }
 
-    /// `keys_owed` and `start_round`: the posts go before anything else does.
+    /// `keys_owed` and `start_round`: the posts go before anything else does. An answer that
+    /// finds the chain over asks for everyone again instead, and the posts wait for that one.
     #[allow(clippy::too_many_arguments)]
     fn owed(
         &mut self,
@@ -828,11 +1114,27 @@ impl WriterState {
             return;
         }
         w.check_out = false;
+        if w.started.is_some() && w.over(now) {
+            w.owed.clear();
+            w.new_chain(now, tally);
+            w.check_out = true;
+            out.push(ClientMessage::KeyCheck {
+                channel_id,
+                restart: true,
+            });
+            return;
+        }
         w.started.get_or_insert(now);
         let mut owed = std::mem::take(&mut w.owed);
         owed.retain(|id| *id != own);
         owed.sort_unstable();
         w.named.extend(owed.iter().copied());
+        if !owed.is_empty() {
+            w.rounds
+                .retain(|(at, _)| now.saturating_sub(*at) < ROUND_LIFE_MS);
+            w.retired.retain(|(_, until, _)| now < *until);
+            w.rounds.push((now, owed.iter().copied().collect()));
+        }
         for sent in w.waiting.drain(..) {
             tally.add(|t| &t.posts_up);
             out.push(ClientMessage::SendEncryptedChannelMessage {
@@ -840,22 +1142,24 @@ impl WriterState {
                 ciphertext: dummy_post(sent, w.chain),
             });
         }
+        let chain = For::Chain(w.chain);
         for id in owed {
             if self.sessions.contains(&id) {
-                self.wraps.push_back((channel_id, id));
+                self.wraps.push(channel_id, id, chain);
             } else {
-                self.opens.push_back((channel_id, id));
+                self.opens.push_back((channel_id, id, chain));
             }
         }
     }
 
-    /// `session_hello`: a wrap for every chain of ours that named them.
+    /// `session_hello`: a wrap for every chain of ours that still answers them, an ended
+    /// one's too.
     fn hello(&mut self, from: u32, now: u64) {
         self.sessions.insert(from);
         self.awaiting.remove(&from);
         for (channel_id, w) in &self.at {
-            if w.named.contains(&from) && !w.over(now) {
-                self.wraps.push_back((*channel_id, from));
+            if w.answers(from, For::Owed, now) {
+                self.wraps.push(*channel_id, from, For::Owed);
             }
         }
     }
@@ -863,23 +1167,31 @@ impl WriterState {
     /// `live_next_frame`, with `next_ask` and `job_over` left out: nobody asks for chat here,
     /// and the refill goes as soon as the relay says it runs low.
     fn next_frame(&mut self, now: u64, tally: &FollowTally) -> Option<ClientMessage> {
-        while let Some(&(channel_id, _)) = self.wraps.front() {
+        while let Some((channel_id, _)) = self.wraps.front() {
+            // `next_wraps`: all a reader waits for in the channel goes as one hand-off, in the
+            // first frame that takes them, and whole, or first in the next frame
             let mut keys = Vec::new();
             let mut bytes = 0;
-            while let Some(&(channel, id)) = self.wraps.front() {
+            while let Some((channel, id)) = self.wraps.front() {
                 if channel != channel_id || keys.len() >= WRAPS_A_FRAME || bytes >= WRAP_FRAME_BYTES
                 {
                     break;
                 }
-                self.wraps.pop_front();
-                let Some(w) = self.at.get(&channel) else {
-                    continue;
-                };
-                if w.over(now) || !w.named.contains(&id) {
-                    continue;
+                let chains: Vec<u32> = self
+                    .at
+                    .get(&channel)
+                    .map_or_else(Vec::new, |w| w.hand_off(id, self.wraps.front_whats(), now));
+                if !keys.is_empty()
+                    && (keys.len() + chains.len() > WRAPS_A_FRAME
+                        || bytes + chains.len() * WRAP_MOST_BYTES > WRAP_FRAME_BYTES)
+                {
+                    break;
                 }
-                bytes += WRAP_BYTES + 8;
-                keys.push((id, 2u8, dummy_wrap(w.chain)));
+                self.wraps.pop_front();
+                for chain in chains {
+                    bytes += WRAP_BYTES + 8;
+                    keys.push((id, 2u8, dummy_wrap(chain)));
+                }
             }
             if !keys.is_empty() {
                 tally
@@ -898,23 +1210,24 @@ impl WriterState {
         if !answered && now.saturating_sub(self.opens_sent_at) < OPEN_WAIT_MS {
             return None;
         }
-        while let Some(&(channel_id, _)) = self.opens.front() {
+        while let Some(&(channel_id, ..)) = self.opens.front() {
             let mut targets = Vec::new();
-            while let Some(&(channel, id)) = self.opens.front() {
+            let mut asked = HashSet::new();
+            while let Some(&(channel, id, what)) = self.opens.front() {
                 if channel != channel_id || targets.len() >= OPENS_A_FRAME {
                     break;
                 }
                 self.opens.pop_front();
-                if self
+                let owed = self
                     .at
                     .get(&channel)
-                    .is_some_and(|w| !w.over(now) && w.named.contains(&id))
-                {
+                    .is_some_and(|w| w.answers(id, what, now));
+                if owed && asked.insert(id) {
                     targets.push(id);
                 }
             }
             if !targets.is_empty() {
-                self.awaiting = targets.iter().copied().collect();
+                self.awaiting = asked;
                 self.open_frame = targets.len();
                 self.opens_sent_at = now;
                 if let Some(w) = self.at.get_mut(&channel_id) {
@@ -948,10 +1261,17 @@ impl WriterState {
 
 type HeldPost = (u64, u32, u64);
 
+/// Chains a reader holds of one writer in one channel, the last taken first: libsignal's
+/// `MAX_SENDER_KEY_STATES`, which a key taken again moves to the front. And so the most keys
+/// a writer hands one reader in one hand-off or frame (`channel_state`'s own).
+const SENDER_KEY_STATES: usize = 5;
+
 /// What a reader holds of a client's run: `channel_state`'s reader, and no key in it.
 #[derive(Default)]
 struct ReaderState {
-    keys: HashMap<(u32, u32), u32>,
+    /// By writer and channel: the chains whose key came, newest first. A chain's key opens
+    /// that chain's posts only, so a post lost to a restart stays lost here too.
+    keys: HashMap<(u32, u32), VecDeque<u32>>,
     /// By writer and channel: sent, its chain, when it arrived.
     held: HashMap<(u32, u32), Vec<HeldPost>>,
     hello_spent: f64,
@@ -1185,12 +1505,14 @@ async fn follow_once(c: &FollowClient) -> Result<(), Error> {
                             .get(..4)
                             .and_then(|b| b.try_into().ok())
                             .map_or(0, u32::from_le_bytes);
-                        let held = reader.keys.entry((from, channel_id)).or_insert(0);
-                        *held = chain.max(*held);
-                        let held = *held;
+                        let held = reader.keys.entry((from, channel_id)).or_default();
+                        held.retain(|on| *on != chain);
+                        held.truncate(SENDER_KEY_STATES - 1);
+                        held.push_front(chain);
+                        let held = &*held;
                         if let Some(posts) = reader.held.get_mut(&(from, channel_id)) {
                             posts.retain(|(sent, on, _)| {
-                                if *on > held {
+                                if !held.contains(on) {
                                     return true;
                                 }
                                 note_opened(tally, (from, channel_id, *on), *sent, now);
@@ -1201,8 +1523,8 @@ async fn follow_once(c: &FollowClient) -> Result<(), Error> {
                     ServerMessage::TextPost { channel_id, user_id, ciphertext, .. } => {
                         tally.add(|t| &t.posts_in);
                         if let Some((sent, chain)) = read_post(&ciphertext) {
-                            let key = reader.keys.get(&(user_id, channel_id)).copied().unwrap_or(0);
-                            if key >= chain {
+                            let key = reader.keys.get(&(user_id, channel_id));
+                            if key.is_some_and(|held| held.contains(&chain)) {
                                 tally.post_ms.lock().unwrap().push(now.saturating_sub(sent));
                             } else {
                                 reader

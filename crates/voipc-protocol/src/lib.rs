@@ -5,8 +5,10 @@ pub mod discord;
 pub mod error;
 #[cfg(any(test, fuzzing))]
 pub mod fuzz;
+pub mod gk;
 pub mod messages;
 pub mod names;
+pub mod pool;
 pub mod types;
 pub mod video;
 pub mod voice;

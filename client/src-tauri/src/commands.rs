@@ -132,6 +132,7 @@ pub async fn disconnect_all(
 #[tauri::command]
 pub async fn join_channel(
     state: State<'_, AppState>,
+    app: tauri::AppHandle,
     server: String,
     channel_id: u32,
     password: Option<String>,
@@ -174,6 +175,11 @@ pub async fn join_channel(
     // the readers' voice handover all take it.
     drop(conns);
     wait_for_capture(capture).await;
+    // A leave is the user's to make, not the server's to confirm: the
+    // microphone closes now (dive 6 F10)
+    if channel_id == 0 {
+        network::leave_voice_now(&state, &app, &server).await;
+    }
     Ok(())
 }
 
@@ -315,6 +321,58 @@ pub async fn request_channel_page(
     .await
 }
 
+/// A page of the lobby from past `after`, sections then A-Z, with names starting `prefix`
+/// if it is not empty (protocol 25): `lobby-page` answers.
+#[tauri::command]
+pub async fn request_lobby_page(
+    state: State<'_, AppState>,
+    server: String,
+    after: Option<voipc_protocol::types::LobbyCursor>,
+    prefix: String,
+) -> Result<(), String> {
+    let conns = state.connections.read().await;
+    let connection = conn(&conns, &server)?;
+    network::send_tcp_message(
+        &connection.tcp_tx,
+        &ClientMessage::RequestLobbyPage { after, prefix },
+    )
+    .await
+}
+
+/// Who these are, if online (protocol 25): `users` answers.
+#[tauri::command]
+pub async fn lookup_users(
+    state: State<'_, AppState>,
+    server: String,
+    ids: Vec<u32>,
+    names: Vec<String>,
+    accounts: Vec<[u8; 16]>,
+) -> Result<(), String> {
+    let conns = state.connections.read().await;
+    let connection = conn(&conns, &server)?;
+    network::send_tcp_message(
+        &connection.tcp_tx,
+        &ClientMessage::LookupUsers {
+            ids,
+            names,
+            accounts,
+        },
+    )
+    .await
+}
+
+/// The lobby's list is on screen, or not: while the lobby is small its joins come by name.
+#[tauri::command]
+pub async fn watch_lobby(
+    state: State<'_, AppState>,
+    server: String,
+    on: bool,
+) -> Result<(), String> {
+    let conns = state.connections.read().await;
+    let connection = conn(&conns, &server)?;
+    network::send_tcp_message(&connection.tcp_tx, &ClientMessage::WatchLobby { on }).await
+}
+
 /// On mobile data or not, as the front end sees it: a large key job asks first, and fewer
 /// sessions open at once.
 #[tauri::command]
@@ -408,12 +466,37 @@ pub async fn set_history_sharing(state: State<'_, AppState>, enabled: bool) -> R
     Ok(())
 }
 
+/// "Help hold keys for text channels" switched: every open connection offers to hold
+/// keys, or stops (`GroupKeying::set_volunteer`). The setting itself is saved by
+/// `set_config_bool`; the next connection reads it from there.
+#[tauri::command]
+pub async fn set_help_hold_keys(
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+    enabled: bool,
+) -> Result<(), String> {
+    let links: Vec<crate::gk_net::GkLink> = state
+        .connections
+        .read()
+        .await
+        .iter()
+        .map(|(server, c)| crate::gk_net::GkLink::of(&app_handle, server, c))
+        .collect();
+    for link in &links {
+        crate::gk_net::set_volunteer(link, enabled).await;
+    }
+    Ok(())
+}
+
 /// Ask named members for a channel's recent chat.
 ///
 /// The automatic ask happens once per channel entry; this is the user asking
 /// again — after clearing a channel by accident, or because somebody who was
-/// offline then is here now. Only members we hold a live session with are
-/// asked, because only they can answer.
+/// offline then is here now. In a text channel on the live path, and in a
+/// voice room under the group key, the ask goes sealed and opens the session
+/// it needs; elsewhere, and under the new-member wait, only members we hold a
+/// live session with are asked, because only they can answer
+/// (`network::ask_history`).
 #[tauri::command]
 pub async fn request_channel_history(
     state: State<'_, AppState>,
@@ -444,54 +527,11 @@ pub async fn request_channel_history(
     if anonymous {
         return Err("an anonymous channel shares no history".into());
     }
-    let live = text && tcp_tx.proto() >= LIVE_PATH_SINCE;
-    let now = crypto::now_ms();
-    // Sealed: the relay sees "R wrote to S", not for which channel. It goes when a session
-    // both ends hold is up, opened for it if need be. Under the new-member wait a direct
-    // message is refused, so there the plain frames below ask whoever already has a session.
-    if live && !signal.lock().map_err(|e| e.to_string())?.direct_held {
-        let mut sig = signal.lock().map_err(|e| e.to_string())?;
-        let asked = sig
-            .channels
-            .live_ask_history(channel_id, &target_user_ids, now);
-        if asked.is_empty() {
-            return Err("nobody here can share that history yet".into());
-        }
-        sig.live_wake.notify_one();
-        return Ok(asked);
-    }
-    let targets: Vec<u32> = {
-        let sig = signal.lock().map_err(|e| e.to_string())?;
-        // A pairwise session is all an answer needs — history travels over that,
-        // not over the channel's group key. Asking for the group key here would
-        // block the one repair a member has when keying went wrong.
-        let reachable: Vec<u32> = target_user_ids
-            .into_iter()
-            .filter(|uid| sig.established_sessions.contains(uid))
-            .collect();
-        voipc_crypto::pick_history_sources(&reachable)
-            .into_iter()
-            .collect()
-    };
-    if targets.is_empty() {
+    let asked = network::ask_history(&signal, &tcp_tx, channel_id, &target_user_ids, text).await?;
+    if asked.is_empty() {
         return Err("nobody here can share that history yet".into());
     }
-    for target_user_id in &targets {
-        if live {
-            let mut sig = signal.lock().map_err(|e| e.to_string())?;
-            sig.channels
-                .live_note_asked(channel_id, *target_user_id, now);
-        }
-        network::send_tcp_message(
-            &tcp_tx,
-            &ClientMessage::RequestChannelHistory {
-                channel_id,
-                target_user_id: *target_user_id,
-            },
-        )
-        .await?;
-    }
-    Ok(targets)
+    Ok(asked)
 }
 
 /// Change a channel's other options (creator, or an admin for a channel from
@@ -813,7 +853,7 @@ pub async fn send_channel_message(
     fwd: Option<serde_json::Value>,
     event: Option<serde_json::Value>,
 ) -> Result<(), String> {
-    let (user_id, username, current_channel_id, tcp_tx, signal, account, channels) = {
+    let (user_id, username, current_channel_id, tcp_tx, signal, account, channels, gk) = {
         let conns = state.connections.read().await;
         let connection = conn(&conns, &server)?;
         (
@@ -826,6 +866,7 @@ pub async fn send_channel_message(
             connection.signal.clone(),
             connection.account.clone(),
             connection.channels.clone(),
+            crate::gk_net::GkLink::of(&app_handle, &server, connection),
         )
     };
     let channel_id = channel_id.unwrap_or(current_channel_id);
@@ -834,17 +875,23 @@ pub async fn send_channel_message(
         return Err("Chat is not available in the lobby".into());
     }
 
+    let text = channels
+        .lock()
+        .ok()
+        .is_some_and(|c| c.iter().any(|ch| ch.channel_id == channel_id && ch.text));
     // On the live path a text channel's keys follow the post (`ChannelKeying::live_post`).
-    let live = tcp_tx.proto() >= LIVE_PATH_SINCE
-        && channels
-            .lock()
-            .ok()
-            .is_some_and(|c| c.iter().any(|ch| ch.channel_id == channel_id && ch.text));
+    let live = tcp_tx.proto() >= LIVE_PATH_SINCE && text;
+    // Under the group key every channel's chat is a post under its epoch (`GroupKeying::post`)
+    let group_key = signal
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .gk
+        .on();
 
     // Somebody left this channel since we last wrote in it: mint a new sender
     // key and hand it to the members still here, so the leaver's copy of the
     // chain cannot read what follows.
-    if !live {
+    if !live && !group_key {
         network::rotate_sender_key_if_stale(channel_id, user_id, &signal, &tcp_tx).await;
     }
 
@@ -853,27 +900,89 @@ pub async fn send_channel_message(
     let message_id = crypto::new_message_id();
     let extras = checked_extras(reply_to, thread, file, fwd, event)?;
     let payload = crypto::envelope_with(&message_id, &content, ttl_secs, &extras);
+    // One the relay would refuse as too large, sealed as it goes (a forward of a long message,
+    // say: the composer counts only what is typed), goes nowhere, kept copy and all, and its
+    // row says so: the relay's refusal would name no message (`EarlyPost::fits`)
+    if !voipc_crypto::group_state::EarlyPost::fits(payload.len(), group_key) {
+        let too_large = voipc_crypto::group_state::EarlyPost::TOO_LARGE;
+        // An edit, a reaction: no row of its own to mark, and none done
+        if extras.event.is_some() {
+            return Err(too_large.into());
+        }
+        network::emit_server(
+            &app_handle,
+            &server,
+            "channel-chat-message",
+            serde_json::json!({
+                "channel_id": channel_id,
+                "user_id": user_id,
+                "username": username,
+                "content": content,
+                "timestamp": crypto::now_ms(),
+                "message_id": message_id,
+                "ttl_secs": ttl_secs,
+                "reply_to": extras.reply,
+                "thread": extras.thread,
+                "file": extras.file,
+                "fwd": extras.fwd,
+                "event": extras.event,
+                "encrypted": true,
+                "not_sent": too_large,
+            }),
+        );
+        return Ok(());
+    }
 
     // A channel with a log keeps it for its members too (cloud copies on),
-    // whether or not anybody is here to read it now.
-    if let Some(link) = &account {
-        let log = channels
-            .lock()
-            .ok()
-            .and_then(|c| {
-                c.iter()
-                    .find(|ch| ch.channel_id == channel_id)
-                    .map(|ch| ch.log.clone())
-            })
-            .unwrap_or_default();
+    // whether or not anybody is here to read it now. Under the group key a text
+    // channel's copy waits for the post to go out, under the epoch it goes under
+    // (`GkOut::released`); a voice room's log stays on its old chains (open choice 26).
+    let log = channels
+        .lock()
+        .ok()
+        .and_then(|c| {
+            c.iter()
+                .find(|ch| ch.channel_id == channel_id)
+                .map(|ch| ch.log.clone())
+        })
+        .unwrap_or_default();
+    let now = crypto::now_ms();
+    let kept_later = group_key && text && account.is_some() && !log.is_empty();
+    if let Some(link) = account.as_ref().filter(|_| !kept_later) {
         let a = link
             .session()
-            .outgoing_channel(&log, payload.clone(), crypto::now_ms(), ttl_secs);
+            .outgoing_channel(&log, payload.clone(), now, ttl_secs);
         crate::account::run(&app_handle, &server, &tcp_tx, a).await;
     }
 
+    if group_key {
+        let kept = kept_later.then_some((log, now, ttl_secs));
+        crate::gk_net::post(&gk, channel_id, &payload, kept).await?;
+        // Their own row shows it as sent; `gk-post-dropped` says so if it could not go.
+        network::emit_server(
+            &app_handle,
+            &server,
+            "channel-chat-message",
+            serde_json::json!({
+                "channel_id": channel_id,
+                "user_id": user_id,
+                "username": username,
+                "content": content,
+                "timestamp": now,
+                "message_id": message_id,
+                "ttl_secs": ttl_secs,
+                "reply_to": extras.reply,
+                "thread": extras.thread,
+                "file": extras.file,
+                "fwd": extras.fwd,
+                "event": extras.event,
+                "encrypted": true,
+            }),
+        );
+        return Ok(());
+    }
+
     if live {
-        let now = crypto::now_ms();
         let out = with_keys(&signal, |stores, keying| {
             keying.live_post(stores, channel_id, payload, now)
         })
@@ -1752,6 +1861,39 @@ pub async fn set_volume(state: State<'_, AppState>, volume: f32) -> Result<(), S
     Ok(())
 }
 
+/// The WebView's side of the `share view:` line (view_timing.rs): every 2 s while it draws
+/// a watched share.
+#[tauri::command]
+pub async fn report_view_timing(
+    state: State<'_, AppState>,
+    report: crate::view_timing::ViewReport,
+) -> Result<(), String> {
+    // A WebView that decodes the share itself knows its size; the stats show it
+    if report.resolution != 0 {
+        let conns = state.connections.read().await;
+        if let Ok(c) = voice(&state, &conns) {
+            c.screen_video_resolution
+                .store(report.resolution, Ordering::Relaxed);
+        }
+    }
+    crate::view_timing::view(report);
+    Ok(())
+}
+
+/// The share codecs this WebView decodes itself (1.13, Android): a watch of one of them
+/// comes to it over `voipcframe` (view_queue.rs) instead of the native decoder.
+#[tauri::command]
+pub async fn set_view_decoder(codecs: Vec<String>) {
+    crate::view_queue::set_codecs(&codecs);
+}
+
+/// The WebView cannot show the share it was handed: the native decoder takes it over from
+/// its next keyframe.
+#[tauri::command]
+pub async fn view_fallback() {
+    crate::view_queue::native();
+}
+
 /// Voice receive stats: (frames_played, frames_lost) since connect.
 /// The UI polls this and computes a windowed loss percentage.
 #[tauri::command]
@@ -1807,15 +1949,25 @@ pub fn enumerate_windows() -> Vec<screenshare::WindowInfo> {
 /// the frontend receives `viewer-count-changed` with count > 0.
 #[tauri::command]
 pub async fn start_screen_share(
+    window: tauri::WebviewWindow,
     state: State<'_, AppState>,
     source_type: String,
     source_id: String,
     resolution: u16,
     _fps: u32,
+    again: Option<bool>,
 ) -> Result<(), String> {
     #[cfg(target_os = "android")]
     {
-        let _ = (state, source_type, source_id, resolution, _fps);
+        let _ = (
+            window,
+            state,
+            source_type,
+            source_id,
+            resolution,
+            _fps,
+            again,
+        );
         return Err("Screen sharing is not available on Android".into());
     }
 
@@ -1825,7 +1977,7 @@ pub async fn start_screen_share(
         // This must happen BEFORE acquiring the connection lock because it may await
         // user interaction (e.g. portal dialog on Linux).
         // (fps is stored in the frontend and passed to start_screen_capture later)
-        let session = screenshare::request_screencast(&source_type, &source_id).await?;
+        let session = capture_session(&window, &state, &source_type, &source_id, again).await?;
 
         let mut conns = state.connections.write().await;
         let connection = voice_mut(&state, &mut conns)?;
@@ -1891,6 +2043,84 @@ pub async fn stop_screen_share(state: State<'_, AppState>) -> Result<(), String>
     // Close the capture session (stops screen capture) once nothing reads it
     drop(session);
     Ok(())
+}
+
+/// The capture session for a share. On Linux through the portal with its "Share again"
+/// token (`again`: restore the last choice without the dialog), and the token it gives back
+/// kept for next time; elsewhere the picked source.
+#[cfg(not(target_os = "android"))]
+async fn capture_session(
+    window: &tauri::WebviewWindow,
+    state: &AppState,
+    source_type: &str,
+    source_id: &str,
+    again: Option<bool>,
+) -> Result<screenshare::CaptureSession, String> {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = source_id;
+        let stored = state.config().screencast_restore_token.clone();
+        let parent = screenshare::x11_parent(window);
+        let (session, change) =
+            screenshare::share_session(source_type, stored, again.unwrap_or(false), parent).await?;
+        if let Some(token) = change {
+            let mut cfg = state.config();
+            cfg.screencast_restore_token = token;
+            if let Err(e) = crate::config::save_config(&cfg) {
+                tracing::warn!("could not keep the share's restore token: {e}");
+            }
+        }
+        Ok(session)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (window, state, again);
+        screenshare::request_screencast(source_type, source_id).await
+    }
+}
+
+/// A picture of a share source for the picker (Windows): its still and, for a window, its
+/// icon. Given up after 300 ms (a window that answers slowly gets its icon from the list's
+/// next refresh, or none); elsewhere nothing, as the system's own picker shows them.
+#[tauri::command]
+pub async fn source_preview(source_type: String, source_id: String) -> screenshare::SourcePicture {
+    #[cfg(target_os = "windows")]
+    {
+        let (tx, rx) = std::sync::mpsc::channel();
+        // Its own thread: a window that blocks in PrintWindow is left to finish alone
+        std::thread::spawn(move || {
+            let _ = tx.send(screenshare::source_picture(&source_type, &source_id));
+        });
+        tokio::task::spawn_blocking(move || {
+            rx.recv_timeout(std::time::Duration::from_millis(300))
+                .unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (source_type, source_id);
+        screenshare::SourcePicture::default()
+    }
+}
+
+/// Whether "Share again" can restore the last screen or window without the portal's dialog.
+#[tauri::command]
+pub fn share_again_known(state: State<'_, AppState>) -> bool {
+    state
+        .config()
+        .screencast_restore_token
+        .as_deref()
+        .is_some_and(|t| !t.is_empty())
+}
+
+/// Forget the remembered screen or window: the next share asks the portal again.
+#[tauri::command]
+pub fn forget_share_again(state: State<'_, AppState>) -> Result<(), String> {
+    let mut cfg = state.config();
+    cfg.screencast_restore_token = None;
+    crate::config::save_config(&cfg)
 }
 
 /// Start watching another user's screen share.
@@ -1980,6 +2210,7 @@ pub async fn stop_watching_screen_share(state: State<'_, AppState>) -> Result<()
     }
 
     network::send_tcp_message(&connection.tcp_tx, &ClientMessage::StopWatchingScreenShare).await?;
+    crate::view_queue::native();
     connection.watching_user_id = None;
     connection
         .watching_user_id_shared
@@ -2161,24 +2392,36 @@ pub async fn stop_screen_capture(state: State<'_, AppState>) -> Result<(), Strin
 /// Stops the current capture, replaces the session, and restarts capture
 /// if viewers are present. The server is not notified — the stream continues.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn switch_screen_share_source(
     app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
     state: State<'_, AppState>,
     source_type: String,
     source_id: String,
     resolution: u16,
     fps: u32,
+    again: Option<bool>,
 ) -> Result<(), String> {
     #[cfg(target_os = "android")]
     {
-        let _ = (app, state, source_type, source_id, resolution, fps);
+        let _ = (
+            app,
+            window,
+            state,
+            source_type,
+            source_id,
+            resolution,
+            fps,
+            again,
+        );
         return Err("Screen sharing is not available on Android".into());
     }
 
     #[cfg(not(target_os = "android"))]
     {
         // Acquire the new capture session BEFORE locking (may show portal on Linux).
-        let new_session = screenshare::request_screencast(&source_type, &source_id).await?;
+        let new_session = capture_session(&window, &state, &source_type, &source_id, again).await?;
 
         let _gate = state.share_gate.lock().await;
         // Stop the current capture, and swap the session, under the lock…
@@ -3837,6 +4080,12 @@ pub async fn report_takers_get(state: State<'_, AppState>, server: String) -> Re
     send_admin_message(&state, &server, ClientMessage::ReportTakersGet).await
 }
 
+/// What the relay carries now (admin only, protocol 25): the `admin-load` event.
+#[tauri::command]
+pub async fn admin_load(state: State<'_, AppState>, server: String) -> Result<(), String> {
+    send_admin_message(&state, &server, ClientMessage::AdminLoad).await
+}
+
 /// Request the ban list (admin only) of a relay before protocol 20; delivered as the
 /// `admin-bans` event.
 #[tauri::command]
@@ -4264,6 +4513,7 @@ pub fn set_config_bool(state: State<'_, AppState>, key: String, value: bool) -> 
         "remember_connection" => config.remember_connection = value,
         "share_channel_history" => config.share_channel_history = value,
         "share_off_notice" => config.share_off_notice = value,
+        "help_hold_keys" => config.help_hold_keys = value,
         _ => return Err(format!("Unknown config key: {key}")),
     }
     crate::config::save_config(&config)

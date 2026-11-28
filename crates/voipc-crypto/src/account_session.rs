@@ -19,7 +19,9 @@ use crate::account::{
     derive_from_master, kdf_salt, login_key_proof, recovery_text, reset_key, DeviceEnrol, LoginKey,
     PinCheck, SignedIn, Vault,
 };
-use crate::sync::{AccountSync, Event, KeptPins, LogMemory, Prefs};
+use crate::group_key::{Floor, NamesFloor, SeatKeys};
+use crate::group_state::{GkEpoch, GkPins, VaultFloor};
+use crate::sync::{AccountSync, Event, FloorPair, KeptGkFloors, KeptPins, LogMemory, Prefs};
 
 /// A device the relay remembers now: what signs this account in there next
 /// time, without the password. The host keeps it in its own vault.
@@ -46,6 +48,14 @@ pub struct Actions {
     pub memory: Option<(String, LogMemory)>,
     /// Who it names as readers moved since it last said: a host that keeps that apart.
     pub memory_named: bool,
+    /// The account's seat keys, new in the vault: `GroupKeying::seat_keys_changed`.
+    pub seat_keys: Option<SeatKeys>,
+    /// The group key's vault floors moved: `gk_floors_moved`, then `GroupKeying::floors_in`.
+    pub gk_floors: bool,
+    /// Past epochs kept history needs (C4): for each, `GroupKeying::past_epoch`, then
+    /// `gk_past_in` or `gk_past_none` (an asked one when `GkOut::past_ready` names it), and
+    /// `GroupKeying::past_asks` sent.
+    pub gk_past: Vec<(String, [u8; 16], u32)>,
 }
 
 impl Actions {
@@ -61,6 +71,9 @@ impl Actions {
         self.emit.extend(other.emit);
         self.memory = other.memory.or(self.memory.take());
         self.memory_named |= other.memory_named;
+        self.seat_keys = other.seat_keys.or(self.seat_keys.take());
+        self.gk_floors |= other.gk_floors;
+        self.gk_past.extend(other.gk_past);
     }
 }
 
@@ -90,6 +103,12 @@ pub struct AccountSession {
     password_based: bool,
     /// The relay knows this device's key (and has not forgotten it since).
     remembered: bool,
+    /// The device id this device kept for the account before (`set_held_device`): once a new
+    /// key is remembered, the relay drops this one (protocol v24), which nothing can use now.
+    held_device: Option<Vec<u8>>,
+    /// Those drops still out: a `DeviceForgotten` past them is a device removed, which
+    /// rotates the seat keys (§5.11); a re-enrolment's own drop rotates nothing.
+    own_forgets: u32,
     /// A role here waits for two-factor codes.
     needs_2fa: bool,
     enrol: Option<DeviceEnrol>,
@@ -259,6 +278,8 @@ impl AccountSession {
         let key_set = upgrade.as_ref().map(|_| "");
         first.extend(upgrade);
         sync.set_protocol(proto);
+        // The kept key goes before anything joins a log, so a sharer answering us finds it
+        first.extend(sync.kem_first());
         let signed_in = json!({
             "name": signed.name,
             "relay_id": hex(&signed.relay_id),
@@ -279,6 +300,8 @@ impl AccountSession {
             first,
             password_based,
             remembered: !password_based,
+            held_device: None,
+            own_forgets: 0,
             needs_2fa: info.needs_2fa,
             enrol: None,
             roster: HashMap::new(),
@@ -334,6 +357,12 @@ impl AccountSession {
             a.emit.push(p.ended());
         }
         a
+    }
+
+    /// The device id of the record this device holds for the account, if any: told before
+    /// `after_connect`, so the key it named is dropped once a new one is remembered.
+    pub fn set_held_device(&mut self, device_id: Vec<u8>) {
+        self.held_device = Some(device_id);
     }
 
     fn start_enrol(&mut self, a: &mut Actions) {
@@ -767,6 +796,16 @@ impl AccountSession {
             AccountReply::DeviceAdded => {
                 if let Some(e) = self.enrol.take() {
                     self.remembered = true;
+                    let held = self.held_device.replace(e.key.device_id.to_vec());
+                    if let Some(old) = held.filter(|old| {
+                        self.proto >= 24 && old.as_slice() != e.key.device_id.as_slice()
+                    }) {
+                        self.own_forgets += 1;
+                        a.send
+                            .push(ClientMessage::Account(AccountRequest::DeviceForget {
+                                device_id: old,
+                            }));
+                    }
                     a.remember = Some(Remembered {
                         relay_id: self.relay_id,
                         name: self.name.clone(),
@@ -780,16 +819,19 @@ impl AccountSession {
             // a role that waited for them counts now.
             AccountReply::TotpEnabled { .. } => {
                 self.remembered = false;
+                self.held_device = None;
                 self.needs_2fa = false;
             }
             // A new password forgets every device key, this one's too: the
             // person just typed the password, so remember this device again.
             AccountReply::PasswordChanged => {
                 self.remembered = false;
+                self.held_device = None;
                 self.password_based = true;
                 if !self.needs_2fa {
                     self.start_enrol(&mut a);
                 }
+                a.absorb(self.seat_keys_rotate());
             }
             AccountReply::Info(info) => {
                 self.needs_2fa = info.needs_2fa;
@@ -807,6 +849,20 @@ impl AccountSession {
                             .push(ClientMessage::SetHistorySharing { enabled: true });
                     }
                 }
+            }
+            // Housekeeping the person never asked for: a key already gone is no news
+            AccountReply::DeviceForgotten => {
+                if self.own_forgets > 0 {
+                    self.own_forgets -= 1;
+                    return a;
+                }
+                // Another device of the account was removed: it may be lost (§5.11)
+                a.absorb(self.seat_keys_rotate());
+                return a;
+            }
+            AccountReply::Error { request, .. } if request == "DeviceForget" => {
+                self.own_forgets = self.own_forgets.saturating_sub(1);
+                return a;
             }
             AccountReply::Error { request, .. } if request.starts_with("Device") => {
                 self.enrol = None
@@ -915,12 +971,80 @@ impl AccountSession {
 
     /// Whatever pins were not saved yet, now: the person is leaving (`AccountSync::flush_pins`).
     pub fn flush_pins(&mut self) -> Actions {
-        Actions::sending(self.sync.flush_pins())
+        let mut send = self.sync.flush_pins();
+        send.extend(self.sync.gk_flush());
+        Actions::sending(send)
     }
 
     /// Whether all of that is stored: a sign-out waits a moment for it.
     pub fn pins_saved(&self) -> bool {
-        self.sync.pins_saved()
+        self.sync.pins_saved() && self.sync.gk_saved()
+    }
+
+    // ── the group key (plan 3d, 3e) ──
+
+    /// `ServerMessage::GroupKeys`, at the relay's clock `relay_clock` (unix seconds): the
+    /// floors are read and the seat keys made, rotated or published. The seat keys go to
+    /// `GkStart::seat_keys` (`Actions::seat_keys`). `reset`: the first sign-in with the group
+    /// key on since a reset with the recovery key, whose seat keys rotate before anything
+    /// else (§5.11): the old keys are neither published again nor handed to `GroupKeying`
+    /// (RV q8-q11). The host's one way in, so none can rotate after the old keys went out.
+    pub fn gk_begin(&mut self, on: bool, relay_clock: u64, reset: bool) -> Actions {
+        let mut a = Actions::sending(self.sync.gk_begin(on, relay_clock, reset));
+        self.gk_news(&mut a);
+        a
+    }
+
+    /// The account's book, for `GkCtx::pins`.
+    pub fn gk_pins(&mut self) -> &mut dyn GkPins {
+        &mut self.sync
+    }
+
+    /// A stored group's vault floor, for `GroupKeying::track`.
+    pub fn gk_floor(&mut self, group: &str) -> VaultFloor {
+        self.sync.gk_floor(group)
+    }
+
+    /// After `Actions::gk_floors`: the floors for `GroupKeying::floors_in`, of tracked groups.
+    pub fn gk_floors_moved(&mut self, tracked: &[String]) -> Vec<(String, Option<FloorPair>)> {
+        self.sync.gk_floors_moved(tracked)
+    }
+
+    /// `GkOut::vault_floors`.
+    pub fn gk_put_floors(&mut self, floors: Vec<(String, Floor, Option<NamesFloor>)>) -> Actions {
+        Actions::sending(self.sync.gk_put_floors(floors))
+    }
+
+    /// `GkOut::self_rows`.
+    pub fn gk_self_rows(&mut self, rows: Vec<voipc_protocol::gk::SelfRowIn>) -> Actions {
+        Actions::sending(self.sync.gk_self_rows(rows))
+    }
+
+    /// `ServerMessage::EpochReseated`.
+    pub fn gk_reseated(&mut self, n: u32, left: u32) -> Actions {
+        Actions::sending(self.sync.gk_reseated(n, left))
+    }
+
+    /// `GkOut::seat_keys_wanted`: the seat keys published again.
+    pub fn seat_keys_wanted(&mut self) -> Actions {
+        Actions::sending(self.sync.seat_keys_wanted())
+    }
+
+    /// The seat keys rotate (§5.11): on a password change and a device removed by itself.
+    pub fn seat_keys_rotate(&mut self) -> Actions {
+        let mut a = Actions::sending(self.sync.seat_keys_rotate());
+        self.gk_news(&mut a);
+        a
+    }
+
+    /// What this connection hands the next of the group key's floors.
+    pub fn keep_gk(&self) -> Option<KeptGkFloors> {
+        self.sync.keep_gk()
+    }
+
+    /// Takes over what an earlier connection kept, before `gk_on`.
+    pub fn adopt_gk(&mut self, kept: KeptGkFloors) {
+        self.sync.adopt_gk(kept);
     }
 
     /// A direct message came from `user_id`: their pin keeps the half open channels cannot fill.
@@ -967,6 +1091,30 @@ impl AccountSession {
             a.memory = Some((self.memory_key(), self.sync.memory()));
             a.memory_named = self.sync.take_named_changed();
         }
+        self.gk_news(a);
+    }
+
+    /// What the group key's part of the sync has for the host.
+    fn gk_news(&mut self, a: &mut Actions) {
+        if let Some(keys) = self.sync.take_seat_keys() {
+            a.seat_keys = Some(keys);
+        }
+        a.gk_floors |= self.sync.take_gk_news();
+        a.gk_past.extend(self.sync.take_gk_past());
+    }
+
+    /// A past epoch's key `GroupKeying::past_epoch` gave (`Actions::gk_past`): what kept
+    /// history sealed under it opens.
+    pub fn gk_past_in(&mut self, ep: &GkEpoch) -> Actions {
+        let (send, events) = self.sync.gk_past_in(ep);
+        let mut a = Actions::sending(send);
+        self.events(events, &mut a);
+        a
+    }
+
+    /// A past epoch `GroupKeying::past_epoch` cannot give (`PastEpoch::Unknown`).
+    pub fn gk_past_none(&mut self, group: &str, gen: [u8; 16], epoch: u32) -> Actions {
+        Actions::sending(self.sync.gk_past_none(group, gen, epoch))
     }
 
     /// Told by user id where they are here, else by name: they may be away,
@@ -1125,6 +1273,22 @@ impl AccountSession {
             return Actions::default();
         }
         Actions::sending(self.sync.send_channel(log, envelope, sent_at, ttl_secs))
+    }
+
+    /// A post the group key let out in a channel with log `log` (`GkOut::released`), under
+    /// the epoch it went under: its kept copy goes on a gk chain of that epoch (C4).
+    pub fn outgoing_channel_gk(
+        &mut self,
+        log: &str,
+        envelope: Vec<u8>,
+        sent_at: u64,
+        ttl_secs: Option<u32>,
+        ep: GkEpoch,
+    ) -> Actions {
+        Actions::sending(
+            self.sync
+                .send_channel_gk(log, envelope, sent_at, ttl_secs, ep),
+        )
     }
 
     /// In a channel with log `conv`: keep it, and read what it kept.
@@ -2612,6 +2776,66 @@ mod tests {
         );
     }
 
+    /// Remembered again by password: the key of the record it held goes, once the new one
+    /// is in, and only on a relay that knows the request (protocol v24). Its answer, or a
+    /// refusal, is no news for the person.
+    #[test]
+    fn remembered_again_the_device_drops_the_key_it_held() {
+        let at = |proto: u32, held: Option<Vec<u8>>| {
+            let signed = SignedIn {
+                relay_id: RELAY,
+                name: "me".into(),
+                vault: Vault::create(RELAY, "me"),
+                identity: IdentityKeyPair::generate(&mut crate::rng()),
+                recovery: None,
+                binding: None,
+                keyed: false,
+                login_key: None,
+                blobs: Vec::new(),
+            };
+            let (mut s, _) = AccountSession::start(
+                signed,
+                &info(false),
+                LogMemory::default(),
+                false,
+                true,
+                proto,
+            );
+            if let Some(id) = held {
+                s.set_held_device(id);
+            }
+            assert_eq!(sends(&s.after_connect(), "DeviceChallenge"), 1);
+            s.on_reply(&AccountReply::DeviceChallenge {
+                challenge: "c".into(),
+            });
+            let a = s.on_reply(&AccountReply::DeviceAdded);
+            let forgets: Vec<_> = a
+                .send
+                .iter()
+                .filter_map(|m| match m {
+                    ClientMessage::Account(AccountRequest::DeviceForget { device_id }) => {
+                        Some(device_id.clone())
+                    }
+                    _ => None,
+                })
+                .collect();
+            (s, a.remember.expect("the new key").device_id, forgets)
+        };
+        let old = vec![9u8; 16];
+        let (mut s, new, forgets) = at(24, Some(old.clone()));
+        assert_eq!(forgets, vec![old.clone()], "the old key goes");
+        assert_ne!(new.as_slice(), old.as_slice());
+        assert!(s.on_reply(&AccountReply::DeviceForgotten).emit.is_empty());
+        let refused = AccountReply::Error {
+            request: "DeviceForget".into(),
+            reason: "gone".into(),
+        };
+        assert!(s.on_reply(&refused).emit.is_empty(), "no news");
+        // Control: nothing held, nothing to drop; a relay before 24 hears none
+        assert!(at(24, None).2.is_empty());
+        assert!(at(23, Some(old)).2.is_empty(), "a relay at 23");
+    }
+
     #[test]
     fn a_role_that_waits_for_codes_asks_for_their_setup_not_for_the_device() {
         let (mut s, _) = session(true, true);
@@ -2910,5 +3134,50 @@ mod tests {
         // The list goes with the next sign-in: from the vault, in `AccountSync`'s tests
         let a = s.set_block(&key, "bob", false).unwrap();
         assert_eq!(a.emit[0].1["blocks"], json!([]));
+    }
+    /// §5.11: a password change rotates the seat keys, and so does a device of the account
+    /// removed; the drop of this device's own old key at a re-enrolment does not.
+    #[test]
+    fn a_password_change_or_a_removed_device_rotates_the_seat_keys() {
+        let (mut s, _) = session(false, false);
+        let item = crate::group_key::ITEM_SEAT_KEM;
+        assert_eq!(sends(&s.gk_begin(true, 0, false), "VaultPut"), 1);
+        let a = s.on_reply(&AccountReply::VaultStored {
+            k: item.into(),
+            version: 1,
+        });
+        assert_eq!(sends(&a, "SeatKeysPublish"), 1);
+        assert_eq!(a.seat_keys.as_ref().map(|k| k.n), Some(1));
+        s.own_forgets = 1;
+        let a = s.on_reply(&AccountReply::DeviceForgotten);
+        assert_eq!(sends(&a, "VaultPut"), 0, "its own drop at a re-enrolment");
+        let a = s.on_reply(&AccountReply::DeviceForgotten);
+        assert_eq!(sends(&a, "VaultPut"), 1, "a device removed");
+        let a = s.on_reply(&AccountReply::VaultStored {
+            k: item.into(),
+            version: 2,
+        });
+        assert_eq!(a.seat_keys.as_ref().map(|k| k.n), Some(2));
+        assert_eq!(sends(&a, "SelfRowsList"), 1, "the kept rows go again");
+        // Mid-rotation a password change waits for the old keys to go, then rotates
+        let a = s.on_reply(&AccountReply::PasswordChanged);
+        assert_eq!(sends(&a, "VaultPut"), 0);
+        s.gk_reseated(2, 0);
+        s.on_reply(&AccountReply::SelfRows {
+            rows: Vec::new(),
+            next: None,
+        });
+        assert_eq!(sends(&s.tick(), "VaultPut"), 1, "the old keys dropped");
+        let a = s.on_reply(&AccountReply::VaultStored {
+            k: item.into(),
+            version: 3,
+        });
+        assert_eq!(sends(&a, "VaultPut"), 1, "the password change's rotation");
+        assert_eq!(sends(&a, "SeatKeysPublish"), 0);
+        let a = s.on_reply(&AccountReply::VaultStored {
+            k: item.into(),
+            version: 4,
+        });
+        assert_eq!(a.seat_keys.as_ref().map(|k| k.n), Some(3));
     }
 }

@@ -103,6 +103,124 @@ export class LivePump {
 }
 
 /**
+ * Whether this relay uses the group key (plan 3i): `none` until `Authenticated`, `wait` from
+ * it until the next frame says, then `legacy` (no `GroupKeys`: a relay from before it, on the
+ * old paths), `off` (the old paths, and kept history read under the group key) or `on`.
+ */
+export type GkPath = "none" | "wait" | "legacy" | "off" | "on";
+
+/** The path after a frame `tag` (`on`: `GroupKeys.on`). The relay sends `GroupKeys` right
+ *  after `Authenticated`, so any other frame first is a relay without it. */
+export function gkPathAfter(path: GkPath, tag: string, on = false): GkPath {
+  if (tag === "Authenticated") return "wait";
+  if (path !== "wait") return path;
+  if (tag === "GroupKeys") return on ? "on" : "off";
+  return "legacy";
+}
+
+/** Whether the group key runs on this connection: on, or off for kept history only. */
+export const gkRuns = (path: GkPath): boolean => path === "on" || path === "off";
+
+/** Whether posts go under the group key: text channels and a voice room's chat alike. */
+export const gkPosts = (path: GkPath): boolean => path === "on";
+
+/** The next task, by a message to ourselves: a hidden tab clamps timers to a second or
+ *  more, and never messages. */
+export function yieldTask(): Promise<void> {
+  return new Promise((resolve) => {
+    const { port1, port2 } = new MessageChannel();
+    port1.onmessage = () => {
+      port1.close();
+      resolve();
+    };
+    port2.postMessage(null);
+  });
+}
+
+/** What a keyholder's uploads need from their session. */
+export interface GkPumpHost {
+  /** The next commit part or welcome page, if one waits. */
+  nextFrame(inCall: boolean): Uint8Array | undefined;
+  send(frame: Uint8Array): void;
+  /** Resolves once the transport has written what was queued (network.rs `drained`). */
+  writable(): Promise<void>;
+  inCall(): boolean;
+  over(): boolean;
+}
+
+/**
+ * A keyholder's commit parts and welcome pages (plan 3g): one in the queue at a time, the
+ * next once the transport has written the last, yielding to voice as `LivePump` does. Its
+ * waits are on `ReadyClock`, never a page timer: a browser keyholder keeps its voice duty
+ * with its page hidden, where a timer waits a second or more and a part would miss its due.
+ */
+export class GkPump {
+  private readonly host: GkPumpHost;
+  private running = false;
+
+  constructor(host: GkPumpHost) {
+    this.host = host;
+  }
+
+  /** Nothing is awaited between the last `nextFrame` and being done, so no wake is lost. */
+  wake(): void {
+    if (this.running) return;
+    this.running = true;
+    void this.run();
+  }
+
+  private async run(): Promise<void> {
+    try {
+      for (;;) {
+        await this.host.writable();
+        if (this.host.over()) return;
+        const frame = this.host.nextFrame(this.host.inCall());
+        if (!frame) return;
+        this.host.send(frame);
+      }
+    } catch (e) {
+      console.warn("a keyholder's uploads stopped:", e);
+    } finally {
+      this.running = false;
+    }
+  }
+}
+
+/**
+ * Waits until each `ready()` says so, looked at on every tick of a clock a hidden tab does
+ * not clamp (a worker's, worklets/tick-worker.js). `start` begins the ticks and returns
+ * what stops them: they run only while something waits.
+ */
+export class ReadyClock {
+  private readonly start: (tick: () => void) => () => void;
+  private readonly waits = new Set<() => boolean>();
+  private stop: (() => void) | undefined;
+
+  constructor(start: (tick: () => void) => () => void) {
+    this.start = start;
+  }
+
+  until(ready: () => boolean): Promise<void> {
+    if (ready()) return Promise.resolve();
+    return new Promise((resolve) => {
+      this.waits.add(() => {
+        if (!ready()) return false;
+        resolve();
+        return true;
+      });
+      this.stop ??= this.start(() => this.tick());
+    });
+  }
+
+  private tick(): void {
+    for (const look of [...this.waits]) if (look()) this.waits.delete(look);
+    if (this.waits.size > 0) return;
+    this.stop?.();
+    this.stop = undefined;
+  }
+}
+
+/**
  * Sessions with accounts between one connection and the next, by server and by the account
  * signed in there (network.rs `keep_sessions`). In this page's memory: a person's disconnect
  * wipes them, and a reload has none. `T` is a wasm object, so each is freed as it goes.

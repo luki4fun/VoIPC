@@ -11,7 +11,8 @@ use tokio::task::JoinSet;
 use tracing::warn;
 use voipc_protocol::types::ChannelGate;
 
-use super::{is_star, log, Relay};
+use super::{is_star, Relay};
+use crate::gk::group::cause::GATE;
 
 /// Accounts a gate pass decides at once: reads side by side, on SQLite's WAL as on Postgres.
 const DECIDE_AT_ONCE: usize = 8;
@@ -96,31 +97,67 @@ impl Relay {
     }
 
     /// The stored members of each gated log (its conv, its gate's groups) outside its
-    /// groups, out of it. Each account is decided once a pass, `DECIDE_AT_ONCE` at a time:
-    /// most of the same accounts sit in every gated log, and each is three reads (W2-1).
-    /// One that cannot be decided keeps its seats until the next pass.
+    /// groups, out of it, and out of its group: those seated there by a live follow alone
+    /// too, whose seats outlive their connections (plan 2d). Each account is decided once a
+    /// pass, `DECIDE_AT_ONCE` at a time: most of the same accounts sit in every gated log, and
+    /// each is three reads (W2-1). One that cannot be decided keeps its seats until the next
+    /// pass.
     pub async fn prune_gated(self: &Arc<Self>, gated: &[(String, Vec<String>)]) {
-        let mut seats = Vec::new();
+        let mut seats = HashSet::new();
         for (i, (conv, _)) in gated.iter().enumerate() {
-            match members_of(self.store(), conv).await {
-                Ok(m) => seats.extend(
-                    m.iter()
-                        .filter_map(|a| <[u8; 16]>::try_from(a.as_slice()).ok())
-                        .map(|a| (i, a)),
-                ),
+            match self.held_in(conv).await {
+                Ok(m) => seats.extend(m.into_iter().map(|a| (i, a))),
                 Err(e) => warn!("keeping {conv} to its gate: {e:#}"),
             }
         }
         let accounts: HashSet<[u8; 16]> = seats.iter().map(|(_, a)| *a).collect();
         let decided = self.decide(accounts).await;
+        // Each log's accounts out at once: one exit asked and one message to its group
+        let mut out: HashMap<usize, Vec<[u8; 16]>> = HashMap::new();
         for (i, account) in seats {
-            let (conv, groups) = &gated[i];
+            let (_, groups) = &gated[i];
             if decided.get(&account).is_some_and(|h| !h.passes(groups)) {
-                if let Err(e) = log::unseat(self.store(), conv, &account).await {
-                    warn!("keeping {conv} to its gate: {e:#}");
-                }
+                out.entry(i).or_default().push(account);
             }
         }
+        for (i, accounts) in out {
+            let (conv, _) = &gated[i];
+            if let Err(e) = self.gate_out(conv, &accounts).await {
+                warn!("keeping {conv} to its gate: {e:#}");
+            }
+        }
+    }
+
+    /// Who holds a seat in `conv`'s log or, with the group key on, in its stored group
+    /// (whose id is the conversation's).
+    async fn held_in(&self, conv: &str) -> Result<Vec<[u8; 16]>> {
+        let mut held: Vec<[u8; 16]> = members_of(self.store(), conv)
+            .await?
+            .iter()
+            .filter_map(|a| <[u8; 16]>::try_from(a.as_slice()).ok())
+            .collect();
+        if self.gk().is_some() {
+            held.extend(super::gk::seated_accounts(self.store(), conv).await?);
+        }
+        Ok(held)
+    }
+
+    /// `accounts` out of `conv`'s log and their seats in the conversation's group exit,
+    /// whichever of the two each holds. The exit is asked first, so a stop while they are
+    /// taken out still exits them at the group's next start (dive 4 F7), and goes to the group
+    /// as one message, whatever a membership's delete did (the gate is the decision).
+    async fn gate_out(&self, conv: &str, accounts: &[[u8; 16]]) -> Result<()> {
+        let asked = self.gk_ask_exit(conv, accounts, GATE).await;
+        let mut done = Ok(());
+        for a in accounts {
+            if let Err(e) = super::log::unseat(self.store(), conv, a).await {
+                done = done.and(Err(e));
+            }
+        }
+        if let Some(gk) = self.gk() {
+            gk.exit_from_log(conv, accounts.to_vec(), GATE, asked);
+        }
+        done
     }
 
     /// What gates ask of each of `accounts`; those whose reads failed are not in it.
@@ -157,16 +194,23 @@ impl Relay {
         out
     }
 
-    /// `account` out of those of `convs` it holds a seat in.
+    /// `account` out of those of `convs` it holds a seat in: in the log, or in the group by a
+    /// live follow alone.
     pub async fn out_of_logs(&self, account: &[u8; 16], convs: &[String]) -> Result<()> {
-        let seats: Vec<String> = db!(self.store(), pool => {
+        let mut seats: Vec<String> = db!(self.store(), pool => {
             sqlx::query_scalar("SELECT conv FROM voipc_members WHERE account = $1")
                 .bind(&account[..])
                 .fetch_all(pool)
                 .await?
         });
+        if self.gk().is_some() {
+            let groups = super::gk::seats_of_account(self.store(), account).await?;
+            seats.extend(groups.into_iter().map(|(grp, _, _)| grp));
+            seats.sort_unstable();
+            seats.dedup();
+        }
         for conv in seats.iter().filter(|s| convs.contains(s)) {
-            log::unseat(self.store(), conv, account).await?;
+            self.gate_out(conv, &[*account]).await?;
         }
         Ok(())
     }

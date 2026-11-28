@@ -291,6 +291,10 @@ impl Relay {
     /// tried again, and without its gate it would come back open.
     pub async fn channel_purge(&self, conv: &str) -> Result<()> {
         self.purge_begin(conv).await?;
+        // Its group stops before its rows go (C4)
+        if let Some(gk) = self.gk() {
+            gk.on_purge(conv);
+        }
         self.purge_rows(conv).await
     }
 
@@ -324,7 +328,7 @@ impl Relay {
     /// rows (a chain counts as its steps) and gives the writer back. Stops, and forgets the
     /// purge, if a channel of that log is back.
     async fn purge_rows(&self, conv: &str) -> Result<()> {
-        const BATCHED: [(&str, i64); 6] = [
+        const BATCHED: [(&str, i64); 20] = [
             (
                 "DELETE FROM voipc_log WHERE seq IN (SELECT seq FROM voipc_log WHERE conv = $1 LIMIT $2)",
                 PURGE_BATCH,
@@ -357,6 +361,80 @@ impl Relay {
                  (SELECT account, conv FROM voipc_left WHERE conv = $1 LIMIT $2)",
                 PURGE_BATCH,
             ),
+            // The group key's: a stored group's id is its log's conversation (its kept
+            // chains' seals went with their chains)
+            (
+                "DELETE FROM voipc_gk_rows WHERE (grp, gen, b, v, seat) IN
+                 (SELECT grp, gen, b, v, seat FROM voipc_gk_rows WHERE grp = $1 LIMIT $2)",
+                PURGE_BATCH,
+            ),
+            (
+                "DELETE FROM voipc_gk_welcomes WHERE (grp, gen, seat, kind, s) IN
+                 (SELECT grp, gen, seat, kind, s FROM voipc_gk_welcomes WHERE grp = $1 LIMIT $2)",
+                PURGE_BATCH,
+            ),
+            (
+                "DELETE FROM voipc_gk_seats WHERE (grp, gen, seat) IN
+                 (SELECT grp, gen, seat FROM voipc_gk_seats WHERE grp = $1 LIMIT $2)",
+                PURGE_BATCH,
+            ),
+            (
+                "DELETE FROM voipc_gk_lists WHERE (grp, gen, b, v) IN
+                 (SELECT grp, gen, b, v FROM voipc_gk_lists WHERE grp = $1 LIMIT $2)",
+                PURGE_BATCH,
+            ),
+            (
+                "DELETE FROM voipc_gk_vids WHERE (grp, gen, v) IN
+                 (SELECT grp, gen, v FROM voipc_gk_vids WHERE grp = $1 LIMIT $2)",
+                PURGE_BATCH,
+            ),
+            (
+                "DELETE FROM voipc_gk_seals WHERE (grp, gen, epoch, b, v) IN
+                 (SELECT grp, gen, epoch, b, v FROM voipc_gk_seals WHERE grp = $1 LIMIT $2)",
+                PURGE_BATCH,
+            ),
+            (
+                "DELETE FROM voipc_gk_keyring WHERE (grp, gen, epoch, j) IN
+                 (SELECT grp, gen, epoch, j FROM voipc_gk_keyring WHERE grp = $1 LIMIT $2)",
+                PURGE_BATCH,
+            ),
+            (
+                "DELETE FROM voipc_gk_krk WHERE (grp, gen, epoch, holder) IN
+                 (SELECT grp, gen, epoch, holder FROM voipc_gk_krk WHERE grp = $1 LIMIT $2)",
+                PURGE_BATCH,
+            ),
+            (
+                "DELETE FROM voipc_gk_headers WHERE (grp, d) IN
+                 (SELECT grp, d FROM voipc_gk_headers WHERE grp = $1 LIMIT $2)",
+                PURGE_BATCH,
+            ),
+            (
+                "DELETE FROM voipc_gk_names WHERE (grp, gen, epoch, j, kind) IN
+                 (SELECT grp, gen, epoch, j, kind FROM voipc_gk_names WHERE grp = $1 LIMIT $2)",
+                PURGE_BATCH,
+            ),
+            (
+                "DELETE FROM voipc_gk_exits WHERE (grp, seq) IN
+                 (SELECT grp, seq FROM voipc_gk_exits WHERE grp = $1 LIMIT $2)",
+                PURGE_BATCH,
+            ),
+            (
+                "DELETE FROM voipc_gk_self WHERE (grp, account, gen, seed, tag_sk, tag_sx, kind) IN
+                 (SELECT grp, account, gen, seed, tag_sk, tag_sx, kind FROM voipc_gk_self WHERE grp = $1 LIMIT $2)",
+                PURGE_BATCH,
+            ),
+            // What a restart would ask again (0014): eager seats (up to `kept_seats`, or every
+            // member's) and exits asked (a new password's can name every member)
+            (
+                "DELETE FROM voipc_gk_eager WHERE (grp, account) IN
+                 (SELECT grp, account FROM voipc_gk_eager WHERE grp = $1 LIMIT $2)",
+                PURGE_BATCH,
+            ),
+            (
+                "DELETE FROM voipc_gk_exit_asks WHERE (grp, account) IN
+                 (SELECT grp, account FROM voipc_gk_exit_asks WHERE grp = $1 LIMIT $2)",
+                PURGE_BATCH,
+            ),
         ];
         for (q, limit) in BATCHED {
             loop {
@@ -378,6 +456,10 @@ impl Relay {
             for q in [
                 "DELETE FROM voipc_writers WHERE conv = $1",
                 "DELETE FROM voipc_log_floors WHERE conv = $1",
+                "DELETE FROM voipc_gk_holders WHERE grp = $1",
+                "DELETE FROM voipc_gk_pending WHERE grp = $1",
+                "DELETE FROM voipc_gk_gens WHERE grp = $1",
+                "DELETE FROM voipc_gk_groups WHERE grp = $1",
                 "DELETE FROM voipc_purging WHERE conv = $1",
             ] {
                 sqlx::query(q).bind(conv).execute(&mut *tx).await?;

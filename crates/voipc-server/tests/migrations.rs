@@ -94,6 +94,23 @@ const SHIPPED: &[(&str, &str)] = &[
         "postgres/0010_kept.sql",
         "d775561e5dea64d52ab7b4f4b2b19ff753c0da5e48c1b47d505ba01519630eb3",
     ),
+    // 1.12.0 (0011 shipped in rc.1, 0012 in rc.2)
+    (
+        "sqlite/0011_promises.sql",
+        "782a047b72b25bd2e7c6262dad306028d52861b66d57ec19e170142f980d768c",
+    ),
+    (
+        "postgres/0011_promises.sql",
+        "78d566a75056295f1a3dfe98d1c441a2a155ad797df854b1281a02bb45ca7c63",
+    ),
+    (
+        "sqlite/0012_round_c.sql",
+        "9e751ced852fb3aedfad0bfe9fd0651a42b6307777ca3caaa5d4e49b39e9b9e0",
+    ),
+    (
+        "postgres/0012_round_c.sql",
+        "9e751ced852fb3aedfad0bfe9fd0651a42b6307777ca3caaa5d4e49b39e9b9e0",
+    ),
 ];
 
 #[test]

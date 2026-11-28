@@ -50,9 +50,17 @@ pub struct ServerConfig {
     /// users behind one address, because that is what a household, an office
     /// or a school looks like from here — and being refused for sharing a NAT
     /// with your friends is worse than the dial-and-drop loop this bounds,
-    /// which `CONNECT_BURST` is the real answer to.
+    /// which `CONNECT_BURST` is the real answer to. Each 32 above the first also
+    /// adds a share of handshakes and connects a second for that address
+    /// (`ConnLimits::new`), for a relay many reach through one carrier's address.
     #[serde(default = "default_max_connections_per_ip")]
     pub max_connections_per_ip: u32,
+
+    /// While the lobby holds at most this many, an app showing its list hears each
+    /// join and leave there by name; past it, only how many (protocol v25). Each one told
+    /// is a message to every watcher, so on a big relay the list comes in pages instead.
+    #[serde(default = "default_live_lobby")]
+    pub live_lobby: u32,
 
     /// Let clients that cannot reach the QUIC endpoint — because something
     /// between them and this server drops UDP — tunnel the whole session,
@@ -65,6 +73,13 @@ pub struct ServerConfig {
     /// they need `tcp_port == udp_port` (the default).
     #[serde(default)]
     pub tcp_fallback: bool,
+
+    /// The group epoch key for text channels and voice rooms (docs/GROUP-KEY.md), read at
+    /// start: on, the relay keys every group that way and refuses the old paths; off, it
+    /// keeps them and refuses the key's messages, and still serves the history the key
+    /// kept, read-only. On by default; `group_key = false` turns it off.
+    #[serde(default = "default_group_key")]
+    pub group_key: bool,
 
     /// Path to TLS certificate file (PEM).
     pub cert_path: String,
@@ -96,6 +111,97 @@ pub struct ServerConfig {
     /// Off by default.
     #[serde(default)]
     pub update: UpdateConfig,
+
+    /// What screen shares may cost this relay (`[media]`, 1.14).
+    #[serde(default)]
+    pub media: MediaConfig,
+
+    /// The media edges this relay places viewers of big shares on (`[pool]`, 1.15). None
+    /// by default.
+    #[serde(default)]
+    pub pool: PoolConfig,
+}
+
+/// `[pool]`: media edges, each a `voipc-server -c edge.toml edge` process that links to
+/// this relay and carries viewers of a share, so a share with thousands of viewers costs
+/// this relay one copy per edge instead of one per viewer. Off while `edges` is empty: the
+/// edges' path is then not served at all.
+#[derive(Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PoolConfig {
+    /// `name = "secret"`, the same pair as the edge's edge.toml. The name is what the
+    /// admin's Load view shows; the secret proves the edge, and seals the tickets viewers
+    /// show it.
+    pub edges: std::collections::BTreeMap<String, String>,
+    /// The first this many viewers of each share stay on this relay, which is no farther
+    /// away than an edge.
+    pub local_first: u32,
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self {
+            edges: Default::default(),
+            local_first: 8,
+        }
+    }
+}
+
+/// The names, never the secrets: a config printed into a log or a bug report gives no
+/// edge away.
+impl std::fmt::Debug for PoolConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PoolConfig")
+            .field(
+                "edges",
+                &self
+                    .edges
+                    .keys()
+                    .map(|name| (name, "<secret>"))
+                    .collect::<std::collections::BTreeMap<_, _>>(),
+            )
+            .field("local_first", &self.local_first)
+            .finish()
+    }
+}
+
+/// The most characters an edge's name has: it is shown, logged and sent in every hello.
+pub const MAX_EDGE_NAME: usize = 32;
+/// The fewest characters an edge's secret has (`openssl rand -base64 32` gives 44).
+pub const MIN_EDGE_SECRET: usize = 32;
+
+/// An edge's name as `[pool] edges` takes it: 1 to `MAX_EDGE_NAME` of `a-z`, `0-9` and `-`.
+pub fn edge_name_ok(name: &str) -> bool {
+    (1..=MAX_EDGE_NAME).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// `[media]`: what screen shares may cost this relay. One HD viewer is about 7.5 Mbit/s
+/// out, so a 1 Gbit port carries about 130 of them, whichever shares they watch.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MediaConfig {
+    /// Viewers of one share: one more is told it is full.
+    pub share_viewers: u32,
+    /// Video this relay sends, all shares together (Mbit/s), counted at what each share's
+    /// resolution may send, not at what it sends now: a still screen sends little until it moves.
+    pub video_egress_mbit: u32,
+    /// People in a voice room that names no limit of its own (0: none). Each joiner trades
+    /// keys with every member, and every voice packet goes to each: 250 is a 15 s join.
+    /// Routed (proximity) rooms send each packet only to who is near and keep no such cap.
+    pub voice_room: u32,
+}
+
+impl Default for MediaConfig {
+    fn default() -> Self {
+        Self {
+            share_viewers: 100,
+            video_egress_mbit: 1000,
+            voice_room: 250,
+        }
+    }
 }
 
 /// Whether guests may stay when the relay has accounts.
@@ -159,6 +265,16 @@ pub struct AccountsConfig {
     /// sign-in back. Empty: no sign-in with a provider. Each provider also needs
     /// its application's `VOIPC_OAUTH_<PROVIDER>_ID` and `_SECRET` in the environment.
     pub public_url: String,
+    /// Connections to the database at most. Each sign-in is a few writes, and a write waits
+    /// for the database's disk: a relay of tens of thousands coming back after a restart
+    /// signs in as fast as this many writes at once go. Postgres' own `max_connections` (100
+    /// by default) has to hold it, and everything else that uses that database.
+    pub db_connections: u32,
+    /// Sign-ins with a password, everyone together, per 15 minutes: how a new device signs in
+    /// (a remembered one signs with its key and is not counted). It holds off guessing spread
+    /// over many addresses; once spent, nobody signs in a new device until the window ends.
+    /// Raise it for a move or a big first evening.
+    pub password_sign_ins_per_15min: u32,
     /// New accounts an hour at most. A move from another service can want more.
     pub signups_per_hour: u32,
     /// How long an account a move from Discord made waits for someone to open it. 0: for
@@ -168,6 +284,9 @@ pub struct AccountsConfig {
     /// removes it, since an owner moved for the history and an expiry cannot be undone.
     pub archive_days: u32,
 }
+
+/// `[accounts] db_connections`, unless set.
+pub const DB_CONNECTIONS: u32 = 32;
 
 impl Default for AccountsConfig {
     fn default() -> Self {
@@ -183,6 +302,8 @@ impl Default for AccountsConfig {
             kept_seats: 5000,
             key_file: "voipc-accounts.key".into(),
             public_url: String::new(),
+            db_connections: DB_CONNECTIONS,
+            password_sign_ins_per_15min: 1000,
             signups_per_hour: 60,
             unclaimed_days: 90,
             archive_days: 0,
@@ -328,6 +449,11 @@ impl ServerConfig {
                     ));
                 }
             }
+            if self.accounts.password_sign_ins_per_15min == 0 {
+                return Err(anyhow!(
+                    "[accounts] password_sign_ins_per_15min must be at least 1: with 0, no new device signs in"
+                ));
+            }
             if self.accounts.signups_per_hour == 0 {
                 return Err(anyhow!("[accounts] signups_per_hour must be at least 1"));
             }
@@ -407,6 +533,34 @@ impl ServerConfig {
                 ));
             }
         }
+        let pool = &self.pool;
+        if !pool.edges.is_empty() {
+            let mut secrets = std::collections::HashSet::new();
+            for (name, secret) in &pool.edges {
+                if !edge_name_ok(name) {
+                    return Err(anyhow!(
+                        "[pool] edges: the name {name:?} must be 1 to {MAX_EDGE_NAME} of a-z, 0-9 and -"
+                    ));
+                }
+                if secret.chars().count() < MIN_EDGE_SECRET {
+                    return Err(anyhow!(
+                        "[pool] edges: the secret of {name} must be at least {MIN_EDGE_SECRET} characters (openssl rand -base64 32)"
+                    ));
+                }
+                if !secrets.insert(secret) {
+                    return Err(anyhow!(
+                        "[pool] edges: {name} has the secret of another edge; each edge needs its own"
+                    ));
+                }
+            }
+            if pool.local_first > self.media.share_viewers {
+                return Err(anyhow!(
+                    "[pool] local_first ({}) must be at most [media] share_viewers ({}): viewers this relay keeps would be refused",
+                    pool.local_first,
+                    self.media.share_viewers
+                ));
+            }
+        }
         if self.update.enabled && !crate::update::SUPPORTED {
             return Err(anyhow!(
                 "[update] enabled needs the linux-x86_64 build: there is no official build of this one to update to"
@@ -449,6 +603,33 @@ fn default_max_connections_per_ip() -> u32 {
     32
 }
 
+fn default_live_lobby() -> u32 {
+    2000
+}
+
+fn default_group_key() -> bool {
+    true
+}
+
+/// `text` read as a TOML file of `T` (server.toml, edge.toml), or what is wrong with it:
+/// where, and toml's word for why. Never the line itself, which toml's own message quotes:
+/// a mistyped `secret` in edge.toml, or an `admin_token` or `[pool] edges` line here, would
+/// print a secret, and under systemd into the journal.
+pub fn parse<T: serde::de::DeserializeOwned>(text: &str) -> Result<T> {
+    toml::from_str(text).map_err(|e| {
+        let at = e
+            .span()
+            .and_then(|span| text.get(..span.start))
+            .map(|before| {
+                let line = before.matches('\n').count() + 1;
+                let column = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
+                format!("line {line}, column {column}: ")
+            })
+            .unwrap_or_default();
+        anyhow!("{at}{}", e.message())
+    })
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -458,14 +639,18 @@ impl Default for ServerConfig {
             udp_port: default_udp_port(),
             max_users: default_max_users(),
             max_connections_per_ip: default_max_connections_per_ip(),
+            live_lobby: default_live_lobby(),
             tcp_fallback: false,
+            group_key: default_group_key(),
             cert_path: "certs/server.crt".into(),
             key_path: "certs/server.key".into(),
             admin_token: None,
             accounts: AccountsConfig::default(),
             files: FilesConfig::default(),
+            media: MediaConfig::default(),
             emotes: EmotesConfig::default(),
             update: UpdateConfig::default(),
+            pool: PoolConfig::default(),
         }
     }
 }
@@ -520,6 +705,7 @@ mod tests {
         assert_eq!(config.max_users, 64);
         assert_eq!(config.max_connections_per_ip, 32);
         assert!(!config.tcp_fallback, "the TCP fallback is opt-in");
+        assert!(config.group_key, "the group key is on by default");
     }
 
     #[test]
@@ -543,6 +729,14 @@ mod tests {
         let config: ServerConfig =
             toml::from_str("tcp_fallback = true\ncert_path = \"c\"\nkey_path = \"k\"").unwrap();
         assert!(config.tcp_fallback);
+        assert!(
+            config.group_key,
+            "a file that does not name it gets the default"
+        );
+
+        let config: ServerConfig =
+            toml::from_str("group_key = false\ncert_path = \"c\"\nkey_path = \"k\"").unwrap();
+        assert!(!config.group_key, "the switch still turns it off");
     }
 
     #[test]
@@ -659,6 +853,32 @@ mod tests {
     }
 
     #[test]
+    fn password_sign_ins_are_a_setting_and_never_zero() {
+        let parse = |extra: &str| {
+            toml::from_str::<ServerConfig>(&format!(
+                "cert_path = \"c\"\nkey_path = \"k\"\n[accounts]\nmode = \"optional\"\n{extra}"
+            ))
+            .unwrap()
+        };
+        assert_eq!(
+            ServerConfig::default().accounts.password_sign_ins_per_15min,
+            1000
+        );
+        let raised = parse("password_sign_ins_per_15min = 20000");
+        raised.validate().unwrap();
+        assert_eq!(
+            crate::accounts::l4f_config(&raised.accounts, [0; 16]).login_per_15min_global,
+            20000
+        );
+        let zero = parse("password_sign_ins_per_15min = 0");
+        assert!(zero
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("password_sign_ins_per_15min"));
+    }
+
+    #[test]
     fn files_are_on_by_default_with_caps_and_refuse_typos() {
         let config = ServerConfig::default();
         assert!(config.files.enabled);
@@ -716,6 +936,104 @@ mod tests {
             on.validate().is_ok(),
             crate::update::SUPPORTED,
             "only the linux-x86_64 build has an official build to update to"
+        );
+    }
+
+    #[test]
+    fn the_pool_is_off_by_default_and_refuses_typos() {
+        let config = ServerConfig::default();
+        assert!(config.pool.edges.is_empty(), "no edges unless named");
+        assert_eq!(config.pool.local_first, 8);
+        let parse = |extra: &str| {
+            toml::from_str::<ServerConfig>(&format!("cert_path = \"c\"\nkey_path = \"k\"\n{extra}"))
+        };
+        let on = parse(&format!(
+            "[pool]\nlocal_first = 4\n[pool.edges]\ne1 = \"{}\"\nedge-2 = \"{}\"",
+            "a".repeat(32),
+            "b".repeat(44)
+        ))
+        .unwrap();
+        on.validate().unwrap();
+        assert_eq!(on.pool.local_first, 4);
+        assert_eq!(on.pool.edges.keys().collect::<Vec<_>>(), ["e1", "edge-2"]);
+        let inline = parse(&format!(
+            "[pool]\nedges = {{ e1 = \"{}\" }}",
+            "a".repeat(32)
+        ))
+        .unwrap();
+        assert_eq!(inline.pool.edges.len(), 1);
+        assert_eq!(inline.pool.local_first, 8, "the rest keep their defaults");
+        assert!(
+            parse("[pool]\nlocal_frist = 4").is_err(),
+            "a typo fails the start"
+        );
+    }
+
+    #[test]
+    fn an_edge_needs_a_plain_name_and_a_long_secret_of_its_own() {
+        let with = |edges: &[(&str, String)], local_first: u32| {
+            let mut c = ServerConfig::default();
+            c.pool.edges = edges
+                .iter()
+                .map(|(n, s)| (n.to_string(), s.clone()))
+                .collect();
+            c.pool.local_first = local_first;
+            c.validate()
+        };
+        let long = |c: char| c.to_string().repeat(32);
+        assert!(with(&[("e1", long('a')), ("e-2", long('b'))], 8).is_ok());
+        assert!(with(&[(&"e".repeat(32), long('a'))], 8).is_ok());
+        for name in ["", "E1", "e_1", "e.1", "é1", &"e".repeat(33)] {
+            let err = with(&[(name, long('a'))], 8).unwrap_err().to_string();
+            assert!(err.contains("name"), "{name:?}: {err}");
+        }
+        let short = with(&[("e1", "a".repeat(31))], 8).unwrap_err().to_string();
+        assert!(short.contains("at least 32"), "{short}");
+        let shared = with(&[("e1", long('a')), ("e2", long('a'))], 8)
+            .unwrap_err()
+            .to_string();
+        assert!(shared.contains("its own"), "{shared}");
+        let beyond = with(&[("e1", long('a'))], 101).unwrap_err().to_string();
+        assert!(beyond.contains("share_viewers"), "{beyond}");
+        assert!(
+            with(&[], 101).is_ok(),
+            "without edges local_first means nothing"
+        );
+    }
+
+    #[test]
+    fn a_printed_config_shows_no_edge_secret() {
+        let mut c = ServerConfig::default();
+        c.pool
+            .edges
+            .insert("e1".into(), "the-secret-of-edge-one-0123456789".into());
+        let printed = format!("{c:?}");
+        assert!(printed.contains("e1"), "{printed}");
+        assert!(printed.contains("<secret>"), "{printed}");
+        assert!(!printed.contains("the-secret"), "{printed}");
+    }
+
+    /// toml's own message quotes the line it stopped on: a server.toml mistyped in a secret's
+    /// line would print the secret, and under systemd into the journal.
+    #[test]
+    fn a_mistyped_server_toml_says_where_and_never_shows_a_secret() {
+        let secret = "TOPSECRET-of-edge-one-0123456789";
+        for text in [
+            format!("cert_path = \"c\"\n[pool]\nedges = {{ e1 = \"{secret} }}\n"),
+            format!("cert_path = \"c\"\n[pool]\nedges = {{ e1 = {secret} }}\n"),
+            format!("cert_path = \"c\"\nadmin_token = \"{secret}\n"),
+        ] {
+            let error = format!("{:#}", parse::<ServerConfig>(&text).unwrap_err());
+            assert!(!error.contains("TOPSECRET"), "{error}");
+            assert!(error.contains("line "), "{error}");
+        }
+        // What is fine still reads
+        let good = format!(
+            "cert_path = \"c\"\nkey_path = \"k\"\n[pool]\nedges = {{ e1 = \"{secret}\" }}\n"
+        );
+        assert_eq!(
+            parse::<ServerConfig>(&good).unwrap().pool.edges["e1"],
+            secret
         );
     }
 

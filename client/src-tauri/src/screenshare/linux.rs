@@ -8,8 +8,9 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use super::{
-    run_encode_loop, AudioProcessor, CapturedFrame, DisplayInfo, FrameProcessor, FrameSlot, PixFmt,
-    WindowInfo, SCREEN_AUDIO_BITRATE, SCREEN_AUDIO_FRAME_SIZE,
+    level_rate, run_encode_loop, AudioProcessor, CapturedFrame, Change, DisplayInfo,
+    FrameProcessor, FrameSlot, PixFmt, WindowInfo, SCREEN_AUDIO_BITRATE, SCREEN_AUDIO_FRAME_SIZE,
+    START_LEVEL,
 };
 
 /// An active XDG Desktop Portal ScreenCast session.
@@ -45,21 +46,101 @@ pub fn enumerate_windows() -> Vec<WindowInfo> {
     Vec::new()
 }
 
-/// Request a ScreenCast session via the XDG Desktop Portal.
-///
-/// `source_type` controls which sources the portal picker shows:
-/// - `"display"` → monitors only
-/// - `"window"` → application windows only
-/// - anything else → both (backwards compat)
-///
-/// `source_id` is ignored on Linux (the portal picker handles selection).
-///
-/// Returns a `CaptureSession` containing the PipeWire FD and node ID.
-/// The session stays alive until the `CaptureSession` is dropped.
-pub async fn request_screencast(
+/// How a share asks the portal: with the stored token when the person chose "Share again",
+/// which restores their last choice without the dialog, else afresh.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Ask {
+    Again(String),
+    Fresh,
+}
+
+pub(crate) fn first_ask(stored: Option<&str>, again: bool) -> Ask {
+    match stored.filter(|t| again && !t.is_empty()) {
+        Some(t) => Ask::Again(t.to_owned()),
+        None => Ask::Fresh,
+    }
+}
+
+/// After a portal refusal: a refused token is asked once more without it; a fresh ask that
+/// failed (cancelled, no portal) is the answer.
+pub(crate) fn after_refusal(ask: &Ask) -> Option<Ask> {
+    match ask {
+        Ask::Again(_) => Some(Ask::Fresh),
+        Ask::Fresh => None,
+    }
+}
+
+/// What the stored token becomes after a share: the portal's new one (each start returns
+/// one), cleared after a refused one that brought none back, else as it was (None).
+pub(crate) fn token_change(
+    ask: &Ask,
+    refused: bool,
+    returned: Option<String>,
+) -> Option<Option<String>> {
+    match returned {
+        Some(t) => Some(Some(t)),
+        None if refused || matches!(ask, Ask::Again(_)) => Some(None),
+        None => None,
+    }
+}
+
+/// The X11 id of the app window a share was asked from, for the portal dialog's parent; None
+/// on Wayland (see `request_screencast_restoring`).
+pub fn x11_parent(window: &tauri::WebviewWindow) -> Option<u64> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    match window.window_handle().ok()?.as_raw() {
+        // c_ulong: u32 on a 32-bit build
+        #[allow(clippy::unnecessary_cast)]
+        RawWindowHandle::Xlib(h) => Some(h.window as u64),
+        RawWindowHandle::Xcb(h) => Some(h.window.get() as u64),
+        _ => None,
+    }
+}
+
+/// A screen-cast session for a share (L2, D5): asks with the stored token when `again`,
+/// retries once without it when the portal refuses it, and says what the stored token becomes
+/// (`token_change`).
+pub async fn share_session(
     source_type: &str,
-    _source_id: &str,
-) -> Result<CaptureSession, String> {
+    stored: Option<String>,
+    again: bool,
+    parent: Option<u64>,
+) -> Result<(CaptureSession, Option<Option<String>>), String> {
+    let mut ask = first_ask(stored.as_deref(), again);
+    let mut refused = false;
+    loop {
+        let restore = match &ask {
+            Ask::Again(t) => Some(t.clone()),
+            Ask::Fresh => None,
+        };
+        match request_screencast_restoring(source_type, restore, parent).await {
+            Ok((session, returned)) => return Ok((session, token_change(&ask, refused, returned))),
+            Err(e) => match after_refusal(&ask) {
+                Some(next) => {
+                    warn!("the portal did not take the remembered choice ({e}): asking afresh");
+                    refused = true;
+                    ask = next;
+                }
+                None => return Err(e),
+            },
+        }
+    }
+}
+
+/// A ScreenCast session through the XDG Desktop Portal, and the token that restores this
+/// choice without the dialog next time (portal version 4 and later, which keeps a choice
+/// until the person revokes it).
+///
+/// `source_type` controls which sources the portal picker shows: `"display"` monitors only,
+/// `"window"` windows only, anything else (`"any"`, the Linux picker's one button) both. The
+/// session stays alive until the `CaptureSession` is dropped. `parent`: the app window's X11
+/// id, so the dialog opens over it (1.13 L3); on Wayland that takes an xdg-foreign export, not
+/// done yet, and the dialog opens unparented as before.
+async fn request_screencast_restoring(
+    source_type: &str,
+    restore: Option<String>,
+    parent: Option<u64>,
+) -> Result<(CaptureSession, Option<String>), String> {
     use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType};
     use ashpd::desktop::PersistMode;
     use ashpd::WindowIdentifier;
@@ -70,7 +151,8 @@ pub async fn request_screencast(
         _ => SourceType::Monitor | SourceType::Window,
     };
 
-    let (result_tx, result_rx) = tokio::sync::oneshot::channel::<Result<(OwnedFd, u32), String>>();
+    let (result_tx, result_rx) =
+        tokio::sync::oneshot::channel::<Result<(OwnedFd, u32, Option<String>), String>>();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     let keep_alive = tokio::spawn(async move {
@@ -84,20 +166,31 @@ pub async fn request_screencast(
                 .await
                 .map_err(|e| format!("Failed to create session: {e}"))?;
 
+            // Version 4 keeps a choice for a token; before it there is nothing to remember
+            let keeps = proxy.get_property::<u32>("version").await.unwrap_or(1) >= 4;
+            let persist = if keeps {
+                PersistMode::ExplicitlyRevoked
+            } else {
+                PersistMode::DoNot
+            };
+            let restore = restore.as_deref().filter(|_| keeps);
             proxy
                 .select_sources(
                     &session,
                     CursorMode::Embedded,
                     portal_source_type,
                     false,
-                    None,
-                    PersistMode::DoNot,
+                    restore,
+                    persist,
                 )
                 .await
                 .map_err(|e| format!("Failed to select sources: {e}"))?;
 
+            let parent = parent
+                .map(|xid| WindowIdentifier::from_xid(xid as std::os::raw::c_ulong))
+                .unwrap_or_default();
             let response = proxy
-                .start(&session, &WindowIdentifier::default())
+                .start(&session, &parent)
                 .await
                 .map_err(|e| format!("Portal start failed (user cancelled?): {e}"))?
                 .response()
@@ -108,6 +201,7 @@ pub async fn request_screencast(
                 return Err("No streams returned by portal".into());
             }
             let node_id = streams[0].pipe_wire_node_id();
+            let token = response.restore_token().map(str::to_owned);
 
             let fd = proxy
                 .open_pipe_wire_remote(&session)
@@ -118,12 +212,12 @@ pub async fn request_screencast(
                 .try_clone()
                 .map_err(|e| format!("Failed to dup PipeWire FD: {e}"))?;
 
-            Ok::<_, String>((fd_clone, node_id, fd, session))
+            Ok::<_, String>((fd_clone, node_id, token, fd, session))
         };
 
         match setup.await {
-            Ok((fd_clone, node_id, _fd, session)) => {
-                let _ = result_tx.send(Ok((fd_clone, node_id)));
+            Ok((fd_clone, node_id, token, _fd, session)) => {
+                let _ = result_tx.send(Ok((fd_clone, node_id, token)));
                 let _ = shutdown_rx.await;
                 match tokio::time::timeout(std::time::Duration::from_secs(5), session.close()).await
                 {
@@ -140,12 +234,15 @@ pub async fn request_screencast(
     });
 
     match result_rx.await {
-        Ok(Ok((fd, node_id))) => Ok(CaptureSession {
-            _shutdown_guard: Some(shutdown_tx),
-            _keep_alive: keep_alive,
-            pw_fd: fd,
-            node_id,
-        }),
+        Ok(Ok((fd, node_id, token))) => Ok((
+            CaptureSession {
+                _shutdown_guard: Some(shutdown_tx),
+                _keep_alive: keep_alive,
+                pw_fd: fd,
+                node_id,
+            },
+            token,
+        )),
         Ok(Err(e)) => {
             keep_alive.abort();
             Err(e)
@@ -266,14 +363,41 @@ fn run_pipewire_capture(
     let stream = pipewire::stream::StreamRc::new(core.clone(), "voipc-screenshare", props)
         .map_err(|e| format!("StreamRc::new: {e}"))?;
 
+    // The portal's node goes when the compositor ends the cast (the shared window closed,
+    // or the desktop's own "stop sharing"). Nothing else says so: a stream whose source is
+    // gone just stops getting buffers, and the share stood frozen, still "live" (1.13).
+    let source_gone = std::rc::Rc::new(std::cell::Cell::new(false));
+    let registry = core
+        .get_registry_rc()
+        .map_err(|e| format!("PipeWire registry: {e}"))?;
+    let _registry_listener = registry
+        .add_listener_local()
+        .global_remove({
+            let gone = source_gone.clone();
+            move |id| {
+                if id == node_id {
+                    gone.set(true);
+                }
+            }
+        })
+        .register();
+    let events = app.clone();
+
     let format_pod = build_video_format_pod(target_width, target_height, target_fps)?;
 
     let start_time = Instant::now();
 
     // ── Create encoder + processor upfront (like Windows) ────────────────
-    let encoder =
-        voipc_video::encoder::Encoder::new(codec, target_width, target_height, bitrate, target_fps)
-            .map_err(|e| format!("Failed to create the {codec:?} encoder: {e}"))?;
+    // At the ladder's start level, which the first watched frame starts from
+    let (start_kbps, start_fps) = level_rate(bitrate, target_fps, START_LEVEL);
+    let encoder = voipc_video::encoder::Encoder::new(
+        codec,
+        target_width,
+        target_height,
+        start_kbps,
+        start_fps,
+    )
+    .map_err(|e| format!("Failed to create the {codec:?} encoder: {e}"))?;
 
     let processor = FrameProcessor {
         encoder,
@@ -291,8 +415,10 @@ fn run_pipewire_capture(
         loss_ms: loss_ms.clone(),
         base_bitrate_kbps: bitrate,
         base_fps: target_fps,
-        level: 0,
+        level: START_LEVEL,
         level_changed: Instant::now(),
+        last_change: Change::Start,
+        sent_since_start: false,
         video_tx,
         session_id,
         media_key: media_key.clone(),
@@ -564,14 +690,24 @@ fn run_pipewire_capture(
     info!("PipeWire audio stream started (default sink monitor)");
 
     let loop_ = mainloop.loop_();
-    while active.load(Ordering::Relaxed) {
+    while active.load(Ordering::Relaxed) && !source_gone.get() {
         loop_.iterate(pipewire::loop_::Timeout::Finite(
             std::time::Duration::from_millis(5),
         ));
     }
+    // Ended by the system only if nobody stopped it first: leaving voice drops the portal
+    // session after clearing `active`, and that removal is ours
+    let ended = source_gone.get() && active.swap(false, Ordering::Relaxed);
 
     // Wait for encode thread to finish (it will exit when active becomes false)
     let _ = encode_thread.join();
+    if ended {
+        warn!("the screen share's source went away: the system ended the capture");
+        // The page ends the share as a Stop would (relay, portal) and says why
+        use tauri::Emitter;
+        let _ = events.emit("screenshare-source-ended", ());
+        return Err("the system ended the screen capture".into());
+    }
     info!("PipeWire capture stopped");
     Ok(())
 }
@@ -738,4 +874,50 @@ fn parse_audio_format(param: &pipewire::spa::pod::Pod) -> Option<(u32, u32)> {
     }
 
     Some((rate, channels))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn share_again_asks_with_the_token_and_nothing_else_does() {
+        assert_eq!(first_ask(Some("t1"), true), Ask::Again("t1".into()));
+        assert_eq!(
+            first_ask(Some("t1"), false),
+            Ask::Fresh,
+            "choose something else"
+        );
+        assert_eq!(first_ask(None, true), Ask::Fresh, "nothing remembered");
+        assert_eq!(first_ask(Some(""), true), Ask::Fresh);
+    }
+
+    #[test]
+    fn a_refused_token_is_asked_once_more_without_it() {
+        assert_eq!(after_refusal(&Ask::Again("t1".into())), Some(Ask::Fresh));
+        assert_eq!(
+            after_refusal(&Ask::Fresh),
+            None,
+            "a fresh refusal is the answer"
+        );
+    }
+
+    #[test]
+    fn the_stored_token_follows_every_start() {
+        let again = Ask::Again("t1".into());
+        // Each start brings a new one, whatever was asked
+        assert_eq!(
+            token_change(&Ask::Fresh, false, Some("t2".into())),
+            Some(Some("t2".into()))
+        );
+        assert_eq!(
+            token_change(&again, true, Some("t3".into())),
+            Some(Some("t3".into()))
+        );
+        // Refused, and the fresh ask kept nothing (a portal before version 4): forgotten
+        assert_eq!(token_change(&Ask::Fresh, true, None), Some(None));
+        assert_eq!(token_change(&again, false, None), Some(None));
+        // A fresh share on a portal that keeps nothing leaves the store alone
+        assert_eq!(token_change(&Ask::Fresh, false, None), None);
+    }
 }

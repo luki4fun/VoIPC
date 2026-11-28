@@ -21,6 +21,10 @@
 //! server name is [`NATIVE_SNI`] (browsers get a rotating hash-pinned one
 //! instead), so the URL host is `NATIVE_SNI` and a fixed resolver dials the
 //! real address. The TLS port presents it to everyone.
+//!
+//! A relay with an edge pool (1.15) may send a viewer to a media edge for the share
+//! it watches: [`connect_edge`] opens that second QUIC connection, which only ever
+//! brings that share's sealed frames in (`edge_view.rs` runs it).
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -41,8 +45,11 @@ use tracing::{info, warn};
 use voipc_crypto::bind::{BIND_LEN, EXPORTER_LABEL};
 use wtransport::config::{DnsLookupFuture, DnsResolver, QuicTransportConfig};
 use wtransport::endpoint::endpoint_side::Client;
+use wtransport::tls::client::ServerHashVerification;
+use wtransport::tls::Sha256Digest;
 use wtransport::{ClientConfig, Connection, Endpoint, RecvStream, VarInt};
 
+use voipc_protocol::pool::VIEW_PATH;
 use voipc_protocol::video::RecordReader;
 use voipc_protocol::ws::{self, Decoder, Message};
 
@@ -238,30 +245,9 @@ async fn connect_quic(
     let mut established = None;
     for &server_addr in addrs {
         let (tls, sight) = tls_config(host, port, accept_invalid_certs, b"h3")?;
-        // Bind in the server's address family: a v6 wildcard socket is not
-        // available everywhere and a v4 one cannot reach a v6 server.
-        let bind: SocketAddr = if server_addr.is_ipv4() {
-            "0.0.0.0:0"
-        } else {
-            "[::]:0"
-        }
-        .parse()
-        .expect("literal bind address");
-        // Few video frames in flight, sent in order, and a cap on what the
-        // server may make us hold across every stream (by default nothing caps
-        // the sum, so a hostile server could park ~155 MB here per open
-        // server): see server_config in crates/voipc-server/src/web.rs for why.
-        let mut transport = QuicTransportConfig::default();
-        transport
-            .max_concurrent_uni_streams(24u32.into())
-            .receive_window((2u32 * 1024 * 1024).into())
-            .send_fairness(false)
-            // Stale voice is dropped, oldest first, instead of a 1 MiB backlog
-            // bursting out after a stall (as on the relay, web.rs)
-            .datagram_send_buffer_size(64 * 1024);
         let config = ClientConfig::builder()
-            .with_bind_address(bind)
-            .with_custom_tls_and_transport(tls, transport)
+            .with_bind_address(bind_for(server_addr))
+            .with_custom_tls_and_transport(tls, media_transport())
             // Keeps NAT mappings alive through silent channels; a vanished
             // server trips the 30 s idle timeout and surfaces as a read error.
             .keep_alive_interval(Some(Duration::from_secs(10)))
@@ -324,6 +310,115 @@ async fn connect_quic(
         },
         sight,
     ))
+}
+
+/// Bind in the server's address family: a v6 wildcard socket is not available
+/// everywhere and a v4 one cannot reach a v6 server.
+fn bind_for(server_addr: SocketAddr) -> SocketAddr {
+    if server_addr.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    }
+    .parse()
+    .expect("literal bind address")
+}
+
+/// The QUIC settings of a link that carries media in, the relay's and an edge's alike.
+/// Few video frames in flight, sent in order, and a cap on what the other end may
+/// make us hold across every stream (by default nothing caps the sum, so a hostile
+/// server could park ~155 MB here per open server): see server_config in
+/// crates/voipc-server/src/web.rs for why.
+fn media_transport() -> QuicTransportConfig {
+    let mut transport = QuicTransportConfig::default();
+    transport
+        .max_concurrent_uni_streams(24u32.into())
+        .receive_window((2u32 * 1024 * 1024).into())
+        .send_fairness(false)
+        // Stale voice is dropped, oldest first, instead of a 1 MiB backlog
+        // bursting out after a stall (as on the relay, web.rs)
+        .datagram_send_buffer_size(64 * 1024);
+    transport
+}
+
+// ── Media edges ──────────────────────────────────────────────────────────
+
+/// Bound for an edge connect: resolving, the handshake and the WebTransport session
+/// together. An edge that does not answer within it is reported to the relay at once
+/// (`edge_view`), which has other places to send us.
+pub const EDGE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Connect to a media edge (`ServerMessage::WatchAt`, 1.15): QUIC to `host:port` and the
+/// WebTransport session at `pool::VIEW_PATH`, every resolved address in turn as in
+/// [`connect_quic`] and with its QUIC settings, within [`EDGE_CONNECT_TIMEOUT`] in all.
+///
+/// An edge shows everyone the short-lived self-signed certificate a browser pins by
+/// hash (`serverCertificateHashes`), and only one of `hashes`, which the relay sent, is
+/// trusted here. wtransport's verifier holds it to what a browser does: ECDSA P-256 and
+/// at most 14 days of validity. No TOFU pin and no public CA: an edge is the relay's
+/// word, and it names the certificate itself.
+pub async fn connect_edge(host: &str, port: u16, hashes: &[[u8; 32]]) -> Result<Quic, String> {
+    let deadline = Instant::now() + EDGE_CONNECT_TIMEOUT;
+    let addrs: Vec<SocketAddr> =
+        tokio::time::timeout(EDGE_CONNECT_TIMEOUT, tokio::net::lookup_host((host, port)))
+            .await
+            .map_err(|_| format!("Timed out resolving the edge {host}"))?
+            .map_err(|e| format!("Could not resolve the edge {host}: {e}"))?
+            .collect();
+    // The relay sends an IPv6 literal bare; the URL needs its brackets
+    let url = if host.contains(':') {
+        format!("https://[{host}]:{port}{VIEW_PATH}")
+    } else {
+        format!("https://{host}:{port}{VIEW_PATH}")
+    };
+    let mut last_err = format!("No addresses found for the edge {host}");
+    for addr in addrs {
+        let config = ClientConfig::builder()
+            .with_bind_address(bind_for(addr))
+            .with_custom_tls_and_transport(edge_tls(hashes)?, media_transport())
+            .keep_alive_interval(Some(Duration::from_secs(10)))
+            .dns_resolver(Fixed(addr))
+            .build();
+        let endpoint = match Endpoint::client(config) {
+            Ok(endpoint) => endpoint,
+            Err(e) => {
+                last_err = format!("Could not create QUIC endpoint for {addr}: {e}");
+                warn!("{last_err}");
+                continue;
+            }
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(remaining, endpoint.connect(&url)).await {
+            Ok(Ok(connection)) => {
+                return Ok(Quic {
+                    endpoint,
+                    connection,
+                })
+            }
+            Ok(Err(e)) => {
+                last_err = format!("Could not connect to the edge {host}:{port} ({addr}): {e}");
+                warn!("{last_err}");
+            }
+            Err(_) => return Err(format!("Timed out connecting to the edge {host}:{port}")),
+        }
+    }
+    Err(last_err)
+}
+
+/// TLS for an edge: 1.3 and `h3` as for the relay, and a certificate trusted only by
+/// its hash.
+fn edge_tls(hashes: &[[u8; 32]]) -> Result<rustls::ClientConfig, String> {
+    let verifier = ServerHashVerification::new(hashes.iter().map(|hash| Sha256Digest::new(*hash)));
+    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .map_err(|e| format!("TLS configuration error: {e}"))?
+    .dangerous()
+    .with_custom_certificate_verifier(Arc::new(verifier))
+    .with_no_client_auth();
+    config.alpn_protocols = vec![b"h3".to_vec()];
+    Ok(config)
 }
 
 // ── Media inputs ─────────────────────────────────────────────────────────

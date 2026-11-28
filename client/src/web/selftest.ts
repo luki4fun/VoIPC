@@ -13,14 +13,26 @@
 //                        session, which is the case where a sender key used to
 //                        go missing and every message read as undecryptable
 //   role=talker|listener talker transmits a PTT burst, listener reports stats
+//   talk_ms=<ms>         how long the talker's burst lasts (default 4000)
 //   dm=<username>        send a direct message to this user once seen
 //   duration=<ms>        main phase before the wrap-up (default 15000)
 //   admin=<token>        wrap-up: log in as admin and kick the user in `kick`
 //   kick=<username>      the user the admin kicks
 //   expect_kick=1        wrap-up: wait (up to 10 s) to be kicked
+//   expect_file=1        wrap-up: wait (up to 20 s) for the talker's file offer and fetch it
 //   share=1              share a screen (a synthetic canvas stands in for the
 //                        display, so headless browsers need no real capture)
 //   watch=1              watch the first peer that starts sharing
+//   share_res=480|720|1080, share_fps=15|30|60, share_noise=<blocks>
+//                        what the share sends (default 480p at 15 fps, and that many
+//                        random blocks a frame to cost bitrate, default 0); both sides log
+//                        a share-window line every 10 s (the sharer's kbps, the
+//                        viewer's canvas draws) for the capped-link lane; the
+//                        sharer logs its quality ladder's changes (share-ladder), and
+//                        the viewer its voice counters as they move (voice-tick)
+//   trace=1              log what share-trace.ts kept at the end (trace-* lines): the
+//                        sharer's frames as they went to the link, voice packets out
+//                        and in, and the main thread's late moments (capped-link lane)
 //   proximity=off|2d|3d  proximity mode for a channel this run creates
 //   pos=<x,y,z>          stand here (metres) and share the position with the
 //                        channel, so peers receive a position beacon
@@ -35,6 +47,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { parseInviteFragment } from "../lib/invite";
 import { checkGoldenValues, testLabel, type ProximityMode } from "../lib/spatial";
+import { share, type ShareSender } from "./backend/share";
+import { traceFrames, traceLag, traceLagStart, traceVoiceIn, traceVoiceOut, traceWrites } from "./backend/share-trace";
 
 interface ChannelInfo { channel_id: number; name: string; text?: boolean }
 interface UserInfo { user_id: number; username: string; channel_id: number; is_screen_sharing?: boolean }
@@ -45,10 +59,10 @@ interface UserInfo { user_id: number; username: string; channel_id: number; is_s
  * replaces getDisplayMedia with this. Product code is untouched — the override
  * lives on the navigator.mediaDevices instance and shadows the prototype method.
  */
-function fakeDisplayCapture(fps: number): void {
+function fakeDisplayCapture(fps: number, height: number, noise: number): void {
   const canvas = document.createElement("canvas");
-  canvas.width = 854;
-  canvas.height = 480;
+  canvas.width = ({ 480: 854, 720: 1280, 1080: 1920 } as Record<number, number>)[height] ?? 854;
+  canvas.height = height;
   const ctx = canvas.getContext("2d")!;
   let frame = 0;
   setInterval(() => {
@@ -61,6 +75,14 @@ function fakeDisplayCapture(fps: number): void {
     ctx.fillRect((frame * 13) % canvas.width, 120, 160, 160);
     ctx.font = "48px sans-serif";
     ctx.fillText(`frame ${frame}`, 40, 400);
+    // The capped-link lane: blocks that change every frame, so the encoder needs about its
+    // target bitrate and the link is what gives way
+    if (noise > 0) {
+      for (let i = 0; i < noise; i++) {
+        ctx.fillStyle = `hsl(${(Math.random() * 360) | 0}, 80%, ${(30 + Math.random() * 40) | 0}%)`;
+        ctx.fillRect((Math.random() * canvas.width) | 0, (Math.random() * canvas.height) | 0, 24, 24);
+      }
+    }
   }, Math.round(1000 / fps));
   const stream = canvas.captureStream(fps);
   navigator.mediaDevices.getDisplayMedia = async () => stream;
@@ -79,6 +101,11 @@ function log(line: string, data?: unknown) {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/** How long after the listener is seated the talker's schedule starts (see its loop): with this
+ *  loop's tick, 4.3-4.5 s, where every lane ran before the clock (3.6-5.8 s, soak 45226171956).
+ *  6 s put her file offer within 0.4 s of the end of his 15 s, and once past it (soak 45269825608). */
+const TALKER_LAG_MS = 4000;
+
 async function sha256(bytes: Uint8Array): Promise<string> {
   const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes as Uint8Array<ArrayBuffer>));
   return Array.from(digest, (b) => b.toString(16).padStart(2, "0")).join("");
@@ -96,11 +123,17 @@ export async function run(params: URLSearchParams): Promise<void> {
   const expectKick = params.has("expect_kick");
   const doShare = params.has("share");
   const doWatch = params.has("watch");
+  const shareRes = Number(params.get("share_res") ?? 480);
+  const shareFps = Number(params.get("share_fps") ?? 15);
+  const shareNoise = Number(params.get("share_noise") ?? 0);
   const textChannelName = params.get("textchannel");
   const proximity = (params.get("proximity") ?? "off") as ProximityMode;
   const ownPosition = params.get("pos");
   const spatialTest = params.get("spatialtest") as "2d" | "3d" | null;
   const fileKib = Number(params.get("file") ?? 0);
+  const expectFile = params.has("expect_file");
+  const talkMs = Number(params.get("talk_ms") ?? 4000);
+  const trace = params.get("trace") === "1";
   // The server id every server-scoped command names: the address we connect with
   const server = window.location.host;
 
@@ -111,6 +144,28 @@ export async function run(params: URLSearchParams): Promise<void> {
   log(spatialMismatch === null ? "spatial ok" : "spatial mismatch", spatialMismatch ?? undefined);
 
   window.addEventListener("error", (e) => log("error", { message: e.message }));
+  // test-web.sh hides a keyholder's page through DevTools: when it was hidden and shown again,
+  // and once a timer of its own came a second or more late, as a hidden page's are clamped
+  // (after a grace, and not while it plays sound): from then on its duty runs under the clamp
+  let hiddenRun = 0;
+  document.addEventListener("visibilitychange", () => {
+    log("page-visibility", { state: document.visibilityState });
+    if (document.visibilityState !== "hidden") return;
+    const run = ++hiddenRun;
+    const hiddenAt = performance.now();
+    let last = hiddenAt;
+    const look = () => {
+      if (run !== hiddenRun || document.visibilityState !== "hidden") return;
+      const now = performance.now();
+      if (now - last >= 900) {
+        log("page-timers-clamped", { late_ms: Math.round(now - last - 50), hidden_ms: Math.round(now - hiddenAt) });
+        return;
+      }
+      last = now;
+      setTimeout(look, 50);
+    };
+    setTimeout(look, 50);
+  });
   window.addEventListener("unhandledrejection", (e) => log("error", { message: String(e.reason) }));
 
   let channels: ChannelInfo[] = [];
@@ -126,6 +181,25 @@ export async function run(params: URLSearchParams): Promise<void> {
   let watching = false;
   let sharerUserId = 0;
   let framesDrawn = 0;
+  /** Pictures the viewer drew on our canvas (the frame event comes once). */
+  let canvasDraws = 0;
+  /** Every 10 s while sharing or watching: what went out, or what was drawn, in that window. */
+  let shareWindows: ReturnType<typeof setInterval> | null = null;
+  const startShareWindows = () => {
+    if (shareWindows !== null) return;
+    let lastBytes = 0;
+    let lastDraws = 0;
+    shareWindows = setInterval(() => {
+      invoke<[number, number, number, number, number, number]>("get_screen_share_stats")
+        .then(([sent, bytesSent]) => {
+          const kbps = Math.round(((bytesSent - lastBytes) * 8) / 10_000);
+          lastBytes = bytesSent;
+          log("share-window", { frames_sent: sent, kbps, drawn: canvasDraws - lastDraws });
+          lastDraws = canvasDraws;
+        })
+        .catch(() => {});
+    }, 10_000);
+  };
   let textChannelId = 0;
   let textCreated = false;
   let textJoined = false;
@@ -135,6 +209,8 @@ export async function run(params: URLSearchParams): Promise<void> {
   let textPeerSeen = 0;
   /** Who else is in the text channel, so the talker writes once somebody reads. */
   const textPeers = new Set<number>();
+  /** When the relay said someone else took a seat in our room (wall clock, from the event). */
+  let peerSeatedAt = 0;
   // What App.svelte would hand to a newcomer, per channel: a member of several
   // channels must answer each one with its own conversation.
   type SeenMessage = { user_id: number; username: string; content: string; timestamp: number };
@@ -204,7 +280,13 @@ export async function run(params: URLSearchParams): Promise<void> {
     "screenshare-started", "screenshare-stopped", "watching-screenshare",
     "stopped-watching-screenshare", "screenshare-error", "screenshare-frame",
     "viewer-count-changed",
+    // Where a share is watched from when the relay sends the viewer to a media edge
+    // (protocol 26): test-web.sh's EDGE lane looks for "ready" and no "failed"
+    "edge-view",
     "user-position", "proximity-mode", "channel-created", "channel-updated",
+    // The group key's lines (stores/gk.ts `gkListeners`): who holds a channel's keys, a post
+    // held or dropped, new readers, a new generation, a warning
+    "gk-state", "gk-post-dropped", "gk-readers", "gk-keyholders", "gk-anew", "gk-warning",
   ];
   // Every other event comes as {server, data}; the lines below log and read
   // `data`, so what test-web.sh greps for is what it always was.
@@ -244,6 +326,9 @@ export async function run(params: URLSearchParams): Promise<void> {
       if (ev === "user-joined") {
         const u = e.payload as UserInfo;
         if (!isTextChannel(u.channel_id)) users.set(u.user_id, u);
+        if (u.user_id !== myUserId && u.channel_id !== 0 && u.channel_id === joinedChannelId && peerSeatedAt === 0) {
+          peerSeatedAt = Date.now();
+        }
       }
       if (ev === "admin-status") {
         const p = e.payload as { user_id: number; is_admin: boolean };
@@ -266,7 +351,7 @@ export async function run(params: URLSearchParams): Promise<void> {
       if (ev === "viewer-count-changed") {
         const p = e.payload as { viewer_count: number };
         const cmd = p.viewer_count > 0 ? "start_screen_capture" : "stop_screen_capture";
-        invoke(cmd, { resolution: 480, fps: 15 }).catch((err) =>
+        invoke(cmd, { resolution: shareRes, fps: shareFps }).catch((err) =>
           log("error", { message: `${cmd}: ${String(err)}` }),
         );
       }
@@ -339,39 +424,14 @@ export async function run(params: URLSearchParams): Promise<void> {
     log("error", { message: `channel: ${String(e)}` });
   }
 
-  // The message alice types while alone, sent before the loop rather than on
-  // its first tick: a peer that joins in between asks for the channel history
-  // straight away, and she can only hand over what she already has.
-  if (role === "talker") {
-    // No fixed budget: test-web.sh holds the second browser until the line
-    // below appears, so taking longer here costs time but never correctness.
-    for (let i = 0; i < 200 && joinedChannelId === 0; i++) {
-      await sleep(50);
-      const me = users.get(myUserId);
-      if (me && me.channel_id !== 0) joinedChannelId = me.channel_id;
-    }
-    if (joinedChannelId === 0) {
-      log("error", { message: "no channel after 10s, skipping the early message" });
-    } else {
-      earlySent = true;
-      const early = `early from ${name}`;
-      const inHistory = () => historyOf(joinedChannelId).some((m) => m.content === early);
-      try {
-        await invoke("send_channel_message", { server, content: early });
-        // "Sent" is not the state the next peer depends on: the message reaches
-        // channelHistory — the list handed to a newcomer — only when the server
-        // echoes it back. Log the line the harness waits for once it is there.
-        for (let i = 0; i < 100 && !inHistory(); i++) await sleep(50);
-        log("early-chat-sent", { in_history: inHistory() });
-      } catch (e) {
-        log("error", { message: `early chat: ${String(e)}` });
-      }
-    }
-  }
-
   // The talker's text channel, made before the loop so its first message is
   // written while nobody else is in it — which is what the listener later has
-  // to be handed as history.
+  // to be handed as history. And made before early-chat-sent below, which is
+  // the line test-web.sh starts bob on and hides alice's page after: made
+  // after it, the retries below ran on a hidden page, whose timers Chrome
+  // stretched until the channel took 16-18 s on CI (run 45225396106), and bob
+  // finished his whole run, or joined the channel before its first line was
+  // written, while alice had not reached her loop yet.
   if (textChannelName && role === "talker") {
     try {
       textCreated = true;
@@ -403,12 +463,53 @@ export async function run(params: URLSearchParams): Promise<void> {
     }
   }
 
-  const started = Date.now();
+  // The message alice types while alone, sent before the loop rather than on
+  // its first tick: a peer that joins in between asks for the channel history
+  // straight away, and she can only hand over what she already has.
+  if (role === "talker") {
+    // No fixed budget: test-web.sh holds the second browser until the line
+    // below appears, so taking longer here costs time but never correctness.
+    for (let i = 0; i < 200 && joinedChannelId === 0; i++) {
+      await sleep(50);
+      const me = users.get(myUserId);
+      if (me && me.channel_id !== 0) joinedChannelId = me.channel_id;
+    }
+    if (joinedChannelId === 0) {
+      log("error", { message: "no channel after 10s, skipping the early message" });
+    } else {
+      earlySent = true;
+      const early = `early from ${name}`;
+      const inHistory = () => historyOf(joinedChannelId).some((m) => m.content === early);
+      try {
+        await invoke("send_channel_message", { server, content: early });
+        // "Sent" is not the state the next peer depends on: the message reaches
+        // channelHistory — the list handed to a newcomer — only when the server
+        // echoes it back. Log the line the harness waits for once it is there.
+        for (let i = 0; i < 100 && !inHistory(); i++) await sleep(50);
+        log("early-chat-sent", { in_history: inHistory() });
+      } catch (e) {
+        log("error", { message: `early chat: ${String(e)}` });
+      }
+    }
+  }
+
+  // The talker's clock is set again once the listener is seated (below)
+  let started = Date.now();
+  let clockSet = false;
   let talked = false;
   let positionShared = false;
   let effectsSet = false;
+  let voiceSeen = [0, 0];
   while (Date.now() - started < duration) {
     await sleep(500);
+    // The viewer's voice counters as they move: the capped-link lane counts loss per window
+    if (role === "listener" && doWatch) {
+      const [played, lost] = await invoke<[number, number]>("get_voice_stats").catch(() => [0, 0]);
+      if (played !== voiceSeen[0] || lost !== voiceSeen[1]) {
+        voiceSeen = [played, lost];
+        log("voice-tick", { played, lost });
+      }
+    }
     const me = users.get(myUserId);
     if (me && me.channel_id !== 0) joinedChannelId = me.channel_id;
 
@@ -473,8 +574,11 @@ export async function run(params: URLSearchParams): Promise<void> {
     }
 
     // Proximity chat: stand somewhere and share it, so the peer's client
-    // receives a position beacon and places us
-    if (ownPosition && !positionShared && joinedChannelId !== 0) {
+    // receives a position beacon and places us. Once the relay has seated us
+    // (our own row in the room's list): a joiner's joinedChannelId is set when
+    // it asks, and a share before the seat throws and is never tried again.
+    // The lossy lane's seat once took 776 ms against this loop's 500 ms tick.
+    if (ownPosition && !positionShared && joinedChannelId !== 0 && users.get(myUserId)?.channel_id === joinedChannelId) {
       positionShared = true;
       const [x, y, z] = ownPosition.split(",").map(Number);
       try {
@@ -486,6 +590,24 @@ export async function run(params: URLSearchParams): Promise<void> {
       }
     }
     const peers = [...users.values()].filter((u) => u.user_id !== myUserId && u.channel_id === joinedChannelId && joinedChannelId !== 0);
+
+    // The talker's schedule (share at 3 s, chat at 4, talk at 5, the end at
+    // `duration`) runs from TALKER_LAG_MS after the listener took his seat, so
+    // by then he holds the room's key and has joined the text channel, however
+    // late his browser came up. Every lane was tuned on that shape, when the
+    // text channel's 6 s creation sat between his start and her loop; once
+    // that moved before it, a late bob (the lossy lane 3-8 s, the capped one
+    // 10-14 s) would have met a talker already half done. His own main phase
+    // still ends `duration` after his start, so the lag is what her share,
+    // talk and file have of it.
+    // The seat's time comes from the event, not this loop's tick, which a
+    // hidden page's timers stretch.
+    if (role === "talker" && !clockSet && peers.length > 0) {
+      clockSet = true;
+      const seatedAt = peerSeatedAt || Date.now();
+      started = seatedAt + TALKER_LAG_MS;
+      log("talker-clock", { seated_ms_ago: Date.now() - seatedAt, lag_ms: TALKER_LAG_MS });
+    }
 
     // Drive both kinds of lane — one coming in, and our own going out — with
     // all four controls on, so the voice checks below cover the whole chain:
@@ -545,14 +667,16 @@ export async function run(params: URLSearchParams): Promise<void> {
     if (doShare && !sharing && peers.length > 0 && Date.now() - started > 3000) {
       sharing = true;
       try {
-        fakeDisplayCapture(15);
+        fakeDisplayCapture(shareFps, shareRes, shareNoise);
         await invoke("start_screen_share", {
           sourceType: "display",
           sourceId: "0",
-          resolution: 480,
-          fps: 15,
+          resolution: shareRes,
+          fps: shareFps,
         });
-        log("share-started");
+        log("share-started", { resolution: shareRes, fps: shareFps });
+        startShareWindows();
+        if (trace) traceLagStart();
       } catch (e) {
         log("error", { message: `share: ${String(e)}` });
       }
@@ -568,9 +692,18 @@ export async function run(params: URLSearchParams): Promise<void> {
           // The viewer component's job: hand the canvas to the web backend
           const canvas = document.createElement("canvas");
           document.body.appendChild(canvas);
+          // Every picture the viewer puts on it, counted (the frame event comes once)
+          const g = canvas.getContext("2d")!;
+          const draw = g.drawImage.bind(g) as (...a: unknown[]) => void;
+          (g as unknown as { drawImage: (...a: unknown[]) => void }).drawImage = (...a: unknown[]) => {
+            canvasDraws++;
+            draw(...a);
+          };
           (window as any).__voipc_web?.setVideoCanvas(canvas);
           await invoke("watch_screen_share", { sharerUserId: target });
           log("watch-requested", { sharer: target });
+          startShareWindows();
+          if (trace) traceLagStart();
         } catch (e) {
           log("error", { message: `watch: ${String(e)}` });
         }
@@ -584,7 +717,7 @@ export async function run(params: URLSearchParams): Promise<void> {
         // A file crosses while this side talks: what voice does then is the measure
         const fileTo = fileKib > 0 ? [...users.values()].find((u) => u.username === dmTarget) : undefined;
         if (fileTo) fileTransfer = sendOffered(fileTo.user_id);
-        await sleep(4000);
+        await sleep(talkMs);
         await invoke("stop_transmit");
         log("transmit-stopped");
       } catch (e) {
@@ -604,6 +737,9 @@ export async function run(params: URLSearchParams): Promise<void> {
     await invoke("stop_spatial_test").catch(() => {});
   }
 
+  // The talker's file may still be on its way when this side's main phase ends: wait for its
+  // offer, then for the fetch, rather than have the wrap-up's kick cut it (soak 45269825608)
+  if (expectFile) for (let i = 0; i < 200 && !fileTransfer; i++) await sleep(100);
   if (fileTransfer) await Promise.race([fileTransfer, sleep(60_000)]);
   if (fileWindow) {
     const [from, to] = fileWindow;
@@ -623,6 +759,18 @@ export async function run(params: URLSearchParams): Promise<void> {
     log("error", { message: `voice-stats: ${String(e)}` });
   }
 
+  if (shareWindows !== null) clearInterval(shareWindows);
+  // The capped-link lane's trace (share-trace.ts), in lines of 200 rows
+  if (trace) {
+    const dump = (what: string, rows: number[][]) => {
+      for (let i = 0; i < rows.length; i += 200) log(`trace-${what}`, rows.slice(i, i + 200));
+    };
+    dump("frames", traceFrames);
+    dump("writes", traceWrites);
+    dump("voice-out", traceVoiceOut);
+    dump("voice-in", traceVoiceIn);
+    dump("lag", traceLag);
+  }
   if (doShare || doWatch) {
     try {
       const [sent, bytesSent, recv, dropped, bytesRecv, resolution] =
@@ -636,10 +784,17 @@ export async function run(params: URLSearchParams): Promise<void> {
         width: resolution >>> 16,
         height: resolution & 0xffff,
         frames_drawn: framesDrawn,
+        canvas_draws: canvasDraws,
       });
     } catch (e) {
       log("error", { message: `screenshare-stats: ${String(e)}` });
     }
+    // Each change of the sharer's quality ladder, ms after the share started
+    if (doShare) log("share-ladder", {
+        steps: (share as ShareSender).ladderSteps(),
+        paced_skips: (share as ShareSender).pacedSkipCount(),
+        uplink: (share as ShareSender).uplinkFinds(),
+      });
     if (doShare) await invoke("stop_screen_share").catch(() => {});
   }
 

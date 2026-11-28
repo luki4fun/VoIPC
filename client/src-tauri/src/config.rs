@@ -105,6 +105,11 @@ pub struct AppConfig {
     /// viewer decodes it, browsers included) or "h265" (smaller, but no browser
     /// on Linux and no Firefox anywhere can decode it).
     pub screen_share_codec: String,
+    /// The Linux portal's token for the last screen or window shared (1.13, "Share again"):
+    /// it restores that choice without the dialog until the person revokes it on their
+    /// desktop or presses Forget in the picker. Only in this 0600 file; None when nothing is
+    /// remembered.
+    pub screencast_restore_token: Option<String>,
 
     // Proximity chat
     /// Render voices positionally in proximity channels. Off gives everyone
@@ -174,6 +179,9 @@ pub struct AppConfig {
     pub share_off_once: bool,
     /// That reset turned a saved `true` off: one notice is owed.
     pub share_off_notice: bool,
+    /// Volunteer as a keyholder for text channels' group keys (on by default,
+    /// desktop only).
+    pub help_hold_keys: bool,
 
     // Appearance
     /// Everything the UI remembers about how it looks: which layout, which
@@ -257,6 +265,7 @@ impl Default for AppConfig {
             saved_servers: Vec::new(),
             open_servers: Vec::new(),
             screen_share_codec: "h264".into(),
+            screencast_restore_token: None,
             spatial_audio: true,
             screen_audio_spatial: true,
             mic_effect: "none".into(),
@@ -275,6 +284,7 @@ impl Default for AppConfig {
             share_channel_history: false,
             share_off_once: true,
             share_off_notice: false,
+            help_hold_keys: true,
             // Null, not `{}`: "nothing has been chosen yet" is the state the
             // whole appearance blob starts in, and an empty object would be
             // indistinguishable from a user who reset every preference. What

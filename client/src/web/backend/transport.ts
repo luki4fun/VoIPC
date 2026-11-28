@@ -13,6 +13,33 @@
 // packet exactly as it would travel as a datagram or video record. QUIC gets a
 // head start, then the two race. Encoding and decoding of the payloads is the
 // session's job either way.
+//
+// A viewer the relay placed on a media edge (protocol 26) also opens a second
+// WebTransport session, to the edge, for that share's frames alone
+// (`openEdgeView`): it shows the ticket the relay sent and gets the same video
+// streams and screen-audio datagrams as from the relay. The edge has no TCP
+// fallback.
+//
+// A sharer's frames go out as they come while the link carries them, on either carrier. Once
+// its uplink queues (lib/video-pacer.ts UplinkControl: a frame's ack on WebTransport, a ping
+// through the tunnel), they go out paced at what the link delivers, a big frame spread over
+// time, until a spell with no queue lets them go as they come again; voice and control never
+// wait behind the pacer. Its clock is a worker's, as a hidden tab clamps the page's own timers.
+
+import {
+  PACE_LOOK_MS,
+  PROBE_EVERY_MS,
+  PROBE_LOST_MS,
+  UPLINK_FLOOR_FRAMES,
+  UPLINK_FLOOR_PROBES,
+  UplinkControl,
+  VideoPacer,
+} from "../../lib/video-pacer.ts";
+import { ReadyClock } from "./live.ts";
+import { traceWriteStage, traceWriteStart } from "./share-trace.ts";
+
+/** A test build's trace (share-trace.ts); Node's tests of this module define no __SELFTEST__. */
+const TRACED = typeof __SELFTEST__ !== "undefined" && __SELFTEST__;
 
 /** Same bound as voipc_protocol::codec::MAX_MSG_SIZE. */
 const MAX_MSG_SIZE = 65_536;
@@ -41,6 +68,10 @@ const KEY_RESERVE = 4;
  * finishes, and this is what that costs every connect.
  */
 const TCP_HEAD_START_MS = 2_000;
+/** Where an app fetches a share from a media edge (voipc_protocol::pool::VIEW_PATH). */
+const VIEW_PATH = "/voipc-view";
+/** Bound for each step of an edge connect: the handshake, then the hello and its Ready. */
+const EDGE_STEP_MS = 5_000;
 /** Control bytes per tunnel message (the server takes up to 64 KiB + the tag). */
 const TUNNEL_CONTROL_CHUNK = 16 * 1024;
 /**
@@ -51,6 +82,41 @@ const TUNNEL_CONTROL_CHUNK = 16 * 1024;
 const TUNNEL_MAX_DELTA_BACKLOG = 64 * 1024;
 /** ...and a keyframe, which ends a drop, while a little more is. */
 const TUNNEL_MAX_KEY_BACKLOG = 512 * 1024;
+
+/**
+ * Lets out what `letOut` has due now, and looks again on the pace clock until nothing waits:
+ * one look per tick for a transport, however many frames wait.
+ */
+function paceOn(letOut: () => boolean): () => void {
+  let waiting = false;
+  const look = () => {
+    const done = letOut();
+    if (done) waiting = false;
+    return done;
+  };
+  return () => {
+    if (letOut() || waiting) return;
+    waiting = true;
+    void paceClock.until(look);
+  };
+}
+
+/**
+ * The pacers' one clock: a worker's while any frame waits (worklets/tick-worker.js), since a
+ * sharer's tab is mostly hidden and a hidden tab clamps its own timers to a second. A frame
+ * taken also goes out at once as far as the bucket allows, so the ticks only spread the rest.
+ */
+let paceTicks: Worker | undefined;
+const paceClock = new ReadyClock((tick) => {
+  if (typeof Worker === "undefined") {
+    const timer = setInterval(tick, PACE_LOOK_MS);
+    return () => clearInterval(timer);
+  }
+  paceTicks ??= new Worker(new URL("./worklets/tick-worker.js", import.meta.url), { type: "module" });
+  paceTicks.onmessage = tick;
+  paceTicks.postMessage({ type: "start", intervalMs: PACE_LOOK_MS });
+  return () => paceTicks?.postMessage({ type: "stop" });
+});
 
 export interface TransportHandlers {
   /** One complete control frame payload (postcard ServerMessage, no length prefix). */
@@ -80,10 +146,34 @@ export interface Transport {
    * are still in flight — our uplink is the bottleneck, and the caller should
    * count that as loss and ask its encoder for a keyframe. A keyframe (`key`)
    * may use a few reserved slots past that point.
+   *
+   * Taken frames go out whole and in order: as they come, or paced once the uplink queued.
    */
   sendVideoFrame(body: Uint8Array, key: boolean): boolean;
   /** Frames whose stream has not finished writing (only ever compared to 0). */
   videoBacklog(): number;
+  /**
+   * How long the video still waiting for the pacer takes to go out, in ms (0 unpaced); on the
+   * TCP fallback with what waits in the socket ahead of the oldest ping still out.
+   */
+  videoQueuedMs(): number;
+  /** When our own uplink was last found queued (performance.now() ms), 0 never. */
+  uplinkQueuedAt(): number;
+  /** A share's video starts: unpaced, its link judged afresh (UplinkControl.reset). */
+  uplinkReset(): void;
+  /**
+   * The sharer's clock, a worker's: judges what is still out and applies the pacer's rate.
+   * True when a ping is due through this link to time it (`sendProbe`): the TCP fallback,
+   * whose queue is the socket's and shows in no ack.
+   */
+  uplinkTick(): boolean;
+  /** A ping (`Ping` datagram) to time the uplink with; `stamp` is the sequence its Pong echoes. */
+  sendProbe(bytes: Uint8Array, stamp: number): void;
+  /** A Pong came back after `rttMs`: true if it was a probe's; else the keepalive's (the
+   *  link's least, if no video was on the way). */
+  uplinkPong(stamp: number, rttMs: number): boolean;
+  /** Each time this share found its uplink queued (self-test): UplinkControl.finds. */
+  uplinkFinds(): number[][];
   /**
    * The server may say nothing for this long from now on, as a sign-in waiting on a person:
    * none of its pings run yet. Never under the usual bound, so 0 puts that back.
@@ -91,6 +181,29 @@ export interface Transport {
   allowQuiet(ms: number): void;
   /** Flush queued control frames and close the session. onClosed is not called. */
   close(): Promise<void>;
+}
+
+/** What comes of an edge link (`openEdgeView`), from its Ready on. */
+export interface EdgeViewHandlers {
+  /** One raw video packet (0x13/0x14), as `TransportHandlers.onVideoPacket`. */
+  onVideoPacket(bytes: Uint8Array): void;
+  /** One raw media datagram, as `TransportHandlers.onDatagram`. */
+  onDatagram(bytes: Uint8Array): void;
+  /** The edge ended the link (its `Ended`, or a close); at most once, never after close(). */
+  onClosed(reason: string): void;
+}
+
+export interface EdgeViewLink {
+  /** Leave the edge; onClosed is not called. */
+  close(): void;
+}
+
+/** The pool messages a viewer speaks, from wasm (`WasmApi`): never written out here. */
+export interface EdgeViewCodec {
+  /** `ViewerMsg::Hello { ticket }`, with its length prefix. */
+  encodeViewerHello(ticket: Uint8Array): Uint8Array;
+  /** An `EdgeViewMsg` from its postcard bytes (no length prefix): `"Ready"` or `{ Ended: { reason } }`. */
+  decodeEdgeViewMsg(bytes: Uint8Array): unknown;
 }
 
 interface BridgeInfo {
@@ -179,13 +292,13 @@ function closeOpened(opened: Opened): void {
 /** The WebTransport handshake, retried once with a fresh certificate hash. */
 async function openQuic(urlHost: string, origin: string, info: BridgeInfo): Promise<WebTransport> {
   try {
-    return await openSession(urlHost, info);
+    return await openSession(urlHost, info.port, "/voipc", [info.hash], CONNECT_TIMEOUT_MS);
   } catch {
     // The bridge certificate rotates every 7 days: a hash fetched just before
     // a rotation is stale by the time the handshake runs. Refetch once.
     const fresh = await fetchBridgeInfo(origin);
     try {
-      return await openSession(urlHost, fresh);
+      return await openSession(urlHost, fresh.port, "/voipc", [fresh.hash], CONNECT_TIMEOUT_MS);
     } catch (e) {
       // Getting here means /wt.json came back over TCP, so the server is up and
       // reachable — only the UDP/QUIC path failed. The browser keeps the real
@@ -216,8 +329,85 @@ async function wrapSession(wt: WebTransport, handlers: TransportHandlers): Promi
   let closed = false;
   let watchdog: ReturnType<typeof setTimeout> | undefined;
   let idleMs = IDLE_TIMEOUT_MS;
-  /** Frames whose stream has not finished writing (send-side backpressure). */
+  /** Frames whose stream has not finished writing (send-side backpressure), the paced included. */
   let framesInFlight = 0;
+  /** A frame on its way: its stream's writer once open, its writes so far in order, and when
+   *  its last bytes left the pacer (0 not yet). */
+  type Paced = {
+    writer: Promise<WritableStreamDefaultWriter<Uint8Array> | null>;
+    writes: Promise<void>;
+    traced: number[] | null;
+    bytes: number;
+    outAt: number;
+  };
+  const pacer = new VideoPacer<Paced>(performance.now());
+  // Each frame's ack measures what the link delivers: a find needs it steady
+  const uplink = new UplinkControl(UPLINK_FLOOR_FRAMES, true);
+  /** Frames out of the pacer and not acked yet, oldest first. */
+  const out = new Set<Paced>();
+  /** Video the peer acked so far, bytes. */
+  let delivered = 0;
+  /** When a frame last came to be sent. */
+  let lastFrameAt = -Infinity;
+  /** Whatever the pacer has due now goes to its streams; true once nothing waits. */
+  const letOut = (): boolean => {
+    if (closed) return true;
+    const now = performance.now();
+    const rate = uplink.rate(now);
+    if (rate !== pacer.rateBps()) {
+      if (TRACED && rate === 0 && uplink.paced() === false && uplink.probeCount > 0) {
+        console.info(`uplink probe ${uplink.probeCount}: unpaced again after ${Math.round(pacer.rateBps() / 1000)} kbps`);
+      }
+      pacer.setRate(rate, now);
+    }
+    for (const slice of pacer.take(now)) {
+      const frame = slice.tag;
+      if (slice.last) {
+        frame.outAt = now;
+        out.add(frame);
+      }
+      if (slice.first) {
+        frame.writer = (wt.createUnidirectionalStream() as Promise<WritableStream<Uint8Array>>).then(
+          (stream) => {
+            if (TRACED && frame.traced) traceWriteStage(frame.traced, 1);
+            return stream.getWriter();
+          },
+          // Stream refused: the frame is lost, the viewers ask for a keyframe
+          () => null,
+        );
+      }
+      frame.writes = frame.writes.then(async () => {
+        try {
+          const writer = await frame.writer;
+          if (!writer) return;
+          await writer.write(slice.bytes);
+          if (slice.last) {
+            if (TRACED && frame.traced) traceWriteStage(frame.traced, 2);
+            // Resolves once the peer acked all of it: a round trip, and whatever queue is on
+            // the way, ours in the browser included
+            await writer.close();
+            const acked = performance.now();
+            delivered += frame.bytes;
+            uplink.sample(acked - frame.outAt, delivered, acked);
+            if (TRACED && frame.traced) traceWriteStage(frame.traced, 3);
+          }
+        } catch {
+          // Stream reset: the frame is lost, the viewers ask for a keyframe. The
+          // session's own error handling reports a dead link.
+          frame.writer = Promise.resolve(null);
+        }
+      });
+      if (slice.last) {
+        void frame.writes.finally(() => {
+          framesInFlight--;
+          out.delete(frame);
+        });
+      }
+    }
+    if (!pacer.empty()) uplink.binding(now);
+    return pacer.empty();
+  };
+  const pace = paceOn(letOut);
   /** Control frames handed to the stream and not taken yet. */
   let controlInFlight = 0;
 
@@ -241,7 +431,7 @@ async function wrapSession(wt: WebTransport, handlers: TransportHandlers): Promi
     () => finish("Server closed connection"),
     (e) => finish(`Read error: ${message(e)}`),
   );
-  void readControl(bidi.readable, controlFramer(handlers, finish), armWatchdog, finish);
+  void readControl(bidi.readable, controlFramer(handlers.onControl, finish), armWatchdog, finish);
   void readDatagrams(wt.datagrams.readable, handlers);
   void readVideoStreams(wt.incomingUnidirectionalStreams, handlers);
   armWatchdog();
@@ -272,22 +462,36 @@ async function wrapSession(wt: WebTransport, handlers: TransportHandlers): Promi
       // stall every viewer's assembler until the next keyframe.
       if (framesInFlight >= MAX_FRAMES_IN_FLIGHT + (key ? KEY_RESERVE : 0)) return false;
       framesInFlight++;
-      void (async () => {
-        try {
-          const stream: WritableStream<Uint8Array> = await wt.createUnidirectionalStream();
-          const writer = stream.getWriter();
-          await writer.write(body);
-          await writer.close();
-        } catch {
-          // Stream refused or reset: the frame is lost, the viewers ask for a
-          // keyframe. The session's own error handling reports a dead link.
-        } finally {
-          framesInFlight--;
-        }
-      })();
+      const traced = TRACED ? traceWriteStart(body.length) : null;
+      lastFrameAt = performance.now();
+      pacer.push(body, { writer: Promise.resolve(null), writes: Promise.resolve(), traced, bytes: body.length, outAt: 0 });
+      pace();
       return true;
     },
     videoBacklog: () => framesInFlight,
+    videoQueuedMs: () => pacer.queuedMs(),
+    uplinkQueuedAt: () => uplink.queuedAt,
+    uplinkReset() {
+      if (TRACED) console.info(`uplink reset: least ${uplink.least()} ms`);
+      uplink.reset();
+    },
+    uplinkTick() {
+      if (closed) return false;
+      const now = performance.now();
+      // On a small link few frames a second come back: what is still out shows a queue first
+      uplink.pending([...out].map((f) => now - f.outAt), now);
+      pace();
+      return false;
+    },
+    // Frames' acks time this link: a ping has nothing to add
+    sendProbe() {},
+    uplinkPong(_stamp, rttMs) {
+      // The datagram path's round trip, with no video of ours on the way: the link's least
+      if (TRACED) console.info(`uplink pong ${rttMs} ms, ${Math.round(performance.now() - lastFrameAt)} ms after video`);
+      if (performance.now() - lastFrameAt > 2000) uplink.base(rttMs, performance.now());
+      return false;
+    },
+    uplinkFinds: () => uplink.finds,
     allowQuiet(ms) {
       if (closed) return;
       idleMs = Math.max(ms, IDLE_TIMEOUT_MS);
@@ -362,7 +566,66 @@ function wrapSocket(ws: WebSocket, handlers: TransportHandlers): Transport {
     clearTimeout(watchdog);
     watchdog = setTimeout(() => finish("Connection timed out (no data from server)"), idleMs);
   };
-  const pushControl = controlFramer(handlers, finish);
+  const pushControl = controlFramer(handlers.onControl, finish);
+  // A frame's packets, one message each as the relay forwards them, as the pacer lets them out
+  const pacer = new VideoPacer<null>(performance.now());
+  // The socket is one queue in send order, and the kernel's part of it shows in no counter
+  // here: a ping through it waits behind every byte sent before, so its round trip is that queue
+  const uplink = new UplinkControl(UPLINK_FLOOR_PROBES, false);
+  /** Video handed to the socket so far, bytes... */
+  let sentVideo = 0;
+  /** ...and when the first of it since the last ping was (NaN: none yet). */
+  let firstSince = NaN;
+  let lastFrameAt = -Infinity;
+  let lastProbeAt = -Infinity;
+  /**
+   * Pings out and not answered, oldest first: their stamp, when, the video sent before them,
+   * and when the first of the video sent since the ping before them went (NaN: none).
+   */
+  const probes: { stamp: number; at: number; before: number; first: number }[] = [];
+  /** Pings sent before this share's video started time no queue of this share (uplinkReset). */
+  let probesFrom = -Infinity;
+  /** The pings still out that time this share's link: sent since its video started, not given up. */
+  const timing = (now: number) => probes.filter((p) => p.at >= probesFrom && now - p.at < PROBE_LOST_MS);
+  /**
+   * How long the oldest ping still out has waited past the link's least: video waits in the
+   * socket ahead of it that long at least, which counts for the sharer's gate as the pacer's
+   * own queue does. Before anything is found (a slow start, a link that carries less), it
+   * keeps voice from going behind more than PACE_GATE_MS of video, rate or no rate.
+   */
+  const socketWaitMs = (now: number) => {
+    const oldest = timing(now)[0];
+    return oldest ? Math.max(0, now - oldest.at - uplink.least()) : 0;
+  };
+  const letOut = (): boolean => {
+    if (closed) {
+      pacer.clear();
+      return true;
+    }
+    const now = performance.now();
+    const rate = uplink.rate(now);
+    if (rate !== pacer.rateBps()) {
+      if (TRACED && rate === 0 && uplink.paced() === false && uplink.probeCount > 0) {
+        console.info(`uplink probe ${uplink.probeCount}: unpaced again after ${Math.round(pacer.rateBps() / 1000)} kbps`);
+      }
+      pacer.setRate(rate, now);
+    }
+    for (const { bytes } of pacer.take(now)) {
+      let off = 0;
+      while (off + 2 <= bytes.length) {
+        const len = (bytes[off] << 8) | bytes[off + 1];
+        off += 2;
+        if (len === 0 || off + len > bytes.length) break;
+        send(bytes.subarray(off, off + len));
+        off += len;
+        sentVideo += len;
+        if (Number.isNaN(firstSince)) firstSince = now;
+      }
+    }
+    if (!pacer.empty()) uplink.binding(now);
+    return pacer.empty();
+  };
+  const pace = paceOn(letOut);
 
   ws.onmessage = (ev: MessageEvent<ArrayBuffer>) => {
     armWatchdog();
@@ -409,19 +672,60 @@ function wrapSocket(ws: WebSocket, handlers: TransportHandlers): Transport {
     },
     sendVideoFrame(body, key) {
       if (closed) return false;
+      // The socket's own backlog only: what the pacer holds is bounded in time by the sharer
+      // (PACE_GATE_MS), and counted in bytes it refused deltas on a link with room
       if (ws.bufferedAmount > (key ? TUNNEL_MAX_KEY_BACKLOG : TUNNEL_MAX_DELTA_BACKLOG)) return false;
-      // One message per packet, as the relay forwards them
-      let off = 0;
-      while (off + 2 <= body.length) {
-        const len = (body[off] << 8) | body[off + 1];
-        off += 2;
-        if (len === 0 || off + len > body.length) break;
-        send(body.subarray(off, off + len));
-        off += len;
-      }
+      lastFrameAt = performance.now();
+      pacer.push(body, null);
+      pace();
       return true;
     },
-    videoBacklog: () => (ws.bufferedAmount > 0 ? 1 : 0),
+    videoBacklog: () => (ws.bufferedAmount > 0 || !pacer.empty() ? 1 : 0),
+    videoQueuedMs: () => pacer.queuedMs() + socketWaitMs(performance.now()),
+    uplinkQueuedAt: () => uplink.queuedAt,
+    uplinkReset() {
+      uplink.reset(sentVideo);
+      probesFrom = performance.now();
+    },
+    uplinkTick() {
+      if (closed) return false;
+      const now = performance.now();
+      // A ping or its pong the relay dropped is not coming: past PROBE_LOST_MS it times nothing
+      // (a queue that long was found while it was younger). Kept to know its pong if it comes.
+      uplink.pending(
+        timing(now).map((p) => now - p.at),
+        now,
+      );
+      pace();
+      // Timed while video goes out, not over a still screen
+      return now - lastFrameAt < 1000 && now - lastProbeAt >= PROBE_EVERY_MS;
+    },
+    sendProbe(bytes, stamp) {
+      if (closed) return;
+      // Never dropped behind a backlog, as sendDatagram drops voice: the backlog is what it times
+      lastProbeAt = performance.now();
+      probes.push({ stamp, at: lastProbeAt, before: sentVideo, first: firstSince });
+      firstSince = NaN;
+      if (probes.length > 16) probes.shift();
+      send(bytes);
+    },
+    uplinkPong(stamp, rttMs) {
+      const now = performance.now();
+      const i = probes.findIndex((p) => p.stamp === stamp);
+      if (i < 0) {
+        // The keepalive's: with no video of ours ahead of it, the link's least
+        if (now - lastFrameAt > 2000) uplink.base(rttMs, now);
+        return false;
+      }
+      const probe = probes[i];
+      // Answered in order: any older one is not coming (the relay may drop a ping). Each ping
+      // since the one answered before says when video first went after the ping before it.
+      const first = probes.slice(0, i + 1).find((p) => !Number.isNaN(p.first))?.first ?? NaN;
+      probes.splice(0, i + 1);
+      if (probe.at >= probesFrom) uplink.sample(now - probe.at, probe.before, now, first);
+      return true;
+    },
+    uplinkFinds: () => uplink.finds,
     allowQuiet(ms) {
       if (closed) return;
       idleMs = Math.max(ms, IDLE_TIMEOUT_MS);
@@ -434,6 +738,101 @@ function wrapSocket(ws: WebSocket, handlers: TransportHandlers): Transport {
       // Messages already queued (the Disconnect) go out ahead of the Close
       ws.onclose = null;
       ws.close(1000);
+    },
+  };
+}
+
+/**
+ * Fetch a share from a media edge: a WebTransport session to its `/voipc-view`,
+ * trusting only a certificate of `hashes` (the relay named them with the edge),
+ * then the viewer's hello with `ticket`. Resolves at the edge's `Ready`; rejects
+ * when the handshake, the hello or the Ready fails or takes longer than its 5 s.
+ *
+ * From then on the edge's video streams and datagrams come as from the relay.
+ * The app sends it nothing more: keyframe asks and loss reports go to the
+ * relay. No watchdog here: what counts as a silent edge is the caller's
+ * (edge-view.ts), by whole decrypted frames rather than bytes.
+ */
+export async function openEdgeView(
+  host: string,
+  port: number,
+  hashes: ArrayLike<number>[],
+  ticket: ArrayLike<number>,
+  handlers: EdgeViewHandlers,
+  codec: EdgeViewCodec,
+): Promise<EdgeViewLink> {
+  const urlHost = host.includes(":") ? `[${host}]` : host;
+  // Copies: the decoded message is the relay's, and the hashes must be plain buffers
+  const pins = hashes.map((h) => Uint8Array.from(h));
+  const wt = await openSession(urlHost, port, VIEW_PATH, pins, EDGE_STEP_MS);
+
+  let closed = false;
+  let ready = false;
+  let answered: { resolve(): void; reject(e: Error): void } = { resolve() {}, reject() {} };
+  const readyAt = new Promise<void>((resolve, reject) => void (answered = { resolve, reject }));
+  // Nobody waits on it once the hello step has given up
+  readyAt.catch(() => {});
+
+  const finish = (reason: string) => {
+    if (closed) return;
+    closed = true;
+    try {
+      wt.close();
+    } catch {
+      // already closed
+    }
+    if (ready) handlers.onClosed(reason);
+    else answered.reject(new Error(reason));
+  };
+  const onFrame = (payload: Uint8Array) => {
+    if (closed) return;
+    let msg: unknown;
+    try {
+      msg = codec.decodeEdgeViewMsg(payload);
+    } catch {
+      return finish("The edge sent something this app cannot read");
+    }
+    if (msg === "Ready" && !ready) {
+      ready = true;
+      void readDatagrams(wt.datagrams.readable, handlers);
+      void readVideoStreams(wt.incomingUnidirectionalStreams, handlers);
+      answered.resolve();
+      return;
+    }
+    const ended = (msg as { Ended?: { reason?: unknown } } | null)?.Ended;
+    finish(ended ? `The edge ended the view: ${String(ended.reason)}` : "The edge said something out of turn");
+  };
+
+  wt.closed.then(
+    () => finish("The edge closed the connection"),
+    (e) => finish(`The edge's connection failed: ${message(e)}`),
+  );
+  try {
+    await withTimeout(
+      (async () => {
+        const bidi: WebTransportBidirectionalStream = await wt.createBidirectionalStream();
+        void readControl(bidi.readable, controlFramer(onFrame, finish), () => {}, finish, "The edge closed the view");
+        // Its send side stays open: an edge may take a finished stream for a viewer gone
+        const writer = (bidi.writable as WritableStream<Uint8Array>).getWriter();
+        await writer.write(codec.encodeViewerHello(Uint8Array.from(ticket)));
+        await readyAt;
+      })(),
+      EDGE_STEP_MS,
+      "Timed out waiting for the edge's Ready",
+    );
+  } catch (e) {
+    finish(message(e));
+    throw e;
+  }
+  return {
+    close() {
+      if (closed) return;
+      closed = true;
+      try {
+        wt.close();
+      } catch {
+        // already closed
+      }
     },
   };
 }
@@ -465,14 +864,21 @@ async function fetchBridgeInfo(origin: string): Promise<BridgeInfo> {
   return { port, hash: hexToBytes(hash), tcp: tcp === true };
 }
 
-async function openSession(urlHost: string, info: BridgeInfo): Promise<WebTransport> {
-  const wt = new WebTransport(`https://${urlHost}:${info.port}/voipc`, {
-    serverCertificateHashes: [{ algorithm: "sha-256", value: info.hash }],
+/** A WebTransport session to `path`, trusting only a certificate of these hashes. */
+async function openSession(
+  urlHost: string,
+  port: number,
+  path: string,
+  hashes: Uint8Array<ArrayBuffer>[],
+  timeoutMs: number,
+): Promise<WebTransport> {
+  const wt = new WebTransport(`https://${urlHost}:${port}${path}`, {
+    serverCertificateHashes: hashes.map((value) => ({ algorithm: "sha-256", value })),
   });
   // A failed handshake also rejects `closed`; the caller attaches the real handler.
   wt.closed.catch(() => {});
   try {
-    await withTimeout(wt.ready, CONNECT_TIMEOUT_MS, "Timed out in WebTransport handshake");
+    await withTimeout(wt.ready, timeoutMs, "Timed out in WebTransport handshake");
   } catch (e) {
     wt.close();
     throw e;
@@ -482,7 +888,7 @@ async function openSession(urlHost: string, info: BridgeInfo): Promise<WebTransp
 
 /** Control-stream bytes in, whole control payloads out (u32 BE length prefix). */
 function controlFramer(
-  handlers: TransportHandlers,
+  onFrame: (payload: Uint8Array) => void,
   finish: (reason: string) => void,
 ): (chunk: Uint8Array) => void {
   let buf: Uint8Array = new Uint8Array(0);
@@ -496,7 +902,7 @@ function controlFramer(
         return;
       }
       if (buf.length - off < 4 + len) break;
-      handlers.onControl(buf.subarray(off + 4, off + 4 + len));
+      onFrame(buf.subarray(off + 4, off + 4 + len));
       off += 4 + len;
     }
     if (off > 0) buf = buf.slice(off);
@@ -508,13 +914,14 @@ async function readControl(
   pushControl: (chunk: Uint8Array) => void,
   armWatchdog: () => void,
   finish: (reason: string) => void,
+  closedReason = "Server closed connection",
 ): Promise<void> {
   const reader = (readable as ReadableStream<Uint8Array>).getReader();
   try {
     for (;;) {
       const { value, done } = await reader.read();
       if (done) {
-        finish("Server closed connection");
+        finish(closedReason);
         return;
       }
       armWatchdog();
@@ -525,7 +932,7 @@ async function readControl(
   }
 }
 
-async function readDatagrams(readable: ReadableStream, handlers: TransportHandlers): Promise<void> {
+async function readDatagrams(readable: ReadableStream, handlers: Pick<TransportHandlers, "onDatagram">): Promise<void> {
   const reader = (readable as ReadableStream<Uint8Array>).getReader();
   try {
     for (;;) {
@@ -538,7 +945,7 @@ async function readDatagrams(readable: ReadableStream, handlers: TransportHandle
   }
 }
 
-async function readVideoStreams(streams: ReadableStream, handlers: TransportHandlers): Promise<void> {
+async function readVideoStreams(streams: ReadableStream, handlers: Pick<TransportHandlers, "onVideoPacket">): Promise<void> {
   const reader = (streams as ReadableStream<ReadableStream<Uint8Array>>).getReader();
   try {
     for (;;) {
@@ -554,7 +961,10 @@ async function readVideoStreams(streams: ReadableStream, handlers: TransportHand
 
 /** Packets are handed on as they arrive: waiting for the frame's FIN would add
  *  its whole transmission time to the latency (voipc_protocol::video::RecordReader). */
-async function readVideoFrame(stream: ReadableStream<Uint8Array>, handlers: TransportHandlers): Promise<void> {
+async function readVideoFrame(
+  stream: ReadableStream<Uint8Array>,
+  handlers: Pick<TransportHandlers, "onVideoPacket">,
+): Promise<void> {
   const reader = stream.getReader();
   let pending: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
   let total = 0;

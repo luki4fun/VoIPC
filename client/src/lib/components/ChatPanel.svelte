@@ -18,6 +18,7 @@
   import { channels } from "../stores/channels.js";
   import { uiPrefs } from "../stores/ui-prefs.js";
   import { serverAddress, serverKey, userId, username } from "../stores/connection.js";
+  import { searchNames } from "../stores/lobby.js";
   import { addNotification } from "../stores/notifications.js";
   import { confirmAction } from "../stores/confirm.js";
   import { get } from "svelte/store";
@@ -96,6 +97,8 @@
   import { channelRosters, goneFrom, textSeats } from "../stores/rosters.js";
   import { askSharers, channelOpened, handOffs } from "../stores/handoff.js";
   import { channelRings } from "../stores/marks.js";
+  import { dismissGk, gkChannels } from "../stores/gk.js";
+  import { gkLines } from "../gk-rules.js";
   import { emptyLine, ringLine, sharersIn } from "../history-rules.js";
   import { ownMentionNames } from "../mention-rules.js";
   import Icon from "./Icons.svelte";
@@ -372,6 +375,15 @@
       ? []
       : ownMentionNames($username, mentionable, !!effectiveChannel?.text && livePath($olderRelay?.protocol ?? null)),
   );
+  /** An `@` being typed in a channel: on a relay that sends the lobby in pages, ask it who
+   *  goes by that name, so the list below can offer them. */
+  let mentionTimer: ReturnType<typeof setTimeout> | undefined;
+  function mentionSearch(q: string) {
+    if (isDmMode || anonymousHere) return;
+    clearTimeout(mentionTimer);
+    const server = $serverAddress;
+    mentionTimer = setTimeout(() => searchNames(server, q), 250);
+  }
   /** Who the message box offers after an `@`: everybody but us. */
   // Once each: an account from before `here` was reserved would otherwise be offered
   // twice, and a keyed list stops the page at a repeat
@@ -525,6 +537,9 @@
     }),
   );
   const ring = $derived(!isDmMode && $channelRings.has($displayChannelId) ? ringLine(askState) : null);
+  // The channel's group key (plan 3h): what becomes of our posts here, then what to know
+  const gkHere = $derived(isDmMode || isLobby ? undefined : $gkChannels.get($displayChannelId));
+  const gkShown = $derived(gkHere ? gkLines(channelLabel, gkHere) : []);
 
   $effect(() => {
     if (!followedHere || !liveHere) return;
@@ -1430,6 +1445,17 @@
     </div>
   {/if}
 
+  {#each gkShown as g (g.key)}
+    <div class="preview-footer post-block gk-line" role="status">
+      <Icon name={g.wait ? "hourglass" : "shield"} size={14} /> {g.line}
+      {#if g.key !== "state"}
+        <button class="gk-dismiss" aria-label="Dismiss" onclick={() => dismissGk($serverAddress, $displayChannelId, g.key)}
+          ><Icon name="close" size={14} /></button
+        >
+      {/if}
+    </div>
+  {/each}
+
   {#if isDmMode && dmReach === "readonly"}
     <div class="preview-footer post-block">
       <Icon name="lock" size={14} /> {readOnlyWhy}
@@ -1470,6 +1496,7 @@
       bind:this={composer}
       placeholder={`Message ${channelLabel}…`}
       mentionables={mentionOthers}
+      onmentionquery={mentionSearch}
       conversation={`${$serverAddress}|${$displayChannelId}`}
       {held}
       onsend={sendMessage}
@@ -2161,6 +2188,17 @@
     align-items: center;
     justify-content: center;
     gap: 6px;
+  }
+
+  .gk-dismiss {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: var(--hit);
+    min-height: var(--hit);
+    background: none;
+    border: none;
+    color: var(--text-muted);
   }
 
   .nsfw-label {

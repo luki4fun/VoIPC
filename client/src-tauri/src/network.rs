@@ -17,6 +17,7 @@ use tracing::{debug, error, info, warn};
 use wtransport::error::SendDatagramError;
 use wtransport::{Connection, SendStream};
 
+use crate::edge_view::{self, EdgeCmd};
 use crate::transport::{Conn, DatagramIn, VideoIn};
 
 use voipc_crypto::media_keys::{MediaKey, MediaKeyRing};
@@ -228,16 +229,32 @@ pub async fn connect_to_server(
                     .unwrap_or_else(PoisonError::into_inner)
                     .remove(&key);
                 if let Some(kept) = kept {
-                    sig.channels.live_adopt_kept(kept);
+                    // The stores are made before the sign-in (`init_signal`): what that
+                    // connection read goes into them, with its sessions
+                    let SignalState {
+                        stores, channels, ..
+                    } = &mut *sig;
+                    match stores.as_mut() {
+                        Some(stores) => channels.live_adopt_kept(stores, kept),
+                        None => warn!("no Signal stores to take the kept sessions over"),
+                    }
                 }
                 let kept = state
                     .kept_pins
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .remove(&key);
+                let kept_gk = state
+                    .kept_gk
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&key);
                 let mut session = link.session();
                 if let Some(kept) = kept {
                     session.adopt_pins(kept);
+                }
+                if let Some(kept) = kept_gk {
+                    session.adopt_gk(kept);
                 }
                 // No key job until what it checks against is here
                 if !session.pins_in() {
@@ -257,7 +274,7 @@ pub async fn connect_to_server(
     let output_device_live = Arc::new(std::sync::Mutex::new(output_device));
     let server: Arc<str> = Arc::from(address.as_str());
     let is_voice = Arc::new(AtomicBool::new(false));
-    let voice_asked_at = Arc::new(AtomicU64::new(0));
+    let voice_asked_at = Arc::new(VoiceAsks::default());
 
     // Control writer channel.
     //
@@ -379,6 +396,39 @@ pub async fn connect_to_server(
                 VideoIn::Tunnel(lanes.video_in.take().expect("taken once")),
             ),
         };
+    // The share being watched may come from a media edge the relay sends us to (1.15):
+    // its frames join the relay's in the receiver tasks, and the edge task watches the
+    // link by the frames that decrypt there.
+    let edge_view::Pipes {
+        out: edge_out,
+        gen: edge_gen,
+        video_in: edge_video_in,
+        datagrams_in: edge_datagrams_in,
+    } = edge_view::Pipes::new(watching_user_id_shared.clone());
+    let last_good_frame_ms = Arc::new(AtomicU64::new(0));
+    let (edge_cmd, edge_cmd_rx) = mpsc::channel::<EdgeCmd>(32);
+    let edge_handle = tokio::spawn(edge_view::run(
+        edge_cmd_rx,
+        edge_view::Ctx {
+            tunnel,
+            tcp_tx: tcp_tx.clone(),
+            out: edge_out,
+            gen: edge_gen,
+            watching: watching_user_id_shared.clone(),
+            last_good_frame_ms: last_good_frame_ms.clone(),
+            emit: Box::new({
+                let (app, server) = (app_handle.clone(), server.clone());
+                move |sharer, host, state| {
+                    emit_server(
+                        &app,
+                        &server,
+                        "edge-view",
+                        serde_json::json!({"sharer_user_id": sharer, "host": host, "state": state}),
+                    )
+                }
+            }),
+        },
+    ));
     let files = Arc::new(crate::files::Files::new(
         Box::new({
             let (app, server) = (app_handle.clone(), server.clone());
@@ -406,6 +456,18 @@ pub async fn connect_to_server(
         tcp_rx,
         tcp_tx.queued.clone(),
     ));
+    let gk = crate::gk_net::GkLink {
+        app: app_handle.clone(),
+        server: server.clone(),
+        signal: signal.clone(),
+        tcp_tx: tcp_tx.clone(),
+        account: account.clone(),
+        media_key: current_media_key.clone(),
+        channel_id: current_channel_id.clone(),
+        channels: channels_snapshot.clone(),
+        is_voice: is_voice.clone(),
+    };
+    let gk_handle = tokio::spawn(crate::gk_net::gk_task(gk.clone()));
     let reader_handle = tokio::spawn(control_reader_task(
         control_recv,
         buf,
@@ -429,6 +491,8 @@ pub async fn connect_to_server(
         transmitting.clone(),
         account.clone(),
         files.clone(),
+        edge_cmd,
+        gk.clone(),
     ));
     let live_handle = (proto >= LIVE_PATH_SINCE).then(|| {
         tokio::spawn(live_task(
@@ -442,12 +506,7 @@ pub async fn connect_to_server(
     });
     if let Some(link) = &account {
         crate::account::after_connect(&app_handle, &address, link, &tcp_tx).await;
-        tokio::spawn(crate::account::tick_task(
-            app_handle.clone(),
-            address.clone(),
-            link.clone(),
-            tcp_tx.clone(),
-        ));
+        tokio::spawn(crate::account::tick_task(gk.clone(), link.clone()));
     }
     let video_decode_handle = tokio::task::spawn_blocking({
         let app_handle = app_handle.clone();
@@ -475,6 +534,7 @@ pub async fn connect_to_server(
 
     let udp_recv_handle = tokio::spawn(datagram_receiver_task(
         datagram_in,
+        edge_datagrams_in,
         tunnel,
         app_handle.clone(),
         mix_sources.clone(),
@@ -487,6 +547,8 @@ pub async fn connect_to_server(
     ));
     let video_recv_handle = tokio::spawn(video_stream_receiver_task(
         video_in,
+        edge_video_in,
+        last_good_frame_ms,
         video_decode_tx,
         current_media_key.clone(),
         current_channel_id.clone(),
@@ -585,6 +647,8 @@ pub async fn connect_to_server(
             mixer_handle,
             latency_handle,
             beacon_handle,
+            edge_handle,
+            gk_handle,
         ]
         .into_iter()
         .chain(congestion_handle)
@@ -671,7 +735,10 @@ pub async fn teardown(
         release_holds(app);
     }
     tell_undelivered(app, server, &connection);
-    keep_sessions(state, server, &connection);
+    keep_pins_and_floors(state, server, &connection);
+    let proto = connection.tcp_tx.proto();
+    // Held posts are given up and told, a keyholder resigns, the floors are kept
+    crate::gk_net::end(&crate::gk_net::GkLink::of(app, server, &connection)).await;
 
     // Stop any ongoing voice and screen capture. Bounded, as `stop_capture`
     // is: a wedged device must not hang the disconnect — and with it, through
@@ -708,10 +775,26 @@ pub async fn teardown(
     // Give the writer task a moment to flush the disconnect message
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    // Now abort remaining background tasks
-    for task in connection.tasks {
+    // Now abort remaining background tasks, and wait for them to stop: the sessions and what
+    // was read go to the next connection only once nothing reads here any more. A relay may
+    // hold a post back until it sees the Disconnect, and one read after the copy would open
+    // again there (review 6).
+    for task in &connection.tasks {
         task.abort();
     }
+    let until = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+    for task in connection.tasks {
+        if tokio::time::timeout_at(until, task).await.is_err() {
+            warn!("a connection task did not stop within 500 ms of its abort");
+        }
+    }
+    keep_sessions(
+        state,
+        server,
+        connection.account.as_deref(),
+        proto,
+        &connection.signal,
+    );
 
     // Drop voice/video/screen-audio channels (the aborted mixer task
     // owned and released the playback stream)
@@ -754,20 +837,24 @@ fn tell_undelivered(app: &tauri::AppHandle, server: &str, connection: &ActiveCon
     }
 }
 
-/// An account's sessions, for its next connection to this server. They stay in memory, a
-/// week at most: a disconnect the person chose wipes them (`commands::disconnect`).
-fn keep_sessions(state: &AppState, server: &str, connection: &ActiveConnection) {
-    let Some(link) = &connection.account else {
+/// An account's sessions and what was read, for its next connection to this server. They stay
+/// in memory, a week at most: a disconnect the person chose wipes them
+/// (`commands::disconnect`). Called once the connection's tasks stopped (`teardown`).
+fn keep_sessions(
+    state: &AppState,
+    server: &str,
+    link: Option<&crate::account::AccountLink>,
+    proto: u32,
+    signal: &std::sync::Mutex<SignalState>,
+) {
+    let Some(link) = link else {
         return;
     };
-    if connection.tcp_tx.proto() < LIVE_PATH_SINCE {
+    if proto < LIVE_PATH_SINCE {
         return;
     }
     let now = voipc_crypto::time::now_millis();
-    let mut sig = connection
-        .signal
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
+    let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
     let SignalState {
         stores, channels, ..
     } = &mut *sig;
@@ -781,12 +868,31 @@ fn keep_sessions(state: &AppState, server: &str, connection: &ActiveConnection) 
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .insert((server.to_string(), account), kept);
+}
+
+/// An account's pins and group-key floors, for its next connection to this server, as
+/// `keep_sessions` keeps its sessions.
+fn keep_pins_and_floors(state: &AppState, server: &str, connection: &ActiveConnection) {
+    let Some(link) = &connection.account else {
+        return;
+    };
+    if connection.tcp_tx.proto() < LIVE_PATH_SINCE {
+        return;
+    }
+    let account = link.session().account_id();
     if let Some(pins) = link.session().keep_pins() {
         state
             .kept_pins
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert((server.to_string(), account), pins);
+    }
+    if let Some(floors) = link.session().keep_gk() {
+        state
+            .kept_gk
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert((server.to_string(), account), floors);
     }
 }
 
@@ -939,24 +1045,100 @@ async fn leave_voice(
     }
 }
 
+/// The user's own leave (`join_channel` to the lobby) ends the call on this
+/// connection here and now, as a disconnect does: the microphone, the
+/// speakers, the holds on them, and voice itself, so nothing opens the
+/// microphone again before the server seats us anew (which takes an ask).
+/// It used to close only when the server's answer came, and a server that
+/// never answered kept a voice-activated microphone open after the user
+/// pressed Leave (dive 6 F10). A leave the server refuses (its join budget)
+/// is sent again on its `ChannelError` (review F10-R1); the room's own state
+/// still waits for the answer (`leave_voice`).
+pub(crate) async fn leave_voice_now(state: &AppState, app: &tauri::AppHandle, server: &str) {
+    // In the order `start_capture` takes them: a device still opening is
+    // closed once it is open
+    let _gate = state.mic_gate.lock().await;
+    let (task, eot) = {
+        let mut conns = state.connections.write().await;
+        let Some(c) = conns
+            .get_mut(server)
+            .filter(|c| c.is_voice.load(Ordering::Relaxed))
+        else {
+            return; // the call is elsewhere, or there is none
+        };
+        c.is_voice.store(false, Ordering::Relaxed);
+        let was = c.transmitting.swap(false, Ordering::Relaxed);
+        (
+            c.capture_task.take(),
+            was.then(|| (c.session_id, c.voice_tx.clone())),
+        )
+    };
+    if clear_voice(state, server) {
+        release_holds(app);
+    }
+    // Bounded, as `stop_capture` is, with `connections` free
+    if let Some(task) = task {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), task).await;
+    }
+    // Behind the last voice frame, so the room hears the phrase end
+    if let Some((session_id, voice_tx)) = eot {
+        let eot = VoicePacket::end_of_transmission(session_id, 0);
+        let _ = voice_tx.send(eot.to_bytes()).await;
+    }
+    info!(
+        server,
+        "left voice: the microphone closed before the server's answer"
+    );
+}
+
 /// How long an ask for a voice seat stays good: the server's answer is one
 /// round trip away, a game's `hello` waits up to its own join timeout.
 const VOICE_ASK_TTL_MS: u64 = 10_000;
 
 /// We are about to ask this connection's server for a voice seat. Called
 /// before the request goes out, so the answer cannot beat it.
-pub fn ask_voice(asked_at: &AtomicU64) {
-    asked_at.store(screenshare::epoch_ms().max(1), Ordering::Relaxed);
+/// Asks for a voice seat not answered yet, oldest first: one ask a seat, so two joins
+/// clicked within one round trip both land (the browser keeps the same list, session.ts).
+/// Since dive 6 F7 a move on the connection that carries the call needs an ask as well, and
+/// one slot spent by the first seat refused the second (review F7-R1).
+pub type VoiceAsks = std::sync::Mutex<std::collections::VecDeque<u64>>;
+
+/// A handful is all a person clicks within the ask's life.
+const VOICE_ASKS_MOST: usize = 8;
+
+pub fn ask_voice(asked_at: &VoiceAsks) {
+    let mut asks = asked_at.lock().unwrap_or_else(PoisonError::into_inner);
+    asks.push_back(screenshare::epoch_ms().max(1));
+    while asks.len() > VOICE_ASKS_MOST {
+        asks.pop_front();
+    }
 }
 
 /// Whether a voice seat the server just gave us was asked for, spending the
 /// ask: one ask pays for one seat.
-fn take_voice_ask(asked_at: &AtomicU64) -> bool {
-    voice_ask_fresh(asked_at.swap(0, Ordering::Relaxed), screenshare::epoch_ms())
+fn take_voice_ask(asked_at: &VoiceAsks) -> bool {
+    let now = screenshare::epoch_ms();
+    let mut asks = asked_at.lock().unwrap_or_else(PoisonError::into_inner);
+    while asks.front().is_some_and(|t| !voice_ask_fresh(*t, now)) {
+        asks.pop_front();
+    }
+    asks.pop_front().is_some()
 }
 
 fn voice_ask_fresh(asked_at: u64, now: u64) -> bool {
     asked_at != 0 && now.saturating_sub(asked_at) < VOICE_ASK_TTL_MS
+}
+
+/// Whether a voice seat in `channel_id`, from a server whose connection stands in `current`
+/// and does (`holds_voice`) or does not carry the call, is taken only on an ask of ours.
+///
+/// Every seat but the lobby and the room the call already stands in. The relay that carries
+/// the call used to be let move it between its rooms unasked, and the open microphone went
+/// along into a room whose members it chose (dive 6 F7). No honest relay does that: it seats
+/// a session where the session asked (a join, a created channel, an accepted invite, a
+/// game's `hello`, each of which asks here) and a kick goes to the lobby.
+fn seat_wants_ask(channel_id: u32, current: u32, holds_voice: bool) -> bool {
+    channel_id != 0 && !(holds_voice && channel_id == current)
 }
 
 /// Send a client message over the control stream.
@@ -1071,6 +1253,13 @@ async fn guest_sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
                     if let Some(accounts) = accounts {
                         emit_server(app_handle, address, "relay-accounts", accounts);
                     }
+                    // What a guest keeps of the group key goes by the address it dialled: the
+                    // relay id a relay names to a guest is its own word
+                    signal
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .gk
+                        .set_scope((address.to_string(), None));
                     return Ok((user_id, session_id, files, emotes, may_share));
                 }
                 ServerMessage::AuthError { reason } => {
@@ -1295,10 +1484,12 @@ async fn control_reader_task<R: AsyncRead + Unpin>(
     channels_snapshot: Arc<std::sync::Mutex<Vec<ChannelInfo>>>,
     server: Arc<str>,
     is_voice: Arc<AtomicBool>,
-    voice_asked_at: Arc<AtomicU64>,
+    voice_asked_at: Arc<VoiceAsks>,
     transmitting: Arc<AtomicBool>,
     account: Option<Arc<crate::account::AccountLink>>,
     files: Arc<crate::files::Files>,
+    edge_cmd: mpsc::Sender<EdgeCmd>,
+    gk: crate::gk_net::GkLink,
 ) {
     let mut inbound = Inbound::new(std::time::Instant::now());
     // What waits for the pages of pins (`voipc_crypto::waits_for_pins`), in order
@@ -1330,7 +1521,15 @@ async fn control_reader_task<R: AsyncRead + Unpin>(
 
         loop {
             match try_decode_frame(&mut buf) {
-                Ok(Some(payload)) => match decode_server_msg_from(&payload, tcp_tx.proto()) {
+                Ok(Some(payload)) => match decode_server_msg_from(&payload, tcp_tx.proto())
+                    // The frame after `Authenticated` says whether this relay keys groups
+                    .inspect(|msg| {
+                        signal
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .gk
+                            .first_frame(msg)
+                    }) {
                     Ok(_) if !inbound.take(std::time::Instant::now()) => {
                         warn!("server sent more than the inbound budget; disconnecting");
                         emit_server(
@@ -1378,6 +1577,8 @@ async fn control_reader_task<R: AsyncRead + Unpin>(
                                 &voice_asked_at,
                                 &transmitting,
                                 account.as_deref(),
+                                &edge_cmd,
+                                &gk,
                             )
                             .await;
                             crate::account::check_seen(
@@ -1676,9 +1877,11 @@ async fn handle_server_message(
     channels_snapshot: &Arc<std::sync::Mutex<Vec<ChannelInfo>>>,
     server: &str,
     is_voice: &Arc<AtomicBool>,
-    voice_asked_at: &AtomicU64,
+    voice_asked_at: &VoiceAsks,
     transmitting: &Arc<AtomicBool>,
     account: Option<&crate::account::AccountLink>,
+    edge_cmd: &mpsc::Sender<EdgeCmd>,
+    gk: &crate::gk_net::GkLink,
 ) {
     // Everything a game hears about comes from the voice connection only: a
     // user id here means nothing on the server the game is playing on.
@@ -1689,6 +1892,8 @@ async fn handle_server_message(
     // anonymous channel adds nothing here.
     let seen: &[UserInfo] = match &msg {
         ServerMessage::UserList { users, .. } | ServerMessage::ChannelUsers { users, .. } => users,
+        // Since 25 the lobby comes in pages and lookups, not whole
+        ServerMessage::LobbyPage { rows, .. } | ServerMessage::Users { rows, .. } => rows,
         ServerMessage::UserJoined { user } | ServerMessage::UserUpdated { user } => {
             std::slice::from_ref(user)
         }
@@ -1698,6 +1903,7 @@ async fn handle_server_message(
         let a = link.session().note_roster(seen);
         crate::account::run(app_handle, server, tcp_tx, a).await;
     }
+    crate::gk_net::note_roster(gk, seen);
     // A bare id in `KeysOwed` goes by these, and a first sight is checked against the pins
     if live && !seen.is_empty() {
         let first = with_keys(signal, |stores, keying| keying.live_note_rows(stores, seen));
@@ -1842,6 +2048,7 @@ async fn handle_server_message(
                 is_voice,
             );
             emit_server(app_handle, server, "channel-list", &channels);
+            crate::gk_net::channels_changed(gk).await;
         }
         // A list too long for one frame. The front end hears it at its end, whole, so a reader
         // of `channel-list` needs to know of no frames.
@@ -1862,6 +2069,7 @@ async fn handle_server_message(
                     is_voice,
                 );
                 emit_server(app_handle, server, "channel-list", &whole);
+                crate::gk_net::channels_changed(gk).await;
             }
         }
         ServerMessage::UserList { channel_id, users } => {
@@ -1959,16 +2167,27 @@ async fn handle_server_message(
             // server had it and opens the microphone into this room — whose
             // members, and so whose media key, the server chooses. An honest
             // server only seats us where we asked (a join, a created channel,
-            // an accepted invite, a game's hello); one that already carries
-            // our voice may still move us between its own rooms.
-            if channel_id != 0
-                && !is_voice.load(Ordering::Relaxed)
-                && !take_voice_ask(voice_asked_at)
+            // an accepted invite, a game's hello), the one that carries our
+            // voice too (`seat_wants_ask`).
+            let holds_voice = is_voice.load(Ordering::Relaxed);
+            if seat_wants_ask(
+                channel_id,
+                channel_id_store.load(Ordering::Relaxed),
+                holds_voice,
+            ) && !take_voice_ask(voice_asked_at)
             {
                 warn!(
                     server,
                     channel_id, "server seated us in a voice channel we did not join; leaving it"
                 );
+                // The call it moved: the microphone closes here, not when the
+                // relay answers the leave below (dive 6 F7, as F10's leave), in
+                // the order a capture start takes its locks, so one already on
+                // its way is closed too (review F7-R2)
+                if holds_voice {
+                    leave_voice_now(&app_handle.state::<AppState>(), app_handle, server).await;
+                    leave_voice(app_handle, server, is_voice, transmitting).await;
+                }
                 let _ = send_tcp_message(
                     tcp_tx,
                     &ClientMessage::JoinChannel {
@@ -1989,8 +2208,9 @@ async fn handle_server_message(
             }
 
             // Update the Rust-side channel tracking so commands (PTT, chat, etc.)
-            // know which channel we're in. This handles server-initiated moves
-            // (create_channel auto-join, kicks, invites, etc.)
+            // know which channel we're in. This handles the moves the server
+            // makes for us: the ones we asked for above (create_channel
+            // auto-join, invites), and a kick to the lobby
             let old_ch = channel_id_store.swap(channel_id, Ordering::Relaxed);
             {
                 let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
@@ -2017,25 +2237,26 @@ async fn handle_server_message(
                     mk.clear();
                 }
                 // Reset sender key state for the new channel
-                {
+                let sources = {
                     let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
                     let SignalState {
                         stores, channels, ..
                     } = &mut *sig;
                     channels.reset_channel(stores.as_mut(), own_user_id, channel_id);
-                    // Ask the members who share, as each one's key arrives
+                    // Ask the members who share (`ask_room_history`)
                     let anonymous = channels_snapshot.lock().is_ok_and(|list| {
                         list.iter()
                             .any(|c| c.channel_id == channel_id && c.anonymous)
                     });
-                    let sources = if anonymous {
+                    if anonymous {
                         HashSet::new()
                     } else {
                         history_sources_of(&users, own_user_id)
-                    };
-                    sig.channels.want_history_from(channel_id, sources);
-                }
+                    }
+                };
+                ask_room_history(signal, tcp_tx, channel_id, sources).await;
                 info!(old_ch, channel_id, "channel changed via UserList");
+                crate::gk_net::room_changed(gk, old_ch, channel_id).await;
 
                 // Stop screen share and watching on channel change
                 if screen_share_active.swap(false, Ordering::Relaxed) {
@@ -2090,9 +2311,17 @@ async fn handle_server_message(
             // Auto-request prekey bundles for users we don't have sessions with.
             // This must happen for ALL channels (including Channel 0) because
             // pairwise sessions are needed for DMs and pokes, not just channel chat.
-            if asks_bundles(live, channel_id, channel_id) {
-                request_prekey_bundles_for_users(&users, own_user_id, signal, tcp_tx).await;
-            }
+            // (A text channel's list returned above.)
+            ask_listed_bundles(
+                channel_id,
+                false,
+                channel_id,
+                &users,
+                own_user_id,
+                signal,
+                tcp_tx,
+            )
+            .await;
 
             // Media keys never touch the server: one member of a channel
             // generates one; everyone else receives it from an existing member
@@ -2108,14 +2337,15 @@ async fn handle_server_message(
             // Ids only ever increase, so the lowest is the longest-present
             // member and a newcomer never mints over a key that already
             // exists; if two do mint at once, `MediaKeyRing::install` settles
-            // it the same way on every client.
+            // it the same way on every client. Under the group key nobody
+            // mints: the room's keys come from its epoch key (`install_gk`).
             let have_key = media_key
                 .lock()
                 .map(|g| g.has_channel(channel_id))
                 .unwrap_or(false);
             let we_mint = {
                 let sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
-                sig.channels.media_key_minter(channel_id) == Some(own_user_id)
+                sig.channels.media_key_minter(channel_id) == Some(own_user_id) && !sig.gk.on()
             };
             if channel_id != 0 && !have_key && we_mint {
                 match MediaKey::generate(channel_id, 0, own_user_id) {
@@ -2137,15 +2367,16 @@ async fn handle_server_message(
         ServerMessage::UserJoined { ref user } => {
             // Auto-request prekey bundle for new user (all channels, needed for DMs/pokes)
             let own_room = channel_id_store.load(Ordering::Relaxed);
-            if user.user_id != own_user_id && asks_bundles(live, user.channel_id, own_room) {
-                request_prekey_bundles_for_users(
-                    std::slice::from_ref(user),
-                    own_user_id,
-                    signal,
-                    tcp_tx,
-                )
-                .await;
-            }
+            ask_listed_bundles(
+                user.channel_id,
+                is_text_channel(channels_snapshot, user.channel_id),
+                own_room,
+                std::slice::from_ref(user),
+                own_user_id,
+                signal,
+                tcp_tx,
+            )
+            .await;
 
             // Somebody joined a channel we are in. Nobody else will tell them
             // our sender key: a text channel does not move us, so we get no
@@ -2216,6 +2447,7 @@ async fn handle_server_message(
                 // Out of the channel's log too: the relay took us out of it
                 // (1.0, D10), and a rejoin keeps it again
                 if user_id == own_user_id {
+                    crate::gk_net::untrack(gk, channel_id).await;
                     if let Some(link) = account {
                         let log = channels_snapshot
                             .lock()
@@ -2241,6 +2473,7 @@ async fn handle_server_message(
                 return;
             }
 
+            crate::gk_net::user_gone(gk, user_id);
             // Clean up E2E state for departing user
             let left_our_room;
             {
@@ -2345,6 +2578,9 @@ async fn handle_server_message(
             // computing a "RTT" from it yielded clock skew, not latency.
         }
         ServerMessage::ServerShutdown { reason } => {
+            // The UI shows the call gone at once: so does the capture, without waiting for
+            // the link to close or the reconnect's first step (dive 6 F4)
+            leave_voice(app_handle, server, is_voice, transmitting).await;
             emit_server(
                 app_handle,
                 server,
@@ -2382,6 +2618,7 @@ async fn handle_server_message(
                 } = &mut *sig;
                 channels.forget_channel(stores.as_mut(), own, channel_id);
             }
+            crate::gk_net::untrack(gk, channel_id).await;
             emit_server(
                 app_handle,
                 server,
@@ -2390,6 +2627,23 @@ async fn handle_server_message(
             );
         }
         ServerMessage::ChannelError { reason } => {
+            // A leave the relay refused (its join budget: the leave left voice here at
+            // once, dive 6 F10) still seats us in the room: asked again once the budget
+            // has a token (2 a second), until it is taken (review F10-R1)
+            if !is_voice.load(Ordering::Relaxed) && channel_id_store.load(Ordering::Relaxed) != 0 {
+                let tx = tcp_tx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                    let _ = send_tcp_message(
+                        &tx,
+                        &ClientMessage::JoinChannel {
+                            channel_id: 0,
+                            password: None,
+                        },
+                    )
+                    .await;
+                });
+            }
             emit_server(
                 app_handle,
                 server,
@@ -2417,6 +2671,7 @@ async fn handle_server_message(
                 is_voice,
             );
             emit_server(app_handle, server, "channel-updated", &channel);
+            crate::gk_net::channels_changed(gk).await;
         }
         ServerMessage::Kicked { channel_id, reason } => {
             emit_server(
@@ -2432,6 +2687,50 @@ async fn handle_server_message(
                 server,
                 "channel-users",
                 serde_json::json!({"channel_id": channel_id, "users": users}),
+            );
+        }
+        ServerMessage::ChannelCounts { counts } => {
+            emit_server(
+                app_handle,
+                server,
+                "channel-counts",
+                serde_json::json!({"counts": counts}),
+            );
+        }
+        ServerMessage::LobbyPage {
+            rows,
+            next,
+            total,
+            sections,
+            prefix,
+        } => {
+            emit_server(
+                app_handle,
+                server,
+                "lobby-page",
+                serde_json::json!({"rows": rows, "next": next, "total": total, "sections": sections, "prefix": prefix}),
+            );
+        }
+        ServerMessage::WatchRefused {
+            sharer_user_id,
+            reason,
+        } => {
+            emit_server(
+                app_handle,
+                server,
+                "watch-refused",
+                serde_json::json!({"sharer_user_id": sharer_user_id, "reason": reason}),
+            );
+        }
+        ServerMessage::AdminLoad { report } => {
+            emit_server(app_handle, server, "admin-load", serde_json::json!(report));
+        }
+        ServerMessage::Users { rows, gone } => {
+            emit_server(
+                app_handle,
+                server,
+                "users",
+                serde_json::json!({"rows": rows, "gone": gone}),
             );
         }
         ServerMessage::InviteReceived {
@@ -2473,6 +2772,7 @@ async fn handle_server_message(
             from_username,
             ciphertext,
             message_type,
+            account: from_account,
         } => {
             // Decrypt the poke message using Signal Protocol
             let message = {
@@ -2516,6 +2816,7 @@ async fn handle_server_message(
                 serde_json::json!({
                     "from_user_id": from_user_id,
                     "from_username": from_username,
+                    "from_account": from_account,
                     "message": message,
                 }),
             );
@@ -2533,6 +2834,7 @@ async fn handle_server_message(
                     serde_json::json!({
                         "from_user_id": from_user_id,
                         "from_username": from_username,
+                        "from_account": from_account,
                         "to_user_id": own_user_id,
                         "content": format!("[Poke] {}", message),
                         "timestamp": timestamp,
@@ -2572,17 +2874,30 @@ async fn handle_server_message(
             sharer_user_id,
             codec,
         } => {
+            // A watch starts over the session. When the relay puts us on an edge its
+            // `WatchAt` follows at once, a watch of the same share again included (it
+            // revoked the old ticket for a new one).
+            let _ = edge_cmd.send(EdgeCmd::Close).await;
             // Before the first fragment arrives: the decode task builds its
             // decoder from this and rebuilds it when the value changes.
             watching_codec.store(codec as u8, Ordering::Relaxed);
+            // A codec the WebView decodes goes to it from the first frame (view_queue.rs)
+            let gen = crate::view_queue::watch(codec);
             emit_server(
                 app_handle,
                 server,
                 "watching-screenshare",
-                serde_json::json!({"sharer_user_id": sharer_user_id, "codec": format!("{codec:?}")}),
+                serde_json::json!({
+                    "sharer_user_id": sharer_user_id,
+                    "codec": format!("{codec:?}"),
+                    "view": if gen.is_some() { "webview" } else { "native" },
+                    "gen": gen.unwrap_or(0),
+                }),
             );
         }
         ServerMessage::StoppedWatchingScreenShare { reason } => {
+            let _ = edge_cmd.send(EdgeCmd::Close).await;
+            crate::view_queue::native();
             emit_server(
                 app_handle,
                 server,
@@ -2760,10 +3075,12 @@ async fn handle_server_message(
             ciphertext,
             message_type,
             timestamp,
+            account: from_account,
         } => {
             handle_encrypted_direct_message(
                 from_user_id,
                 &from_username,
+                from_account,
                 to_user_id,
                 &ciphertext,
                 message_type,
@@ -2795,6 +3112,14 @@ async fn handle_server_message(
                 app_handle,
                 server,
             );
+        }
+        // Under the group key no key comes this way (`group_key_on`): taking one
+        // would reciprocate, flush queued chat on the old path and install a
+        // media key over the room's epoch keys, all of which the relay drops
+        ServerMessage::SenderKeyReceived { .. } | ServerMessage::MediaKeyReceived { .. }
+            if group_key_on(signal) =>
+        {
+            debug!("a key on the old path under the group key, ignored");
         }
         // ── E2E: Sender key received → decrypt pairwise, process, reciprocate ──
         ServerMessage::SenderKeyReceived {
@@ -2887,6 +3212,15 @@ async fn handle_server_message(
                 channels_snapshot,
             )
             .await;
+            match &msg {
+                ServerMessage::TextJoined { joined, refused } => {
+                    crate::gk_net::text_joined(gk, joined, refused).await
+                }
+                ServerMessage::Evicted { channel_id, .. } => {
+                    crate::gk_net::untrack(gk, *channel_id).await
+                }
+                _ => {}
+            }
         }
         ServerMessage::AdminBansPaged {
             search,
@@ -2945,7 +3279,7 @@ async fn handle_server_message(
         }
         ServerMessage::Account(reply) => match account {
             Some(link) => {
-                crate::account::on_reply(app_handle, server, link, tcp_tx, reply).await;
+                crate::account::on_reply(gk, link, reply).await;
                 // The pages of pins came in: the key jobs that waited for them
                 if link.session().take_pins_in() {
                     let own_channel = channel_id_store.load(Ordering::Relaxed);
@@ -2975,6 +3309,51 @@ async fn handle_server_message(
         | ServerMessage::EmoteList { .. }
         | ServerMessage::EmoteTicket { .. }
         | ServerMessage::EmoteError { .. } => {}
+        // The group key (protocol 26): `gk_net` takes it
+        ServerMessage::GroupKeys { on, run, clock } => {
+            crate::gk_net::group_keys(gk, on, run, clock).await;
+        }
+        ServerMessage::EpochIn { .. }
+        | ServerMessage::EpochWait { .. }
+        | ServerMessage::EpochDue { .. }
+        | ServerMessage::EpochStale { .. }
+        | ServerMessage::EpochLists { .. }
+        | ServerMessage::KeyringIn { .. }
+        | ServerMessage::EpochExit { .. }
+        | ServerMessage::EpochPostIn { .. }
+        | ServerMessage::EpochBlob { .. }
+        | ServerMessage::EpochNamesIn { .. }
+        | ServerMessage::EpochRefused { .. }
+        | ServerMessage::VoiceSeats { .. }
+        | ServerMessage::EpochReseated { .. }
+        | ServerMessage::EpochPostTaken { .. } => crate::gk_net::frame(gk, &msg).await,
+        ServerMessage::WatchAt {
+            sharer_user_id,
+            placement,
+            edge,
+        } => {
+            // Only for the share we watch: an edge is dialled for nothing else
+            if watching_user_id_shared.load(Ordering::Relaxed) != sharer_user_id {
+                debug!(sharer_user_id, "WatchAt for a share not watched, ignoring");
+            } else {
+                let cmd = match edge {
+                    Some(view) => EdgeCmd::Open {
+                        sharer: sharer_user_id,
+                        placement,
+                        view,
+                    },
+                    None => EdgeCmd::Close,
+                };
+                let _ = edge_cmd.send(cmd).await;
+            }
+        }
+        ServerMessage::VideoLossSummary { reporters, viewers } => {
+            // In place of each viewer's report past 8 viewers: the same majority, counted
+            // by the relay
+            if loss_summary_steps_down(reporters, viewers, share_loss_ms, screenshare::epoch_ms()) {
+                info!(reporters, viewers, "most viewers report frame loss");
+            }
+        }
     }
 }
 
@@ -3262,6 +3641,132 @@ fn asks_bundles(live: bool, channel: u32, own_room: u32) -> bool {
     !live || (channel == own_room && own_room != 0)
 }
 
+/// Asks the bundles of `users`, listed in `channel` (`text`: a text channel), that
+/// `asks_bundles` says, except in a voice room under the group key: its keys come from its
+/// epoch key, one welcome in all (spec §5.9), and no key goes over a session there
+/// (`group_key_on`). The N asks and N session set-ups a join cost on the old path would only
+/// queue ahead of the keyholder's frames, which have deadlines. DMs and pokes open their
+/// sessions when there is something to say, and the room's history hand-off opens its few
+/// with the ask (`ask_history`). The browser's `roomAsksBundles`.
+async fn ask_listed_bundles(
+    channel: u32,
+    text: bool,
+    own_room: u32,
+    users: &[UserInfo],
+    own_user_id: u32,
+    signal: &Arc<std::sync::Mutex<SignalState>>,
+    tcp_tx: &ControlTx,
+) {
+    let live = tcp_tx.proto() >= LIVE_PATH_SINCE;
+    if asks_bundles(live, channel, own_room) && (text || !group_key_on(signal)) {
+        request_prekey_bundles_for_users(users, own_user_id, signal, tcp_tx).await;
+    }
+}
+
+/// Whether a history ask for a channel goes sealed, as a direct message (plan 2k: the
+/// history hand-off, DM path), where the new-member wait lets it: on the live path, in a text
+/// channel, and in a voice room under the group key (`gk_on`), where no sender key comes for
+/// the old ask to wait on and no bundle was asked at the join. Elsewhere plain frames ask.
+/// The browser's `historyAskSealed`.
+fn history_goes_sealed(live: bool, text: bool, gk_on: bool) -> bool {
+    live && (text || gk_on)
+}
+
+/// Asks a few of `targets` for `channel_id`'s recent chat (`text`: a text channel). Who was
+/// asked; none: nobody there can share it yet. Sealed where it can be (`history_goes_sealed`):
+/// the relay sees "R wrote to S", not for which channel, and it goes when a session both ends
+/// hold is up, opened for it if need be (`live_ask_history`, then the live task). Under the
+/// new-member wait a direct message is refused, so there, as on the old path, plain frames ask
+/// whoever already has a session. A pairwise session is all an answer needs: history travels
+/// over that, not over the channel's group key, and asking for the group key here would block
+/// the one repair a member has when keying went wrong. The manual resync
+/// (`request_channel_history`) and a group-key voice room's entry (`ask_room_history`) both
+/// ask here.
+pub(crate) async fn ask_history(
+    signal: &std::sync::Mutex<SignalState>,
+    tcp_tx: &ControlTx,
+    channel_id: u32,
+    targets: &[u32],
+    text: bool,
+) -> Result<Vec<u32>, String> {
+    let live = tcp_tx.proto() >= LIVE_PATH_SINCE;
+    let now = voipc_crypto::time::now_millis();
+    let plain: Vec<u32> = {
+        let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
+        if history_goes_sealed(live, text, sig.gk.on()) && !sig.direct_held {
+            let asked = sig.channels.live_ask_history(channel_id, targets, now);
+            if !asked.is_empty() {
+                sig.live_wake.notify_one();
+            }
+            return Ok(asked);
+        }
+        let reachable: Vec<u32> = targets
+            .iter()
+            .copied()
+            .filter(|uid| sig.established_sessions.contains(uid))
+            .collect();
+        let picked: Vec<u32> = voipc_crypto::pick_history_sources(&reachable)
+            .into_iter()
+            .collect();
+        // No roster says who is in a text channel on the live path: its answer is taken only
+        // from who was asked
+        if live && text {
+            for target in &picked {
+                sig.channels.live_note_asked(channel_id, *target, now);
+            }
+        }
+        picked
+    };
+    for target_user_id in &plain {
+        send_tcp_message(
+            tcp_tx,
+            &ClientMessage::RequestChannelHistory {
+                channel_id,
+                target_user_id: *target_user_id,
+            },
+        )
+        .await?;
+    }
+    Ok(plain)
+}
+
+/// The history ask of a voice room just entered, `sources` the sharers we mean to ask (none
+/// in an anonymous room). The old path asks each one once its sender key arrives
+/// (`take_history_wanted`). Under the group key none arrives, so the ask goes now, sealed
+/// (`ask_history`), as the browser's does. Never in channel 0, as before.
+async fn ask_room_history(
+    signal: &std::sync::Mutex<SignalState>,
+    tcp_tx: &ControlTx,
+    channel_id: u32,
+    sources: HashSet<u32>,
+) {
+    let targets: Vec<u32> = {
+        let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
+        if channel_id == 0 || !sig.gk.on() {
+            sig.channels.want_history_from(channel_id, sources);
+            return;
+        }
+        sources.into_iter().collect()
+    };
+    match ask_history(signal, tcp_tx, channel_id, &targets, false).await {
+        Ok(asked) => debug!(channel_id, ?asked, "asked for the room's recent chat"),
+        Err(e) => debug!(channel_id, "could not ask for the room's recent chat: {e}"),
+    }
+}
+
+/// Whether this connection's rooms take their media keys from the group key (`GroupKeys
+/// {on: true}`, plan part 5). Then none of the old key path runs here: no media key is
+/// minted, rotated, handed over or taken, no sender key goes to a room's members or is taken
+/// from one, and the relay drops those in its voice rooms anyway. With no `GroupKeys`, or
+/// `on: false`, the old path runs as it always did.
+fn group_key_on(signal: &std::sync::Mutex<SignalState>) -> bool {
+    signal
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .gk
+        .on()
+}
+
 /// Request prekey bundles for users we don't yet have sessions with.
 async fn request_prekey_bundles_for_users(
     users: &[UserInfo],
@@ -3385,7 +3890,8 @@ async fn handle_prekey_bundle(
 
 /// Create our sender key distribution message for a channel, encrypt it pairwise,
 /// and send it to a specific user. On success also hands them the channel's
-/// media key (if we hold one) over the same pairwise session.
+/// media key (if we hold one) over the same pairwise session. Never under the
+/// group key (`group_key_on`).
 async fn distribute_sender_key_to_user(
     channel_id: u32,
     target_user_id: u32,
@@ -3394,6 +3900,9 @@ async fn distribute_sender_key_to_user(
     media_key: &Arc<std::sync::Mutex<MediaKeyRing>>,
     tcp_tx: &ControlTx,
 ) {
+    if group_key_on(signal) {
+        return;
+    }
     if send_sender_key(channel_id, target_user_id, own_user_id, signal, tcp_tx).await {
         distribute_media_key_to_user(channel_id, target_user_id, signal, media_key, tcp_tx).await;
     }
@@ -3534,7 +4043,8 @@ async fn rotate_media_key_if_minter(
 ) {
     let remaining: Vec<u32> = {
         let sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
-        if sig.channels.media_key_minter(channel_id) != Some(own_user_id) {
+        // Under the group key the leave's opening commit re-keys the room
+        if sig.channels.media_key_minter(channel_id) != Some(own_user_id) || sig.gk.on() {
             return;
         }
         sig.channels.others_in(channel_id, own_user_id)
@@ -4035,6 +4545,15 @@ async fn drain_pending_channel_messages(
             .map_err(|e| format!("group encrypt: {e}"));
 
         match result {
+            // Past what the relay takes: it would refuse it naming no message, so its row,
+            // shown as pending, is marked not sent here (the browser's `sendChannelCiphertext`)
+            Ok(ciphertext)
+                if ciphertext.len() > voipc_crypto::group_state::EarlyPost::MAX_SEALED =>
+            {
+                warn!(channel_id, "queued channel msg too large, not sent");
+                let said = crate::gk_net::not_sent_said(channel_id, Some(id));
+                emit_server(app_handle, server, "channel-not-sent", said);
+            }
             Ok(ciphertext) => {
                 let msg = ClientMessage::SendEncryptedChannelMessage {
                     channel_id,
@@ -4060,6 +4579,7 @@ async fn drain_pending_channel_messages(
 fn handle_encrypted_direct_message(
     from_user_id: u32,
     from_username: &str,
+    from_account: Option<[u8; 16]>,
     to_user_id: u32,
     ciphertext: &[u8],
     message_type: u8,
@@ -4131,6 +4651,7 @@ fn handle_encrypted_direct_message(
                 serde_json::json!({
                     "from_user_id": from_user_id,
                     "from_username": from_username,
+                    "from_account": from_account,
                     "to_user_id": to_user_id,
                     "content": msg.text,
                     "timestamp": timestamp,
@@ -4161,6 +4682,7 @@ fn handle_encrypted_direct_message(
                 serde_json::json!({
                     "from_user_id": from_user_id,
                     "from_username": from_username,
+                    "from_account": from_account,
                     "to_user_id": to_user_id,
                     "content": "[encrypted message — decryption failed]",
                     "timestamp": timestamp,
@@ -5208,6 +5730,22 @@ fn majority_reached(reporters: usize, viewers: u32) -> bool {
     reporters as u32 >= viewers.div_ceil(2).max(1)
 }
 
+/// A relay's loss summary for our share (`VideoLossSummary`, past 8 viewers, at most once
+/// a second): how many of its `viewers` reported loss lately. A majority steps the share
+/// down, as a majority of single reports does below that. Whether it did.
+fn loss_summary_steps_down(
+    reporters: u32,
+    viewers: u32,
+    share_loss_ms: &AtomicU64,
+    now: u64,
+) -> bool {
+    let due = majority_reached(reporters as usize, viewers);
+    if due {
+        share_loss_ms.store(now, Ordering::Relaxed);
+    }
+    due
+}
+
 /// One second of this connection's QUIC path statistics.
 #[derive(Clone, Copy, Default)]
 struct PathSample {
@@ -5300,15 +5838,39 @@ async fn latency_task(voice_tx: mpsc::Sender<Vec<u8>>, session_id: u32) {
     }
 }
 
+/// A received media packet opened under the key it names, as every receive site opens one:
+/// in a room under the group key its sender's own, derived from the seat the roster gives
+/// `sid` and the packet's stream (`MediaKeyRing::get_for`, plan part 5); otherwise the room's
+/// key of that generation. `None`: no such key is held.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn open_media(
+    ring: &mut MediaKeyRing,
+    channel_id: u32,
+    packet_type: u8,
+    sid: u32,
+    stream: u32,
+    key_id: u16,
+    (sequence, extra): (u32, u32),
+    ciphertext: &[u8],
+) -> Option<anyhow::Result<Vec<u8>>> {
+    let key = ring.get_for(channel_id, sid, stream, key_id)?;
+    let aad = voipc_crypto::build_aad(channel_id, packet_type, sid);
+    Some(voipc_crypto::media_decrypt(
+        key, stream, sequence, extra, &aad, ciphertext,
+    ))
+}
+
 /// Server → client datagrams: voice (0x05), end-of-transmission (0x02) and
 /// screen-share audio (0x15), decrypted and fed to the mixer's per-source
 /// jitter buffers; also drives the speaking indicator, and turns the pong to
 /// our keepalive ping (0x04) into the latency display. Video arrives on its
 /// own (`video_stream_receiver_task`). `tunnel`: the link is the TCP fallback,
-/// which the latency display says.
+/// which the latency display says. `edge`: the watched share's screen audio when it
+/// comes from a media edge, which goes the same way as the relay's.
 #[allow(clippy::too_many_arguments)]
 async fn datagram_receiver_task(
     mut input: DatagramIn,
+    mut edge: edge_view::EdgeIn<bytes::Bytes>,
     tunnel: bool,
     app_handle: tauri::AppHandle,
     sources: MixSources,
@@ -5331,7 +5893,8 @@ async fn datagram_receiver_task(
 
     loop {
         tokio::select! {
-            received = input.recv() => {
+            // Cancel-safe, so the speaking sweep may win the race (edge_view::merged)
+            received = edge_view::merged(input.recv(), &mut edge) => {
                 let Some(datagram) = received else {
                     break;
                 };
@@ -5369,32 +5932,28 @@ async fn datagram_receiver_task(
                         let stream_id =
                             u32::from_be_bytes([buf[11], buf[12], buf[13], buf[14]]);
 
-                        let opus_data: Vec<u8> = {
-                            let raw_encrypted = &buf[header_size..n];
-                            let ch_id = channel_id.load(Ordering::Relaxed);
-                            let key_guard = media_key.lock().unwrap_or_else(PoisonError::into_inner);
-                            if let Some(key) = key_guard.get(ch_id, key_id) {
-                                let aad = voipc_crypto::build_aad(ch_id, 0x05, session_id);
-                                match voipc_crypto::media_decrypt(
-                                    key,
-                                    stream_id,
-                                    sequence,
-                                    0,
-                                    &aad,
-                                    raw_encrypted,
-                                ) {
-                                    Ok(decrypted) => decrypted,
-                                    Err(e) => {
-                                        if log_due(&mut decrypt_log) {
-                                            warn!(
-                                                "Voice decryption failed from session {}: {}",
-                                                session_id, e
-                                            );
-                                        }
-                                        continue;
-                                    }
+                        let opened = open_media(
+                            &mut media_key.lock().unwrap_or_else(PoisonError::into_inner),
+                            channel_id.load(Ordering::Relaxed),
+                            0x05,
+                            session_id,
+                            stream_id,
+                            key_id,
+                            (sequence, 0),
+                            &buf[header_size..n],
+                        );
+                        let opus_data: Vec<u8> = match opened {
+                            Some(Ok(decrypted)) => decrypted,
+                            Some(Err(e)) => {
+                                if log_due(&mut decrypt_log) {
+                                    warn!(
+                                        "Voice decryption failed from session {}: {}",
+                                        session_id, e
+                                    );
                                 }
-                            } else {
+                                continue;
+                            }
+                            None => {
                                 if log_due(&mut key_log) {
                                     warn!("Received encrypted voice but no media key available");
                                 }
@@ -5476,31 +6035,25 @@ async fn datagram_receiver_task(
                         let stream_id =
                             u32::from_be_bytes([buf[11], buf[12], buf[13], buf[14]]);
 
-                        let plaintext = {
-                            let ch_id = channel_id.load(Ordering::Relaxed);
-                            let key_guard = media_key.lock().unwrap_or_else(PoisonError::into_inner);
-                            let Some(key) = key_guard.get(ch_id, key_id) else { continue };
-                            let aad = voipc_crypto::build_aad(
-                                ch_id,
-                                VoicePacketType::Position as u8,
-                                session_id,
-                            );
-                            match voipc_crypto::media_decrypt(
-                                key,
-                                stream_id,
-                                sequence,
-                                0,
-                                &aad,
-                                &buf[header_size..n],
-                            ) {
-                                Ok(decrypted) => decrypted,
-                                Err(e) => {
-                                    if log_due(&mut decrypt_log) {
-                                        warn!("position decryption failed from session {session_id}: {e}");
-                                    }
-                                    continue;
+                        let opened = open_media(
+                            &mut media_key.lock().unwrap_or_else(PoisonError::into_inner),
+                            channel_id.load(Ordering::Relaxed),
+                            VoicePacketType::Position as u8,
+                            session_id,
+                            stream_id,
+                            key_id,
+                            (sequence, 0),
+                            &buf[header_size..n],
+                        );
+                        let plaintext = match opened {
+                            Some(Ok(decrypted)) => decrypted,
+                            Some(Err(e)) => {
+                                if log_due(&mut decrypt_log) {
+                                    warn!("position decryption failed from session {session_id}: {e}");
                                 }
+                                continue;
                             }
+                            None => continue,
                         };
                         let Ok(payload) = PositionPayload::from_bytes(&plaintext) else {
                             continue;
@@ -5579,35 +6132,33 @@ async fn datagram_receiver_task(
                         };
 
                         // Decrypt encrypted screen audio
-                        let opus_data = if packet.encrypted {
-                            let key_guard = media_key.lock().unwrap_or_else(PoisonError::into_inner);
-                            let ch_id = channel_id.load(Ordering::Relaxed);
-                            if let Some(key) = key_guard.get(ch_id, packet.key_id) {
-                                let aad = voipc_crypto::build_aad(ch_id, 0x15, packet.session_id);
-                                match voipc_crypto::media_decrypt(
-                                    key,
-                                    packet.stream_id,
-                                    packet.sequence,
-                                    0,
-                                    &aad,
-                                    &packet.opus_data,
-                                ) {
-                                    Ok(decrypted) => decrypted,
-                                    Err(e) => {
-                                        if log_due(&mut decrypt_log) {
-                                            warn!("Screen audio decryption failed: {}", e);
-                                        }
-                                        continue;
-                                    }
+                        if !packet.encrypted {
+                            continue;
+                        }
+                        let opened = open_media(
+                            &mut media_key.lock().unwrap_or_else(PoisonError::into_inner),
+                            channel_id.load(Ordering::Relaxed),
+                            0x15,
+                            packet.session_id,
+                            packet.stream_id,
+                            packet.key_id,
+                            (packet.sequence, 0),
+                            &packet.opus_data,
+                        );
+                        let opus_data = match opened {
+                            Some(Ok(decrypted)) => decrypted,
+                            Some(Err(e)) => {
+                                if log_due(&mut decrypt_log) {
+                                    warn!("Screen audio decryption failed: {}", e);
                                 }
-                            } else {
+                                continue;
+                            }
+                            None => {
                                 if log_due(&mut key_log) {
                                     warn!("Received encrypted screen audio but no media key");
                                 }
                                 continue;
                             }
-                        } else {
-                            continue;
                         };
 
                         // Feed the mixer like a voice stream (flagged key) —
@@ -5692,9 +6243,16 @@ const LOSS_REPORT_WINDOW: std::time::Duration = std::time::Duration::from_secs(2
 /// Decrypts, reassembles, hands complete frames to the decode task, requests a
 /// keyframe on loss and keeps asking while there is nothing clean to show, and
 /// reports the loss to the sharer every 2 s so it can lower its bitrate/fps.
+///
+/// `edge`: the watched share's records when they come from a media edge, put through
+/// the same assembler. Each whole frame of the watched share stamps
+/// `last_good_frame_ms`, the edge task's watchdog: every fragment of it decrypted, so
+/// an edge that forwards garbage or partial frames never stamps it.
 #[allow(clippy::too_many_arguments)]
 async fn video_stream_receiver_task(
     mut input: VideoIn,
+    mut edge: edge_view::EdgeIn<Vec<Vec<u8>>>,
+    last_good_frame_ms: Arc<AtomicU64>,
     video_decode_tx: mpsc::Sender<(Vec<u8>, bool, bool)>,
     media_key: Arc<std::sync::Mutex<MediaKeyRing>>,
     channel_id: Arc<AtomicU32>,
@@ -5715,6 +6273,8 @@ async fn video_stream_receiver_task(
     let mut window_dropped: u32 = 0;
     let mut window_received: u32 = 0;
     let mut budget = FrameBudget::new(std::time::Instant::now());
+    // The frame being put together and when its first fragment came (`share view:`)
+    let mut first_fragment: Option<(u32, std::time::Instant)> = None;
     // At most once a second, which is also all the server relays: a request
     // that went unanswered (rate-limited, or its keyframe lost) is made again.
     let request_keyframe = |last: &mut std::time::Instant| {
@@ -5731,7 +6291,7 @@ async fn video_stream_receiver_task(
         *last = std::time::Instant::now();
     };
 
-    while let Some(records) = input.next().await {
+    while let Some(records) = edge_view::merged(input.next(), &mut edge).await {
         for packet_bytes in records {
             let n = packet_bytes.len();
             if n < VIDEO_HEADER_SIZE {
@@ -5749,28 +6309,25 @@ async fn video_stream_receiver_task(
             screen_video_bytes_received.fetch_add(n as u64, Ordering::Relaxed);
 
             // Decrypt (plaintext video is never relayed)
-            {
-                let key_guard = media_key.lock().unwrap_or_else(PoisonError::into_inner);
-                let ch_id = channel_id.load(Ordering::Relaxed);
-                if let Some(key) = key_guard.get(ch_id, packet.key_id) {
-                    let aad = voipc_crypto::build_aad(ch_id, packet_type, packet.session_id);
-                    match voipc_crypto::media_decrypt(
-                        key,
-                        packet.stream_id,
-                        packet.frame_id,
-                        packet.fragment_index as u32,
-                        &aad,
-                        &packet.payload,
-                    ) {
-                        Ok(decrypted) => packet.payload = decrypted,
-                        Err(e) => {
-                            if log_due(&mut decrypt_log) {
-                                warn!("Video decryption failed: {}", e);
-                            }
-                            continue;
-                        }
+            let opened = open_media(
+                &mut media_key.lock().unwrap_or_else(PoisonError::into_inner),
+                channel_id.load(Ordering::Relaxed),
+                packet_type,
+                packet.session_id,
+                packet.stream_id,
+                packet.key_id,
+                (packet.frame_id, packet.fragment_index as u32),
+                &packet.payload,
+            );
+            match opened {
+                Some(Ok(decrypted)) => packet.payload = decrypted,
+                Some(Err(e)) => {
+                    if log_due(&mut decrypt_log) {
+                        warn!("Video decryption failed: {}", e);
                     }
-                } else {
+                    continue;
+                }
+                None => {
                     if log_due(&mut key_log) {
                         warn!("Received encrypted video but no media key");
                     }
@@ -5785,6 +6342,9 @@ async fn video_stream_receiver_task(
                 current_video_session = Some(packet.session_id);
             }
 
+            if first_fragment.is_none_or(|(id, _)| id != packet.frame_id) {
+                first_fragment = Some((packet.frame_id, std::time::Instant::now()));
+            }
             let result = video_assembler.add_fragment(&packet);
 
             // A frame was lost: the next one handed on carries the gap, and
@@ -5797,8 +6357,14 @@ async fn video_stream_receiver_task(
             }
 
             if let Some((frame_data, is_keyframe)) = result.frame {
+                if packet.session_id == watching_user_id.load(Ordering::Relaxed) {
+                    last_good_frame_ms.store(edge_view::now_ms(), Ordering::Relaxed);
+                }
                 screen_video_frames_received.fetch_add(1, Ordering::Relaxed);
                 window_received += 1;
+                if let Some((_, at)) = first_fragment.take() {
+                    crate::view_timing::assembled(at.elapsed());
+                }
                 // Past what any share sends: lost like on the wire (S-045)
                 if !budget.take(std::time::Instant::now()) {
                     gap = true;
@@ -5810,16 +6376,29 @@ async fn video_stream_receiver_task(
                     request_keyframe(&mut last_keyframe_request);
                     continue;
                 }
-                // Send to decode task — drop if full to avoid stalling voice.
-                // Lost here is lost like on the wire.
-                match video_decode_tx.try_send((frame_data, is_keyframe, gap)) {
-                    Ok(()) => gap = false,
-                    Err(_) => {
+                // To the WebView when it decodes this share, else to the decode task
+                match crate::view_queue::push(frame_data, is_keyframe, gap) {
+                    crate::view_queue::Pushed::Queued => gap = false,
+                    crate::view_queue::Pushed::TooLarge => {
                         gap = true;
                         screen_video_frames_dropped.fetch_add(1, Ordering::Relaxed);
-                        window_dropped += 1;
-                        warn!("video decode channel full — dropping assembled frame");
-                        request_keyframe(&mut last_keyframe_request);
+                        if log_due(&mut budget_log) {
+                            warn!("a share keyframe is larger than any viewer shows — dropped");
+                        }
+                    }
+                    // Send to decode task — drop if full to avoid stalling voice.
+                    // Lost here is lost like on the wire.
+                    crate::view_queue::Pushed::Native(frame_data) => {
+                        match video_decode_tx.try_send((frame_data, is_keyframe, gap)) {
+                            Ok(()) => gap = false,
+                            Err(_) => {
+                                gap = true;
+                                screen_video_frames_dropped.fetch_add(1, Ordering::Relaxed);
+                                window_dropped += 1;
+                                warn!("video decode channel full — dropping assembled frame");
+                                request_keyframe(&mut last_keyframe_request);
+                            }
+                        }
                     }
                 }
             }
@@ -5827,7 +6406,14 @@ async fn video_stream_receiver_task(
             // Keep asking while there is nothing clean to show: the server
             // rate-limits keyframe relays, so the one a join or a loss
             // triggered may never have come.
-            if needs_keyframe.load(Ordering::Acquire) || !video_assembler.has_keyframe() {
+            // (A WebView that decodes the share says so in its pulls; the decode task's flag
+            // is not its.)
+            let wants = if crate::view_queue::active() {
+                crate::view_queue::wants_key()
+            } else {
+                needs_keyframe.load(Ordering::Acquire)
+            };
+            if wants || !video_assembler.has_keyframe() {
                 request_keyframe(&mut last_keyframe_request);
             }
         }
@@ -5979,7 +6565,13 @@ fn video_decode_render_task(
         let mut batch = 0;
         while let Some((frame_data, is_keyframe, gap_before)) = next {
             batch += 1;
+            let started = std::time::Instant::now();
             let decoded = dec.decode(&frame_data);
+            #[cfg(target_os = "android")]
+            let copy = Some(dec.take_copy_time());
+            #[cfg(not(target_os = "android"))]
+            let copy = None;
+            crate::view_timing::decoded(started.elapsed(), copy);
             if let Err(e) = &decoded {
                 warn!("{want_codec:?} decode error: {}", e);
             }
@@ -6040,6 +6632,37 @@ pub(crate) fn mic_error_text(raw: &str) -> String {
     } else {
         format!("The system is blocking the microphone: {raw}")
     }
+}
+
+/// Whether a capture said `media-key-missing` and no frame has had a key since. Process-wide,
+/// as the warning is (one toast): a push-to-talk press that said it can end before the key
+/// comes, and the next press with a key takes it back. The keys' arrival says it too: the
+/// handover's on the old path, `gk_net::install_voice` under the group key; a second one is a
+/// no-op.
+static KEY_WAIT_SAID: AtomicBool = AtomicBool::new(false);
+
+/// Whether this frame has news for the UI about the room's key: without one, that frames have
+/// waited 2 s for it (`media-key-missing`, once a wait); with one, that the wait is over
+/// (`media-key-installed`), once a capture said it, this one or an earlier one (`said`).
+fn key_news(
+    have_key: bool,
+    since: &mut Option<std::time::Instant>,
+    emitted: &mut bool,
+    said: &AtomicBool,
+    now: std::time::Instant,
+) -> bool {
+    if have_key {
+        *since = None;
+        *emitted = false;
+        return said.load(Ordering::Relaxed) && said.swap(false, Ordering::Relaxed);
+    }
+    let since = *since.get_or_insert(now);
+    if *emitted || now.duration_since(since) <= std::time::Duration::from_secs(2) {
+        return false;
+    }
+    *emitted = true;
+    said.store(true, Ordering::Relaxed);
+    true
 }
 
 /// Capture+encode task: reads from mic, encodes to Opus, encrypts with
@@ -6149,6 +6772,17 @@ pub fn spawn_capture_encode_task(
             if capture_error.swap(false, Ordering::Relaxed) && !stream_dead {
                 stream_dead = true;
                 warn!("capture device error — attempting recovery");
+                // The reopen keeps to the chosen device, so this can last until
+                // it is plugged back in (dive 6 F8): the phrase ends now, for
+                // the room and for a mod, as a release ends it
+                if std::mem::take(&mut was_on_air) {
+                    let eot = VoicePacket::end_of_transmission(session_id, 0);
+                    let _ = voice_tx.blocking_send(eot.to_bytes());
+                    app_handle.state::<AppState>().sdk_event(SdkEvent::Talk {
+                        user_id: session_id,
+                        speaking: false,
+                    });
+                }
             }
             if stream_dead {
                 if last_rebuild.elapsed() >= std::time::Duration::from_secs(1) {
@@ -6302,10 +6936,23 @@ pub fn spawn_capture_encode_task(
                     let packet = {
                         let key_guard = media_key.lock().unwrap_or_else(PoisonError::into_inner);
                         let stream_id = key_guard.stream_id();
+                        let news = key_news(
+                            key_guard.current().is_some(),
+                            &mut key_missing_since,
+                            &mut key_missing_emitted,
+                            &KEY_WAIT_SAID,
+                            std::time::Instant::now(),
+                        );
                         if let Some(key) = key_guard.current() {
-                            key_missing_since = None;
-                            key_missing_emitted = false;
                             let ch_id = channel_id.load(Ordering::Relaxed);
+                            if news {
+                                emit_server(
+                                    &app_handle,
+                                    &server,
+                                    "media-key-installed",
+                                    serde_json::json!({"channel_id": ch_id, "key_id": key.key_id}),
+                                );
+                            }
                             let aad = voipc_crypto::build_aad(ch_id, 0x05, session_id);
                             match voipc_crypto::media_encrypt(
                                 key, stream_id, sequence, 0, &aad, &opus_data,
@@ -6327,12 +6974,7 @@ pub fn spawn_capture_encode_task(
                             // the channel's media key (channel switch, or the
                             // member holding it is still establishing our
                             // Signal session); warn the UI once if it drags on.
-                            let since =
-                                *key_missing_since.get_or_insert_with(std::time::Instant::now);
-                            if !key_missing_emitted
-                                && since.elapsed() > std::time::Duration::from_secs(2)
-                            {
-                                key_missing_emitted = true;
+                            if news {
                                 warn!("no media key for 2s — voice frames are being dropped");
                                 emit_server(&app_handle, &server, "media-key-missing", ());
                             }
@@ -6366,7 +7008,7 @@ pub fn spawn_capture_encode_task(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// S-045: a share's 60 fps (with its bursts) always passes; a flood of
@@ -6380,6 +7022,331 @@ mod tests {
         // An older relay's apps expect the whole mesh
         assert!(asks_bundles(false, 0, 0));
         assert!(asks_bundles(false, 7, 5));
+    }
+
+    /// A member as the relay lists one.
+    fn listed(user_id: u32, channel_id: u32, shares_history: bool) -> UserInfo {
+        UserInfo {
+            user_id,
+            username: format!("u{user_id}"),
+            channel_id,
+            is_muted: false,
+            is_deafened: false,
+            is_screen_sharing: false,
+            is_admin: false,
+            shares_history,
+            account: None,
+            is_moderator: false,
+            badges: vec![],
+        }
+    }
+
+    /// The frames after `Authenticated` the old-path gates read: no `GroupKeys` (a relay below
+    /// 26), the switch off, the switch on.
+    fn first_frames() -> [ServerMessage; 3] {
+        let keys = |on| ServerMessage::GroupKeys {
+            on,
+            run: [7; 16],
+            clock: 0,
+        };
+        [
+            ServerMessage::ChannelList { channels: vec![] },
+            keys(false),
+            keys(true),
+        ]
+    }
+
+    /// A member's own stores, with their pre-keys, to open a session with them and read what
+    /// reaches them over it.
+    fn peer_stores(user_id: u32) -> voipc_crypto::SignalStores {
+        let ik = voipc_crypto::generate_identity_key_pair();
+        let mut stores = voipc_crypto::SignalStores::new(&ik, 1000 + user_id);
+        stores.own_user_id = user_id;
+        voipc_crypto::prekey::generate_prekeys(&mut stores, &ik).unwrap();
+        stores
+    }
+
+    /// The live task's frames over `secs` seconds from `from`: each second, as many as it
+    /// sends before it has none (`live_task`).
+    fn live_frames(
+        signal: &std::sync::Mutex<SignalState>,
+        from: u64,
+        secs: u64,
+    ) -> Vec<ClientMessage> {
+        let mut out = Vec::new();
+        for s in 0..secs {
+            for _ in 0..8 {
+                let frame = with_keys(signal, |stores, keying| {
+                    keying.live_next_frame(
+                        stores,
+                        from + s * 1000,
+                        true,
+                        voipc_crypto::channel_state::WRAPS_A_FRAME,
+                    )
+                })
+                .flatten();
+                let Some(frame) = frame else { break };
+                out.push(frame);
+            }
+        }
+        out
+    }
+
+    /// What a direct message from member 1 reads as to the member it went to.
+    async fn read_as(peer: &mut voipc_crypto::SignalStores, dm: &ClientMessage) -> Vec<u8> {
+        let ClientMessage::SendEncryptedDirectMessage {
+            target_user_id,
+            ciphertext,
+            message_type,
+        } = dm
+        else {
+            panic!("not a direct message: {dm:?}");
+        };
+        assert_eq!(*target_user_id, peer.own_user_id);
+        voipc_crypto::session::decrypt_message(peer, 1, ciphertext, *message_type)
+            .await
+            .unwrap()
+    }
+
+    /// Spec §5.9: a voice join under the group key is one welcome in all. The room we stand in
+    /// asks no member's bundle, at its roster or at a `UserJoined` (both ask here), while the
+    /// old path's room still does, with no `GroupKeys` or `on: false`. A text channel keeps its
+    /// own rule under every switch: on the live path no text channel's list asks any, so its
+    /// case shows on an older relay's rule, which asks the whole mesh.
+    #[tokio::test]
+    async fn under_the_group_key_a_voice_join_asks_no_bundles_but_a_text_channel_and_the_old_path_do(
+    ) {
+        const TEXT: u32 = 4;
+        for first in first_frames() {
+            for (proto, channel, text) in [
+                (PROTOCOL_VERSION, ROOM, false),
+                (LIVE_PATH_SINCE - 1, TEXT, true),
+            ] {
+                let mut sig = SignalState {
+                    initialized: true,
+                    ..Default::default()
+                };
+                sig.gk.first_frame(&first);
+                let gk_room = sig.gk.on() && !text;
+                let signal = Arc::new(std::sync::Mutex::new(sig));
+                let (tx, mut rx) = mpsc::unbounded_channel();
+                let tcp_tx = ControlTx::new(tx, proto);
+                let member = listed(2, channel, true);
+                let one = std::slice::from_ref(&member);
+                ask_listed_bundles(channel, text, ROOM, one, 1, &signal, &tcp_tx).await;
+                let sent: Vec<Vec<u8>> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+                if gk_room {
+                    assert!(sent.is_empty(), "the room, after {first:?}: {sent:?}");
+                    continue;
+                }
+                assert_eq!(sent.len(), 1, "channel {channel}, after {first:?}");
+                if proto == PROTOCOL_VERSION {
+                    assert!(matches!(
+                        voipc_protocol::codec::decode_client_msg(&sent[0][4..]).unwrap(),
+                        ClientMessage::RequestPreKeyBundle { target_user_id: 2 }
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Plan 2k (the history hand-off, DM path) under the group key: entering a voice room asks
+    /// its sharers for its recent chat at once and sealed, since no sender key comes to wait
+    /// for. A sharer we hold a session with gets the ask as a direct message, one we do not
+    /// gets a bundle asked to open one, a member who does not share gets nothing, and no plain
+    /// frame goes. On the old path, with no `GroupKeys` or `on: false`, the entry only lines
+    /// the sharers up for their sender keys (`take_history_wanted`), as before.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn under_the_group_key_entering_a_voice_room_asks_its_sharers_sealed() {
+        let (own, held, unheld, quiet) = (1u32, 2u32, 3u32, 4u32);
+        let users = [
+            listed(own, ROOM, true),
+            listed(held, ROOM, true),
+            listed(unheld, ROOM, true),
+            listed(quiet, ROOM, false),
+        ];
+        for first in first_frames() {
+            let mut peer = peer_stores(held);
+            let bundle = voipc_crypto::prekey::bundle(&peer).unwrap();
+            let own_ik = voipc_crypto::generate_identity_key_pair();
+            let mut stores = voipc_crypto::SignalStores::new(&own_ik, 1001);
+            stores.own_user_id = own;
+            voipc_crypto::session::establish_session(&mut stores, held, &bundle)
+                .await
+                .unwrap();
+            let mut sig = SignalState {
+                stores: Some(stores),
+                initialized: true,
+                ..Default::default()
+            };
+            sig.session_up(held);
+            sig.channels
+                .set_members(ROOM, users.iter().map(|u| u.user_id));
+            sig.gk.first_frame(&first);
+            let group_key = sig.gk.on();
+            let signal = Arc::new(std::sync::Mutex::new(sig));
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let tcp_tx = ControlTx::new(tx, PROTOCOL_VERSION);
+
+            let sources = history_sources_of(&users, own);
+            assert_eq!(sources, HashSet::from([held, unheld]));
+            ask_room_history(&signal, &tcp_tx, ROOM, sources).await;
+            assert_eq!(rx.try_recv().ok(), None, "no plain ask, after {first:?}");
+            let out = live_frames(&signal, voipc_crypto::time::now_millis(), 3);
+            let bundles: Vec<u32> = out
+                .iter()
+                .filter_map(|m| match m {
+                    ClientMessage::RequestPreKeyBundle { target_user_id } => Some(*target_user_id),
+                    _ => None,
+                })
+                .collect();
+            let dms: Vec<&ClientMessage> = out
+                .iter()
+                .filter(|m| matches!(m, ClientMessage::SendEncryptedDirectMessage { .. }))
+                .collect();
+            if !group_key {
+                assert!(
+                    bundles.is_empty() && dms.is_empty(),
+                    "after {first:?}: {out:?}"
+                );
+                let mut sig = signal.lock().unwrap();
+                assert!(sig.channels.take_history_wanted(ROOM, held));
+                assert!(sig.channels.take_history_wanted(ROOM, unheld));
+                continue;
+            }
+            assert_eq!(bundles, [unheld], "{out:?}");
+            assert_eq!(dms.len(), 1, "{out:?}");
+            let read = read_as(&mut peer, dms[0]).await;
+            assert!(matches!(
+                voipc_crypto::open_sealed(&read),
+                Some(voipc_crypto::Sealed::Ask { channel_id: ROOM })
+            ));
+            // Nothing lined up for a sender key that never comes
+            let mut sig = signal.lock().unwrap();
+            assert!(!sig.channels.take_history_wanted(ROOM, held));
+        }
+    }
+
+    /// The manual resync (`request_channel_history` asks through `ask_history`) in a voice room
+    /// under the group key reaches a member we hold no session with: sealed, it asks their
+    /// bundle, and once the session is up the ask goes as a direct message they read as one.
+    /// With no `GroupKeys` or `on: false` it asks only who holds a session already, so nobody
+    /// here. A text channel's ask went sealed before and still does. Under the new-member wait,
+    /// which refuses a direct message, a plain frame asks a member with a session, as before.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn under_the_group_key_a_resync_in_a_voice_room_reaches_a_member_with_no_session_sealed()
+    {
+        let (own, member) = (1u32, 2u32);
+        for first in first_frames() {
+            for text in [false, true] {
+                let mut peer = peer_stores(member);
+                let bundle = voipc_crypto::prekey::bundle(&peer).unwrap();
+                let own_ik = voipc_crypto::generate_identity_key_pair();
+                let mut stores = voipc_crypto::SignalStores::new(&own_ik, 1001);
+                stores.own_user_id = own;
+                let mut sig = SignalState {
+                    stores: Some(stores),
+                    initialized: true,
+                    ..Default::default()
+                };
+                sig.gk.first_frame(&first);
+                let sealed = text || sig.gk.on();
+                let signal = Arc::new(std::sync::Mutex::new(sig));
+                let (tx, mut rx) = mpsc::unbounded_channel();
+                let tcp_tx = ControlTx::new(tx, PROTOCOL_VERSION);
+
+                let asked = ask_history(&signal, &tcp_tx, ROOM, &[member], text)
+                    .await
+                    .unwrap();
+                assert_eq!(rx.try_recv().ok(), None, "no plain ask");
+                if !sealed {
+                    assert!(asked.is_empty(), "nobody with a session, after {first:?}");
+                    continue;
+                }
+                assert_eq!(asked, [member], "text {text}, after {first:?}");
+                let t0 = voipc_crypto::time::now_millis();
+                let out = live_frames(&signal, t0, 1);
+                assert!(
+                    matches!(
+                        out.as_slice(),
+                        [ClientMessage::RequestPreKeyBundle { target_user_id }] if *target_user_id == member
+                    ),
+                    "{out:?}"
+                );
+                // Their bundle comes: the session the ask waits for
+                let mut stores = signal.lock().unwrap().stores.take().unwrap();
+                voipc_crypto::session::establish_session(&mut stores, member, &bundle)
+                    .await
+                    .unwrap();
+                {
+                    let mut sig = signal.lock().unwrap();
+                    sig.stores = Some(stores);
+                    sig.session_up(member);
+                }
+                let out = live_frames(&signal, t0 + 1000, 1);
+                assert_eq!(out.len(), 1, "{out:?}");
+                let read = read_as(&mut peer, &out[0]).await;
+                assert!(matches!(
+                    voipc_crypto::open_sealed(&read),
+                    Some(voipc_crypto::Sealed::Ask { channel_id: ROOM })
+                ));
+
+                // The new-member wait: a plain frame, to the member who has a session now
+                signal.lock().unwrap().direct_held = true;
+                let asked = ask_history(&signal, &tcp_tx, ROOM, &[member, 3], text)
+                    .await
+                    .unwrap();
+                assert_eq!(asked, [member]);
+                let plain = rx.try_recv().unwrap();
+                assert!(matches!(
+                    voipc_protocol::codec::decode_client_msg(&plain[4..]).unwrap(),
+                    ClientMessage::RequestChannelHistory { channel_id: ROOM, target_user_id } if target_user_id == member
+                ));
+            }
+        }
+    }
+
+    /// The "waiting for the key" warning is taken back by the first frame with a key, also
+    /// when the press that said it ended first: under the group key no handover takes it
+    /// back (the keys' arrival does since, `gk_net::install_voice`), and it stayed up for the
+    /// whole call.
+    #[test]
+    fn a_said_wait_for_the_key_is_taken_back_by_the_next_frame_with_one() {
+        let said = AtomicBool::new(false);
+        let t0 = std::time::Instant::now();
+        let at = |ms| t0 + std::time::Duration::from_millis(ms);
+        // One press: its frames wait, and the warning goes once, after 2 s
+        let (mut since, mut emitted) = (None, false);
+        assert!(!key_news(false, &mut since, &mut emitted, &said, at(0)));
+        assert!(!key_news(false, &mut since, &mut emitted, &said, at(2000)));
+        assert!(
+            key_news(false, &mut since, &mut emitted, &said, at(2001)),
+            "said after 2 s"
+        );
+        assert!(
+            !key_news(false, &mut since, &mut emitted, &said, at(3000)),
+            "said once a wait"
+        );
+        // It ends, the welcome lands, and the next press's first frame takes it back, once
+        let (mut since, mut emitted) = (None, false);
+        assert!(
+            key_news(true, &mut since, &mut emitted, &said, at(9000)),
+            "taken back"
+        );
+        assert!(
+            !key_news(true, &mut since, &mut emitted, &said, at(9020)),
+            "once"
+        );
+        // A wait under 2 s says nothing, either way
+        let (mut since, mut emitted) = (None, false);
+        assert!(
+            !key_news(false, &mut since, &mut emitted, &said, at(10_000)),
+            "a short wait"
+        );
+        assert!(
+            !key_news(true, &mut since, &mut emitted, &said, at(11_000)),
+            "nothing to take back"
+        );
     }
 
     /// A key job's frames go one at a time, however long the job: a seat frame queued in
@@ -6786,6 +7753,124 @@ mod tests {
         assert!(!voice_ask_fresh(40_000, 40_000 + VOICE_ASK_TTL_MS), "stale");
         // A clock that stepped back is not an ask from the future
         assert!(voice_ask_fresh(40_000, 39_000));
+        // Two joins clicked within one round trip: two seats, each with its ask (review F7-R1)
+        let asks = VoiceAsks::default();
+        ask_voice(&asks);
+        ask_voice(&asks);
+        assert!(take_voice_ask(&asks), "the first seat");
+        assert!(take_voice_ask(&asks), "the second seat");
+        assert!(!take_voice_ask(&asks), "a third, unasked, is refused");
+    }
+
+    /// The relay that carries the call moved it into another of its rooms with no ask, and
+    /// the open microphone went along (dive 6 F7). No honest relay does: it seats a session
+    /// only where it asked, or kicks it to the lobby.
+    #[test]
+    fn a_relay_moving_the_call_needs_an_ask_too() {
+        assert!(seat_wants_ask(2, 1, true), "the call moved to another room");
+        // Controls: the room the call stands in (a roster refresh) and the lobby (a leave, a
+        // kick) need none; a seat on a connection without the call needs one, as before
+        assert!(!seat_wants_ask(1, 1, true));
+        assert!(!seat_wants_ask(0, 1, true));
+        assert!(!seat_wants_ask(0, 0, false));
+        assert!(seat_wants_ask(2, 0, false));
+        assert!(
+            seat_wants_ask(1, 1, false),
+            "the same room while voice is elsewhere"
+        );
+    }
+
+    /// Past 8 viewers the relay counts the reports itself: the same majority steps the
+    /// share down.
+    #[test]
+    fn a_loss_summary_of_a_majority_steps_the_share_down() {
+        let loss = AtomicU64::new(0);
+        assert!(!loss_summary_steps_down(3, 9, &loss, 1_000));
+        assert_eq!(loss.load(Ordering::Relaxed), 0);
+        assert!(loss_summary_steps_down(5, 9, &loss, 2_000));
+        assert_eq!(loss.load(Ordering::Relaxed), 2_000);
+        assert!(!loss_summary_steps_down(0, 1_000, &loss, 3_000));
+        assert_eq!(loss.load(Ordering::Relaxed), 2_000);
+    }
+
+    async fn until(what: &str, done: impl Fn() -> bool) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !done() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{what} within 5 s"));
+    }
+
+    /// The edge watchdog's stamp comes from a whole frame of the watched share that
+    /// decrypted, from the edge link in force: a frame that does not decrypt leaves it,
+    /// and one an older link queued never gets to the assembler.
+    #[tokio::test]
+    async fn only_a_frame_that_decrypts_feeds_the_edge_watchdog() {
+        const CHANNEL: u32 = 3;
+        const SHARER: u32 = 7;
+        let key = MediaKey::new(CHANNEL, 1, SHARER, [5; 32]);
+        let forged = MediaKey::new(CHANNEL, 1, SHARER, [6; 32]);
+        let frame = |frame_id: u32, key: &MediaKey| {
+            let aad = voipc_crypto::build_aad(CHANNEL, 0x14, SHARER);
+            let sealed =
+                voipc_crypto::media_encrypt(key, 11, frame_id, 0, &aad, b"a keyframe").unwrap();
+            VideoPacket::encrypted_fragment(true, SHARER, frame_id, 0, 1, 0, 1, 11, sealed)
+                .to_bytes()
+        };
+        let mut ring = MediaKeyRing::default();
+        assert!(ring.install(key.clone(), CHANNEL));
+        let watching = Arc::new(AtomicU32::new(SHARER));
+        let edge_view::Pipes {
+            out, gen, video_in, ..
+        } = edge_view::Pipes::new(watching.clone());
+        let stamp = Arc::new(AtomicU64::new(0));
+        let received = Arc::new(AtomicU32::new(0));
+        let bytes = Arc::new(AtomicU64::new(0));
+        let (_core, core_rx) = mpsc::channel(8);
+        let (decode_tx, _decode_rx) = mpsc::channel(8);
+        let (tx, _control) = mpsc::unbounded_channel();
+        tokio::spawn(video_stream_receiver_task(
+            VideoIn::Tunnel(core_rx),
+            video_in,
+            stamp.clone(),
+            decode_tx,
+            Arc::new(std::sync::Mutex::new(ring)),
+            Arc::new(AtomicU32::new(CHANNEL)),
+            received.clone(),
+            Arc::default(),
+            bytes.clone(),
+            ControlTx::new(tx, PROTOCOL_VERSION),
+            watching,
+            Arc::default(),
+        ));
+        gen.store(1, Ordering::Release);
+
+        out.video.send((1, vec![frame(1, &key)])).await.unwrap();
+        until("the first frame", || stamp.load(Ordering::Relaxed) > 0).await;
+        stamp.store(0, Ordering::Relaxed);
+
+        let before = bytes.load(Ordering::Relaxed);
+        out.video.send((1, vec![frame(2, &forged)])).await.unwrap();
+        until("the forged frame read", || {
+            bytes.load(Ordering::Relaxed) > before
+        })
+        .await;
+        assert_eq!(
+            stamp.load(Ordering::Relaxed),
+            0,
+            "a frame that does not decrypt"
+        );
+
+        out.video.send((0, vec![frame(3, &key)])).await.unwrap();
+        out.video.send((1, vec![frame(4, &key)])).await.unwrap();
+        until("the last frame", || stamp.load(Ordering::Relaxed) > 0).await;
+        assert_eq!(
+            received.load(Ordering::Relaxed),
+            2,
+            "frames 1 and 4: the older link's 3 never came in"
+        );
     }
 
     #[test]
@@ -6802,6 +7887,317 @@ mod tests {
         assert!(
             !chain_intact(true, false, false, false),
             "a failed decode breaks it"
+        );
+    }
+
+    // ── Voice under the group key (plan part 5) ──
+
+    /// The room of the group-key tests.
+    pub(crate) const ROOM: u32 = 9;
+
+    /// An epoch of the room as `GroupKeying` holds it: `(e, D_e, CK_e)`.
+    pub(crate) type Epoch = (u32, [u8; 32], [u8; 32]);
+
+    /// The seat of member `sid`, by the roster: member 1 is signed in, so its account names
+    /// it; the others are named by their connection.
+    fn seat(sid: u32) -> (u32, voipc_crypto::group_key::MemberId, [u8; 8]) {
+        use voipc_crypto::group_key::MemberId;
+        let m = match sid {
+            1 => MemberId::Account([1; 16]),
+            u => MemberId::Conn(u),
+        };
+        (sid, m, [sid as u8; 8])
+    }
+
+    /// The room's keys as `GroupKeying` hands them to member `own` (`GkOut::voice`, which
+    /// `gk_net` installs): the epochs it holds, its own seat and the roster's.
+    pub(crate) fn voice_keys(
+        own: u32,
+        epochs: &[Epoch],
+        roster: &[u32],
+    ) -> voipc_crypto::group_state::VoiceKeys {
+        use voipc_crypto::group_key::GroupKind;
+        let (_, m, tag) = seat(own);
+        voipc_crypto::group_state::VoiceKeys {
+            channel_id: ROOM,
+            group: voipc_crypto::group_state::group_id(GroupKind::Voice, "", &[7; 16], ROOM),
+            gen: [3; 16],
+            epochs: epochs
+                .iter()
+                .map(|(e, d_e, ck)| (*e, *d_e, voipc_crypto::account::Zeroizing::new(*ck)))
+                .collect(),
+            own: (m, tag),
+            seats: roster.iter().map(|u| seat(*u)).collect(),
+            switch_at: 0,
+            new_generation: false,
+        }
+    }
+
+    /// One member's voice path: the ring its receive and send sites share.
+    struct App {
+        sid: u32,
+        ring: Arc<std::sync::Mutex<MediaKeyRing>>,
+        sequence: AtomicU32,
+    }
+
+    impl App {
+        fn new(sid: u32) -> App {
+            App {
+                sid,
+                ring: Arc::default(),
+                sequence: AtomicU32::new(1),
+            }
+        }
+
+        /// What `GroupKeying` hands it: a welcome, a roster, an opening.
+        fn take(&self, epochs: &[Epoch], roster: &[u32]) {
+            let keys = voice_keys(self.sid, epochs, roster);
+            assert!(self.ring.lock().unwrap().install_gk(&keys, ROOM));
+        }
+
+        /// A voice frame, sealed as the capture thread seals one.
+        fn speak(&self) -> Vec<u8> {
+            let ring = self.ring.lock().unwrap();
+            let (key, stream) = (ring.current().unwrap(), ring.stream_id());
+            let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
+            let aad = voipc_crypto::build_aad(ROOM, 0x05, self.sid);
+            let sealed =
+                voipc_crypto::media_encrypt(key, stream, sequence, 0, &aad, b"opus").unwrap();
+            VoicePacket::encrypted_voice(self.sid, sequence, key.key_id, stream, sealed).to_bytes()
+        }
+
+        /// A position beacon, from the beacon task's own send.
+        fn beacon(&self) -> Vec<u8> {
+            let (tx, mut rx) = mpsc::channel(1);
+            let room = AtomicU32::new(ROOM);
+            send_position_parts(
+                &tx,
+                &self.ring,
+                self.sid,
+                &room,
+                &self.sequence,
+                [1., 2., 3.],
+            );
+            rx.try_recv().unwrap()
+        }
+
+        /// Whether a voice frame or a beacon opens here, read as the datagram receiver
+        /// reads one.
+        fn hears(&self, buf: &[u8]) -> bool {
+            let at = |i: usize| u32::from_be_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]);
+            let key_id = u16::from_be_bytes([buf[9], buf[10]]);
+            let header = voipc_protocol::voice::ENCRYPTED_VOICE_HEADER_SIZE;
+            let mut ring = self.ring.lock().unwrap();
+            let opened = open_media(
+                &mut ring,
+                ROOM,
+                buf[0],
+                at(1),
+                at(11),
+                key_id,
+                (at(5), 0),
+                &buf[header..],
+            );
+            opened.is_some_and(|o| o.is_ok())
+        }
+    }
+
+    /// Plan part 5 (the V3 row's three-member room): three apps on the paths the native app
+    /// sends and receives on. Each derives its own key from its seat and every other one the
+    /// same key from the roster, after a join as before it. After a leave the others go to the
+    /// next epoch, which the leaver cannot open, and the leaver's own frames open nowhere.
+    #[test]
+    fn under_the_group_key_members_hear_each_other_after_a_join_and_a_leaver_no_next_epoch() {
+        let e1: Epoch = (1, rand::random(), rand::random());
+        let e2: Epoch = (2, rand::random(), rand::random());
+        let (a, b, c) = (App::new(1), App::new(2), App::new(3));
+        a.take(&[e1], &[1, 2]);
+        b.take(&[e1], &[1, 2]);
+        assert!(b.hears(&a.speak()) && a.hears(&b.speak()) && a.hears(&b.beacon()));
+
+        // C joins: its welcome brings it the epoch, the roster brings its seat to the others
+        c.take(&[e1], &[1, 2, 3]);
+        a.take(&[e1], &[1, 2, 3]);
+        b.take(&[e1], &[1, 2, 3]);
+        for (from, to) in [(&a, &b), (&a, &c), (&b, &a), (&b, &c), (&c, &a), (&c, &b)] {
+            assert!(to.hears(&from.speak()), "{} hears {}", to.sid, from.sid);
+            assert!(to.hears(&from.beacon()), "{} places {}", to.sid, from.sid);
+        }
+        let (own, stream) = {
+            let ring = c.ring.lock().unwrap();
+            (ring.current().unwrap().key_bytes, ring.stream_id())
+        };
+        for other in [&a, &b] {
+            let mut ring = other.ring.lock().unwrap();
+            let derived = ring.get_for(ROOM, c.sid, stream, 1).unwrap();
+            assert_eq!(derived.key_bytes, own, "the joiner's key, derived alike");
+        }
+        let in_flight = a.speak();
+
+        // C leaves: the opening commit's epoch reaches A and B only
+        a.take(&[e1, e2], &[1, 2]);
+        b.take(&[e1, e2], &[1, 2]);
+        let (from_a, from_b) = (a.speak(), b.speak());
+        assert_eq!(
+            u16::from_be_bytes([from_a[9], from_a[10]]),
+            2,
+            "the next epoch"
+        );
+        assert!(b.hears(&from_a) && a.hears(&from_b) && b.hears(&a.beacon()));
+        assert!(
+            b.hears(&in_flight),
+            "a frame in flight under the epoch before"
+        );
+        assert!(
+            !c.hears(&from_a) && !c.hears(&from_b) && !c.hears(&b.beacon()),
+            "the leaver opens no frame of the next epoch"
+        );
+        assert!(
+            !a.hears(&c.speak()) && !b.hears(&c.speak()),
+            "and the roster seats it no more"
+        );
+    }
+
+    /// With no group key (a relay below 26, or `GroupKeys {on: false}`) every receive site
+    /// opens what it did before: under the room's key of the generation the packet names,
+    /// whoever sent it.
+    #[test]
+    fn without_the_group_key_every_receive_site_opens_under_the_rooms_key() {
+        let (a, b) = (App::new(1), App::new(2));
+        for app in [&a, &b] {
+            let key = MediaKey::new(ROOM, 4, 1, [9; 32]);
+            assert!(app.ring.lock().unwrap().install(key, ROOM));
+        }
+        assert!(b.hears(&a.speak()) && a.hears(&b.speak()) && a.hears(&b.beacon()));
+        let stranger = App::new(3);
+        let other = MediaKey::new(ROOM, 5, 1, [8; 32]);
+        assert!(stranger.ring.lock().unwrap().install(other, ROOM));
+        assert!(!a.hears(&stranger.speak()), "a generation not held");
+    }
+
+    /// Plan part 5: under the group key no sender key and no media key goes to a member of
+    /// the room we stand in (a join, a bundle answered, a key to reciprocate all hand them on
+    /// here). On the old path, with no `GroupKeys` or `on: false`, the same member gets both.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn under_the_group_key_no_sender_or_media_key_goes_to_a_member() {
+        let (own, peer) = (1u32, 2u32);
+        let own_ik = voipc_crypto::generate_identity_key_pair();
+        let peer_ik = voipc_crypto::generate_identity_key_pair();
+        let mut peer_stores = voipc_crypto::SignalStores::new(&peer_ik, 1002);
+        voipc_crypto::prekey::generate_prekeys(&mut peer_stores, &peer_ik).unwrap();
+        let bundle = voipc_crypto::prekey::bundle(&peer_stores).unwrap();
+        let first_frames = [
+            ServerMessage::ChannelList { channels: vec![] },
+            ServerMessage::GroupKeys {
+                on: false,
+                run: [7; 16],
+                clock: 0,
+            },
+            ServerMessage::GroupKeys {
+                on: true,
+                run: [7; 16],
+                clock: 0,
+            },
+        ];
+        for first in first_frames {
+            let mut stores = voipc_crypto::SignalStores::new(&own_ik, 1001);
+            stores.own_user_id = own;
+            voipc_crypto::session::establish_session(&mut stores, peer, &bundle)
+                .await
+                .unwrap();
+            let mut sig = SignalState {
+                stores: Some(stores),
+                ..Default::default()
+            };
+            sig.channels.set_members(ROOM, [own, peer]);
+            sig.gk.first_frame(&first);
+            let group_key = sig.gk.on();
+            let signal = Arc::new(std::sync::Mutex::new(sig));
+            let ring = Arc::new(std::sync::Mutex::new(MediaKeyRing::default()));
+            let key = MediaKey::new(ROOM, 0, own, [4; 32]);
+            assert!(ring.lock().unwrap().install(key, ROOM));
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let tcp_tx = ControlTx::new(tx, PROTOCOL_VERSION);
+            distribute_sender_key_to_user(ROOM, peer, own, &signal, &ring, &tcp_tx).await;
+            let sent: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+                .map(|f| voipc_protocol::codec::decode_client_msg(&f[4..]).unwrap())
+                .collect();
+            let handed = sent.iter().any(|m| {
+                matches!(m, ClientMessage::DistributeSenderKey { target_user_id, .. } if *target_user_id == peer)
+            }) && sent.iter().any(|m| {
+                matches!(m, ClientMessage::DistributeMediaKey { target_user_id, .. } if *target_user_id == peer)
+            });
+            if group_key {
+                assert!(sent.is_empty(), "under the group key: {sent:?}");
+            } else {
+                assert!(handed, "the old path, after {first:?}: {sent:?}");
+            }
+        }
+    }
+
+    /// Plan part 5: a share is watched under its sharer's own key, its fragments sealed as
+    /// the share's send site seals them (`current()`, the ring's stream), through the real
+    /// video receiver. A sharer the viewer's roster does not seat shows nothing.
+    #[tokio::test]
+    async fn under_the_group_key_a_share_is_watched_under_its_sharers_own_key() {
+        let e1: Epoch = (1, rand::random(), rand::random());
+        let (sharer, viewer, outsider) = (App::new(1), App::new(2), App::new(3));
+        sharer.take(&[e1], &[1, 2]);
+        viewer.take(&[e1], &[1, 2]);
+        outsider.take(&[e1], &[1, 2, 3]);
+        let keyframe = |app: &App, frame_id: u32| {
+            let ring = app.ring.lock().unwrap();
+            let (key, stream) = (ring.current().unwrap(), ring.stream_id());
+            let aad = voipc_crypto::media_keys::build_aad(ROOM, 0x14, app.sid);
+            let sealed =
+                voipc_crypto::media_encrypt(key, stream, frame_id, 0, &aad, b"a keyframe").unwrap();
+            VideoPacket::encrypted_fragment(
+                true, app.sid, frame_id, 0, 1, 0, key.key_id, stream, sealed,
+            )
+            .to_bytes()
+        };
+        let watching = Arc::new(AtomicU32::new(sharer.sid));
+        let pipes = edge_view::Pipes::new(watching.clone());
+        let received = Arc::new(AtomicU32::new(0));
+        let bytes = Arc::new(AtomicU64::new(0));
+        let (core, core_rx) = mpsc::channel(8);
+        let (decode_tx, _decode_rx) = mpsc::channel(8);
+        let (tx, _control) = mpsc::unbounded_channel();
+        tokio::spawn(video_stream_receiver_task(
+            VideoIn::Tunnel(core_rx),
+            pipes.video_in,
+            Arc::default(),
+            decode_tx,
+            viewer.ring.clone(),
+            Arc::new(AtomicU32::new(ROOM)),
+            received.clone(),
+            Arc::default(),
+            bytes.clone(),
+            ControlTx::new(tx, PROTOCOL_VERSION),
+            watching,
+            Arc::default(),
+        ));
+
+        core.send(keyframe(&sharer, 1)).await.unwrap();
+        until("the sharer's frame", || {
+            received.load(Ordering::Relaxed) == 1
+        })
+        .await;
+        let before = bytes.load(Ordering::Relaxed);
+        core.send(keyframe(&outsider, 2)).await.unwrap();
+        until("the outsider's frame read", || {
+            bytes.load(Ordering::Relaxed) > before
+        })
+        .await;
+        core.send(keyframe(&sharer, 3)).await.unwrap();
+        until("the sharer's next frame", || {
+            received.load(Ordering::Relaxed) > 1
+        })
+        .await;
+        assert_eq!(
+            received.load(Ordering::Relaxed),
+            2,
+            "the outsider's frame never came together"
         );
     }
 }

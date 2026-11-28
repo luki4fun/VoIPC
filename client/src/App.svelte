@@ -64,6 +64,7 @@
   import { pendingPokes, createPoke, addPoke } from "./lib/stores/pokes.js";
   import {
     addChannelMessage,
+    markNotSent,
     noteNeverOpened,
     addChannelLineAtTop,
     addDmMessage,
@@ -97,14 +98,17 @@
   } from "./lib/stores/chat.js";
   import ChatHistorySetup from "./lib/components/ChatHistorySetup.svelte";
   import AudioSetup from "./lib/components/AudioSetup.svelte";
-  import type { ChannelInfo, ChatMessage, UserInfo } from "./lib/types.js";
+  import type { ChannelInfo, ChatMessage, LobbyCursor, UserInfo } from "./lib/types.js";
   import { parseInviteFragment, parseJoinFragment } from "./lib/invite.js";
+  import { roomAtDrop } from "./lib/rejoin-rules.js";
   import {
     channelListArrived,
     disconnectServer,
     fromServer,
     listenServer,
+    noteRelayRun,
     reconnectAll,
+    relayRun,
     withReloadServers,
     autoConnectList,
     serverId,
@@ -135,7 +139,9 @@
     muteKey,
     deafenKey,
     chatHistoryDisabled,
+    chatHistoryLater,
     shareChannelHistory,
+    helpHoldKeys,
     maxConversations,
     screenShareCodec,
     spatialAudio,
@@ -167,9 +173,14 @@
     requestRoster,
     forgetUser,
     rosterAccount,
+    setCounts,
     setRoster,
     textSeats,
+    lazyHere,
   } from "./lib/stores/rosters.js";
+  import { afterLookup, lobbyPage, lookedUp, resetLobby } from "./lib/stores/lobby.js";
+  import { adminLoad, type LoadReport } from "./lib/stores/load.js";
+  import { gkListeners } from "./lib/stores/gk.js";
   import { emoteLimits, metered, setEmotes, type EmoteLimits, type EmoteSet } from "./lib/stores/emotes.js";
   import { UNOPENED_LINE, answersHandOff, clampedLine, spendServe, type ServeBudget } from "./lib/history-rules.js";
   import { olderRelay } from "./lib/stores/relay.js";
@@ -225,6 +236,7 @@
     messageRefs,
     notificationBody,
     receivedText,
+    channelErrorText,
   } from "./lib/chat-rules.js";
   import { LAYOUT_PICKER_VERSION } from "./lib/ui-prefs.js";
   import { stopTransmit, voiceMode, vadThreshold } from "./lib/stores/voice.js";
@@ -237,7 +249,7 @@
     playChannelMessageSound,
     playPokeSound,
   } from "./lib/sounds.js";
-  import { isMobile, isWeb } from "./lib/stores/platform.js";
+  import { isAndroidApp, isMobile, isWeb } from "./lib/stores/platform.js";
   import {
     audibleIds,
     centreView,
@@ -279,6 +291,10 @@
     previewShown,
     streamStage,
   } from "./lib/stores/screenshare.js";
+  import { frameArrived } from "./lib/view-timing.js";
+  import { offerWebViewDecoding, startPull, stopPull } from "./lib/native-view.js";
+  import type { ShareCodec } from "./lib/video-sink.js";
+  import type { SharedFrame } from "./lib/view-tally.js";
 
   // Look up channel name by numeric ID (stable key for chat history). Per
   // server: an id is a slot in one server's list and means nothing on another.
@@ -577,8 +593,9 @@
 
   /** Whether someone here is blocked: by their account where a list we see has
    *  it, else by the name. */
-  function blockedSender(server: string, uid: number, name: string): boolean {
-    const known = get(users.peek(server)).find((u) => u.user_id === uid)?.account ?? rosterAccount(server, uid);
+  function blockedSender(server: string, uid: number, name: string, said?: number[] | null): boolean {
+    // `said`: the account the relay put on the frame (protocol 25), where no list may hold them
+    const known = said ?? get(users.peek(server)).find((u) => u.user_id === uid)?.account ?? rosterAccount(server, uid);
     return isBlocked(get(blocked.peek(server)), { account: known, username: name }, false);
   }
 
@@ -608,7 +625,12 @@
    * list. `mayWait`: a stranger to the last list moves the next sweep up, and is looked at once
    * more when it is in.
    */
-  function answerHandOff(server: string, data: HandOffAskEvent, mayWait: boolean): void {
+  function answerHandOff(server: string, data: HandOffAskEvent, mayWait: boolean, looked = false): void {
+    // Someone standing in the lobby is on no list here since 25 until asked about
+    if (!looked) {
+      afterLookup(server, [data.from_user_id], () => answerHandOff(server, data, mayWait, true));
+      return;
+    }
     const channelId = data.channel_id;
     const chName = channelNameById(server, channelId);
     if (!chName) return;
@@ -693,9 +715,9 @@
   }
 
   // Trigger auto-connect only after chat history password has been entered
-  // (or the vault was skipped — then there is nothing to unlock)
+  // (or the vault was skipped, or left locked for this session: "Not now")
   $effect(() => {
-    if (pendingAutoConnect && ($chatUnlocked || $chatHistoryDisabled)) {
+    if (pendingAutoConnect && ($chatUnlocked || $chatHistoryDisabled || $chatHistoryLater)) {
       const list = pendingAutoConnect;
       pendingAutoConnect = null;
       reconnectAll(list);
@@ -857,6 +879,9 @@
         )
         .catch(() => {});
     }
+    // The phone decodes a watched share in this WebView (1.13, D1); the desktop keeps its
+    // native decoder (D3)
+    if (isAndroidApp) void offerWebViewDecoding();
     // ...and the file cache follows what the chat still refers to
     const stopFileRetain = startFileRetain();
     // A reload, or a window closed under us: the debounced chat save goes now
@@ -931,6 +956,7 @@
       deafenKey.set(config.deafen_key ?? "");
       chatHistoryDisabled.set(config.chat_history_disabled ?? false);
       shareChannelHistory.set(config.share_channel_history ?? false);
+      helpHoldKeys.set(config.help_hold_keys ?? true);
       if (config.share_off_notice) {
         addNotification("Sharing with newcomers is off now, until you turn it on: it used to start on. Settings → Privacy & data.", "info", 15000);
         invoke("set_config_bool", { key: "share_off_notice", value: false }).catch(() => {});
@@ -1073,6 +1099,8 @@
         currentChannelId.of(server).set(newChannelId);
         users.of(server).set(data.users);
         setRoster(server, newChannelId, data.users);
+        // Since 25 the lobby's list is our own row: its people come a page at a time again
+        if (newChannelId === 0 && lazyHere(server)) resetLobby(server);
         // A room can hold an archive too, and the relay is what moved us
         if (newChannelId !== 0 && livePath(get(olderRelay.peek(server))?.protocol ?? null)) askArchiveChannels(server);
         // We just left one, and the channel we joined may have been listed with
@@ -1364,6 +1392,12 @@
         });
       }),
 
+      // The relay's run (`GroupKeys`): a reconnect puts the user back in a room a person made
+      // only on the same run (dive 6 F6)
+      listenServer<{ run: string }>("relay-run", (server, data) => {
+        if (typeof data?.run === "string") noteRelayRun(server, data.run);
+      }),
+
       listenServer<{ ms: number; tcp?: boolean }>("latency-update", (server, data) => {
         latency.of(server).set(data.ms);
         viaTcp.of(server).set(data.tcp === true);
@@ -1395,13 +1429,14 @@
 
         // Play disconnected sound on initial loss (not during reconnect retries)
         playDisconnectedSound();
-        // By name, both of them, and read here because this runs while the
-        // channel list is still ours: the reconnect may land on a restarted
-        // server, where the ids are new but the channels people were in are
-        // the same ones they would recognise. The voice channel only if the
-        // call was on this server.
+        // Read here because this runs while the channel list is still ours: the
+        // reconnect may land on a restarted server, where the ids are new but the
+        // channels people were in are the same ones they would recognise. The text
+        // channels by name; the voice room with what tells it from another room of
+        // that name, and only if the call was on this server (dive 6 F6).
         const seat = get(voice);
-        const prevVoice = seat?.server === server ? channelNameById(server, seat.channelId) : "";
+        const seatRoom = seat?.server === server ? get(channels.peek(server)).find((c) => c.channel_id === seat.channelId) : undefined;
+        const prevVoice = seatRoom ? roomAtDrop(seatRoom, relayRun(server)) : null;
         const prevText = [...get(joinedTextChannelIds.peek(server))]
           .map((id) => channelNameById(server, id))
           .filter((n) => n !== "");
@@ -1410,8 +1445,11 @@
         // What the connection held goes now, the call with it if it was this
         // server's: a channel id is a slot in one server's run, and the
         // reconnect may land on a restarted server that hands them out again.
+        // How many were online, read before the stores go: on a big relay the first try
+        // waits its turn (dive 6 F5)
+        const online = get(channels.peek(server)).find((c) => c.channel_id === 0)?.user_count ?? 0;
         resetServer(server);
-        void startReconnect(server, { voice: prevVoice, text: prevText, open: prevOpen }, reason);
+        void startReconnect(server, { voice: prevVoice, text: prevText, open: prevOpen, online }, reason);
       }),
 
       listen<{ error: string; retrying?: boolean }>("audio-device-error", (event) => {
@@ -1614,7 +1652,8 @@
       }),
 
       listenServer<{ reason: string }>("channel-error", (server, data) => {
-        addNotification(`${fromServer(server)}${data.reason}`, "error");
+        // A post past 16 KiB, said plainly (one the composer never let by: a forward, say)
+        addNotification(`${fromServer(server)}${channelErrorText(data.reason)}`, "error");
       }),
 
       listenServer<ChannelLayout>("channel-layout", (server, layout) => {
@@ -1820,6 +1859,16 @@
         }
       }),
 
+      // The lobby on a big relay (protocol 25): counts, pages, lookups
+      listenServer<{ counts: [number, number][] }>("channel-counts", (server, data) => setCounts(server, data.counts)),
+      listenServer<{ rows: UserInfo[]; next: LobbyCursor | null; total: number; sections: [number, number][]; prefix?: string }>(
+        "lobby-page",
+        (server, data) => lobbyPage(server, { ...data, rows: eachOnce(data.rows, (u) => u.user_id) }),
+      ),
+      listenServer<{ rows: UserInfo[]; gone: number[] }>("users", (server, data) =>
+        lookedUp(server, eachOnce(data.rows, (u) => u.user_id), data.gone),
+      ),
+
       // Invite events
       listenServer<{ channel_id: number; channel_name: string; invited_by: string }>(
         "invite-received",
@@ -1850,10 +1899,10 @@
       }),
 
       // Poke events
-      listenServer<{ from_user_id: number; from_username: string; message: string }>(
+      listenServer<{ from_user_id: number; from_username: string; from_account?: number[] | null; message: string }>(
         "poke-received",
         (server, data) => {
-          if (blockedSender(server, data.from_user_id, data.from_username)) return;
+          if (blockedSender(server, data.from_user_id, data.from_username, data.from_account)) return;
           const poke = createPoke(server, data.from_user_id, data.from_username, data.message);
           let fresh = false;
           pendingPokes.update((p) => {
@@ -1887,6 +1936,8 @@
         is_moderator?: boolean;
         /** It waited for its key. */
         held?: boolean;
+        /** Our own post, which never went: why (the relay's words). */
+        not_sent?: string;
       }>("channel-chat-message", (server, data) => {
         const { channel_id, user_id: uid, username, timestamp, message_id } = data;
         // Cut where it arrives (D-7): what follows parses it, for a mention
@@ -1951,6 +2002,7 @@
               kind: data.decryption_failed ? "undecryptable" : undefined,
               account: writer ? accountHex(writer) : undefined,
               ...messageRefs(data),
+              ...(uid === self && data.not_sent ? { not_sent: data.not_sent } : {}),
             },
             !!data.held,
           );
@@ -2074,6 +2126,8 @@
         reply_to?: string | null;
         thread?: string | null;
         event?: unknown;
+        /** As a roster row would show it (protocol 25); none on an older relay. */
+        from_account?: number[] | null;
       }>("direct-chat-message", (server, data) => {
         const { from_user_id, to_user_id, timestamp } = data;
         const content = receivedText(data.content);
@@ -2089,7 +2143,9 @@
         // the stored log later is recognised (sameMessage).
         const sender = from_user_id === myId
           ? get(account.peek(server))?.info.id
-          : (get(users.peek(server)).find((u) => u.user_id === from_user_id)?.account ?? rosterAccount(server, from_user_id));
+          : (data.from_account ??
+            get(users.peek(server)).find((u) => u.user_id === from_user_id)?.account ??
+            rosterAccount(server, from_user_id));
         // Done to an earlier message of the conversation: no message, no sound
         if (data.event != null) {
           const event = chatEvent(data.event);
@@ -2146,6 +2202,13 @@
         },
       ),
 
+      // A post of ours that never went, though its row showed it sent: the relay would have
+      // refused it as too large, sealed, naming no message. Its row says so.
+      listenServer<{ channel_id: number; message_id: string; reason: string }>("channel-not-sent", (server, d) => {
+        const name = channelNameById(server, d.channel_id);
+        if (name) markNotSent(server, name, d.message_id, get(userId.peek(server)), d.reason);
+      }),
+
       // The channel's keys did not get out, so what was written then was never
       // sent, though it showed as sent.
       // A connection's end says which channel by name: its ids have gone from the stores by then,
@@ -2195,14 +2258,29 @@
         }
       }),
 
-      listenServer<{ sharer_user_id: number }>("watching-screenshare", (server, data) => {
+      listenServer<{ sharer_user_id: number; codec: ShareCodec; view?: string; gen?: number }>("watching-screenshare", (server, data) => {
         if (!inVoice(server)) return;
         watchingUserId.set(data.sharer_user_id);
         currentFrame.set(null);
+        // The app hands this share to the WebView's own decoder (native-view.ts)
+        if (data.view === "webview" && data.gen) {
+          startPull(data.gen, data.codec, {
+            first: () => currentFrame.set("canvas"),
+            tooLarge: () => {
+              invoke("stop_watching_screen_share").catch(() => {});
+              watchingUserId.set(null);
+              currentFrame.set(null);
+              addNotification("Screen share ended: its picture is larger than VoIPC shows", "info");
+            },
+          });
+        } else {
+          stopPull();
+        }
       }),
 
       listenServer<{ reason: string }>("stopped-watching-screenshare", (server, data) => {
         if (!inVoice(server)) return;
+        stopPull();
         watchingUserId.set(null);
         currentFrame.set(null);
         if (data.reason !== "requested") {
@@ -2214,6 +2292,16 @@
         if (!inVoice(server)) return;
         // Capture follows this (captureWanted, above)
         viewerCount.set(data.viewer_count);
+      }),
+
+      // What the relay carries now, for the admin's Load tab (protocol 25)
+      listenServer<LoadReport>("admin-load", (server, report) => adminLoad.of(server).set(report)),
+      // Group-key status lines (protocol 26)
+      ...Object.entries(gkListeners).map(([name, fn]) => listenServer(name, fn as (server: string, e: any) => void)),
+
+      // A watch the relay would not start (protocol 25): about that share, never ours
+      listenServer<{ sharer_user_id: number; reason: string }>("watch-refused", (server, data) => {
+        addNotification(`${fromServer(server)}${data.reason}`, "error");
       }),
 
       listenServer<{ reason: string }>("screenshare-error", (server, data) => {
@@ -2231,8 +2319,8 @@
         }
       }),
 
-      listen<string>("screenshare-frame", (event) => {
-        currentFrame.set(event.payload);
+      listen<SharedFrame | string>("screenshare-frame", (event) => {
+        currentFrame.set(frameArrived(event.payload));
       }),
 
       // What our own share sends, for the preview (native only)
@@ -2248,6 +2336,19 @@
         watchingUserId.set(null);
         currentFrame.set(null);
         invoke("stop_screen_capture").catch(() => {});
+      }),
+
+      // The system ended our capture (the shared window closed, or the desktop's own "stop
+      // sharing"; screenshare/linux.rs): end the share as Stop does, and say why
+      listen("screenshare-source-ended", () => {
+        if (!$isSharingScreen) return;
+        isSharingScreen.set(false);
+        viewerCount.set(0);
+        invoke("stop_screen_share").catch(() => {});
+        addNotification(
+          "Your screen share ended: the system stopped capturing it (the shared window closed, or sharing was stopped from the desktop)",
+          "info",
+        );
       }),
 
       // A game pressing push-to-talk for us, so the voice bar can say so
@@ -2348,7 +2449,7 @@
 <!-- Both wait for the config, which says whether there is history to unlock
      and what to fill in: before it, a start with history off flashed "Set up
      chat history", and the connect dialog showed empty fields first -->
-{#if $uiPrefsReady && !$chatUnlocked && !$chatHistoryDisabled}
+{#if $uiPrefsReady && !$chatUnlocked && !$chatHistoryDisabled && !$chatHistoryLater}
   <ChatHistorySetup />
 {/if}
 

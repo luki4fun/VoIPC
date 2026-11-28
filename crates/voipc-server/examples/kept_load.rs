@@ -81,6 +81,21 @@ impl Relay {
     pub async fn identity(&self, _: AccountId) -> Result<Option<Vec<u8>>> {
         Ok(None)
     }
+
+    /// The group key's part of the tombstone sweep: no groups here.
+    pub async fn gk_tombstone(&self, _: &Id) -> Result<i64> {
+        Ok(0)
+    }
+
+    /// The group key's part of a log leave: no groups here, the membership goes alone.
+    pub async fn gk_log_leave(
+        &self,
+        _: &str,
+        _: Id,
+        remove: impl std::future::Future<Output = Result<bool>>,
+    ) -> Result<bool> {
+        remove.await
+    }
 }
 
 fn refused(request: &str, reason: &str) -> AccountReply {

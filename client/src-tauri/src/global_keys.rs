@@ -205,31 +205,108 @@ fn spawn_ptt_worker(handle: tauri::AppHandle) -> tokio::sync::mpsc::UnboundedSen
     tauri::async_runtime::spawn(async move {
         while let Some(pressed) = rx.recv().await {
             let state = handle.state::<AppState>();
-            if pressed {
-                // Not in a call is not an error to log: the key is an
-                // ordinary key everywhere else on the desktop.
-                if VoiceMode::from_u8(state.voice_mode.load(Ordering::Relaxed)) != VoiceMode::Ptt
-                    || state.voice_id().is_none()
-                {
-                    continue;
-                }
-                match commands::do_start_transmit(&state, handle.clone()).await {
+            let mode = VoiceMode::from_u8(state.voice_mode.load(Ordering::Relaxed));
+            match key_edge(pressed, mode, state.voice_id().is_some()) {
+                KeyEdge::Skip => {}
+                KeyEdge::Open => match commands::do_start_transmit(&state, handle.clone()).await {
                     Ok(()) => {
                         let _ = handle.emit("ptt-global-pressed", ());
                     }
                     Err(e) => tracing::warn!("Global PTT start failed: {e}"),
-                }
-            } else {
-                match commands::do_stop_transmit(&state).await {
+                },
+                KeyEdge::Close => match commands::do_stop_transmit(&state).await {
                     Ok(()) => {
                         let _ = handle.emit("ptt-global-released", ());
                     }
                     Err(e) => tracing::warn!("Global PTT stop failed: {e}"),
-                }
+                },
             }
         }
     });
     tx
+}
+
+/// What the worker does with one edge of the push-to-talk key.
+#[cfg(not(target_os = "android"))]
+#[derive(Debug, PartialEq, Eq)]
+enum KeyEdge {
+    Open,
+    Close,
+    Skip,
+}
+
+/// The key is push-to-talk's in push-to-talk mode only, on its release as on
+/// its press. In voice activation or always-on the capture is the mode's: a
+/// release that closed it there did so at every space typed in any window (the
+/// default key), and the UI opened the device again (dive 6 F3).
+#[cfg(not(target_os = "android"))]
+fn key_edge(pressed: bool, mode: VoiceMode, in_voice: bool) -> KeyEdge {
+    if mode != VoiceMode::Ptt {
+        return KeyEdge::Skip;
+    }
+    if !pressed {
+        return KeyEdge::Close;
+    }
+    // Not in a call is not an error to log: the key is an ordinary key
+    // everywhere else on the desktop.
+    if in_voice {
+        KeyEdge::Open
+    } else {
+        KeyEdge::Skip
+    }
+}
+
+/// The OS-wide hook saw the push-to-talk binding go down, and not up yet.
+/// Where the hook hears no key of ours it never is: Wayland without the
+/// `input` group (the X11 fallback hears X11 windows only, H4-13), or no hook
+/// at all.
+#[cfg(not(target_os = "android"))]
+static HOOK_HOLDS_PTT: AtomicBool = AtomicBool::new(false);
+
+/// One edge of the binding as the hook saw it, to the worker in that order.
+#[cfg(not(target_os = "android"))]
+fn hook_edge(ptt: &tokio::sync::mpsc::UnboundedSender<bool>, pressed: bool) {
+    HOOK_HOLDS_PTT.store(pressed, Ordering::Relaxed);
+    let _ = ptt.send(pressed);
+}
+
+/// The main window lost focus (lib.rs). A push-to-talk key held in it sends
+/// its key-up to the window that has focus now, and the window's own handler
+/// (VoiceKeys.svelte) never hears it: where the hook did not see the press,
+/// it does not see the release either, and the microphone stayed open after
+/// the user let go (dive 6 F2). So the window's hold ends here, as it does on
+/// blur in the browser. Also a hold the hook saw: a hook cannot hear every
+/// release (on Windows none goes to it over an elevated window), so focus loss
+/// fails closed, and a hold carried across a window change needs a new press
+/// (review F2-R1). The hook's own later release then stops nothing.
+#[cfg(not(target_os = "android"))]
+pub fn window_lost_focus(handle: &tauri::AppHandle) {
+    let state = handle.state::<AppState>();
+    let mode = VoiceMode::from_u8(state.voice_mode.load(Ordering::Relaxed));
+    let user_holds = state.ptt_user.load(Ordering::Relaxed);
+    if !focus_loss_releases(mode, user_holds) {
+        return;
+    }
+    HOOK_HOLDS_PTT.store(false, Ordering::Relaxed);
+    let handle = handle.clone();
+    tauri::async_runtime::spawn(async move {
+        let state = handle.state::<AppState>();
+        match commands::do_stop_transmit(&state).await {
+            // The window's key handler, and the UI's "Talking", go by this
+            Ok(()) => {
+                let _ = handle.emit("ptt-global-released", ());
+            }
+            Err(e) => tracing::warn!("PTT release on focus loss failed: {e}"),
+        }
+    });
+}
+
+/// Whether the window losing focus lets go of push-to-talk for the user: in
+/// push-to-talk mode only (in voice activation the user's hold is the mode's),
+/// while the user holds it.
+#[cfg(not(target_os = "android"))]
+fn focus_loss_releases(mode: VoiceMode, user_holds: bool) -> bool {
+    mode == VoiceMode::Ptt && user_holds
 }
 
 #[cfg(not(target_os = "android"))]
@@ -313,7 +390,7 @@ fn run_rdev_loop(
 
                 if matches && !ptt_active {
                     ptt_active = true;
-                    let _ = ptt.send(true);
+                    hook_edge(&ptt, true);
                 }
             }
             rdev::EventType::KeyRelease(key) => {
@@ -330,7 +407,7 @@ fn run_rdev_loop(
 
                 if !still && ptt_active {
                     ptt_active = false;
-                    let _ = ptt.send(false);
+                    hook_edge(&ptt, false);
                 }
             }
             _ => {} // Ignore mouse events, etc.
@@ -588,7 +665,7 @@ fn run_evdev_loop(
 
                                     if matches && !ptt_active {
                                         ptt_active = true;
-                                        let _ = ptt.send(true);
+                                        hook_edge(&ptt, true);
                                     }
                                 }
                                 0 => {
@@ -601,7 +678,7 @@ fn run_evdev_loop(
                                     );
                                     if !ptt_still_held(&held_keys) && ptt_active {
                                         ptt_active = false;
-                                        let _ = ptt.send(false);
+                                        hook_edge(&ptt, false);
                                     }
                                 }
                                 _ => {} // Repeat (2), ignore
@@ -662,7 +739,7 @@ fn run_evdev_loop(
             update_toggles(&held_keys, &mut mute_active, &mut deafen_active);
             if ptt_active && !ptt_still_held(&held_keys) {
                 ptt_active = false;
-                let _ = ptt.send(false);
+                hook_edge(&ptt, false);
             }
         }
     }
@@ -724,6 +801,35 @@ mod tests {
         // Only Ctrl + Space (missing Alt) → false
         let held: HashSet<Key> = [Key::ControlLeft, Key::Space].into();
         assert!(!rdev_binding_held(&held, &b));
+    }
+
+    // ── The worker's edges (dive 6 F3) ──
+
+    /// In voice activation or always-on the capture is the mode's: the push-to-talk key's
+    /// release (Space by default, typed in any window) closed it at every space, and the UI
+    /// reopened it (dive 6 F3).
+    #[test]
+    fn a_release_closes_the_microphone_only_in_push_to_talk() {
+        assert_eq!(key_edge(false, VoiceMode::Vad, true), KeyEdge::Skip);
+        assert_eq!(key_edge(false, VoiceMode::AlwaysOn, true), KeyEdge::Skip);
+        // Controls: push-to-talk opens on the press in a call and closes on the release
+        assert_eq!(key_edge(true, VoiceMode::Ptt, true), KeyEdge::Open);
+        assert_eq!(key_edge(false, VoiceMode::Ptt, true), KeyEdge::Close);
+        assert_eq!(key_edge(true, VoiceMode::Vad, true), KeyEdge::Skip);
+        assert_eq!(key_edge(true, VoiceMode::Ptt, false), KeyEdge::Skip);
+    }
+
+    /// A push-to-talk key held in the window when it loses focus: its release goes to the
+    /// other window, and where the hook did not see the press nothing let go (dive 6 F2).
+    #[test]
+    fn the_window_losing_focus_lets_go_of_a_held_key() {
+        // Whether the hook saw the press or not: it may not hear the release (review F2-R1)
+        assert!(focus_loss_releases(VoiceMode::Ptt, true));
+        // Controls: voice activation holds for the mode, not for a key; nothing held,
+        // nothing to let go
+        assert!(!focus_loss_releases(VoiceMode::Vad, true));
+        assert!(!focus_loss_releases(VoiceMode::AlwaysOn, true));
+        assert!(!focus_loss_releases(VoiceMode::Ptt, false));
     }
 
     // ── evdev_binding_held (Linux only) ──

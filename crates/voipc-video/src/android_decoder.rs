@@ -116,10 +116,6 @@ mod ffi {
 
 /// Largest width or height believed, from a parameter set or from the codec.
 const MAX_DIMENSION: i32 = 8192;
-/// Largest picture a peer's parameter set may claim, as on the desktop
-/// (`decoder::MAX_DECODE_PIXELS`): per side alone, 8192×8192 is 67 million
-/// pixels (S-047).
-const MAX_SPS_PIXELS: u64 = 2048 * 2048;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -153,6 +149,9 @@ pub struct Decoder {
     /// The stream's range and matrix, from the output format.
     full_range: bool,
     bt709: bool,
+    /// Time spent copying pictures out since `take_copy_time` last asked (the viewer's
+    /// `share view:` line).
+    copy_time: std::time::Duration,
 }
 
 // SAFETY: The decoder is only used from a single blocking tokio task.
@@ -189,6 +188,7 @@ impl Decoder {
             pts_counter: 0,
             full_range: matches!(video_codec, VideoCodec::Vp8 | VideoCodec::Vp9),
             bt709: false,
+            copy_time: std::time::Duration::ZERO,
         })
     }
 
@@ -201,6 +201,11 @@ impl Decoder {
         self.video_codec
     }
 
+    /// What copying the pictures out cost since the last ask: part of `decode`'s time.
+    pub fn take_copy_time(&mut self) -> std::time::Duration {
+        std::mem::take(&mut self.copy_time)
+    }
+
     /// Decode one encoded frame (Annex B with start codes for H.264/H.265,
     /// raw frames for VP8/VP9).
     ///
@@ -211,8 +216,20 @@ impl Decoder {
             self.configure_from_keyframe(data)?;
         }
 
-        self.queue_input(data)?;
-        self.drain_output()
+        match self.queue_input(data) {
+            Ok(()) => self.drain_output(),
+            // A codec holds its inputs while its pictures wait to be taken out, so a decode that
+            // fell behind ran out of inputs here and, never draining again, stayed frozen for
+            // the rest of the share (1.13, seen on the emulator). Take the pictures out, which
+            // frees inputs, and try this frame once more; if it still finds none, it is lost,
+            // and the error says so.
+            Err(first) => {
+                let mut frames = self.drain_output()?;
+                self.queue_input(data).map_err(|_| first)?;
+                frames.extend(self.drain_output()?);
+                Ok(frames)
+            }
+        }
     }
 
     /// Configure the codec from the first keyframe: parameter sets as CSD-0 for
@@ -247,7 +264,14 @@ impl Decoder {
         };
 
         // Parse width/height from the SPS if possible, otherwise use defaults
-        let (w, h) = parse_sps_dimensions(self.video_codec, data).unwrap_or((1920, 1080));
+        // HEVC only: for every other codec the configure hint is the 1920x1080 fallback, and
+        // the real size arrives with INFO_OUTPUT_FORMAT_CHANGED, which MediaCodec raises before
+        // the first decoded buffer (`update_output_format` resets stride and slice height).
+        let (w, h) = Some(self.video_codec)
+            .filter(|c| *c == VideoCodec::H265)
+            .and_then(|c| crate::frame_size::keyframe_size(c, data))
+            .filter(|&(w, h)| crate::frame_size::fits(w, h))
+            .unwrap_or((1920, 1080));
 
         let format = unsafe { ffi::AMediaFormat_new() };
         if format.is_null() {
@@ -409,7 +433,10 @@ impl Decoder {
                     let offset = info.offset as usize;
                     let size = info.size as usize;
                     let raw = std::slice::from_raw_parts(buf.add(offset), size);
-                    Some(self.convert_to_i420(raw))
+                    let started = std::time::Instant::now();
+                    let i420 = self.convert_to_i420(raw);
+                    self.copy_time += started.elapsed();
+                    Some(i420)
                 } else {
                     None
                 };
@@ -689,14 +716,6 @@ fn is_parameter_set(video_codec: VideoCodec, nal_type: u8) -> bool {
     }
 }
 
-/// The SPS NAL type for this codec.
-fn sps_nal_type(video_codec: VideoCodec) -> u8 {
-    match video_codec {
-        VideoCodec::H264 => 7,
-        _ => 33,
-    }
-}
-
 /// Extract the parameter sets from an Annex B keyframe as the CSD-0 buffer.
 ///
 /// Returns the byte range from the first parameter-set NAL through the end
@@ -742,196 +761,4 @@ fn split_h264_csd(csd: &[u8]) -> (&[u8], &[u8]) {
         }
     }
     (csd, &[])
-}
-
-/// Minimal HEVC SPS parser to extract pic_width and pic_height.
-///
-/// Parses just enough of the SPS NAL to reach pic_width_in_luma_samples
-/// and pic_height_in_luma_samples (both exp-Golomb coded).
-///
-/// HEVC only: for every other codec the configure hint is the 1920x1080
-/// fallback, and the real size arrives with INFO_OUTPUT_FORMAT_CHANGED, which
-/// MediaCodec raises before the first decoded buffer (`update_output_format`
-/// then resets stride and slice height along with it).
-/// bernd: add an H.264 SPS parser only if a device is ever seen to hand out
-/// a buffer before that callback.
-fn parse_sps_dimensions(video_codec: VideoCodec, data: &[u8]) -> Option<(u32, u32)> {
-    if video_codec != VideoCodec::H265 {
-        return None;
-    }
-    let positions = find_start_codes(data);
-
-    // Find the SPS NAL unit
-    for (i, &pos) in positions.iter().enumerate() {
-        let Some(t) = nal_type(video_codec, data, pos) else {
-            continue;
-        };
-        if t == sps_nal_type(video_codec) {
-            // SPS NAL type
-            let hdr_offset = if data[pos + 2] == 1 { pos + 3 } else { pos + 4 };
-            let nal_end = if i + 1 < positions.len() {
-                positions[i + 1]
-            } else {
-                data.len()
-            };
-            let nal_data = &data[hdr_offset..nal_end];
-            return parse_sps_nal(nal_data);
-        }
-    }
-    None
-}
-
-/// Parse width/height from raw SPS NAL unit bytes (after start code).
-fn parse_sps_nal(nal: &[u8]) -> Option<(u32, u32)> {
-    let mut reader = BitReader::new(nal);
-
-    // NAL unit header: 2 bytes (already identified as SPS)
-    reader.skip(16)?;
-
-    // sps_video_parameter_set_id: u4
-    reader.skip(4)?;
-    // sps_max_sub_layers_minus1: u3
-    let max_sub_layers = reader.read_bits(3)? as usize;
-    // sps_temporal_id_nesting_flag: u1
-    reader.skip(1)?;
-
-    // profile_tier_level(1, max_sub_layers_minus1)
-    skip_profile_tier_level(&mut reader, max_sub_layers)?;
-
-    // sps_seq_parameter_set_id: ue(v)
-    reader.read_ue()?;
-    // chroma_format_idc: ue(v)
-    let chroma_format = reader.read_ue()?;
-    if chroma_format == 3 {
-        // separate_colour_plane_flag: u1
-        reader.skip(1)?;
-    }
-
-    // pic_width_in_luma_samples: ue(v)
-    let width = reader.read_ue()?;
-    // pic_height_in_luma_samples: ue(v)
-    let height = reader.read_ue()?;
-
-    let max = MAX_DIMENSION as u32;
-    if width > 0
-        && height > 0
-        && width <= max
-        && height <= max
-        && width as u64 * height as u64 <= MAX_SPS_PIXELS
-    {
-        Some((width, height))
-    } else {
-        None
-    }
-}
-
-/// Skip the profile_tier_level() syntax structure in the bitstream.
-fn skip_profile_tier_level(reader: &mut BitReader, max_sub_layers: usize) -> Option<()> {
-    // general_profile_space(2) + general_tier_flag(1) + general_profile_idc(5)
-    reader.skip(8)?;
-    // general_profile_compatibility_flag[32]
-    reader.skip(32)?;
-    // general_progressive_source_flag..general_reserved_zero_43bits (48 bits)
-    reader.skip(48)?;
-    // general_level_idc: u8
-    reader.skip(8)?;
-
-    if max_sub_layers > 0 {
-        // sub_layer_profile_present_flag[i] + sub_layer_level_present_flag[i]
-        // for i in 0..max_sub_layers-1
-        let mut profile_present = Vec::new();
-        let mut level_present = Vec::new();
-        for _ in 0..max_sub_layers {
-            profile_present.push(reader.read_bits(1)? != 0);
-            level_present.push(reader.read_bits(1)? != 0);
-        }
-        // reserved bits to fill to 8 sub-layers
-        if max_sub_layers < 8 {
-            reader.skip(2 * (8 - max_sub_layers) as u32)?;
-        }
-        // sub_layer profile/level data
-        for i in 0..max_sub_layers {
-            if profile_present[i] {
-                // sub_layer_profile_space..compatibility_flag..constraint (88 bits)
-                reader.skip(88)?;
-            }
-            if level_present[i] {
-                reader.skip(8)?;
-            }
-        }
-    }
-    Some(())
-}
-
-// ---------------------------------------------------------------------------
-// Minimal bitstream reader for exp-Golomb parsing
-// ---------------------------------------------------------------------------
-
-struct BitReader<'a> {
-    data: &'a [u8],
-    byte_pos: usize,
-    bit_pos: u8, // 0..8, bits consumed in current byte
-}
-
-impl<'a> BitReader<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        Self {
-            data,
-            byte_pos: 0,
-            bit_pos: 0,
-        }
-    }
-
-    fn read_bit(&mut self) -> Option<u32> {
-        if self.byte_pos >= self.data.len() {
-            return None;
-        }
-        let bit = ((self.data[self.byte_pos] >> (7 - self.bit_pos)) & 1) as u32;
-        self.bit_pos += 1;
-        if self.bit_pos >= 8 {
-            self.bit_pos = 0;
-            self.byte_pos += 1;
-            // Handle emulation prevention bytes (0x00 0x00 0x03 → skip 0x03)
-            if self.byte_pos >= 2
-                && self.byte_pos < self.data.len()
-                && self.data[self.byte_pos] == 0x03
-                && self.data[self.byte_pos - 1] == 0x00
-                && self.data[self.byte_pos - 2] == 0x00
-            {
-                self.byte_pos += 1;
-            }
-        }
-        Some(bit)
-    }
-
-    fn read_bits(&mut self, n: u32) -> Option<u32> {
-        let mut val = 0u32;
-        for _ in 0..n {
-            val = (val << 1) | self.read_bit()?;
-        }
-        Some(val)
-    }
-
-    fn skip(&mut self, n: u32) -> Option<()> {
-        for _ in 0..n {
-            self.read_bit()?;
-        }
-        Some(())
-    }
-
-    /// Read unsigned exp-Golomb coded value.
-    fn read_ue(&mut self) -> Option<u32> {
-        let mut leading_zeros = 0u32;
-        while self.read_bit()? == 0 {
-            leading_zeros += 1;
-            if leading_zeros > 31 {
-                return None;
-            }
-        }
-        if leading_zeros == 0 {
-            return Some(0);
-        }
-        let suffix = self.read_bits(leading_zeros)?;
-        Some((1 << leading_zeros) - 1 + suffix)
-    }
 }

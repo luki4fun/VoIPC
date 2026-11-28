@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -11,12 +11,14 @@ use tokio::sync::{mpsc, RwLock};
 use tracing::warn;
 use zeroize::Zeroizing;
 
+use voipc_crypto::group_key::GroupKind;
 use voipc_protocol::messages::ServerMessage;
 use voipc_protocol::types::*;
 
 use crate::channels::{ChannelEntry, MAX_SLOW_MODE_SECS};
 use crate::config::ServerConfig;
 use crate::control::ControlTx;
+use crate::gk::group::cause as gk_cause;
 use crate::settings::ServerSettings;
 
 /// Simple token-bucket rate limiter.
@@ -196,10 +198,12 @@ pub struct UserSession {
     ///
     /// An entry appears only once the pair has passed the membership check, so
     /// the map is bounded by the people this user actually shares a channel
-    /// with; `remove_session` drops the departing user's entry from everybody
-    /// else's, because a user id is never handed out twice and the entry would
-    /// otherwise outlive the person for the life of the connection.
+    /// with. Limiters that have refilled are pruned as it grows (`may_relay_key_to`):
+    /// they say nothing a new one would not, and a departed user's refills too.
     pub key_relay_rate: HashMap<UserId, RateLimiter>,
+    /// The size at which `key_relay_rate` is next pruned: doubled each time, so a map of
+    /// live limiters is not walked again at every new target.
+    pub(crate) key_relay_prune_at: usize,
     /// The burst each of those limiters starts with: a sender key per channel
     /// this server can hold, plus the media key and room for a re-key or two.
     pub(crate) key_relay_burst: f64,
@@ -229,6 +233,43 @@ pub struct UserSession {
     pub silence: crate::restrict::Silence,
     /// The user_id of the screenshare this user is currently watching (if any).
     pub watching_screenshare: Option<UserId>,
+    /// This connection is the TCP tunnel (`tunnel.rs`): it reaches no edge, since what keeps
+    /// it off UDP to the relay keeps it off UDP to an edge too, so it watches from here.
+    pub tunnel: bool,
+    /// `ClientMessage::EdgeFailed`: one in 2 s. The app sends one per 10 s of silence.
+    pub edge_failed_rate: RateLimiter,
+    /// The edges that failed this viewer lately, with when: none of them is picked for it
+    /// again for `pool::AVOID_FOR`. At most `pool::MAX_AVOID`.
+    pub edge_avoid: Vec<(String, Instant)>,
+    /// The group key's asks (plan 1b), each refused `RATE` past its budget, which the app
+    /// paces: `EpochFetch` 10/s after a burst of 50 (one token a frame, however many past
+    /// epochs it names), `EpochBlobWanted` 20/s, `EpochNames` 1/s (a connect into a few
+    /// gated channels asks each once).
+    pub gk_fetch_rate: RateLimiter,
+    pub gk_blob_rate: RateLimiter,
+    pub gk_names_rate: RateLimiter,
+    /// `EpochPost`s: `chat_rate`'s 5 a second, but 32 at once, since an app sends everything
+    /// of the last `HOLD_MS` at once after `OLD_EPOCH` or `RATE`, and every post it held
+    /// while it waited for its key (writer.rs `flush`); a post refused here is lost to it.
+    pub gk_post_rate: RateLimiter,
+    /// `KeyholdVolunteer{on}`: 1 a minute after a burst of 4 (plan 1b). A browser offers
+    /// each time its page is shown or hidden or a call begins or ends (`BROWSER_BUSY`);
+    /// past the budget its newest offer is held, not refused.
+    pub gk_volunteer_rate: RateLimiter,
+    /// The newest `KeyholdVolunteer{on}` past its budget: it goes at the first keepalive
+    /// tick with a token (`gk_volunteer_late`), unless an `off` came after it. Refused, the
+    /// app would think itself offered for good (a refusal names no group it could place).
+    pub gk_volunteer_held: Option<voipc_protocol::messages::ClientMessage>,
+    /// The last `KeyholdVolunteer` let through was `on`: an `off` changes nothing otherwise.
+    pub gk_volunteered: bool,
+    /// When an `EpochFloorAhead` went last, per group (plan 1b: 1 a minute a group).
+    pub gk_ahead: HashMap<String, Instant>,
+    /// This connection's last `EpochPost` still waiting on its group's task (a blob does):
+    /// the next one waits behind it, so its posts keep their order while its other frames
+    /// are read on (plan 2a: never a blocked session).
+    pub gk_post_tail: Option<tokio::sync::oneshot::Receiver<()>>,
+    /// An old key path was refused on this connection already (plan 2k): told once.
+    pub gk_legacy_told: bool,
 
     // ── E2E Encryption fields ─────────────────────────────────────────
     /// Client's long-term identity public key (Curve25519). Opaque to server.
@@ -404,6 +445,7 @@ impl UserSession {
             // ~48 KiB of encrypting each.
             history_serve_rate: RateLimiter::new(6.0, 0.5),
             key_relay_rate: HashMap::new(),
+            key_relay_prune_at: KEY_RELAY_PRUNE_AT,
             key_relay_burst: channel_budget as f64 + 8.0,
             create_channel_rate: RateLimiter::new(1.0, 0.2),
             key_check_rate: RateLimiter::new(channel_budget as f64 + 8.0, 5.0),
@@ -415,19 +457,35 @@ impl UserSession {
             // what arriving costs: a pairwise session with everybody, for DMs
             // and for the keys. Draining somebody's one-time pre-keys is not
             // what this guards — running out is answered with a bundle that
-            // has none, which X3DH accepts.
-            prekey_bundle_rate: RateLimiter::new(max_users.max(16) as f64, 10.0),
+            // has none, which X3DH accepts. Past 10,000, though, what it guards is the
+            // relay's egress: 1.7 KB a bundle, 32 guests an address.
+            // shortcut: past 10,000 a newcomer reaches the rest at 10 a second; the group
+            // key (scale plan Track C) ends the pairwise arrival this pays for.
+            prekey_bundle_rate: RateLimiter::new(max_users.clamp(16, 10_000) as f64, 10.0),
             is_screen_sharing: false,
             listen_only: HashSet::new(),
             silence: Default::default(),
             watching_screenshare: None,
+            tunnel: false,
+            edge_failed_rate: RateLimiter::new(1.0, 0.5),
+            edge_avoid: Vec::new(),
+            gk_fetch_rate: RateLimiter::new(50.0, 10.0),
+            gk_blob_rate: RateLimiter::new(20.0, 20.0),
+            gk_names_rate: RateLimiter::new(4.0, 1.0),
+            gk_post_rate: RateLimiter::new(32.0, 5.0),
+            gk_volunteer_rate: RateLimiter::new(4.0, 1.0 / 60.0),
+            gk_volunteer_held: None,
+            gk_volunteered: false,
+            gk_ahead: HashMap::new(),
+            gk_post_tail: None,
+            gk_legacy_told: false,
             identity_key: None,
             bundle: None,
         }
     }
 
     /// This member as a row of `channel_id`'s list.
-    fn row_in(
+    pub(crate) fn row_in(
         &self,
         channel_id: ChannelId,
         username: String,
@@ -457,6 +515,12 @@ impl UserSession {
     /// Call it only once the pair has passed the membership check: that is
     /// what keeps the map to people this user really shares a channel with.
     pub fn may_relay_key_to(&mut self, target: UserId) -> bool {
+        if self.key_relay_rate.len() >= self.key_relay_prune_at
+            && !self.key_relay_rate.contains_key(&target)
+        {
+            self.key_relay_rate.retain(|_, limiter| !limiter.is_full());
+            self.key_relay_prune_at = KEY_RELAY_PRUNE_AT.max(2 * self.key_relay_rate.len());
+        }
         let burst = self.key_relay_burst;
         self.key_relay_rate
             .entry(target)
@@ -473,6 +537,14 @@ impl UserSession {
 /// follows it, and nothing honest sustains a rate to one person at all — a key
 /// is handed over once per channel and then only when somebody leaves.
 const KEY_RELAY_REFILL: f64 = 2.0;
+/// Below this many targets `key_relay_rate` is never pruned.
+const KEY_RELAY_PRUNE_AT: usize = 1024;
+
+/// Writers a follower may have asked of it at once (`session_asked`). Past that the set is
+/// emptied, departed writers' entries with the rest.
+/// shortcut: a writer still waiting then has its hello refused and asks again; prune by who is
+/// online instead if a relay ever sees this.
+pub const MAX_ASKED: usize = 4096;
 
 /// Tracks an active screen share session within a channel.
 pub struct ScreenShareSession {
@@ -482,7 +554,302 @@ pub struct ScreenShareSession {
     pub viewers: HashSet<UserId>,
     /// Codec the sharer encodes with; handed to every viewer on watch.
     pub codec: VideoCodec,
+    /// What it may send each viewer at its resolution (kbit/s), for `[media]`'s budget.
+    pub ceiling_kbps: u32,
+    /// The viewers a media edge serves (`[pool]`), and where. The rest of `viewers` are
+    /// served by this relay. `viewers` names both, so the count, keyframe requests and loss
+    /// reports are the same wherever a viewer watches from.
+    pub on_edge: HashMap<UserId, crate::pool::Placement>,
+    /// How many of `on_edge` each edge serves, by its name: this relay sends each of these
+    /// edges one copy of the share.
+    edges: HashMap<String, u32>,
 }
+
+impl ScreenShareSession {
+    fn new(
+        sharer_user_id: UserId,
+        sharer_session_id: SessionId,
+        codec: VideoCodec,
+        ceiling_kbps: u32,
+    ) -> Self {
+        Self {
+            sharer_user_id,
+            sharer_session_id,
+            viewers: HashSet::new(),
+            codec,
+            ceiling_kbps,
+            on_edge: HashMap::new(),
+            edges: HashMap::new(),
+        }
+    }
+
+    /// The viewers this relay sends the share to itself.
+    pub fn local_viewers(&self) -> usize {
+        self.viewers.len().saturating_sub(self.on_edge.len())
+    }
+
+    /// The edges this relay sends the share to, one copy each.
+    pub fn edges_fed(&self) -> usize {
+        self.edges.len()
+    }
+
+    /// What the share costs this relay to send (kbit/s), counted at its resolution: one copy
+    /// for each of its own viewers, and one for each edge that serves any.
+    pub fn egress_kbps(&self) -> u64 {
+        self.ceiling_kbps as u64 * (self.local_viewers() + self.edges_fed()) as u64
+    }
+
+    fn put_on_edge(&mut self, viewer: UserId, placement: crate::pool::Placement) {
+        *self.edges.entry(placement.edge.clone()).or_insert(0) += 1;
+        if let Some(before) = self.on_edge.insert(viewer, placement) {
+            self.forget_edge(&before.edge);
+        }
+    }
+
+    fn take_off_edge(&mut self, viewer: UserId) -> Option<crate::pool::Placement> {
+        let placement = self.on_edge.remove(&viewer)?;
+        self.forget_edge(&placement.edge);
+        Some(placement)
+    }
+
+    fn forget_edge(&mut self, edge: &str) {
+        if let Some(n) = self.edges.get_mut(edge) {
+            *n -= 1;
+            if *n == 0 {
+                self.edges.remove(edge);
+            }
+        }
+    }
+
+    /// Takes `viewer` out of the share. One an edge served has its ticket's slot revoked
+    /// there (`CoreMsg::Revoke`), so the edge ends it, and the edge's counts here go down.
+    /// Whether it watched. The caller refans.
+    pub(crate) fn drop_viewer(&mut self, viewer: UserId, pool: Option<&crate::pool::Pool>) -> bool {
+        if let Some(placement) = self.take_off_edge(viewer) {
+            if let Some(pool) = pool {
+                pool.unplace(&placement, self.sharer_session_id, self.ceiling_kbps, true);
+            }
+        }
+        self.viewers.remove(&viewer)
+    }
+}
+
+/// The end of a share, for the edges that carry it: each is told `CoreMsg::ShareEnded`,
+/// which ends its viewers there, and its counts and feed of the share go. Every path that
+/// removes a share from its channel comes here.
+fn end_share(state: &ServerState, share: &ScreenShareSession) {
+    if let Some(pool) = &state.pool {
+        pool.end_share(
+            state,
+            share.sharer_session_id,
+            share.ceiling_kbps,
+            share.on_edge.values(),
+        );
+    }
+}
+
+/// Whether `user` shares in any channel: what `UserSession::is_screen_sharing` says. A share
+/// can be left in a room its sharer was moved out of until that move's own cleanup ends it
+/// (a kick's comes after the log is written), and the flag stays up until it does, so that
+/// no second share of the same sharer starts meanwhile: past `channels`, a share is known by
+/// its sharer alone (its fan, the pool's placements and feeds, an edge's tickets), and two
+/// would feed each other's edges and end each other there.
+fn shares_anywhere(channels: &HashMap<ChannelId, Channel>, user: UserId) -> bool {
+    channels
+        .values()
+        .any(|c| c.screen_shares.contains_key(&user))
+}
+
+/// What a share costs this relay to send, all of them together (kbit/s): what `[media]
+/// video_egress_mbit` is weighed against.
+pub(crate) fn video_egress_kbps(channels: &HashMap<ChannelId, Channel>) -> u64 {
+    channels
+        .values()
+        .flat_map(|c| c.screen_shares.values())
+        .map(ScreenShareSession::egress_kbps)
+        .sum()
+}
+
+/// What `watch_screen_share` says.
+#[derive(Debug)]
+pub struct Watched {
+    pub sharer_sid: SessionId,
+    /// How many watch the share now.
+    pub new_count: u32,
+    pub codec: VideoCodec,
+    /// Where the viewer fetches the share, when an edge serves it: `ServerMessage::WatchAt`'s
+    /// placement and edge, to go right after `WatchingScreenShare`.
+    pub edge: Option<(u64, EdgeView)>,
+}
+
+/// Where a viewer is seated (`ServerState::seat`).
+enum Spot {
+    Edge(crate::pool::Placement, EdgeView),
+    Here,
+}
+
+/// The edges a viewer is to avoid now, of those that failed it (`UserSession::edge_avoid`),
+/// once those past `pool::AVOID_FOR` are forgotten.
+fn avoided(list: &mut Vec<(String, Instant)>, now: Instant) -> Vec<String> {
+    list.retain(|(_, at)| now.saturating_duration_since(*at) < crate::pool::AVOID_FOR);
+    list.iter().map(|(edge, _)| edge.clone()).collect()
+}
+
+/// Where one share's packets go (`ServerState::share_fans`), kept beside `channels` so the
+/// video path takes no `channels` lock per packet. With a read lock for each packet, every
+/// join, leave and watch waited behind the fan-out, and as the lock is write-preferring, a
+/// write that waited held up every share's packets in turn.
+///
+/// Each half is swapped whole and read by cloning the `Arc`, so a packet goes to the list as
+/// it was when the packet came in.
+pub struct Fan {
+    /// The channel the share is in. A packet goes out only while its sharer is still there:
+    /// a kick moves the sharer to General under the lock, and the share is ended after.
+    pub channel_id: ChannelId,
+    /// The media queues of the viewers on this relay, as the share's `viewers` names them.
+    /// Rebuilt under the `channels` write lock on every change of who watches, which keeps
+    /// two rebuilds in order (`ServerState::refan`).
+    pub local: Arc<[mpsc::Sender<Bytes>]>,
+    /// The feeds of the edges that carry this share. Empty while no edge does; the pool
+    /// swaps it without the `channels` lock.
+    pub feeds: Arc<[mpsc::Sender<Bytes>]>,
+    /// When the share last sent a video fragment, in `ServerState::uptime_ms`; 0 while it has
+    /// sent none. Viewers who say they get nothing from an edge are not moved while the share
+    /// itself is silent. Screen audio does not count: viewers judge an edge by its video.
+    pub last_packet_ms: Arc<AtomicU64>,
+    /// What the sharer is told of its viewers. Here and not under `channels`, so a loss
+    /// report, of which a big share's viewers send up to a thousand a second, takes no
+    /// `channels` lock.
+    pub news: Mutex<ShareNews>,
+}
+
+impl Fan {
+    fn new(channel_id: ChannelId, sharer_tx: ControlTx) -> Self {
+        Self {
+            channel_id,
+            local: Arc::from(Vec::new()),
+            feeds: Arc::from(Vec::new()),
+            last_packet_ms: Arc::default(),
+            news: Mutex::new(ShareNews::new(sharer_tx)),
+        }
+    }
+}
+
+/// Above this many viewers a sharer hears its viewers' loss as one `VideoLossSummary` a
+/// second, not as each viewer's `VideoLossReported`: a thousand viewers who each report
+/// every 2 s were 500 messages a second to one app.
+pub const LOSS_SUMMARY_ABOVE: u32 = 8;
+/// A viewer's loss report counts in the summary for this long, as it does in the apps'
+/// own tally of `VideoLossReported` (viewers report every 2 s).
+pub const LOSS_REPORT_TTL_MS: u64 = 2_000;
+
+/// What a sharer hears about its viewers, each kind at most once a second
+/// (`ServerState::share_tick`), apart from the count going to 0 or from 0, which goes at once:
+/// the app captures only while somebody watches.
+///
+/// Sent under this lock, so two counts reach the app in the order they were made. Each
+/// change of who watches comes here under the `channels` write lock (`ServerState::refan`),
+/// the tick and the loss reports with no `channels` lock.
+pub struct ShareNews {
+    /// The sharer's control queue, taken when the share started: nothing here looks
+    /// `sessions` up while the fan's shard is held.
+    tx: ControlTx,
+    /// How many watch, as the share's `viewers` counts them.
+    viewers: u32,
+    /// The count the sharer was told last.
+    told: u32,
+    /// The viewers who reported loss in the last `LOSS_REPORT_TTL_MS`, with when
+    /// (`ServerState::uptime_ms`). Filled only while more than `LOSS_SUMMARY_ABOVE` watch.
+    lossy: HashMap<UserId, u64>,
+    /// A loss report came in since the last summary: a summary goes out only after news.
+    fresh: bool,
+}
+
+impl ShareNews {
+    fn new(tx: ControlTx) -> Self {
+        Self {
+            tx,
+            viewers: 0,
+            told: 0,
+            lossy: HashMap::new(),
+            fresh: false,
+        }
+    }
+
+    /// Who watches changed: to 0 or from 0 the sharer is told at once, the rest waits for
+    /// the tick, which sends the last count of the second, if it is not what was told.
+    fn viewers_now(&mut self, viewers: u32) {
+        self.viewers = viewers;
+        if (viewers == 0) != (self.told == 0) {
+            self.tell_count();
+        }
+    }
+
+    fn tell_count(&mut self) {
+        self.told = self.viewers;
+        let _ = crate::session::send_msg(
+            &self.tx,
+            &ServerMessage::ViewerCountChanged {
+                viewer_count: self.viewers,
+            },
+        );
+    }
+
+    /// A viewer lost frames: relayed as it is to a sharer with few viewers, kept for the
+    /// summary above `LOSS_SUMMARY_ABOVE`. A report of no loss counts for nothing there,
+    /// as the apps count it.
+    fn loss(&mut self, viewer: UserId, frames_dropped: u32, frames_received: u32, now_ms: u64) {
+        if self.viewers <= LOSS_SUMMARY_ABOVE {
+            let _ = crate::session::send_msg(
+                &self.tx,
+                &ServerMessage::VideoLossReported {
+                    viewer_user_id: viewer,
+                    frames_dropped,
+                    frames_received,
+                },
+            );
+        } else if frames_dropped > 0 {
+            self.lossy.insert(viewer, now_ms);
+            self.fresh = true;
+        }
+    }
+
+    /// Once a second: the count, if the sharer was told another, and a summary of the loss
+    /// reported since the last one.
+    fn tick(&mut self, now_ms: u64) {
+        if self.viewers != self.told {
+            self.tell_count();
+        }
+        self.lossy
+            .retain(|_, at| now_ms.saturating_sub(*at) < LOSS_REPORT_TTL_MS);
+        if std::mem::take(&mut self.fresh) && !self.lossy.is_empty() {
+            // Somebody who reported and left within the 2 s still counts, but never past
+            // how many watch: the app weighs the one against the other.
+            let reporters = (self.lossy.len() as u32).min(self.viewers);
+            let _ = crate::session::send_msg(
+                &self.tx,
+                &ServerMessage::VideoLossSummary {
+                    reporters,
+                    viewers: self.viewers,
+                },
+            );
+        }
+    }
+}
+
+/// What a share may send each viewer, by its resolution (kbit/s): the encoders' top rates.
+pub fn share_ceiling_kbps(resolution: u16) -> u32 {
+    match resolution {
+        1080.. => 7500,
+        720.. => 4000,
+        _ => 2000,
+    }
+}
+
+/// A watch refused for room, not because of anything the viewer did.
+pub const SHARE_FULL: &str =
+    "This share is full: it has as many viewers as this server carries. Try again later.";
+pub const VIDEO_FULL: &str = "This server is sending all the video it can. Try again later.";
 
 /// A follower's place in a text channel's count (`Follow`).
 #[derive(Clone, Copy)]
@@ -765,7 +1132,7 @@ impl Channel {
 
 /// Whether everyone with an app holds who stands in this room, as a list they asked for or
 /// the joins since: so a bare id tells them who it is.
-fn list_is_public(channel: &Channel) -> bool {
+pub(crate) fn list_is_public(channel: &Channel) -> bool {
     !channel.info.text
         && !channel.info.anonymous
         && !channel.info.hide_members
@@ -773,13 +1140,21 @@ fn list_is_public(channel: &Channel) -> bool {
         && !channel.gated()
 }
 
+/// What an anonymous room does is not told under the real name: a mute or a share there
+/// and here at once ties the two (G1).
+pub(crate) fn masked_flags(row: &mut UserInfo) {
+    row.is_muted = false;
+    row.is_deafened = false;
+    row.is_screen_sharing = false;
+}
+
 /// What a page of people may fill: a frame, less what goes around it.
-const PAGE_BYTES: usize = 60 * 1024;
+pub(crate) const PAGE_BYTES: usize = 60 * 1024;
 /// What a bare id costs a page at most.
 const ID_BYTES: usize = 5;
 
 /// What a row costs a page at most: its ids and flags, and its strings.
-fn row_bytes(row: &UserInfo) -> usize {
+pub(crate) fn row_bytes(row: &UserInfo) -> usize {
     48 + row.username.len() + row.badges.iter().map(|b| b.len() + 5).sum::<usize>()
 }
 
@@ -810,6 +1185,7 @@ fn check_admission(
     user_id: UserId,
     password: Option<&str>,
     passes_gate: bool,
+    room_cap: u32,
 ) -> anyhow::Result<bool> {
     // Worded as for a channel that is not there: to someone outside its
     // groups, it is not (`gates`). No invite opens it either.
@@ -834,7 +1210,14 @@ fn check_admission(
         }
     }
 
-    if channel.info.max_users > 0 && channel.members.len() >= channel.info.max_users as usize {
+    // A voice room with no cap of its own takes `[media] voice_room`: each joiner there trades
+    // keys with every member, and each voice packet is sent to each. A routed room sends each
+    // only to who is near, and keeps no cap it was not given.
+    let cap = match channel.info.max_users {
+        0 if !channel.info.text && !channel.info.routed && channel.info.channel_id != 0 => room_cap,
+        own => own,
+    };
+    if cap > 0 && channel.members.len() >= cap as usize {
         anyhow::bail!("channel is full");
     }
 
@@ -1035,6 +1418,17 @@ pub struct ServerState {
     /// Here rather than on the channel, so leaving and coming back does not
     /// reset the clock; an account's goes across its connections.
     pub post_marks: DashMap<(ChannelId, Poster, PostStamp), Instant>,
+    /// Who online may call on everybody (`accounts::holds_mention_power`), kept as it
+    /// changes so a connect is not a walk of every session to find out.
+    pub mention_holders: dashmap::DashSet<UserId>,
+    /// The lobby's pages, watchers and size for live news (`lobby`, protocol v25).
+    pub lobby: crate::lobby::Lobby,
+    /// What screen shares may cost (`[media]`).
+    pub media: crate::config::MediaConfig,
+    /// The UDP port, whose socket's drops the Load view reads (`web::udp_drops`).
+    pub udp_port: u16,
+    /// Accounts on SQLite, which a very big relay outgrows (the Load view says so).
+    pub sqlite_accounts: bool,
     /// `tcp_fallback`: whether `GET /voipc` is served (`tunnel::serve`).
     pub tcp_fallback: bool,
     /// The encrypted file cache; `None` with `[files] enabled = false`, and
@@ -1043,6 +1437,15 @@ pub struct ServerState {
     /// The server's emotes; `None` with `[emotes] enabled = false`, and until
     /// main.rs has opened their directory (`emotes::EmoteStore::open`).
     pub emotes: Option<Arc<crate::emotes::EmoteStore>>,
+    /// Where each screen share's packets go, by sharer (`Fan`). The video path reads this
+    /// and never `channels`.
+    pub share_fans: DashMap<UserId, Fan>,
+    /// When this state was made: the clock of `uptime_ms`.
+    pub started: Instant,
+    /// The media edges of `[pool]`; `None` without any.
+    pub pool: Option<Arc<crate::pool::Pool>>,
+    /// The group epoch key (`group_key`), and this start's run.
+    pub gk: Arc<crate::gk::Groups>,
 }
 
 /// Which of a member's posts slow mode counts: the live message, or its copy
@@ -1226,10 +1629,25 @@ impl ServerState {
             import: tokio::sync::Mutex::new(None),
             account_sessions: DashMap::new(),
             post_marks: DashMap::new(),
+            mention_holders: dashmap::DashSet::new(),
+            lobby: crate::lobby::Lobby::new(config.live_lobby),
+            media: config.media.clone(),
+            udp_port: config.udp_port,
+            sqlite_accounts: config.accounts.mode != crate::config::AccountsMode::Off
+                && config.accounts.database.starts_with("sqlite"),
             tcp_fallback: config.tcp_fallback,
             files: None,
             emotes: None,
+            share_fans: DashMap::new(),
+            started: Instant::now(),
+            pool: crate::pool::Pool::new(&config.pool).map(Arc::new),
+            gk: Arc::new(crate::gk::Groups::new(config.group_key)),
         }
+    }
+
+    /// Milliseconds since this state was made, on a clock no change of the wall clock moves.
+    pub fn uptime_ms(&self) -> u64 {
+        self.started.elapsed().as_millis() as u64
     }
 
     /// A state for tests, with the default settings.
@@ -1399,8 +1817,9 @@ impl ServerState {
 
     /// Broadcast a raw serialized message to all connected sessions.
     pub async fn broadcast_raw_to_all(&self, data: &[u8]) {
+        let data = bytes::Bytes::copy_from_slice(data);
         for entry in self.sessions.iter() {
-            let _ = entry.value().control_tx.try_send(data.to_vec());
+            let _ = entry.value().control_tx.try_send(data.clone());
         }
     }
 
@@ -1556,6 +1975,7 @@ impl ServerState {
             user_id,
             password,
             self.passes(user_id, &channel.gate.groups),
+            self.media.voice_room,
         )?;
 
         Ok(())
@@ -1570,7 +1990,7 @@ impl ServerState {
         session_id: SessionId,
         channel_id: ChannelId,
         password: Option<&str>,
-    ) -> anyhow::Result<Vec<SessionId>> {
+    ) -> anyhow::Result<()> {
         let mut channels = self.channels.write().await;
 
         // Read under the lock, which is the only place `channel_id` changes.
@@ -1591,7 +2011,7 @@ impl ServerState {
         // refused for some other reason — so it is consumed only here, once
         // the admission has been granted in full.
         let passes = self.passes(user_id, &channel.gate.groups);
-        if check_admission(channel, user_id, password, passes)? {
+        if check_admission(channel, user_id, password, passes, self.media.voice_room)? {
             channel.end_invite(user_id);
         }
         let speakers = channel.gate.speakers.clone();
@@ -1600,13 +2020,6 @@ impl ServerState {
         if let Some(timer) = channel.delete_timer.take() {
             timer.abort();
         }
-
-        // Get other members before adding (for notification)
-        let others: Vec<SessionId> = channel
-            .members
-            .iter()
-            .filter_map(|&uid| self.sessions.contains_key(&uid).then_some(uid))
-            .collect();
 
         channel.members.insert(user_id);
         channel.info.user_count = channel.members.len() as u32;
@@ -1620,11 +2033,14 @@ impl ServerState {
 
         // Update the session's channel_id, and whether they may speak in it:
         // under this lock, so no voice gets past before it is known
+        let mut account = None;
         if let Some(mut session) = self.sessions.get_mut(&session_id) {
             session.channel_id = channel_id;
             let listen = !crate::gates::passes(&session, &speakers);
             crate::gates::mark(&mut session.listen_only, channel_id, listen);
+            account = session.account_id();
         }
+        self.gk_room_join(channel, user_id, account);
         // A voice room is one at a time. The caller leaves the old one first
         // (and tells its members); this is for a move that landed in between,
         // a kick's to General, which would otherwise leave them in both.
@@ -1633,6 +2049,7 @@ impl ServerState {
                 if old.members.remove(&user_id) {
                     old.info.user_count = old.members.len() as u32;
                     old.pseudonyms.remove(&user_id);
+                    self.gk_room_leave(old, user_id, gk_cause::LEAVE);
                 }
             }
         }
@@ -1642,7 +2059,7 @@ impl ServerState {
         // has left, which is exactly what this server should not be keeping.
         self.routing.clear_session(session_id);
 
-        Ok(others)
+        Ok(())
     }
 
     /// Whether a channel exists and is a text channel.
@@ -1697,7 +2114,7 @@ impl ServerState {
         }
 
         let passes = self.passes(user_id, &channel.gate.groups);
-        if check_admission(channel, user_id, password, passes)? {
+        if check_admission(channel, user_id, password, passes, self.media.voice_room)? {
             channel.end_invite(user_id);
         }
         if let Some(mut session) = self.sessions.get_mut(&user_id) {
@@ -1769,7 +2186,7 @@ impl ServerState {
             };
             if !channel.members.contains(&user_id) {
                 let passes = crate::gates::passes_without_star(&session, &channel.gate.groups);
-                match check_admission(channel, user_id, None, passes) {
+                match check_admission(channel, user_id, None, passes, self.media.voice_room) {
                     Ok(invited) => {
                         if invited {
                             channel.end_invite(user_id);
@@ -1790,9 +2207,56 @@ impl ServerState {
             let listen = !crate::gates::passes(&session, &channel.gate.speakers);
             crate::gates::mark(&mut session.listen_only, channel_id, listen);
             joined.push(channel.seat_row(listen));
+            self.gk_follow(channel, user_id, session.account_id());
         }
         drop(session);
         send_text_joined(tx, joined, refused);
+    }
+
+    /// A text channel's group id (spec §11.1): `c:` its offered log, else `r:`.
+    pub(crate) fn gk_id(&self, channel: &Channel) -> String {
+        let log = Some(channel.info.log.as_str()).filter(|l| !l.is_empty());
+        self.gk.id_for(channel.info.channel_id, log)
+    }
+
+    /// A follower of a text channel, whole or quiet, follows its group (plan 2a). The
+    /// channel's gate goes first where the group key does not hold it yet (a channel loaded
+    /// or made with one): the group, whichever path started it, holds it before any due.
+    fn gk_follow(&self, channel: &Channel, user_id: UserId, account: Option<[u8; 16]>) {
+        if !self.gk.on {
+            return;
+        }
+        let (channel_id, id) = (channel.info.channel_id, self.gk_id(channel));
+        if self.gk.gated(channel_id) != channel.gated() {
+            self.gk.on_gate(channel_id, channel.gated());
+        }
+        self.gk
+            .on_follow(channel_id, &id, GroupKind::Text, user_id, account);
+    }
+
+    /// A member of a voice room follows its group from its join on (plan part 5), the
+    /// channel's gate told first as `gk_follow` tells it. The lobby carries no voice.
+    fn gk_room_join(&self, channel: &Channel, user_id: UserId, account: Option<[u8; 16]>) {
+        let channel_id = channel.info.channel_id;
+        if !self.gk.on || channel.info.text || channel_id == 0 {
+            return;
+        }
+        if self.gk.gated(channel_id) != channel.gated() {
+            self.gk.on_gate(channel_id, channel.gated());
+        }
+        self.gk
+            .on_room_join(channel_id, user_id, account, channel.info.anonymous);
+    }
+
+    /// Out of a voice room, already taken out of its members: its seat exits, with `cause`,
+    /// and the room's group goes once nobody is left in it.
+    fn gk_room_leave(&self, channel: &Channel, user_id: UserId, cause: u8) {
+        if !self.gk.on || channel.info.text {
+            return;
+        }
+        let empty = channel.members.is_empty();
+        self.gk
+            .on_room_leave(channel.info.channel_id, user_id, cause, empty);
     }
 
     /// Takes followed channels whole or quiet. Going quiet is no exit: nobody rotates, and
@@ -1887,9 +2351,11 @@ impl ServerState {
             let Some(session) = self.sessions.get(uid) else {
                 continue;
             };
-            let public = channels
-                .get(&session.channel_id)
-                .is_some_and(list_is_public);
+            // Since 25 no app holds the lobby whole: someone standing there goes as a row
+            let public = session.channel_id != 0
+                && channels
+                    .get(&session.channel_id)
+                    .is_some_and(list_is_public);
             // Standing in an anonymous room: what it does there is not told under the name
             // here, or a mute or a share there and here at once ties the two (G1)
             let masked_room = channels
@@ -1901,9 +2367,7 @@ impl ServerState {
                 let account = account_shown(session.account_id(), true, false);
                 let mut row = session.row_in(channel_id, session.username.clone(), account);
                 if masked_room {
-                    row.is_muted = false;
-                    row.is_deafened = false;
-                    row.is_screen_sharing = false;
+                    masked_flags(&mut row);
                 }
                 row
             });
@@ -1989,6 +2453,7 @@ impl ServerState {
         if let Some(first) = channel.follow.remove(user_id) {
             self.exit_due(channel_id, &channel.follow, first);
         }
+        self.gk.on_unfollow(channel_id, user_id);
         Some(channel.members.len())
     }
 
@@ -2010,6 +2475,12 @@ impl ServerState {
                     self.exit_due(channel.info.channel_id, &channel.follow, first);
                 }
             }
+            // Put out, their seat exits at once; going offline is the group's to judge
+            // (`on_session_end`: an account's text seat stays)
+            if ejected {
+                self.gk
+                    .on_kick(channel.info.channel_id, user_id, gk_cause::KICK);
+            }
             left.push((channel.info.channel_id, channel.members.len()));
         }
         left
@@ -2021,7 +2492,7 @@ impl ServerState {
         &self,
         user_id: UserId,
         session_id: SessionId,
-    ) -> Option<(ChannelId, Vec<SessionId>, usize)> {
+    ) -> Option<(ChannelId, usize)> {
         let mut channels = self.channels.write().await;
         // Under the lock: a kick moves the session to General under it, and a
         // `channel_id` read before would leave the wrong room (S-002).
@@ -2033,6 +2504,7 @@ impl ServerState {
             return None;
         }
         channel.info.user_count = channel.members.len() as u32;
+        self.gk_room_leave(channel, user_id, gk_cause::LEAVE);
         // Coming back means a new pseudonym, which is the point
         channel.pseudonyms.remove(&user_id);
         // Whatever they asked to hear belonged to this channel. `join_channel`
@@ -2040,15 +2512,7 @@ impl ServerState {
         // one — stepping back into the lobby — and a stale answer about people
         // somebody has left is exactly what this server should not be keeping.
         self.routing.clear_session(session_id);
-
-        let remaining: Vec<SessionId> = channel
-            .members
-            .iter()
-            .filter_map(|&uid| self.sessions.contains_key(&uid).then_some(uid))
-            .collect();
-
-        let count = channel.members.len();
-        Some((channel_id, remaining, count))
+        Some((channel_id, channel.members.len()))
     }
 
     /// Remove a user session entirely (on disconnect).
@@ -2056,6 +2520,8 @@ impl ServerState {
         let (_, session) = self.sessions.remove(&session_id)?;
 
         self.routing.clear_session(session_id);
+        // Out of every group it followed, its volunteering and its commit lane with it
+        self.gk.on_session_end(session_id);
         // Only if it is still ours: an account signing in again elsewhere
         // took the name over, and this cleanup runs after that.
         self.username_to_session
@@ -2066,6 +2532,8 @@ impl ServerState {
             self.account_sessions
                 .remove_if(&a.user.id.0, |_, sid| *sid == session_id);
         }
+        self.mention_holders.remove(&session.user_id);
+        self.lobby.watchers.remove(&session.user_id);
         // A guest's slow-mode clock goes with its connection; an account's stays.
         self.post_marks
             .retain(|(_, p, _), _| *p != Poster::Session(session_id));
@@ -2073,7 +2541,9 @@ impl ServerState {
         // Remove from channel
         let mut channels = self.channels.write().await;
         if let Some(channel) = channels.get_mut(&session.channel_id) {
-            channel.members.remove(&session.user_id);
+            if channel.members.remove(&session.user_id) {
+                self.gk_room_leave(channel, session.user_id, gk_cause::DISCONNECT);
+            }
             channel.info.user_count = channel.members.len() as u32;
         }
         // Unanswered invites would otherwise pin the user_id in every
@@ -2081,15 +2551,21 @@ impl ServerState {
         for channel in channels.values_mut() {
             channel.end_invite(session.user_id);
         }
-        // And the same for the budget everybody else holds for relaying keys
-        // *to* them. A user id is never handed out twice, so an entry left here
-        // is a limiter for somebody who will never come back — one per person a
-        // long-lived session has ever shared a channel with.
-        for mut other in self.sessions.iter_mut() {
-            other.key_relay_rate.remove(&session.user_id);
-            other.session_asked.remove(&session.user_id);
+        // The fans hold media queues themselves, so this one comes out of any it is still in
+        // (the share cleanup takes it out of `viewers` first, on every path that has one).
+        // Out of the share too, or an edge would keep its seat and its ticket. A share of its
+        // own sends nothing more: its packets came on this connection.
+        self.share_fans.remove(&session.user_id);
+        for (&channel_id, channel) in channels.iter_mut() {
+            for share in channel.screen_shares.values_mut() {
+                if share.drop_viewer(session.user_id, self.pool.as_deref()) {
+                    self.refan(channel_id, share);
+                }
+            }
         }
-
+        // Not swept from everybody else's `key_relay_rate` and `session_asked` here: a walk
+        // of every session under this lock stalled every voice packet at each disconnect.
+        // Those prune themselves (`may_relay_key_to`, `MAX_ASKED`).
         Some(session)
     }
 
@@ -2213,7 +2689,7 @@ impl ServerState {
         // Plain drop, no abort: the caller IS the timer task whose handle is
         // stored here — aborting it would cancel the ChannelDeleted broadcast
         // that follows at its next yield point.
-        let _ = channels.remove(&channel_id);
+        self.remove_channel(&mut channels, channel_id);
         // And with it whatever a game server had told us about who could hear
         // whom in it: the ids will be handed to different people. (The channel
         // is empty — that is checked above — so there are no members' own
@@ -2221,6 +2697,58 @@ impl ServerState {
         self.routing.clear_channel(channel_id, []);
 
         Ok(())
+    }
+
+    /// Takes `channel_id` out of `channels`, with every share still in it: of a sharer moved
+    /// out before that move's cleanup ran, or of one who came in while it was being emptied.
+    /// Each ends as a stop ends it, but for the room's own messages, since everyone who
+    /// could see the channel is told it is gone: its edges let it go (`end_share`), its fan
+    /// goes, its sharer may share again, and a viewer still watching it is told it stopped.
+    /// Every path that removes a channel comes here, under the `channels` write lock.
+    pub(crate) fn remove_channel(
+        &self,
+        channels: &mut HashMap<ChannelId, Channel>,
+        channel_id: ChannelId,
+    ) {
+        let Some(gone) = channels.remove(&channel_id) else {
+            return;
+        };
+        for share in gone.screen_shares.values() {
+            let sharer = share.sharer_user_id;
+            self.share_fans
+                .remove_if(&sharer, |_, fan| fan.channel_id == channel_id);
+            end_share(self, share);
+            if let Some(mut session) = self.sessions.get_mut(&share.sharer_session_id) {
+                if !shares_anywhere(channels, sharer) {
+                    session.is_screen_sharing = false;
+                }
+            }
+            for viewer in &share.viewers {
+                if let Some(mut session) = self.sessions.get_mut(viewer) {
+                    if session.watching_screenshare == Some(sharer) {
+                        session.watching_screenshare = None;
+                        let _ = crate::session::send_msg(
+                            &session.control_tx,
+                            &ServerMessage::StoppedWatchingScreenShare {
+                                reason: "sharer_left".into(),
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        // A text channel's group goes with it, retired as a moved one is and followed by
+        // nobody: a delete takes its followers out in bulk (layout's, with no word to the
+        // group), a purged conversation's rows must not be written back, and an `r:` id
+        // comes back with the channel id. Its name for the group and its gate go with it: an
+        // id made again starts open. So does a voice room's
+        if self.gk.on {
+            let id = match gone.info.text {
+                true => self.gk_id(&gone),
+                false => self.gk.room_id(channel_id),
+            };
+            self.gk.on_channel_gone(channel_id, &id);
+        }
     }
 
     /// Change a channel's password (creator or admin). Returns the updated
@@ -2351,6 +2879,7 @@ impl ServerState {
         if !overrides && channel.info.created_by != Some(user_id) {
             anyhow::bail!("only the channel creator can change the channel options");
         }
+        let group_was = self.gk_id(channel);
 
         // A text channel carries no voice, so the options about voice do not
         // apply there — and turning screen share "on" in one would advertise
@@ -2436,13 +2965,38 @@ impl ServerState {
                         channel.pseudonyms.insert(uid, name);
                     }
                 }
+                // A voice room's seats are named anew (open choice 11)
+                if !channel.info.text {
+                    self.gk.on_room_anonymous(channel_id, v);
+                }
             }
         }
         // ponytail: a log switched off this way keeps its stored members and
         // entries until they expire; clients just stop writing to it.
         channel.refresh_log();
+        self.gk_moved(channel, &group_was);
 
         Ok((channel.info.clone(), changed))
+    }
+
+    /// A text channel's offered log came or went (`hide_members`, spec §5.12): its group id
+    /// moved from `was`, and every follower follows the group under the new one. A voice
+    /// room's id is `r:` either way.
+    fn gk_moved(&self, channel: &Channel, was: &str) {
+        let now = self.gk_id(channel);
+        if !self.gk.on || !channel.info.text || now == was {
+            return;
+        }
+        self.gk.on_group_moved(channel.info.channel_id, was, &now);
+        for uid in channel
+            .follow
+            .joined
+            .keys()
+            .chain(channel.follow.quiet.keys())
+        {
+            let account = self.sessions.get(uid).and_then(|s| s.account_id());
+            self.gk_follow(channel, *uid, account);
+        }
     }
 
     /// The real name of `subject`, and the pseudonym they currently go by if
@@ -2580,6 +3134,18 @@ impl ServerState {
         channel.pseudonyms.remove(&target_id);
         if let Some(first) = channel.follow.remove(target_id) {
             self.exit_due(channel_id, &channel.follow, first);
+        }
+        // Requester 0 is the relay putting out who lost the gate (`session::evict`)
+        let cause = if requester_id == 0 {
+            gk_cause::GATE
+        } else {
+            gk_cause::KICK
+        };
+        if channel.info.text {
+            self.gk.on_kick(channel_id, target_id, cause);
+        } else {
+            // A voice kick to the lobby: out of the room, into no group
+            self.gk_room_leave(channel, target_id, cause);
         }
 
         let target_session_id = self
@@ -2787,6 +3353,7 @@ impl ServerState {
         session_id: SessionId,
         channel_id: ChannelId,
         codec: VideoCodec,
+        resolution: u16,
     ) -> anyhow::Result<Vec<SessionId>> {
         if channel_id == 0 {
             anyhow::bail!("cannot screen share in the General channel");
@@ -2804,7 +3371,7 @@ impl ServerState {
         }
 
         // Mark user as sharing
-        if let Some(mut session) = self.sessions.get_mut(&session_id) {
+        let sharer_tx = if let Some(mut session) = self.sessions.get_mut(&session_id) {
             if session.listen_only.contains(&channel_id) {
                 anyhow::bail!("you can only listen in this channel");
             }
@@ -2815,19 +3382,18 @@ impl ServerState {
                 anyhow::bail!("already screen sharing");
             }
             session.is_screen_sharing = true;
+            session.control_tx.clone()
         } else {
             anyhow::bail!("session not found");
-        }
+        };
 
         channel.screen_shares.insert(
             user_id,
-            ScreenShareSession {
-                sharer_user_id: user_id,
-                sharer_session_id: session_id,
-                viewers: HashSet::new(),
-                codec,
-            },
+            ScreenShareSession::new(user_id, session_id, codec, share_ceiling_kbps(resolution)),
         );
+        // The only place a fan is made: `refan` updates a fan of this channel only
+        self.share_fans
+            .insert(user_id, Fan::new(channel_id, sharer_tx));
 
         // Return other members' session_ids for broadcasting
         let others: Vec<SessionId> = channel
@@ -2847,20 +3413,25 @@ impl ServerState {
         session_id: SessionId,
         channel_id: ChannelId,
     ) -> anyhow::Result<(Vec<(UserId, SessionId)>, Vec<SessionId>)> {
-        // Unmark user as sharing
-        if let Some(mut session) = self.sessions.get_mut(&session_id) {
-            session.is_screen_sharing = false;
-        }
-
         let mut channels = self.channels.write().await;
+        let removed = channels
+            .get_mut(&channel_id)
+            .and_then(|c| c.screen_shares.remove(&user_id));
+        // Unmark user as sharing, unless a share of theirs is left in another room
+        // (`shares_anywhere`): a stop asked of this one does not end that
+        if let Some(mut session) = self.sessions.get_mut(&session_id) {
+            if removed.is_some() || !shares_anywhere(&channels, user_id) {
+                session.is_screen_sharing = false;
+            }
+        }
         let channel = channels
             .get_mut(&channel_id)
             .ok_or_else(|| anyhow::anyhow!("channel not found"))?;
 
-        let share = channel
-            .screen_shares
-            .remove(&user_id)
-            .ok_or_else(|| anyhow::anyhow!("not screen sharing"))?;
+        let share = removed.ok_or_else(|| anyhow::anyhow!("not screen sharing"))?;
+        self.share_fans
+            .remove_if(&user_id, |_, fan| fan.channel_id == channel_id);
+        end_share(self, &share);
 
         // Clear watching state for all viewers
         let viewer_sessions: Vec<(UserId, SessionId)> = share
@@ -2883,30 +3454,27 @@ impl ServerState {
         Ok((viewer_sessions, member_sessions))
     }
 
-    /// Start watching a screen share. Enforces one-at-a-time.
-    /// Returns (sharer_session_id, old_viewer_count, new_viewer_count,
-    /// Option<previous_sharer_session_for_unwatch>, share_codec).
+    /// Start watching a screen share. Enforces one-at-a-time: a viewer of another share is
+    /// taken out of that one. With `[pool]`, a viewer past the share's first `local_first`
+    /// may be placed on an media edge (`Watched::edge`). Watching the same share again is
+    /// never refused; on an edge it gets a fresh ticket, and the one before is revoked.
     pub async fn watch_screen_share(
         &self,
         viewer_user_id: UserId,
         viewer_session_id: SessionId,
         sharer_user_id: UserId,
         channel_id: ChannelId,
-    ) -> anyhow::Result<(
-        SessionId,
-        u32,
-        u32,
-        Option<(UserId, SessionId, u32)>,
-        VideoCodec,
-    )> {
+    ) -> anyhow::Result<Watched> {
         // Check if viewer is already watching someone else — auto-unwatch
-        let prev_unwatch = {
-            let session = self
+        let (prev_unwatch, tunnel, avoid) = {
+            let mut session = self
                 .sessions
-                .get(&viewer_session_id)
+                .get_mut(&viewer_session_id)
                 .ok_or_else(|| anyhow::anyhow!("session not found"))?;
-            session.watching_screenshare
+            let avoid = avoided(&mut session.edge_avoid, Instant::now());
+            (session.watching_screenshare, session.tunnel, avoid)
         };
+        let pool = self.pool.as_deref();
 
         // Every refusal comes before anything changes: a click on somebody
         // whose share just ended must not cost the stream being watched, nor
@@ -2914,18 +3482,30 @@ impl ServerState {
         // lets a session ask that user for keyframes and report losses).
         let mut channels = self.channels.write().await;
         let channel = channels
+            .get(&channel_id)
+            .ok_or_else(|| anyhow::anyhow!("channel not found"))?;
+        let Some(share) = channel.screen_shares.get(&sharer_user_id) else {
+            anyhow::bail!("user is not screen sharing");
+        };
+        let rewatch = share.viewers.contains(&viewer_user_id);
+        // Room for one more, unless they watch it already (`[media]`, `[pool]`)
+        let spot = if rewatch {
+            None
+        } else {
+            Some(
+                self.seat(&channels, share, tunnel, &avoid)
+                    .map_err(|why| anyhow::anyhow!(why))?,
+            )
+        };
+        let channel = channels
             .get_mut(&channel_id)
             .ok_or_else(|| anyhow::anyhow!("channel not found"))?;
-        if !channel.screen_shares.contains_key(&sharer_user_id) {
-            anyhow::bail!("user is not screen sharing");
-        }
 
-        let mut prev_info = None;
+        // Its sharer is told the new count by the fan (`ShareNews`)
         if let Some(prev_sharer_id) = prev_unwatch.filter(|&id| id != sharer_user_id) {
             if let Some(prev_share) = channel.screen_shares.get_mut(&prev_sharer_id) {
-                prev_share.viewers.remove(&viewer_user_id);
-                let new_count = prev_share.viewers.len() as u32;
-                prev_info = Some((prev_sharer_id, prev_share.sharer_session_id, new_count));
+                prev_share.drop_viewer(viewer_user_id, pool);
+                self.refan(channel_id, prev_share);
             }
         }
 
@@ -2938,17 +3518,284 @@ impl ServerState {
             .get_mut(&sharer_user_id)
             .ok_or_else(|| anyhow::anyhow!("user is not screen sharing"))?;
 
-        let old_count = share.viewers.len() as u32;
+        let mut edge = None;
+        match spot {
+            Some(Spot::Edge(placement, view)) => {
+                edge = Some((placement.id, view));
+                share.put_on_edge(viewer_user_id, placement);
+            }
+            Some(Spot::Here) => {}
+            // Again on its edge: a fresh slot there, and the one before revoked, so a viewer
+            // holds one live ticket however often it clicks
+            None => {
+                let held = share.on_edge.get(&viewer_user_id);
+                if let Some((placement, view)) =
+                    held.and_then(|p| pool.and_then(|pool| pool.reslot(p, share.sharer_session_id)))
+                {
+                    edge = Some((placement.id, view));
+                    share.put_on_edge(viewer_user_id, placement);
+                }
+            }
+        }
         share.viewers.insert(viewer_user_id);
         let new_count = share.viewers.len() as u32;
+        // Again on a watch of the same share too: it is the list, so nobody is in it twice
+        self.refan(channel_id, share);
 
-        Ok((
-            share.sharer_session_id,
-            old_count,
+        Ok(Watched {
+            sharer_sid: share.sharer_session_id,
             new_count,
-            prev_info,
-            share.codec,
-        ))
+            codec: share.codec,
+            edge,
+        })
+    }
+
+    /// Where a viewer who does not watch `share` yet is to watch it from: a media edge
+    /// (`Pool::place`), or this relay, or nowhere, with why. Past the share's first
+    /// `[pool] local_first` an edge is tried first, unless the viewer comes through the TCP
+    /// tunnel; this relay takes one under its own `[media]` caps, which count only the viewers
+    /// it serves itself. Within the first `local_first`, a viewer this relay has no room for
+    /// goes to an edge that carries the share already, which costs this relay nothing more,
+    /// rather than be refused. Called under the `channels` write lock, which the counts are
+    /// made in.
+    fn seat(
+        &self,
+        channels: &HashMap<ChannelId, Channel>,
+        share: &ScreenShareSession,
+        tunnel: bool,
+        avoid: &[String],
+    ) -> Result<Spot, &'static str> {
+        let local = share.local_viewers();
+        let sent = video_egress_kbps(channels);
+        let room_here =
+            sent + share.ceiling_kbps as u64 <= self.media.video_egress_mbit as u64 * 1000;
+        if let Some(pool) = &self.pool {
+            // Without `room_here`, only an edge that carries the share is eligible
+            if !tunnel && (local >= pool.local_first as usize || !room_here) {
+                if let Some((placement, view)) = pool.place(
+                    share.sharer_session_id,
+                    share.ceiling_kbps,
+                    avoid,
+                    room_here,
+                ) {
+                    return Ok(Spot::Edge(placement, view));
+                }
+            }
+        }
+        if local as u32 >= self.media.share_viewers {
+            return Err(SHARE_FULL);
+        }
+        if !room_here {
+            return Err(VIDEO_FULL);
+        }
+        Ok(Spot::Here)
+    }
+
+    /// Seats again a viewer of `sharer`'s share in `channel_id` whose edge failed it or went
+    /// away, taken out of the share's `viewers` and `on_edge` already (`seat`), and tells it
+    /// where the share comes from now: `WatchAt` with another edge, or with none for this
+    /// relay. With no room anywhere it watches nothing and is told why. Whether it still
+    /// watches. The caller refans.
+    fn reseat(
+        &self,
+        channels: &mut HashMap<ChannelId, Channel>,
+        channel_id: ChannelId,
+        sharer: UserId,
+        viewer: UserId,
+        avoid: &[String],
+    ) -> bool {
+        let tunnel = self.sessions.get(&viewer).is_some_and(|s| s.tunnel);
+        let Some(share) = channels
+            .get(&channel_id)
+            .and_then(|c| c.screen_shares.get(&sharer))
+        else {
+            return false;
+        };
+        let spot = self.seat(channels, share, tunnel, avoid);
+        let Some(share) = channels
+            .get_mut(&channel_id)
+            .and_then(|c| c.screen_shares.get_mut(&sharer))
+        else {
+            return false;
+        };
+        let told = match spot {
+            Ok(Spot::Edge(placement, view)) => {
+                let msg = ServerMessage::WatchAt {
+                    sharer_user_id: sharer,
+                    placement: placement.id,
+                    edge: Some(view),
+                };
+                share.viewers.insert(viewer);
+                share.put_on_edge(viewer, placement);
+                vec![msg]
+            }
+            Ok(Spot::Here) => {
+                share.viewers.insert(viewer);
+                // It joins the fan mid-stream: a keyframe, within the share's budget
+                crate::session::relay_keyframe_request(self, share.sharer_session_id);
+                vec![ServerMessage::WatchAt {
+                    sharer_user_id: sharer,
+                    placement: self.pool.as_ref().map_or(0, |p| p.next_placement()),
+                    edge: None,
+                }]
+            }
+            Err(why) => {
+                if let Some(mut session) = self.sessions.get_mut(&viewer) {
+                    if session.watching_screenshare == Some(sharer) {
+                        session.watching_screenshare = None;
+                    }
+                }
+                vec![
+                    ServerMessage::StoppedWatchingScreenShare {
+                        reason: "edge_lost".into(),
+                    },
+                    ServerMessage::WatchRefused {
+                        sharer_user_id: sharer,
+                        reason: why.into(),
+                    },
+                ]
+            }
+        };
+        let watches = matches!(told[0], ServerMessage::WatchAt { .. });
+        if let Some(session) = self.sessions.get(&viewer) {
+            for msg in &told {
+                let _ = crate::session::send_msg(&session.control_tx, msg);
+            }
+        }
+        watches
+    }
+
+    /// A viewer says the edge of its `WatchAt` numbered `placement` failed it
+    /// (`ClientMessage::EdgeFailed`, from a viewer of `sharer`'s share, within its rate). It
+    /// is moved off that edge, which is revoked its ticket and not picked for it again for
+    /// `pool::AVOID_FOR`: to another edge, or to this relay, or, with no room, out of the
+    /// share. Not while the share itself has sent nothing for `pool::SHARE_SILENT_MS`: then
+    /// no edge is to blame, and a stalled sharer would empty every edge onto this relay.
+    /// A placement that is not the viewer's current one is ignored, so a late word about an
+    /// edge it left never moves it off the one it is on.
+    pub async fn edge_failed(
+        &self,
+        viewer: UserId,
+        sharer: UserId,
+        placement: u64,
+        channel_id: ChannelId,
+    ) {
+        let Some(pool) = self.pool.as_deref() else {
+            return;
+        };
+        let mut channels = self.channels.write().await;
+        let Some(share) = channels
+            .get_mut(&channel_id)
+            .and_then(|c| c.screen_shares.get_mut(&sharer))
+        else {
+            self.limits.count("edge failed", "no such share");
+            return;
+        };
+        match share.on_edge.get(&viewer) {
+            Some(p) if p.id == placement => {}
+            Some(_) => return self.limits.count("edge failed", "stale placement"),
+            None => return self.limits.count("edge failed", "not on an edge"),
+        }
+        if self.share_silent(sharer) {
+            return self.limits.count("edge failed", "share silent");
+        }
+        let Some(failed) = share.take_off_edge(viewer) else {
+            return;
+        };
+        share.viewers.remove(&viewer);
+        pool.unplace(&failed, share.sharer_session_id, share.ceiling_kbps, true);
+        let avoid = match self.sessions.get_mut(&viewer) {
+            Some(mut session) => {
+                let now = Instant::now();
+                let list = &mut session.edge_avoid;
+                list.retain(|(edge, _)| *edge != failed.edge);
+                list.push((failed.edge.clone(), now));
+                if list.len() > crate::pool::MAX_AVOID {
+                    list.remove(0);
+                }
+                avoided(list, now)
+            }
+            None => vec![failed.edge.clone()],
+        };
+        let watches = self.reseat(&mut channels, channel_id, sharer, viewer, &avoid);
+        self.limits
+            .count("edge failed", if watches { "moved" } else { "no room" });
+        if let Some(share) = channels
+            .get(&channel_id)
+            .and_then(|c| c.screen_shares.get(&sharer))
+        {
+            self.refan(channel_id, share);
+        }
+    }
+
+    /// Whether `sharer`'s share has sent no video for `pool::SHARE_SILENT_MS`, or none yet.
+    fn share_silent(&self, sharer: UserId) -> bool {
+        let last = self
+            .share_fans
+            .get(&sharer)
+            .map_or(0, |fan| fan.last_packet_ms.load(Ordering::Relaxed));
+        crate::pool::share_silent(last, self.uptime_ms())
+    }
+
+    /// The edge link `name`/`link` ended: closed, timed out, or its queue full. Its viewers
+    /// are seated again, with a new placement each, as after `edge_failed` but avoiding
+    /// nothing (`move_off_edge`). Nobody is moved back once it returns.
+    pub async fn edge_lost(&self, name: &str, link: u64, why: &str) {
+        let Some(pool) = self.pool.as_deref() else {
+            return;
+        };
+        let mut channels = self.channels.write().await;
+        if !pool.unlink(self, name, link) {
+            // Replaced by a newer link of the same edge, which moved its viewers then
+            return;
+        }
+        let (moved, refused) = self.move_off_edge(&mut channels, name, link);
+        tracing::info!("edge {name} offline ({why}); {moved} viewers moved, {refused} refused");
+    }
+
+    /// Seats again every viewer placed on the edge link `name`/`link`, which is gone from the
+    /// pool already: `(moved, refused)`.
+    pub(crate) fn move_off_edge(
+        &self,
+        channels: &mut HashMap<ChannelId, Channel>,
+        name: &str,
+        link: u64,
+    ) -> (usize, usize) {
+        let mut stranded = Vec::new();
+        for (&channel_id, channel) in channels.iter_mut() {
+            for (&sharer, share) in channel.screen_shares.iter_mut() {
+                let gone: Vec<UserId> = share
+                    .on_edge
+                    .iter()
+                    .filter(|(_, p)| p.edge == name && p.link == link)
+                    .map(|(&viewer, _)| viewer)
+                    .collect();
+                for &viewer in &gone {
+                    share.take_off_edge(viewer);
+                    share.viewers.remove(&viewer);
+                }
+                if !gone.is_empty() {
+                    stranded.push((channel_id, sharer, gone));
+                }
+            }
+        }
+        let (mut moved, mut refused) = (0, 0);
+        for (channel_id, sharer, viewers) in stranded {
+            for viewer in viewers {
+                if self.reseat(channels, channel_id, sharer, viewer, &[]) {
+                    moved += 1;
+                } else {
+                    refused += 1;
+                }
+            }
+            if let Some(share) = channels
+                .get(&channel_id)
+                .and_then(|c| c.screen_shares.get(&sharer))
+            {
+                self.refan(channel_id, share);
+            }
+        }
+        (moved, refused)
     }
 
     /// Stop watching a screen share.
@@ -2985,8 +3832,9 @@ impl ServerState {
             .ok_or_else(|| anyhow::anyhow!("screen share not found"))?;
 
         let old_count = share.viewers.len() as u32;
-        share.viewers.remove(&viewer_user_id);
+        share.drop_viewer(viewer_user_id, self.pool.as_deref());
         let new_count = share.viewers.len() as u32;
+        self.refan(channel_id, share);
 
         Ok((
             sharer_user_id,
@@ -2996,30 +3844,71 @@ impl ServerState {
         ))
     }
 
-    /// Get the media queues of all viewers of a given sharer.
-    /// Called from media routing to forward video packets only to viewers.
-    pub async fn get_screen_share_viewer_txs(
-        &self,
-        sharer_user_id: UserId,
-        channel_id: ChannelId,
-    ) -> Vec<mpsc::Sender<Bytes>> {
-        let channels = self.channels.read().await;
-        let Some(channel) = channels.get(&channel_id) else {
-            return Vec::new();
-        };
-        let Some(share) = channel.screen_shares.get(&sharer_user_id) else {
-            return Vec::new();
-        };
-
-        share
+    /// Points a share's fan at its viewers' media queues again, after who watches changed,
+    /// and gives the sharer the new count (`ShareNews::viewers_now`).
+    ///
+    /// Called under the `channels` write lock, which orders the rebuilds and the counts, and
+    /// with no `sessions` guard held, since it reads `sessions`. A viewer whose session is
+    /// gone gets nothing, as when the video path looked each one up. A fan of another
+    /// channel is left alone: only `start_screen_share` makes one, so a share left behind in
+    /// a channel its sharer has moved out of never takes over the fan of the share in force.
+    /// Viewers on an edge are not in it: their edge's feed is (`Fan::feeds`), and the count
+    /// is of everyone.
+    fn refan(&self, channel_id: ChannelId, share: &ScreenShareSession) {
+        let local: Arc<[mpsc::Sender<Bytes>]> = share
             .viewers
             .iter()
+            .filter(|vid| !share.on_edge.contains_key(vid))
             .filter_map(|vid| Some(self.sessions.get(vid)?.media_tx.clone()))
-            .collect()
+            .collect();
+        if let Some(mut fan) = self.share_fans.get_mut(&share.sharer_user_id) {
+            if fan.channel_id == channel_id {
+                fan.local = local;
+                fan.news
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .viewers_now(share.viewers.len() as u32);
+            }
+        }
+    }
+
+    /// A viewer of `sharer`'s share lost frames (`ClientMessage::VideoLossReport`, already
+    /// checked to come from a viewer of it, within its rate). Takes no `channels` lock.
+    pub fn loss_reported(
+        &self,
+        sharer: UserId,
+        viewer: UserId,
+        frames_dropped: u32,
+        frames_received: u32,
+    ) {
+        let now_ms = self.uptime_ms();
+        if let Some(fan) = self.share_fans.get(&sharer) {
+            fan.news
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .loss(viewer, frames_dropped, frames_received, now_ms);
+        }
+    }
+
+    /// Each second (main.rs): tells every sharer whose viewer count moved since it was last
+    /// told, and those with more than `LOSS_SUMMARY_ABOVE` viewers how many lose frames.
+    /// Also ends the edges' feeds that no viewer was placed for in 10 s (`Pool::tick`).
+    pub fn share_tick(&self) {
+        let now_ms = self.uptime_ms();
+        for fan in self.share_fans.iter() {
+            fan.news
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .tick(now_ms);
+        }
+        if let Some(pool) = &self.pool {
+            pool.tick(self, Instant::now());
+        }
     }
 
     /// Clean up screen share state when a user disconnects or leaves a channel.
     /// Returns a list of actions to take: (viewer notifications, sharer notifications).
+    /// The sharer of a share the user watched is told the new count from here (`refan`).
     pub async fn cleanup_screen_shares_for_user(
         &self,
         user_id: UserId,
@@ -3035,6 +3924,9 @@ impl ServerState {
 
         // If the user was screen sharing, remove their share and notify viewers
         if let Some(share) = channel.screen_shares.remove(&user_id) {
+            self.share_fans
+                .remove_if(&user_id, |_, fan| fan.channel_id == channel_id);
+            end_share(self, &share);
             for &viewer_id in &share.viewers {
                 if let Some(mut vs) = self.sessions.get_mut(&viewer_id) {
                     vs.watching_screenshare = None;
@@ -3044,10 +3936,17 @@ impl ServerState {
             cleanup.stopped_sharer_user_id = Some(user_id);
         }
 
-        // Unmark sharing on session
+        // Unmark sharing on session, unless a share of theirs is left in another room
+        // (`shares_anywhere`), which its own cleanup ends
+        let removed = cleanup.stopped_sharer_user_id.is_some();
         if let Some(mut session) = self.sessions.get_mut(&session_id) {
-            session.is_screen_sharing = false;
+            if session.is_screen_sharing && (removed || !shares_anywhere(&channels, user_id)) {
+                session.is_screen_sharing = false;
+            }
         }
+        let Some(channel) = channels.get_mut(&channel_id) else {
+            return cleanup;
+        };
 
         // If the user was watching someone, remove them as a viewer
         let watching = self
@@ -3057,9 +3956,8 @@ impl ServerState {
 
         if let Some(sharer_id) = watching {
             if let Some(share) = channel.screen_shares.get_mut(&sharer_id) {
-                share.viewers.remove(&user_id);
-                let new_count = share.viewers.len() as u32;
-                cleanup.sharer_viewer_count_changed = Some((share.sharer_session_id, new_count));
+                share.drop_viewer(user_id, self.pool.as_deref());
+                self.refan(channel_id, share);
             }
             if let Some(mut session) = self.sessions.get_mut(&session_id) {
                 session.watching_screenshare = None;
@@ -3085,8 +3983,6 @@ pub struct ScreenShareCleanup {
     pub viewers_to_notify_stopped: Vec<SessionId>,
     /// The user_id of the share that stopped (if any).
     pub stopped_sharer_user_id: Option<UserId>,
-    /// If the leaving user was a viewer, notify the sharer of new viewer count.
-    pub sharer_viewer_count_changed: Option<(SessionId, u32)>,
     /// All remaining channel member session_ids (for broadcast).
     pub channel_member_sessions: Vec<SessionId>,
 }
@@ -3406,11 +4302,10 @@ mod tests {
             .create_channel("Test".into(), None, ProximityMode::Off, false, false, uid)
             .await
             .unwrap();
-        let others = state
+        state
             .join_channel(uid, sid, ch.channel_id, None)
             .await
             .unwrap();
-        assert!(others.is_empty());
         let channels = state.channels.read().await;
         let channel = channels.get(&ch.channel_id).unwrap();
         assert!(channel.members.contains(&uid));
@@ -3465,9 +4360,8 @@ mod tests {
             .join_channel(uid, sid, ch.channel_id, None)
             .await
             .unwrap();
-        let (left_ch, remaining, count) = state.leave_current_channel(uid, sid).await.unwrap();
+        let (left_ch, count) = state.leave_current_channel(uid, sid).await.unwrap();
         assert_eq!(left_ch, ch.channel_id);
-        assert!(remaining.is_empty());
         assert_eq!(count, 0);
     }
 
@@ -4314,7 +5208,7 @@ mod tests {
             .unwrap();
 
         let err = state
-            .start_screen_share(alice, alice_sid, ch.channel_id, VideoCodec::H264)
+            .start_screen_share(alice, alice_sid, ch.channel_id, VideoCodec::H264, 1080)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("off in this channel"), "{err}");
@@ -4336,7 +5230,7 @@ mod tests {
             .await
             .unwrap();
         assert!(state
-            .start_screen_share(alice, alice_sid, ch.channel_id, VideoCodec::H264)
+            .start_screen_share(alice, alice_sid, ch.channel_id, VideoCodec::H264, 1080)
             .await
             .is_ok());
     }
@@ -4356,7 +5250,7 @@ mod tests {
             .await
             .unwrap();
         state
-            .start_screen_share(alice, alice_sid, ch.channel_id, VideoCodec::H264)
+            .start_screen_share(alice, alice_sid, ch.channel_id, VideoCodec::H264, 1080)
             .await
             .unwrap();
 
@@ -4478,14 +5372,24 @@ mod tests {
         let right = state.channel_password_attempt(1, 5, Some("pw")).await;
         let wrong = state.channel_password_attempt(1, 5, Some("nope")).await;
         let channels = state.channels.read().await;
+        assert!(check_admission(
+            &channels[&1],
+            5,
+            right.as_deref().map(|p| p.as_str()),
+            true,
+            0
+        )
+        .is_ok());
+        assert!(check_admission(
+            &channels[&1],
+            5,
+            wrong.as_deref().map(|p| p.as_str()),
+            true,
+            0
+        )
+        .is_err());
         assert!(
-            check_admission(&channels[&1], 5, right.as_deref().map(|p| p.as_str()), true).is_ok()
-        );
-        assert!(
-            check_admission(&channels[&1], 5, wrong.as_deref().map(|p| p.as_str()), true).is_err()
-        );
-        assert!(
-            check_admission(&channels[&1], 5, Some("pw"), true).is_err(),
+            check_admission(&channels[&1], 5, Some("pw"), true, 0).is_err(),
             "only an attempt checked against the hash gets in"
         );
     }
@@ -4534,7 +5438,8 @@ mod tests {
                 &channels[&1],
                 5,
                 attempt.as_deref().map(|p| p.as_str()),
-                true
+                true,
+                0
             )
             .is_err(),
             "what comes back matches nothing, should a grant land in between"
@@ -4737,6 +5642,30 @@ mod tests {
                 "the history budget ran out"
             );
         }
+    }
+
+    /// Refilled limiters (a departed user's among them) are pruned as the map grows, live
+    /// ones never, and a map of live ones is not walked again at the next target.
+    #[test]
+    fn the_key_relay_map_prunes_refilled_limiters_only() {
+        let state = make_state();
+        let (alice, _) = add_user(&state, "alice");
+        let mut s = state.sessions.get_mut(&alice).unwrap();
+        s.key_relay_burst = 1.0;
+        for target in 0..KEY_RELAY_PRUNE_AT as UserId {
+            assert!(s.may_relay_key_to(target + 10));
+        }
+        // All spent: the next target finds nothing to prune, and the next prune waits
+        assert!(s.may_relay_key_to(1));
+        assert_eq!(s.key_relay_rate.len(), KEY_RELAY_PRUNE_AT + 1);
+        assert_eq!(s.key_relay_prune_at, 2 * KEY_RELAY_PRUNE_AT);
+        assert!(!s.may_relay_key_to(10), "a spent limiter is still there");
+        // A second refills one token at KEY_RELAY_REFILL 2/s
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        s.key_relay_prune_at = KEY_RELAY_PRUNE_AT;
+        assert!(s.may_relay_key_to(2));
+        assert_eq!(s.key_relay_rate.len(), 1, "every refilled one went");
+        assert_eq!(s.key_relay_prune_at, KEY_RELAY_PRUNE_AT);
     }
 
     #[tokio::test]
@@ -5272,7 +6201,7 @@ mod tests {
             .await
             .unwrap();
         let others = state
-            .start_screen_share(uid, sid, ch.channel_id, VideoCodec::H264)
+            .start_screen_share(uid, sid, ch.channel_id, VideoCodec::H264, 1080)
             .await
             .unwrap();
         assert!(others.is_empty());
@@ -5285,12 +6214,164 @@ mod tests {
             .contains_key(&uid));
     }
 
+    /// `[media]`: a share holds `share_viewers`, and the relay sends what `video_egress_mbit`
+    /// allows, counted at each share's resolution; watching again is never refused.
+    #[tokio::test]
+    async fn a_full_share_or_a_full_relay_refuses_the_next_viewer() {
+        let state = ServerState::new(
+            &ServerConfig {
+                media: crate::config::MediaConfig {
+                    share_viewers: 2,
+                    video_egress_mbit: 10,
+                    voice_room: 0,
+                },
+                ..ServerConfig::default()
+            },
+            ServerSettings::default(),
+            Vec::new(),
+            "test-admin-token".into(),
+        );
+        let people: Vec<_> = ["alice", "bob", "cat", "dan"]
+            .iter()
+            .map(|n| add_user(&state, n))
+            .collect();
+        let (alice, asid) = people[0];
+        let ch = state
+            .create_channel("Room".into(), None, ProximityMode::Off, false, false, alice)
+            .await
+            .unwrap();
+        for &(uid, sid) in &people {
+            state
+                .join_channel(uid, sid, ch.channel_id, None)
+                .await
+                .unwrap();
+        }
+        state
+            .start_screen_share(alice, asid, ch.channel_id, VideoCodec::H264, 1080)
+            .await
+            .unwrap();
+        let watch = |(uid, sid): (UserId, SessionId)| {
+            let state = &state;
+            async move {
+                state
+                    .watch_screen_share(uid, sid, alice, ch.channel_id)
+                    .await
+            }
+        };
+        watch(people[1]).await.unwrap();
+        watch(people[1]).await.unwrap();
+        // 7.5 Mbit/s sent, 7.5 more is past 10
+        let err = watch(people[2]).await.unwrap_err();
+        assert_eq!(err.to_string(), VIDEO_FULL);
+
+        let roomy = ServerState::new(
+            &ServerConfig {
+                media: crate::config::MediaConfig {
+                    share_viewers: 1,
+                    video_egress_mbit: 1000,
+                    voice_room: 0,
+                },
+                ..ServerConfig::default()
+            },
+            ServerSettings::default(),
+            Vec::new(),
+            "test-admin-token".into(),
+        );
+        let (a, a_sid) = add_user(&roomy, "alice");
+        let (b, b_sid) = add_user(&roomy, "bob");
+        let (c, c_sid) = add_user(&roomy, "cat");
+        let ch = roomy
+            .create_channel("Room".into(), None, ProximityMode::Off, false, false, a)
+            .await
+            .unwrap();
+        for (uid, sid) in [(a, a_sid), (b, b_sid), (c, c_sid)] {
+            roomy
+                .join_channel(uid, sid, ch.channel_id, None)
+                .await
+                .unwrap();
+        }
+        roomy
+            .start_screen_share(a, a_sid, ch.channel_id, VideoCodec::H264, 480)
+            .await
+            .unwrap();
+        roomy
+            .watch_screen_share(b, b_sid, a, ch.channel_id)
+            .await
+            .unwrap();
+        let err = roomy
+            .watch_screen_share(c, c_sid, a, ch.channel_id)
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), SHARE_FULL);
+    }
+
+    /// A voice room that names no limit takes `[media] voice_room`; a text channel, a routed
+    /// room and one with its own limit do not.
+    #[tokio::test]
+    async fn a_voice_room_without_a_limit_takes_the_relays() {
+        let state = ServerState::new(
+            &ServerConfig {
+                media: crate::config::MediaConfig {
+                    voice_room: 2,
+                    ..Default::default()
+                },
+                ..ServerConfig::default()
+            },
+            ServerSettings::default(),
+            Vec::new(),
+            "test-admin-token".into(),
+        );
+        let people: Vec<_> = ["a", "b", "c"]
+            .iter()
+            .map(|n| add_user(&state, n))
+            .collect();
+        let (a, _) = people[0];
+        let room = state
+            .create_channel("Room".into(), None, ProximityMode::Off, false, false, a)
+            .await
+            .unwrap();
+        let text = state
+            .create_channel("Text".into(), None, ProximityMode::Off, false, true, a)
+            .await
+            .unwrap();
+        for &(uid, sid) in &people[..2] {
+            state
+                .join_channel(uid, sid, room.channel_id, None)
+                .await
+                .unwrap();
+        }
+        let (c, c_sid) = people[2];
+        let err = state
+            .join_channel(c, c_sid, room.channel_id, None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "channel is full");
+        for &(uid, _) in &people {
+            assert!(state
+                .join_text_channel(uid, text.channel_id, None)
+                .await
+                .unwrap());
+        }
+        state
+            .channels
+            .write()
+            .await
+            .get_mut(&room.channel_id)
+            .unwrap()
+            .info
+            .routed = true;
+        state
+            .join_channel(c, c_sid, room.channel_id, None)
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn start_screen_share_general_fails() {
         let state = make_state();
         let (uid, sid) = add_user(&state, "alice");
         let err = state
-            .start_screen_share(uid, sid, 0, VideoCodec::H264)
+            .start_screen_share(uid, sid, 0, VideoCodec::H264, 1080)
             .await;
         assert!(err.unwrap_err().to_string().contains("General"));
     }
@@ -5308,7 +6389,7 @@ mod tests {
             .await
             .unwrap();
         state
-            .start_screen_share(uid, sid, ch.channel_id, VideoCodec::H264)
+            .start_screen_share(uid, sid, ch.channel_id, VideoCodec::H264, 1080)
             .await
             .unwrap();
         state
@@ -5337,7 +6418,7 @@ mod tests {
             .await
             .unwrap();
         state
-            .start_screen_share(uid, sid, ch.channel_id, VideoCodec::H265)
+            .start_screen_share(uid, sid, ch.channel_id, VideoCodec::H265, 1080)
             .await
             .unwrap();
         let (uid2, sid2) = add_user(&state, "bob");
@@ -5345,16 +6426,15 @@ mod tests {
             .join_channel(uid2, sid2, ch.channel_id, None)
             .await
             .unwrap();
-        let (sharer_sid, old, new, prev, codec) = state
+        let watched = state
             .watch_screen_share(uid2, sid2, uid, ch.channel_id)
             .await
             .unwrap();
-        assert_eq!(sharer_sid, sid);
-        assert_eq!(old, 0);
-        assert_eq!(new, 1);
-        assert!(prev.is_none());
+        assert_eq!(watched.sharer_sid, sid);
+        assert_eq!(watched.new_count, 1);
+        assert!(watched.edge.is_none(), "no pool, no edge");
         // The viewer is told what the sharer encodes with
-        assert_eq!(codec, VideoCodec::H265);
+        assert_eq!(watched.codec, VideoCodec::H265);
     }
 
     #[tokio::test]
@@ -5374,7 +6454,7 @@ mod tests {
                 .unwrap();
         }
         state
-            .start_screen_share(alice, alice_sid, ch.channel_id, VideoCodec::H264)
+            .start_screen_share(alice, alice_sid, ch.channel_id, VideoCodec::H264, 1080)
             .await
             .unwrap();
         state
@@ -5409,7 +6489,7 @@ mod tests {
             .await
             .unwrap();
         state
-            .start_screen_share(uid, sid, ch.channel_id, VideoCodec::H264)
+            .start_screen_share(uid, sid, ch.channel_id, VideoCodec::H264, 1080)
             .await
             .unwrap();
         let (uid2, sid2) = add_user(&state, "bob");
@@ -5426,5 +6506,298 @@ mod tests {
             .await;
         assert_eq!(cleanup.stopped_sharer_user_id, Some(uid));
         assert!(cleanup.viewers_to_notify_stopped.contains(&sid2));
+    }
+
+    /// Whose media queues `sharer`'s fan holds, of `people`; `None` without a fan. Each
+    /// queue is in it once, and nothing else is.
+    fn fanned(
+        state: &ServerState,
+        sharer: UserId,
+        people: &[(UserId, mpsc::Sender<Bytes>)],
+    ) -> Option<Vec<UserId>> {
+        let fan = state.share_fans.get(&sharer)?;
+        let mut who: Vec<UserId> = people
+            .iter()
+            .filter(|(_, tx)| fan.local.iter().any(|t| t.same_channel(tx)))
+            .map(|&(uid, _)| uid)
+            .collect();
+        who.sort();
+        assert_eq!(fan.local.len(), who.len(), "a queue twice, or a stranger's");
+        assert!(fan.feeds.is_empty());
+        Some(who)
+    }
+
+    #[tokio::test]
+    async fn the_fan_follows_who_watches() {
+        let state = make_state();
+        let names = ["alice", "bob", "carol", "dan", "erin"];
+        let people: Vec<(UserId, SessionId)> = names.iter().map(|n| add_user(&state, n)).collect();
+        let queues: Vec<(UserId, mpsc::Sender<Bytes>)> = people
+            .iter()
+            .map(|&(uid, sid)| (uid, state.sessions.get(&sid).unwrap().media_tx.clone()))
+            .collect();
+        let [alice, bob, carol, dan, erin] = [0, 1, 2, 3, 4].map(|i| people[i].0);
+        let ch = state
+            .create_channel("Room".into(), None, ProximityMode::Off, false, false, alice)
+            .await
+            .unwrap()
+            .channel_id;
+        for &(uid, sid) in &people {
+            state.join_channel(uid, sid, ch, None).await.unwrap();
+        }
+        let fan = |sharer| fanned(&state, sharer, &queues);
+
+        // Start
+        assert_eq!(fan(alice), None);
+        state
+            .start_screen_share(alice, alice, ch, VideoCodec::H264, 1080)
+            .await
+            .unwrap();
+        assert_eq!(fan(alice), Some(vec![]));
+        assert_eq!(state.share_fans.get(&alice).unwrap().channel_id, ch);
+
+        // Watch, and the same watch again
+        state.watch_screen_share(bob, bob, alice, ch).await.unwrap();
+        assert_eq!(fan(alice), Some(vec![bob]));
+        state.watch_screen_share(bob, bob, alice, ch).await.unwrap();
+        assert_eq!(fan(alice), Some(vec![bob]));
+
+        // A watch of another share takes Bob out of Alice's
+        state
+            .start_screen_share(carol, carol, ch, VideoCodec::H264, 1080)
+            .await
+            .unwrap();
+        state.watch_screen_share(bob, bob, carol, ch).await.unwrap();
+        assert_eq!(fan(alice), Some(vec![]));
+        assert_eq!(fan(carol), Some(vec![bob]));
+
+        // Stop watching
+        state.watch_screen_share(dan, dan, carol, ch).await.unwrap();
+        assert_eq!(fan(carol), Some(vec![bob, dan]));
+        state
+            .stop_watching_screen_share(bob, bob, ch)
+            .await
+            .unwrap();
+        assert_eq!(fan(carol), Some(vec![dan]));
+
+        // The cleanup of a viewer leaving
+        state.watch_screen_share(bob, bob, alice, ch).await.unwrap();
+        assert_eq!(fan(alice), Some(vec![bob]));
+        state.cleanup_screen_shares_for_user(bob, bob, ch).await;
+        assert_eq!(fan(alice), Some(vec![]));
+
+        // A viewer's session gone, though nothing took it out of `viewers`
+        state.remove_session(dan).await.unwrap();
+        assert_eq!(fan(carol), Some(vec![]));
+
+        // The sharer stops, and the cleanup of a sharer leaving
+        state
+            .watch_screen_share(erin, erin, carol, ch)
+            .await
+            .unwrap();
+        assert_eq!(fan(carol), Some(vec![erin]));
+        state.stop_screen_share(carol, carol, ch).await.unwrap();
+        assert_eq!(fan(carol), None);
+        state.cleanup_screen_shares_for_user(alice, alice, ch).await;
+        assert_eq!(fan(alice), None);
+
+        // A sharer's session gone
+        state
+            .start_screen_share(erin, erin, ch, VideoCodec::H264, 1080)
+            .await
+            .unwrap();
+        assert_eq!(fan(erin), Some(vec![]));
+        state.remove_session(erin).await.unwrap();
+        assert_eq!(fan(erin), None);
+    }
+
+    /// A share left behind in a channel its sharer moved out of takes nothing from the share
+    /// they started since: not when somebody watches it, nor when it is ended.
+    #[tokio::test]
+    async fn a_share_left_behind_does_not_touch_the_fan_in_force() {
+        let state = make_state();
+        let (alice, _) = add_user(&state, "alice");
+        let (bob, _) = add_user(&state, "bob");
+        let (carol, _) = add_user(&state, "carol");
+        let queues: Vec<_> = [bob, carol]
+            .map(|uid| (uid, state.sessions.get(&uid).unwrap().media_tx.clone()))
+            .into();
+        let mut rooms = Vec::new();
+        for name in ["One", "Two"] {
+            rooms.push(
+                state
+                    .create_channel(name.into(), None, ProximityMode::Off, false, false, alice)
+                    .await
+                    .unwrap()
+                    .channel_id,
+            );
+        }
+        let [one, two] = [rooms[0], rooms[1]];
+        state.join_channel(alice, alice, one, None).await.unwrap();
+        state.join_channel(carol, carol, one, None).await.unwrap();
+        state
+            .start_screen_share(alice, alice, one, VideoCodec::H264, 1080)
+            .await
+            .unwrap();
+        // Moved without the share in `one` ended. No second share starts then
+        // (`a_sharer_with_a_share_left_behind_starts_no_second_one`); should one, as here
+        // with the flag put down by hand, the fan of the share in force is its own
+        state.join_channel(alice, alice, two, None).await.unwrap();
+        state.sessions.get_mut(&alice).unwrap().is_screen_sharing = false;
+        state.join_channel(bob, bob, two, None).await.unwrap();
+        state
+            .start_screen_share(alice, alice, two, VideoCodec::H264, 1080)
+            .await
+            .unwrap();
+        state
+            .watch_screen_share(bob, bob, alice, two)
+            .await
+            .unwrap();
+
+        state
+            .watch_screen_share(carol, carol, alice, one)
+            .await
+            .unwrap();
+        assert_eq!(fanned(&state, alice, &queues), Some(vec![bob]));
+        state.stop_screen_share(alice, alice, one).await.unwrap();
+        assert_eq!(fanned(&state, alice, &queues), Some(vec![bob]));
+        assert_eq!(state.share_fans.get(&alice).unwrap().channel_id, two);
+    }
+
+    /// A share left in a room its sharer was moved out of, until that move's cleanup ends it:
+    /// a stop asked of the new room does not end it, and no second share of the same sharer
+    /// starts beside it. Past `channels` a share is known by its sharer alone, so two would
+    /// feed each other's edges and end each other there.
+    #[tokio::test]
+    async fn a_sharer_with_a_share_left_behind_starts_no_second_one() {
+        let state = make_state();
+        let (alice, _) = add_user(&state, "alice");
+        let mut rooms = Vec::new();
+        for name in ["One", "Two"] {
+            rooms.push(
+                state
+                    .create_channel(name.into(), None, ProximityMode::Off, false, false, alice)
+                    .await
+                    .unwrap()
+                    .channel_id,
+            );
+        }
+        let [one, two] = [rooms[0], rooms[1]];
+        state.join_channel(alice, alice, one, None).await.unwrap();
+        state
+            .start_screen_share(alice, alice, one, VideoCodec::H264, 1080)
+            .await
+            .unwrap();
+        state.join_channel(alice, alice, two, None).await.unwrap();
+        assert!(state.stop_screen_share(alice, alice, two).await.is_err());
+        assert!(state.sessions.get(&alice).unwrap().is_screen_sharing);
+        assert!(state
+            .start_screen_share(alice, alice, two, VideoCodec::H264, 1080)
+            .await
+            .is_err());
+        // A cleanup of another room it is in leaves it up too
+        state
+            .cleanup_screen_shares_for_user(alice, alice, two)
+            .await;
+        assert!(state.sessions.get(&alice).unwrap().is_screen_sharing);
+        // The cleanup of the room it was left in ends it: then a share may start
+        state
+            .cleanup_screen_shares_for_user(alice, alice, one)
+            .await;
+        assert!(!state.sessions.get(&alice).unwrap().is_screen_sharing);
+        state
+            .start_screen_share(alice, alice, two, VideoCodec::H264, 1080)
+            .await
+            .unwrap();
+        // And a stop asked of a room with none, with none left anywhere, puts it down
+        state
+            .channels
+            .write()
+            .await
+            .get_mut(&two)
+            .unwrap()
+            .screen_shares
+            .clear();
+        assert!(state.stop_screen_share(alice, alice, two).await.is_err());
+        assert!(!state.sessions.get(&alice).unwrap().is_screen_sharing);
+    }
+
+    /// What a sharer heard, in a form tests compare.
+    #[derive(Debug, PartialEq)]
+    enum Heard {
+        Count(u32),
+        Summary { reporters: u32, viewers: u32 },
+    }
+
+    /// What a control queue holds, waiting for no more.
+    async fn heard(rx: &mut crate::control::ControlRx) -> Vec<Heard> {
+        let mut out = Vec::new();
+        while let Ok(Some(frame)) =
+            tokio::time::timeout(std::time::Duration::from_millis(20), rx.recv()).await
+        {
+            let mut buf = bytes::BytesMut::from(&frame[..]);
+            let payload = voipc_protocol::codec::try_decode_frame(&mut buf)
+                .unwrap()
+                .unwrap();
+            out.push(
+                match voipc_protocol::codec::decode_server_msg(&payload).unwrap() {
+                    ServerMessage::ViewerCountChanged { viewer_count } => {
+                        Heard::Count(viewer_count)
+                    }
+                    ServerMessage::VideoLossSummary { reporters, viewers } => {
+                        Heard::Summary { reporters, viewers }
+                    }
+                    other => panic!("not news of the viewers: {other:?}"),
+                },
+            );
+        }
+        out
+    }
+
+    fn summary(reporters: u32, viewers: u32) -> Heard {
+        Heard::Summary { reporters, viewers }
+    }
+
+    /// A report counts for 2 s, as in the apps' own tally; a summary goes only after a new
+    /// report, and a report of no loss is none.
+    #[tokio::test]
+    async fn a_loss_report_counts_in_the_summary_for_2_s() {
+        let (tx, mut rx) = crate::control::control_queue(Arc::default());
+        let mut news = ShareNews::new(tx);
+        news.viewers_now(9);
+        assert_eq!(heard(&mut rx).await, [Heard::Count(9)]);
+
+        news.loss(11, 3, 50, 0);
+        assert_eq!(heard(&mut rx).await, [], "kept for the tick");
+        news.tick(500);
+        assert_eq!(heard(&mut rx).await, [summary(1, 9)]);
+        news.loss(12, 1, 50, 1_500);
+        news.tick(1_600);
+        assert_eq!(heard(&mut rx).await, [summary(2, 9)], "11 still counts");
+        news.tick(2_600);
+        assert_eq!(heard(&mut rx).await, [], "nothing new");
+        news.loss(13, 2, 50, 3_000);
+        news.loss(14, 0, 60, 3_000);
+        news.tick(3_100);
+        assert_eq!(
+            heard(&mut rx).await,
+            [summary(2, 9)],
+            "11 is past its 2 s, and 14 lost nothing"
+        );
+    }
+
+    /// A count that moves and comes back within the second is no news for the sharer.
+    #[tokio::test]
+    async fn a_count_back_where_it_was_by_the_tick_is_not_sent() {
+        let (tx, mut rx) = crate::control::control_queue(Arc::default());
+        let mut news = ShareNews::new(tx);
+        news.viewers_now(1);
+        news.viewers_now(2);
+        news.tick(0);
+        assert_eq!(heard(&mut rx).await, [Heard::Count(1), Heard::Count(2)]);
+        news.viewers_now(3);
+        news.viewers_now(2);
+        news.tick(1_000);
+        assert_eq!(heard(&mut rx).await, []);
     }
 }

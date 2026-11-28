@@ -100,10 +100,24 @@ pub const CONTROL_MSGS_PER_SEC: u32 = 50;
 ///      AccountRequest::LogJoinMany/ChainPut/LogMemberIds/ChainFetch/WrapsPage/OwnChains/
 ///      OwnBuckets/BucketLists/OwnChainRows, AccountReply::LogJoinedMany/ChainStored/ChainRekey/
 ///      LogMemberIdsFound/ChainPage/WrapsPage/OwnChains/OwnBuckets/BucketLists/OwnChainRows
+/// v25: the lobby on a big relay, not sent whole — RequestLobbyPage/LookupUsers/WatchLobby,
+///      ChannelCounts/LobbyPage/Users; the sender's account on EncryptedDirectChatMessage and
+///      PokeReceived
+/// v26: the media edge pool — WatchAt (types::EdgeView) and EdgeFailed, LoadReport.edges
+///      (types::EdgeLoad), ShareLoad.on_edges; VideoLossSummary to a sharer past 8 viewers.
+///      Between a relay and its edges the pool has its own version, `pool::POOL_VERSION`;
+///      the group epoch key (docs/GROUP-KEY.md, `gk`) — EpochFetch/EpochCommit/EpochDecline/
+///      EpochWelcomes/EpochListsWanted/KeyringWanted/EpochPost/EpochBlobWanted/EpochNames/
+///      EpochFloorAhead/KeyholdVolunteer/KeyholdResign/KeyholdReplace, GroupKeys/EpochIn/
+///      EpochWait/EpochDue/EpochStale/EpochLists/KeyringIn/EpochExit/EpochPostIn/EpochBlob/
+///      EpochNamesIn/EpochRefused/VoiceSeats/EpochReseated/EpochPostTaken,
+///      AccountRequest::SeatKeysPublish/SelfRowPut/EpochChainStart/EpochChainKeys/SelfRowsList/
+///      RowMakers/KeptKemPublish and their AccountReply answers, AccountReply::KeptKems,
+///      LoadReport.groups (types::GroupLoad)
 ///
 /// A relay admits only its own protocol; an app speaks its own down to
 /// `compat::OLDEST_RELAY_PROTOCOL` (1.6).
-pub const PROTOCOL_VERSION: u32 = 23;
+pub const PROTOCOL_VERSION: u32 = 26;
 
 /// Application version, read from Cargo.toml at compile time.
 /// Single source of truth: workspace root `Cargo.toml` `[workspace.package] version`.
@@ -519,6 +533,7 @@ mod tests {
             ciphertext: vec![0xCA, 0xFE],
             message_type: 2,
             timestamp: 1000,
+            account: None,
         };
         let encoded = encode_server_msg(&msg).unwrap();
         let decoded = decode_server_msg(&encoded[4..]).unwrap();

@@ -1,0 +1,5956 @@
+//! Keyholder duty (3g): volunteering, the relay's dues taken whole and checked, the keyring
+//! brought up to the head, the lists a build needs, commits built off the lock and in steps
+//! (`take_build` → `BuildJob::step` → `built`), checked by the validator over this device's
+//! own view and paced out in parts (`next_frame`), rebased on `HEAD_MOVED`, declined where
+//! the rules forbid, and a desktop pair's `KeyholdersReplace` at a seat-key rotation.
+//!
+//! What it keeps on the device (`HolderKeep`, in `gk_local.bin`): a desktop's keyholder
+//! pair, the old one until its Replace is done, the seats its Joins sealed to that no
+//! header named yet (§5.2), and per group the highest desktop counter each account's
+//! entries had in the sets it took there (§5.11). Every check of a joiner or candidate is C1's or C3b's
+//! (`take_endorsement`); every commit is `group_key::build`'s and passes
+//! `commit::validate` before it goes.
+
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::time::Duration;
+
+use libsignal_protocol::{IdentityKey, IdentityKeyPair};
+use serde::{Deserialize, Serialize};
+use voipc_protocol::gk::{
+    self, decline, due as due_code, join_refused, stale, DuePiece, EndorsedPair, GkMember,
+    KeyringPiece, Part, Parts, Seq,
+};
+use voipc_protocol::messages::{ClientMessage, ServerMessage};
+use zeroize::{Zeroize, Zeroizing};
+
+use super::member::Member;
+use super::names::Names;
+use super::{
+    seat_keys, take_endorsement, EndorsementBad, GkCtx, GkEvent, GkOut, Platform, Warn, Who,
+};
+use crate::group_key::build::{
+    self, build_genesis, build_regenesis, join_in_steps, kx_tag, opening_in_steps, plan_opening,
+    seed_welcomes_in_steps, steps, BucketNow, Holding, ListSeat, Lists, OpeningAsk, Replacing,
+    RowBases, Start,
+};
+use crate::group_key::commit::{
+    self, list_order, validate, Candidate, Due, DueKind, Exit, GroupView, HeadView, HolderRef,
+    Joiner, Listed, Pair, ReplaceAsk,
+};
+use crate::group_key::timers::{
+    BROWSER_MAX_SEATS, CHECK_WAIT_MS, EPOCH_AGE_MAX_SECS, KEYHOLDER_SKEW_SECS,
+    MAX_GUEST_KEYHOLDERS, OLD_KEYS_SECS, PIECE_MAX_BYTES, SEED_WELCOMES_A_FRAME,
+};
+use crate::group_key::{
+    check_carried, counter_flagged, keyholder_set_digest, list_digest, open_keyring_welcome,
+    seat_dh, take_keyring, wire, Endorsement, Group, GroupKind, Keyholder, Keyring, KeyringBucket,
+    Kind, Me, MemberId, Origin, Pool, SeatPair, SeatPublic, SeatRef, SeedRolls, Seen, SignedHeader,
+    Version, CLOCK_SLACK, MAX_KEYHOLDERS,
+};
+
+/// A KeyholdReplace is done once no tracked group names the old pair this long after it
+/// went: the relay asks the Replaces at once, so a group still to swap shows by then.
+const REPLACE_SETTLE_MS: u64 = 5_000;
+
+// ── What the device keeps ─────────────────────────────────────────────────
+
+/// Private key bytes that wipe themselves and never print.
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct Secret(Vec<u8>);
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(..)")
+    }
+}
+
+/// A desktop keyholder pair (0x03) with its endorsement, as kept.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct KeptPair {
+    account: [u8; 16],
+    keys: Secret,
+    n: u32,
+    made: u64,
+    sig: Vec<u8>,
+    /// For the old pair: when the rotation replaced it (unix seconds).
+    since: u64,
+}
+
+/// A pair this device holds keys with, opened.
+#[derive(Clone)]
+struct Mine {
+    m: MemberId,
+    pair: SeatPair,
+    wire: Pair,
+}
+
+impl Mine {
+    fn kx(&self) -> [u8; 32] {
+        self.wire.kx()
+    }
+
+    fn by(&self) -> HolderRef {
+        HolderRef {
+            m: self.m,
+            kx: self.kx(),
+        }
+    }
+}
+
+impl KeptPair {
+    /// A new desktop pair of `account`, endorsed 0x03 with its counter `n` now.
+    fn make(identity: &IdentityKeyPair, account: [u8; 16], n: u32, now: u64) -> Option<KeptPair> {
+        let pair = SeatPair::generate();
+        let e = Endorsement::sign(
+            identity,
+            Origin::Desktop,
+            MemberId::Account(account),
+            n,
+            now,
+            &pair.public(),
+        )?;
+        Some(KeptPair {
+            account,
+            keys: Secret(pair.to_bytes().to_vec()),
+            n,
+            made: e.made,
+            sig: e.sig.to_vec(),
+            since: now,
+        })
+    }
+
+    fn open(&self) -> Option<Mine> {
+        let pair = SeatPair::from_bytes(&self.keys.0)?;
+        let m = MemberId::Account(self.account);
+        let endorsement = Endorsement {
+            origin: Origin::Desktop,
+            m,
+            n: self.n,
+            made: self.made,
+            sig: self.sig[..].try_into().ok()?,
+        };
+        let wire = Pair {
+            keys: pair.public(),
+            endorsement,
+        };
+        Some(Mine { m, pair, wire })
+    }
+}
+
+/// Seats a Join `J` of this device sealed to (§5.2): named once the chain the member stands
+/// on reaches a later epoch from `J`, told once the head is shown off it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct Unnamed {
+    group: String,
+    gen: [u8; 16],
+    epoch: u32,
+    join: u32,
+    d: [u8; 32],
+    seats: u32,
+    /// When it went, unix seconds.
+    at: u64,
+    /// The member took it, or a header that stands on it.
+    taken: bool,
+    /// The newest head the member took that stands on `J`: `J` itself, one that descends
+    /// from it by signed `parent` links, or, in a gated group, one whose `names_hash` runs
+    /// through this one's (RV q4-q5:1790: a walk may take the head across a fork, so the head
+    /// moving on is no sign the relay shows it on `J`).
+    tip: Tip,
+    /// The head does not stand on `tip`, by links or by names, yet.
+    off: bool,
+    /// The channel, to tell it by once the group is no longer tracked.
+    channel_id: u32,
+}
+
+/// A head an `Unnamed` stands on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct Tip {
+    d: [u8; 32],
+    epoch: u32,
+    join: u32,
+    /// Its `names_hash`: 0³² in an open group, which names nobody.
+    names: [u8; 32],
+}
+
+impl Tip {
+    fn of(h: &SignedHeader) -> Tip {
+        let hd = h.header();
+        Tip {
+            d: h.d(),
+            epoch: hd.epoch,
+            join: hd.join,
+            names: hd.names_hash,
+        }
+    }
+}
+
+/// How long a head the member cannot link to a Join's record waits for the lists that show
+/// it stands on it (an honest relay answers in a round trip), before it is told: counted
+/// while the member has a head, so not while it reconnects.
+const PROOF_WAIT_SECS: u64 = 5 * 60;
+
+impl Unnamed {
+    fn new(group: &str, j: &SignedHeader, seats: u32, at: u64, channel_id: u32) -> Unnamed {
+        let h = j.header();
+        Unnamed {
+            group: group.to_string(),
+            gen: h.gen,
+            epoch: h.epoch,
+            join: h.join,
+            d: j.d(),
+            seats,
+            at,
+            taken: false,
+            tip: Tip::of(j),
+            off: false,
+            channel_id,
+        }
+    }
+
+    /// The headers the member took since the last look (`D` and signed `parent`), and its
+    /// head: whether the head stands on `tip`, by those links, or in a gated group by the
+    /// lists at hand (`names`), whose fold from `tip`'s `names_hash` reaches the head's.
+    ///
+    /// A head of an open group that does not link is taken as standing on it: no header
+    /// there names a reader, so nothing can show it, and the relay seats whom it likes by
+    /// an honest Join as well. The same look again changes nothing. Whether anything
+    /// changed.
+    fn look(
+        &mut self,
+        took: &[([u8; 32], [u8; 32])],
+        head: Option<&SignedHeader>,
+        names: &Names,
+    ) -> bool {
+        let mut changed = false;
+        if !self.taken {
+            let met = took
+                .iter()
+                .copied()
+                .chain(head.map(|h| (h.d(), h.header().parent)))
+                .any(|(d, parent)| d == self.d || parent == self.d);
+            if met {
+                self.taken = true;
+                changed = true;
+            }
+        }
+        let Some(h) = head else {
+            return changed;
+        };
+        let hd = h.header();
+        if h.d() == self.tip.d || hd.gen != self.gen {
+            return changed;
+        }
+        let linked = self.taken && {
+            let mut at = hd.parent;
+            let mut found = false;
+            for _ in 0..=took.len() {
+                if at == self.tip.d {
+                    found = true;
+                    break;
+                }
+                match took.iter().find(|(d, _)| *d == at) {
+                    Some((_, p)) => at = *p,
+                    None => break,
+                }
+            }
+            found
+        };
+        let gated = self.tip.names != [0; 32] && hd.gated;
+        let on = linked
+            || (gated && names.reaches((self.tip.epoch, self.tip.join), self.tip.names, hd))
+            || (self.taken && !gated);
+        if on {
+            self.taken = true;
+            self.tip = Tip::of(h);
+            self.off = false;
+            return true;
+        }
+        // Not met and not shown by names: only a gated head past it waits for them
+        let waits = gated && (hd.epoch, hd.join) > (self.tip.epoch, self.tip.join);
+        if (self.taken || waits) && !self.off {
+            self.off = true;
+            return true;
+        }
+        changed
+    }
+
+    /// Named so far: taken, and a later header stands on it.
+    fn named(&self) -> bool {
+        self.taken && !self.off && self.tip.d != self.d
+    }
+
+    /// Named for good: the chain it stands on reached a later epoch, which ends `J`'s `CK_e`.
+    fn done(&self) -> bool {
+        self.taken && !self.off && self.tip.epoch > self.epoch
+    }
+}
+
+/// Accounts whose desktop counter a group's `desk_n` keeps, at most, per group; and groups.
+const DESK_N_ACCOUNTS: usize = 16;
+const DESK_N_GROUPS: usize = 4096;
+
+/// What a keyholder keeps on this device (3d `gk_local.bin`: its pair, the old one until its
+/// Replace is done, the seats it sealed that no header named yet, and the desktop counters
+/// its groups' sets named).
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct HolderKeep {
+    pair: Option<KeptPair>,
+    old: Option<KeptPair>,
+    unnamed: Vec<Unnamed>,
+    /// Per group, each account's highest counter on a desktop entry (0x03) of a keyholder set
+    /// this device took while it held keys there (RV r-keyholders:773): a desktop pair below
+    /// it is replaced, and is no candidate there whatever the set holds now. Oldest first.
+    desk_n: std::collections::BTreeMap<String, Vec<([u8; 16], u32)>>,
+}
+
+impl std::fmt::Debug for HolderKeep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HolderKeep")
+            .field("pair", &self.pair.as_ref().map(|p| p.n))
+            .field("old", &self.old.as_ref().map(|p| p.n))
+            .field("unnamed", &self.unnamed.len())
+            .field("desk_n", &self.desk_n.len())
+            .finish()
+    }
+}
+
+impl HolderKeep {
+    /// The highest desktop counter of `account` a set of `group` named, as kept.
+    fn desk_floor(&self, group: &str, account: &[u8; 16]) -> Option<u32> {
+        self.desk_n
+            .get(group)?
+            .iter()
+            .find(|(a, _)| a == account)
+            .map(|(_, n)| *n)
+    }
+
+    /// Counts the desktop entries of `set` toward `group`'s floors; whether one moved.
+    fn count_desks(&mut self, group: &str, set: &[Keyholder]) -> bool {
+        let desks = set
+            .iter()
+            .filter(|k| k.origin == Origin::Desktop as u8)
+            .filter_map(|k| Some((k.m.account()?, k.n)));
+        let mut moved = false;
+        for (a, n) in desks {
+            if !self.desk_n.contains_key(group) && self.desk_n.len() >= DESK_N_GROUPS {
+                self.desk_n.pop_first();
+            }
+            let kept = self.desk_n.entry(group.to_string()).or_default();
+            match kept.iter_mut().find(|(x, _)| *x == a) {
+                Some((_, m)) if *m >= n => {}
+                Some((_, m)) => {
+                    *m = n;
+                    moved = true;
+                }
+                None => {
+                    if kept.len() >= DESK_N_ACCOUNTS {
+                        kept.remove(0);
+                    }
+                    kept.push((a, n));
+                    moved = true;
+                }
+            }
+        }
+        moved
+    }
+}
+
+// ── Jobs ──────────────────────────────────────────────────────────────────
+
+/// What a job makes.
+enum What {
+    Commit,
+    /// A seed-welcome page under the head's seed.
+    Welcomes(Vec<(SeatRef, SeatPublic)>),
+}
+
+/// Everything a build needs, owned.
+struct Task {
+    what: What,
+    kind: GroupKind,
+    id: String,
+    stored: bool,
+    due: Due,
+    refused: Vec<commit::Refused>,
+    head: Option<SignedHeader>,
+    kh: Option<SignedHeader>,
+    ring: Option<Keyring>,
+    krk: Zeroizing<[u8; 32]>,
+    rolls: SeedRolls,
+    me: Mine,
+    ik: IdentityKeyPair,
+    /// A Replace's new pair and entry.
+    new: Option<(Mine, Keyholder)>,
+    lists: Lists,
+    held: HashMap<SeatRef, u32>,
+    /// The other keyholders' pairs as the relay sent them, endorsements and all: each is
+    /// taken only for the entry whose `IK` endorsed it (`pair_of`).
+    pairs: Vec<EndorsedPair>,
+    seed_seats: HashMap<SeatRef, SeatPublic>,
+    finish: bool,
+    now: u64,
+    roster: Vec<u32>,
+    reuse: Option<build::Built>,
+}
+
+/// What a job made.
+enum Done {
+    Commit(Box<build::Built>),
+    Welcomes {
+        gen: [u8; 16],
+        s: u32,
+        list: Vec<commit::SeedWelcomeOut>,
+    },
+    /// Nothing: the build met a reason to decline with this code (`decline`), not `NOT_READY`.
+    Declined(u8, &'static str),
+}
+
+/// A group's row bases (`RowBases`), shared by its hold and its jobs: a job takes them at
+/// its first step and puts them back when it ends or is dropped (`Lease`). A job waiting in
+/// the queue, or dropped there, holds none, so the job built next finds them.
+type Bases = Arc<Mutex<Option<RowBases>>>;
+
+/// A group's row bases while one job builds with them.
+struct Lease {
+    home: Bases,
+    bases: RowBases,
+}
+
+impl Lease {
+    fn take(home: Bases) -> Lease {
+        let bases = home
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+            .unwrap_or_default();
+        Lease { home, bases }
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        let bases = std::mem::take(&mut self.bases);
+        *self.home.lock().unwrap_or_else(PoisonError::into_inner) = Some(bases);
+    }
+}
+
+/// A job's build in progress: it owns its task and its lease.
+type Run = Pin<Box<dyn Future<Output = Result<Done, String>> + Send>>;
+
+/// What a job that stopped before its end says (`built` drops it: its due or attempt is no
+/// longer the one in hand).
+const JOB_GONE: &str = "the due is no longer in hand";
+
+/// A commit to build off the `SignalState` lock: owned and `Send`, built in steps.
+pub struct BuildJob {
+    group: String,
+    due: u64,
+    attempt: u64,
+    /// Until its first step.
+    task: Option<Box<Task>>,
+    /// From its first step to its end.
+    run: Option<Run>,
+    bases: Bases,
+    /// Alive while its due and attempt are the ones in hand (`Work::job`).
+    live: Weak<()>,
+    units: u64,
+}
+
+impl BuildJob {
+    /// Works on for about `budget`: the step stops at the first unit of work (a row and its
+    /// row base, a welcome, a seal, a list's digest; `build::steps`) that finds the budget
+    /// spent, so it lasts the budget and one unit at most. The one block it cannot cut, the
+    /// validator over the whole commit, begins a step of its own. A zero budget does one
+    /// unit a step. The job finished or failed once it says so; one whose due or attempt is
+    /// no longer the one in hand stops at its next step, unbuilt, and `built` drops it.
+    pub fn step(&mut self, budget: Duration) -> Option<Built> {
+        self.step_by(budget, steps::clock_ms)
+    }
+
+    /// `step` on `clock` (milliseconds).
+    fn step_by(&mut self, budget: Duration, clock: fn() -> f64) -> Option<Built> {
+        if self.task.is_none() && self.run.is_none() {
+            return None;
+        }
+        let out = if self.live.strong_count() == 0 {
+            Err(JOB_GONE.to_string())
+        } else {
+            if let Some(t) = self.task.take() {
+                self.run = Some(Box::pin(t.run_with(self.bases.clone())));
+            }
+            let run = self.run.as_mut()?;
+            let (out, units) = steps::step_by(run.as_mut(), budget, clock);
+            self.units += units;
+            out?
+        };
+        // Its lease ends with its run: the row bases are home before `built`
+        self.task = None;
+        self.run = None;
+        Some(Built {
+            group: std::mem::take(&mut self.group),
+            due: self.due,
+            attempt: self.attempt,
+            out,
+        })
+    }
+
+    /// The units of work its steps did so far (`build::steps::unit`).
+    pub fn units(&self) -> u64 {
+        self.units
+    }
+}
+
+/// A finished or failed job, for `GroupKeying::built`.
+pub struct Built {
+    group: String,
+    due: u64,
+    attempt: u64,
+    out: Result<Done, String>,
+}
+
+fn build_error(e: build::BuildError) -> String {
+    match e {
+        build::BuildError::Key(k) => k.to_string(),
+        build::BuildError::Header(r) => r.to_string(),
+        build::BuildError::Refuse(why) | build::BuildError::Candidate(why) => why.to_string(),
+    }
+}
+
+impl Task {
+    /// The whole job, with the group's row bases for as long as it runs.
+    async fn run_with(mut self: Box<Task>, home: Bases) -> Result<Done, String> {
+        let mut lease = Lease::take(home);
+        self.run(&mut lease.bases).await
+    }
+
+    async fn run(&mut self, cache: &mut RowBases) -> Result<Done, String> {
+        if let What::Welcomes(seats) = &self.what {
+            let head = self.head.as_ref().ok_or("no head")?;
+            let ring = self.ring.as_ref().ok_or("no keyring")?;
+            let h = head.header();
+            let g = Group::new(self.kind, &self.id, h.gen).map_err(|e| e.to_string())?;
+            let seed = ring.seed(h.seed).ok_or("the keyring holds no head seed")?;
+            let me = Me {
+                m: self.me.m,
+                keys: &self.me.pair,
+            };
+            let list = seed_welcomes_in_steps(&g, h.seed, seed, &me, seats)
+                .await
+                .map_err(build_error)?;
+            return Ok(Done::Welcomes {
+                gen: h.gen,
+                s: h.seed,
+                list,
+            });
+        }
+        let b = match self.build(cache).await {
+            Ok(b) => b,
+            // A candidate the build refuses is the due's fault, as `candidate_ok`'s are
+            Err(build::BuildError::Candidate(why)) => {
+                return Ok(Done::Declined(decline::CANDIDATE, why))
+            }
+            Err(e) => return Err(build_error(e)),
+        };
+        self.check(&b).await?;
+        Ok(Done::Commit(Box::new(b)))
+    }
+
+    async fn build(&mut self, cache: &mut RowBases) -> Result<build::Built, build::BuildError> {
+        let me = Me {
+            m: self.me.m,
+            keys: &self.me.pair,
+        };
+        let refuse = build::BuildError::Refuse;
+        match self.due.kind {
+            DueKind::Genesis | DueKind::Regenesis => {
+                let entry = self
+                    .me
+                    .wire
+                    .entry(self.kind, self.me.m, raw(&self.ik))
+                    .ok_or(refuse("this pair holds no keys of this kind of group"))?;
+                let joiners: Vec<&Joiner> = self.due.joiners.iter().collect();
+                let st = Start {
+                    kind: self.kind,
+                    id: &self.id,
+                    me,
+                    ik: &self.ik,
+                    entry,
+                    joiners: &joiners,
+                    gated: self.due.gated,
+                    stored: self.stored,
+                    now: self.now,
+                };
+                // One seat and one keyring welcome: whole, in one step
+                if self.due.kind == DueKind::Genesis {
+                    build_genesis(&st, cache)
+                } else {
+                    let head = self.head.as_ref().ok_or(refuse("no head"))?;
+                    build_regenesis(&st, head, &self.due.exits, self.due.exits_upto, cache)
+                }
+            }
+            dk => {
+                let (Some(head), Some(kh), Some(ring)) = (&self.head, &self.kh, &self.ring) else {
+                    return Err(refuse("no keyring at the head"));
+                };
+                let g = Group::new(self.kind, &self.id, head.header().gen)?;
+                let seed = head.header().seed;
+                let held_map = &self.held;
+                let held = |s: &SeatRef| held_map.get(s).copied().or(Some(seed));
+                let hold = Holding {
+                    g: &g,
+                    head,
+                    kh,
+                    ring,
+                    krk: &self.krk,
+                    me,
+                    ik: &self.ik,
+                    lists: &self.lists,
+                    held: &held,
+                    rolls: self.rolls,
+                    stored: self.stored,
+                };
+                if dk == DueKind::Join {
+                    let out: HashSet<SeatRef> = self.refused.iter().map(|r| r.seat).collect();
+                    let seat: Vec<&Joiner> = self
+                        .due
+                        .joiners
+                        .iter()
+                        .filter(|j| !out.contains(&j.seat))
+                        .collect();
+                    join_in_steps(
+                        &hold,
+                        &seat,
+                        self.refused.clone(),
+                        self.now,
+                        cache,
+                        self.reuse.as_ref(),
+                    )
+                    .await
+                } else {
+                    let pairs = &self.pairs;
+                    let kind = self.kind;
+                    let pair_of = |k: &Keyholder| pair_of(kind, pairs, k);
+                    let replace = self.new.as_ref().map(|(n, entry)| Replacing {
+                        me: Me {
+                            m: n.m,
+                            keys: &n.pair,
+                        },
+                        entry: *entry,
+                    });
+                    let ask = OpeningAsk {
+                        kind: dk.header_kind(),
+                        exits: &self.due.exits,
+                        exits_upto: self.due.exits_upto,
+                        refresh: dk == DueKind::Refresh,
+                        gated: self.due.gated,
+                        candidate: self.due.candidate.as_ref(),
+                        remove: self.due.remove,
+                        replace,
+                        finish: self.finish,
+                        seed_seats: &self.seed_seats,
+                        pairs: &pair_of,
+                        now: self.now,
+                    };
+                    opening_in_steps(&hold, &ask, cache, self.reuse.as_ref()).await
+                }
+            }
+        }
+    }
+
+    /// The validator over this device's own view (plan 2c): the head and keyring it built
+    /// on, the lists it fetched (a version whose list it did not need shows by its leaf
+    /// alone), each seat's seed as the due said. A bucket the commit drops or re-versions
+    /// is read from its list, one its keyring names: by its leaf alone it would hide the
+    /// seats a drop takes (rules 8 and 10). A step may stop after each list it reads; the
+    /// validator runs in one block, at the start of a step of its own.
+    async fn check(&self, b: &build::Built) -> Result<(), String> {
+        let anew = matches!(self.due.kind, DueKind::Genesis | DueKind::Regenesis);
+        let mut keys: HashMap<SeatRef, [u8; 33]> = HashMap::new();
+        let leaves: Vec<Listed> = match (&self.ring, &self.head, anew) {
+            (Some(ring), Some(head), false) => {
+                let g = Group::new(self.kind, &self.id, head.header().gen)
+                    .map_err(|e| e.to_string())?;
+                let changed: HashSet<u64> = b
+                    .commit
+                    .drops
+                    .iter()
+                    .copied()
+                    .chain(b.commit.versions.iter().map(|vo| vo.b))
+                    .collect();
+                let mut leaves = Vec::with_capacity(ring.buckets.len());
+                for kb in &ring.buckets {
+                    let seats = match self.lists.get(&kb.version()) {
+                        Some(l) => {
+                            let seats = listed(&g, kb, l)
+                                .ok_or("own check: a list the keyring does not name")?;
+                            keys.extend(l.iter().filter_map(|x| Some((x.seat, seat_dh(&x.dh)?))));
+                            seats
+                        }
+                        None if changed.contains(&kb.b) => {
+                            return Err("own check: no list of a bucket the commit changes".into())
+                        }
+                        None => vec![],
+                    };
+                    let read = !seats.is_empty();
+                    leaves.push(Listed {
+                        leaf: kb.leaf(),
+                        seats,
+                    });
+                    if read {
+                        steps::unit().await;
+                    }
+                }
+                leaves
+            }
+            _ => vec![],
+        };
+        steps::fresh().await;
+        let joiners: HashSet<SeatRef> = self.due.joiners.iter().map(|j| j.seat).collect();
+        let seed = self.head.as_ref().map_or(0, |h| h.header().seed);
+        let held =
+            |s: &SeatRef| (!joiners.contains(s)).then(|| self.held.get(s).copied().unwrap_or(seed));
+        let used = |_: u64| false;
+        let head = match (self.due.kind, &self.head, &self.kh) {
+            (DueKind::Genesis, _, _) => None,
+            (_, Some(head), Some(kh)) => Some(HeadView { head, kh }),
+            _ => return Err("no head to check against".into()),
+        };
+        let view = GroupView {
+            kind: self.kind,
+            id: &self.id,
+            stored: self.stored,
+            head,
+            leaves: &leaves,
+            dh: &|s| keys.get(s).copied(),
+            held: &held,
+            due: &self.due,
+            by: self.me.by(),
+            rolls: self.rolls,
+            known_gens: &[],
+            used_v: &used,
+            now: self.now,
+            roster: &self.roster,
+            no_keyholder_since: (self.due.kind == DueKind::Regenesis).then_some(0),
+        };
+        validate(&view, &b.commit)
+            .map(|_| ())
+            .map_err(|bad| format!("own check: {bad}"))
+    }
+}
+
+// ── Per group ─────────────────────────────────────────────────────────────
+
+/// The keyring at a head, as this keyholder holds it: its seed rolls too
+/// (`KeyringBase::rolls`).
+struct Ring {
+    head: SignedHeader,
+    kh: SignedHeader,
+    ring: Keyring,
+    krk: Zeroizing<[u8; 32]>,
+}
+
+enum Stage {
+    /// Waiting for the head the due was asked on, and the keyring at it.
+    Head,
+    /// Waiting for the lists the build needs.
+    Lists,
+    /// A job is out (`take_build`).
+    Building,
+    /// The commit went; until the relay shows it taken, or stale.
+    Sent(Box<build::Built>),
+}
+
+/// The due in hand.
+struct Work {
+    due: u64,
+    piece: DuePiece,
+    /// The build's time (unix seconds), fixed at the ask so the lists asked are the build's.
+    now: u64,
+    stage: Stage,
+    attempt: u64,
+    lists_asked: bool,
+    /// The attempt the head moved under, for a rebase.
+    stale: Option<Box<build::Built>>,
+    /// Joins of this due that went stale, by `D`, with the seats they sealed: the rebase
+    /// names them again, else they are told once the due is let go (§5.2).
+    rebased: Vec<([u8; 32], Vec<SeatRef>)>,
+    /// Held while this attempt's job is out: a job whose due or attempt went stops at its
+    /// next step (`BuildJob::live`).
+    job: Option<Arc<()>>,
+}
+
+/// A `KeyringIn` sequence's key: `(gen, epoch, join)`.
+type RingAt = ([u8; 16], u32, u32);
+
+#[derive(Default)]
+struct Hold {
+    kind: Option<GroupKind>,
+    dues: Option<Parts<u64, DuePiece>>,
+    keyring: Option<Parts<RingAt, KeyringPiece>>,
+    keyring_asked: Option<RingAt>,
+    ring: Option<Ring>,
+    cache: Bases,
+    lists: Lists,
+    lists_gen: [u8; 16],
+    lists_out: usize,
+    work: Option<Work>,
+    /// One of this device's pairs is in the head's keyholder set.
+    in_set: bool,
+    /// `KX` of the pair this device holds keys with here now.
+    kx: Option<[u8; 32]>,
+    resigned: bool,
+    /// The sets the member holds were counted into `HolderKeep::desk_n` this connection.
+    counted: bool,
+}
+
+impl Hold {
+    fn dues(&mut self) -> &mut Parts<u64, DuePiece> {
+        self.dues.get_or_insert_with(|| Parts::new(Seq::Due))
+    }
+
+    fn keyring_parts(&mut self) -> &mut Parts<RingAt, KeyringPiece> {
+        self.keyring.get_or_insert_with(|| Parts::new(Seq::Keyring))
+    }
+}
+
+fn raw(ik: &IdentityKeyPair) -> [u8; 32] {
+    ik.public_key()
+        .public_key_bytes()
+        .try_into()
+        .expect("an X25519 key is 32 bytes")
+}
+
+fn same_ik(ik: &IdentityKeyPair) -> IdentityKeyPair {
+    IdentityKeyPair::new(*ik.identity_key(), *ik.private_key())
+}
+
+fn kx_of(pair: &SeatPair) -> [u8; 32] {
+    pair.public().dh_bytes()[1..].try_into().expect("33 bytes")
+}
+
+/// A due's parts as one: its scalars from the first, its lists in part order.
+fn merge_due(parts: Vec<DuePiece>) -> Option<DuePiece> {
+    let mut it = parts.into_iter();
+    let mut p = it.next()?;
+    for q in it {
+        p.joins.extend(q.joins);
+        p.exits.extend(q.exits);
+        p.pairs.extend(q.pairs);
+        p.held.extend(q.held);
+        p.seed_seats.extend(q.seed_seats);
+        p.promote = p.promote.or(q.promote);
+        p.remove = p.remove.or(q.remove);
+    }
+    Some(p)
+}
+
+fn encoded<T: Serialize>(x: &T) -> usize {
+    postcard::experimental::serialized_size(x).unwrap_or(usize::MAX)
+}
+
+/// Why a due joiner is left out (`join_refused`), or `None` to seat it (§5.2): its
+/// endorsement under its `IK` for this kind of seat, the pin or TOFU, a gated group's
+/// accounts only, and the counter rules (`take_endorsement`: §11.8's time rule at `at`, the
+/// Join's own time, a guest's counter 0), which count it toward its account's highest once
+/// it passes.
+fn joiner_why(
+    kind: GroupKind,
+    gated: bool,
+    j: &Joiner,
+    at: u64,
+    c: &mut GkCtx,
+    seated: &HashSet<SeatRef>,
+) -> Option<u8> {
+    let e = &j.endorsement;
+    if !endorsed_seat(kind, j.seat, &j.ik, &j.keys, e) {
+        return Some(join_refused::ENDORSEMENT);
+    }
+    if kind == GroupKind::Text && gated && j.seat.m.is_conn() {
+        return Some(join_refused::GUEST_IN_GATED);
+    }
+    if seated.contains(&j.seat) {
+        return Some(join_refused::ALREADY_SEATED);
+    }
+    let account = j.seat.m.account();
+    let pinned = account.and_then(|a| c.pins.pin(&a));
+    if pinned.is_some_and(|p| p != j.ik) {
+        return Some(join_refused::PIN);
+    }
+    // A voice seat is the connection's pair, made once a connection (plan §5): an older one
+    // is held to the counter rule alone and raises nothing (P3 finding 5's earliest `made`)
+    let aged = kind == GroupKind::Voice
+        && e.origin == Origin::Connection
+        && e.made < at.saturating_sub(CLOCK_SLACK);
+    let taken = match account {
+        Some(a) if aged => match counter_flagged(e.n, at, c.pins.seen(&a)) {
+            Some(highest) => Err(EndorsementBad::OldCounter { n: e.n, highest }),
+            None => Ok(()),
+        },
+        // A voice seat named by its connection is a guest's or, in an anonymous room, a
+        // signed-in member's (§11.8: its pair carries the account's counter); no account is
+        // named to hold that counter to, so it is taken as it comes and raises nothing
+        None if kind == GroupKind::Voice => Ok(()),
+        _ => take_endorsement(c.pins, account, e, at),
+    };
+    match taken {
+        Ok(()) => {}
+        Err(EndorsementBad::OldCounter { .. }) => return Some(join_refused::OLD_COUNTER),
+        Err(_) => return Some(join_refused::ENDORSEMENT),
+    }
+    if let (Some(a), None) = (account, pinned) {
+        c.pins.pin_new(a, j.ik, c.now);
+    }
+    None
+}
+
+/// Whether `keys` are seat `seat`'s in a group of `kind` on their endorsement alone (§11.8):
+/// an origin that may stand for that seat, a signature by `ik`, and the seat's tags.
+fn endorsed_seat(
+    kind: GroupKind,
+    seat: SeatRef,
+    ik: &[u8; 32],
+    keys: &SeatPublic,
+    e: &Endorsement,
+) -> bool {
+    let fits = match (kind, seat.m, e.origin, e.m) {
+        (GroupKind::Text, MemberId::Account(a), Origin::VaultSeat, MemberId::Account(b)) => a == b,
+        (GroupKind::Text, MemberId::Conn(u), Origin::Connection, MemberId::Conn(v)) => u == v,
+        (GroupKind::Voice, MemberId::Account(_), Origin::Connection, MemberId::Conn(_)) => true,
+        (GroupKind::Voice, MemberId::Conn(u), Origin::Connection, MemberId::Conn(v)) => u == v,
+        _ => false,
+    };
+    fits && keys.seat(seat.m) == seat && verifies(ik, keys, e)
+}
+
+/// Whether `e` is a signature by `ik` (32 raw bytes) over `keys`.
+fn verifies(ik: &[u8; 32], keys: &SeatPublic, e: &Endorsement) -> bool {
+    super::ik_serialized(ik)
+        .and_then(|b| IdentityKey::decode(&b).ok())
+        .is_some_and(|ik| e.verify(&ik, keys))
+}
+
+/// Whether a seat owed a seed welcome is given it to these keys (RV q1-q2:1420): endorsed for
+/// it as a joiner's are (`endorsed_seat`), for an account by the `IK` pinned for it, whatever
+/// `IK` the relay sent beside them (no header names a seed seat's `IK`); with no pin, by the
+/// relay's, to be pinned as a Join pins it once the whole page passes (`Some(Some(..))`). A
+/// seed welcome carries the seat's real `s_m` under the new seed, and the seat's two 8-byte
+/// tags are all that would bind the keys otherwise.
+fn seat_signed(
+    kind: GroupKind,
+    seat: SeatRef,
+    ik: &[u8; 32],
+    pair: &Pair,
+    c: &GkCtx,
+) -> Option<Option<([u8; 16], [u8; 32])>> {
+    let pinned = seat.m.account().and_then(|a| c.pins.pin(&a));
+    let by = pinned.unwrap_or(*ik);
+    if !endorsed_seat(kind, seat, &by, &pair.keys, &pair.endorsement) {
+        return None;
+    }
+    Some(
+        seat.m
+            .account()
+            .filter(|_| pinned.is_none())
+            .map(|a| (a, by)),
+    )
+}
+
+/// The pair the relay sent for keyholder entry `k` (`EpochDue.pairs`), for its `KRK` welcome
+/// (RV q1-q2:1488): one whose endorsement, under the entry's own `IK`, makes exactly that
+/// entry. An entry names `kx` and only the 8-byte `tag_kk` of its Kyber key: with the tag
+/// alone a relay that found a Kyber key of its own with that tag would get the post-quantum
+/// half of the welcome.
+fn pair_of(kind: GroupKind, pairs: &[EndorsedPair], k: &Keyholder) -> Option<SeatPublic> {
+    pairs
+        .iter()
+        .filter(|x| x.dh.get(1..) == Some(&k.kx[..]))
+        .find_map(|x| {
+            let p = wire::pair(x, k.m.into()).ok()?;
+            (p.entry(kind, k.m, k.ik) == Some(*k) && verifies(&k.ik, &p.keys, &p.endorsement))
+                .then_some(p.keys)
+        })
+}
+
+/// Whether the candidate of a Promote may be added (§5.6): an entry its pair may make in
+/// this kind of group, endorsed by its `IK` (pinned, or pinned now), a counter not below the
+/// highest seen for its account at this time (a guest's 0), a desktop pair not below one its
+/// account had in this group (`floor`, `HolderKeep::desk_floor`), and no guest past the
+/// limits. That it is seated the build checks in a gated text group, by its account's id
+/// only (`opening_in_steps`, RV q4-q5:748); elsewhere seating is the relay's word. A desktop
+/// pair is made once and kept, so its `made` is not held to the ask's time as a joiner's is;
+/// a higher counter counts toward its account.
+fn candidate_ok(
+    kind: GroupKind,
+    gated: bool,
+    set: &[Keyholder],
+    floor: Option<u32>,
+    cand: &Candidate,
+    c: &mut GkCtx,
+) -> bool {
+    let e = &cand.pair.endorsement;
+    if cand.pair.entry(kind, cand.m, cand.ik).is_none() || set.len() >= MAX_KEYHOLDERS {
+        return false;
+    }
+    if !verifies(&cand.ik, &cand.pair.keys, e) {
+        return false;
+    }
+    // A desktop pair its account replaced (§5.11) is no candidate here (RV r-keyholders:773):
+    // below the counter a desktop entry of its account has in the set, or had in a set of this
+    // group this device took while it held keys here, whatever this device's book holds. The
+    // chain's order shows the newer entry came first, so `CLOCK_SLACK` has no part in it, and
+    // a removal of the newer entry before the ask changes nothing
+    let desktop = Origin::Desktop as u8;
+    let in_set = set
+        .iter()
+        .filter(|k| k.m == cand.m && k.origin == desktop)
+        .map(|k| k.n)
+        .max();
+    if e.origin == Origin::Desktop && in_set.max(floor).is_some_and(|n| n > e.n) {
+        return false;
+    }
+    match cand.m.account() {
+        Some(a) => {
+            let pinned = c.pins.pin(&a);
+            if pinned.is_some_and(|p| p != cand.ik) {
+                return false;
+            }
+            let seen = c.pins.seen(&a);
+            if counter_flagged(e.n, c.secs(), seen).is_some() {
+                return false;
+            }
+            if pinned.is_none() {
+                c.pins.pin_new(a, cand.ik, c.now);
+            }
+            if seen.is_none_or(|s| e.n > s.n) {
+                let s = Seen {
+                    n: e.n,
+                    made: e.made,
+                };
+                c.pins.raise(a, s, false);
+            }
+            true
+        }
+        None => {
+            let guests = set.iter().filter(|k| k.m.is_conn()).count();
+            e.n == 0 && (kind == GroupKind::Voice || (!gated && guests < MAX_GUEST_KEYHOLDERS))
+        }
+    }
+}
+
+// ── The duty ──────────────────────────────────────────────────────────────
+
+/// This connection's keyholder duty, across its groups.
+#[derive(Default)]
+pub(super) struct Duty {
+    keep: HolderKeep,
+    /// `keep` moved since it was last handed out (`take_keep`).
+    dirty: bool,
+    desk: Option<Mine>,
+    old: Option<Mine>,
+    /// `KeyholdVolunteer{on}` went and no `{on: false}` since.
+    offered: bool,
+    /// It went as a browser hidden or in a call (`BROWSER_BUSY`).
+    offered_busy: bool,
+    /// This connection asked `KeyholdReplace`; and from when, by the ticks' clock (ms).
+    replacing: Option<Option<u64>>,
+    /// The relay's clock less this device's, seconds, at `GroupKeys`.
+    skew: i64,
+    in_call: bool,
+    holds: HashMap<String, Hold>,
+    /// Commit parts and welcome pages to go, in order: (group, due, frame).
+    upload: VecDeque<(String, u64, ClientMessage)>,
+    jobs: VecDeque<BuildJob>,
+    attempts: u64,
+    /// How long (s) each `Unnamed` by `D` has been `off` while the member had a head, and
+    /// the tick that last counted it (unix s).
+    off_for: HashMap<[u8; 32], (u64, u64)>,
+    /// When (ms) the lists were last asked for each `Unnamed` by `D` that is `off`.
+    proof_asked: HashMap<[u8; 32], u64>,
+}
+
+impl Duty {
+    /// What this device kept (`LocalGk::holder`), at `GroupKeys`.
+    pub(super) fn keep_in(&mut self, keep: &HolderKeep) {
+        self.keep = keep.clone();
+        self.desk = keep.pair.as_ref().and_then(KeptPair::open);
+        self.old = keep.old.as_ref().and_then(KeptPair::open);
+        self.dirty = false;
+    }
+
+    /// What to keep, when it moved since last asked.
+    pub(super) fn take_keep(&mut self) -> Option<HolderKeep> {
+        std::mem::take(&mut self.dirty).then(|| self.keep.clone())
+    }
+
+    /// At `GroupKeys`: a volunteer offers itself (`KeyholdVolunteer`).
+    pub(super) fn start(&mut self, who: &mut Who, out: &mut GkOut) {
+        let now = crate::time::now_millis();
+        self.skew = who.relay_clock as i64 - (now / 1000) as i64;
+        self.volunteer(who, now, out);
+    }
+
+    fn uses_desk(who: &Who) -> bool {
+        who.platform == Platform::Desktop && who.account.is_some()
+    }
+
+    /// A browser whose page is hidden or in a call: it holds text keys only as the fallback
+    /// (choice 31), ranked below every other text volunteer of its kind.
+    fn busy(&self, who: &Who) -> bool {
+        who.platform == Platform::Browser && (!who.visible || self.in_call)
+    }
+
+    /// The desktop pair, made at its first need and replaced when the account's counter
+    /// moved past it (§5.11): the old one is kept until its Replace is done.
+    fn desk(&mut self, who: &Who, now: u64) -> Option<()> {
+        let (account, n) = (who.account?, who.seat_keys.as_ref()?.n);
+        let behind = self.desk.as_ref().is_some_and(|d| d.wire.endorsement.n < n);
+        if self.desk.is_some() && !(behind && self.old.is_none()) {
+            return Some(());
+        }
+        let kept = KeptPair::make(&who.identity, account, n, now / 1000)?;
+        let mine = kept.open()?;
+        if behind {
+            let mut old = self.keep.pair.take()?;
+            old.since = now / 1000;
+            self.keep.old = Some(old);
+            self.old = self.desk.take();
+            self.replacing = None;
+        }
+        self.keep.pair = Some(kept);
+        self.desk = Some(mine);
+        self.dirty = true;
+        Some(())
+    }
+
+    /// The connection's pair, opened (0x02).
+    fn conn(who: &mut Who, now: u64) -> Option<Mine> {
+        let ep = seat_keys::conn_pair(who, now)?;
+        let wire = wire::pair(&ep, GkMember::Conn(who.user_id)).ok()?;
+        let pair = who.conn.pair()?.clone();
+        let m = who
+            .account
+            .map_or(MemberId::Conn(who.user_id), MemberId::Account);
+        Some(Mine { m, pair, wire })
+    }
+
+    /// The pair this device volunteers with: a signed-in desktop's own (the old one while
+    /// its Replace is out), else the connection's.
+    fn volunteer_pair(&mut self, who: &mut Who, now: u64) -> Option<Mine> {
+        if Self::uses_desk(who) {
+            self.desk(who, now)?;
+            return self.old.clone().or_else(|| self.desk.clone());
+        }
+        Self::conn(who, now)
+    }
+
+    /// This device's pairs a group of `kind` may name, the one it holds keys with now first.
+    fn my_kxs(&self, who: &Who, kind: GroupKind) -> Vec<[u8; 32]> {
+        if kind == GroupKind::Text && Self::uses_desk(who) {
+            return self.desk.iter().chain(&self.old).map(Mine::kx).collect();
+        }
+        who.conn.pair().map(kx_of).into_iter().collect()
+    }
+
+    /// The pair of this device a set names: the one its entry holds.
+    fn pair_in(&self, who: &mut Who, kind: GroupKind, set: &[Keyholder], now: u64) -> Option<Mine> {
+        let named = |m: &Mine| set.iter().any(|k| k.kx == m.kx() && k.m == m.m);
+        if kind == GroupKind::Text && Self::uses_desk(who) {
+            return self
+                .old
+                .iter()
+                .chain(&self.desk)
+                .find(|m| named(m))
+                .cloned();
+        }
+        Self::conn(who, now).filter(named)
+    }
+
+    fn volunteer(&mut self, who: &mut Who, now: u64, out: &mut GkOut) {
+        if !who.on || !who.help || who.platform == Platform::Phone {
+            return;
+        }
+        let Some(mine) = self.volunteer_pair(who, now) else {
+            return;
+        };
+        let busy = self.busy(who);
+        out.send.push(ClientMessage::KeyholdVolunteer {
+            on: true,
+            platform: if busy {
+                gk::platform::BROWSER_BUSY
+            } else {
+                who.platform.code()
+            },
+            pair: Some(EndorsedPair::from(&mine.wire)),
+        });
+        self.offered = true;
+        self.offered_busy = busy;
+        self.ask_replace(out);
+    }
+
+    /// `KeyholdReplace` from the connection volunteering with the old pair (R1: it must).
+    fn ask_replace(&mut self, out: &mut GkOut) {
+        if let (Some(old), Some(new), true) = (&self.old, &self.desk, self.offered) {
+            out.send.push(ClientMessage::KeyholdReplace {
+                old: kx_tag(&old.kx()),
+                pair: EndorsedPair::from(&new.wire),
+            });
+            self.replacing = Some(None);
+        }
+    }
+
+    /// `EpochDue`, `EpochStale`, `EpochLists`, `KeyringIn`.
+    pub(super) fn frame(
+        &mut self,
+        who: &mut Who,
+        groups: &mut std::collections::BTreeMap<String, Member>,
+        msg: &ServerMessage,
+        c: &mut GkCtx,
+        out: &mut GkOut,
+    ) {
+        if !who.on {
+            return;
+        }
+        match msg {
+            ServerMessage::EpochDue {
+                group,
+                due,
+                part,
+                last,
+                piece,
+            } => {
+                let Some(m) = groups.get(group) else {
+                    return;
+                };
+                self.sync(who, m, out);
+                let bytes = encoded(&**piece);
+                let hold = self.holds.entry(group.clone()).or_default();
+                let took = hold
+                    .dues()
+                    .take(*due, *part, *last, (**piece).clone(), bytes);
+                if let Part::Whole(d, parts) = took.part {
+                    if let Some(p) = merge_due(parts) {
+                        self.on_due(who, m, d, p, c, out);
+                    }
+                }
+            }
+            ServerMessage::EpochStale {
+                group,
+                due,
+                reason,
+                detail,
+                head,
+            } => {
+                let Some(m) = groups.get(group) else {
+                    return;
+                };
+                self.sync(who, m, out);
+                self.on_stale(m, *due, *reason, detail, head.as_ref());
+                self.advance(who, m, c, out);
+            }
+            ServerMessage::EpochLists {
+                group,
+                gen,
+                lists,
+                more,
+            } => {
+                let Some(m) = groups.get(group) else {
+                    return;
+                };
+                let Some(hold) = self.holds.get_mut(group) else {
+                    return;
+                };
+                if *gen == hold.lists_gen {
+                    // Only a list the keyring names: one of the right shape is still the
+                    // relay's word
+                    let g = Group::new(m.t.kind, &m.t.group, *gen).ok();
+                    for l in lists.iter().filter(|l| l.check().is_ok()) {
+                        let (v, seats) = wire::list(l.clone());
+                        let named = match (&g, &hold.ring) {
+                            (Some(g), Some(r)) => r
+                                .ring
+                                .buckets
+                                .iter()
+                                .find(|kb| kb.version() == v)
+                                .is_some_and(|kb| listed(g, kb, &seats).is_some()),
+                            _ => false,
+                        };
+                        if named {
+                            hold.lists.insert(v, seats);
+                        }
+                    }
+                }
+                if !more {
+                    hold.lists_out = hold.lists_out.saturating_sub(1);
+                }
+                self.advance(who, m, c, out);
+            }
+            ServerMessage::KeyringIn {
+                group,
+                gen,
+                epoch,
+                join,
+                part,
+                last,
+                piece,
+            } => {
+                let Some(m) = groups.get(group) else {
+                    return;
+                };
+                let bytes = encoded(piece);
+                let hold = self.holds.entry(group.clone()).or_default();
+                let took = hold.keyring_parts().take(
+                    (*gen, *epoch, *join),
+                    *part,
+                    *last,
+                    piece.clone(),
+                    bytes,
+                );
+                if let Part::Whole(at, parts) = took.part {
+                    if let Err(why) = self.take_ring(who, m, at, parts, c.now) {
+                        tracing::warn!(%group, why, "the keyring did not open");
+                        self.give_up(m, decline::NOT_READY, why, out);
+                        return;
+                    }
+                    self.advance(who, m, c, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether this device holds keys in `group`: it then reads every name it takes.
+    pub(super) fn holds(&self, group: &str) -> bool {
+        self.holds.get(group).is_some_and(|h| h.in_set)
+    }
+
+    /// The `KX` of this device's own entry in `group`, if it holds one: the pair it holds
+    /// keys with now (the new one while its own Replace is out; `own_kxs` gives both).
+    #[cfg(test)]
+    pub(super) fn own_kx(&self, group: &str) -> Option<[u8; 32]> {
+        self.holds.get(group).and_then(|h| h.kx)
+    }
+
+    /// Every pair of this device a set of a `kind` group may name: the old one too while its
+    /// own Replace is out (`own_kx` gives the new one then). A Replace swapping any of them
+    /// for a pair not among them is one it did not make (§5.11). From the pairs it keeps, not
+    /// from `holds`: the first `EpochIn` of a connection, where a device away meets the swap,
+    /// comes before any `sync` of it (RV repair).
+    pub(super) fn own_kxs(&self, who: &Who, kind: GroupKind) -> Vec<[u8; 32]> {
+        self.my_kxs(who, kind)
+    }
+
+    /// The member took a header (`EpochIn`): each pushed head is seen, so a Join of ours is
+    /// met as the head or its parent however fast the next ones come (§5.2).
+    pub(super) fn head_taken(&mut self, who: &mut Who, m: &Member, out: &mut GkOut) {
+        if who.on {
+            self.sync(who, m, out);
+        }
+    }
+
+    /// Where this device stands in `m`'s group: in its set or not, a commit of its own the
+    /// member took, a resignation the rules want (§5.6).
+    fn sync(&mut self, who: &mut Who, m: &Member, out: &mut GkOut) {
+        let kind = m.t.kind;
+        let kxs = self.my_kxs(who, kind);
+        let hold = self.holds.entry(m.t.group.clone()).or_default();
+        hold.kind = Some(kind);
+        let set: &[Keyholder] = m.kh.as_ref().map_or(&[], |k| &k.header().keyholders);
+        let mine = set.iter().find(|k| kxs.contains(&k.kx));
+        hold.in_set = mine.is_some();
+        hold.kx = mine.and(kxs.first().copied());
+        // The desktop counters of every set the member holds of this group, kept while this
+        // device holds keys here (RV r-keyholders:773): at the first look of a connection, and
+        // after each take (a catch-up's sets are among `kh_seen`)
+        if hold.in_set && (!hold.counted || !m.took.is_empty()) {
+            hold.counted = true;
+            for h in m.kh.iter().chain(m.kh_seen.values()) {
+                if self.keep.count_desks(&m.t.group, &h.header().keyholders) {
+                    self.dirty = true;
+                }
+            }
+        }
+        // Our commit the member took
+        let taken = match (&hold.work, &m.head) {
+            (
+                Some(Work {
+                    stage: Stage::Sent(b),
+                    ..
+                }),
+                Some(h),
+            ) => b.header.d() == h.d(),
+            _ => false,
+        };
+        if taken {
+            if let Some(Work {
+                stage: Stage::Sent(b),
+                ..
+            }) = hold.work.take()
+            {
+                adopt(hold, *b);
+            }
+        }
+        // A guest gives way to an account keyholder, a browser to a desktop (§5.6)
+        if let (Some(k), GroupKind::Text, false) = (mine, kind, hold.resigned) {
+            let guest = k.m.is_conn() && set.iter().any(|x| x.m.account().is_some());
+            let browser = who.platform == Platform::Browser
+                && set.iter().any(|x| x.origin == Origin::Desktop as u8);
+            if guest || browser {
+                out.send.push(ClientMessage::KeyholdResign {
+                    group: m.t.group.clone(),
+                    entry: None,
+                });
+                hold.resigned = true;
+            }
+        }
+        if !hold.in_set {
+            hold.resigned = false;
+        }
+        // The seats our Joins sealed, met among the headers taken since the last look (a
+        // catch-up carries many) or at the head, and whether the head stands on them
+        for u in self
+            .keep
+            .unnamed
+            .iter_mut()
+            .filter(|u| u.group == m.t.group)
+        {
+            if u.look(&m.took, m.head.as_ref(), &m.names) {
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// A whole `EpochDue`.
+    fn on_due(
+        &mut self,
+        who: &mut Who,
+        m: &Member,
+        due: u64,
+        p: DuePiece,
+        c: &mut GkCtx,
+        out: &mut GkOut,
+    ) {
+        let group = m.t.group.clone();
+        let hold = self.holds.entry(group.clone()).or_default();
+        // The relay asks the next due on the commit it took: ours, taken
+        if let Some(Work {
+            stage: Stage::Sent(b),
+            ..
+        }) = &hold.work
+        {
+            if b.header.d() == p.parent {
+                if let Some(Work {
+                    stage: Stage::Sent(b),
+                    ..
+                }) = hold.work.take()
+                {
+                    adopt(hold, *b);
+                }
+            }
+        }
+        // A new due replaces what was in hand
+        self.drop_work(&group);
+        if let Some((why, detail)) = self.refuses(who, m, &p, out) {
+            out.send.push(ClientMessage::EpochDecline {
+                group,
+                due,
+                why,
+                detail: detail.into(),
+            });
+            return;
+        }
+        self.attempts += 1;
+        let hold = self.holds.entry(group).or_default();
+        hold.work = Some(Work {
+            due,
+            piece: p,
+            now: c.secs(),
+            stage: Stage::Head,
+            attempt: self.attempts,
+            lists_asked: false,
+            stale: None,
+            rebased: vec![],
+            job: None,
+        });
+        self.advance(who, m, c, out);
+    }
+
+    /// A decline the rules want for this due, before anything is fetched or built; with
+    /// the resignations they also want (§5.6 "refuses or resigns").
+    fn refuses(
+        &mut self,
+        who: &Who,
+        m: &Member,
+        p: &DuePiece,
+        out: &mut GkOut,
+    ) -> Option<(u8, &'static str)> {
+        let text = m.t.kind == GroupKind::Text;
+        let resign = |out: &mut GkOut| {
+            out.send.push(ClientMessage::KeyholdResign {
+                group: m.t.group.clone(),
+                entry: None,
+            })
+        };
+        if text && who.platform == Platform::Phone {
+            return Some((decline::PLATFORM, "a phone holds no text group's keys"));
+        }
+        if self.skew.unsigned_abs() > KEYHOLDER_SKEW_SECS {
+            return Some((decline::CLOCK, "this device's clock is off the relay's"));
+        }
+        let gated = p.gated || m.head.as_ref().is_some_and(|h| h.header().gated);
+        // Hidden or in a call too: it builds in the host's short steps (choice 31)
+        if text
+            && who.platform == Platform::Browser
+            && m.head
+                .as_ref()
+                .is_some_and(|h| h.header().seats > BROWSER_MAX_SEATS)
+        {
+            resign(out);
+            return Some((
+                decline::PLATFORM,
+                "a browser holds no group past 10 000 seats",
+            ));
+        }
+        if text && who.account.is_none() && gated {
+            resign(out);
+            return Some((decline::GUEST_LIMIT, "a guest holds no gated group's keys"));
+        }
+        None
+    }
+
+    /// Takes the due in hand as far as it goes now.
+    fn advance(&mut self, who: &mut Who, m: &Member, c: &mut GkCtx, out: &mut GkOut) {
+        let group = m.t.group.clone();
+        let Some(hold) = self.holds.get_mut(&group) else {
+            return;
+        };
+        let Some(w) = hold.work.as_mut() else {
+            return;
+        };
+        if matches!(w.stage, Stage::Head) {
+            let kind = w.piece.kind;
+            if kind != due_code::GENESIS {
+                let Some(head) = m.head.as_ref().filter(|h| h.d() == w.piece.parent) else {
+                    return;
+                };
+                if kind != due_code::REGENESIS
+                    && !hold.ring.as_ref().is_some_and(|r| r.head.d() == head.d())
+                {
+                    let h = head.header();
+                    let at = (h.gen, h.epoch, h.join);
+                    if hold.keyring_asked != Some(at) {
+                        hold.keyring_asked = Some(at);
+                        out.send.push(ClientMessage::KeyringWanted {
+                            group,
+                            gen: h.gen,
+                            have: None,
+                        });
+                    }
+                    return;
+                }
+            }
+            w.stage = Stage::Lists;
+        }
+        if matches!(w.stage, Stage::Lists) {
+            let needed = match &hold.ring {
+                Some(r) if !matches!(w.piece.kind, due_code::GENESIS | due_code::REGENESIS) => {
+                    lists_needed(&r.ring, &w.piece, w.now)
+                }
+                _ => vec![],
+            };
+            let gen = hold.ring.as_ref().map(|r| r.head.header().gen);
+            if gen.is_some_and(|g| g != hold.lists_gen) {
+                hold.lists.clear();
+                hold.lists_gen = gen.unwrap_or_default();
+            }
+            let missing: Vec<Version> = needed
+                .into_iter()
+                .filter(|v| !hold.lists.contains_key(v))
+                .collect();
+            if !missing.is_empty() {
+                if hold.lists_out > 0 {
+                    return;
+                }
+                if w.lists_asked {
+                    let why = "the relay did not send a list the build needs";
+                    self.give_up(m, decline::NOT_READY, why, out);
+                    return;
+                }
+                w.lists_asked = true;
+                for chunk in missing.chunks(gk::LISTS_WANTED_MAX) {
+                    hold.lists_out += 1;
+                    out.send.push(ClientMessage::EpochListsWanted {
+                        group: group.clone(),
+                        gen: hold.lists_gen,
+                        versions: chunk.iter().map(|v| (v.b, v.v)).collect(),
+                    });
+                }
+                return;
+            }
+            self.job(who, m, c, out);
+        }
+    }
+
+    /// Declines the due in hand and lets it go.
+    fn give_up(&mut self, m: &Member, why: u8, detail: &str, out: &mut GkOut) {
+        let Some(hold) = self.holds.get_mut(&m.t.group) else {
+            return;
+        };
+        if let Some(w) = hold.work.take() {
+            out.send.push(ClientMessage::EpochDecline {
+                group: m.t.group.clone(),
+                due: w.due,
+                why,
+                detail: detail.into(),
+            });
+        }
+    }
+
+    /// The due in hand, checked, as a job.
+    fn job(&mut self, who: &mut Who, m: &Member, c: &mut GkCtx, out: &mut GkOut) {
+        match self.task(who, m, c) {
+            Ok((task, due, attempt)) => {
+                let Some(hold) = self.holds.get_mut(&m.t.group) else {
+                    return;
+                };
+                let live = Arc::new(());
+                let Some(w) = hold.work.as_mut() else {
+                    return;
+                };
+                w.stage = Stage::Building;
+                w.job = Some(live.clone());
+                self.jobs.push_back(BuildJob {
+                    group: m.t.group.clone(),
+                    due,
+                    attempt,
+                    task: Some(Box::new(task)),
+                    run: None,
+                    bases: hold.cache.clone(),
+                    live: Arc::downgrade(&live),
+                    units: 0,
+                });
+                out.build_ready = true;
+            }
+            Err((why, detail)) => self.give_up(m, why, detail, out),
+        }
+    }
+
+    fn task(
+        &mut self,
+        who: &mut Who,
+        m: &Member,
+        c: &mut GkCtx,
+    ) -> Result<(Task, u64, u64), (u8, &'static str)> {
+        let not_ready = |d: &'static str| (decline::NOT_READY, d);
+        let kind = m.t.kind;
+        let hold = self.holds.get(&m.t.group).ok_or(not_ready("no due"))?;
+        let w = hold.work.as_ref().ok_or(not_ready("no due"))?;
+        let p = &w.piece;
+        let anew = matches!(p.kind, due_code::GENESIS | due_code::REGENESIS);
+        let ring = hold.ring.as_ref().filter(|_| !anew);
+        let set: Vec<Keyholder> = ring.map_or_else(Vec::new, |r| r.kh.header().keyholders.clone());
+        let now_ms = c.now;
+        // The pair this device signs with: the volunteer's for a new start of a text group,
+        // the connection's in voice (plan §5: any platform, a desktop's 0x03 pair holds no
+        // voice keys), else its entry's
+        let me = if anew && kind == GroupKind::Voice {
+            Self::conn(who, now_ms)
+        } else if anew {
+            self.volunteer_pair(who, now_ms)
+        } else {
+            self.pair_in(who, kind, &set, now_ms)
+        }
+        .ok_or(not_ready("this device holds no pair the due names"))?;
+        let hold = self.holds.get(&m.t.group).ok_or(not_ready("no due"))?;
+        let w = hold.work.as_ref().ok_or(not_ready("no due"))?;
+        let p = &w.piece;
+        let ring = hold.ring.as_ref().filter(|_| !anew);
+        let (head, kh) = match (anew, ring, &m.head, &m.kh) {
+            (true, _, h, k) => (
+                h.clone().filter(|_| p.kind == due_code::REGENESIS),
+                k.clone(),
+            ),
+            (false, Some(r), _, _) => (Some(r.head.clone()), Some(r.kh.clone())),
+            _ => return Err(not_ready("no keyring at the head")),
+        };
+        let gated_head = head.as_ref().is_some_and(|h| h.header().gated);
+        let mut due = Due::of(
+            DueKind::from_code(p.kind).unwrap_or(DueKind::Refresh),
+            p.gated,
+        );
+        let mut what = What::Commit;
+        // Seats owed a seed welcome: each to the keys its seat is named by, so the relay
+        // cannot point one seat's `s_m` at keys of its own: endorsed by the seat's `IK`, its
+        // pin for an account, as a joiner's are (RV q1-q2:1420; the tags alone are 64 bits)
+        let mut owed = Vec::with_capacity(p.seed_seats.len());
+        let mut tofu = vec![];
+        for s in &p.seed_seats {
+            let seat = SeatRef::from(s.seat);
+            let checked = wire::pair(&s.keys, s.seat.m)
+                .ok()
+                .and_then(|pair| Some((seat_signed(kind, seat, &s.ik, &pair, c)?, pair)));
+            let Some((pin, pair)) = checked else {
+                return Err(not_ready("a seat's keys are not its own"));
+            };
+            tofu.extend(pin);
+            owed.push((seat, pair.keys));
+        }
+        // Pinned on the relay's word only once every seat passed: a page declined pins nothing
+        for (a, ik) in tofu {
+            if c.pins.pin(&a).is_none() {
+                c.pins.pin_new(a, ik, c.now);
+            }
+        }
+        let mut seed_seats = HashMap::new();
+        if p.kind == due_code::SEED_WELCOMES {
+            what = What::Welcomes(owed);
+        } else {
+            seed_seats.extend(owed);
+            for j in &p.joins {
+                due.joiners
+                    .push(Joiner::try_from(j).map_err(|_| not_ready("a joiner is malformed"))?);
+            }
+            due.exits = p.exits.iter().cloned().map(Exit::from).collect();
+            due.exits_upto = p.exits_upto;
+            due.remove = p.remove.map(Into::into);
+            if let Some(cand) = &p.promote {
+                let cand = Candidate::try_from(cand)
+                    .map_err(|_| (decline::CANDIDATE, "the candidate is malformed"))?;
+                let floor = cand
+                    .m
+                    .account()
+                    .and_then(|a| self.keep.desk_floor(&m.t.group, &a));
+                if !candidate_ok(kind, p.gated || gated_head, &set, floor, &cand, c) {
+                    return Err((decline::CANDIDATE, "the candidate fails the checks"));
+                }
+                due.candidate = Some(cand);
+            }
+        }
+        let mut new = None;
+        match due.kind {
+            DueKind::Genesis | DueKind::Regenesis => {
+                let own = Self::own_seats(who, kind);
+                if due.joiners.len() != 1 || !own.contains(&due.joiners[0].seat) {
+                    return Err(not_ready("a new start seats this device's own seat only"));
+                }
+                due.volunteer = Some(Candidate {
+                    m: me.m,
+                    ik: raw(&who.identity),
+                    pair: me.wire.clone(),
+                });
+            }
+            DueKind::Replace => {
+                let (Some(old), Some(desk)) = (&self.old, &self.desk) else {
+                    return Err(not_ready("no Replace of this device is out"));
+                };
+                if old.kx() != me.kx() {
+                    return Err(not_ready("the old pair is not the entry"));
+                }
+                let entry = desk
+                    .wire
+                    .entry(kind, desk.m, raw(&who.identity))
+                    .ok_or(not_ready("the new pair makes no entry"))?;
+                due.replace = Some(ReplaceAsk {
+                    old: kx_tag(&old.kx()),
+                    pair: desk.wire.clone(),
+                });
+                new = Some((desk.clone(), entry));
+            }
+            _ => {}
+        }
+        // A gated header with a connections-pool bucket left (§5.6)
+        if let (true, Some(r)) = (p.gated, ring) {
+            let mut leaving: HashMap<u64, usize> = HashMap::new();
+            for x in &p.exits {
+                *leaving.entry(x.b).or_default() += 1;
+            }
+            let conns_left = r.ring.buckets.iter().any(|b| {
+                b.pool == Pool::Conns
+                    && usize::from(b.seats) > leaving.get(&b.b).copied().unwrap_or(0)
+            });
+            if conns_left {
+                return Err((
+                    decline::CONN_BUCKET,
+                    "a gated header over a connections bucket",
+                ));
+            }
+        }
+        // The joiners this keyholder seats (§5.2)
+        let mut refused = Vec::new();
+        // Never into a text epoch past its age (or of an age not known), whatever the relay
+        // asks: a newcomer reads that epoch's kept posts from its opening, so a relay that
+        // withholds refreshes would have it read hours back (§6 "A newcomer")
+        if due.kind == DueKind::Join
+            && kind == GroupKind::Text
+            && m.opened
+                .is_none_or(|t| c.secs() > t.saturating_add(EPOCH_AGE_MAX_SECS))
+        {
+            return Err(not_ready("a Join into an epoch past its age"));
+        }
+        if due.kind == DueKind::Join {
+            // Seated now: in a list of a version the keyring still holds, not a superseded one
+            let current: HashSet<Version> = ring
+                .map(|r| r.ring.buckets.iter().map(|k| k.version()).collect())
+                .unwrap_or_default();
+            let seated: HashSet<SeatRef> = hold
+                .lists
+                .iter()
+                .filter(|(v, _)| current.contains(v))
+                .flat_map(|(_, l)| l.iter().map(|s| s.seat))
+                .collect();
+            for j in &due.joiners {
+                if let Some(why) = joiner_why(kind, gated_head, j, w.now, c, &seated) {
+                    refused.push(commit::Refused { seat: j.seat, why });
+                }
+            }
+        }
+        let (ring_copy, krk, rolls) = match ring {
+            Some(r) => (
+                Some(Keyring {
+                    base: r.ring.base.clone(),
+                    buckets: r.ring.buckets.clone(),
+                }),
+                r.krk.clone(),
+                SeedRolls {
+                    removal: r.ring.base.rolls.removal || p.roll_due,
+                    ..r.ring.base.rolls
+                },
+            ),
+            None => (
+                None,
+                Zeroizing::new([0; 32]),
+                SeedRolls {
+                    raised: 0,
+                    removal: false,
+                },
+            ),
+        };
+        let needed: HashSet<Version> = match ring {
+            Some(r) => lists_needed(&r.ring, p, w.now).into_iter().collect(),
+            None => HashSet::new(),
+        };
+        let lists: Lists = hold
+            .lists
+            .iter()
+            .filter(|(v, _)| needed.contains(v))
+            .map(|(v, l)| (*v, l.clone()))
+            .collect();
+        let task = Task {
+            what,
+            kind,
+            id: m.t.group.clone(),
+            stored: m.stored(),
+            refused,
+            head,
+            kh,
+            ring: ring_copy,
+            krk,
+            rolls,
+            me,
+            ik: same_ik(&who.identity),
+            new,
+            lists,
+            held: p
+                .held
+                .iter()
+                .map(|(s, n)| (SeatRef::from(*s), *n))
+                .collect(),
+            pairs: p.pairs.clone(),
+            seed_seats,
+            finish: p.finish,
+            now: w.now,
+            roster: m.voice_seats.keys().copied().collect(),
+            reuse: None,
+            due,
+        };
+        let (due_id, attempt) = (w.due, w.attempt);
+        let hold = self.holds.get_mut(&m.t.group).ok_or(not_ready("no due"))?;
+        let w = hold.work.as_mut().ok_or(not_ready("no due"))?;
+        let mut task = task;
+        task.reuse = w.stale.take().map(|b| *b);
+        Ok((task, due_id, attempt))
+    }
+
+    /// This device's own seat in a group of `kind`, as the relay may name it (gk/session.rs
+    /// `volunteer`, gk/voice.rs `room_seat_m`): the account's seat keys in text, else the
+    /// connection's pair. A signed-in member's voice seat is named by its account, or by its
+    /// connection in an anonymous room that is not gated (open choice 11); the relay names
+    /// it by the room's flags, which this app may learn late, so either name of the
+    /// connection's pair is its own seat (as `seat_keys::mine` takes a welcome to either).
+    fn own_seats(who: &Who, kind: GroupKind) -> Vec<SeatRef> {
+        match (who.account, kind) {
+            (Some(a), GroupKind::Text) => who
+                .seat_keys
+                .iter()
+                .map(|k| k.pair.public().seat(MemberId::Account(a)))
+                .collect(),
+            (a, _) => {
+                let Some(keys) = who.conn.pair().map(SeatPair::public) else {
+                    return vec![];
+                };
+                let conn = MemberId::Conn(who.user_id);
+                a.map(MemberId::Account)
+                    .into_iter()
+                    .chain([conn])
+                    .map(|m| keys.seat(m))
+                    .collect()
+            }
+        }
+    }
+
+    /// `EpochStale`: on `HEAD_MOVED` the commit is made again on the new head (reusing what
+    /// may be, `build`'s `reuse`), else the due is let go and the next one waited for.
+    fn on_stale(
+        &mut self,
+        m: &Member,
+        due: u64,
+        reason: u8,
+        detail: &str,
+        head: Option<&gk::WalkLinkIn>,
+    ) {
+        let group = &m.t.group;
+        let Some(hold) = self.holds.get_mut(group) else {
+            return;
+        };
+        if !hold.work.as_ref().is_some_and(|w| w.due == due) {
+            return;
+        }
+        self.upload.retain(|(g, d, _)| !(g == group && *d == due));
+        let new = head.and_then(|l| {
+            crate::group_key::check_form(&l.header.body, &l.header.sig, m.t.kind, group).ok()
+        });
+        let (Some(new), stale::HEAD_MOVED) = (new, reason) else {
+            tracing::info!(%group, due, reason = stale::name(reason), detail, "a commit went stale");
+            hold.work = None;
+            return;
+        };
+        self.attempts += 1;
+        let w = hold.work.as_mut().expect("checked");
+        if let Stage::Sent(b) = std::mem::replace(&mut w.stage, Stage::Head) {
+            // The relay's word alone: what the Join sealed stays kept until named (§5.2)
+            if !b.sealed_to.is_empty() {
+                w.rebased.push((b.header.d(), b.sealed_to.clone()));
+            }
+            w.stale = Some(b);
+        }
+        w.piece.parent = new.d();
+        // A Fresh sent meanwhile may have dealt with this due's exits (R1)
+        let upto = new.header().exits_upto;
+        w.piece.exits.retain(|x| x.seq > upto);
+        w.lists_asked = false;
+        w.attempt = self.attempts;
+        w.job = None;
+    }
+
+    /// A whole `KeyringIn` at `at`: taken under the member's head with the `KRK` this device
+    /// holds or opens now (§3.7), and checked against the keyring it held (`check_carried`).
+    fn take_ring(
+        &mut self,
+        who: &mut Who,
+        m: &Member,
+        at: RingAt,
+        parts: Vec<KeyringPiece>,
+        now: u64,
+    ) -> Result<(), &'static str> {
+        let head = m.head.as_ref().ok_or("no head")?;
+        let h = head.header();
+        if (h.gen, h.epoch, h.join) != at {
+            return Ok(());
+        }
+        let kh =
+            m.kh.as_ref()
+                .filter(|k| k.d() == head.kh())
+                .ok_or("no keyholder header")?;
+        let g = Group::new(m.t.kind, &m.t.group, h.gen).map_err(|_| "a malformed group")?;
+        let set = &kh.header().keyholders;
+        let me = self
+            .pair_in(who, m.t.kind, set, now)
+            .ok_or("this device is in no set")?;
+        let hold = self.holds.get_mut(&m.t.group).ok_or("no group")?;
+        let held = hold.ring.as_ref().filter(|r| r.kh.d() == kh.d());
+        let krk = match (held, parts.first().and_then(|p| p.krk.as_ref())) {
+            (Some(r), _) => r.krk.clone(),
+            (None, Some(w)) => {
+                let from: MemberId = w.from.m.into();
+                if from != kh.header().signer {
+                    return Err("a KRK welcome from another than its maker");
+                }
+                // The pair it comes from, by the signed sets, not by the relay's word
+                if !krk_makers(m, kh)?.iter().any(|k| k.kx == w.from.kx) {
+                    return Err("a KRK welcome from no pair its signer held in the set");
+                }
+                let maker = crate::group_key::Holder::from_raw(from, &w.from.kx)
+                    .map_err(|_| "a malformed maker")?;
+                let ks = keyholder_set_digest(set);
+                let me = Me {
+                    m: me.m,
+                    keys: &me.pair,
+                };
+                let kh_h = kh.header();
+                open_keyring_welcome(&g, kh_h.seed, kh_h.epoch, &ks, &me, &maker, &w.bytes)
+                    .map_err(|_| "the KRK welcome does not open")?
+            }
+            _ => return Err("no KRK welcome"),
+        };
+        let stream: Vec<u8> = parts
+            .iter()
+            .flat_map(|p| p.stream.iter().copied())
+            .collect();
+        let entries = gk::read_keyring(&stream, 0, h.join).map_err(|_| "a malformed keyring")?;
+        let (base, deltas) = entries.split_first().ok_or("no keyring base")?;
+        let deltas: Vec<Vec<u8>> = deltas.iter().map(|(_, d)| d.to_vec()).collect();
+        let ring = take_keyring(&g, head, kh, &krk, base.1, &deltas)
+            .map_err(|_| "the keyring is not the head's")?;
+        if let Some(own) = hold.ring.as_ref().filter(|r| r.head.header().gen == h.gen) {
+            check_carried(&own.ring, &ring)
+                .map_err(|_| "the keyring carries what this device did not hold")?;
+            let counted = own.ring.base.rolls;
+            if !counted.carried(own.head.header(), &own.head.d(), ring.base.rolls, h) {
+                return Err("the keyring's seed rolls are not what this device counted");
+            }
+        }
+        let current: HashSet<Version> = ring.buckets.iter().map(|k| k.version()).collect();
+        hold.lists.retain(|v, _| current.contains(v));
+        hold.ring = Some(Ring {
+            head: head.clone(),
+            kh: kh.clone(),
+            ring,
+            krk,
+        });
+        Ok(())
+    }
+
+    /// The due's work of a group goes: its parts not sent, its jobs not taken, and what it
+    /// waited for. A keyholder's own asks refused (as `COMMIT`'s, which reach the member, not
+    /// the duty) or answered too late then stall no later due: the next one asks again.
+    fn drop_work(&mut self, group: &str) {
+        if let Some(hold) = self.holds.get_mut(group) {
+            hold.work = None;
+            hold.lists_out = 0;
+            hold.keyring_asked = None;
+        }
+        self.upload.retain(|(g, _, _)| g != group);
+        self.jobs.retain(|j| j.group != group);
+    }
+
+    pub(super) fn tick(
+        &mut self,
+        who: &mut Who,
+        groups: &mut std::collections::BTreeMap<String, Member>,
+        c: &mut GkCtx,
+        out: &mut GkOut,
+    ) {
+        if !who.on {
+            return;
+        }
+        for m in groups.values() {
+            self.sync(who, m, out);
+            self.advance(who, m, c, out);
+        }
+        self.unnamed(groups, c, out);
+        self.replaced(who, groups, c, out);
+    }
+
+    /// §5.2: the seats a Join of ours sealed are named once the chain the member stands on
+    /// reaches a later epoch from it, by signed `parent` links, or in a gated group by the
+    /// names (a walk: `Unnamed::look`); the head moving on without it, a head shown off it
+    /// whose lists do not come within `PROOF_WAIT_SECS`, or no later header in 70 min, is
+    /// told.
+    fn unnamed(
+        &mut self,
+        groups: &std::collections::BTreeMap<String, Member>,
+        c: &GkCtx,
+        out: &mut GkOut,
+    ) {
+        let now = c.secs();
+        let before = self.keep.unnamed.len();
+        let mut events = vec![];
+        // Joins whose due is in hand and being made again: their rebase may name them yet
+        let rebasing: HashSet<[u8; 32]> = self
+            .holds
+            .values()
+            .filter_map(|h| h.work.as_ref())
+            .flat_map(|w| w.rebased.iter().map(|(d, _)| *d))
+            .collect();
+        let off_for = &mut self.off_for;
+        self.keep.unnamed.retain(|u| {
+            let late = now >= u.at.saturating_add(EPOCH_AGE_MAX_SECS);
+            let off_late = u.off && {
+                let (waited, seen) = off_for.entry(u.d).or_insert((0, now));
+                let headed = groups.get(&u.group).is_some_and(|m| m.head.is_some());
+                if headed {
+                    *waited = waited.saturating_add(now.saturating_sub(*seen));
+                }
+                *seen = now;
+                *waited >= PROOF_WAIT_SECS
+            };
+            // `Some(true)` told, `Some(false)` named, `None` kept
+            let told = match groups.get(&u.group) {
+                // No longer tracked (the channel left, or the relay delisted it, RV
+                // q4-q5:1782): no later header comes, so at 70 min what it was then
+                None if late => Some(!u.named()),
+                None => None,
+                Some(_) if !late && rebasing.contains(&u.d) => None,
+                Some(m) => match m.head.as_ref() {
+                    // Taken, then a new generation: its epoch is over for every branch
+                    Some(h) if u.taken && h.header().gen != u.gen => Some(false),
+                    _ if u.done() => Some(false),
+                    _ if u.off => off_late.then_some(true),
+                    // No later header in 70 min
+                    _ if u.taken => (late && u.tip.d == u.d).then_some(true),
+                    Some(h) if h.header().gen != u.gen => Some(true),
+                    Some(h) if (h.header().epoch, h.header().join) >= (u.epoch, u.join) => {
+                        Some(true)
+                    }
+                    _ => late.then_some(true),
+                },
+            };
+            if told == Some(true) {
+                events.push(GkEvent::Warning {
+                    channel_id: groups
+                        .get(&u.group)
+                        .map_or(u.channel_id, |m| m.t.channel_id),
+                    kind: Warn::UnnamedSeats,
+                    n: u.seats,
+                });
+            }
+            told.is_none()
+        });
+        out.events.extend(events);
+        // A head shown off a record: the lists from the head it stood on, which show whether
+        // the head's names run through it, again after 10 s
+        let off: HashSet<[u8; 32]> = self
+            .keep
+            .unnamed
+            .iter()
+            .filter(|u| u.off)
+            .map(|u| u.d)
+            .collect();
+        self.off_for.retain(|d, _| off.contains(d));
+        self.proof_asked.retain(|d, _| off.contains(d));
+        let mut sent = HashSet::new();
+        for u in self.keep.unnamed.iter().filter(|u| u.off) {
+            let Some(h) = groups.get(&u.group).and_then(|m| m.head.as_ref()) else {
+                continue;
+            };
+            let asked = self.proof_asked.entry(u.d).or_insert(0);
+            if *asked != 0 && c.now < asked.saturating_add(CHECK_WAIT_MS) {
+                continue;
+            }
+            *asked = c.now.max(1);
+            let hd = h.header();
+            let from = gk::NamesRef {
+                gen: u.gen,
+                epoch: u.tip.epoch,
+                join: u.tip.join,
+            };
+            let to = gk::NamesRef {
+                gen: hd.gen,
+                epoch: hd.epoch,
+                join: hd.join,
+            };
+            if sent.insert((u.group.clone(), from, to)) {
+                out.send.push(ClientMessage::EpochNames {
+                    group: u.group.clone(),
+                    from,
+                    to,
+                });
+            }
+        }
+        if self.keep.unnamed.len() != before {
+            self.dirty = true;
+        }
+    }
+
+    /// A Replace done in every tracked group that named the old pair, or 7 days past: the
+    /// old pair goes (resigning where it was not swapped) and the new one volunteers.
+    fn replaced(
+        &mut self,
+        who: &mut Who,
+        groups: &std::collections::BTreeMap<String, Member>,
+        c: &GkCtx,
+        out: &mut GkOut,
+    ) {
+        let (Some(old), Some(asked)) = (&self.old, self.replacing) else {
+            return;
+        };
+        let Some(asked) = asked else {
+            self.replacing = Some(Some(c.now));
+            return;
+        };
+        let since = self.keep.old.as_ref().map_or(0, |o| o.since);
+        let expired = c.secs() >= since.saturating_add(OLD_KEYS_SECS);
+        let kx = old.kx();
+        let pending: Vec<String> = groups
+            .values()
+            .filter(|m| {
+                m.t.kind == GroupKind::Text
+                    && m.kh
+                        .as_ref()
+                        .is_some_and(|k| k.header().keyholders.iter().any(|e| e.kx == kx))
+            })
+            .map(|m| m.t.group.clone())
+            .collect();
+        if !expired && !(pending.is_empty() && c.now >= asked.saturating_add(REPLACE_SETTLE_MS)) {
+            return;
+        }
+        if expired {
+            for group in pending {
+                out.send
+                    .push(ClientMessage::KeyholdResign { group, entry: None });
+            }
+        }
+        self.old = None;
+        self.keep.old = None;
+        self.replacing = None;
+        self.dirty = true;
+        if self.offered {
+            self.offered = false;
+            self.volunteer(who, c.now, out);
+        }
+    }
+
+    pub(super) fn next_frame(&mut self, _now: u64, _in_call: bool) -> Option<ClientMessage> {
+        self.upload.pop_front().map(|(_, _, m)| m)
+    }
+
+    pub(super) fn take_build(&mut self) -> Option<BuildJob> {
+        self.jobs.pop_front()
+    }
+
+    pub(super) fn built(
+        &mut self,
+        who: &mut Who,
+        groups: &mut std::collections::BTreeMap<String, Member>,
+        b: Built,
+        c: &mut GkCtx,
+        out: &mut GkOut,
+    ) {
+        let Built {
+            group,
+            due,
+            attempt,
+            out: done,
+        } = b;
+        let Some(hold) = self.holds.get_mut(&group) else {
+            return;
+        };
+        let Some(w) = hold
+            .work
+            .as_mut()
+            .filter(|w| w.due == due && w.attempt == attempt)
+        else {
+            return;
+        };
+        match done {
+            Ok(Done::Commit(b)) => {
+                let piece = match gk::CommitPiece::try_from(b.commit.clone()) {
+                    Ok(p) => p,
+                    Err(_) => {
+                        let why = "the commit does not encode";
+                        return self.failed(&group, due, decline::NOT_READY, why, out);
+                    }
+                };
+                let max = PIECE_MAX_BYTES - gk::commit_frame_overhead(&group);
+                let parts = match gk::cut_commit(piece, max) {
+                    Ok(p) => p,
+                    Err(_) => {
+                        let why = "the commit does not cut";
+                        return self.failed(&group, due, decline::NOT_READY, why, out);
+                    }
+                };
+                let n = parts.len();
+                for (i, piece) in parts.into_iter().enumerate() {
+                    let msg = ClientMessage::EpochCommit {
+                        group: group.clone(),
+                        due,
+                        part: i as u16,
+                        last: i + 1 == n,
+                        piece,
+                    };
+                    self.upload.push_back((group.clone(), due, msg));
+                }
+                let h = b.header.header();
+                if h.kind == Kind::Join && !b.sealed_to.is_empty() {
+                    self.keep.unnamed.push(Unnamed::new(
+                        &group,
+                        &b.header,
+                        b.sealed_to.len() as u32,
+                        c.secs(),
+                        groups.get(&group).map_or(0, |m| m.t.channel_id),
+                    ));
+                    // A stale Join of this due whose seats this one seals again: its record
+                    // is this one's now
+                    let now_sealed: HashSet<&SeatRef> = b.sealed_to.iter().collect();
+                    let again: Vec<[u8; 32]> = w
+                        .rebased
+                        .iter()
+                        .filter(|(_, seats)| seats.iter().all(|s| now_sealed.contains(s)))
+                        .map(|(d, _)| *d)
+                        .collect();
+                    w.rebased.retain(|(d, _)| !again.contains(d));
+                    self.keep.unnamed.retain(|u| !again.contains(&u.d));
+                    self.dirty = true;
+                }
+                w.stage = Stage::Sent(b);
+            }
+            Ok(Done::Welcomes { gen, s, list }) => {
+                for page in list.chunks(SEED_WELCOMES_A_FRAME) {
+                    let msg = ClientMessage::EpochWelcomes {
+                        group: group.clone(),
+                        due,
+                        gen,
+                        seed: s,
+                        welcomes: page
+                            .iter()
+                            .map(|w| gk::SeedWelcomeOut {
+                                seat: w.seat.into(),
+                                bytes: w.bytes.clone(),
+                            })
+                            .collect(),
+                    };
+                    self.upload.push_back((group.clone(), due, msg));
+                }
+                hold.work = None;
+            }
+            Ok(Done::Declined(why, detail)) => self.failed(&group, due, why, detail, out),
+            Err(detail) => {
+                tracing::warn!(%group, due, detail, "a keyholder job failed");
+                self.failed(&group, due, decline::NOT_READY, &detail, out);
+            }
+        }
+        if let Some(m) = groups.get(&group) {
+            self.sync(who, m, out);
+        }
+    }
+
+    fn failed(&mut self, group: &str, due: u64, why: u8, detail: &str, out: &mut GkOut) {
+        if let Some(hold) = self.holds.get_mut(group) {
+            hold.work = None;
+        }
+        let mut detail = detail.to_string();
+        detail.truncate(gk::DETAIL_MAX_BYTES);
+        out.send.push(ClientMessage::EpochDecline {
+            group: group.to_string(),
+            due,
+            why,
+            detail,
+        });
+    }
+
+    /// "Help hold keys" switched: off resigns every text group held (before the volunteer
+    /// goes, so the relay still knows whose entry each resign names).
+    pub(super) fn set_volunteer(
+        &mut self,
+        who: &mut Who,
+        _groups: &mut std::collections::BTreeMap<String, Member>,
+        on: bool,
+        out: &mut GkOut,
+    ) {
+        if !who.on {
+            return;
+        }
+        if on {
+            if !self.offered {
+                self.volunteer(who, crate::time::now_millis(), out);
+            }
+            return;
+        }
+        let mut held: Vec<&String> = self
+            .holds
+            .iter()
+            .filter(|(_, h)| h.in_set && h.kind == Some(GroupKind::Text))
+            .map(|(g, _)| g)
+            .collect();
+        held.sort();
+        for group in held {
+            out.send.push(ClientMessage::KeyholdResign {
+                group: group.clone(),
+                entry: None,
+            });
+        }
+        self.unoffer(who, out);
+    }
+
+    fn unoffer(&mut self, who: &Who, out: &mut GkOut) {
+        if std::mem::take(&mut self.offered) {
+            out.send.push(ClientMessage::KeyholdVolunteer {
+                on: false,
+                platform: who.platform.code(),
+                pair: None,
+            });
+        }
+    }
+
+    /// The account's seat keys settled, or rotated: a signed-in device that could not offer
+    /// itself at `GroupKeys` (its keys not yet in the vault) volunteers now, a desktop
+    /// keyholder replaces its pair (§5.11).
+    pub(super) fn seat_keys_changed(
+        &mut self,
+        who: &mut Who,
+        groups: &mut std::collections::BTreeMap<String, Member>,
+        out: &mut GkOut,
+    ) {
+        if !who.on {
+            return;
+        }
+        let now = crate::time::now_millis();
+        if !self.offered {
+            // Its Replace goes after it where the kept pair is behind (`volunteer`)
+            self.volunteer(who, now, out);
+        } else if !Self::uses_desk(who)
+            || self.desk.is_none()
+            || self.old.is_some()
+            || self.desk(who, now).is_none()
+        {
+            return;
+        } else {
+            self.ask_replace(out);
+        }
+        // The pair it holds keys with is the new one from now (`own_kx`)
+        for m in groups.values() {
+            self.sync(who, m, out);
+        }
+    }
+
+    /// The browser page was hidden or shown, or a call began or ended: a browser offers
+    /// again when that moved it between shown and out of a call (`BROWSER`) and hidden or in
+    /// a call (`BROWSER_BUSY`, the fallback of choice 31); the relay takes it as its new rank.
+    pub(super) fn visibility(
+        &mut self,
+        who: &mut Who,
+        _groups: &mut std::collections::BTreeMap<String, Member>,
+        visible: bool,
+        in_call: bool,
+        out: &mut GkOut,
+    ) {
+        who.visible = visible;
+        self.in_call = in_call;
+        if !who.on || who.platform != Platform::Browser {
+            return;
+        }
+        if !self.offered || self.offered_busy != self.busy(who) {
+            self.volunteer(who, crate::time::now_millis(), out);
+        }
+    }
+
+    pub(super) fn untrack(&mut self, group: &str) {
+        self.drop_work(group);
+        self.holds.remove(group);
+    }
+
+    pub(super) fn end(&mut self, _who: &mut Who, _out: &mut GkOut) {
+        self.offered = false;
+        self.replacing = None;
+        self.holds.clear();
+        self.upload.clear();
+        self.jobs.clear();
+    }
+}
+
+/// The lists an opening on `ring` needs (`plan_opening`, as `build_opening` plans it at the
+/// same time); a Join, a new start and a welcome page need none. An opening also asks the
+/// lists of the buckets it drops: it may drop only the seats its exits name (`validate`
+/// rules 8 and 10), and its own check (`Task::check`) sees a bucket's seats only in its list.
+fn lists_needed(ring: &Keyring, p: &DuePiece, now: u64) -> Vec<Version> {
+    let kind = match DueKind::from_code(p.kind) {
+        Some(DueKind::Join | DueKind::Genesis | DueKind::Regenesis) | None => return vec![],
+        Some(k) => k,
+    };
+    let mut exits: HashMap<u64, HashSet<SeatRef>> = HashMap::new();
+    for x in &p.exits {
+        exits.entry(x.b).or_default().insert(x.seat.into());
+    }
+    let buckets: Vec<BucketNow> = ring
+        .buckets
+        .iter()
+        .map(|kb| BucketNow {
+            b: kb.b,
+            v: kb.v,
+            pool: kb.pool,
+            seats: kb.seats,
+            made: kb.made,
+            exits: exits.get(&kb.b).map_or(0, |x| x.len() as u16),
+        })
+        .collect();
+    let plan = plan_opening(kind.header_kind(), &buckets, kind == DueKind::Refresh, now);
+    let mut needed = plan.lists_needed(&buckets);
+    needed.extend(
+        buckets
+            .iter()
+            .zip(&plan.steps)
+            .filter(|(_, s)| **s == build::Step::Drop)
+            .map(|(b, _)| Version { b: b.b, v: b.v }),
+    );
+    needed
+}
+
+/// The seats of keyring bucket `kb` in list order, when `list` is the one it names (its
+/// digest and its count, as `build_opening` checks a list it builds from).
+fn listed(g: &Group, kb: &KeyringBucket, list: &[ListSeat]) -> Option<Vec<SeatRef>> {
+    let mut seats: Vec<SeatRef> = list.iter().map(|l| l.seat).collect();
+    list_order(&mut seats);
+    let keys: HashMap<SeatRef, &[u8]> = list.iter().map(|l| (l.seat, &l.dh[..])).collect();
+    let digest = list_digest(g, kb.version(), &seats, |s| seat_dh(keys.get(s)?));
+    (seats.len() == usize::from(kb.seats) && digest == Some(kb.list)).then_some(seats)
+}
+
+/// The entries a KRK welcome under the keyholder header `kh` may come from (§4.3): the one a
+/// KeyholdersReplace swaps (its old pair proves the signer held it); the signer's entries in
+/// the parent set for a KeyholdersAdd (an entry it adds made nothing yet); the signer's in
+/// the set itself for a KeyholdersRemove (whose signer stays) and a Genesis or Regenesis. The
+/// relay names the welcome's maker, its `KX` included: one from another pair of the signer's
+/// account (a sibling device, a thief of its `IK`) is opened as from none (RV). A parent set
+/// this device does not hold refuses: no welcome is opened on the relay's word.
+fn krk_makers(m: &Member, kh: &SignedHeader) -> Result<Vec<Keyholder>, &'static str> {
+    let h = kh.header();
+    let parent = || {
+        m.kh_seen
+            .get(&h.kh_parent)
+            .filter(|p| p.header().gen == h.gen && p.header().kind.sets_keyholders())
+            .map(|p| &p.header().keyholders)
+            .ok_or("the parent keyholder set is not held")
+    };
+    let signers = |set: &[Keyholder]| -> Vec<Keyholder> {
+        set.iter().filter(|k| k.m == h.signer).copied().collect()
+    };
+    Ok(match h.kind {
+        Kind::KeyholdersReplace => {
+            let swap = crate::group_key::replaced_entry(parent()?, h)
+                .map_err(|_| "not a swap of the parent set")?;
+            vec![swap.old]
+        }
+        Kind::KeyholdersAdd => signers(parent()?),
+        _ => signers(&h.keyholders),
+    })
+}
+
+/// Our commit was taken: its keyring (its rolls with it) and `KRK` are the group's now.
+fn adopt(hold: &mut Hold, b: build::Built) {
+    let h = b.header.header();
+    let prev = hold.ring.take();
+    let kh = if h.kind.sets_keyholders() {
+        b.header.clone()
+    } else {
+        match &prev {
+            Some(r) => r.kh.clone(),
+            None => return,
+        }
+    };
+    if prev.as_ref().is_none_or(|r| r.head.header().gen != h.gen) {
+        hold.lists.clear();
+    }
+    let current: HashSet<Version> = b.ring.buckets.iter().map(|k| k.version()).collect();
+    hold.lists.retain(|v, _| current.contains(v));
+    hold.lists_gen = h.gen;
+    hold.ring = Some(Ring {
+        head: b.header,
+        kh,
+        ring: b.ring,
+        krk: b.krk,
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::group_key::build::world::{self, World, T0, TEXT_ID};
+    use crate::group_key::commit::{Applied, Commit};
+    use crate::group_key::{open_seed_welcome, tag, Added, NamesList, Removed, SeatKeys};
+    use crate::group_state::{GkPins, GkTrack, MemoryPins};
+
+    const CH: u32 = 7;
+    const U: u32 = 3;
+
+    fn track() -> GkTrack {
+        GkTrack {
+            channel_id: CH,
+            group: TEXT_ID.into(),
+            kind: GroupKind::Text,
+            anonymous: false,
+            hide_members: false,
+            viewer_admin: false,
+            keeps_history: true,
+        }
+    }
+
+    /// One connection's duty and its member of `TEXT_ID`, at `T0`.
+    struct Rig {
+        duty: Duty,
+        who: Who,
+        groups: BTreeMap<String, Member>,
+        pins: MemoryPins,
+        now: u64,
+        /// Each job's steps, units, and the most units one step did.
+        ran: Vec<(u64, u64, u64)>,
+    }
+
+    impl Rig {
+        fn new(account: Option<[u8; 16]>, platform: Platform) -> Rig {
+            let who = Who {
+                on: true,
+                run: [1; 16],
+                relay_clock: crate::time::now_millis() / 1000,
+                platform,
+                help: true,
+                visible: true,
+                user_id: U,
+                identity: IdentityKeyPair::generate(&mut crate::rng()),
+                account,
+                seat_keys: account.map(|_| SeatKeys::generate(1, T0)),
+                conn: Default::default(),
+            };
+            let mut groups = BTreeMap::new();
+            groups.insert(TEXT_ID.to_string(), Member::new(track(), None));
+            Rig {
+                duty: Duty::default(),
+                who,
+                groups,
+                pins: MemoryPins::default(),
+                now: T0 * 1000,
+                ran: vec![],
+            }
+        }
+
+        fn start(&mut self) -> Vec<ClientMessage> {
+            let mut out = GkOut::default();
+            self.duty.start(&mut self.who, &mut out);
+            out.send
+        }
+
+        fn frame(&mut self, msg: ServerMessage) -> GkOut {
+            let mut out = GkOut::default();
+            let mut c = GkCtx {
+                pins: &mut self.pins,
+                now: self.now,
+            };
+            self.duty
+                .frame(&mut self.who, &mut self.groups, &msg, &mut c, &mut out);
+            out
+        }
+
+        fn tick(&mut self) -> GkOut {
+            let mut out = GkOut::default();
+            let mut c = GkCtx {
+                pins: &mut self.pins,
+                now: self.now,
+            };
+            self.duty
+                .tick(&mut self.who, &mut self.groups, &mut c, &mut out);
+            out
+        }
+
+        fn due(&mut self, id: u64, p: DuePiece) -> GkOut {
+            self.frame(ServerMessage::EpochDue {
+                group: TEXT_ID.into(),
+                due: id,
+                part: 0,
+                last: true,
+                piece: Box::new(p),
+            })
+        }
+
+        /// `due` in parts of 20 joiners, as a relay cuts a big Join to `PIECE_MAX_BYTES`.
+        fn due_in_parts(&mut self, id: u64, mut p: DuePiece) -> GkOut {
+            let joins = std::mem::take(&mut p.joins);
+            let mut parts = vec![p];
+            for (i, chunk) in joins.chunks(20).enumerate() {
+                if i > 0 {
+                    parts.push(DuePiece {
+                        joins: vec![],
+                        exits: vec![],
+                        pairs: vec![],
+                        held: vec![],
+                        seed_seats: vec![],
+                        ..parts[0].clone()
+                    });
+                }
+                parts.last_mut().expect("one").joins = chunk.to_vec();
+            }
+            let n = parts.len();
+            let mut all = GkOut::default();
+            for (i, piece) in parts.into_iter().enumerate() {
+                let out = self.frame(ServerMessage::EpochDue {
+                    group: TEXT_ID.into(),
+                    due: id,
+                    part: i as u16,
+                    last: i + 1 == n,
+                    piece: Box::new(piece),
+                });
+                all.send.extend(out.send);
+                all.build_ready |= out.build_ready;
+            }
+            all
+        }
+
+        /// Every job run and handed back, as the host does off the lock: in steps of one
+        /// unit of work each (a zero budget), so every test here builds in steps.
+        fn jobs(&mut self) -> GkOut {
+            let mut all = GkOut::default();
+            while let Some(mut job) = self.duty.take_build() {
+                let (mut steps, mut most) = (0, 0);
+                let b = loop {
+                    let before = job.units();
+                    let b = job.step(Duration::ZERO);
+                    steps += 1;
+                    most = most.max(job.units() - before);
+                    if let Some(b) = b {
+                        break b;
+                    }
+                    assert!(steps < 10_000_000, "a job finishes");
+                };
+                self.ran.push((steps, job.units(), most));
+                let mut c = GkCtx {
+                    pins: &mut self.pins,
+                    now: self.now,
+                };
+                let mut out = GkOut::default();
+                self.duty
+                    .built(&mut self.who, &mut self.groups, b, &mut c, &mut out);
+                all.send.extend(out.send);
+                all.events.extend(out.events);
+            }
+            all
+        }
+
+        fn uploads(&mut self) -> Vec<ClientMessage> {
+            std::iter::from_fn(|| self.duty.next_frame(self.now, false)).collect()
+        }
+
+        /// The jobs run, and the commit their parts make.
+        fn commit(&mut self) -> Commit {
+            let out = self.jobs();
+            assert!(
+                !out.send
+                    .iter()
+                    .any(|m| matches!(m, ClientMessage::EpochDecline { .. })),
+                "declined: {:?}",
+                out.send
+            );
+            let parts: Vec<gk::CommitPiece> = self
+                .uploads()
+                .into_iter()
+                .filter_map(|m| match m {
+                    ClientMessage::EpochCommit { piece, .. } => Some(piece),
+                    _ => None,
+                })
+                .collect();
+            assert!(!parts.is_empty(), "a commit went");
+            Commit::try_from(gk::join_commit(parts).unwrap()).unwrap()
+        }
+
+        fn sent(&self) -> &build::Built {
+            match &self.duty.holds[TEXT_ID].work {
+                Some(Work {
+                    stage: Stage::Sent(b),
+                    ..
+                }) => b,
+                _ => panic!("no commit out"),
+            }
+        }
+
+        fn member(&mut self) -> &mut Member {
+            self.groups.get_mut(TEXT_ID).unwrap()
+        }
+
+        /// The member took `h` (as a keyholder's push of `chain: [h]`).
+        fn took(&mut self, h: &SignedHeader) {
+            let m = self.member();
+            if h.header().kind.sets_keyholders() {
+                m.kh_seen.insert(h.d(), h.clone());
+                m.kh = Some(h.clone());
+            }
+            m.names.header_taken(h, None);
+            m.head = Some(h.clone());
+            if h.header().kind.opens_epoch() {
+                m.opened = Some(h.header().time);
+            }
+            m.took.push((h.d(), h.header().parent));
+        }
+
+        /// The relay's `EpochNamesIn` with each of `lists`' lists at its place, taken by the
+        /// member, then seen by the duty (as `Keying::duty_saw` does).
+        fn names_in(&mut self, lists: &[&SignedHeader]) -> GkOut {
+            let piece = gk::NamesPiece {
+                lists: lists
+                    .iter()
+                    .map(|h| gk::NamesListIn::from(&NamesList::of(h.header())))
+                    .collect(),
+                ..Default::default()
+            };
+            super::super::names::names_in(self.member(), vec![piece]);
+            let mut out = GkOut::default();
+            self.duty
+                .head_taken(&mut self.who, &self.groups[TEXT_ID], &mut out);
+            out
+        }
+
+        /// The pair it volunteered with.
+        fn volunteered(sent: &[ClientMessage]) -> EndorsedPair {
+            sent.iter()
+                .find_map(|m| match m {
+                    ClientMessage::KeyholdVolunteer {
+                        on: true,
+                        pair: Some(p),
+                        ..
+                    } => Some(p.clone()),
+                    _ => None,
+                })
+                .expect("a volunteer")
+        }
+    }
+
+    /// The relay's `EpochDue` for `d` on `head`, as gk/group.rs `send_due` makes it.
+    fn piece(kind: u8, d: &Due, w: Option<&World>, pairs: Vec<EndorsedPair>) -> DuePiece {
+        let held: Vec<(gk::GkSeat, u32)> = w.map_or_else(Vec::new, |w| {
+            let s = w.head.header().seed;
+            w.held
+                .iter()
+                .filter(|(_, n)| **n < s)
+                .map(|(seat, n)| ((*seat).into(), *n))
+                .collect()
+        });
+        DuePiece {
+            kind,
+            parent: w.map_or([0; 32], |w| w.head.d()),
+            deadline_ms: 0,
+            keyring_at: w.map_or((0, 0), |w| (w.head.header().epoch, w.head.header().join)),
+            joins: d
+                .joiners
+                .iter()
+                .map(|j| gk::Joiner {
+                    seat: j.seat.into(),
+                    ik: j.ik,
+                    keys: (&Pair {
+                        keys: j.keys.clone(),
+                        endorsement: j.endorsement.clone(),
+                    })
+                        .into(),
+                    returning: j.returning,
+                })
+                .collect(),
+            exits: d
+                .exits
+                .iter()
+                .map(|x| gk::ExitIn {
+                    seq: x.seq,
+                    seat: x.seat.into(),
+                    b: x.b,
+                })
+                .collect(),
+            exits_upto: d.exits_upto,
+            promote: d.candidate.as_ref().map(|c| gk::Candidate {
+                m: c.m.into(),
+                ik: c.ik,
+                pair: (&c.pair).into(),
+            }),
+            remove: d.remove.map(Into::into),
+            gated: d.gated,
+            roll_due: false,
+            seed_seats: vec![],
+            finish: held.is_empty(),
+            pairs,
+            held,
+        }
+    }
+
+    /// `EpochLists` for every version asked in `sent`, from the relay's lists.
+    fn lists_for(w: &World, sent: &[ClientMessage]) -> Option<ServerMessage> {
+        let all = w.lists();
+        let asked: Vec<(u64, u64)> = sent
+            .iter()
+            .filter_map(|m| match m {
+                ClientMessage::EpochListsWanted { versions, .. } => Some(versions.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        if asked.is_empty() {
+            return None;
+        }
+        let lists = asked
+            .iter()
+            .filter_map(|(b, v)| {
+                let l = all.get(&Version { b: *b, v: *v })?;
+                Some(gk::ListIn {
+                    b: *b,
+                    v: *v,
+                    seats: l
+                        .iter()
+                        .map(|s| gk::ListSeat {
+                            seat: s.seat.into(),
+                            dh: s.dh.clone(),
+                        })
+                        .collect(),
+                })
+            })
+            .collect();
+        Some(ServerMessage::EpochLists {
+            group: TEXT_ID.into(),
+            gen: w.g.gen(),
+            lists,
+            more: false,
+        })
+    }
+
+    /// The relay after a Genesis it took.
+    fn world_after(due: &Due, a: Applied, b: &build::Built) -> World {
+        let h = a.header.header().clone();
+        let mut w = World {
+            kind: GroupKind::Text,
+            id: TEXT_ID,
+            stored: true,
+            g: Group::new(GroupKind::Text, TEXT_ID, h.gen).unwrap(),
+            head: a.header.clone(),
+            kh: a.header.clone(),
+            leaves: vec![],
+            keys: HashMap::new(),
+            held: HashMap::new(),
+            used_v: HashSet::new(),
+            rolls: a.rolls,
+            gens: vec![],
+            ring: world::copy_ring(&b.ring),
+            krk: b.krk.clone(),
+            holders: vec![],
+            cache: RowBases::new(),
+            now: T0,
+            roster: vec![],
+            no_keyholder_since: None,
+            seq: 0,
+            seed_keys: true,
+        };
+        w.take(due, a, b);
+        w
+    }
+
+    /// A guest keyholder's Genesis, checked and taken by the relay.
+    fn genesis(rig: &mut Rig) -> (World, Pair) {
+        let sent = rig.start();
+        let ep = Rig::volunteered(&sent);
+        let me = MemberId::Conn(U);
+        let pair = wire::pair(&ep, me.into()).unwrap();
+        let joiner = Joiner {
+            seat: pair.keys.seat(me),
+            ik: raw(&rig.who.identity),
+            keys: pair.keys.clone(),
+            endorsement: pair.endorsement.clone(),
+            returning: false,
+        };
+        let due = Due {
+            joiners: vec![joiner],
+            volunteer: Some(Candidate {
+                m: me,
+                ik: raw(&rig.who.identity),
+                pair: pair.clone(),
+            }),
+            ..Due::of(DueKind::Genesis, false)
+        };
+        let out = rig.due(1, piece(due_code::GENESIS, &due, None, vec![]));
+        assert!(out.build_ready);
+        let c = rig.commit();
+        let by = HolderRef {
+            m: me,
+            kx: pair.kx(),
+        };
+        let a = World::check_start(GroupKind::Text, TEXT_ID, true, &due, by, &c, T0, &[])
+            .unwrap_or_else(|bad| panic!("{bad}"));
+        let h = a.header.clone();
+        let w = world_after(&due, a, rig.sent());
+        rig.took(&h);
+        rig.now = w.now * 1000;
+        rig.tick();
+        assert!(
+            rig.duty.holds(TEXT_ID),
+            "in the set once its Genesis is taken"
+        );
+        assert_eq!(rig.duty.own_kx(TEXT_ID), Some(pair.kx()));
+        (w, pair)
+    }
+
+    /// What the relay made of a commit it took.
+    struct Landed {
+        header: SignedHeader,
+        seated: usize,
+        refused: Vec<(SeatRef, u8)>,
+        removed: Vec<SeatRef>,
+        /// What the member's next tick told.
+        events: Vec<GkEvent>,
+    }
+
+    /// Checks the commit as the relay would for `due`, takes it, and shows it to the member.
+    fn land(rig: &mut Rig, w: &mut World, due: &Due, by: HolderRef, c: &Commit) -> Landed {
+        let a = w.check(due, by, c).unwrap_or_else(|bad| panic!("{bad}"));
+        let mut landed = Landed {
+            header: a.header.clone(),
+            seated: a.seated.len(),
+            refused: a.refused.iter().map(|r| (r.seat, r.why)).collect(),
+            removed: a.removed.clone(),
+            events: vec![],
+        };
+        w.take(due, a, rig.sent());
+        rig.took(&landed.header);
+        rig.now = w.now * 1000;
+        landed.events = rig.tick().events;
+        landed
+    }
+
+    /// `EpochStale` for `due`, naming `head`.
+    fn stale_on(due: u64, reason: u8, head: Option<&SignedHeader>) -> ServerMessage {
+        ServerMessage::EpochStale {
+            group: TEXT_ID.into(),
+            due,
+            reason,
+            detail: String::new(),
+            head: head.map(|h| gk::WalkLinkIn {
+                header: gk::HeaderIn {
+                    body: h.body().to_vec(),
+                    sig: h.sig().to_vec(),
+                },
+                parent: None,
+            }),
+        }
+    }
+
+    /// `KeyringIn` at `head`: its epoch's opening keyring, then each Join's delta since.
+    fn keyring_at(head: &SignedHeader, entries: &[&[u8]]) -> ServerMessage {
+        let mut stream = vec![];
+        for e in entries {
+            gk::put_keyring_entry(&mut stream, e).unwrap();
+        }
+        let h = head.header();
+        ServerMessage::KeyringIn {
+            group: TEXT_ID.into(),
+            gen: h.gen,
+            epoch: h.epoch,
+            join: h.join,
+            part: 0,
+            last: true,
+            piece: KeyringPiece { krk: None, stream },
+        }
+    }
+
+    /// The promotion of a second keyholder (a desktop of account 9), whose commits win the
+    /// races below: its keyring entry, for a `KeyringIn` from it.
+    fn second_keyholder(rig: &mut Rig, w: &mut World, pair: &Pair) -> Vec<u8> {
+        let by = HolderRef {
+            m: MemberId::Conn(U),
+            kx: pair.kx(),
+        };
+        let cand = world::Holder::desktop(9);
+        let promote = w.promote_due(&cand);
+        let own: EndorsedPair = pair.into();
+        let out = rig.due(90, piece(due_code::PROMOTE, &promote, Some(w), vec![own]));
+        if let Some(lists) = lists_for(w, &out.send) {
+            rig.frame(lists);
+        }
+        let c = rig.commit();
+        land(rig, w, &promote, by, &c);
+        w.holders.push(cand);
+        c.keyring
+    }
+
+    fn sent_kinds(sent: &[ClientMessage]) -> Vec<&'static str> {
+        sent.iter()
+            .map(|m| match m {
+                ClientMessage::KeyholdVolunteer { on: true, .. } => "volunteer",
+                ClientMessage::KeyholdVolunteer { on: false, .. } => "unvolunteer",
+                ClientMessage::KeyholdResign { .. } => "resign",
+                ClientMessage::KeyholdReplace { .. } => "replace",
+                ClientMessage::EpochDecline { .. } => "decline",
+                ClientMessage::KeyringWanted { .. } => "keyring",
+                ClientMessage::EpochListsWanted { .. } => "lists",
+                _ => "other",
+            })
+            .collect()
+    }
+
+    fn declined(out: &GkOut) -> Option<u8> {
+        out.send.iter().find_map(|m| match m {
+            ClientMessage::EpochDecline { why, .. } => Some(*why),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn a_keyholder_starts_seats_drops_promotes_and_rebases_a_commit_the_relay_takes() {
+        let mut rig = Rig::new(None, Platform::Desktop);
+        let (mut w, pair) = genesis(&mut rig);
+        let by = HolderRef {
+            m: MemberId::Conn(U),
+            kx: pair.kx(),
+        };
+
+        // A Join: three accounts seated, one whose endorsement is not its IK's left out
+        let people: Vec<world::Member> = (10..13).map(world::Member::account).collect();
+        let refs: Vec<&world::Member> = people.iter().collect();
+        let mut join = w.join_due(&refs);
+        let forged = world::Member::account(20);
+        let mut j = forged.joiner();
+        j.ik = people[0].ik_raw();
+        join.joiners.push(j);
+        rig.due(2, piece(due_code::JOIN, &join, Some(&w), vec![]));
+        let c = rig.commit();
+        let a = land(&mut rig, &mut w, &join, by, &c);
+        assert_eq!(a.seated, 3);
+        assert_eq!(a.refused, vec![(forged.seat, join_refused::ENDORSEMENT)]);
+
+        // An exit: the lists it needs asked, its opening taken
+        let exits = w.exits(&[people[0].seat], DueKind::Exits);
+        let out = rig.due(3, piece(due_code::EXITS, &exits, Some(&w), vec![]));
+        assert_eq!(sent_kinds(&out.send), vec!["lists"]);
+        let lists = lists_for(&w, &out.send).unwrap();
+        rig.frame(lists);
+        let c = rig.commit();
+        let a = land(&mut rig, &mut w, &exits, by, &c);
+        assert_eq!(a.removed, vec![people[0].seat]);
+
+        // A second keyholder promoted: a desktop of another account
+        let cand = world::Holder::desktop(9);
+        let promote = w.promote_due(&cand);
+        let own: EndorsedPair = (&pair).into();
+        let out = rig.due(
+            4,
+            piece(due_code::PROMOTE, &promote, Some(&w), vec![own.clone()]),
+        );
+        if let Some(lists) = lists_for(&w, &out.send) {
+            rig.frame(lists);
+        }
+        let c = rig.commit();
+        let add_keyring = c.keyring.clone();
+        land(&mut rig, &mut w, &promote, by, &c);
+        w.holders.push(cand);
+        assert_eq!(w.head.header().keyholders.len(), 2);
+
+        // A refresh due loses the head to the other keyholder's Join, and is rebased
+        let refresh = w.due(DueKind::Refresh);
+        let refresh_piece = piece(due_code::REFRESH, &refresh, Some(&w), vec![own]);
+        let out = rig.due(5, refresh_piece);
+        if let Some(lists) = lists_for(&w, &out.send) {
+            rig.frame(lists);
+        }
+        let first = rig.commit();
+        let late = world::Member::account(30);
+        let jb = w.join(&[&late]);
+        rig.took(&jb.header);
+        rig.now = w.now * 1000;
+        let out = rig.frame(ServerMessage::EpochStale {
+            group: TEXT_ID.into(),
+            due: 5,
+            reason: stale::HEAD_MOVED,
+            detail: String::new(),
+            head: Some(gk::WalkLinkIn {
+                header: gk::HeaderIn {
+                    body: jb.header.body().to_vec(),
+                    sig: jb.header.sig().to_vec(),
+                },
+                parent: None,
+            }),
+        });
+        assert_eq!(
+            sent_kinds(&out.send),
+            vec!["keyring"],
+            "the keyring at the new head"
+        );
+        let mut stream = vec![];
+        gk::put_keyring_entry(&mut stream, &add_keyring).unwrap();
+        gk::put_keyring_entry(&mut stream, &jb.commit.keyring).unwrap();
+        let h = jb.header.header();
+        let out = rig.frame(ServerMessage::KeyringIn {
+            group: TEXT_ID.into(),
+            gen: h.gen,
+            epoch: h.epoch,
+            join: h.join,
+            part: 0,
+            last: true,
+            piece: KeyringPiece { krk: None, stream },
+        });
+        if let Some(lists) = lists_for(&w, &out.send) {
+            rig.frame(lists);
+        }
+        let again = rig.commit();
+        assert_ne!(again.body, first.body, "made again on the new head");
+        let a = land(&mut rig, &mut w, &refresh, by, &again);
+        assert_eq!(a.header.header().parent, jb.header.d());
+        // The Join's seats are named
+        named_until_closed(&mut rig, &mut w);
+    }
+
+    #[test]
+    fn a_desktop_replaces_its_pair_before_it_volunteers_with_the_new_one() {
+        let a = [5; 16];
+        let mut rig = Rig::new(Some(a), Platform::Desktop);
+        let sent = rig.start();
+        let ep = Rig::volunteered(&sent);
+        assert_eq!(ep.origin, gk::origin::DESKTOP);
+        let me = MemberId::Account(a);
+        let old = wire::pair(&ep, me.into()).unwrap();
+        // The Genesis seats the account's own seat
+        let keys = rig.who.seat_keys.as_ref().unwrap();
+        let public = keys.pair.public();
+        let e =
+            Endorsement::sign(&rig.who.identity, Origin::VaultSeat, me, 1, T0, &public).unwrap();
+        let due = Due {
+            joiners: vec![Joiner {
+                seat: public.seat(me),
+                ik: raw(&rig.who.identity),
+                keys: public,
+                endorsement: e,
+                returning: false,
+            }],
+            volunteer: Some(Candidate {
+                m: me,
+                ik: raw(&rig.who.identity),
+                pair: old.clone(),
+            }),
+            ..Due::of(DueKind::Genesis, false)
+        };
+        rig.due(1, piece(due_code::GENESIS, &due, None, vec![]));
+        let c = rig.commit();
+        let by_old = HolderRef {
+            m: me,
+            kx: old.kx(),
+        };
+        let ap = World::check_start(GroupKind::Text, TEXT_ID, true, &due, by_old, &c, T0, &[])
+            .unwrap_or_else(|bad| panic!("{bad}"));
+        let h = ap.header.clone();
+        let mut w = world_after(&due, ap, rig.sent());
+        rig.took(&h);
+        rig.now = w.now * 1000;
+        rig.tick();
+
+        // The account's seat keys rotate: the Replace is asked with the old pair still
+        // volunteered, and no new volunteer goes yet
+        let rotated = SeatKeys::from_bytes(&rig.who.seat_keys.as_ref().unwrap().to_bytes())
+            .unwrap()
+            .rotate(T0 + 10)
+            .unwrap();
+        rig.who.seat_keys = Some(rotated);
+        let mut out = GkOut::default();
+        rig.duty
+            .seat_keys_changed(&mut rig.who, &mut rig.groups, &mut out);
+        assert_eq!(sent_kinds(&out.send), vec!["replace"]);
+        let ClientMessage::KeyholdReplace { old: tag_old, pair } = out.send[0].clone() else {
+            unreachable!()
+        };
+        assert_eq!(tag_old, kx_tag(&old.kx()));
+        assert_eq!(pair.n, 2);
+        let new = wire::pair(&pair, me.into()).unwrap();
+        assert_eq!(
+            rig.duty.own_kx(TEXT_ID),
+            Some(new.kx()),
+            "its own Replace is no swap it did not make"
+        );
+        let kept = rig.duty.take_keep().expect("the keep moved");
+        assert!(kept.old.is_some() && kept.pair.as_ref().unwrap().n == 2);
+
+        // The Replace due: built from the old pair's entry, taken
+        let replace = Due {
+            replace: Some(ReplaceAsk {
+                old: tag_old,
+                pair: new.clone(),
+            }),
+            ..w.due(DueKind::Replace)
+        };
+        let out = rig.due(2, piece(due_code::REPLACE, &replace, Some(&w), vec![]));
+        if let Some(lists) = lists_for(&w, &out.send) {
+            rig.frame(lists);
+        }
+        let c = rig.commit();
+        land(&mut rig, &mut w, &replace, by_old, &c);
+        assert!(w.head.header().keyholders.iter().any(|k| k.kx == new.kx()));
+        // Settled: the new pair volunteers, the old one is gone
+        rig.now += REPLACE_SETTLE_MS;
+        let out = rig.tick();
+        assert_eq!(sent_kinds(&out.send), vec!["volunteer"]);
+        assert_eq!(Rig::volunteered(&out.send).dh, new.keys.dh_bytes().to_vec());
+        assert!(rig.duty.take_keep().unwrap().old.is_none());
+        assert_eq!(rig.duty.own_kx(TEXT_ID), Some(new.kx()));
+    }
+
+    /// A member's push of `h`, by the member's own path (`take_in`), as a frame would:
+    /// unlike `Rig::took`, the floor moves and what a header taken tells is told.
+    fn pushed(rig: &mut Rig, h: &SignedHeader) -> GkOut {
+        let mut out = GkOut::default();
+        let mut kept = super::super::kept::Kept::default();
+        let mut c = GkCtx {
+            pins: &mut rig.pins,
+            now: rig.now,
+        };
+        let p = gk::InPiece {
+            head: Some(gk::WalkLinkIn {
+                header: gk::HeaderIn {
+                    body: h.body().to_vec(),
+                    sig: h.sig().to_vec(),
+                },
+                parent: None,
+            }),
+            pushed: true,
+            ..Default::default()
+        };
+        let m = rig.groups.get_mut(TEXT_ID).unwrap();
+        m.take_in(&mut rig.who, &mut rig.duty, &mut kept, p, &mut c, &mut out);
+        out
+    }
+
+    /// This rig's connection keyholder as the world seals to it.
+    fn as_world_holder(rig: &Rig, pair: &Pair) -> world::Holder {
+        let conn = rig.who.conn.pair().unwrap().clone();
+        let m = MemberId::Conn(U);
+        world::Holder {
+            m,
+            pair: conn.clone(),
+            ik: world::same_ik(&rig.who.identity),
+            endorsement: pair.endorsement.clone(),
+            seat: world::Member {
+                seat: conn.public().seat(m),
+                pair: conn,
+                ik: world::same_ik(&rig.who.identity),
+                endorsement: pair.endorsement.clone(),
+            },
+        }
+    }
+
+    /// RV (`take_ring`, §4.3): a KeyholdersReplace's KRK welcome is taken only as from the
+    /// pair it swaps, whatever pair of the signer's account the relay names. One from another
+    /// pair of that account (a sibling device that holds the keyring, a thief of its `IK`)
+    /// carrying the true `KRK` is refused, by a keyholder that holds the generation's ring
+    /// (`check_carried` passes the true keyring) and by one that holds none, as after a
+    /// reconnect. The control: the old pair's welcome is taken.
+    #[test]
+    fn a_replace_whose_krk_welcome_is_not_from_the_old_pair_is_refused() {
+        use crate::group_key::{keyring_welcome, Me, Them};
+        for (held, sibling) in [(true, true), (false, true), (false, false)] {
+            let mut rig = Rig::new(None, Platform::Desktop);
+            let (mut w, pair) = genesis(&mut rig);
+            second_keyholder(&mut rig, &mut w, &pair);
+            let us = as_world_holder(&rig, &pair);
+            let to = HolderRef {
+                m: us.m,
+                kx: pair.kx(),
+            };
+            w.holders.push(us);
+            let new = w.holders[0].rotated();
+            let due = w.replace_due(&new);
+            let rb = w.opening_by(0, &due, false, Some(&new), None).unwrap();
+            w.step(&due, &rb);
+            rig.took(&rb.header);
+            if !held {
+                rig.duty.holds.get_mut(TEXT_ID).unwrap().ring = None;
+            }
+            let honest = rb.commit.krk.iter().find(|k| k.to == to).unwrap();
+            let (from, bytes) = if sibling {
+                let sib = world::Holder::desktop(9);
+                let h = rb.header.header();
+                let ks = keyholder_set_digest(&h.keyholders);
+                let public = rig.who.conn.pair().unwrap().public();
+                let them = Them {
+                    m: to.m,
+                    keys: &public,
+                };
+                let me = Me {
+                    m: sib.m,
+                    keys: &sib.pair,
+                };
+                let bytes =
+                    keyring_welcome(&w.g, h.seed, h.epoch, &ks, &me, &them, &rb.krk).unwrap();
+                (sib.by(), bytes)
+            } else {
+                let old = HolderRef {
+                    m: w.holders[0].m,
+                    kx: honest.from_kx,
+                };
+                (old, honest.bytes.clone())
+            };
+            assert_eq!(from.m, rb.header.header().signer, "named as the signer");
+            let mut msg = keyring_at(&rb.header, &[&rb.commit.keyring]);
+            if let ServerMessage::KeyringIn { piece, .. } = &mut msg {
+                piece.krk = Some(gk::KrkIn {
+                    from: from.into(),
+                    bytes,
+                });
+            }
+            rig.frame(msg);
+            let at = rig.duty.holds[TEXT_ID].ring.as_ref().map(|r| r.head.d());
+            assert_eq!(
+                at == Some(rb.header.d()),
+                !sibling,
+                "held {held}, from a sibling {sibling}"
+            );
+        }
+    }
+
+    /// RV (`take_ring`, §4.3): a KeyholdersAdd's KRK welcome is taken only as from an entry
+    /// its signer held in the set before it, whatever pair of the signer's account the
+    /// relay names: not from the entry the Add brings in (a sibling device of the signer's
+    /// account, or a pair a thief of its `IK` endorsed), nor from a pair in no set. The
+    /// keyholder holds no ring, as after a reconnect. The control: the signer's own pair.
+    #[test]
+    fn an_adds_krk_welcome_is_taken_only_from_its_signers_entry_in_the_set_before() {
+        use crate::group_key::{keyring_welcome, Me, Them};
+        for maker in ["signer", "added", "none"] {
+            let mut rig = Rig::new(None, Platform::Desktop);
+            let (mut w, pair) = genesis(&mut rig);
+            second_keyholder(&mut rig, &mut w, &pair);
+            let us = as_world_holder(&rig, &pair);
+            let to = HolderRef {
+                m: us.m,
+                kx: pair.kx(),
+            };
+            w.holders.push(us);
+            // Holder 0 (account 9) promotes another desktop of its own account
+            let signer = w.holders[0].by();
+            let mut sib = world::Holder::desktop(9);
+            sib.ik = world::same_ik(&w.holders[0].ik);
+            let due = w.promote_due(&sib);
+            let rb = w.opening_by(0, &due, false, None, None).unwrap();
+            w.step(&due, &rb);
+            rig.took(&rb.header);
+            rig.duty.holds.get_mut(TEXT_ID).unwrap().ring = None;
+            let h = rb.header.header();
+            assert_eq!(h.kind, Kind::KeyholdersAdd);
+            let ks = keyholder_set_digest(&h.keyholders);
+            let public = rig.who.conn.pair().unwrap().public();
+            let them = Them {
+                m: to.m,
+                keys: &public,
+            };
+            let other = world::Holder::desktop(9);
+            let (from, bytes) = match maker {
+                "signer" => {
+                    let honest = rb.commit.krk.iter().find(|k| k.to == to).unwrap();
+                    assert_eq!(honest.from_kx, signer.kx);
+                    (signer, honest.bytes.clone())
+                }
+                _ => {
+                    let x = if maker == "added" { &sib } else { &other };
+                    let me = Me {
+                        m: x.m,
+                        keys: &x.pair,
+                    };
+                    let b = keyring_welcome(&w.g, h.seed, h.epoch, &ks, &me, &them, &rb.krk);
+                    (x.by(), b.unwrap())
+                }
+            };
+            assert_eq!(from.m, h.signer, "named as the signer");
+            let mut msg = keyring_at(&rb.header, &[&rb.commit.keyring]);
+            if let ServerMessage::KeyringIn { piece, .. } = &mut msg {
+                piece.krk = Some(gk::KrkIn {
+                    from: from.into(),
+                    bytes,
+                });
+            }
+            rig.frame(msg);
+            let at = rig.duty.holds[TEXT_ID].ring.as_ref().map(|r| r.head.d());
+            assert_eq!(at == Some(rb.header.d()), maker == "signer", "from {maker}");
+        }
+    }
+
+    /// RV (`own_kxs`, §5.11): from its seat-key rotation until its own Replace lands, a
+    /// desktop's entry still names its old pair. A Replace it did not make that swaps that
+    /// entry (by a thief of the account's `IK` and the old pair) is warned of and its entry's
+    /// removal asked, as at any other time. The control: its own Replace, to its new pair,
+    /// is not.
+    #[test]
+    fn a_swap_of_the_old_entry_during_its_own_rotation_warns() {
+        for own in [false, true] {
+            let a = [5; 16];
+            let mut rig = Rig::new(Some(a), Platform::Desktop);
+            let sent = rig.start();
+            let ep = Rig::volunteered(&sent);
+            let me = MemberId::Account(a);
+            let old = wire::pair(&ep, me.into()).unwrap();
+            let keys = rig.who.seat_keys.as_ref().unwrap();
+            let public = keys.pair.public();
+            let e = Endorsement::sign(&rig.who.identity, Origin::VaultSeat, me, 1, T0, &public)
+                .unwrap();
+            let due = Due {
+                joiners: vec![Joiner {
+                    seat: public.seat(me),
+                    ik: raw(&rig.who.identity),
+                    keys: public,
+                    endorsement: e,
+                    returning: false,
+                }],
+                volunteer: Some(Candidate {
+                    m: me,
+                    ik: raw(&rig.who.identity),
+                    pair: old.clone(),
+                }),
+                ..Due::of(DueKind::Genesis, false)
+            };
+            rig.due(1, piece(due_code::GENESIS, &due, None, vec![]));
+            let c = rig.commit();
+            let by_old = HolderRef {
+                m: me,
+                kx: old.kx(),
+            };
+            let ap = World::check_start(GroupKind::Text, TEXT_ID, true, &due, by_old, &c, T0, &[])
+                .unwrap_or_else(|bad| panic!("{bad}"));
+            let h = ap.header.clone();
+            let mut w = world_after(&due, ap, rig.sent());
+            rig.now = w.now * 1000;
+            pushed(&mut rig, &h);
+            rig.tick();
+            assert!(rig.duty.holds(TEXT_ID));
+
+            // The rotation: its Replace is asked, and the set still names the old pair
+            let rotated = SeatKeys::from_bytes(&rig.who.seat_keys.as_ref().unwrap().to_bytes())
+                .unwrap()
+                .rotate(T0 + 10)
+                .unwrap();
+            rig.who.seat_keys = Some(rotated);
+            let mut out = GkOut::default();
+            rig.duty
+                .seat_keys_changed(&mut rig.who, &mut rig.groups, &mut out);
+            assert_eq!(sent_kinds(&out.send), vec!["replace"]);
+            let held = |x: &Mine| world::Holder {
+                m: x.m,
+                pair: x.pair.clone(),
+                ik: world::same_ik(&rig.who.identity),
+                endorsement: x.wire.endorsement.clone(),
+                seat: world::Member::account(99),
+            };
+            let maker = held(rig.duty.old.as_ref().unwrap());
+            // The thief's third pair, at the account's new counter; or our own new one
+            let swapped_in = if own {
+                held(rig.duty.desk.as_ref().unwrap())
+            } else {
+                maker.rotated()
+            };
+            w.holders = vec![maker];
+            let replace = w.replace_due(&swapped_in);
+            let rb = w
+                .opening_by(0, &replace, false, Some(&swapped_in), None)
+                .unwrap();
+            w.step(&replace, &rb);
+            let out = pushed(&mut rig, &rb.header);
+            let resign = out.send.iter().any(|m| {
+                matches!(m, ClientMessage::KeyholdResign { entry: Some(kx), .. }
+                    if *kx == swapped_in.by().kx)
+            });
+            let warned = out.events.iter().any(|e| {
+                matches!(
+                    e,
+                    GkEvent::Warning {
+                        kind: Warn::EntrySwapped,
+                        ..
+                    }
+                )
+            });
+            assert_eq!((resign, warned), (!own, !own), "own {own}");
+        }
+    }
+
+    /// RV (`moved_to`, §5.11): a desktop away when a Replace it did not make swapped its
+    /// entry meets that Replace on a walk, under the next head: it warns and asks for the
+    /// entry's removal, as one that took the Replace as the head does. RV repair: also as
+    /// the first `EpochIn` of a new connection (restarted, from its kept pair and local
+    /// floor, no tick before it), where a device away meets it.
+    #[test]
+    fn a_swap_of_our_entry_a_walk_crossed_warns() {
+        for (restart, as_head) in [(false, false), (true, false), (false, true), (true, true)] {
+            let a = [5; 16];
+            let mut rig = Rig::new(Some(a), Platform::Desktop);
+            let sent = rig.start();
+            let ep = Rig::volunteered(&sent);
+            let me = MemberId::Account(a);
+            let ours = wire::pair(&ep, me.into()).unwrap();
+            let keys = rig.who.seat_keys.as_ref().unwrap();
+            let public = keys.pair.public();
+            let e = Endorsement::sign(&rig.who.identity, Origin::VaultSeat, me, 1, T0, &public)
+                .unwrap();
+            let due = Due {
+                joiners: vec![Joiner {
+                    seat: public.seat(me),
+                    ik: raw(&rig.who.identity),
+                    keys: public,
+                    endorsement: e,
+                    returning: false,
+                }],
+                volunteer: Some(Candidate {
+                    m: me,
+                    ik: raw(&rig.who.identity),
+                    pair: ours.clone(),
+                }),
+                ..Due::of(DueKind::Genesis, false)
+            };
+            rig.due(1, piece(due_code::GENESIS, &due, None, vec![]));
+            let c = rig.commit();
+            let by = HolderRef {
+                m: me,
+                kx: ours.kx(),
+            };
+            let ap = World::check_start(GroupKind::Text, TEXT_ID, true, &due, by, &c, T0, &[])
+                .unwrap_or_else(|bad| panic!("{bad}"));
+            let h = ap.header.clone();
+            let mut w = world_after(&due, ap, rig.sent());
+            rig.now = w.now * 1000;
+            pushed(&mut rig, &h);
+            rig.tick();
+            assert!(rig.duty.holds(TEXT_ID));
+            // Away: a thief of the account's IK and our pair swaps our entry, then commits on
+            w.holders = vec![world::Holder {
+                m: me,
+                pair: rig.duty.desk.as_ref().unwrap().pair.clone(),
+                ik: world::same_ik(&rig.who.identity),
+                endorsement: rig.duty.desk.as_ref().unwrap().wire.endorsement.clone(),
+                seat: world::Member::account(99),
+            }];
+            let thief = w.holders[0].rotated();
+            let replace = w.replace_due(&thief);
+            let rb = w
+                .opening_by(0, &replace, false, Some(&thief), None)
+                .unwrap();
+            w.step(&replace, &rb);
+            let swapped_in = thief.by().kx;
+            w.holders[0] = thief;
+            w.tick(60);
+            let fresh = w.due(DueKind::Refresh);
+            let fb = w.opening(&fresh).unwrap();
+            w.step(&fresh, &fb);
+            rig.now = w.now * 1000;
+            if restart {
+                // A new connection: the duty from its keep, the member from its local floor
+                let keep = rig.duty.keep.clone();
+                let floor = rig.groups[TEXT_ID].local_floor().expect("a floor");
+                rig.duty = Duty::default();
+                rig.duty.keep_in(&keep);
+                rig.who.conn = Default::default();
+                rig.start();
+                rig.groups
+                    .insert(TEXT_ID.to_string(), Member::new(track(), Some(floor)));
+            }
+            // Back: the relay answers with the Fresh, and the Replace on the walk; or with
+            // the Replace as the head
+            let mut out = GkOut::default();
+            let mut kept = super::super::kept::Kept::default();
+            let mut c = GkCtx {
+                pins: &mut rig.pins,
+                now: rig.now,
+            };
+            let link = |h: &SignedHeader| gk::WalkLinkIn {
+                header: gk::HeaderIn {
+                    body: h.body().to_vec(),
+                    sig: h.sig().to_vec(),
+                },
+                parent: None,
+            };
+            let (head, p) = if as_head {
+                let p = gk::InPiece {
+                    head: Some(link(&rb.header)),
+                    ..Default::default()
+                };
+                (rb.header.d(), p)
+            } else {
+                let p = gk::InPiece {
+                    head: Some(link(&fb.header)),
+                    walk: vec![link(&rb.header)],
+                    ..Default::default()
+                };
+                (fb.header.d(), p)
+            };
+            let m = rig.groups.get_mut(TEXT_ID).unwrap();
+            m.take_in(&mut rig.who, &mut rig.duty, &mut kept, p, &mut c, &mut out);
+            let case = format!("restart {restart}, as head {as_head}");
+            assert_eq!(
+                rig.groups[TEXT_ID].floor.as_ref().unwrap().d,
+                head,
+                "the head is taken ({case})"
+            );
+            let resign = out.send.iter().any(|m| {
+                matches!(m, ClientMessage::KeyholdResign { entry: Some(kx), .. }
+                    if *kx == swapped_in)
+            });
+            let warned = out.events.iter().any(|e| {
+                matches!(
+                    e,
+                    GkEvent::Warning {
+                        kind: Warn::EntrySwapped,
+                        ..
+                    }
+                )
+            });
+            assert_eq!((resign, warned), (true, true), "{case}");
+        }
+    }
+
+    #[test]
+    fn a_desktop_keeps_its_pair_across_connections_and_a_phone_offers_nothing() {
+        let a = [6; 16];
+        let mut rig = Rig::new(Some(a), Platform::Desktop);
+        let first = Rig::volunteered(&rig.start());
+        let keep = rig.duty.take_keep().expect("the pair is kept");
+        let mut next = Rig::new(Some(a), Platform::Desktop);
+        next.who.identity = same_ik(&rig.who.identity);
+        next.duty.keep_in(&keep);
+        let again = Rig::volunteered(&next.start());
+        assert_eq!(first, again, "the same pair and endorsement");
+        assert!(next.duty.take_keep().is_none(), "nothing new to keep");
+        // Through serde, as gk_local.bin holds it
+        let bytes = postcard::to_allocvec(&keep).unwrap();
+        let back: HolderKeep = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(
+            back.pair.as_ref().and_then(KeptPair::open).map(|m| m.kx()),
+            keep.pair.as_ref().and_then(KeptPair::open).map(|m| m.kx())
+        );
+
+        let mut phone = Rig::new(Some(a), Platform::Phone);
+        assert!(phone.start().is_empty(), "a phone holds no text keys");
+        let out = phone.due(1, DuePiece::default());
+        assert_eq!(declined(&out), Some(decline::PLATFORM));
+    }
+
+    #[test]
+    fn help_switched_off_resigns_each_text_group_held_before_the_volunteer_goes() {
+        let mut rig = Rig::new(None, Platform::Desktop);
+        genesis(&mut rig);
+        let mut out = GkOut::default();
+        rig.duty
+            .set_volunteer(&mut rig.who, &mut rig.groups, false, &mut out);
+        assert_eq!(sent_kinds(&out.send), vec!["resign", "unvolunteer"]);
+    }
+
+    #[test]
+    fn a_due_is_declined_off_the_relays_clock_and_for_an_old_counter() {
+        let mut rig = Rig::new(None, Platform::Desktop);
+        let (w, pair) = genesis(&mut rig);
+        rig.duty.skew = KEYHOLDER_SKEW_SECS as i64 + 1;
+        let out = rig.due(
+            9,
+            piece(
+                due_code::REFRESH,
+                &w.due(DueKind::Refresh),
+                Some(&w),
+                vec![],
+            ),
+        );
+        assert_eq!(declined(&out), Some(decline::CLOCK));
+        rig.duty.skew = 0;
+
+        // A candidate whose counter is below one this keyholder saw for its account
+        let cand = world::Holder::desktop(9);
+        let account = [9; 16];
+        rig.pins.raise(
+            account,
+            Seen {
+                n: 5,
+                made: T0 - 3600,
+            },
+            true,
+        );
+        let promote = w.promote_due(&cand);
+        let own: EndorsedPair = (&pair).into();
+        let out = rig.due(10, piece(due_code::PROMOTE, &promote, Some(&w), vec![own]));
+        if let Some(lists) = lists_for(&w, &out.send) {
+            let out = rig.frame(lists);
+            assert_eq!(declined(&out), Some(decline::CANDIDATE));
+        } else {
+            assert_eq!(declined(&out), Some(decline::CANDIDATE));
+        }
+    }
+
+    /// Choice 31 (owner, 2026-11-19): a browser hidden or in a call offers anyway, as the
+    /// fallback (`BROWSER_BUSY`), takes text dues and builds them in short steps; shown and
+    /// out of a call it offers again as `BROWSER`, which the relay ranks above it.
+    #[test]
+    fn a_busy_browser_offers_as_the_fallback_and_takes_a_text_due() {
+        fn offers(sent: &[ClientMessage]) -> Vec<u8> {
+            sent.iter()
+                .map(|m| match m {
+                    ClientMessage::KeyholdVolunteer {
+                        on: true, platform, ..
+                    } => *platform,
+                    other => panic!("not an offer: {other:?}"),
+                })
+                .collect()
+        }
+        fn page(rig: &mut Rig, visible: bool, in_call: bool) -> Vec<ClientMessage> {
+            let mut out = GkOut::default();
+            rig.duty
+                .visibility(&mut rig.who, &mut rig.groups, visible, in_call, &mut out);
+            out.send
+        }
+        let mut rig = Rig::new(None, Platform::Browser);
+        rig.who.visible = false;
+        assert_eq!(offers(&rig.start()), [gk::platform::BROWSER_BUSY]);
+        // Its Genesis, hidden; then in a call, a Join built in 2 ms steps
+        let (w, _) = genesis(&mut rig);
+        assert!(page(&mut rig, false, true).is_empty(), "still the fallback");
+        let people: Vec<world::Member> = (10..12).map(world::Member::account).collect();
+        let refs: Vec<&world::Member> = people.iter().collect();
+        let out = rig.due(
+            2,
+            piece(due_code::JOIN, &w.join_due(&refs), Some(&w), vec![]),
+        );
+        assert_eq!(declined(&out), None);
+        let mut job = rig.duty.take_build().expect("a job, run off the lock");
+        let b = loop {
+            if let Some(b) = job.step(Duration::from_millis(2)) {
+                break b;
+            }
+        };
+        let mut c = GkCtx {
+            pins: &mut rig.pins,
+            now: rig.now,
+        };
+        let mut out = GkOut::default();
+        rig.duty
+            .built(&mut rig.who, &mut rig.groups, b, &mut c, &mut out);
+        assert_eq!(declined(&out), None);
+        let parts = rig.uploads();
+        assert!(
+            !parts.is_empty()
+                && parts
+                    .iter()
+                    .all(|m| matches!(m, ClientMessage::EpochCommit { .. })),
+            "its Join goes"
+        );
+        // Shown and out of a call: offered again, ranked as a browser; each change once
+        assert_eq!(
+            offers(&page(&mut rig, true, false)),
+            [gk::platform::BROWSER]
+        );
+        assert!(page(&mut rig, true, false).is_empty());
+        assert_eq!(
+            offers(&page(&mut rig, true, true)),
+            [gk::platform::BROWSER_BUSY]
+        );
+        // A desktop never offers as busy
+        let mut desk = Rig::new(None, Platform::Desktop);
+        assert_eq!(offers(&desk.start()), [gk::platform::DESKTOP]);
+        assert!(page(&mut desk, false, true).is_empty());
+    }
+
+    /// RV q7:1031: a keyholder seats nobody into a text epoch past its age, whatever the
+    /// relay asks: the newcomer would read that epoch's kept posts from its opening.
+    #[test]
+    fn a_join_due_into_an_epoch_past_its_age_is_declined() {
+        let mut rig = Rig::new(None, Platform::Desktop);
+        let (mut w, _) = genesis(&mut rig);
+        let people: Vec<world::Member> = (10..12).map(world::Member::account).collect();
+        let refs: Vec<&world::Member> = people.iter().collect();
+        w.tick(EPOCH_AGE_MAX_SECS + 60);
+        rig.now = w.now * 1000;
+        let out = rig.due(
+            2,
+            piece(due_code::JOIN, &w.join_due(&refs), Some(&w), vec![]),
+        );
+        assert_eq!(declined(&out), Some(decline::NOT_READY));
+        assert!(!out.build_ready, "no Join is built");
+    }
+
+    #[test]
+    fn seats_a_join_sealed_that_no_header_names_in_70_minutes_are_told() {
+        let mut rig = Rig::new(None, Platform::Desktop);
+        let (w, _) = genesis(&mut rig);
+        let people: Vec<world::Member> = (10..12).map(world::Member::account).collect();
+        let refs: Vec<&world::Member> = people.iter().collect();
+        let join = w.join_due(&refs);
+        rig.due(2, piece(due_code::JOIN, &join, Some(&w), vec![]));
+        let _ = rig.commit();
+        assert_eq!(rig.duty.keep.unnamed.len(), 1);
+        rig.now += EPOCH_AGE_MAX_SECS * 1000;
+        let out = rig.tick();
+        assert_eq!(
+            out.events,
+            vec![GkEvent::Warning {
+                channel_id: CH,
+                kind: Warn::UnnamedSeats,
+                n: 2
+            }]
+        );
+        assert!(rig.duty.keep.unnamed.is_empty());
+    }
+
+    #[test]
+    fn a_volunteer_starts_a_stored_group_anew_by_a_regenesis_after_an_hour_with_no_keyholder() {
+        let mut w = World::text(true, false);
+        let people: Vec<world::Member> = (10..13).map(world::Member::account).collect();
+        w.join(&people.iter().collect::<Vec<_>>());
+        let a = [5; 16];
+        let mut rig = Rig::new(Some(a), Platform::Desktop);
+        rig.took(&w.kh.clone());
+        rig.took(&w.head.clone());
+        w.tick(3600);
+        w.no_keyholder_since = Some(w.now - 3600);
+        rig.now = w.now * 1000;
+
+        let ep = Rig::volunteered(&rig.start());
+        let me = MemberId::Account(a);
+        let pair = wire::pair(&ep, me.into()).unwrap();
+        let public = rig.who.seat_keys.as_ref().unwrap().pair.public();
+        let e =
+            Endorsement::sign(&rig.who.identity, Origin::VaultSeat, me, 1, T0, &public).unwrap();
+        let due = Due {
+            joiners: vec![Joiner {
+                seat: public.seat(me),
+                ik: raw(&rig.who.identity),
+                keys: public,
+                endorsement: e,
+                returning: false,
+            }],
+            volunteer: Some(Candidate {
+                m: me,
+                ik: raw(&rig.who.identity),
+                pair: pair.clone(),
+            }),
+            ..w.due(DueKind::Regenesis)
+        };
+        let out = rig.due(1, piece(due_code::REGENESIS, &due, Some(&w), vec![]));
+        assert!(
+            out.build_ready,
+            "no keyring asked: {:?}",
+            sent_kinds(&out.send)
+        );
+        let c = rig.commit();
+        let by = HolderRef {
+            m: me,
+            kx: pair.kx(),
+        };
+        let landed = land(&mut rig, &mut w, &due, by, &c);
+        let h = landed.header.header();
+        assert_eq!((h.kind, h.seed, h.seats), (Kind::Regenesis, 2, 1));
+        assert_eq!(h.keyholders.len(), 1);
+        assert!(rig.duty.holds(TEXT_ID));
+        assert_eq!(rig.duty.own_kx(TEXT_ID), Some(pair.kx()));
+    }
+
+    /// A guest keyholder seats accounts 10..13 (their `IK`s pinned by the Join), promotes a
+    /// desktop and, a day on, removes it: that starts a text roll (seed 2, floor 1). Gives the
+    /// relay, our entry, the three people and the honest seed-welcome page for their seats.
+    fn rolled(rig: &mut Rig) -> (World, HolderRef, Vec<world::Member>, DuePiece) {
+        let (mut w, pair) = genesis(rig);
+        let by = HolderRef {
+            m: MemberId::Conn(U),
+            kx: pair.kx(),
+        };
+        let own: EndorsedPair = (&pair).into();
+        let people: Vec<world::Member> = (10..13).map(world::Member::account).collect();
+        let join = w.join_due(&people.iter().collect::<Vec<_>>());
+        rig.due(2, piece(due_code::JOIN, &join, Some(&w), vec![]));
+        let c = rig.commit();
+        land(rig, &mut w, &join, by, &c);
+
+        let cand = world::Holder::desktop(9);
+        let promote = w.promote_due(&cand);
+        let out = rig.due(
+            3,
+            piece(due_code::PROMOTE, &promote, Some(&w), vec![own.clone()]),
+        );
+        if let Some(lists) = lists_for(&w, &out.send) {
+            rig.frame(lists);
+        }
+        let c = rig.commit();
+        land(rig, &mut w, &promote, by, &c);
+        w.holders.push(cand);
+
+        // A day on, the other keyholder's removal starts the roll unasked
+        w.tick(86_400);
+        rig.now = w.now * 1000;
+        let remove = w.remove_due(0);
+        let out = rig.due(4, piece(due_code::REMOVE, &remove, Some(&w), vec![own]));
+        if let Some(lists) = lists_for(&w, &out.send) {
+            rig.frame(lists);
+        }
+        let c = rig.commit();
+        let landed = land(rig, &mut w, &remove, by, &c);
+        let h = landed.header.header();
+        assert_eq!(
+            (h.kind, h.seed, h.seed_floor),
+            (Kind::KeyholdersRemove, 2, 1)
+        );
+
+        // A seed-welcome page: one welcome per seat, under the new seed, each its own
+        let seed_seats: Vec<gk::SeedSeat> = people
+            .iter()
+            .map(|p| gk::SeedSeat {
+                seat: p.seat.into(),
+                ik: p.ik_raw(),
+                keys: (&Pair {
+                    keys: p.pair.public(),
+                    endorsement: p.endorsement.clone(),
+                })
+                    .into(),
+            })
+            .collect();
+        let page = DuePiece {
+            kind: due_code::SEED_WELCOMES,
+            parent: w.head.d(),
+            seed_seats,
+            ..DuePiece::default()
+        };
+        (w, by, people, page)
+    }
+
+    #[test]
+    fn a_text_removal_a_day_on_rolls_the_seed_and_a_page_gives_each_seat_its_seed_welcome() {
+        let mut rig = Rig::new(None, Platform::Desktop);
+        let (w, by, people, page) = rolled(&mut rig);
+        let seed_seats = page.seed_seats.clone();
+        assert!(rig.due(5, page.clone()).build_ready);
+        assert_eq!(declined(&rig.jobs()), None);
+        let frames = rig.uploads();
+        let [ClientMessage::EpochWelcomes {
+            due: 5,
+            gen,
+            seed: 2,
+            welcomes,
+            ..
+        }] = &frames[..]
+        else {
+            panic!("one page: {}", frames.len());
+        };
+        assert_eq!(*gen, w.g.gen());
+        assert_eq!(welcomes.len(), people.len());
+        let from = crate::group_key::Holder::from_raw(by.m, &by.kx).unwrap();
+        for p in &people {
+            let sent = welcomes
+                .iter()
+                .find(|x| SeatRef::from(x.seat) == p.seat)
+                .expect("a welcome for every seat asked");
+            assert!(open_seed_welcome(&w.g, 2, &p.me(), &from, &sent.bytes).is_ok());
+        }
+
+        // A seat whose keys are not its own gets nothing
+        let mut forged = page;
+        forged.seed_seats[0].keys = seed_seats[1].keys.clone();
+        assert_eq!(declined(&rig.due(6, forged)), Some(decline::NOT_READY));
+        assert!(rig.uploads().is_empty());
+    }
+
+    /// §5.6, RV q1-q2:1210: a day after the roll started, with every seat still behind and
+    /// the relay never saying it may finish, the keyholder's next opening ends the roll and
+    /// passes its own check.
+    #[test]
+    fn a_keyholder_ends_a_text_roll_the_relay_holds_open_a_day_after_its_start() {
+        let mut rig = Rig::new(None, Platform::Desktop);
+        let (mut w, by, _, _) = rolled(&mut rig);
+        w.tick(86_400);
+        rig.now = w.now * 1000;
+        let fresh = w.due(DueKind::Refresh);
+        let p = piece(due_code::REFRESH, &fresh, Some(&w), vec![]);
+        assert!(!p.finish && !p.held.is_empty(), "the relay holds it open");
+        let out = rig.due(5, p);
+        if let Some(lists) = lists_for(&w, &out.send) {
+            rig.frame(lists);
+        }
+        let c = rig.commit();
+        let h = land(&mut rig, &mut w, &fresh, by, &c).header;
+        assert_eq!((h.header().seed, h.header().seed_floor), (2, 2));
+    }
+
+    /// A text group whose one keyholder is a World desktop (account 1), with this Rig's
+    /// guest connection seated by its Join. Gives the relay, the Rig's pair and its entry.
+    fn seated_guest(rig: &mut Rig) -> (World, Pair, HolderRef) {
+        let mut w = World::text(true, false);
+        rig.took(&w.head.clone());
+        let ep = Rig::volunteered(&rig.start());
+        let me = MemberId::Conn(U);
+        let pair = wire::pair(&ep, me.into()).unwrap();
+        let join = Due {
+            joiners: vec![Joiner {
+                seat: pair.keys.seat(me),
+                ik: raw(&rig.who.identity),
+                keys: pair.keys.clone(),
+                endorsement: pair.endorsement.clone(),
+                returning: false,
+            }],
+            ..w.due(DueKind::Join)
+        };
+        let b = w.build_join(&join, None).unwrap();
+        w.roster.push(U);
+        w.step(&join, &b);
+        rig.took(&b.header);
+        let by = HolderRef {
+            m: me,
+            kx: pair.kx(),
+        };
+        (w, pair, by)
+    }
+
+    /// The World's keyholder promotes the Rig now; the Rig takes the head. Gives the
+    /// `KRK` welcome the relay keeps for it, and the Add's keyring.
+    fn promote_rig(
+        rig: &mut Rig,
+        w: &mut World,
+        pair: &Pair,
+        by: HolderRef,
+    ) -> (gk::KrkIn, Vec<u8>) {
+        let add = Due {
+            candidate: Some(Candidate {
+                m: by.m,
+                ik: raw(&rig.who.identity),
+                pair: pair.clone(),
+            }),
+            ..w.due(DueKind::Promote)
+        };
+        let b = w.opening(&add).unwrap();
+        w.step(&add, &b);
+        rig.took(&b.header);
+        rig.now = w.now * 1000;
+        rig.tick();
+        assert!(rig.duty.holds(TEXT_ID), "in the set once its Add is taken");
+        let k = b.commit.krk.iter().find(|k| k.to == by).expect("welcomed");
+        let krk = gk::KrkIn {
+            from: HolderRef {
+                m: b.header.header().signer,
+                kx: k.from_kx,
+            }
+            .into(),
+            bytes: k.bytes.clone(),
+        };
+        (krk, b.commit.keyring.clone())
+    }
+
+    /// The Rig's commit for an opening `due` the relay asks of it on the World's head (an
+    /// opening), taking the keyring at the head fresh (`ring`, with `krk`) when it asks for
+    /// it. `roll_due` as the relay says it.
+    fn rig_opening(
+        rig: &mut Rig,
+        w: &mut World,
+        due: &Due,
+        (krk, ring): &(gk::KrkIn, Vec<u8>),
+        roll_due: bool,
+    ) -> Commit {
+        rig.now = w.now * 1000;
+        let own: EndorsedPair = (&w.holders[0].pair()).into();
+        let mut p = piece(due_code::REFRESH, due, Some(w), vec![own]);
+        p.roll_due = roll_due;
+        let out = rig.due(50, p);
+        assert_eq!(sent_kinds(&out.send), vec!["keyring"], "none held");
+        let mut keyring = keyring_at(&w.head, &[ring]);
+        if let ServerMessage::KeyringIn { piece, .. } = &mut keyring {
+            piece.krk = Some(krk.clone());
+        }
+        let out = rig.frame(keyring);
+        if let Some(lists) = lists_for(w, &out.send) {
+            rig.frame(lists);
+        }
+        rig.commit()
+    }
+
+    /// RV review of the Q2 fix: a keyholder promoted 23 h into a text roll takes its keyring
+    /// fresh (as one does after any connection end), and the relay cannot restart the
+    /// roll's 24 h at the Add: the keyholder's first opening a day after the roll's start
+    /// ends it.
+    #[test]
+    fn a_keyholder_promoted_23_h_into_a_roll_ends_it_a_day_after_its_start() {
+        let mut rig = Rig::new(None, Platform::Desktop);
+        let (mut w, pair, by) = seated_guest(&mut rig);
+        w.promote(world::Holder::desktop(9));
+        w.tick(86_400);
+        w.remove(1);
+        let h = w.head.header().clone();
+        assert_eq!((h.seed, h.seed_floor), (2, 1), "the removal starts a roll");
+        rig.took(&w.head.clone());
+        w.tick(23 * 3600);
+        let krk = promote_rig(&mut rig, &mut w, &pair, by);
+        assert_eq!(w.head.header().seed_floor, 1, "the Add ends nothing yet");
+        w.tick(3600);
+        let fresh = w.due(DueKind::Refresh);
+        let c = rig_opening(&mut rig, &mut w, &fresh, &krk, false);
+        let h = land(&mut rig, &mut w, &fresh, by, &c).header;
+        assert_eq!((h.header().seed, h.header().seed_floor), (2, 2));
+    }
+
+    /// RV review of the Q2 fix: a removal within a day of the last raise leaves a roll due.
+    /// A keyholder that takes its keyring fresh an hour later (promoted) starts it at its
+    /// first opening once the day's slot opens, counted from the Genesis, not from the head it
+    /// took: with a relay that says no roll is due, and with one that says it is.
+    #[test]
+    fn a_keyholder_taking_its_keyring_after_a_removal_starts_the_roll_when_the_slot_opens() {
+        for roll_due in [false, true] {
+            let mut rig = Rig::new(None, Platform::Desktop);
+            let (mut w, pair, by) = seated_guest(&mut rig);
+            w.promote(world::Holder::desktop(9));
+            w.remove(1);
+            assert_eq!(w.head.header().seed, 1, "within a day of the Genesis");
+            assert!(w.rolls.removal);
+            rig.took(&w.head.clone());
+            w.tick(3600);
+            let krk = promote_rig(&mut rig, &mut w, &pair, by);
+            // A day after the Genesis, not yet a day after the Add
+            w.tick(86_400 - 3600);
+            let fresh = w.due(DueKind::Refresh);
+            let c = rig_opening(&mut rig, &mut w, &fresh, &krk, roll_due);
+            let h = land(&mut rig, &mut w, &fresh, by, &c).header;
+            let h = h.header();
+            assert_eq!((h.seed, h.seed_floor), (2, 1), "roll_due: {roll_due}");
+        }
+    }
+
+    /// RV review of the Q2 fix: a keyholder that takes its keyring fresh 29 days after the
+    /// seed's roll counts the seed's age from that roll, not from the head it took: on day
+    /// 30 its opening starts the roll, with a relay that never asks.
+    #[test]
+    fn a_keyholder_promoted_on_day_29_rolls_the_seed_on_day_30_unasked() {
+        let mut rig = Rig::new(None, Platform::Desktop);
+        let (mut w, pair, by) = seated_guest(&mut rig);
+        w.tick(29 * 86_400);
+        let krk = promote_rig(&mut rig, &mut w, &pair, by);
+        assert_eq!(w.head.header().seed, 1);
+        w.tick(86_400);
+        let fresh = w.due(DueKind::Refresh);
+        let c = rig_opening(&mut rig, &mut w, &fresh, &krk, false);
+        let h = land(&mut rig, &mut w, &fresh, by, &c).header;
+        assert_eq!((h.header().seed, h.header().seed_floor), (2, 1));
+    }
+
+    /// RV review of the Q2 fix: a keyholder that held the parent's keyring takes no keyring
+    /// whose seed rolls put the last raise later than it counted (another keyholder's, that
+    /// would keep a roll open or put off a seed's 30 days): it declines the due.
+    #[test]
+    fn a_keyring_whose_rolls_this_keyholder_did_not_count_is_declined() {
+        for forged in [false, true] {
+            let mut rig = Rig::new(None, Platform::Desktop);
+            let (mut w, pair) = genesis(&mut rig);
+            second_keyholder(&mut rig, &mut w, &pair);
+            w.tick(2 * 3600);
+            let truth = w.rolls;
+            if forged {
+                w.rolls.raised += 3600;
+            }
+            let fresh = w.due(DueKind::Refresh);
+            let b = w.opening(&fresh).unwrap();
+            w.rolls = truth;
+            w.step(&fresh, &b);
+            rig.took(&b.header);
+            rig.now = w.now * 1000;
+            let own: EndorsedPair = (&pair).into();
+            let out = rig.due(7, piece(due_code::REFRESH, &fresh, Some(&w), vec![own]));
+            assert_eq!(sent_kinds(&out.send), vec!["keyring"]);
+            let out = rig.frame(keyring_at(&w.head, &[&b.commit.keyring]));
+            let want = forged.then_some(decline::NOT_READY);
+            assert_eq!(declined(&out), want, "forged: {forged}");
+        }
+    }
+
+    #[test]
+    fn a_lists_ask_left_unanswered_stalls_no_later_due() {
+        let mut rig = Rig::new(None, Platform::Desktop);
+        let (mut w, pair) = genesis(&mut rig);
+        let by = HolderRef {
+            m: MemberId::Conn(U),
+            kx: pair.kx(),
+        };
+        let people: Vec<world::Member> = (10..13).map(world::Member::account).collect();
+        let join = w.join_due(&people.iter().collect::<Vec<_>>());
+        rig.due(2, piece(due_code::JOIN, &join, Some(&w), vec![]));
+        let c = rig.commit();
+        land(&mut rig, &mut w, &join, by, &c);
+
+        // The lists ask is refused (as a `COMMIT`'s, which the duty never sees)
+        let exits = w.exits(&[people[0].seat], DueKind::Exits);
+        let out = rig.due(3, piece(due_code::EXITS, &exits, Some(&w), vec![]));
+        assert_eq!(sent_kinds(&out.send), vec!["lists"]);
+        // The relay asks again: the lists are asked again, and the commit is taken
+        let out = rig.due(4, piece(due_code::EXITS, &exits, Some(&w), vec![]));
+        assert_eq!(sent_kinds(&out.send), vec!["lists"]);
+        rig.frame(lists_for(&w, &out.send).unwrap());
+        let c = rig.commit();
+        let a = land(&mut rig, &mut w, &exits, by, &c);
+        assert_eq!(a.removed, vec![people[0].seat]);
+    }
+
+    #[test]
+    fn a_signed_in_device_whose_seat_keys_settle_late_volunteers_then_and_replaces_a_pair_behind() {
+        let a = [5; 16];
+        // An account's first connection under the group key: no keys at `GroupKeys` yet
+        for platform in [Platform::Desktop, Platform::Browser] {
+            let mut rig = Rig::new(Some(a), platform);
+            let keys = rig.who.seat_keys.take();
+            assert!(rig.start().is_empty(), "nothing to offer without seat keys");
+            rig.who.seat_keys = keys;
+            let mut out = GkOut::default();
+            rig.duty
+                .seat_keys_changed(&mut rig.who, &mut rig.groups, &mut out);
+            assert_eq!(sent_kinds(&out.send), vec!["volunteer"], "{platform:?}");
+        }
+        // The keys rotated at sign-in: the kept pair volunteers, then its Replace goes
+        let mut first = Rig::new(Some(a), Platform::Desktop);
+        let old = Rig::volunteered(&first.start());
+        let keep = first.duty.take_keep().unwrap();
+        let rotated = SeatKeys::from_bytes(&first.who.seat_keys.as_ref().unwrap().to_bytes())
+            .unwrap()
+            .rotate(T0 + 10)
+            .unwrap();
+        let mut next = Rig::new(Some(a), Platform::Desktop);
+        next.who.identity = same_ik(&first.who.identity);
+        next.duty.keep_in(&keep);
+        next.who.seat_keys = None;
+        assert!(next.start().is_empty());
+        next.who.seat_keys = Some(rotated);
+        let mut out = GkOut::default();
+        next.duty
+            .seat_keys_changed(&mut next.who, &mut next.groups, &mut out);
+        assert_eq!(sent_kinds(&out.send), vec!["volunteer", "replace"]);
+        assert_eq!(
+            Rig::volunteered(&out.send),
+            old,
+            "the pair its entries name"
+        );
+    }
+
+    #[test]
+    fn a_voice_joiners_connection_pair_of_any_age_is_seated_but_not_below_a_counter_seen() {
+        let (a, u) = ([8; 16], 21);
+        let ik = IdentityKeyPair::generate(&mut crate::rng());
+        let joiner = |n: u32, made: u64| {
+            let keys = SeatPair::generate().public();
+            let e = Endorsement::sign(&ik, Origin::Connection, MemberId::Conn(u), n, made, &keys)
+                .unwrap();
+            Joiner {
+                seat: keys.seat(MemberId::Account(a)),
+                ik: raw(&ik),
+                keys,
+                endorsement: e,
+                returning: false,
+            }
+        };
+        let at = T0 + 7200;
+        let mut pins = MemoryPins::default();
+        let mut c = GkCtx {
+            pins: &mut pins,
+            now: at * 1000,
+        };
+        fn why(j: &Joiner, c: &mut GkCtx<'_>) -> Option<u8> {
+            joiner_why(GroupKind::Voice, false, j, T0 + 7200, c, &HashSet::new())
+        }
+        // Made with the connection, two hours before this join
+        assert_eq!(why(&joiner(1, T0), &mut c), None);
+        // Never ahead of the join
+        let ahead = joiner(1, at + CLOCK_SLACK + 1);
+        assert_eq!(why(&ahead, &mut c), Some(join_refused::ENDORSEMENT));
+        // Below a counter seen before the join
+        c.pins.raise(
+            a,
+            Seen {
+                n: 2,
+                made: T0 + 60,
+            },
+            true,
+        );
+        assert_eq!(why(&joiner(1, T0), &mut c), Some(join_refused::OLD_COUNTER));
+    }
+
+    /// §11.8, plan 16: in an anonymous room a signed-in member's voice seat is named by its
+    /// connection, and its 0x02 pair carries the account's counter: seated as it comes, with
+    /// every other check kept. A text seat named by a connection is a guest's, counter 0.
+    #[test]
+    fn a_voice_seat_named_by_its_connection_is_seated_with_its_accounts_counter() {
+        let u = 21;
+        let ik = IdentityKeyPair::generate(&mut crate::rng());
+        let joiner = |n: u32, signed_for: u32| {
+            let keys = SeatPair::generate().public();
+            let e = Endorsement::sign(
+                &ik,
+                Origin::Connection,
+                MemberId::Conn(signed_for),
+                n,
+                T0,
+                &keys,
+            )
+            .unwrap();
+            Joiner {
+                seat: keys.seat(MemberId::Conn(u)),
+                ik: raw(&ik),
+                keys,
+                endorsement: e,
+                returning: false,
+            }
+        };
+        let mut pins = MemoryPins::default();
+        let mut c = GkCtx {
+            pins: &mut pins,
+            now: (T0 + 7200) * 1000,
+        };
+        let why = |kind: GroupKind, j: &Joiner, c: &mut GkCtx<'_>| {
+            joiner_why(kind, false, j, T0 + 7200, c, &HashSet::new())
+        };
+        assert_eq!(why(GroupKind::Voice, &joiner(3, u), &mut c), None);
+        assert_eq!(
+            why(GroupKind::Voice, &joiner(0, u), &mut c),
+            None,
+            "a guest"
+        );
+        let other = joiner(3, u + 1);
+        assert_eq!(
+            why(GroupKind::Voice, &other, &mut c),
+            Some(join_refused::ENDORSEMENT),
+            "another connection's pair"
+        );
+        assert_eq!(
+            why(GroupKind::Text, &joiner(3, u), &mut c),
+            Some(join_refused::ENDORSEMENT),
+            "a text guest's counter is 0"
+        );
+        assert_eq!(why(GroupKind::Text, &joiner(0, u), &mut c), None);
+    }
+
+    #[test]
+    fn a_signed_in_desktop_starts_a_voice_room_with_its_connection_pair() {
+        let a = [5; 16];
+        let mut rig = Rig::new(Some(a), Platform::Desktop);
+        let _ = rig.start();
+        let me = MemberId::Account(a);
+        let ep = seat_keys::conn_pair(&mut rig.who, rig.now).unwrap();
+        let pair = wire::pair(&ep, GkMember::Conn(U)).unwrap();
+        let mut m = Member::new(
+            GkTrack {
+                group: world::VOICE_ID.into(),
+                kind: GroupKind::Voice,
+                ..track()
+            },
+            None,
+        );
+        m.voice_seats.insert(U, pair.keys.seat(me).into());
+        rig.groups.insert(world::VOICE_ID.into(), m);
+        let due = Due {
+            joiners: vec![Joiner {
+                seat: pair.keys.seat(me),
+                ik: raw(&rig.who.identity),
+                keys: pair.keys.clone(),
+                endorsement: pair.endorsement.clone(),
+                returning: false,
+            }],
+            volunteer: Some(Candidate {
+                m: me,
+                ik: raw(&rig.who.identity),
+                pair: pair.clone(),
+            }),
+            ..Due::of(DueKind::Genesis, false)
+        };
+        let out = rig.frame(ServerMessage::EpochDue {
+            group: world::VOICE_ID.into(),
+            due: 1,
+            part: 0,
+            last: true,
+            piece: Box::new(piece(due_code::GENESIS, &due, None, vec![])),
+        });
+        assert!(out.build_ready, "{:?}", sent_kinds(&out.send));
+        let c = rig.commit();
+        let by = HolderRef {
+            m: me,
+            kx: pair.kx(),
+        };
+        let ap = World::check_start(
+            GroupKind::Voice,
+            world::VOICE_ID,
+            false,
+            &due,
+            by,
+            &c,
+            T0,
+            &[U],
+        )
+        .unwrap_or_else(|bad| panic!("{bad}"));
+        assert_eq!(ap.header.header().keyholders[0].u, Some(U));
+    }
+
+    #[test]
+    fn a_stale_join_is_told_unless_its_rebase_seals_its_seats_again() {
+        let mut rig = Rig::new(None, Platform::Desktop);
+        let (mut w, pair) = genesis(&mut rig);
+        let by = HolderRef {
+            m: MemberId::Conn(U),
+            kx: pair.kx(),
+        };
+        let kh_ring = second_keyholder(&mut rig, &mut w, &pair);
+
+        // Our Join loses the head to the other keyholder's, is made again on it and taken:
+        // nothing told meanwhile, its record is the rebased one's
+        let people: Vec<world::Member> = (10..12).map(world::Member::account).collect();
+        let join = w.join_due(&people.iter().collect::<Vec<_>>());
+        rig.due(3, piece(due_code::JOIN, &join, Some(&w), vec![]));
+        let _ = rig.commit();
+        let late = world::Member::account(30);
+        let jb = w.join(&[&late]);
+        rig.took(&jb.header);
+        rig.now = w.now * 1000;
+        let out = rig.frame(stale_on(3, stale::HEAD_MOVED, Some(&jb.header)));
+        assert_eq!(sent_kinds(&out.send), vec!["keyring"]);
+        assert_eq!(rig.tick().events, vec![], "not told while it is made again");
+        rig.frame(keyring_at(&jb.header, &[&kh_ring, &jb.commit.keyring]));
+        let again = rig.commit();
+        let landed = land(&mut rig, &mut w, &join, by, &again);
+        assert_eq!(landed.seated, 2);
+        assert_eq!(landed.events, vec![]);
+        let kept: Vec<[u8; 32]> = rig.duty.keep.unnamed.iter().map(|u| u.d).collect();
+        assert_eq!(kept, vec![landed.header.d()]);
+
+        // A Join the relay calls stale on an old head it never moves to: kept, and told once
+        // the due is let go and the head moves on without it
+        let more: Vec<world::Member> = (40..43).map(world::Member::account).collect();
+        let join2 = w.join_due(&more.iter().collect::<Vec<_>>());
+        rig.due(4, piece(due_code::JOIN, &join2, Some(&w), vec![]));
+        let _ = rig.commit();
+        rig.frame(stale_on(4, stale::HEAD_MOVED, Some(&w.kh.clone())));
+        assert_eq!(rig.tick().events, vec![]);
+        rig.frame(stale_on(4, stale::TIMED_OUT, None));
+        let x = world::Member::account(31);
+        let jx = w.join(&[&x]);
+        rig.took(&jx.header);
+        rig.now = w.now * 1000;
+        assert_eq!(
+            rig.tick().events,
+            vec![GkEvent::Warning {
+                channel_id: CH,
+                kind: Warn::UnnamedSeats,
+                n: 3
+            }]
+        );
+        // The rebased one is named
+        let kept: Vec<[u8; 32]> = rig.duty.keep.unnamed.iter().map(|u| u.d).collect();
+        assert_eq!(kept, vec![landed.header.d()]);
+        named_until_closed(&mut rig, &mut w);
+    }
+
+    #[test]
+    fn a_join_seats_again_a_seat_only_a_superseded_list_held() {
+        let mut rig = Rig::new(None, Platform::Desktop);
+        let (mut w, pair) = genesis(&mut rig);
+        let by = HolderRef {
+            m: MemberId::Conn(U),
+            kx: pair.kx(),
+        };
+        let people: Vec<world::Member> = (10..13).map(world::Member::account).collect();
+        let join = w.join_due(&people.iter().collect::<Vec<_>>());
+        rig.due(2, piece(due_code::JOIN, &join, Some(&w), vec![]));
+        let c = rig.commit();
+        land(&mut rig, &mut w, &join, by, &c);
+        second_keyholder(&mut rig, &mut w, &pair);
+
+        // This keyholder fetches the list of an exit it then loses
+        let exits = w.exits(&[people[0].seat], DueKind::Exits);
+        let out = rig.due(4, piece(due_code::EXITS, &exits, Some(&w), vec![]));
+        rig.frame(lists_for(&w, &out.send).expect("lists asked"));
+        let listed = |rig: &Rig| {
+            rig.duty.holds[TEXT_ID]
+                .lists
+                .values()
+                .any(|l| l.iter().any(|s| s.seat == people[0].seat))
+        };
+        assert!(listed(&rig));
+        rig.frame(stale_on(4, stale::TIMED_OUT, None));
+        // The other keyholder re-keys the bucket without the seat, which then comes back
+        let o = w.open(&exits);
+        rig.took(&o.header);
+        rig.now = w.now * 1000;
+        let back = w.join_due(&[&people[0]]);
+        let out = rig.due(5, piece(due_code::JOIN, &back, Some(&w), vec![]));
+        assert_eq!(sent_kinds(&out.send), vec!["keyring"]);
+        rig.frame(keyring_at(&o.header, &[&o.commit.keyring]));
+        let c = rig.commit();
+        let a = land(&mut rig, &mut w, &back, by, &c);
+        assert_eq!((a.seated, a.refused), (1, vec![]));
+    }
+
+    #[test]
+    fn a_join_named_between_ticks_or_before_a_new_generation_is_not_told() {
+        // Pushed heads come faster than the ticks: each is seen as it is taken
+        let mut rig = Rig::new(None, Platform::Desktop);
+        let (mut w, pair) = genesis(&mut rig);
+        let by = HolderRef {
+            m: MemberId::Conn(U),
+            kx: pair.kx(),
+        };
+        second_keyholder(&mut rig, &mut w, &pair);
+        let people: Vec<world::Member> = (10..12).map(world::Member::account).collect();
+        let join = w.join_due(&people.iter().collect::<Vec<_>>());
+        rig.due(3, piece(due_code::JOIN, &join, Some(&w), vec![]));
+        let c = rig.commit();
+        let a = w.check(&join, by, &c).unwrap_or_else(|bad| panic!("{bad}"));
+        let j = a.header.clone();
+        w.take(&join, a, rig.sent());
+        let next: Vec<world::Member> = (20..22).map(world::Member::account).collect();
+        let j2 = w.join(&[&next[0]]).header;
+        let j3 = w.join(&[&next[1]]).header;
+        for h in [&j, &j2, &j3] {
+            rig.took(h);
+            let mut out = GkOut::default();
+            let m = &rig.groups[TEXT_ID];
+            rig.duty.head_taken(&mut rig.who, m, &mut out);
+        }
+        rig.now = w.now * 1000;
+        assert_eq!(rig.tick().events, vec![]);
+        named_until_closed(&mut rig, &mut w);
+
+        // Named, then a new generation
+        let mut rig = Rig::new(None, Platform::Desktop);
+        let (mut w, pair) = genesis(&mut rig);
+        let by = HolderRef {
+            m: MemberId::Conn(U),
+            kx: pair.kx(),
+        };
+        let join = w.join_due(&people.iter().collect::<Vec<_>>());
+        rig.due(2, piece(due_code::JOIN, &join, Some(&w), vec![]));
+        let c = rig.commit();
+        land(&mut rig, &mut w, &join, by, &c);
+        assert_eq!(rig.duty.keep.unnamed.len(), 1);
+        let anew = World::text(true, false);
+        rig.took(&anew.head);
+        assert_eq!(rig.tick().events, vec![]);
+        assert!(rig.duty.keep.unnamed.is_empty());
+    }
+
+    /// Every Join record named: none told, and each kept, through its 70 min too, until the
+    /// chain it stands on reaches a later epoch (a walk may yet take the head off it before);
+    /// then gone untold.
+    fn named_until_closed(rig: &mut Rig, w: &mut World) {
+        let unnamed = &rig.duty.keep.unnamed;
+        assert!(unnamed.iter().all(Unnamed::named), "{unnamed:?}");
+        if let Some(last) = unnamed.iter().map(|u| u.at).max() {
+            rig.now = rig.now.max((last + EPOCH_AGE_MAX_SECS) * 1000);
+            assert_eq!(told(&rig.tick()), Vec::<&GkEvent>::new());
+            assert!(!rig.duty.keep.unnamed.is_empty(), "kept: its epoch runs on");
+            w.tick(60);
+            let f = w.open(&w.due(DueKind::Refresh)).header;
+            rig.took(&f);
+        }
+        assert_eq!(told(&rig.tick()), Vec::<&GkEvent>::new());
+        assert!(rig.duty.keep.unnamed.is_empty());
+    }
+
+    /// RV q4-q5:1790, one header on: the relay shows this device a child of its Join `J`,
+    /// so `J` looks named, then walks it onto a branch without `J`. In a gated group the
+    /// walked-to head's names do not run through the child's, and no lists the relay can
+    /// send make them: told once the wait for them is out.
+    #[test]
+    fn a_join_named_by_a_child_and_then_walked_away_from_is_told() {
+        let mut rig = Rig::new(None, Platform::Desktop);
+        let (w, p, _, _) = gated_join_and_child(&mut rig);
+        assert!(rig.duty.keep.unnamed[0].named());
+        // Everyone else goes on from the parent without it
+        let f = opening_on(&p, 60);
+        rig.took(&f);
+        rig.now = (w.now + 60) * 1000;
+        let out = rig.tick();
+        assert_eq!(told(&out), Vec::<&GkEvent>::new(), "it waits for the lists");
+        assert!(out
+            .send
+            .iter()
+            .any(|m| matches!(m, ClientMessage::EpochNames { .. })));
+        // Whatever lists the relay sends
+        rig.names_in(&[&f]);
+        rig.now += (PROOF_WAIT_SECS - 1) * 1000;
+        assert_eq!(told(&rig.tick()), Vec::<&GkEvent>::new());
+        rig.now += 1000;
+        assert_eq!(
+            told(&rig.tick()),
+            vec![&GkEvent::Warning {
+                channel_id: CH,
+                kind: Warn::UnnamedSeats,
+                n: 2
+            }]
+        );
+        assert!(rig.duty.keep.unnamed.is_empty());
+    }
+
+    /// RV q4-q5:1790: a Join of ours the member took counted as named the moment the head
+    /// moved anywhere. A relay lets this device take `J`, gives its seats `J`'s keys, then
+    /// walks it onto a branch that never had `J`. In a gated group no lists show the head
+    /// stands on `J`: told. In an open group no header names a reader, so nothing shows it
+    /// either way, and the walk is taken as standing on it (the owner's choice to make).
+    #[test]
+    fn a_join_taken_then_walked_past_onto_a_branch_without_it_is_told() {
+        let mut rig = Rig::new(None, Platform::Desktop);
+        let mut w = World::text(true, true);
+        let p = w.head.clone();
+        rig.took(&p);
+        let people: Vec<world::Member> = (10..12).map(world::Member::account).collect();
+        let j = w.join(&people.iter().collect::<Vec<_>>()).header;
+        rig.duty.keep.unnamed.push(record(&j, 2, w.now));
+        rig.took(&j);
+        rig.now = w.now * 1000;
+        assert_eq!(rig.tick().events, vec![]);
+        assert!(rig.duty.keep.unnamed[0].taken);
+        let f = opening_on(&p, 60);
+        rig.took(&f);
+        rig.now += 60 * 1000;
+        assert_eq!(told(&rig.tick()), Vec::<&GkEvent>::new());
+        rig.names_in(&[]);
+        rig.now += PROOF_WAIT_SECS * 1000;
+        assert_eq!(
+            told(&rig.tick()),
+            vec![&GkEvent::Warning {
+                channel_id: CH,
+                kind: Warn::UnnamedSeats,
+                n: 2
+            }]
+        );
+        assert!(rig.duty.keep.unnamed.is_empty());
+
+        // An open group: the same walk is not told
+        let mut rig = Rig::new(None, Platform::Desktop);
+        let (mut w, pair) = genesis(&mut rig);
+        second_keyholder(&mut rig, &mut w, &pair);
+        let join = w.join_due(&people.iter().collect::<Vec<_>>());
+        rig.due(3, piece(due_code::JOIN, &join, Some(&w), vec![]));
+        let _ = rig.commit();
+        // Only this device is shown its Join
+        let j = rig.sent().header.clone();
+        rig.took(&j);
+        assert_eq!(rig.tick().events, vec![]);
+        assert!(rig.duty.keep.unnamed[0].taken);
+        // Everyone else goes on from the parent without it
+        let x = world::Member::account(30);
+        w.join(&[&x]);
+        w.tick(60);
+        let f = w.open(&w.due(DueKind::Refresh));
+        rig.took(&f.header);
+        rig.now = w.now * 1000;
+        assert_eq!(told(&rig.tick()), Vec::<&GkEvent>::new());
+        assert!(rig.duty.keep.unnamed.is_empty(), "taken as named");
+    }
+
+    /// RV q4-q5:1782: a group no longer tracked (the relay delisted the channel, or evicted
+    /// this keyholder, after it had the Join's seal) dropped the record at 70 min untold.
+    #[test]
+    fn a_join_of_a_group_no_longer_tracked_is_told_at_70_minutes() {
+        let mut rig = Rig::new(None, Platform::Desktop);
+        let (w, _) = genesis(&mut rig);
+        let people: Vec<world::Member> = (10..12).map(world::Member::account).collect();
+        let join = w.join_due(&people.iter().collect::<Vec<_>>());
+        rig.due(2, piece(due_code::JOIN, &join, Some(&w), vec![]));
+        let _ = rig.commit();
+        assert_eq!(rig.duty.keep.unnamed.len(), 1);
+        rig.groups.remove(TEXT_ID);
+        rig.duty.untrack(TEXT_ID);
+        rig.now += (EPOCH_AGE_MAX_SECS - 1) * 1000;
+        assert_eq!(rig.tick().events, vec![]);
+        rig.now += 1000;
+        assert_eq!(
+            rig.tick().events,
+            vec![GkEvent::Warning {
+                channel_id: CH,
+                kind: Warn::UnnamedSeats,
+                n: 2
+            }]
+        );
+        assert!(rig.duty.keep.unnamed.is_empty());
+
+        // One named before the group went is not told
+        let mut rig = Rig::new(None, Platform::Desktop);
+        let (mut w, pair) = genesis(&mut rig);
+        let by = HolderRef {
+            m: MemberId::Conn(U),
+            kx: pair.kx(),
+        };
+        second_keyholder(&mut rig, &mut w, &pair);
+        let join = w.join_due(&people.iter().collect::<Vec<_>>());
+        rig.due(3, piece(due_code::JOIN, &join, Some(&w), vec![]));
+        let c = rig.commit();
+        let a = w.check(&join, by, &c).unwrap_or_else(|bad| panic!("{bad}"));
+        let j = a.header.clone();
+        w.take(&join, a, rig.sent());
+        let x = world::Member::account(30);
+        let j2 = w.join(&[&x]).header;
+        rig.took(&j);
+        rig.took(&j2);
+        rig.now = w.now * 1000;
+        assert_eq!(rig.tick().events, vec![]);
+        rig.groups.remove(TEXT_ID);
+        rig.duty.untrack(TEXT_ID);
+        rig.now += EPOCH_AGE_MAX_SECS * 1000;
+        assert_eq!(rig.tick().events, vec![]);
+        assert!(rig.duty.keep.unnamed.is_empty());
+    }
+
+    /// The record a Join of this device's leaves (as `built` keeps it), `at` unix seconds.
+    fn record(j: &SignedHeader, seats: u32, at: u64) -> Unnamed {
+        Unnamed::new(TEXT_ID, j, seats, at, CH)
+    }
+
+    /// An opening of the next epoch on `parent`, `secs` after it, that the world never took:
+    /// the branch the others went on along, without what this device took after `parent`.
+    fn opening_on(parent: &SignedHeader, secs: u64) -> SignedHeader {
+        let p = parent.header();
+        let mut hd = p.clone();
+        hd.kind = Kind::Fresh;
+        hd.epoch += 1;
+        hd.join = 0;
+        hd.parent = parent.d();
+        if p.kind.sets_keyholders() {
+            hd.kh_parent = parent.d();
+        }
+        hd.keyholders = vec![];
+        hd.time = p.time + secs;
+        hd.added = Added::List(vec![]);
+        hd.removed = Removed::List(vec![]);
+        hd.names_hash = crate::group_key::names_hash(Some(p), &hd);
+        SignedHeader::sign(hd, &IdentityKeyPair::generate(&mut crate::rng())).unwrap()
+    }
+
+    /// A gated group's world with its Genesis taken, and a Join `J` of this device's on its
+    /// record, seating two, taken with a child `C` on it: `(world, J's parent, J, C)`.
+    fn gated_join_and_child(rig: &mut Rig) -> (World, SignedHeader, SignedHeader, SignedHeader) {
+        let mut w = World::text(true, true);
+        let p = w.head.clone();
+        rig.took(&p);
+        let people: Vec<world::Member> = (10..12).map(world::Member::account).collect();
+        let j = w.join(&people.iter().collect::<Vec<_>>()).header;
+        rig.duty.keep.unnamed.push(record(&j, 2, w.now));
+        rig.took(&j);
+        let c = w.join(&[&world::Member::account(20)]).header;
+        rig.took(&c);
+        rig.now = w.now * 1000;
+        assert_eq!(rig.tick().events, vec![]);
+        (w, p, j, c)
+    }
+
+    fn told(out: &GkOut) -> Vec<&GkEvent> {
+        out.events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    GkEvent::Warning {
+                        kind: Warn::UnnamedSeats,
+                        ..
+                    }
+                )
+            })
+            .collect()
+    }
+
+    /// Review of RV q4-q5:1790: a device that leaves the keyholder set (a browser giving way
+    /// to a desktop, an entry removed for misses, a connection keyholder whose entry ends with
+    /// its connection) is walked by an honest relay, which sends the parent chain to keyholder
+    /// sessions only. Every such walk within 70 min of its own Join warned. In a gated group the
+    /// walked-to head's `names_hash` shows whether it stands on the Join: the device asks for
+    /// the lists between, and is not told.
+    #[test]
+    fn a_join_walked_along_its_own_chain_in_a_gated_group_is_not_told() {
+        let mut rig = Rig::new(None, Platform::Desktop);
+        let (mut w, _, _, c) = gated_join_and_child(&mut rig);
+        let j2 = w.join(&[&world::Member::account(21)]).header;
+        w.tick(60);
+        let f = w.open(&w.due(DueKind::Refresh)).header;
+        rig.took(&f);
+        rig.now = w.now * 1000;
+        let out = rig.tick();
+        assert_eq!(told(&out), Vec::<&GkEvent>::new(), "a walk is no fork");
+        let asked = out.send.iter().any(|m| {
+            matches!(m, ClientMessage::EpochNames { from, to, .. }
+                if (from.epoch, from.join) == (c.header().epoch, c.header().join)
+                    && (to.epoch, to.join) == (f.header().epoch, f.header().join))
+        });
+        assert!(
+            asked,
+            "the lists from the last header it stood on: {:?}",
+            out.send
+        );
+        // The relay answers from that header on
+        rig.names_in(&[&c, &j2]);
+        rig.now += 3600 * 1000;
+        assert_eq!(told(&rig.tick()), Vec::<&GkEvent>::new());
+        assert!(
+            rig.duty.keep.unnamed.is_empty(),
+            "named: J's epoch closed on it"
+        );
+    }
+
+    /// Review of RV q4-q5:1790: a relay that shows this device its Join and a child of it,
+    /// then nothing for 70 min, saw the record dropped as named, and walked it across the
+    /// fork unwarned. A record stays until the chain it stands on reaches a later epoch.
+    #[test]
+    fn a_join_kept_on_a_private_branch_past_70_minutes_then_walked_across_is_told() {
+        let mut rig = Rig::new(None, Platform::Desktop);
+        let (w, p, _, _) = gated_join_and_child(&mut rig);
+        rig.now = (w.now + EPOCH_AGE_MAX_SECS + 60) * 1000;
+        assert_eq!(told(&rig.tick()), Vec::<&GkEvent>::new());
+        assert_eq!(rig.duty.keep.unnamed.len(), 1, "kept past 70 min");
+        // The others went on from J's parent without it
+        let f = opening_on(&p, EPOCH_AGE_MAX_SECS + 120);
+        rig.took(&f);
+        assert_eq!(told(&rig.tick()), Vec::<&GkEvent>::new());
+        // The relay has no lists that fold from where the device stood
+        rig.names_in(&[]);
+        rig.now += 3600 * 1000;
+        assert_eq!(
+            told(&rig.tick()),
+            vec![&GkEvent::Warning {
+                channel_id: CH,
+                kind: Warn::UnnamedSeats,
+                n: 2
+            }]
+        );
+        assert!(rig.duty.keep.unnamed.is_empty());
+    }
+
+    /// Review of RV q4-q5:1790 (low): a named record whose 70 min ran out while the member had
+    /// no head (between a reconnect and its first `EpochIn`, or after `vault_in`) was told.
+    #[test]
+    fn a_named_join_is_not_told_while_the_member_has_no_head() {
+        let mut rig = Rig::new(None, Platform::Desktop);
+        let (w, _, _, _) = gated_join_and_child(&mut rig);
+        rig.member().head = None;
+        rig.now = (w.now + EPOCH_AGE_MAX_SECS + 60) * 1000;
+        assert_eq!(told(&rig.tick()), Vec::<&GkEvent>::new());
+        assert_eq!(rig.duty.keep.unnamed.len(), 1);
+
+        // Nor is a walked-to head's wait for its lists counted while it reconnects
+        let mut rig = Rig::new(None, Platform::Desktop);
+        let (mut w, _, _, c) = gated_join_and_child(&mut rig);
+        let j2 = w.join(&[&world::Member::account(21)]).header;
+        w.tick(60);
+        let f = w.open(&w.due(DueKind::Refresh)).header;
+        rig.took(&f);
+        rig.now = w.now * 1000;
+        assert_eq!(told(&rig.tick()), Vec::<&GkEvent>::new());
+        assert!(rig.duty.keep.unnamed[0].off);
+        rig.member().head = None;
+        rig.now += 3600 * 1000;
+        assert_eq!(told(&rig.tick()), Vec::<&GkEvent>::new());
+        rig.member().head = Some(f.clone());
+        let out = rig.tick();
+        assert_eq!(told(&out), Vec::<&GkEvent>::new());
+        assert!(out
+            .send
+            .iter()
+            .any(|m| matches!(m, ClientMessage::EpochNames { .. })));
+        rig.names_in(&[&c, &j2]);
+        rig.now += 1000;
+        assert_eq!(told(&rig.tick()), Vec::<&GkEvent>::new());
+        assert!(rig.duty.keep.unnamed.is_empty());
+    }
+
+    /// A Join of ours walked past before the member took it (its push lost to a reconnect):
+    /// told at once before. In a gated group the walked-to head's names show whether it
+    /// stands on it.
+    #[test]
+    fn a_join_walked_past_before_it_was_taken_is_told_only_off_its_chain() {
+        let mut rig = Rig::new(None, Platform::Desktop);
+        let mut w = World::text(true, true);
+        let p = w.head.clone();
+        rig.took(&p);
+        let people: Vec<world::Member> = (10..12).map(world::Member::account).collect();
+        let j = w.join(&people.iter().collect::<Vec<_>>()).header;
+        rig.duty.keep.unnamed.push(record(&j, 2, w.now));
+        let j2 = w.join(&[&world::Member::account(21)]).header;
+        w.tick(60);
+        let f = w.open(&w.due(DueKind::Refresh)).header;
+        rig.took(&f);
+        rig.now = w.now * 1000;
+        let out = rig.tick();
+        assert_eq!(told(&out), Vec::<&GkEvent>::new());
+        assert!(out
+            .send
+            .iter()
+            .any(|m| matches!(m, ClientMessage::EpochNames { from, .. }
+            if (from.epoch, from.join) == (j.header().epoch, j.header().join))));
+        rig.names_in(&[&j, &j2]);
+        assert_eq!(told(&rig.tick()), Vec::<&GkEvent>::new());
+        assert!(rig.duty.keep.unnamed.is_empty(), "named");
+
+        // Off its chain: told once the wait for the lists is out
+        let mut rig = Rig::new(None, Platform::Desktop);
+        let mut w = World::text(true, true);
+        let p = w.head.clone();
+        rig.took(&p);
+        let j = w.join(&people.iter().collect::<Vec<_>>()).header;
+        rig.duty.keep.unnamed.push(record(&j, 2, w.now));
+        let f = opening_on(&p, 60);
+        rig.took(&f);
+        rig.now = (w.now + 60) * 1000;
+        assert_eq!(told(&rig.tick()), Vec::<&GkEvent>::new());
+        rig.names_in(&[&f]);
+        rig.now += PROOF_WAIT_SECS * 1000;
+        assert_eq!(
+            told(&rig.tick()),
+            vec![&GkEvent::Warning {
+                channel_id: CH,
+                kind: Warn::UnnamedSeats,
+                n: 2
+            }]
+        );
+    }
+
+    /// Review of RV q4-q5:1790: in a group that is not gated no header names a reader, so a
+    /// walk proves nothing either way; the relay seats whom it likes there, by an honest Join
+    /// as well. A walk is taken as standing on the record (owner's choice to make), and an
+    /// honest one is not told.
+    #[test]
+    fn a_join_walked_along_its_own_chain_in_an_open_group_is_not_told() {
+        let mut rig = Rig::new(None, Platform::Desktop);
+        let (mut w, pair) = genesis(&mut rig);
+        let by = HolderRef {
+            m: MemberId::Conn(U),
+            kx: pair.kx(),
+        };
+        second_keyholder(&mut rig, &mut w, &pair);
+        let people: Vec<world::Member> = (10..12).map(world::Member::account).collect();
+        let join = w.join_due(&people.iter().collect::<Vec<_>>());
+        rig.due(3, piece(due_code::JOIN, &join, Some(&w), vec![]));
+        let c = rig.commit();
+        let landed = land(&mut rig, &mut w, &join, by, &c);
+        assert_eq!(landed.events, vec![]);
+        let j2 = w.join(&[&world::Member::account(21)]).header;
+        rig.took(&j2);
+        assert_eq!(rig.tick().events, vec![]);
+        w.join(&[&world::Member::account(22)]);
+        w.tick(60);
+        let f = w.open(&w.due(DueKind::Refresh)).header;
+        rig.took(&f);
+        rig.now = w.now * 1000;
+        assert_eq!(told(&rig.tick()), Vec::<&GkEvent>::new());
+        rig.now += 3600 * 1000;
+        assert_eq!(told(&rig.tick()), Vec::<&GkEvent>::new());
+        assert!(rig.duty.keep.unnamed.is_empty());
+    }
+
+    #[test]
+    fn a_join_of_ours_inside_a_catch_up_the_duty_sees_once_is_not_told() {
+        // A reconnect's catch-up: one `EpochIn` carries our Join and two headers after it,
+        // and the duty looks once, at the last
+        let mut rig = Rig::new(None, Platform::Desktop);
+        let (mut w, pair) = genesis(&mut rig);
+        let by = HolderRef {
+            m: MemberId::Conn(U),
+            kx: pair.kx(),
+        };
+        second_keyholder(&mut rig, &mut w, &pair);
+        let people: Vec<world::Member> = (10..12).map(world::Member::account).collect();
+        let join = w.join_due(&people.iter().collect::<Vec<_>>());
+        rig.due(3, piece(due_code::JOIN, &join, Some(&w), vec![]));
+        let c = rig.commit();
+        let a = w.check(&join, by, &c).unwrap_or_else(|bad| panic!("{bad}"));
+        let j = a.header.clone();
+        w.take(&join, a, rig.sent());
+        let next: Vec<world::Member> = (20..22).map(world::Member::account).collect();
+        let j2 = w.join(&[&next[0]]).header;
+        let j3 = w.join(&[&next[1]]).header;
+        for h in [&j, &j2, &j3] {
+            rig.took(h);
+        }
+        let mut out = GkOut::default();
+        let m = &rig.groups[TEXT_ID];
+        rig.duty.head_taken(&mut rig.who, m, &mut out);
+        rig.now = w.now * 1000;
+        assert_eq!(rig.tick().events, vec![]);
+        named_until_closed(&mut rig, &mut w);
+    }
+
+    /// T1e B (J8H): in an anonymous voice room that is not gated the relay seats a
+    /// signed-in member by its connection (open choice 11, gk/voice.rs `room_seat_m`). Its
+    /// Genesis due names that seat; the device takes it as its own seat, builds, and the
+    /// relay takes the commit. It declined every such due before (`NOT_READY`, "a new start
+    /// seats this device's own seat only"), and the room never had keys.
+    #[test]
+    fn a_signed_in_device_starts_an_anonymous_voice_room_seated_by_its_connection() {
+        let a = [5; 16];
+        let mut rig = Rig::new(Some(a), Platform::Desktop);
+        let _ = rig.start();
+        let me = MemberId::Account(a);
+        let seat_m = MemberId::Conn(U);
+        let ep = seat_keys::conn_pair(&mut rig.who, rig.now).unwrap();
+        let pair = wire::pair(&ep, GkMember::Conn(U)).unwrap();
+        let mut m = Member::new(
+            GkTrack {
+                group: world::VOICE_ID.into(),
+                kind: GroupKind::Voice,
+                anonymous: true,
+                ..track()
+            },
+            None,
+        );
+        m.voice_seats.insert(U, pair.keys.seat(seat_m).into());
+        rig.groups.insert(world::VOICE_ID.into(), m);
+        let due = Due {
+            joiners: vec![Joiner {
+                seat: pair.keys.seat(seat_m),
+                ik: raw(&rig.who.identity),
+                keys: pair.keys.clone(),
+                endorsement: pair.endorsement.clone(),
+                returning: false,
+            }],
+            volunteer: Some(Candidate {
+                m: me,
+                ik: raw(&rig.who.identity),
+                pair: pair.clone(),
+            }),
+            ..Due::of(DueKind::Genesis, false)
+        };
+        let voice_due = |id: u64, d: &Due| ServerMessage::EpochDue {
+            group: world::VOICE_ID.into(),
+            due: id,
+            part: 0,
+            last: true,
+            piece: Box::new(piece(due_code::GENESIS, d, None, vec![])),
+        };
+
+        // A seat is its keys and its name: another device's keys under its own connection,
+        // under this device's connection or under this account, and this device's keys under
+        // another connection, are no start of this one's
+        let other = world::Member::conn(U + 1).joiner();
+        let named = |keys: &Joiner, m: MemberId, endorsed: MemberId| Joiner {
+            seat: keys.keys.seat(m),
+            endorsement: Endorsement {
+                m: endorsed,
+                ..keys.endorsement.clone()
+            },
+            ..keys.clone()
+        };
+        let mine = due.joiners[0].clone();
+        let not_mine = [
+            ("another device's", other.clone()),
+            (
+                "another device's keys by this connection",
+                named(&other, seat_m, seat_m),
+            ),
+            (
+                "another device's keys by this account",
+                named(&other, me, MemberId::Conn(U + 1)),
+            ),
+            (
+                "this device's keys by another connection",
+                named(&mine, MemberId::Conn(U + 1), MemberId::Conn(U + 1)),
+            ),
+        ];
+        for (id, (what, j)) in (1..).zip(not_mine) {
+            let mut theirs = due.clone();
+            theirs.joiners = vec![j];
+            let out = rig.frame(voice_due(id, &theirs));
+            assert_eq!(declined(&out), Some(decline::NOT_READY), "{what}");
+            assert_eq!(
+                decline_detail(&out).as_deref(),
+                Some("a new start seats this device's own seat only"),
+                "{what}"
+            );
+        }
+
+        let out = rig.frame(voice_due(5, &due));
+        assert!(out.build_ready, "{:?}", out.send);
+        let c = rig.commit();
+        let by = HolderRef {
+            m: me,
+            kx: pair.kx(),
+        };
+        let ap = World::check_start(
+            GroupKind::Voice,
+            world::VOICE_ID,
+            false,
+            &due,
+            by,
+            &c,
+            T0,
+            &[U],
+        )
+        .unwrap_or_else(|bad| panic!("{bad}"));
+        let h = ap.header.header();
+        assert_eq!(h.keyholders[0].m, me, "the entry names the account");
+        assert_eq!(h.keyholders[0].u, Some(U));
+        assert_eq!(
+            ap.seated.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            vec![pair.keys.seat(seat_m)],
+            "seated by its connection"
+        );
+    }
+
+    /// T1e C (J8H): a KeyholdersAdd drops the buckets its exits empty (§5.3), and rule 8 lets
+    /// it drop only those. The keyholder's own check saw a bucket by its leaf alone when its
+    /// build needed no list of it, so a promotion that carried the exit of a one-seat
+    /// bucket's only seat (a gate turning on, the connection seats going) failed its own
+    /// rule 8 and was declined: the exits never landed. It asks the dropped buckets' lists
+    /// too now, and the relay takes the commit.
+    #[test]
+    fn a_promotion_carrying_the_exit_that_empties_a_bucket_drops_it_and_is_taken() {
+        let mut rig = Rig::new(None, Platform::Desktop);
+        let (mut w, pair) = genesis(&mut rig);
+        let by = HolderRef {
+            m: MemberId::Conn(U),
+            kx: pair.kx(),
+        };
+        // A lone joiner in a bucket of its own, then three more in another
+        let lone = world::Member::account(10);
+        let join = w.join_due(&[&lone]);
+        rig.due(2, piece(due_code::JOIN, &join, Some(&w), vec![]));
+        let c = rig.commit();
+        assert_eq!(land(&mut rig, &mut w, &join, by, &c).seated, 1);
+        let people: Vec<world::Member> = (11..14).map(world::Member::account).collect();
+        let refs: Vec<&world::Member> = people.iter().collect();
+        let join = w.join_due(&refs);
+        rig.due(3, piece(due_code::JOIN, &join, Some(&w), vec![]));
+        let c = rig.commit();
+        assert_eq!(land(&mut rig, &mut w, &join, by, &c).seated, 3);
+        let lone_b = w.bucket_of(&lone.seat);
+        let buckets = w.leaves.len();
+
+        // The promotion carries the lone seat's exit
+        let cand = world::Holder::desktop(9);
+        let mut promote = w.exits(&[lone.seat], DueKind::Promote);
+        promote.candidate = Some(cand.candidate());
+        let own: EndorsedPair = (&pair).into();
+        let out = rig.due(4, piece(due_code::PROMOTE, &promote, Some(&w), vec![own]));
+        let asked: Vec<(u64, u64)> = out
+            .send
+            .iter()
+            .filter_map(|m| match m {
+                ClientMessage::EpochListsWanted { versions, .. } => Some(versions.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        rig.frame(lists_for(&w, &out.send).expect("lists asked"));
+        let c = rig.commit();
+        assert!(
+            asked.iter().any(|(b, _)| *b == lone_b),
+            "the dropped bucket's list is asked: {asked:?}"
+        );
+        let a = land(&mut rig, &mut w, &promote, by, &c);
+        let h = a.header.header();
+        assert_eq!(h.kind, Kind::KeyholdersAdd);
+        assert_eq!(h.keyholders.len(), 2);
+        assert_eq!(a.removed, vec![lone.seat]);
+        assert_eq!(w.leaves.len(), buckets - 1, "the emptied bucket is dropped");
+        assert!(w.leaves.iter().all(|l| l.leaf.b != lone_b));
+    }
+
+    /// A keyholder of `TEXT_ID` whose keyring holds, next to its own, a bucket of two
+    /// accounts' seats: the world, its pair, the two, and that bucket.
+    fn two_seat_bucket(rig: &mut Rig) -> (World, Pair, [world::Member; 2], u64) {
+        let (mut w, pair) = genesis(rig);
+        let by = HolderRef {
+            m: MemberId::Conn(U),
+            kx: pair.kx(),
+        };
+        let s = [world::Member::account(10), world::Member::account(11)];
+        let join = w.join_due(&[&s[0], &s[1]]);
+        rig.due(2, piece(due_code::JOIN, &join, Some(&w), vec![]));
+        let c = rig.commit();
+        assert_eq!(land(rig, &mut w, &join, by, &c).seated, 2);
+        let b = w.bucket_of(&s[0].seat);
+        assert_eq!(w.bucket_of(&s[1].seat), b, "one bucket of two");
+        (w, pair, s, b)
+    }
+
+    /// A due of `kind` carrying `gone`'s exit and `made_up`'s, both from bucket `b`: two
+    /// exits count that two-seat bucket empty, though its other seat stays.
+    fn exits_with_a_made_up_one(
+        w: &mut World,
+        gone: &world::Member,
+        made_up: &world::Member,
+        b: u64,
+        kind: DueKind,
+    ) -> Due {
+        let mut due = w.exits(&[gone.seat], kind);
+        w.seq += 1;
+        due.exits.push(Exit {
+            seq: w.seq,
+            seat: made_up.seat,
+            b,
+        });
+        due.exits_upto = w.seq;
+        due
+    }
+
+    /// The versions `sent` asked the lists of.
+    fn lists_asked(sent: &[ClientMessage]) -> Vec<(u64, u64)> {
+        sent.iter()
+            .filter_map(|m| match m {
+                ClientMessage::EpochListsWanted { versions, .. } => Some(versions.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    /// `lists`, with bucket `b`'s list made of `seats` (each with its own key, in list order):
+    /// a list of the right shape, as a relay may send it.
+    fn forge_list(lists: ServerMessage, b: u64, seats: &[&world::Member]) -> ServerMessage {
+        let ServerMessage::EpochLists {
+            group,
+            gen,
+            mut lists,
+            more,
+        } = lists
+        else {
+            panic!("not lists");
+        };
+        let mut forged: Vec<gk::ListSeat> = seats
+            .iter()
+            .map(|m| gk::ListSeat {
+                seat: m.seat.into(),
+                dh: m.joiner().keys.dh_bytes().to_vec(),
+            })
+            .collect();
+        forged.sort_by_key(|s| s.seat);
+        let l = lists
+            .iter_mut()
+            .find(|l| l.b == b)
+            .expect("the bucket's list asked");
+        l.seats = forged;
+        assert!(l.check().is_ok(), "a list of the right shape");
+        ServerMessage::EpochLists {
+            group,
+            gen,
+            lists,
+            more,
+        }
+    }
+
+    /// What the decline in `out` said, if one went.
+    fn decline_detail(out: &GkOut) -> Option<String> {
+        out.send.iter().find_map(|m| match m {
+            ClientMessage::EpochDecline { detail, .. } => Some(detail.clone()),
+            _ => None,
+        })
+    }
+
+    /// J8H review: a KeyholdersAdd reads the buckets it drops through their lists (rule 8
+    /// and 10 in its own check). A relay that made up an exit in a two-seat bucket counts it
+    /// empty; if it then sent that bucket's list with the made-up seat in place of the one
+    /// that stays, a list of the right shape that its keyring does not name, the keyholder
+    /// signed a commit dropping the staying seat, which `removed` never names. A list the
+    /// keyring does not name is not taken now; the true list shows the staying seat, and the
+    /// own check refuses its drop (rule 10).
+    #[test]
+    fn a_promotion_drops_no_seat_its_exits_do_not_name_whatever_list_the_relay_sends() {
+        let mut rig = Rig::new(None, Platform::Desktop);
+        let (mut w, pair, s, b) = two_seat_bucket(&mut rig);
+        let x = world::Member::account(12);
+        let own: EndorsedPair = (&pair).into();
+        let cand = world::Holder::desktop(9);
+
+        // The made-up list
+        let mut promote = exits_with_a_made_up_one(&mut w, &s[0], &x, b, DueKind::Promote);
+        promote.candidate = Some(cand.candidate());
+        let out = rig.due(
+            3,
+            piece(due_code::PROMOTE, &promote, Some(&w), vec![own.clone()]),
+        );
+        assert!(
+            lists_asked(&out.send).iter().any(|(ab, _)| *ab == b),
+            "the dropped bucket's list is asked"
+        );
+        let lists = lists_for(&w, &out.send).expect("lists asked");
+        let mut out = rig.frame(forge_list(lists, b, &[&s[0], &x]));
+        let jobs = rig.jobs();
+        out.send.extend(jobs.send);
+        assert!(
+            rig.uploads().is_empty(),
+            "no commit went: {:?}",
+            sent_kinds(&out.send)
+        );
+        assert_eq!(declined(&out), Some(decline::NOT_READY), "{:?}", out.send);
+        assert_eq!(
+            decline_detail(&out).as_deref(),
+            Some("the relay did not send a list the build needs"),
+            "the made-up list is not taken"
+        );
+
+        // The true list, the same made-up exit
+        let mut promote = exits_with_a_made_up_one(&mut w, &s[0], &x, b, DueKind::Promote);
+        promote.candidate = Some(cand.candidate());
+        let out = rig.due(4, piece(due_code::PROMOTE, &promote, Some(&w), vec![own]));
+        let mut out = match lists_for(&w, &out.send) {
+            Some(lists) => rig.frame(lists),
+            None => out,
+        };
+        let jobs = rig.jobs();
+        out.send.extend(jobs.send);
+        assert!(rig.uploads().is_empty(), "no commit went");
+        let why = decline_detail(&out).expect("declined");
+        assert!(why.contains("rule 10"), "{why}");
+    }
+
+    /// J8H review: a Fresh (an exit due), a KeyholdersRemove or a KeyholdersReplace drops a
+    /// bucket its exits count empty, and its own check saw a dropped bucket by its leaf
+    /// alone: a relay that made up an exit in a two-seat bucket got a commit dropping the
+    /// seat that stays, never named in `removed`. Every opening asks the lists of the buckets
+    /// it drops now, so the own check sees that seat and refuses (rule 10); an honest drop
+    /// is still taken.
+    #[test]
+    fn an_opening_asks_the_list_of_each_bucket_it_drops_and_drops_no_seat_no_exit_names() {
+        let mut rig = Rig::new(None, Platform::Desktop);
+        let (mut w, pair, s, b) = two_seat_bucket(&mut rig);
+        let by = HolderRef {
+            m: MemberId::Conn(U),
+            kx: pair.kx(),
+        };
+        let x = world::Member::account(12);
+
+        let fresh = exits_with_a_made_up_one(&mut w, &s[0], &x, b, DueKind::Exits);
+        let out = rig.due(3, piece(due_code::EXITS, &fresh, Some(&w), vec![]));
+        let asked = lists_asked(&out.send);
+        let mut out = match lists_for(&w, &out.send) {
+            Some(lists) => rig.frame(lists),
+            None => out,
+        };
+        let jobs = rig.jobs();
+        out.send.extend(jobs.send);
+        assert!(
+            asked.iter().any(|(ab, _)| *ab == b),
+            "the dropped bucket's list is asked: {asked:?}"
+        );
+        assert!(rig.uploads().is_empty(), "no commit went");
+        let why = decline_detail(&out).expect("declined");
+        assert!(why.contains("rule 10"), "{why}");
+
+        // Both seats go: the bucket is dropped, and the relay takes it
+        let honest = w.exits(&[s[0].seat, s[1].seat], DueKind::Exits);
+        let out = rig.due(4, piece(due_code::EXITS, &honest, Some(&w), vec![]));
+        if let Some(lists) = lists_for(&w, &out.send) {
+            rig.frame(lists);
+        }
+        let c = rig.commit();
+        let a = land(&mut rig, &mut w, &honest, by, &c);
+        assert_eq!(a.removed.len(), 2);
+        assert!(
+            w.leaves.iter().all(|l| l.leaf.b != b),
+            "the bucket is dropped"
+        );
+    }
+
+    #[test]
+    fn a_job_and_its_result_cross_threads() {
+        fn send<T: Send>() {}
+        send::<BuildJob>();
+        send::<Built>();
+        let _ = tag(&[0x05; 33]);
+    }
+
+    /// A keyholder's jobs build in steps: at a zero budget each step does one unit of work
+    /// (a row, a welcome, a seal, a list read), and the commits are the relay's to take, a
+    /// Join of 300 seats (two dues: 256 and 44), its exits and a refresh among them.
+    #[test]
+    fn a_keyholders_jobs_build_in_steps_of_one_unit_and_the_relay_takes_each_commit() {
+        let mut rig = Rig::new(None, Platform::Desktop);
+        let (mut w, pair) = genesis(&mut rig);
+        assert_eq!(rig.ran.len(), 1, "the Genesis: {:?}", rig.ran);
+        let by = HolderRef {
+            m: MemberId::Conn(U),
+            kx: pair.kx(),
+        };
+        let people: Vec<world::Member> = (0..300).map(world::Member::numbered).collect();
+        let mut due_id = 2;
+        let mut land_job = |rig: &mut Rig, w: &mut World, kind: u8, due: &Due| {
+            rig.ran.clear();
+            let out = rig.due_in_parts(due_id, piece(kind, due, Some(w), vec![]));
+            due_id += 1;
+            if let Some(lists) = lists_for(w, &out.send) {
+                rig.frame(lists);
+            }
+            let c = rig.commit();
+            let a = land(rig, w, due, by, &c);
+            let (steps, units, most) = rig.ran[0];
+            let rows: usize = c.rows.iter().map(|r| r.rows.len() / 60).sum();
+            let least = rows + c.welcomes.len() + c.seals.len();
+            assert!(
+                units >= least as u64,
+                "{units} units for {least} rows, welcomes and seals"
+            );
+            assert_eq!(most, 1, "one unit a step");
+            assert_eq!(steps, units + 1, "each step but the last stops at its unit");
+            a
+        };
+        for part in [&people[..256], &people[256..]] {
+            let refs: Vec<&world::Member> = part.iter().collect();
+            let join = w.join_due(&refs);
+            let a = land_job(&mut rig, &mut w, due_code::JOIN, &join);
+            assert_eq!(a.seated, part.len());
+        }
+        assert_eq!(w.head.header().seats, 301);
+        let leaving: Vec<SeatRef> = people.iter().step_by(11).map(|p| p.seat).collect();
+        let exits = w.exits(&leaving, DueKind::Exits);
+        let a = land_job(&mut rig, &mut w, due_code::EXITS, &exits);
+        assert_eq!(a.removed.len(), leaving.len());
+        w.tick(3700);
+        rig.now = w.now * 1000;
+        let refresh = w.due(DueKind::Refresh);
+        let a = land_job(&mut rig, &mut w, due_code::REFRESH, &refresh);
+        assert_eq!(a.header.header().kind, Kind::Fresh);
+    }
+
+    /// A job holds the group's row bases from its first step to its end, never while it
+    /// waits. One whose due went (asked again) stops at its next step, unbuilt, and its
+    /// bases go home, so the job for the due asked again builds on them, not cold.
+    #[test]
+    fn a_job_whose_due_went_stops_at_its_next_step_and_its_row_bases_go_home() {
+        let mut rig = Rig::new(None, Platform::Desktop);
+        let (mut w, pair) = genesis(&mut rig);
+        let by = HolderRef {
+            m: MemberId::Conn(U),
+            kx: pair.kx(),
+        };
+        let bases = |rig: &Rig| {
+            let home = rig.duty.holds[TEXT_ID].cache.lock().unwrap();
+            home.as_ref().map(RowBases::len)
+        };
+        let people: Vec<world::Member> = (10..40).map(world::Member::account).collect();
+        let refs: Vec<&world::Member> = people.iter().collect();
+        let join = w.join_due(&refs);
+        rig.due(2, piece(due_code::JOIN, &join, Some(&w), vec![]));
+        let c = rig.commit();
+        land(&mut rig, &mut w, &join, by, &c);
+        assert_eq!(
+            bases(&rig),
+            Some(30),
+            "a base for each row of the stored Join"
+        );
+
+        let exits = w.exits(&[people[0].seat], DueKind::Exits);
+        let out = rig.due(3, piece(due_code::EXITS, &exits, Some(&w), vec![]));
+        rig.frame(lists_for(&w, &out.send).expect("its lists"));
+        let mut job = rig.duty.take_build().expect("a job");
+        assert_eq!(bases(&rig), Some(30), "a job waiting holds none");
+        assert!(job.step(Duration::ZERO).is_none());
+        assert_eq!(job.units(), 1);
+        assert_eq!(bases(&rig), None, "out with the job while it builds");
+
+        // The relay asks the due again: the first job's attempt is gone
+        let out = rig.due(4, piece(due_code::EXITS, &exits, Some(&w), vec![]));
+        if let Some(lists) = lists_for(&w, &out.send) {
+            rig.frame(lists);
+        }
+        let b = job.step(Duration::MAX).expect("it stops at once");
+        assert!(job.step(Duration::MAX).is_none(), "and is done");
+        assert_eq!(job.units(), 1, "it built nothing more");
+        assert_eq!(bases(&rig), Some(30), "its bases are home");
+        let mut out = GkOut::default();
+        let mut c = GkCtx {
+            pins: &mut rig.pins,
+            now: rig.now,
+        };
+        rig.duty
+            .built(&mut rig.who, &mut rig.groups, b, &mut c, &mut out);
+        assert!(
+            out.send.is_empty(),
+            "a gone job says nothing: {:?}",
+            out.send
+        );
+
+        // The due asked again builds on the warm bases: no base made anew, none lost
+        let c = rig.commit();
+        let a = land(&mut rig, &mut w, &exits, by, &c);
+        assert_eq!(a.removed, vec![people[0].seat]);
+        assert_eq!(bases(&rig), Some(30));
+    }
+
+    /// A Join job at a zero budget does one unit of work a step: its first step does not
+    /// end it, and it takes a step for each seat's row and welcome at least.
+    #[test]
+    fn a_join_job_at_a_zero_budget_does_not_end_at_its_first_step() {
+        let mut rig = Rig::new(None, Platform::Desktop);
+        let (w, _) = genesis(&mut rig);
+        let people: Vec<world::Member> = (10..30).map(world::Member::account).collect();
+        let refs: Vec<&world::Member> = people.iter().collect();
+        let join = w.join_due(&refs);
+        rig.due(2, piece(due_code::JOIN, &join, Some(&w), vec![]));
+        let mut job = rig.duty.take_build().expect("a job");
+        assert!(
+            job.step(Duration::ZERO).is_none(),
+            "a step of one unit, not the whole build"
+        );
+        let mut steps = 1;
+        while job.step(Duration::ZERO).is_none() {
+            steps += 1;
+        }
+        assert!(
+            steps > 2 * 20,
+            "a step for each seat's row and welcome: {steps}"
+        );
+    }
+
+    /// RV q1-q2:1420: a seed welcome carries the seat's real `s_m` under the new seed, so it
+    /// goes only to keys the seat's own `IK` endorsed (its pin, as a joiner's), never to keys
+    /// that merely carry the seat's two 8-byte tags.
+    #[test]
+    fn a_seed_seat_with_a_foreign_ik_or_endorsement_gets_no_seed_welcome() {
+        let mut rig = Rig::new(None, Platform::Desktop);
+        let (_, _, people, page) = rolled(&mut rig);
+        let (p0, p1) = (&people[0], &people[1]);
+        // people[0]'s own keys, endorsed by people[1]'s identity: a valid signature, by an
+        // IK that is not the one pinned for people[0]'s account
+        let by_other = Endorsement::sign(
+            &p1.ik,
+            Origin::VaultSeat,
+            p0.seat.m,
+            p0.endorsement.n,
+            p0.endorsement.made,
+            &p0.pair.public(),
+        )
+        .unwrap();
+        let other_pair: EndorsedPair = (&Pair {
+            keys: p0.pair.public(),
+            endorsement: by_other,
+        })
+            .into();
+        let mut pin_swap = page.clone();
+        pin_swap.seed_seats[0].ik = p1.ik_raw();
+        pin_swap.seed_seats[0].keys = other_pair.clone();
+        let mut bad_sig = page.clone();
+        bad_sig.seed_seats[0].keys.sig = other_pair.sig.clone();
+        for (id, forged) in [(5, pin_swap), (6, bad_sig)] {
+            assert_eq!(declined(&rig.due(id, forged)), Some(decline::NOT_READY));
+            assert!(rig.uploads().is_empty(), "no welcome went");
+        }
+        // The honest page still builds
+        assert!(rig.due(7, page).build_ready);
+        assert_eq!(declined(&rig.jobs()), None);
+        assert_eq!(rig.uploads().len(), 1);
+    }
+
+    /// RV q1-q2:1420, repair round: a seed seat's keys are checked under the `IK` pinned for
+    /// its account, not the one the relay sends beside them (a relay whose identity row moved
+    /// on still gets the page built), and a page declined pins nothing it met before the seat
+    /// that failed.
+    #[test]
+    fn a_seed_page_is_checked_under_the_pin_and_a_declined_one_pins_nothing() {
+        let mut rig = Rig::new(None, Platform::Desktop);
+        let (_, _, people, page) = rolled(&mut rig);
+        // An account the Join did not pin, first in the page, then a seat whose keys its
+        // account's identity did not endorse
+        let fresh = world::Member::account(20);
+        let fresh_seat = gk::SeedSeat {
+            seat: fresh.seat.into(),
+            ik: fresh.ik_raw(),
+            keys: (&Pair {
+                keys: fresh.pair.public(),
+                endorsement: fresh.endorsement.clone(),
+            })
+                .into(),
+        };
+        let mut bad = page.clone();
+        bad.seed_seats[0].keys.sig = page.seed_seats[1].keys.sig.clone();
+        bad.seed_seats.insert(0, fresh_seat);
+        assert_eq!(declined(&rig.due(5, bad)), Some(decline::NOT_READY));
+        assert_eq!(
+            rig.pins.pin(&[20; 16]),
+            None,
+            "the declined page pinned nothing"
+        );
+        // The relay sends another identity beside people[0]'s own keys: they are endorsed
+        // by the pinned one, so the page goes
+        let mut other_ik = page.clone();
+        other_ik.seed_seats[0].ik = people[1].ik_raw();
+        assert!(rig.due(6, other_ik).build_ready);
+        assert_eq!(declined(&rig.jobs()), None);
+        assert_eq!(rig.uploads().len(), 1);
+    }
+
+    /// RV q4-q5:748, repair round: the build's refusal of a candidate seated nowhere in a
+    /// gated group goes as a `CANDIDATE` decline, which counts toward no removal of this
+    /// keyholder, as `candidate_ok`'s refusals do.
+    #[test]
+    fn a_gated_promotion_of_a_candidate_seated_nowhere_is_declined_as_the_candidates() {
+        let a = [5; 16];
+        let mut rig = Rig::new(Some(a), Platform::Desktop);
+        let sent = rig.start();
+        let me = MemberId::Account(a);
+        let pair = wire::pair(&Rig::volunteered(&sent), me.into()).unwrap();
+        let public = rig.who.seat_keys.as_ref().unwrap().pair.public();
+        let e =
+            Endorsement::sign(&rig.who.identity, Origin::VaultSeat, me, 1, T0, &public).unwrap();
+        let due = Due {
+            joiners: vec![Joiner {
+                seat: public.seat(me),
+                ik: raw(&rig.who.identity),
+                keys: public,
+                endorsement: e,
+                returning: false,
+            }],
+            volunteer: Some(Candidate {
+                m: me,
+                ik: raw(&rig.who.identity),
+                pair: pair.clone(),
+            }),
+            ..Due::of(DueKind::Genesis, true)
+        };
+        rig.due(1, piece(due_code::GENESIS, &due, None, vec![]));
+        let c = rig.commit();
+        let by = HolderRef {
+            m: me,
+            kx: pair.kx(),
+        };
+        let ap = World::check_start(GroupKind::Text, TEXT_ID, true, &due, by, &c, T0, &[])
+            .unwrap_or_else(|bad| panic!("{bad}"));
+        let h = ap.header.clone();
+        let w = world_after(&due, ap, rig.sent());
+        rig.took(&h);
+        rig.now = w.now * 1000;
+        rig.tick();
+        assert!(w.head.header().gated);
+        let promote = w.promote_due(&world::Holder::desktop(9));
+        let own: EndorsedPair = (&pair).into();
+        let out = rig.due(2, piece(due_code::PROMOTE, &promote, Some(&w), vec![own]));
+        if let Some(lists) = lists_for(&w, &out.send) {
+            rig.frame(lists);
+        }
+        let out = rig.jobs();
+        assert_eq!(declined(&out), Some(decline::CANDIDATE));
+        assert_eq!(
+            decline_detail(&out).as_deref(),
+            Some("the candidate is seated nowhere")
+        );
+    }
+
+    /// RV r-keyholders:773, repair round: a group's desktop floor counts the counter a set
+    /// names (a Replace's new entry among them), never falls back to an older set's, is the
+    /// group's own, and keeps at most `DESK_N_ACCOUNTS` accounts a group.
+    #[test]
+    fn a_groups_desktop_floor_rises_with_its_sets_and_never_falls() {
+        let mut w = World::text(false, false);
+        let before = w.kh.header().keyholders.clone();
+        let new = w.holders[0].rotated();
+        let due = w.replace_due(&new);
+        let b = w.opening_by(0, &due, false, Some(&new), None).unwrap();
+        w.step(&due, &b);
+        assert_eq!(w.kh.header().kind, Kind::KeyholdersReplace);
+        let mut keep = HolderKeep::default();
+        assert!(keep.count_desks(TEXT_ID, &before));
+        assert!(keep.count_desks(TEXT_ID, &w.kh.header().keyholders));
+        assert!(
+            !keep.count_desks(TEXT_ID, &before),
+            "an older set lowers nothing"
+        );
+        assert_eq!(keep.desk_floor(TEXT_ID, &[1; 16]), Some(new.endorsement.n));
+        assert_eq!(
+            keep.desk_floor("another", &[1; 16]),
+            None,
+            "the group's own"
+        );
+        let many: Vec<Keyholder> = (10..=(10 + DESK_N_ACCOUNTS as u8))
+            .map(|i| world::Holder::desktop(i).entry(GroupKind::Text))
+            .collect();
+        keep.count_desks("another", &many);
+        assert_eq!(keep.desk_n["another"].len(), DESK_N_ACCOUNTS);
+        assert_eq!(
+            keep.desk_floor("another", &[10; 16]),
+            None,
+            "the oldest went"
+        );
+    }
+
+    /// RV r-keyholders:773, repair round: the relay has the newer desktop entry of an account
+    /// removed first, then asks, within `CLOCK_SLACK` of it, the promotion of the pair it
+    /// replaced. The set holds no newer entry by then and the book's counter is still inside
+    /// its slack, but this keyholder took the set that named the newer counter and kept it for
+    /// this group, across connections too: it declines `CANDIDATE`.
+    #[test]
+    fn a_replaced_desktop_pair_is_no_candidate_after_its_successor_is_removed() {
+        let mut rig = Rig::new(None, Platform::Desktop);
+        let (mut w, pair) = genesis(&mut rig);
+        let by = HolderRef {
+            m: MemberId::Conn(U),
+            kx: pair.kx(),
+        };
+        let own: EndorsedPair = (&pair).into();
+        let old = world::Holder::desktop(9);
+        let new = old.rotated();
+        let (new_n, new_made) = (new.endorsement.n, new.endorsement.made);
+        // The account's newer pair holds keys here, as its Replace leaves it
+        let promote = w.promote_due(&new);
+        let out = rig.due(
+            2,
+            piece(due_code::PROMOTE, &promote, Some(&w), vec![own.clone()]),
+        );
+        if let Some(lists) = lists_for(&w, &out.send) {
+            rig.frame(lists);
+        }
+        let c = rig.commit();
+        land(&mut rig, &mut w, &promote, by, &c);
+        w.holders.push(new);
+        // The relay has that entry removed
+        let remove = w.remove_due(0);
+        let out = rig.due(
+            3,
+            piece(due_code::REMOVE, &remove, Some(&w), vec![own.clone()]),
+        );
+        if let Some(lists) = lists_for(&w, &out.send) {
+            rig.frame(lists);
+        }
+        let c = rig.commit();
+        land(&mut rig, &mut w, &remove, by, &c);
+        w.holders.remove(0);
+        assert!(!w.head.header().keyholders.iter().any(|k| k.m == old.m));
+        assert!(
+            rig.now / 1000 <= new_made + CLOCK_SLACK,
+            "the book alone would not refuse it yet"
+        );
+        // The pair it replaced, asked
+        let again = w.promote_due(&old);
+        let out = rig.due(4, piece(due_code::PROMOTE, &again, Some(&w), vec![own]));
+        let out = match lists_for(&w, &out.send) {
+            Some(lists) => rig.frame(lists),
+            None => out,
+        };
+        assert_eq!(declined(&out), Some(decline::CANDIDATE));
+        // Kept: what the next connection's duty starts from
+        let keep = rig.duty.take_keep().expect("the keep moved");
+        let back: HolderKeep =
+            postcard::from_bytes(&postcard::to_allocvec(&keep).unwrap()).unwrap();
+        let mut next = Duty::default();
+        next.keep_in(&back);
+        assert_eq!(next.keep.desk_floor(TEXT_ID, &[9; 16]), Some(new_n));
+    }
+
+    /// RV q1-q2:1488: a keyring welcome goes only to a keyholder pair that the entry's own
+    /// `IK` endorsed. The relay supplies the other keyholders' pairs (`EpochDue.pairs`), and
+    /// `kx` with the 8-byte `tag_kk` is all an entry names of them: without the endorsement
+    /// a relay that finds a Kyber key with that tag gets the post-quantum half of the KRK.
+    #[test]
+    fn an_opening_refuses_a_keyholder_pair_its_ik_did_not_endorse() {
+        for forged in [true, false] {
+            let mut rig = Rig::new(None, Platform::Desktop);
+            let (mut w, pair) = genesis(&mut rig);
+            second_keyholder(&mut rig, &mut w, &pair);
+            let other = &w.holders[0];
+            let own: EndorsedPair = (&pair).into();
+            let mut theirs: EndorsedPair = (&other.pair()).into();
+            if forged {
+                // The same keys, so `kx` and `tag_kk` match the entry; signed by another IK
+                let e = Endorsement::sign(
+                    &IdentityKeyPair::generate(&mut crate::rng()),
+                    Origin::Desktop,
+                    other.m,
+                    other.endorsement.n,
+                    other.endorsement.made,
+                    &other.pair.public(),
+                )
+                .unwrap();
+                theirs.sig = e.sig.to_vec();
+            }
+            // A set change: a new KRK, welcomed to every keyholder
+            let next = world::Holder::desktop(8);
+            let promote = w.promote_due(&next);
+            let out = rig.due(
+                91,
+                piece(due_code::PROMOTE, &promote, Some(&w), vec![own, theirs]),
+            );
+            if let Some(lists) = lists_for(&w, &out.send) {
+                rig.frame(lists);
+            }
+            let out = rig.jobs();
+            let commits = rig
+                .uploads()
+                .iter()
+                .filter(|m| matches!(m, ClientMessage::EpochCommit { .. }))
+                .count();
+            if forged {
+                assert!(declined(&out).is_some(), "declined: {:?}", out.send);
+                assert_eq!(commits, 0, "no keyring welcome went");
+            } else {
+                assert_eq!(declined(&out), None);
+                assert!(commits > 0);
+            }
+        }
+    }
+
+    /// RV r-keyholders:773: a desktop pair its account replaced is not promoted again while
+    /// the entry that replaced it is in the set, even within `CLOCK_SLACK` of the Replace, and
+    /// whatever counter this keyholder's book holds. Another desktop of the account at the
+    /// same counter still is.
+    #[test]
+    fn a_replaced_desktop_pair_is_no_candidate_beside_its_successor() {
+        let old = world::Holder::desktop(9);
+        let new = old.rotated();
+        let own = world::Holder::desktop(1);
+        let set = vec![own.entry(GroupKind::Text), new.entry(GroupKind::Text)];
+        let mut pins = MemoryPins::default();
+        // What promoting the old pair once counted
+        pins.raise(
+            [9; 16],
+            Seen {
+                n: old.endorsement.n,
+                made: T0,
+            },
+            false,
+        );
+        let mut c = GkCtx {
+            pins: &mut pins,
+            now: (T0 + 60) * 1000,
+        };
+        assert!(!candidate_ok(
+            GroupKind::Text,
+            false,
+            &set,
+            None,
+            &old.candidate(),
+            &mut c
+        ));
+        // With no newer entry in the set and none kept for the group (a keyholder promoted
+        // after the newer entry left, which can be fooled once, §5.11), the old pair passes
+        let alone = vec![own.entry(GroupKind::Text)];
+        assert!(candidate_ok(
+            GroupKind::Text,
+            false,
+            &alone,
+            None,
+            &old.candidate(),
+            &mut c
+        ));
+        // Nor once the newer entry is gone from the set, where a set of this group named it
+        // (`desk_floor`): within `CLOCK_SLACK`, and whatever the book holds
+        assert!(!candidate_ok(
+            GroupKind::Text,
+            false,
+            &alone,
+            Some(new.endorsement.n),
+            &old.candidate(),
+            &mut c
+        ));
+        // A second desktop of the account, at the counter its entry in the set holds
+        let twin = world::Holder::desktop(9);
+        let twin = world::Holder {
+            ik: world::same_ik(&new.ik),
+            endorsement: Endorsement::sign(
+                &new.ik,
+                Origin::Desktop,
+                twin.m,
+                new.endorsement.n,
+                T0,
+                &twin.pair.public(),
+            )
+            .unwrap(),
+            ..twin
+        };
+        assert!(candidate_ok(
+            GroupKind::Text,
+            false,
+            &set,
+            None,
+            &twin.candidate(),
+            &mut c
+        ));
+    }
+
+    /// RV r-keyholders:118: the list a keyholder takes for a bucket must give each seat the
+    /// X25519 key it was seated with, not just a key whose 8-byte tag matches its `tag_sx`.
+    #[test]
+    fn a_list_with_another_dh_for_a_seat_is_not_taken() {
+        let mut w = World::text(true, false);
+        let people: Vec<world::Member> = (10..13).map(world::Member::account).collect();
+        w.join(&people.iter().collect::<Vec<_>>());
+        let lists = w.lists();
+        let kb = w
+            .ring
+            .buckets
+            .iter()
+            .find(|kb| {
+                lists[&kb.version()]
+                    .iter()
+                    .any(|s| s.seat == people[0].seat)
+            })
+            .expect("seated");
+        let honest = lists[&kb.version()].clone();
+        assert!(listed(&w.g, kb, &honest).is_some());
+        let mut forged = honest;
+        let i = forged
+            .iter()
+            .position(|s| s.seat == people[0].seat)
+            .unwrap();
+        forged[i].dh = SeatPair::generate().public().dh_bytes().to_vec();
+        assert!(listed(&w.g, kb, &forged).is_none());
+    }
+}

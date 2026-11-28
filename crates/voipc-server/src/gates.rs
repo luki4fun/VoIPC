@@ -255,6 +255,8 @@ async fn gate_changed(state: &Arc<ServerState>, channel_id: ChannelId, old: &Cha
         }
     }
     if old.groups.is_empty() != gate.groups.is_empty() {
+        // Its group: on, connection seats exit and the next opening is gated; off, cleared
+        state.gk.on_gate(channel_id, !gate.groups.is_empty());
         tell_followers_gate(state, channel_id).await;
     }
 }

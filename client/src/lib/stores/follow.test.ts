@@ -8,7 +8,7 @@ const { invoked } = await import("./node-stores.mjs");
 const { autoJoinTextChannels, forgetAutoJoinAsk, hasNsfwConsent, giveNsfwConsent, isLeft, markKicked } = await import("./channel-ui.ts");
 const { channels } = await import("./channels.ts");
 const { activeTextChannelId, authorsHere, peerName, joinedTextChannelIds, addChannelMessage, channelMessages, chatKey, dmMessages, noteChannelUnseen, noteNeverOpened, clearChannelUnread, unseenChannels } = await import("./chat.ts");
-const { channelRosters, exchangedKey, goneFrom, noteJoin, noteLeft, onlineById, patchRosters, requestAllRosters, setRoster, textSeats } = await import("./rosters.ts");
+const { channelRosters, exchangedKey, goneFrom, noteJoin, noteLeft, onlineById, patchRosters, requestAllRosters, setCounts, setRoster, textSeats } = await import("./rosters.ts");
 const { clearSweeps, joinedMade, noteMade, noteMemberGone, onSweepPage, refreshList, setSweepQuiet, startSweeps, sweepForAsker } = await import("./sweep.ts");
 const { askSharers, channelOpened, forgetHandOff, handOffAnswered, handOffs, reopenAfterDrop, sharersOf } = await import("./handoff.ts");
 const { channelRings, clearRing, flushMarks, forgetRings, lightRing, moveRead, noteLastPost, ringBack, ringForPost } = await import("./marks.ts");
@@ -201,6 +201,26 @@ test("a flag that comes while the join waits in the batch is on the row the batc
   patchRosters(s, 11, { shares_history: false }, (id) => id !== 500);
   assert.equal(flag(12), false);
   assert.equal(flag(11), true);
+});
+
+test("a count from the relay while a join or leave waits in the batch is not moved again", () => {
+  const s = server();
+  channels.of(s).set([voice(500, { user_count: 1 })]);
+  setRoster(s, 500, [person(1, { channel_id: 500 })]);
+  // Bob's join is in the batch; the relay's count, with him in it, comes before the flush
+  noteJoin(s, person(2, { channel_id: 500 }));
+  mock.timers.tick(100);
+  setCounts(s, [[500, 2]]);
+  mock.timers.tick(300);
+  assert.equal(get(channels.peek(s))[0].user_count, 2, "not 3");
+  assert.deepEqual(get(channelRosters.peek(s)).get(500)!.map((u) => u.user_id), [1, 2]);
+  // His leave the same way
+  noteLeft(s, 500, 2);
+  mock.timers.tick(100);
+  setCounts(s, [[500, 1]]);
+  mock.timers.tick(300);
+  assert.equal(get(channels.peek(s))[0].user_count, 1, "not 0");
+  assert.deepEqual(get(channelRosters.peek(s)).get(500)!.map((u) => u.user_id), [1]);
 });
 
 test("a join applies after a list that came before it, and twice counts once", () => {
@@ -413,6 +433,97 @@ test("the sweep's budget holds it back, and then there is no answer", () => {
   assert.equal(retried, 0);
   mock.timers.tick(200_000);
   sweepForAsker(s, () => retried++);
+  assert.equal(asked("request_channel_page").length, 1);
+  clearSweeps(s);
+});
+
+test("an asker who comes while a Refresh is out is looked at after a whole sweep asked after them", () => {
+  const s = server();
+  swept(s);
+  startSweeps(s, 0.9);
+  // The page of 2 went out before they joined it, and comes back without them
+  refreshList(s, 2);
+  const seen: boolean[] = [];
+  sweepForAsker(s, () => seen.push(get(channelRosters.peek(s)).get(2)!.some((u) => u.user_id === 9)));
+  onSweepPage(s, { channel_id: 2, rows: [person(1)], next: 0 });
+  assert.deepEqual(seen, [], "not on a page asked before them");
+  // Then the whole sweep, from its first channel: never that one page alone
+  assert.deepEqual(asked("request_channel_page").map((a) => a.channelId), [2, 2]);
+  onSweepPage(s, { channel_id: 2, rows: [person(1), person(9)], next: 0 });
+  onSweepPage(s, { channel_id: 3, rows: [], next: 0 });
+  assert.deepEqual(seen, []);
+  onSweepPage(s, { channel_id: 4, rows: [], next: 0 });
+  assert.deepEqual(seen, [true]);
+  clearSweeps(s);
+});
+
+test("an asker during a sweep is looked at when it is in, and no sweep follows it at once", () => {
+  const s = server();
+  swept(s);
+  startSweeps(s, 0);
+  mock.timers.tick(1);
+  let retried = 0;
+  onSweepPage(s, { channel_id: 2, rows: [], next: 0 });
+  sweepForAsker(s, () => retried++);
+  onSweepPage(s, { channel_id: 3, rows: [], next: 0 });
+  assert.equal(retried, 0);
+  onSweepPage(s, { channel_id: 4, rows: [], next: 0 });
+  assert.equal(retried, 1);
+  // One more at once would let a relay double what the budget lets it make us ask
+  assert.equal(asked("request_channel_page").length, 3);
+  invoked().length = 0;
+  mock.timers.tick(599_000);
+  assert.equal(asked("request_channel_page").length, 0, "the next is ten minutes on");
+  mock.timers.tick(1000);
+  assert.equal(asked("request_channel_page").length, 1);
+  clearSweeps(s);
+});
+
+test("a Refresh a sweep came due in is that sweep: what it asked before an asker is asked again at its end", () => {
+  const s = server();
+  swept(s);
+  startSweeps(s, 0.4);
+  refreshList(s, 3);
+  const seen: boolean[] = [];
+  sweepForAsker(s, () => seen.push(get(channelRosters.peek(s)).get(3)!.some((u) => u.user_id === 9)));
+  mock.timers.tick(24_000);
+  onSweepPage(s, { channel_id: 3, rows: [], next: 0 });
+  onSweepPage(s, { channel_id: 2, rows: [], next: 0 });
+  onSweepPage(s, { channel_id: 4, rows: [], next: 0 });
+  assert.deepEqual(seen, [], "3 went before them");
+  onSweepPage(s, { channel_id: 3, rows: [person(9)], next: 0 });
+  assert.deepEqual(seen, [true]);
+  // Inside the sweep it became, and nothing follows it at once
+  assert.deepEqual(asked("request_channel_page").map((a) => a.channelId), [3, 2, 4, 3]);
+  clearSweeps(s);
+});
+
+test("a Refresh the relay leaves unanswered is followed by no sweep", () => {
+  const s = server();
+  swept(s);
+  startSweeps(s, 0.9);
+  refreshList(s, 2);
+  mock.timers.tick(1000);
+  let retried = 0;
+  sweepForAsker(s, () => retried++);
+  mock.timers.tick(29_000);
+  assert.equal(retried, 1, "looked at, as before");
+  assert.equal(asked("request_channel_page").length, 1);
+  clearSweeps(s);
+});
+
+test("a Refresh whose ask fails is followed by no sweep", async () => {
+  const s = server();
+  swept(s);
+  startSweeps(s, 0.9);
+  (globalThis as any).__answer = (command: string) => {
+    if (command === "request_channel_page") throw new Error("connection gone");
+  };
+  refreshList(s, 2);
+  let retried = 0;
+  sweepForAsker(s, () => retried++);
+  await new Promise((done) => setImmediate(done));
+  assert.equal(retried, 1, "looked at, as before");
   assert.equal(asked("request_channel_page").length, 1);
   clearSweeps(s);
 });
@@ -736,6 +847,30 @@ test("opening a quiet channel makes it whole, and ten minutes off screen makes i
   assert.equal(asked("set_quiet").length, 1);
   mock.timers.tick(2 * 60_000);
   assert.deepEqual(asked("set_quiet")[1], { server: s, channels: [1], quiet: true });
+  clearQuiet(s);
+});
+
+test("a quiet channel's kept copies are read as it opens, and again once a writer's last copy is filed", () => {
+  // Item J9W-2: under the group key a writer files its post's copy a second or two after the
+  // post (group_state::Copies, SETTLE_MS at its next tick), and nothing tells a quiet reader of
+  // it. A reader that opened the channel in that while read once and never saw it
+  const s = server();
+  quietServer(s, [ch(1, { log: "c:one" })], "always");
+  applyQuiet(s);
+  invoked().length = 0;
+  mock.timers.reset();
+  mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000_000_000_000 });
+  channelOpened(s, 1);
+  const reads = () => asked("account_read_now");
+  assert.deepEqual(reads(), [{ server: s, conv: "c:one" }], "read as it opens");
+  mock.timers.tick(2_999);
+  assert.equal(reads().length, 1);
+  mock.timers.tick(1);
+  assert.equal(reads().length, 2, "read again past the writer's settle, at its next tick");
+  mock.timers.tick(7_000);
+  assert.equal(reads().length, 3, "and once more for a writer whose clock runs late");
+  mock.timers.tick(60_000);
+  assert.equal(reads().length, 3, "and no more");
   clearQuiet(s);
 });
 

@@ -49,7 +49,7 @@
   import { can, myBadges } from "../../stores/powers.js";
   import { blocked, revealedRows, revealRow } from "../../stores/blocks.js";
   import { foldedLine } from "../../block-rules.js";
-  import { hiddenLine, isHidden } from "../../chat-rules.js";
+  import { hiddenLine, isHidden, notSentLine } from "../../chat-rules.js";
   import { ambiguousTarget, findTarget, indexById, isOwn } from "../../thread-rules.js";
   import { reactionChips, rowKey, sameRow } from "../../chat-rules.js";
   import { channelMessages, chatKey, receivedNow } from "../../stores/chat.js";
@@ -128,7 +128,16 @@
   $effect(() => {
     // A second late: a timer may fire a moment early
     const timer = setTimeout(() => (today = Date.now()), msToMidnight(today) + 1000);
-    return () => clearTimeout(timer);
+    // A timer counts only the time the device was awake: a phone asleep over
+    // midnight fired it hours late. Coming back to the app catches up.
+    const shown = () => {
+      if (dayKey(Date.now()) !== dayKey(today)) today = Date.now();
+    };
+    document.addEventListener("visibilitychange", shown);
+    return () => {
+      clearTimeout(timer);
+      document.removeEventListener("visibilitychange", shown);
+    };
   });
 
   /** A loaded picture shown big. */
@@ -638,6 +647,9 @@
           {/if}
           {#if isHidden(msg)}
             <span class="pinned-tag hidden-tag" title={msg.hide?.ban ? "This server says it removed this with a ban. You chose to show it." : "A moderator hid this from its readers. You chose to show it."}><Icon name="eye-off" size={11} /> {hiddenLine(msg)}</span>
+          {/if}
+          {#if msg.not_sent}
+            <span class="not-sent" role="note">{notSentLine(msg.not_sent)}</span>
           {/if}
           {#if msg.file}
             <FileCard
@@ -1211,6 +1223,13 @@
 
   .report-reason {
     color: var(--text-primary);
+  }
+
+  .not-sent {
+    display: block;
+    margin-top: 2px;
+    font-size: var(--fs-micro);
+    color: var(--danger);
   }
 
   .edited,

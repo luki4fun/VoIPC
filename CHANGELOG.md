@@ -2,6 +2,595 @@
 
 All notable changes to VoIPC are documented here.
 
+## [1.14.0] - release candidate
+
+Protocol 26: a 1.14 relay admits only 1.14 apps, so update the apps first. A 1.14 app still talks to older relays,
+down to 1.0. 1.12.1 and 1.13.0 (protocol 24) were never released: their changes come with 1.14.0, listed at the end of
+this section (protocol 25 was a step on the way here and never shipped either). Bugs found and fixed during 1.14's
+own development, which no release carried, are not listed. Media edges speak a version of their own (pool 1): update a
+relay before its edges. Two database migrations (`0013_group_keys.sql`, and `0014_group_keys_restart.sql` after rc.1),
+and l4f-accounts 0.15.
+**Text channels and voice rooms move to a group epoch key, which weakens several security claims** (Security, below).
+No outside cryptographer has reviewed it.
+
+### Security
+- **Channel keys come from a group epoch key now, and some promises are weaker for it** (`group_key`, on by default;
+  [GROUP-KEY.md](docs/GROUP-KEY.md) §6, [THREAT-MODEL.md](docs/THREAT-MODEL.md)). These are for one GitHub security
+  advisory. A relay with `group_key = false` keeps 1.12's paths, and their promises:
+  - **A stolen device reads recorded live text back to the last seat-key rotation**, not the last hour. A channel's keys
+    reach its members through seat keys each account keeps in its vault, made anew every 30 days and at a password
+    change, a recovery-key reset and a removed device. The vault's own key never changes, though: whoever once held it
+    (a remembered device, a thief, someone who had the password) reads each later rotation wherever it gets the relay's
+    copy of the vault. A password change signs it out, and does not change that key (accepted for 1.14, owner
+    2026-11-22; a recovery slot that lets it change is planned).
+  - **A held key lasts until the next epoch**: at most 5 minutes (one in the smallest channels) under an honest relay,
+    up to twice that while people keep joining, and up to 70 minutes under a hostile one, in a channel of any size. On
+    the live path a writer ended its own chain by age, which no relay could stretch, so small channels lose most.
+  - **Writers no longer name each new reader themselves.** In a gated channel the signed headers name every new reader
+    to each writer seated before them: before that writer's next post under an honest relay, and before its first post
+    in a later epoch (70 minutes at most) under a hostile one, with no name skipped. A member who only reads is not shown
+    them, and in an open channel nobody is named. A relay can also give up to 256 accounts of its choice, each time it
+    asks a keyholder to seat people, the keys of the epochs opened within about 10 minutes of that ask, with no header
+    naming them. The keyholder device that seated them warns, unless the relay keeps that device on a branch of its own
+    past a later epoch, or walks it back in an open channel, or shows it a new generation, which every member sees as
+    made anew (accepted for 1.14, owner 2026-11-22; a key per join is planned).
+  - **An account that only goes offline stays seated** until it leaves, rotates its keys at its next sign-in, or 90 days
+    pass unused, and a relay that keeps feeding it the epochs lets it read them all when it is back. A new start of a
+    channel's keys seats it again only within 120 days of its keys, so its seat ends at most 210 days after its last
+    sign-in. A guest's seat ends with its connection.
+  - **A new party holds each channel's keys**: the keyholders, named in the member list, whose online times show. Like
+    any member a keyholder reads what the channel carries and can give its keys away. If a keyholder's seed leaks, a
+    quantum computer with the recordings opens the rows under it: about 31 days of them at most in a text channel,
+    whatever the relay does, since keyholders end a new seed's roll a day after it starts. A desktop's keyholder pair
+    lives in `gk_local.bin` beside its settings, readable by your user only and not encrypted. With *Help hold keys* on
+    (the default, guests included), a browser tells the relay when its page is hidden or shown, and the offers tell
+    desktops from phones.
+  - **Whoever holds an account's identity key can, with the relay, add a keyholder of its own unseen**: the other
+    keyholders refuse its keys, but members take them, and no device warns. Whoever holds that key is the account, and
+    admins and the relay are trusted to keep a channel going (owner, 2026-11-22). A removed desktop whose account has
+    another keyholder still holds that key.
+  - **Newcomers read up to 5 minutes back** (60 s in the smallest channels) under an honest relay, up to twice that
+    while people keep joining, and up to 70 minutes under a hostile one, where the live path gave about 60 s.
+  - **Where only browsers and guests hold a channel's keys, a hostile relay can have them made anew at once**, by
+    dropping their connections (the fast new start, below), and again within seconds through a hand-over: no faster than
+    it could already, by asking any volunteer to start the channel's keys anew. It reads and forges nothing by it, and a
+    channel with a desktop keyholder keeps the hour.
+  - **In an anonymous room** everyone is seated by their connection, so a writer's key there is taken on trust as a
+    guest's is; the signed headers still name each keyholder's account, which the app does not show.
+  - Stronger: kept copies under the group key need Kyber1024 as well as X25519 to open, their chain starts and the
+    rows a sharer gives newcomers included (owner, 2026-11-21: the final review found both still X25519 only), through
+    the account's kept keys, a new vault item (`item.kept`); copies from before the switch, and a voice room's kept chat,
+    stay X25519 only. Pairing a new device hands the vault key over sealed to its Kyber1024 key as well; an account that
+    paired a device with an earlier app sent that key under X25519 alone, and since it never changes, that account's
+    vault stays open to a quantum computer holding the recording. Writers no longer upload a session start for each
+    reader; two voice senders never share a media key and nonce, whatever ids are handed out; a desktop or phone app
+    refuses a channel's keys rolled back below what it saw.
+- **No outside cryptographer has reviewed the group key** (owner, 2026-11-17). It had adversarial reviews of our own
+  while it was built, and one more before the release (2026-11-21) worked through GROUP-KEY.md §7 against the code:
+  of its 50 findings, 29 were confirmed (7 high), and each is fixed below or decided by the owner. §7 gives its answers.
+  Six deep dives by a stronger model followed (2026-11-27): a hostile relay, liveness, kept history, restarts, the
+  browser share's uplink watch and the microphone. Each finding came with a failing test, and each is fixed below.
+  The owner's review comes last.
+- **What that review found, fixed in 1.14.** Each fix has tests of its own (GROUP-KEY.md §7 names them).
+  - A member took a channel's keys from whichever keyholder the relay named, and a relay seating a member of its own
+    could make others keep a key it chose. Members now take keys only from a keyholder of the signed set, and
+    keyholders seal keys only to keys whose owner's identity signed them, a seat's whole X25519 key included (a relay
+    could grind a key to match an 8-byte tag).
+  - A keyholder took another keyholder's keyring change from whoever the relay named; it now checks who made it
+    against the signed headers, also after a reconnect. A device sees its own keyholder entry swapped by someone else
+    also on a walk, after a restart and during its own key change. A replaced desktop pair is not promoted again by a
+    keyholder that has seen its successor.
+  - In a gated channel a relay could have a device promoted to keyholder whose account was seated nowhere, so no
+    writer was shown its name. A keyholder now checks that the candidate's account holds a seat.
+  - A writer counted a reader as gone on a removal from another branch, or one the relay made up. Removals now count
+    only where the signed names hash of the head carries them.
+  - A keyholder device that seated people the server then did not list was not told when the relay walked it past
+    onto another branch, or when the channel went from its list. It is now, but for the cases above.
+  - For a minute after a new epoch opened, a member that had only read the one before could still start writing under
+    it, on a chain whoever just left could open. That is now refused, and the app posts again under the new epoch.
+  - A relay could hold a text channel's seed roll open for good. Keyholders now end it a day after it starts, whatever
+    the relay says, and roll a 30-day seed; a member still on the old seed gets the new one by the relay's pages, and
+    reads no new epoch until then (accepted, owner 2026-11-22).
+  - A thief with one session could publish seat keys at the top counter and lock the account out of channel text. The
+    relay now takes a counter at most 4 above the account's and tells the app its keys are behind; the app warns, asks
+    for a password change, and goes above them.
+  - A new start of a channel's keys seated again accounts gone longer than the seat expiry; now only within 120 days.
+    Memory-only channels never expired a seat that only went offline; now after 90 days.
+  - After a relay restart, a stored channel asked no refresh, so newcomers read its epoch from however far back. It does
+    now, a keyholder declines to seat a newcomer into an epoch older than 70 minutes, and a refresh a whole period late
+    goes before a join.
+  - A long-lived channel could outgrow what a member walks, locking newcomers out; its keys now start anew first. A
+    removed keyholder could force a new start every hour by a proof of a restore; that proof now counts only from the
+    current keyholders, and one from a keyholder the restored database does not know warns the admins, where it was
+    dropped unseen.
+  - A relay that started 8 new generations of a channel's keys within 10 minutes could roll a desktop or phone app back
+    into one it took before. The app now refuses each of the last 64 it took since it began following the channel.
+  - In a voice room where nobody writes, the warning that someone who left may still hear never came; every member is
+    now told each exit. A new start of a channel's keys met on a walk is now told as made anew, and a writer's hold for
+    an exit it left behind ends.
+  - Seat keys dated ahead switched the counter check off; they now count from when they were met.
+  - After a recovery-key reset an app could hand its channels the seat keys from before the rotation the reset asks
+    for. It now rotates them first; that a reset asks for one is still held in memory only (Known, below).
+- **What the deep dives found in the group key, fixed in 1.14.** Each fix has a test that failed before it.
+  - A relay could get a swapped identity key past a pinned writer by withholding the vault's group-key pages. A pin
+    with no time on those pages counted from "now", so a new device took every header of the last minutes as "pinned
+    since, unknown before" and showed it with no warning. A pin with no time now counts from before any header; only a
+    pin that changed is timed when it changed.
+  - Withholding those pages also took the seat-key counters a device had met, so it no longer refused that account's
+    older seat keys at its fold or in a keyholder entry. Each signed-in device now keeps the counters it checked or
+    raised itself: the desktop and Android apps in `gk_local.bin`, a browser in IndexedDB, sealed under the key its
+    remembered devices are, per relay and account. Forgetting the device forgets them. (A device that kept none: Known,
+    below.)
+  - Another device of the account could move a floor this device had checked. The vault floor replaced a desktop's own
+    floor and names floor when it was higher, so a fresh device that took a removed keyholder's fork, or a generation
+    the desktop had left, carried the desktop there, and past names nobody had folded. A device that holds a floor of
+    its own now keeps it; the vault floor stands in only where it holds none (GROUP-KEY.md §5.7).
+  - A gate turned off and on again hid whoever was seated meanwhile from writers that were away, and a member that took
+    no header while it was off could no longer post. The names hash now starts again where the gate came back on, and
+    a writer whose gated names are older than that is told the channel was open to readers who are not listed.
+  - A channel the relay moved to another group id started anew with nobody told. The first generation a device takes
+    in a channel it followed under another id is now told as made anew by its signer; desktops and phones remember each
+    channel's id across restarts (`gk_local.bin` version 2, which reads version 1).
+  - Kept history: after a seat-key rotation the relay answered a past read with the seat welcome, which only the
+    deleted keys open; it now answers with the row beside it. An account seated while none of its devices was online
+    (every account that keeps a channel's history, at every new start) was locked out once its bucket was re-keyed,
+    for up to 30 days, and lost the posts of a seed that came and went while it was away: the relay now gives such a
+    seat a seed welcome at once, keeps an unopened one while kept posts under that seed are stored, and seats the
+    account again when it comes back. A rotation left unfinished on its device lost everything kept before it once the
+    next sign-in came 7 days later: the old keys now go only after that sign-in's kept reads (5 minutes at most). A
+    kept copy filed just after the next opening could land under an epoch whose opening header the sweep had taken.
+  - After `db new-incarnation`, or the group key switched off and on, no stored channel got a key again: the store
+    refused every Genesis over the old row. One failed read while a channel's keys loaded was taken for "start a new
+    generation", and a commit the database applied but answered with an error left the relay one head behind for good.
+    All three are fixed.
+  - Seated members could not post once the epoch was 70 minutes old after every keyholder had gone: the relay now asks
+    the new start as the epoch nears that age. A keyholder that declines every due (its clock more than 5 minutes off,
+    a browser past 10,000 seats) no longer counts as online, and a candidate the keyholders refuse no longer holds up
+    every join, exit and refresh of its channel. An exits opening that must re-key every version gets 60 s, not 4 s.
+    A device whose clock is more than 10 minutes off is told so, where it was told only "keys late".
+  - A new start left exit rows in the database that later removed a member seated again, after which a restart could
+    leave the channel unable to open an epoch; seats are now removed by what each commit removed, and an exit whose
+    write failed is written again. A restart right after a keyholder change no longer forgets the new keyholder's pair,
+    and the removal of a banned, reset or removed device's keyholder entry outlives one. Leaving a channel's kept
+    history, a kick, a gate unseat and a removed device are written down before they take effect, so a relay that
+    stops in between still carries them out at the channel's next start; it also exits the seats of banned accounts
+    and of seat keys no longer current then, asks again the eager seats that were on their way, and starts anew a
+    channel whose group id came back to its stored one, as a running relay does. The hour a channel waits for its keyholders before a new
+    start counts their absence before a restart, but not the relay's own downtime: after a start it ends no sooner
+    than 10 minutes later, so keyholders that were online at the stop can come back first (OPERATING.md §3).
+- **A relay could show you a post you had already read**, and an old edit or reaction with it. On a relay with
+  `group_key = false` (or one from before 1.14) it had to hold back a key and hand it over late: with a made-up key
+  request (five keys before, one during 1.14's development), by naming the writer's account under another id, or after
+  a reconnect. Under the group key it only had to refuse the writer's post five times, each time sending it on a new
+  chain, and then replay the first post with the key that comes with it. The app now remembers what it read, by the
+  key each writer's chain is signed with, which no relay can rename, and refuses a post it already read. This holds on
+  both paths, under any id the relay gives the writer, and, for an account, across a reconnect that keeps its
+  sessions, on both apps. What it still gives up:
+  - Past 100,000 chains read, the one read least lately is forgotten. That takes about 17 MB of memory a connection,
+    25 MB at most, and as much again while it is kept for the next connection. A relay can get there on its own: it
+    can start new chains with a guest or a seat it makes up, or refuse one writer's post again and again. A review
+    did it in about half a minute of the app's time and 40 MB sent to it, and those posts show as one message.
+    Closing this needs a limit on what a chain first seen late may bring, which is planned for 1.15.
+  - On a chain with more than 8 gaps, a post that arrives late into an old gap is refused. Only a relay delivers out
+    of order.
+  - A fresh start remembers nothing: a disconnect you chose, a restart, a reload of the browser app, and every
+    reconnect of a guest. On the old path no key from before opens there. Under the group key a relay can show such
+    a connection a post of an epoch it has the key for once more, as it can show one to a new device.
+  - On the old path, suppose a member hands you another writer's key as their own, then sends you that writer's post
+    before the writer's key reaches you. You see the post under the member's name, and the writer's own copy is
+    refused. Under the group key both show, as before 1.14.
+
+  Nothing becomes readable that was not readable already. A writer also hands one reader at most 5 keys at a time,
+  which bounds what a made-up request costs, and keeps every key message under the size limit.
+- **Two advisories fixed in the lockfile:** `url` 2.5.9 (RUSTSEC-2026-0592, a stack overflow in `Url::origin()` on
+  nested `blob:` URLs; the relay has it through l4f-accounts' HTTP client, the desktop app through Tauri) and `cookie`
+  0.18.3 (RUSTSEC-2026-0594, private cookie nonces that can repeat after a fork; through Tauri). `async-executor`
+  1.14.0, which was yanked, is 1.14.1.
+
+### Added
+- **The group epoch key in every text channel and voice room** (`group_key = true`, [GROUP-KEY.md](docs/GROUP-KEY.md)).
+  A channel's messages, and a room's voice, video and chat, are under one epoch key, which reaches each member in a
+  hybrid welcome (Kyber1024 and X25519) from the channel's keyholders. A post costs its writer the same however many
+  read it, where by our sums a first post to 100,000 followers cost the writer about 180 MB down and 17.6 MB up on the live path. A
+  newcomer costs the channel one welcome, a leaver a new epoch soon after (writers hold their posts if none comes within
+  46 s), and joining a voice room is one welcome, where it was 3 messages to each member. On this machine 100,000
+  accounts that keep a channel's history were seated in two minutes, and 50,000 guests connecting 1,000 a second, 95% of
+  them seated within 0.3 s (OPERATING §10a).
+  - **Keyholders.** Desktop apps help hold the keys of the text channels they are in (*Settings → Help hold keys for text
+    channels*, on by default), browsers and guests only as a last resort, and in a voice room the two members with the
+    lowest user ids. The member list says "Keys held by …". A browser builds in short steps, 2 ms at a time in a call or
+    while hidden, so the call goes on while it holds keys.
+  - **What the app says** in the channel: its keys are late; nobody who holds them is online, and a message was not sent;
+    keys were made anew, and by whom; new readers of a gated channel, by name. And it warns when this device gave the
+    channel's keys to people the server then did not list (also for a channel you no longer have), when an old key of
+    your account was listed, when another device published channel keys for your account that your vault does not hold
+    (change your password), when the server's keys are older than what this device saw, and when someone who left may
+    still hear a room.
+  - **Fast new start** (owner, 2026-11-19; at once since 2026-11-22). When every keyholder of a channel is a browser or
+    a guest and none is online, as after the only browser holding its keys reloads or the relay restarts, a volunteer
+    starts its keys anew at once, where it waited an hour, so someone who joins meanwhile reads what is written then.
+    Members check that from the signed headers. A set of keyholders a new start began keeps the hour for an hour, and
+    one with a desktop always does. A volunteer that was never seated is first sent the channel's head, so it can make
+    the new start.
+  - **Kept history under the group key.** A writer's chain lives inside one epoch and is sealed once to the epoch key,
+    for every reader at once. Its start is kept for the writer's other devices under the account's kept keys
+    (`item.kept`, made at the first sign-in with 1.14), and a writer who shares history gives each newcomer a row of
+    1,629 B at each of its chains no link reaches, sealed to the newcomer's kept Kyber1024 key as well as X25519. Those
+    rows are not charged to the sharer's quota. The relay keeps them only for newcomers the sharer owes an answer, at
+    most its chains no link reaches plus 4 for each (GROUP-KEY.md §8 bounds those), and files a chain's link only to
+    the writer's highest chain. A post's kept copy is filed the moment the relay answers that it took the post
+    (`EpochPostTaken`), under the epoch the post went under, and a post the relay refused is never kept. A page closed
+    within about one round trip of posting can still lose the kept copy; its live readers got the post. `kept_seats`
+    (5000) is now cheap to raise, and `kept_window` bounds the key material as well as the messages.
+  - **The Load tab lists the groups** of 1,000 seats and more, and any with something amiss: keyholders online, the last
+    commit's age, joins and exits waiting, missed deadlines and memory, with warnings that name the channel.
+  - **`voipc-server db new-incarnation`**, the last step of every restore of the database (OPERATING §7): every
+    channel's keys start anew at the next start, since whoever left after the backup was taken out only in keys the
+    backup does not hold. Forgotten, an app whose keys are ahead of the database proves it, and the relay starts that
+    channel anew itself, at most once an hour.
+  - **`group_key = false`** keeps 1.12's paths, and still serves, read-only, what was kept under the group key. Turned
+    on again later, it starts every channel's keys anew. **The switch gap:** an account is seated for a channel's kept
+    history from the first time one of its devices signs in with a 1.14 app; kept posts written under the group key
+    before then are not readable to it. What was kept before the update stays readable as before.
+- **Media edges for big screen shares** (`[pool]`, `voipc-server -c edge.toml edge`): a relay can hand the viewers of
+  a share past its first `local_first` (8) to edges, processes of the same binary on machines of their own, so a share
+  with thousands of viewers costs it one copy per edge instead of one per viewer. An edge links to the relay and
+  proves itself with a secret both hold. It has no page, accounts, files or channels, and sees which addresses watch
+  and how big the frames are, never a name, a channel or a key: the sharer's app seals every frame
+  (docs/THREAT-MODEL.md). Each viewer the relay places there gets the edge's address, the hash of its certificate and
+  a ticket good once, for that edge, for 30 s. A viewer whose edge sends no whole frame for 10 s is moved to another
+  edge or back to the relay, and so are the viewers of an edge that goes away, within its 6 s timeout. Viewers over
+  the TCP fallback stay on the relay. On this machine, all on loopback: 2000 HD viewers through two edges cost the
+  relay 0.04 of a core, where 1000 on the relay alone took 2.2 (both held to 4 CPUs); every frame came, the edge added
+  no latency measurable at 1000, and a killed edge's viewers had frames again 6.1 s later on the relay, 7.2 s on the
+  other edge. Three edges of 1000 on that one machine got only 73% of frames through: the machine's limit, and no measure
+  of edges on machines of their own. The
+  Load tab lists the edges, what each carries against its limits, and its last report. Setup and numbers in
+  OPERATING.md §10a and §10b.
+
+### Changed
+- **Pairing a new device from another of yours needs 1.14 on both and on the server.** The vault key now goes sealed to
+  the new device's Kyber1024 key as well as its X25519 key (Security, above). A 1.14 device and an older one cannot pair:
+  the older one's key is refused, or the two show different codes, and nothing is handed over. A 1.14 app pairs only
+  through a server at 1.14 or later, and says so instead of asking; the recovery key and the password still work
+  everywhere.
+- **One channel message holds at most 16 KiB, everywhere**: text channels and voice rooms, the group key on or off. The
+  composer stops a longer one before it goes and says why, and one refused anyway is marked on its row: "Not sent: one
+  message holds at most 16 KiB." A voice room's chat could run to 60 KiB before. Direct messages keep that limit.
+- **Opening a quiet channel reads its kept copies again at 3 s and at 10 s**, so a post whose copy was filed a moment
+  after the channel opened shows too. The relay learns nothing new from the two extra reads.
+- **The browser's module is about 38 KB larger on the wire** (brotli): its Kyber code is built for speed (libcrux at
+  opt-level 3), 6 to 11 times faster in Chromium, which a browser holding a channel's keys needs.
+- **A big server's lobby is no longer sent whole.** Everyone stands in General, so each app was sent a list of
+  everyone online and told of every join there: work that grew with the square of who is online, 197 s of relay
+  CPU to let 5000 people in. Now the Online list comes a page at a time as it scrolls, sorted as before
+  (sections, then A-Z), with a search box over everyone; how many stand in each channel comes counted. Up to
+  `live_lobby` people (2000) an app showing the list still hears each join and leave there, so a small server
+  looks as it always did. On this machine 5000 people now connect on 7.9 s of relay CPU at 114 KiB each, and
+  25,000 on 2.7 GiB with no packet dropped. Rooms keep their live lists.
+- **After a big relay's restart its apps come back spread out**: the first try waits up to a millisecond for each
+  person who was online, at most a minute, instead of all of them within the same second.
+- **A direct message and a poke name their sender's account**, as a roster row does: blocking by account no longer
+  needs the sender to be on a list this app holds.
+- **What screen shares and voice rooms may cost is a setting** (`[media]`): viewers of one share (100), the video the
+  relay sends in all (1000 Mbit/s, counted at each share's resolution), and people in a voice room that names no limit
+  of its own (250; routed rooms keep none). A viewer past a limit is told so, and nothing else changes. **A voice room
+  over 250 now refuses the next joiner** until its limit or `voice_room` is raised.
+- **A relay with accounts keeps up to 32 connections to its database** (`db_connections`, was 10). A sign-in is a few
+  writes, each waiting for the database's disk, and more of them waiting together go in one flush: 50,000 accounts
+  coming back after a restart signed in within 51 to 166 s on this machine's disk, and 38 s with Postgres'
+  `synchronous_commit` off, where 10 connections got 17,700 in in five minutes. Needs l4f-accounts 0.15.
+- **How many password sign-ins a relay takes is a setting** (`[accounts] password_sign_ins_per_15min`, 1000 every
+  15 minutes, everyone together). It was fixed at that, about one a second, so a move's first evening kept new devices
+  waiting for hours. A remembered device signs in with its key and was never counted.
+- **The admin panel has a Load tab**: who is online and where, each share and the video they cost against the budget,
+  the relay's memory and processor, datagrams dropped, the last minute's refusals, and warnings where a limit is near,
+  asked every two seconds while it is open. A relay with accounts on SQLite and `max_users` above 10,000 says at start
+  that Postgres would serve it better.
+- **`voice_load` takes `--rooms` and `--speakers`**, and counts what is lost once everyone is in: 20 rooms of 50 with
+  three talking in each lost 0.001%, and the numbers are in OPERATING §10a.
+- **A sharer is told how many watch at most once a second**, the latest count, where every watch and stop sent one:
+  thousands of messages a second for a big share. The first viewer and the last one to go are still told at once:
+  the sharer's app starts and stops its capture by them, unless its own preview is open.
+- **Above 8 viewers, a sharer gets one loss summary a second** (`VideoLossSummary`): how many of its viewers lost
+  frames in the last 2 s, of how many, instead of each viewer's report. The app steps the share down on a majority, as
+  before. Up to 8 viewers each report comes as before.
+- **A viewer drops a frame it already put together, or an older one**, up to 1000 frames back: a frame that comes
+  twice, from the relay and from an edge across a move, or that an edge replays, is not shown again.
+- **With edges, `[media] share_viewers` is what the relay serves of a share itself**: its edges carry the rest, each
+  up to its own `max_viewers` and `egress_mbit`, and `video_egress_mbit` counts one copy for each edge fed.
+- **The relay writes one line a minute about connections, when anything happened**: connects refused and why, setups
+  that failed or timed out, how sessions ended (closed by the app, timed out), and UDP datagrams the kernel dropped for
+  a full buffer. The line for each connect stays at debug.
+- **A screen share starts a little below its quality and climbs once its first frames crossed with no loss for 5 s**,
+  in the browser and the desktop apps: at 60 % of its bitrate, full resolution and frame rate. Started at full quality
+  on a small uplink, it filled the link for the seconds before the first loss report came back, and voice lost frames
+  meanwhile. A climb that meets loss steps back at once instead of after 3 s. On a link with room, a share reaches
+  full quality about 5 s after its first frames. Measured on a 6 Mbit/s link with a 720p30 share whose picture does
+  not compress: voice lost 1.1-2.3 % over 15 s of talk where it lost 2.3-2.5 %, and 3.6-7.6 % in the first 4 s as the
+  share started, where it lost 4.9-7.2 % (this machine, 4 cores, 4 runs against 2). In the browser, a watch on its
+  own uplink took the rest (Fixed, below).
+
+### Fixed
+- **A relay's shutdown or self-update cut off the group key's last writes** (rc.1): it closed the database 500 ms after
+  telling the clients, whatever a channel's keys still had queued, so an exit or a keyholder's removal could be lost.
+  It now gives them up to 3 s to write it and logs a channel that took longer (OPERATING.md §3).
+- **In the browser, "Reset all settings" during a call left the microphone sending every frame** while the UI showed
+  push-to-talk and "not talking" (from 0.4.0; the desktop has stopped the capture first since 0.10.0). The reset now
+  closes the microphone first, and tells every server the mute and deafen it cleared, as the desktop does.
+- **After a relay's shutdown notice the capture ran on until the reconnect's first step** (0.5 to 1.5 s), while the UI
+  already showed the call gone: a relay that sent the notice and kept the link open went on receiving the microphone.
+  Both apps now leave the call locally as the notice comes, as they do for a dead link.
+- **After a relay restart, the reconnect walked you into any voice room that now had the old room's name**, with your
+  microphone live, even a room with no password in place of one that had one. Rooms that users make do not outlive
+  the relay's run, so after a restart a room of that name could be anyone's. The reconnect now puts you back in voice
+  by itself only in the same room (the same relay run and room id) or in one of the relay's own rooms, never in a room
+  with no password in place of one that had one, and says "Not back in" the room otherwise. Text channels rejoin by
+  name, as before.
+- **The relay that carries a call could move your open microphone into another of its voice rooms** without an ask, and
+  the app showed it as an ordinary room change (0.10.0's "a voice seat needs an ask" covered only a call's start). A
+  move the app did not ask for now leaves the call, and the microphone closes at once.
+- **"Leave voice" closed the microphone only when the relay answered**: a relay that did not answer kept a
+  voice-activated or always-on microphone open. It now closes as you press Leave, and a leave the relay refused is
+  sent again.
+- **When the chosen microphone went away, the capture reopened on the system's default microphone** within about a
+  second and said nothing, so pulling a headset's plug went on sending from a laptop's built-in microphone. A capture
+  on a chosen microphone now stays off until it is back, and says so. At a call's start a chosen microphone that is
+  not there is refused on the desktop; the browser falls back to the default and says so, since its device names
+  change with the system default.
+- **On the desktop, a push-to-talk key held in the window stayed held for good** when the window lost focus before
+  the release, wherever the system-wide key hook is not available (Linux under Wayland without access to the input
+  devices): the microphone stayed open. Losing focus now lets go of a key the hook did not see.
+- **On the desktop, in voice activation or always on, every release of the push-to-talk key anywhere on the system
+  closed the microphone** for the time a capture restart takes (the default key is Space). A release now closes it
+  only in push-to-talk mode.
+- **In the browser, a push-to-talk release and press while the app reopened a lost microphone left a second capture
+  open** that nothing closed (the browser's recording mark stayed on, and both fed the encoder while talking).
+- **The mute and deafen marks on your own row in the member list were whatever the relay said**; they now follow your
+  own buttons, as the voice bar does.
+- **The reconnect's wait on a big relay never applied** (rc.1): the online count it is spread by was cleared one line
+  before the reconnect read it, so every app of a relay of 100,000 that went down came back within 0.5 to 1.5 s.
+- **Voice lost frames for the first seconds of a screen share from the browser on an uplink too small for it**, and CI's
+  capped-link lane was red for it (4.3-8.3 % in the first 4 s, in 6 runs of 6). A browser's video encoder keeps to no
+  rate: WebCodecs has no VBV, and Chromium's software H.264 encoder sends what the picture costs whatever bitrate it is
+  asked for, in every bitrate mode, "constant" too (on the lane's moving picture 3.2 Mbit/s at 720p30 with 1.8 or 3.0
+  asked, 8.4 at 1080p30 with 3 or 5). All of it went to the link at once, and a link smaller than that queued it for the
+  3-4 s until a viewer's report stepped the share down: voice came 170-350 ms late where it takes 50, up to 650, and
+  much of what the listener counted lost came too late to play. The browser now watches its own uplink, as the desktop
+  apps do: over WebTransport by how long the relay takes to ack each frame, how many frames are still out unacked and
+  how fast the acks come back (Chromium has no WebTransport `getStats`), over the TCP fallback by a ping through the
+  tunnel three times a second while video goes out (the socket's queue shows in nothing a page can read). A queue is
+  video backing up while the link delivers at a steady rate, its own: over WebTransport the rate the acks come back at,
+  over the TCP fallback the rate between two pongs with video sent between their pings, both of which waited behind a
+  queue. Two other things back video up and do not count: a new connection's slow start, whose rate doubles each round
+  trip (on a 300 ms round trip a QUIC path's first frames' acks take 0.7-1.3 s, and a TCP connection's window of ten
+  segments takes four or five round trips to carry a share's first keyframe), and a path that stalls both ways for a
+  moment, as Wi-Fi can, after acks that came on time. Nor does a path that got longer: a queue of ours grows, while a
+  longer path is one step up and then flat, and becomes the link's new shortest round trip; over the TCP fallback the
+  pongs have to keep the link's pace, not the pings'. rc.1 took a round trip that rose once or wandered, on a link with
+  room, for a queue, and paced such a share down to 5-7 pictures a second again and again; uneven pongs over the TCP
+  fallback did the same there. While there is no queue, the share goes out as before, as fast as
+  it comes. Once there is one,
+  the share steps down at once instead of after the ladder's 3 s hold, and goes out paced at what the link was seen to
+  deliver (half of that for up to a second, to drain what queued), rising slowly while the encoder wants more; the
+  browser encodes no new frame while more than 100 ms of video waits, so an encoder over the link sends fewer frames,
+  never broken ones. Over the TCP fallback what waits in the socket ahead of the oldest ping still out counts too,
+  from the share's start on: voice there waits behind little more than that before any queue is found, and a slow
+  start holds the encoder only while it lasts. After 2 s paced with no queue found, the share goes out unpaced again
+  to see whether the link still needs pacing; each time that finds the queue again within 3 s, the next try waits
+  twice as long, up to 8 s. Voice and control never wait for it. This machine (4 cores), each run followed by one of
+  the code before this change on the same lane:
+  - CI's capped lane (6 Mbit/s): voice lost 0-0.53 % in the first 4 s in 3 runs (3.2-6.0 % in the 3 runs before) and
+    0-0.13 % over the whole share (0.8-1.5 %), and came 46-47 ms after it was sent, 79 at most. The share stepped down
+    0.62-0.67 s after its video started (3.1 s).
+  - 4.5 Mbit/s: 0-1.7 % in the first 4 s in 2 runs (7.5-10.0 %), 0-0.4 % over the share (2.0-2.4 %), the step down
+    0.64-0.65 s after the video started (4.2-4.3 s).
+  - 3 Mbit/s, a link below the start level: 5.7-10.5 % in the first 4 s in 2 runs (13.9-19.3 %), 3.2-3.6 % over the
+    share (6.8-9.9 %), the step down 0.67-0.91 s after the video started (4.3-4.8 s), and the viewer drew 9-10 pictures
+    a second (6.5-7.5).
+  - The TCP fallback under the 6 Mbit/s cap: 0 % in the first 4 s in 2 runs (11.0-13.8 %), 0-0.13 % over the share
+    (7.9-10.0 %), the step down 1.3-1.8 s after the video started (24-40 s). With the loopback's MTU at 1500 bytes
+    (the lanes' 65536 gives TCP a first window of 640 KB): 0.5 % in the first 4 s (20.1 %), 0.3 % over the share
+    (14.2 %), the step down 1.4 s in.
+  - Links with room over the TCP fallback, with the loopback's MTU at 1500 bytes, against the run before: a 300 ms round
+    trip with the capped lane's picture 0.94-1.00 of its pictures in each 10 s (2 runs), with the 1080p30 one
+    0.99-1.16 and voice 0 % in the first 4 s (0.6-1.4 %); a 120 ms round trip with the 1080p30 one 1.00-1.01, with the
+    capped lane's picture 0.99-1.03 in 2 runs and 0.88 in a third, in whose 4th second the tunnel stood still for
+    1.4 s (voice 6.6 % in the first 4 s there, 0 % before). None found a queue; the hold on what waits in the socket
+    skipped 1-39 frames a run. At the loopback's own MTU, where TCP carried much less on a 300 ms round trip (the viewer
+    drew 2-8 pictures a second before), the shares that lost 26-35 % of voice over their talk before lost 0.4 % at
+    720p30, with no queue found and the viewer drawing 25-30 pictures a second, and 2.9 % at 1080p30, one queue found
+    at 2.0 Mbit/s, drawing 9-15.
+  - A cap that lifts 15 s into a 1080p30 share of that picture: from the lift on the viewer drew 0.99-1.18 times the
+    pictures of the run before in each 10 s, unpaced again 3.5 s after the lift; under the cap voice lost 3.5 % (6.7 %).
+  - Links with room, the viewer's pictures in each 10 s against the run before: a 300 ms round trip with the capped
+    lane's picture 0.95-1.01 (2 runs), with a 1080p30 one that costs 8.4 Mbit/s 0.94-1.00 in 1 run and 0.83-0.99 in
+    another (its first 10 s, in which a new path refuses some 20 of that share's streams before and after this change),
+    a 200 ms round trip with that one 0.95-0.99, no delay at 1080p30 1.00 over QUIC and the TCP fallback and at 1080p60
+    over the TCP fallback 1.00, with no frame refused. None of these found a queue. A 100 ms round trip with the 1080p30
+    picture drew 0.50-2.00 of the run before in 3 runs and found no queue either: the viewer's loss reports at its start
+    stepped that share down 3.1 s in, in 2 runs of 3 before this change and 2 of 3 after. With a 200 ms stall every 10 s
+    (netem, 0.2 s each) no run found a queue either (6 runs); the viewer's own loss reports step that share down at some
+    of the stalls, before and after this change alike, so its 10 s windows came out 0.51-1.97 of the run before. The
+    lossy lane found one in 1 run of 3 (Known, below).
+- **Many people signing in at once stopped the relay signing anyone in.** Past 32 sign-ins at once it told the next
+  one it was busy, after its whole handshake, and the app came back with another: 50,000 accounts arriving after a
+  restart went from 390 sign-ins a second to 10. A sign-in now waits its turn for up to 10 s.
+- **A refused watch stopped your own share**: the relay said it in the words it uses for your own share failing. It now
+  says it apart (`WatchRefused`), and your share goes on.
+- **About one connect in 2000 hung for 30 s and failed on a busy relay**, with nothing in the relay's log. The QUIC
+  library puts only 3 random bytes in a connection id, and the id the relay gave a client in its first answer could be
+  one a live connection already held: that client's next packet went to the other connection. The relay now draws 8
+  random bytes. At 2000 clients: 16 connects failed in 18 runs before, none in 8 after. It grows with the relay, to one
+  connect in 20 at 100,000 online.
+- **About two connects in 1000 failed on a busy relay** with "QUIC handshake failed" (H3 frame unexpected or excessive
+  load) in its log. The WebTransport library lost the part of a client's settings it had read whenever they arrived in
+  two pieces with anything else in between, and read the rest as garbage. Relay and app now build with a fork of it
+  carrying the fix (upstream issue #331), until upstream releases one. With the relay held to 2 cores and 1000 clients:
+  8 connects failed in 5 runs before, none in 11 after.
+- **A request for a channel's history could go unanswered** when it reached an app while its Refresh of that channel's
+  member list was under way (one also runs when you join a channel, so two people joining together hit it): the list
+  could be from before the asker joined, and the Refresh then counted as the sweep, so no new one came for minutes. The
+  app now looks again only at a list asked after the request: a whole sweep follows the Refresh, within the sweep's
+  usual budget.
+- **On a relay with `group_key = false` (or one from before 1.14), a post could stay locked for someone still in the
+  channel** when another person left just as it went out. The relay sends its word that someone left once a second,
+  and that word could reach the writer between the post and its key. The writer then refused the key to readers it had
+  already named, so they waited for the writer's next post. Now the writer still hands that key, for up to 60 s, to
+  whoever it named, and later posts go on a new key. CI hit this in 1 to 5 runs in 100.
+
+### Known
+- **A browser share over WebTransport on a path whose round trip swings by a few times its length** (40 ms, then 140 ms
+  for a second, in turn) is still paced down a few times a minute: Chromium's own QUIC queues the share in each long
+  spell, and voice waits behind that queue too, so the watch takes it as the queue it is. A single rise, and the
+  same swings over the TCP fallback, now keep the share at its full rate.
+- **A relay that withholds an account's group-key vault pages takes with them the seat-key counters only another device
+  of the account met**, and every counter on a device that kept none (a new install or browser profile, cleared site
+  data, storage off). There, an account's older seat keys are not refused at the fold until the pages come back. A
+  device that saw the pages says the account settings are missing, as for the pins (THREAT-MODEL). Pins it holds are
+  still checked against every header.
+- Watching through an edge was tested in Chromium (the `EDGE=1` lane of test-web.sh, in CI). Firefox, the desktop
+  apps and Android were not tried yet, nor an edge or a viewer on another machine.
+- **The browser share's uplink watch was measured in Chromium**, a Firefox sharer only under the 6 Mbit/s cap and in
+  the Firefox lanes (H.264, on this machine: the capped-link lane at 6, 4.5 and 3 Mbit/s over QUIC and the TCP
+  fallback, a cap that lifts, far links with room, delay spikes, and the lossy, TCP, edge and Firefox lanes). **Over
+  WebTransport a Firefox sharer keeps the share's behaviour from before this change**: Firefox resolves a WebTransport
+  stream's close at once (0-4 ms on a 40 ms round trip), not when the relay acked it, so the watch never sees a queue
+  there. Under the 6 Mbit/s cap a Firefox sharer (VP9) lost 3.6 % of voice over its talk with no queue found (3.8 %
+  before). **Over the TCP fallback a Firefox sharer runs the ping watch, its pacing and the hold on what waits in the
+  socket as Chromium does**: under the 6 Mbit/s cap, with a Chromium viewer on QUIC, it lost 0.8 % of voice over its
+  talk with one queue found 3.0 s after its video started (2.9 % before, in one run each), and the uncapped
+  Firefox-over-TCP lane passes; no other link was tried with it. A real screen's picture and a real Wi-Fi link were
+  not tried; the stalls measured are netem's, 200 ms for 0.2 s every 10 s. A sharer's tab hidden for 6.5 minutes under
+  the cap from the share's start lost 0.05 % of voice (0.25 %).
+- **What queues before the watch finds it still costs voice.** Over WebTransport it waits for three windows of the
+  link's own steady delivery, each 200 ms, three of the shortest round trips the link has shown or two of its own gaps
+  between acks, whichever is longest: three, so that a slow start's acks, which come in bursts a round trip apart,
+  cannot pass for a link's own rate, and two gaps, so that a link one frame takes 300 ms or more to cross (720p30 at
+  about 350 kbit/s, 1080p30 at 930) fills each window; such a link is found 1.8-3.4 s into the share (unit-modelled,
+  never found before). On a small link the frames handed meanwhile take a second or more to cross, and voice waits
+  behind them: at 3 Mbit/s 5.7-10.5 % (13.9-19.3 % before) in the first 4 s of talk, and a 1080p30 share of that
+  picture under the 6 Mbit/s cap 8.1 % (11.2 % before), 3.5 % over its 15 s of talk (6.7 %). Each find counts as loss
+  for the ladder, so a link too small for the bottom level is found again every few seconds as the pacing rises or a
+  try unpaced meets the queue. The climb, 30 s into a share, still finds the link too small and steps back: in the 4 s
+  after it voice lost 3.1 % over WebTransport and 6.6 % over the TCP fallback, one run each. The lossy lane (5 % loss,
+  40 ms either way) found a queue that was not one in 1 run of 3: its acks come 40-120 ms late at random and the least
+  is the luckiest of them; the share was already at its lowest level there. On a far link with room the share's start
+  itself still costs some voice, as before this change, since the watch finds no queue there: on a 300 ms round trip
+  with the 1080p30 picture 0-1.7 % in the first 4 s of talk over WebTransport in 3 runs (0-1.6 % before; one earlier
+  run lost 2.2 %).
+- **Over the TCP fallback the watch needs the pongs of three pings**, the last two of which waited behind a queue with
+  video sent between them, so it finds a queue 1.3-1.8 s after the video starts in the capped lane, and its pings take
+  3 of the 55 voice packets a second the relay lets each sender send. Until then only the encoder's hold keeps video
+  from piling up in the socket, and it sees a queue a round trip late: on a 300 ms round trip with TCP carrying less
+  than the share (the loopback's own MTU, Fixed above), a 1080p30 share's voice came up to 2.8 s late in its first 2 s
+  and 74 of 200 packets were dropped behind the socket in the next second, 25 % in the first 4 s of talk (35 %
+  before); 720p30 lost 1.9 % there (27 %). A hold on a tunnel that stood still lasts as long as it does (1.4 s in one
+  run: no frames sent meanwhile, voice up to 1.1 s late behind what was sent before it). A ping whose pong the relay
+  dropped holds the encoder until the next ping's pong and times nothing after 2 s, nor once a new share's video
+  starts. The 1500-byte-MTU rows are this machine's loopback with netem, no real long path.
+- **The desktop apps' share does not watch its uplink the browser's way.** Their encoders keep to the level's rate
+  themselves (VBV, up to half a second of it in one frame), QUIC paces what they send, and their uplink watch reads
+  QUIC's round trip. The lower start is unit-tested there and builds for Linux and Windows, but no real capture ran it
+  yet, and on encoders that cannot change their rate in place (the hardware ones) each level change rebuilds the
+  encoder and sends a keyframe, the climb too.
+- **The group key ran in end-to-end tests** of the relay with the apps' own key code, on SQLite and Postgres, and in the
+  browser lanes of test-web.sh (Chromium, and a Chromium and Firefox pair). The desktop apps and Android were not tried
+  against it by hand yet, nor keyholders on machines of their own, nor how long a browser's stepped builds take on a busy
+  page against the 4 s a keyholder has for an exit's commit.
+- **Planned after 1.14**, from the final review and the owner's decisions of 2026-11-22: a key per join, which ends the
+  unnamed accounts a relay can seat for up to about 80 minutes per keyholder ask; and an asymmetric hybrid recovery
+  slot, so that a password change can give the vault a new key. Neither is an outside cryptographer's review, and
+  nor were the deep dives (Security, above).
+- **Left open by the final review** (GROUP-KEY.md §7): an exit batch that rides a keyholder change waits for its 60 s
+  deadline, so a leaver may read up to 46 s then; a hostile keyholder with the relay can list an account at a counter of
+  its choosing, so writers in gated channels where that account sits hold their posts, and its devices warn falsely; a
+  keyholder's refusal of a header with a seat that fails its checks does not stick across a walk; for an account a
+  keyholder never pinned,
+  the relay can still get a seed welcome to a key of its own at about 2^64 work divided by the seats; after an
+  account's identity changes, keyholders with no pin for it decline whole seed pages; the rotation a recovery-key reset
+  asks for is held in memory only; a promotion in a gated channel checks the candidate's account is seated, not its
+  identity key; an honest relay can promote a desktop's old pair while its new one is on the way, which stalls
+  keyholders that know the new one; a quantum attacker that also holds a seat in the epoch can plant keys in a welcome.
+  The desktop sender's screen-share nonces rest on its encoder never returning two packets of one kind in one call,
+  which was not checked on hardware. There is no end-to-end test of a keyholder's pair swap through the relay, nor of a
+  seed roll ended at its 24 h.
+- **Kept keys** (`item.kept`): if an account first signs in with 1.14 and joins a channel's history within one vault
+  round trip, a sharer that answers twice before the relay has its kept key gives it nothing at those chains. A vault
+  that loses `item.kept` does not get the rows made to the old one again. A sharer's rows to newcomers cost the relay
+  1,629 B per newcomer at each of its chains no link reaches, and up to 4 more, where a 60 B row once did; a sharer
+  that makes such chains on purpose can raise that to about 1.4 GB per newcomer at the default quota (GROUP-KEY.md §8).
+  That bound is a little loose in two ways: two sessions answering one newcomer at the same moment can each store
+  about one row past it (the per-answer count is read outside the write's transaction), and the quota counts a chain
+  start's 60 B self-wrap but not its 60 B group-key seal, so a chain costs its writer about 61 B, not 121 B.
+
+### From 1.13.0, never released on its own
+
+Written for 1.13.0 (protocol 24), which was never released: these changes come with 1.14.0.
+
+#### Changed
+- **The Android app draws a watched share at its full frame rate**: it decodes the share in its own WebView with
+  WebCodecs, as the browser does, fed the frames over a URI scheme of the app's own (Tauri's IPC carries no bytes on
+  Android), instead of decoding with MediaCodec, converting and JPEG-encoding each shown frame and sending it as base64
+  text. On the emulator: 1080p30 drawn at 29.7 fps (was 15.5), 720p60 at 57.5 and 1080p60 at 58.7 (were 25 and 15), a
+  frame on screen 6-12 ms after it came whole (was 30-40 ms after the JPEG went out). A WebView without a decoder for
+  the share's codec, or one that fails on it, hands it back to the native decoder. The desktop apps keep theirs.
+- **A Linux sharer with an Intel or AMD GPU encodes on it** (VAAPI), where it used x264 on the processor. Every render
+  node is tried, an NVIDIA one never (its VAAPI driver only decodes). On an Intel UHD 770 at 1080p, against x264 as
+  shipped: about a fifth of the processor, 2-10 dB sharper text at each rate, and a still screen settles to 20-40 kbit/s
+  where x264 kept ~900. NVIDIA keeps NVENC. A machine where VAAPI does not open shares with x264 as before.
+  `VOIPC_VIDEO_ENCODER=<FFmpeg encoder>` picks one encoder by name, for testing and support.
+- **The Windows share picker shows what each choice would share**: displays and windows are tiles with a picture of
+  each (a still drawn by Windows itself, so no capture border flashes and nothing is captured until you start), and a
+  window that cannot be pictured (minimised, protected) shows its icon. The names come as fast as before, the
+  pictures follow and keep up while the picker is open; arrow keys move between tiles and Enter starts.
+- **Sharing on Linux is one step, and "Share again" skips the dialog**: the share picker no longer asks first for a
+  screen or a window (the system's dialog offers both, with its own pictures), and a share remembers the portal's
+  choice (portals from version 4, as on current KDE and GNOME). The next time, "Share again", with the last picture of
+  that share, starts it without the dialog; "Forget it" drops the choice. A remembered choice the portal no longer
+  takes is asked for afresh, once. The choice is kept in `settings.json` (0600), see docs/THREAT-MODEL.md. On X11
+  the system's dialog now opens over the VoIPC window (on Wayland it still opens on its own).
+- **The stream view has its own Share button** (and Stop while sharing) in its header, on the desktop and in a browser:
+  in a narrow window (800x600) the stream view covered the voice bar's, so a viewer could not start a share of their
+  own without closing the view.
+- **Watching a share logs what its frames cost** in the desktop and Android apps: one `share view:` line every 10 s
+  while frames come, with frames put together, decoded and shown, the time each step took (p50/p95/max), and how many
+  frames the view drew and how long each took from the app to the screen. Nothing is logged while not watching.
+
+#### Fixed
+- **A Linux share whose source went away stood frozen and still "live"**: when the shared window closed, or sharing
+  was stopped from the desktop, the compositor removed the screen's PipeWire node and the app never noticed, so viewers
+  kept a still picture of a share that had ended. The app now sees the node go, ends the share as Stop does (the relay
+  and the portal session too) and says why.
+- **A share watched on Android could freeze for good**: once the phone's video decoder fell behind and had no input
+  buffer free, the app stopped taking its finished pictures out, so the decoder never freed one again and the picture
+  stood still until the share changed (seen on the emulator at 1080p30: frozen after 41 s, 8.5 fps drawn until then).
+  It now takes them out and tries the frame again: 14.2 fps for the whole minute.
+- **A device remembered again left its old key on the relay** (found after 1.12.0): a password or provider sign-in on a
+  device that already remembered the account enrolled a new device key, and the relay kept the old one, unused, until
+  its 90-day sweep. Once the new key is in, the app now asks the relay to drop the old one (`DeviceForget`, protocol
+  24); the relay drops only a key of the signed-in account. On a 1.12 relay the old key stays until the sweep, as before.
+
+### From 1.12.1, never released on its own
+
+A patch to 1.12.0 that was never released: these fixes come with 1.14.0.
+
+#### Fixed
+- **On a phone, a toast that stays (a new server's certificate) covered the connect form's first fields** (1.12.0 moved
+  the toasts to the top while a dialog is open, off its Connect button): the dialog now moves down under the toasts while
+  they are up, and scrolls. The toast also takes the screen's width: centred from half way, a fingerprint stood three
+  times as tall.
+- **The chat history's lock came before everything**, with no way past it but turning history off or deleting it:
+  *Not now* keeps this session's chat in memory, leaves the saved history as it is, and the next start asks again.
+- **The account name field let a phone keyboard capitalise and autocorrect the name**, as the guest name field already
+  did not.
+- **Joining a voice channel with a password from its preview showed #general**, not the room's own chat (without a
+  password it already did).
+- **A day divider still said "Today" after a phone slept past midnight**: the midnight timer counts only awake time.
+  Coming back to the app now catches up.
+- **In a narrow chat column (a tablet's, beside both side panels) the message field's hint wrapped**, and the empty
+  field stood two lines tall; it is one line, cut short.
+
 ## [1.12.0] - 2026-11-15
 
 Protocol 23 (rc.1 was 22: its apps and relays update too). A 1.12 app talks to relays back to 1.0 (protocol 12); update

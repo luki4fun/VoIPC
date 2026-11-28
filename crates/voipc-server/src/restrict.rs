@@ -273,7 +273,7 @@ fn tell(state: &ServerState, rows: &[Restriction], skip: Option<UserId>) {
             &plain
         };
         for frame in to_them {
-            let _ = s.control_tx.try_send(frame.clone());
+            let _ = s.control_tx.try_send(frame.clone().into());
         }
     }
 }

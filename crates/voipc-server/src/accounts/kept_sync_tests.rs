@@ -11,7 +11,7 @@ use voipc_crypto::generate_identity_key_pair;
 use voipc_crypto::log::{
     chain_epoch, epoch_parts, open_chain_entry, Bucket, Chain, LogKey, StaticKey,
 };
-use voipc_crypto::sync::{AccountSync, Event, LogMemory, Prefs, ITEM_LOGKEY};
+use voipc_crypto::sync::{AccountSync, Event, LogMemory, Prefs, ITEM_KEPT, ITEM_LOGKEY};
 use voipc_protocol::codec::{decode_client_msg, encode_client_msg, PROTOCOL_VERSION};
 use voipc_protocol::messages::{
     AccountReply, AccountRequest, ChainAsk, ChainKeys, ClientMessage, LogEntry, LogKeyInfo,
@@ -91,6 +91,8 @@ enum Line {
 struct World {
     relay: Relay,
     file: std::path::PathBuf,
+    /// On `scratch_db`'s database: Postgres when `VOIPC_TEST_POSTGRES` is set.
+    scratch: bool,
     next_id: u64,
     next_at: u64,
     devices: Vec<Device>,
@@ -107,6 +109,10 @@ struct World {
 
 impl Drop for World {
     fn drop(&mut self) {
+        if self.scratch {
+            crate::gk_e2e_tests::drop_db(&self.file);
+            return;
+        }
         for suffix in ["", "-wal", "-shm", ".lock"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", self.file.display()));
         }
@@ -124,6 +130,21 @@ impl World {
         let store = Store::connect(&format!("sqlite://{}?mode=rwc", file.display()))
             .await
             .unwrap();
+        World::on(store, file, false, change).await
+    }
+
+    /// `with`, on Postgres when `VOIPC_TEST_POSTGRES` is set (`scratch_db`), else SQLite.
+    async fn scratch_with(change: impl FnOnce(&mut AccountsConfig)) -> World {
+        let (store, file) = crate::gk_e2e_tests::scratch_db().await;
+        World::on(store, file, true, change).await
+    }
+
+    async fn on(
+        store: Store,
+        file: std::path::PathBuf,
+        scratch: bool,
+        change: impl FnOnce(&mut AccountsConfig),
+    ) -> World {
         let mut cfg = AccountsConfig {
             mode: AccountsMode::Optional,
             kept_seats: 0,
@@ -134,6 +155,7 @@ impl World {
         World {
             relay,
             file,
+            scratch,
             next_id: 1,
             next_at: 1_700_000_000_000,
             devices: Vec::new(),
@@ -187,10 +209,19 @@ impl World {
         .unwrap();
         assert!(matches!(out, AccountReply::LogKeyStored), "{out:?}");
         let vault = Vault::create(RELAY, name);
-        let blobs = vec![VaultBlob {
-            version: 1,
-            ..vault.seal_item(ITEM_LOGKEY, 1, &logkey.to_bytes())
-        }];
+        // Its kept keys too, so every device of it has the same ones (this relay fakes the
+        // vault's other writes)
+        let kept = voipc_crypto::log::KeptKeys::generate();
+        let blobs = vec![
+            VaultBlob {
+                version: 1,
+                ..vault.seal_item(ITEM_LOGKEY, 1, &logkey.to_bytes())
+            },
+            VaultBlob {
+                version: 1,
+                ..vault.seal_item(ITEM_KEPT, 1, &kept.to_bytes())
+            },
+        ];
         SignedIn {
             relay_id: RELAY,
             name: name.to_string(),
@@ -212,6 +243,7 @@ impl World {
         sync.set_protocol(PROTOCOL_VERSION);
         let mut out: VecDeque<ClientMessage> = sync.pins_first().into_iter().collect();
         out.extend(first);
+        out.extend(sync.kem_first());
         out.extend(sync.set_prefs(Prefs {
             cloud: true,
             asked: true,
@@ -234,7 +266,9 @@ impl World {
         let id = id_of(account as u64 + 1);
         let held = self.relay.vault(AccountId(id)).await.unwrap();
         let signed = &mut self.accounts[account];
-        signed.blobs.retain(|b| b.k == ITEM_LOGKEY);
+        signed
+            .blobs
+            .retain(|b| b.k == ITEM_LOGKEY || b.k == ITEM_KEPT);
         signed.blobs.extend(held);
         self.device_of(account, memory)
     }
@@ -360,7 +394,13 @@ impl World {
             AccountRequest::LogKeyPublish { logkey, sig } => {
                 log::publish(relay, me, logkey, sig).await.unwrap()
             }
-            AccountRequest::LogKeys { accounts } => log::keys(relay, accounts).await.unwrap(),
+            AccountRequest::LogKeys { accounts } => {
+                then.extend(log::kept_kems(relay, accounts).await.unwrap());
+                log::keys(relay, accounts).await.unwrap()
+            }
+            AccountRequest::KeptKemPublish { kem, sig } => {
+                log::publish_kem(relay, me, kem, sig).await.unwrap()
+            }
             AccountRequest::EpochPut { conv, epoch, wraps } => {
                 let (out, told) = log::epoch_put(relay, me, conv, *epoch, wraps)
                     .await
@@ -393,7 +433,7 @@ impl World {
             }
             AccountRequest::LogJoin { conv } => {
                 let (out, owners) = log::join(relay, me, conv, true).await.unwrap();
-                for o in owners {
+                for o in owners.unwrap_or_default() {
                     pushes.push((
                         o,
                         AccountReply::LogPending {
@@ -476,6 +516,43 @@ impl World {
             }
             AccountRequest::BucketLists { conv, wanted } => {
                 log::bucket_lists(relay, me, conv, wanted).await.unwrap()
+            }
+            AccountRequest::EpochChainKeys { conv, chains } => {
+                log::gk_chain_keys(relay, me, conv, chains).await.unwrap()
+            }
+            AccountRequest::EpochChainStart {
+                conv,
+                epoch,
+                self_wrap,
+                link,
+                group,
+                gen,
+                gk_epoch,
+                sealed,
+                last,
+            } => {
+                let start = log::GkChainStart {
+                    epoch: *epoch,
+                    self_wrap: self_wrap.clone(),
+                    link: link.clone(),
+                    group: group.clone(),
+                    gen: *gen,
+                    gk_epoch: *gk_epoch,
+                    sealed: sealed.clone(),
+                    last: *last,
+                };
+                let sharing = log::Sharing {
+                    shares: self.devices[d].shares,
+                    may: self.devices[d].may,
+                };
+                let (out, told) = log::chain_start(relay, me, conv, start, sharing)
+                    .await
+                    .unwrap();
+                pushes.extend(
+                    told.into_iter()
+                        .map(|r| (r, AccountReply::LogNews { conv: conv.clone() })),
+                );
+                out
             }
             AccountRequest::OwnChainRows { conv, chain, after } => {
                 log::own_chain_rows(relay, me, conv, *chain, *after)
@@ -3722,4 +3799,1231 @@ async fn an_own_post_reads_back_after_an_exit_with_no_save() {
     let third = w.device_of(alice, memory);
     w.read(third).await;
     assert!(w.texts(third).is_empty());
+}
+
+// ── Under the group key (C4): gk chains, their seals and their sweep ─────
+
+/// `CONV`'s group's generation here.
+const GK_GEN: [u8; 16] = [0x6b; 16];
+/// The first gk chain's number (part 4): above every 0010 chain.
+const GK: u32 = voipc_crypto::log::MAX_CHAIN + 1;
+
+/// `CONV`'s group as the group key's tables hold it: head epoch `head`, opened `ago_ms` ago,
+/// a seal kept at each epoch up to it.
+async fn gk_head(w: &World, head: u32, ago_ms: i64) {
+    let at = (log::now_ms() - ago_ms) / 1000;
+    db!(w.relay.store(), pool => {
+        sqlx::query("DELETE FROM voipc_gk_groups WHERE grp = $1").bind(CONV).execute(pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO voipc_gk_groups (grp, kind, gen, gen_time, incarnation, head_d, head_epoch, head_join, exits_next, rolls, gated, updated)
+             VALUES ($1, 0, $2, 0, $3, $4, $5, 0, 1, $6, FALSE, 0)",
+        )
+        .bind(CONV)
+        .bind(&GK_GEN[..])
+        .bind(&[0u8; 16][..])
+        .bind(&[head as u8; 32][..])
+        .bind(i64::from(head))
+        .bind(&[0u8][..])
+        .execute(pool)
+        .await
+        .unwrap();
+        for e in 1..=head {
+            sqlx::query("INSERT INTO voipc_gk_seals (grp, gen, epoch, b, v, bytes, commit_id) VALUES ($1, $2, $3, 1, 1, $4, 1) ON CONFLICT DO NOTHING")
+                .bind(CONV)
+                .bind(&GK_GEN[..])
+                .bind(i64::from(e))
+                .bind(&[1u8; 80][..])
+                .execute(pool)
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM voipc_gk_headers WHERE grp = $1 AND d = $2")
+                .bind(CONV)
+                .bind(&[e as u8; 32][..])
+                .execute(pool)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO voipc_gk_headers (grp, d, gen, epoch, j, kind, time, body, sig, keep) VALUES ($1, $2, $3, $4, 0, 2, $5, $6, $6, 1)",
+            )
+            .bind(CONV)
+            .bind(&[e as u8; 32][..])
+            .bind(&GK_GEN[..])
+            .bind(i64::from(e))
+            .bind(if e == head { at } else { at - 3600 })
+            .bind(&[0u8][..])
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    });
+}
+
+/// `d`'s `EpochChainStart` of gk chain `chain` under the group's epoch `epoch`.
+async fn gk_start(w: &World, d: usize, chain: u32, epoch: u32, group: &str) -> AccountReply {
+    let start = log::GkChainStart {
+        epoch: chain << 1,
+        self_wrap: vec![1; voipc_crypto::log::ROW_BYTES],
+        link: None,
+        group: group.into(),
+        gen: GK_GEN,
+        gk_epoch: epoch,
+        sealed: vec![2; voipc_protocol::gk::CHAIN_SEAL_BYTES],
+        last: true,
+    };
+    let sharing = log::Sharing {
+        shares: false,
+        may: false,
+    };
+    log::chain_start(&w.relay, AccountId(w.id(d)), CONV, start, sharing)
+        .await
+        .unwrap()
+        .0
+}
+
+/// RV r-attackers:2721, end to end with the real apps: a sharer posts under the group key and
+/// hands a newcomer its gk chain's start. The newcomer, which was in no epoch of it, reads the
+/// post by that row. Whoever holds the relay's database and breaks X25519 has every log key's
+/// private half (from its public one): with those, neither the sharer's self-wrap nor its row
+/// to the newcomer opens, and so no kept post.
+#[tokio::test]
+async fn a_sharers_newcomer_reads_its_gk_post_and_the_log_keys_alone_open_neither_key() {
+    use voipc_crypto::log::{self_open_state, MAX_CHAIN};
+    let mut w = World::new().await;
+    let (alice, cy) = (w.person().await, w.person().await);
+    w.join(alice).await;
+    w.sharing(alice, true);
+    gk_head(&w, 5, 1_000).await;
+    let ep = voipc_crypto::group_state::GkEpoch {
+        group: CONV.into(),
+        gen: GK_GEN,
+        epoch: 5,
+        d_e: [5; 32],
+        ck: zeroize::Zeroizing::new([0x45; 32]),
+    };
+    w.next_at += 1;
+    let env = envelope("g1", "under the group key", None);
+    let s = w.devices[alice]
+        .sync
+        .send_channel_gk(CONV, env, w.next_at, None, ep);
+    w.devices[alice].out.extend(s);
+    w.pump().await;
+    let posted = w.appends.iter().rev().find(|(d, _)| *d == alice).unwrap().1;
+    let chain = posted >> 1;
+    assert!(chain > MAX_CHAIN, "a gk chain: {chain}");
+    w.join(cy).await;
+    w.read(cy).await;
+    // Its host holds no key of an epoch it was not in, and says so: it reads by the row
+    assert_eq!(
+        w.devices[cy].sync.take_gk_past(),
+        vec![(CONV.to_string(), GK_GEN, 5)]
+    );
+    let s = w.devices[cy].sync.gk_past_none(CONV, GK_GEN, 5);
+    w.devices[cy].out.extend(s);
+    w.pump().await;
+    assert_eq!(w.texts(cy), ["under the group key"]);
+
+    // The database, and the log keys as Shor gives them from their public halves
+    let logkey = |w: &World, d: usize| {
+        let a = &w.accounts[d];
+        LogKey::from_bytes(&a.vault.open_item(&a.blobs, ITEM_LOGKEY).unwrap().payload).unwrap()
+    };
+    let (alice_lk, cy_lk) = (logkey(&w, alice), logkey(&w, cy));
+    let (a, c) = (w.id(alice), w.id(cy));
+    let (self_wrap, row): (Vec<u8>, Vec<u8>) = db!(w.relay.store(), pool => {
+        sqlx::query_as(
+            "SELECT c.self_wrap, r.wrapped FROM voipc_chains c JOIN voipc_chain_wraps r ON r.chain_id = c.id
+              WHERE c.chain = $1 AND r.recipient = $2",
+        )
+        .bind(chain as i32)
+        .bind(&c[..])
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    });
+    let at = chain << 1;
+    assert!(self_open_state(&alice_lk, &self_wrap, CONV, &a, at).is_err());
+    let x = StaticKey::new(&cy_lk, &alice_lk.public()).unwrap();
+    assert_eq!(row.len(), voipc_crypto::log::PQ_ROW_BYTES);
+    assert!(x.open_state(&row, CONV, &a, at, &c).is_err());
+}
+
+/// RV g4 review2 (chains.rs:1461), end to end with the real apps: a sharer that posted in
+/// many epochs while it did not share has a gk top at each, since a gk chain links back only
+/// while its device shares. A newcomer that reads through it reads every one of those posts:
+/// the sharer answers at every top, and the relay keeps a row at each, as its bound counts the
+/// sharer's tops. Before, the newest four only. On Postgres too, with `VOIPC_TEST_POSTGRES`.
+#[tokio::test]
+async fn a_sharers_newcomer_reads_its_gk_posts_at_every_top_it_has() {
+    let mut w = World::scratch_with(|_| {}).await;
+    let (alice, cy) = (w.person().await, w.person().await);
+    w.join(alice).await;
+    let epochs: Vec<u32> = (5..15).collect();
+    for e in &epochs {
+        gk_head(&w, *e, 1_000).await;
+        let ep = voipc_crypto::group_state::GkEpoch {
+            group: CONV.into(),
+            gen: GK_GEN,
+            epoch: *e,
+            d_e: [*e as u8; 32],
+            ck: zeroize::Zeroizing::new([*e as u8 ^ 0x40; 32]),
+        };
+        w.next_at += 1;
+        let env = envelope(&format!("g{e}"), &format!("epoch {e}"), None);
+        let s = w.devices[alice]
+            .sync
+            .send_channel_gk(CONV, env, w.next_at, None, ep);
+        w.devices[alice].out.extend(s);
+        w.pump().await;
+    }
+    let tops: i64 = w
+        .rows("SELECT COUNT(*) FROM voipc_chains WHERE older IS NULL")
+        .await;
+    assert_eq!(tops, epochs.len() as i64, "one top at each epoch");
+    w.sharing(alice, true);
+    log::set_shares(w.relay.store(), &w.id(alice), true)
+        .await
+        .unwrap();
+    w.join(cy).await;
+    w.read(cy).await;
+    for _ in 0..epochs.len() {
+        let past = w.devices[cy].sync.take_gk_past();
+        if past.is_empty() {
+            break;
+        }
+        for (group, gen, e) in past {
+            let s = w.devices[cy].sync.gk_past_none(&group, gen, e);
+            w.devices[cy].out.extend(s);
+        }
+        w.pump().await;
+    }
+    let want: Vec<String> = epochs.iter().map(|e| format!("epoch {e}")).collect();
+    assert_eq!(w.texts(cy), want);
+}
+
+/// `d`'s `EpochChainStart` of gk chain `chain` under epoch `epoch`, linking back to `older`,
+/// as a sharer's does.
+async fn gk_link(w: &World, d: usize, chain: u32, epoch: u32, older: u32) -> AccountReply {
+    let start = log::GkChainStart {
+        epoch: chain << 1 | 1,
+        self_wrap: vec![1; voipc_crypto::log::ROW_BYTES],
+        link: Some((older, vec![4; voipc_crypto::log::ROW_BYTES])),
+        group: CONV.into(),
+        gen: GK_GEN,
+        gk_epoch: epoch,
+        sealed: vec![2; voipc_protocol::gk::CHAIN_SEAL_BYTES],
+        last: true,
+    };
+    let sharing = log::Sharing {
+        shares: true,
+        may: true,
+    };
+    log::chain_start(&w.relay, AccountId(w.id(d)), CONV, start, sharing)
+        .await
+        .unwrap()
+        .0
+}
+
+/// `d`'s frame of rows of a gk chain's start, at `epoch`, to `to`, as a sharer answers.
+async fn gk_rows_put(w: &World, d: usize, epoch: u32, to: &[Id], last: bool) -> AccountReply {
+    let frame = log::ChainFrame {
+        epoch,
+        self_wrap: None,
+        step: None,
+        link: None,
+        wraps: to
+            .iter()
+            .map(|r| voipc_protocol::messages::ChainRow {
+                recipient: *r,
+                index: 0,
+                wrapped: vec![3; voipc_crypto::log::PQ_ROW_BYTES],
+            })
+            .collect(),
+        buckets: vec![],
+        seals: vec![],
+        last,
+    };
+    let sharing = log::Sharing {
+        shares: true,
+        may: true,
+    };
+    log::chain_put(&w.relay, AccountId(w.id(d)), CONV, frame, sharing)
+        .await
+        .unwrap()
+        .0
+}
+
+fn filed(r: &AccountReply) -> bool {
+    matches!(r, AccountReply::ChainStored { behind: false, .. })
+}
+
+fn refused_for(r: &AccountReply, why: &str) -> bool {
+    matches!(r, AccountReply::Error { reason, .. } if reason.contains(why))
+}
+
+/// C4: a gk chain is filed, with its seal, only under its own group's head epoch or the one
+/// before until `HOLD_MS` after the opening that ended it, and only while that epoch's seals
+/// are kept; one refused leaves no chain behind.
+#[tokio::test]
+async fn a_gk_chain_is_filed_only_under_its_groups_head_epoch_or_the_one_before_while_held() {
+    let mut w = World::new().await;
+    let ann = w.person().await;
+    w.join(ann).await;
+    gk_head(&w, 5, 10_000).await;
+    assert!(filed(&gk_start(&w, ann, GK, 5, CONV).await));
+    assert!(filed(&gk_start(&w, ann, GK + 1, 4, CONV).await));
+    let gone = "That epoch's key is gone here";
+    assert!(refused_for(&gk_start(&w, ann, GK + 2, 3, CONV).await, gone));
+    assert!(refused_for(
+        &gk_start(&w, ann, GK + 2, 5, "c:other").await,
+        "malformed"
+    ));
+    gk_head(&w, 5, 61_000).await;
+    assert!(refused_for(&gk_start(&w, ann, GK + 2, 4, CONV).await, gone));
+    w.rows("DELETE FROM voipc_gk_seals WHERE epoch = 5").await;
+    assert!(refused_for(&gk_start(&w, ann, GK + 2, 5, CONV).await, gone));
+    assert_eq!(w.rows("SELECT COUNT(*) FROM voipc_gk_chains").await, 2);
+    assert_eq!(w.rows("SELECT COUNT(*) FROM voipc_chains").await, 2);
+    assert_eq!(
+        w.rows("SELECT newest_chain FROM voipc_writers").await,
+        i64::from(GK + 1)
+    );
+}
+
+/// C4: a gk chain is no `NEW_EPOCHS_PER_HOUR` chain (the group's epochs bound them, a few to
+/// one), and gk chains go up among themselves. A 0010 chain made after them lies below their
+/// numbers (K1: `(highest gk >> 11) + 1`), and is the next 0010 chain all the same.
+#[tokio::test]
+async fn gk_chains_pass_the_hourly_cap_go_up_on_their_own_and_a_0010_chain_after_them_is_not_behind(
+) {
+    let mut w = World::new().await;
+    let ann = w.person().await;
+    let bob = w.person().await;
+    w.join(ann).await;
+    w.join(bob).await;
+    w.post(ann, "before").await;
+    gk_head(&w, 5, 1_000).await;
+    w.rows(&format!(
+        "UPDATE voipc_writers SET new_this_hour = 60, hour = {}",
+        util::now() / 3600
+    ))
+    .await;
+    for k in 0..4 {
+        assert!(filed(&gk_start(&w, ann, GK + k, 5, CONV).await), "{k}");
+    }
+    assert!(refused_for(
+        &gk_start(&w, ann, GK + 4, 5, CONV).await,
+        "Too many"
+    ));
+    gk_head(&w, 6, 1_000).await;
+    assert!(matches!(
+        gk_start(&w, ann, GK + 1, 6, CONV).await,
+        AccountReply::ChainStored { behind: true, .. }
+    ));
+    w.rows("UPDATE voipc_writers SET new_this_hour = 0").await;
+    let next = ((GK + 3) >> 11) + 1;
+    let frame = log::ChainFrame {
+        epoch: chain_epoch(next, 0).unwrap(),
+        self_wrap: Some(vec![1; voipc_crypto::log::ROW_BYTES]),
+        step: None,
+        link: None,
+        wraps: vec![],
+        buckets: vec![],
+        seals: vec![],
+        last: true,
+    };
+    let sharing = log::Sharing {
+        shares: false,
+        may: false,
+    };
+    let (out, _) = log::chain_put(&w.relay, AccountId(w.id(ann)), CONV, frame, sharing)
+        .await
+        .unwrap();
+    assert!(filed(&out), "{out:?}");
+}
+
+/// C4: a post on a gk chain needs only "newest, at its top": no member check, which reads the
+/// 0010 tables and would ask a row for everyone. Every stored member is served its entries and
+/// its seal (who opens them is the group key's to say); a 0010 chain has no seal, and someone
+/// not in the log gets neither.
+#[tokio::test]
+async fn a_post_on_a_gk_chain_needs_only_its_newest_top_and_every_member_reads_it_and_its_seal() {
+    let mut w = World::new().await;
+    let (ann, bob, cy) = (w.person().await, w.person().await, w.person().await);
+    w.join(ann).await;
+    w.join(bob).await;
+    w.post(ann, "on a 0010 chain").await;
+    gk_head(&w, 5, 1_000).await;
+    assert!(filed(&gk_start(&w, ann, GK, 5, CONV).await));
+    let (a, b) = (AccountId(w.id(ann)), AccountId(w.id(bob)));
+    let out = log::append(&w.relay, a, CONV, GK << 1, b"sealed", None)
+        .await
+        .unwrap();
+    assert!(matches!(out, AccountReply::LogAppended { .. }), "{out:?}");
+    let out = log::append(&w.relay, a, CONV, GK << 1 | 1, b"sealed", None)
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            out,
+            AccountReply::ChainRekey {
+                new_chain: false,
+                ..
+            }
+        ),
+        "{out:?}"
+    );
+    let AccountReply::ChainPage { entries, .. } =
+        log::chain_fetch(&w.relay, b, CONV, 0).await.unwrap()
+    else {
+        panic!("a page");
+    };
+    assert!(entries
+        .iter()
+        .any(|e| e.epoch == GK << 1 && e.sender == a.0));
+    let asks = [(a.0, GK), (a.0, 1)];
+    let AccountReply::EpochChainKeys { keys, .. } =
+        log::gk_chain_keys(&w.relay, b, CONV, &asks).await.unwrap()
+    else {
+        panic!("keys");
+    };
+    assert_eq!(
+        keys,
+        [voipc_protocol::gk::GkChainKey {
+            owner: a.0,
+            chain: GK,
+            index: 0,
+            group: CONV.into(),
+            gen: GK_GEN,
+            epoch: 5,
+            sealed: vec![2; voipc_protocol::gk::CHAIN_SEAL_BYTES],
+        }]
+    );
+    let c = AccountId(w.id(cy));
+    for out in [
+        log::gk_chain_keys(&w.relay, c, CONV, &asks).await.unwrap(),
+        log::chain_fetch(&w.relay, c, CONV, 0).await.unwrap(),
+    ] {
+        assert!(refused_for(&out, "not a conversation of yours"), "{out:?}");
+    }
+}
+
+/// C4: on a gk chain a frame carries only a sharer's rows of its start, at index 0, to
+/// newcomers; a step, a row at another index, or rows from someone without the right are not.
+#[tokio::test]
+async fn a_sharers_rows_to_newcomers_go_on_its_gk_chain_at_index_0_and_nothing_else_does() {
+    let mut w = World::new().await;
+    let (ann, bob) = (w.person().await, w.person().await);
+    w.join(ann).await;
+    w.join(bob).await;
+    gk_head(&w, 5, 1_000).await;
+    assert!(filed(&gk_start(&w, ann, GK, 5, CONV).await));
+    // A newcomer she owes an answer: a gk chain takes rows to no one else (RV g4 review)
+    owe(&w, ann, bob).await;
+    let to_bob = w.id(bob);
+    let sized = |index: u32, step: bool, bytes: usize| log::ChainFrame {
+        epoch: GK << 1,
+        self_wrap: None,
+        step: step.then(|| vec![4; voipc_crypto::log::ROW_BYTES]),
+        link: None,
+        wraps: vec![voipc_protocol::messages::ChainRow {
+            recipient: to_bob,
+            index,
+            wrapped: vec![3; bytes],
+        }],
+        buckets: vec![],
+        seals: vec![],
+        last: true,
+    };
+    let rows = |index: u32, step: bool| sized(index, step, voipc_crypto::log::PQ_ROW_BYTES);
+    let me = AccountId(w.id(ann));
+    let put = |frame, may| {
+        let relay = &w.relay;
+        async move {
+            let sharing = log::Sharing { shares: may, may };
+            log::chain_put(relay, me, CONV, frame, sharing)
+                .await
+                .unwrap()
+                .0
+        }
+    };
+    assert!(refused_for(&put(rows(0, false), false).await, "privilege"));
+    assert!(refused_for(&put(rows(1, false), true).await, "malformed"));
+    assert!(refused_for(&put(rows(0, true), true).await, "malformed"));
+    // RV r-attackers:2721: a row of the static shape alone (X25519 only) is none a gk chain
+    // takes, nor one of any other size: each is a hybrid one to the newcomer's kept key
+    for bytes in [
+        voipc_crypto::log::ROW_BYTES,
+        voipc_crypto::log::PQ_ROW_BYTES - 1,
+    ] {
+        assert!(refused_for(
+            &put(sized(0, false, bytes), true).await,
+            "malformed"
+        ));
+    }
+    assert!(filed(&put(rows(0, false), true).await));
+    assert_eq!(
+        w.rows("SELECT COUNT(*) FROM voipc_chain_wraps WHERE idx = 0")
+            .await,
+        1
+    );
+}
+
+/// `CONV`'s answer `owner` owes `joiner`, as a seat taken files it.
+async fn owe(w: &World, owner: usize, joiner: usize) {
+    db!(w.relay.store(), pool => {
+        sqlx::query("INSERT INTO voipc_pending (conv, owner, recipient, created_at) VALUES ($1, $2, $3, $4)")
+            .bind(CONV)
+            .bind(&w.id(owner)[..])
+            .bind(&w.id(joiner)[..])
+            .bind(util::now())
+            .execute(pool)
+            .await
+            .unwrap();
+    });
+}
+
+/// Rows on any writer's chains to `to`.
+async fn rows_to(w: &World, to: &Id) -> i64 {
+    db!(w.relay.store(), pool => {
+        sqlx::query_scalar("SELECT CAST(COUNT(*) AS BIGINT) FROM voipc_chain_wraps WHERE recipient = $1")
+            .bind(&to[..])
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    })
+}
+
+/// `owner`'s writer row in `CONV`: its id, and the key bytes charged to it.
+async fn writer_here(w: &World, owner: &Id) -> (i32, i64) {
+    db!(w.relay.store(), pool => {
+        sqlx::query_as("SELECT id, key_bytes FROM voipc_writers WHERE conv = $1 AND owner = $2")
+            .bind(CONV)
+            .bind(&owner[..])
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    })
+}
+
+/// RV g4 review (log.rs:1885): a sharer's rows to newcomers on its gk chains are hybrid,
+/// 1,629 B each, and they are for others. Charged to its kept quota, some 30k of them filled
+/// 50 MB, and then its own posts and answers were refused. They are not charged to it now. What
+/// bounds them instead: a row goes only to a joiner this writer owes an answer, which only a
+/// seat taken files, and to each per answer owed at most its gk tops in the channel and
+/// `GK_ROWS_SLACK` more (RV g4 review2).
+/// On Postgres too, with `VOIPC_TEST_POSTGRES` (its name has `gk` for that run).
+#[tokio::test]
+async fn a_sharers_gk_rows_to_newcomers_are_not_charged_to_its_quota_and_go_only_to_whom_it_owes() {
+    let mut w = World::scratch_with(|c| c.quota_mb = 1).await;
+    let (ann, bob, cy, dan) = (
+        w.person().await,
+        w.person().await,
+        w.person().await,
+        w.person().await,
+    );
+    for d in [ann, bob, cy, dan] {
+        w.join(d).await;
+    }
+    gk_head(&w, 5, 1_000).await;
+    assert!(filed(&gk_start(&w, ann, GK, 5, CONV).await));
+    let (a, b, c, d) = (w.id(ann), w.id(bob), w.id(cy), w.id(dan));
+    owe(&w, ann, bob).await;
+    // Ann's own keys and posts stand right under her quota
+    let quota = 1024 * 1024;
+    db!(w.relay.store(), pool => {
+        sqlx::query("UPDATE voipc_writers SET key_bytes = $1 WHERE conv = $2 AND owner = $3")
+            .bind(quota - 1000)
+            .bind(CONV)
+            .bind(&a[..])
+            .execute(pool)
+            .await
+            .unwrap();
+    });
+    let frame = |chain: u32, to: &[Id], last: bool| log::ChainFrame {
+        epoch: chain << 1,
+        self_wrap: None,
+        step: None,
+        link: None,
+        wraps: to
+            .iter()
+            .map(|r| voipc_protocol::messages::ChainRow {
+                recipient: *r,
+                index: 0,
+                wrapped: vec![3; voipc_crypto::log::PQ_ROW_BYTES],
+            })
+            .collect(),
+        buckets: vec![],
+        seals: vec![],
+        last,
+    };
+    let me = AccountId(a);
+    let put = |f| {
+        let relay = &w.relay;
+        async move {
+            let sharing = log::Sharing {
+                shares: true,
+                may: true,
+            };
+            log::chain_put(relay, me, CONV, f, sharing).await.unwrap().0
+        }
+    };
+    let out = put(frame(GK, &[b, c], true)).await;
+    assert!(filed(&out), "{out:?}");
+    assert_eq!(rows_to(&w, &b).await, 1, "the joiner she owes");
+    assert_eq!(rows_to(&w, &c).await, 0, "not to a member she owes nothing");
+    assert_eq!(
+        writer_here(&w, &a).await.1,
+        quota - 1000,
+        "none of it is hers"
+    );
+    assert_eq!(w.rows("SELECT COUNT(*) FROM voipc_pending").await, 0);
+    // Her own post still goes, and a recount charges her nothing of the rows either
+    let posted = log::append(&w.relay, me, CONV, GK << 1, &[7; 500], None)
+        .await
+        .unwrap();
+    assert!(
+        matches!(posted, AccountReply::LogAppended { .. }),
+        "{posted:?}"
+    );
+    log::recount(w.relay.store(), writer_here(&w, &a).await.0)
+        .await
+        .unwrap();
+    assert!(
+        writer_here(&w, &a).await.1 < voipc_crypto::log::PQ_ROW_BYTES as i64,
+        "her own keys, and no row of others"
+    );
+    // A joiner owed an answer gets rows on at most her tops and `GK_ROWS_SLACK` more, however
+    // many chains she has: these link back, one run with one top
+    let mut chains = vec![GK];
+    for e in 6..6 + log::GK_ROWS_SLACK as u32 + 6 {
+        gk_head(&w, e, 1_000).await;
+        let chain = GK + e - 5;
+        assert!(filed(&gk_link(&w, ann, chain, e, chain - 1).await));
+        chains.push(chain);
+    }
+    let writer = writer_here(&w, &a).await.0;
+    assert_eq!(log::gk_tops(w.relay.store(), writer).await.unwrap(), 1);
+    owe(&w, ann, dan).await;
+    for (i, chain) in chains.iter().enumerate() {
+        let at = chain << 1 | u32::from(i > 0);
+        let out = gk_rows_put(&w, ann, at, &[d], i + 1 == chains.len()).await;
+        assert!(filed(&out), "{out:?}");
+    }
+    assert_eq!(rows_to(&w, &d).await, 1 + log::GK_ROWS_SLACK);
+    assert_eq!(
+        w.rows("SELECT COUNT(*) FROM voipc_pending").await,
+        0,
+        "and the last frame ends the wait all the same"
+    );
+}
+
+/// RV g4 review2 (chains.rs:1461, log.rs:110): a sharer's rows to a newcomer reach every gk
+/// top it has, however many. Each chain a device made while it did not share links to nothing
+/// and is a top of its own; the bound per answer owed counts those tops, not a fixed 8.
+/// On Postgres too, with `VOIPC_TEST_POSTGRES`.
+#[tokio::test]
+async fn a_sharers_gk_rows_reach_a_newcomer_at_every_top_it_has() {
+    let mut w = World::scratch_with(|_| {}).await;
+    let (ann, dan) = (w.person().await, w.person().await);
+    w.join(ann).await;
+    w.join(dan).await;
+    let tops = 3 * log::GK_ROWS_SLACK as u32;
+    let mut chains = Vec::new();
+    for e in 5..5 + tops {
+        gk_head(&w, e, 1_000).await;
+        let chain = GK + e - 5;
+        assert!(filed(&gk_start(&w, ann, chain, e, CONV).await));
+        chains.push(chain);
+    }
+    let (a, d) = (w.id(ann), w.id(dan));
+    let writer = writer_here(&w, &a).await.0;
+    assert_eq!(
+        log::gk_tops(w.relay.store(), writer).await.unwrap(),
+        i64::from(tops)
+    );
+    owe(&w, ann, dan).await;
+    for (i, chain) in chains.iter().enumerate() {
+        let out = gk_rows_put(&w, ann, chain << 1, &[d], i + 1 == chains.len()).await;
+        assert!(filed(&out), "{out:?}");
+    }
+    assert_eq!(rows_to(&w, &d).await, i64::from(tops));
+    assert_eq!(w.rows("SELECT COUNT(*) FROM voipc_pending").await, 0);
+}
+
+/// RV g4 review2: a gk chain's link names the writer's highest chain, as an honest app's
+/// does. Two links to one chain would make two tops of one run, both kept by one entry of
+/// it, and the bound on rows to newcomers counts tops.
+#[tokio::test]
+async fn a_gk_chains_link_names_the_writers_highest_chain_only() {
+    let mut w = World::new().await;
+    let ann = w.person().await;
+    w.join(ann).await;
+    gk_head(&w, 5, 1_000).await;
+    assert!(filed(&gk_start(&w, ann, GK, 5, CONV).await));
+    gk_head(&w, 6, 1_000).await;
+    assert!(filed(&gk_link(&w, ann, GK + 1, 6, GK).await));
+    gk_head(&w, 7, 1_000).await;
+    let twice = gk_link(&w, ann, GK + 2, 7, GK).await;
+    assert!(
+        matches!(twice, AccountReply::ChainStored { behind: true, .. }),
+        "{twice:?}"
+    );
+    assert!(filed(&gk_link(&w, ann, GK + 2, 7, GK + 1).await));
+    let writer = writer_here(&w, &w.id(ann)).await.0;
+    assert_eq!(log::gk_tops(w.relay.store(), writer).await.unwrap(), 1);
+}
+
+/// C4: a gk chain goes by its entries alone: the newest one with none, a minute old, goes,
+/// and its seal and the hold on its epoch's material with it; one with an entry stays.
+#[tokio::test]
+async fn a_gk_chain_goes_by_its_entries_alone() {
+    let mut w = World::new().await;
+    let (ann, bob) = (w.person().await, w.person().await);
+    w.join(ann).await;
+    w.join(bob).await;
+    gk_head(&w, 5, 1_000).await;
+    let a = AccountId(w.id(ann));
+    assert!(filed(&gk_start(&w, ann, GK, 5, CONV).await));
+    let out = log::append(&w.relay, a, CONV, GK << 1, b"sealed", None)
+        .await
+        .unwrap();
+    assert!(matches!(out, AccountReply::LogAppended { .. }), "{out:?}");
+    assert!(filed(&gk_start(&w, ann, GK + 1, 5, CONV).await));
+    w.rows(&format!(
+        "UPDATE voipc_chains SET created_at = {}",
+        util::now() - 120
+    ))
+    .await;
+    log::sweep(&w.relay).await.unwrap();
+    assert_eq!(
+        w.rows(&format!(
+            "SELECT chain FROM voipc_chains WHERE chain >= {GK}"
+        ))
+        .await,
+        i64::from(GK)
+    );
+    assert_eq!(w.rows("SELECT COUNT(*) FROM voipc_chains").await, 1);
+    assert_eq!(w.rows("SELECT COUNT(*) FROM voipc_gk_chains").await, 1);
+}
+
+/// Plan 2g: what the group key keeps of an account names it with no foreign key. At the
+/// tombstone sweep its self-rows go; a seat of it still sitting or a keyholder entry still
+/// held keeps the stone (the entry's row tells the relay which group removes it), which
+/// goes once that seat's exit and that entry's Remove landed.
+#[tokio::test]
+async fn a_deleted_accounts_group_key_rows_go_at_the_tombstone_sweep_and_a_seat_or_entry_keeps_the_stone(
+) {
+    let mut w = World::new().await;
+    let ann = w.person().await;
+    let a = w.id(ann);
+    let m = voipc_crypto::group_key::MemberId::Account(a).seat_id();
+    db!(w.relay.store(), pool => {
+        sqlx::query("INSERT INTO voipc_gk_self (grp, account, gen, seed, tag_sk, tag_sx, kind, sealed) VALUES ($1, $2, $3, 1, $4, $4, 0, $5)")
+            .bind(CONV).bind(&a[..]).bind(&GK_GEN[..]).bind(&[1u8; 8][..]).bind(&[9u8; 60][..])
+            .execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO voipc_gk_holders (grp, kx, m, rank, last_online, missed) VALUES ($1, $2, $3, 0, 0, $4)")
+            .bind(CONV).bind(&[3u8; 32][..]).bind(&m[..]).bind(&[0u8, 0][..])
+            .execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO voipc_gk_seats (grp, gen, seat, dh, b, pool, seed, last_use, account) VALUES ($1, $2, $3, $4, 1, 0, 1, 0, $5)")
+            .bind(CONV).bind(&GK_GEN[..]).bind(&[1u8; 33][..]).bind(&[5u8; 33][..]).bind(&a[..])
+            .execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO voipc_tombstones (account, at) VALUES ($1, 1)")
+            .bind(&a[..])
+            .execute(pool).await.unwrap();
+    });
+    log::sweep(&w.relay).await.unwrap();
+    assert_eq!(w.rows("SELECT COUNT(*) FROM voipc_gk_self").await, 0);
+    assert_eq!(w.rows("SELECT COUNT(*) FROM voipc_gk_holders").await, 1);
+    assert_eq!(w.rows("SELECT COUNT(*) FROM voipc_tombstones").await, 1);
+    w.rows("DELETE FROM voipc_gk_seats").await;
+    log::sweep(&w.relay).await.unwrap();
+    assert_eq!(
+        w.rows("SELECT COUNT(*) FROM voipc_tombstones").await,
+        1,
+        "its keyholder entry is still held"
+    );
+    // The group's actor drops the row once the entry's Remove landed (`put_holders`)
+    w.rows("DELETE FROM voipc_gk_holders").await;
+    log::sweep(&w.relay).await.unwrap();
+    assert_eq!(w.rows("SELECT COUNT(*) FROM voipc_tombstones").await, 0);
+}
+
+/// A channel's purge takes its group's rows too (its stored group's id is its log's
+/// conversation), and leaves another's.
+#[tokio::test]
+async fn a_purged_channels_group_key_rows_go_with_it() {
+    let w = World::new().await;
+    for grp in [CONV, OTHER] {
+        db!(w.relay.store(), pool => {
+            sqlx::query(
+                "INSERT INTO voipc_gk_groups (grp, kind, gen, gen_time, incarnation, head_d, head_epoch, head_join, exits_next, rolls, gated, updated)
+                 VALUES ($1, 0, $2, 0, $2, $3, 1, 0, 1, $2, FALSE, 0)",
+            )
+            .bind(grp).bind(&GK_GEN[..]).bind(&[1u8; 32][..])
+            .execute(pool).await.unwrap();
+            sqlx::query("INSERT INTO voipc_gk_seats (grp, gen, seat, dh, b, pool, seed, last_use) VALUES ($1, $2, $3, $3, 1, 0, 1, 0)")
+                .bind(grp).bind(&GK_GEN[..]).bind(&[1u8; 33][..])
+                .execute(pool).await.unwrap();
+            sqlx::query("INSERT INTO voipc_gk_seals (grp, gen, epoch, b, v, bytes, commit_id) VALUES ($1, $2, 1, 1, 1, $3, 1)")
+                .bind(grp).bind(&GK_GEN[..]).bind(&[1u8; 80][..])
+                .execute(pool).await.unwrap();
+            sqlx::query("INSERT INTO voipc_gk_self (grp, account, gen, seed, tag_sk, tag_sx, kind, sealed) VALUES ($1, $2, $2, 1, $3, $3, 0, $4)")
+                .bind(grp).bind(&GK_GEN[..]).bind(&[1u8; 8][..]).bind(&[9u8; 60][..])
+                .execute(pool).await.unwrap();
+            // What a restart asks again (0014): an eager seat and an exit
+            sqlx::query("INSERT INTO voipc_gk_eager (grp, account, seat, at) VALUES ($1, $2, $3, 1)")
+                .bind(grp).bind(&GK_GEN[..]).bind(&[1u8; 33][..])
+                .execute(pool).await.unwrap();
+            sqlx::query("INSERT INTO voipc_gk_exit_asks (grp, account, cause, at) VALUES ($1, $2, 1, 1)")
+                .bind(grp).bind(&GK_GEN[..])
+                .execute(pool).await.unwrap();
+        });
+    }
+    w.relay.channel_purge(CONV).await.unwrap();
+    for t in [
+        "voipc_gk_groups",
+        "voipc_gk_seats",
+        "voipc_gk_seals",
+        "voipc_gk_self",
+        "voipc_gk_eager",
+        "voipc_gk_exit_asks",
+    ] {
+        assert_eq!(
+            w.rows(&format!("SELECT COUNT(*) FROM {t} WHERE grp = '{CONV}'"))
+                .await,
+            0,
+            "{t}"
+        );
+        assert_eq!(
+            w.rows(&format!("SELECT COUNT(*) FROM {t} WHERE grp = '{OTHER}'"))
+                .await,
+            1,
+            "{t}"
+        );
+    }
+}
+
+/// RV g4 review3 (log.rs:1666): a sharer's rows at a gk chain the hourly sweep took since its
+/// app read its chains are `behind`, as before the rows were hybrid, so the app reads its
+/// chains again and answers at those left. Refused as malformed, the whole answer went, and
+/// every post waiting behind it. A frame of any other shape there is still malformed.
+/// On Postgres too, with `VOIPC_TEST_POSTGRES`.
+#[tokio::test]
+async fn a_sharers_rows_at_a_gk_chain_the_sweep_took_are_behind_and_a_malformed_frame_is_not() {
+    let mut w = World::scratch_with(|_| {}).await;
+    let (ann, dan) = (w.person().await, w.person().await);
+    w.join(ann).await;
+    w.join(dan).await;
+    gk_head(&w, 5, 1_000).await;
+    let a = AccountId(w.id(ann));
+    assert!(filed(&gk_start(&w, ann, GK, 5, CONV).await));
+    gk_head(&w, 6, 1_000).await;
+    assert!(filed(&gk_start(&w, ann, GK + 1, 6, CONV).await));
+    let out = log::append(&w.relay, a, CONV, (GK + 1) << 1, b"sealed", None)
+        .await
+        .unwrap();
+    assert!(matches!(out, AccountReply::LogAppended { .. }), "{out:?}");
+    w.rows(&format!(
+        "UPDATE voipc_chains SET created_at = {}",
+        util::now() - 120
+    ))
+    .await;
+    log::sweep(&w.relay).await.unwrap();
+    assert_eq!(
+        w.rows(&format!(
+            "SELECT COUNT(*) FROM voipc_chains WHERE chain = {GK}"
+        ))
+        .await,
+        0,
+        "the sweep took the chain with no entry"
+    );
+    owe(&w, ann, dan).await;
+    let d = w.id(dan);
+    let out = gk_rows_put(&w, ann, GK << 1, &[d], false).await;
+    assert!(
+        matches!(out, AccountReply::ChainStored { behind: true, .. }),
+        "{out:?}"
+    );
+    assert_eq!(rows_to(&w, &d).await, 0);
+    assert_eq!(w.rows("SELECT COUNT(*) FROM voipc_pending").await, 1);
+
+    // Not rows alone at index 0, each of the hybrid shape to someone else, at an epoch of the
+    // gk range: malformed, there as anywhere
+    let frame = |epoch: u32, to: Id, index: u32, bytes: usize, step: bool| log::ChainFrame {
+        epoch,
+        self_wrap: None,
+        step: step.then(|| vec![4; voipc_crypto::log::ROW_BYTES]),
+        link: None,
+        wraps: vec![voipc_protocol::messages::ChainRow {
+            recipient: to,
+            index,
+            wrapped: vec![3; bytes],
+        }],
+        buckets: vec![],
+        seals: vec![],
+        last: false,
+    };
+    let pq = voipc_crypto::log::PQ_ROW_BYTES;
+    let put = |f, may| {
+        let relay = &w.relay;
+        async move {
+            let sharing = log::Sharing { shares: may, may };
+            log::chain_put(relay, a, CONV, f, sharing).await.unwrap().0
+        }
+    };
+    for (f, why) in [
+        (frame(GK << 1, d, 0, pq - 1, false), "a row of another size"),
+        (frame(GK << 1, d, 0, pq, true), "with a step"),
+        (frame(GK << 1, d, 1, pq, false), "at index 1"),
+        (frame(GK << 1, a.0, 0, pq, false), "to herself"),
+        (frame(5 << 12, d, 0, pq, false), "below the gk range"),
+    ] {
+        let out = put(f, true).await;
+        assert!(refused_for(&out, "malformed"), "{why}: {out:?}");
+    }
+    let out = put(frame(GK << 1, d, 0, pq, false), false).await;
+    assert!(refused_for(&out, "privilege"), "{out:?}");
+    // And the answer read again goes on at the chain left, and ends the wait
+    let out = gk_rows_put(&w, ann, (GK + 1) << 1, &[d], true).await;
+    assert!(filed(&out), "{out:?}");
+    assert_eq!(rows_to(&w, &d).await, 1);
+    assert_eq!(w.rows("SELECT COUNT(*) FROM voipc_pending").await, 0);
+}
+
+/// RV g4 review3 (log.rs:1666), end to end with the real apps: a sharer online across a sweep
+/// that took its oldest gk top answers a newcomer from its view of before. The first frame,
+/// at that top, is `behind`; the app reads its chains again and answers at the nine left, and
+/// the newcomer reads those nine epochs. Before, it read none, the answer was dropped, and the
+/// sharer's app stopped keeping posts there. On Postgres too, with `VOIPC_TEST_POSTGRES`.
+#[tokio::test]
+async fn a_newcomer_through_a_sharer_whose_oldest_gk_top_was_swept_reads_the_rest() {
+    let mut w = World::scratch_with(|_| {}).await;
+    let (alice, cy) = (w.person().await, w.person().await);
+    w.join(alice).await;
+    let epochs: Vec<u32> = (5..15).collect();
+    for e in &epochs {
+        gk_head(&w, *e, 1_000).await;
+        let ep = voipc_crypto::group_state::GkEpoch {
+            group: CONV.into(),
+            gen: GK_GEN,
+            epoch: *e,
+            d_e: [*e as u8; 32],
+            ck: zeroize::Zeroizing::new([*e as u8 ^ 0x40; 32]),
+        };
+        w.next_at += 1;
+        let env = envelope(&format!("g{e}"), &format!("epoch {e}"), None);
+        let s = w.devices[alice]
+            .sync
+            .send_channel_gk(CONV, env, w.next_at, None, ep);
+        w.devices[alice].out.extend(s);
+        w.pump().await;
+    }
+    // The first epoch's post goes (its timer, a moderator, the window), and the sweep takes
+    // its chain; alice's device stays online and reads nothing in between
+    w.rows("UPDATE voipc_log SET keep_until = 1 WHERE seq = (SELECT MIN(seq) FROM voipc_log)")
+        .await;
+    w.rows(&format!(
+        "UPDATE voipc_chains SET created_at = {}",
+        util::now() - 120
+    ))
+    .await;
+    log::sweep(&w.relay).await.unwrap();
+    assert_eq!(w.rows("SELECT COUNT(*) FROM voipc_chains").await, 9);
+    w.sharing(alice, true);
+    log::set_shares(w.relay.store(), &w.id(alice), true)
+        .await
+        .unwrap();
+    let sent_before = w.log.len();
+    w.join(cy).await;
+    w.read(cy).await;
+    for _ in 0..epochs.len() {
+        let past = w.devices[cy].sync.take_gk_past();
+        if past.is_empty() {
+            break;
+        }
+        for (group, gen, e) in past {
+            let s = w.devices[cy].sync.gk_past_none(&group, gen, e);
+            w.devices[cy].out.extend(s);
+        }
+        w.pump().await;
+    }
+    let behind = w.log[sent_before..]
+        .iter()
+        .filter(|l| matches!(l, Line::Stored { device, behind: true } if *device == alice))
+        .count();
+    assert_eq!(behind, 1, "its frame at the swept top");
+    let not_kept = w.log[sent_before..]
+        .iter()
+        .any(|l| matches!(l, Line::NotKept { device, .. } if *device == alice));
+    assert!(!not_kept);
+    assert!(!w.devices[alice].sync.copy_refused());
+    assert_eq!(w.rows("SELECT COUNT(*) FROM voipc_pending").await, 0);
+    let want: Vec<String> = epochs[1..].iter().map(|e| format!("epoch {e}")).collect();
+    assert_eq!(w.texts(cy), want);
+}
+
+/// Two `EpochChainStart`s of `me` at once, as two sessions of one account send them: each on
+/// a thread of its own, on the test's runtime (whose driver the pool's connections are on).
+fn starts_at_once(
+    relay: &Relay,
+    me: AccountId,
+    starts: [log::GkChainStart; 2],
+) -> [AccountReply; 2] {
+    let rt = tokio::runtime::Handle::current();
+    tokio::task::block_in_place(|| {
+        std::thread::scope(|sc| {
+            let runs = starts.map(|st| {
+                let rt = rt.clone();
+                sc.spawn(move || {
+                    rt.block_on(log::chain_start(
+                        relay,
+                        me,
+                        CONV,
+                        st,
+                        log::Sharing {
+                            shares: true,
+                            may: true,
+                        },
+                    ))
+                    .unwrap()
+                    .0
+                })
+            });
+            runs.map(|r| r.join().unwrap())
+        })
+    })
+}
+
+/// A start of gk chain `chain` under the group's epoch `epoch`, linking back to `older`.
+fn gk_start_of(chain: u32, epoch: u32, older: Option<u32>) -> log::GkChainStart {
+    log::GkChainStart {
+        epoch: chain << 1 | u32::from(older.is_some()),
+        self_wrap: vec![1; voipc_crypto::log::ROW_BYTES],
+        link: older.map(|o| (o, vec![4; voipc_crypto::log::ROW_BYTES])),
+        group: CONV.into(),
+        gen: GK_GEN,
+        gk_epoch: epoch,
+        sealed: vec![2; voipc_protocol::gk::CHAIN_SEAL_BYTES],
+        last: true,
+    }
+}
+
+/// RV g4 review3 (log.rs:2272): the link rule is held in the insert's own transaction. Two
+/// sessions of one account each linking a new chain to the highest at the same moment file
+/// one of them: the other is `behind`. Before, both were filed in most rounds, one chain had
+/// two links, and one kept post held up both tops. On Postgres too, with
+/// `VOIPC_TEST_POSTGRES` (its name has `gk` for that run).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_sessions_linking_gk_chains_at_once_file_one_link_to_each_chain() {
+    let mut w = World::scratch_with(|_| {}).await;
+    let ann = w.person().await;
+    w.join(ann).await;
+    gk_head(&w, 5, 1_000).await;
+    assert!(filed(&gk_start(&w, ann, GK, 5, CONV).await));
+    let me = AccountId(w.id(ann));
+    let mut highest = GK;
+    for round in 0..40u32 {
+        let e = 6 + round;
+        gk_head(&w, e, 1_000).await;
+        let h = highest;
+        let [x, y] = starts_at_once(
+            &w.relay,
+            me,
+            [
+                gk_start_of(h + 1, e, Some(h)),
+                gk_start_of(h + 2, e, Some(h)),
+            ],
+        );
+        assert!(!(filed(&x) && filed(&y)), "round {round}: {x:?} / {y:?}");
+        assert!(filed(&x) || filed(&y), "round {round}: {x:?} / {y:?}");
+        highest = if filed(&y) { h + 2 } else { h + 1 };
+    }
+    let twice: i64 = w
+        .rows("SELECT CAST(COUNT(*) AS BIGINT) FROM (SELECT older FROM voipc_chains WHERE older IS NOT NULL GROUP BY older HAVING COUNT(*) > 1) t")
+        .await;
+    assert_eq!(twice, 0, "no chain is linked twice");
+    let writer = writer_here(&w, &me.0).await.0;
+    assert_eq!(log::gk_tops(w.relay.store(), writer).await.unwrap(), 1);
+}
+
+/// RV g4 review3: `GK_STARTS_PER_EPOCH` is held in the insert's own transaction too. With
+/// three starts in an epoch, two sessions starting at once file one more at most.
+/// On Postgres too, with `VOIPC_TEST_POSTGRES` (its name has `gk` for that run).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_sessions_starting_gk_chains_at_once_file_four_an_epoch_at_most() {
+    let mut w = World::scratch_with(|_| {}).await;
+    let ann = w.person().await;
+    w.join(ann).await;
+    let me = AccountId(w.id(ann));
+    let mut next = GK;
+    for round in 0..40u32 {
+        let e = 5 + round;
+        gk_head(&w, e, 1_000).await;
+        for _ in 1..log::GK_STARTS_PER_EPOCH {
+            assert!(filed(&gk_start(&w, ann, next, e, CONV).await));
+            next += 1;
+        }
+        let [x, y] = starts_at_once(
+            &w.relay,
+            me,
+            [gk_start_of(next, e, None), gk_start_of(next + 1, e, None)],
+        );
+        next += 2;
+        let here: i64 = w
+            .rows(&format!(
+                "SELECT CAST(COUNT(*) AS BIGINT) FROM voipc_gk_chains WHERE epoch = {e}"
+            ))
+            .await;
+        assert_eq!(
+            here,
+            log::GK_STARTS_PER_EPOCH,
+            "round {round}: {x:?} / {y:?}"
+        );
+    }
+}
+
+/// RV g4 review3 (log.rs:3369): what `gk_tops` counts, and what bounds it. A top lives while a
+/// post of its run is kept, and the sweep keeps every post younger than `GRACE_MS` (3 days)
+/// past `kept_window`: those tops all count, so a newcomer gets a row at each and reads their
+/// posts. Once the posts are settled, the window keeps its newest two, and two tops are left,
+/// their rows to the newcomer with them. On Postgres too, with `VOIPC_TEST_POSTGRES`.
+#[tokio::test]
+async fn gk_tops_past_the_kept_window_count_while_their_posts_are_in_their_grace() {
+    let mut w = World::scratch_with(|c| c.kept_window = 2).await;
+    let (ann, dan) = (w.person().await, w.person().await);
+    w.join(ann).await;
+    w.join(dan).await;
+    let me = AccountId(w.id(ann));
+    let tops = 8u32;
+    for i in 0..tops {
+        gk_head(&w, 5 + i, 1_000).await;
+        assert!(filed(&gk_start(&w, ann, GK + i, 5 + i, CONV).await));
+        db!(w.relay.store(), pool => {
+            sqlx::query("INSERT INTO voipc_log (conv, sender, epoch, server_at, keep_until, ct) VALUES ($1, $2, $3, $4, $5, $6)")
+                .bind(CONV)
+                .bind(&me.0[..])
+                .bind(i64::from((GK + i) << 1))
+                .bind(log::now_ms() - 3_600_000)
+                .bind(i64::MAX / 2)
+                .bind(&b"x"[..])
+                .execute(pool)
+                .await
+                .unwrap();
+        });
+    }
+    w.rows(&format!(
+        "UPDATE voipc_chains SET created_at = {}",
+        util::now() - 7200
+    ))
+    .await;
+    log::sweep(&w.relay).await.unwrap();
+    let writer = writer_here(&w, &me.0).await.0;
+    assert_eq!(
+        w.rows("SELECT COUNT(*) FROM voipc_log").await,
+        i64::from(tops)
+    );
+    assert_eq!(
+        log::gk_tops(w.relay.store(), writer).await.unwrap(),
+        i64::from(tops)
+    );
+    owe(&w, ann, dan).await;
+    let d = w.id(dan);
+    for i in 0..tops {
+        let out = gk_rows_put(&w, ann, (GK + i) << 1, &[d], i + 1 == tops).await;
+        assert!(filed(&out), "{out:?}");
+    }
+    assert_eq!(rows_to(&w, &d).await, i64::from(tops), "a row at every top");
+    // Settled: the window's two are what is left
+    w.rows(&format!(
+        "UPDATE voipc_log SET server_at = server_at - {}",
+        4 * 86_400_000i64
+    ))
+    .await;
+    log::sweep(&w.relay).await.unwrap();
+    assert_eq!(w.rows("SELECT COUNT(*) FROM voipc_log").await, 2);
+    assert_eq!(log::gk_tops(w.relay.store(), writer).await.unwrap(), 2);
+    assert_eq!(rows_to(&w, &d).await, 2);
+}
+
+/// RV g4 review4 check: a post with its own timer of 3 to 6 days never counts as settled
+/// (older than GRACE_MS with more than GRACE_MS left), so past 3 days old it is outside both
+/// `kept_window` and "the last 3 days", and still keeps its gk top. Control: no timer.
+#[tokio::test]
+async fn gk_tops_kept_by_posts_with_a_timer_of_3_to_6_days_count_past_their_grace() {
+    for ttl in [Some(5 * 86_400u32), None] {
+        let mut w = World::scratch_with(|c| c.kept_window = 2).await;
+        let (ann, dan) = (w.person().await, w.person().await);
+        w.join(ann).await;
+        w.join(dan).await;
+        let me = AccountId(w.id(ann));
+        let tops = 8u32;
+        for i in 0..tops {
+            gk_head(&w, 5 + i, 1_000).await;
+            assert!(filed(&gk_start(&w, ann, GK + i, 5 + i, CONV).await));
+            let out = log::append(&w.relay, me, CONV, (GK + i) << 1, b"x", ttl)
+                .await
+                .unwrap();
+            assert!(matches!(out, AccountReply::LogAppended { .. }), "{out:?}");
+        }
+        // Four days pass: posts and chain starts are 4 days old
+        let d4 = 4 * 86_400_000i64;
+        w.rows(&format!(
+            "UPDATE voipc_log SET server_at = server_at - {d4}, keep_until = keep_until - {d4}"
+        ))
+        .await;
+        w.rows(&format!(
+            "UPDATE voipc_chains SET created_at = {}",
+            util::now() - 4 * 86_400
+        ))
+        .await;
+        log::sweep(&w.relay).await.unwrap();
+        let writer = writer_here(&w, &me.0).await.0;
+        let left = w.rows("SELECT COUNT(*) FROM voipc_log").await;
+        let t = log::gk_tops(w.relay.store(), writer).await.unwrap();
+        owe(&w, ann, dan).await;
+        let d = w.id(dan);
+        for i in 0..tops {
+            let _ = gk_rows_put(&w, ann, (GK + i) << 1, &[d], i + 1 == tops).await;
+        }
+        let rows = rows_to(&w, &d).await;
+        match ttl {
+            Some(_) => assert_eq!((left, t, rows), (8, 8, 8)),
+            None => assert_eq!((left, t, rows), (2, 2, 2)),
+        }
+    }
+}
+
+/// RV g4 review4 check: with no chain yet, a link naming a chain past i32 is filed (base:
+/// `behind`, the link had to name a chain the relay holds).
+#[tokio::test]
+async fn a_gk_link_to_no_chain_is_behind_whether_or_not_the_writer_has_one() {
+    let mut w = World::scratch_with(|_| {}).await;
+    let ann = w.person().await;
+    w.join(ann).await;
+    gk_head(&w, 5, 1_000).await;
+    let me = AccountId(w.id(ann));
+    let sharing = || log::Sharing {
+        shares: true,
+        may: true,
+    };
+    let a = log::chain_start(&w.relay, me, CONV, gk_start_of(GK, 5, Some(7)), sharing())
+        .await
+        .unwrap()
+        .0;
+    let b = log::chain_start(
+        &w.relay,
+        me,
+        CONV,
+        gk_start_of(GK, 5, Some(0x8000_0000)),
+        sharing(),
+    )
+    .await
+    .unwrap()
+    .0;
+    let rows: Vec<(i32, Option<i32>)> = db!(w.relay.store(), pool => {
+        sqlx::query_as("SELECT chain, older FROM voipc_chains").fetch_all(pool).await.unwrap()
+    });
+    assert!(!filed(&a), "a link to chain 7, which is not there");
+    assert!(!filed(&b), "a link past any chain number: {b:?}");
+    assert!(rows.is_empty(), "nothing filed: {rows:?}");
 }

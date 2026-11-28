@@ -349,6 +349,211 @@ pub const RESHAPED: &[(u32, Side, u32, &str)] = &[
         68,
         "Restrictions without the moderator's part and the wait's end",
     ),
+    (
+        22,
+        Side::Client,
+        41,
+        "AccountRequest::DeviceForget is refused",
+    ),
+    (
+        22,
+        Side::Server,
+        46,
+        "AccountReply::DeviceForgotten never comes",
+    ),
+    (
+        23,
+        Side::Client,
+        41,
+        "AccountRequest::DeviceForget is refused",
+    ),
+    (
+        23,
+        Side::Server,
+        46,
+        "AccountReply::DeviceForgotten never comes",
+    ),
+    (
+        12,
+        Side::Server,
+        32,
+        "EncryptedDirectChatMessage without the sender's account",
+    ),
+    (
+        12,
+        Side::Server,
+        36,
+        "PokeReceived without the sender's account",
+    ),
+    (
+        13,
+        Side::Server,
+        32,
+        "EncryptedDirectChatMessage without the sender's account",
+    ),
+    (
+        13,
+        Side::Server,
+        36,
+        "PokeReceived without the sender's account",
+    ),
+    (
+        14,
+        Side::Server,
+        32,
+        "EncryptedDirectChatMessage without the sender's account",
+    ),
+    (
+        14,
+        Side::Server,
+        36,
+        "PokeReceived without the sender's account",
+    ),
+    (
+        15,
+        Side::Server,
+        32,
+        "EncryptedDirectChatMessage without the sender's account",
+    ),
+    (
+        15,
+        Side::Server,
+        36,
+        "PokeReceived without the sender's account",
+    ),
+    (
+        16,
+        Side::Server,
+        32,
+        "EncryptedDirectChatMessage without the sender's account",
+    ),
+    (
+        16,
+        Side::Server,
+        36,
+        "PokeReceived without the sender's account",
+    ),
+    (
+        17,
+        Side::Server,
+        32,
+        "EncryptedDirectChatMessage without the sender's account",
+    ),
+    (
+        17,
+        Side::Server,
+        36,
+        "PokeReceived without the sender's account",
+    ),
+    (
+        18,
+        Side::Server,
+        32,
+        "EncryptedDirectChatMessage without the sender's account",
+    ),
+    (
+        18,
+        Side::Server,
+        36,
+        "PokeReceived without the sender's account",
+    ),
+    (
+        19,
+        Side::Server,
+        32,
+        "EncryptedDirectChatMessage without the sender's account",
+    ),
+    (
+        19,
+        Side::Server,
+        36,
+        "PokeReceived without the sender's account",
+    ),
+    (
+        20,
+        Side::Server,
+        32,
+        "EncryptedDirectChatMessage without the sender's account",
+    ),
+    (
+        20,
+        Side::Server,
+        36,
+        "PokeReceived without the sender's account",
+    ),
+    (
+        21,
+        Side::Server,
+        32,
+        "EncryptedDirectChatMessage without the sender's account",
+    ),
+    (
+        21,
+        Side::Server,
+        36,
+        "PokeReceived without the sender's account",
+    ),
+    (
+        22,
+        Side::Server,
+        32,
+        "EncryptedDirectChatMessage without the sender's account",
+    ),
+    (
+        22,
+        Side::Server,
+        36,
+        "PokeReceived without the sender's account",
+    ),
+    (
+        23,
+        Side::Server,
+        32,
+        "EncryptedDirectChatMessage without the sender's account",
+    ),
+    (
+        23,
+        Side::Server,
+        36,
+        "PokeReceived without the sender's account",
+    ),
+    (
+        24,
+        Side::Server,
+        32,
+        "EncryptedDirectChatMessage without the sender's account",
+    ),
+    (
+        24,
+        Side::Server,
+        36,
+        "PokeReceived without the sender's account",
+    ),
+    (
+        24,
+        Side::Client,
+        41,
+        "AccountRequest: the group key's requests are refused",
+    ),
+    (
+        24,
+        Side::Server,
+        46,
+        "AccountReply: the group key's replies never come from it",
+    ),
+    (
+        25,
+        Side::Client,
+        41,
+        "AccountRequest: the group key's requests are refused",
+    ),
+    (
+        25,
+        Side::Server,
+        46,
+        "AccountReply: the group key's replies never come from it",
+    ),
+    (25, Side::Server, 90, "AdminLoad without edges and groups"),
 ];
 
 /// How many messages each side had at a protocol: an index at or past it is
@@ -362,7 +567,8 @@ fn client_messages(proto: u32) -> u32 {
         18 => 52,
         19 => 54,
         20 => 55,
-        21..=22 => 64,
+        21..=24 => 64,
+        25 => 68,
         _ => u32::MAX,
     }
 }
@@ -378,6 +584,9 @@ const CHANNEL_USERS: u32 = 18;
 const EMOTE_LIST: u32 = 56;
 const EMOTE_TICKET: u32 = 57;
 const RESTRICTIONS: u32 = 68;
+const DIRECT_MESSAGE: u32 = 32;
+const POKE_RECEIVED: u32 = 36;
+const ADMIN_LOAD: u32 = 90;
 
 /// `encode_client_msg` for a relay at `proto`: the frames to send, one each
 /// so a sender's pacer counts them as the relay does (`EmoteRemove` of many
@@ -562,6 +771,20 @@ fn frames_for(msg: &ClientMessage, proto: u32) -> Result<Vec<Vec<u8>>, ProtocolE
             | AccountRequest::KeyStepUp { .. }
             | AccountRequest::LoginKeySet { .. },
         ) if proto < 22 => Err(ProtocolError::NotOnThisRelay(proto)),
+        // A relay before 24 has no way to drop one key: the old one ages out there (90 days)
+        ClientMessage::Account(AccountRequest::DeviceForget { .. }) if proto < 24 => {
+            Err(ProtocolError::NotOnThisRelay(proto))
+        }
+        // The group key (26): its own messages are past every older relay's count
+        ClientMessage::Account(
+            AccountRequest::SeatKeysPublish { .. }
+            | AccountRequest::SelfRowPut { .. }
+            | AccountRequest::EpochChainStart { .. }
+            | AccountRequest::EpochChainKeys { .. }
+            | AccountRequest::SelfRowsList { .. }
+            | AccountRequest::RowMakers { .. }
+            | AccountRequest::KeptKemPublish { .. },
+        ) if proto < 26 => Err(ProtocolError::NotOnThisRelay(proto)),
         ClientMessage::EmoteAdd { emote } if proto == 14 => old(postcard::to_allocvec(&(
             EMOTE_ADD,
             EmoteAdd14 {
@@ -619,6 +842,12 @@ pub fn decode_server_msg_from(payload: &[u8], proto: u32) -> Result<ServerMessag
                 emotes: list.emotes.into_iter().map(Emote::from).collect(),
             }
         }
+        (DIRECT_MESSAGE, ..=24) => postcard::from_bytes::<Direct24>(rest)?.into(),
+        (POKE_RECEIVED, ..=24) => postcard::from_bytes::<Poke24>(rest)?.into(),
+        // A struct variant of one field is that field's bytes; 90 is new at 25
+        (ADMIN_LOAD, 25) => ServerMessage::AdminLoad {
+            report: postcard::from_bytes::<LoadReport25>(rest)?.into(),
+        },
         (RESTRICTIONS, 19..=22) => ServerMessage::Restrictions {
             list: postcard::from_bytes::<Restrictions22>(rest)?
                 .list
@@ -653,6 +882,118 @@ struct Restriction22 {
     expires_in_secs: Option<u32>,
     by: String,
     reason: String,
+}
+
+/// A direct message before 25, which named no account: the app knew it off the lobby.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename = "EncryptedDirectChatMessage")]
+struct Direct24 {
+    from_user_id: UserId,
+    from_username: String,
+    to_user_id: UserId,
+    ciphertext: Vec<u8>,
+    message_type: u8,
+    timestamp: u64,
+}
+
+impl From<Direct24> for ServerMessage {
+    fn from(m: Direct24) -> ServerMessage {
+        ServerMessage::EncryptedDirectChatMessage {
+            from_user_id: m.from_user_id,
+            from_username: m.from_username,
+            to_user_id: m.to_user_id,
+            ciphertext: m.ciphertext,
+            message_type: m.message_type,
+            timestamp: m.timestamp,
+            account: None,
+        }
+    }
+}
+
+/// A poke before 25, as `Direct24`.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename = "PokeReceived")]
+struct Poke24 {
+    from_user_id: UserId,
+    from_username: String,
+    ciphertext: Vec<u8>,
+    message_type: u8,
+}
+
+impl From<Poke24> for ServerMessage {
+    fn from(m: Poke24) -> ServerMessage {
+        ServerMessage::PokeReceived {
+            from_user_id: m.from_user_id,
+            from_username: m.from_username,
+            ciphertext: m.ciphertext,
+            message_type: m.message_type,
+            account: None,
+        }
+    }
+}
+
+/// The Load view of a relay at 25, which has no edges.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename = "LoadReport")]
+struct LoadReport25 {
+    online: u32,
+    max_users: u32,
+    in_rooms: u32,
+    lobby: u32,
+    live_lobby: u32,
+    shares: Vec<ShareLoad25>,
+    video_kbps: u64,
+    video_budget_kbps: u64,
+    rss_mib: u32,
+    cpu_secs: u64,
+    udp_dropped: u64,
+    last_minute: Vec<String>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename = "ShareLoad")]
+struct ShareLoad25 {
+    channel_id: ChannelId,
+    sharer: String,
+    viewers: u32,
+    cap: u32,
+    kbps: u32,
+}
+
+impl From<LoadReport25> for LoadReport {
+    fn from(r: LoadReport25) -> LoadReport {
+        LoadReport {
+            online: r.online,
+            max_users: r.max_users,
+            in_rooms: r.in_rooms,
+            lobby: r.lobby,
+            live_lobby: r.live_lobby,
+            shares: r.shares.into_iter().map(ShareLoad::from).collect(),
+            video_kbps: r.video_kbps,
+            video_budget_kbps: r.video_budget_kbps,
+            rss_mib: r.rss_mib,
+            cpu_secs: r.cpu_secs,
+            udp_dropped: r.udp_dropped,
+            last_minute: r.last_minute,
+            warnings: r.warnings,
+            edges: vec![],
+            groups: vec![],
+        }
+    }
+}
+
+impl From<ShareLoad25> for ShareLoad {
+    fn from(s: ShareLoad25) -> ShareLoad {
+        ShareLoad {
+            channel_id: s.channel_id,
+            sharer: s.sharer,
+            viewers: s.viewers,
+            cap: s.cap,
+            kbps: s.kbps,
+            on_edges: 0,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1019,9 +1360,31 @@ mod tests {
                 "EmoteTicket",
                 variant(14, &["ServerMessage", "ENUM", "57", "EmoteTicket"]),
             ),
+            (
+                traced::<AdminLoad25>(),
+                "AdminLoad",
+                variant(25, &["ServerMessage", "ENUM", "90", "AdminLoad"]),
+            ),
         ];
         let cases = cases
             .into_iter()
+            .chain((OLDEST_RELAY_PROTOCOL..25).flat_map(|v| {
+                [
+                    (
+                        traced::<Direct24>(),
+                        "EncryptedDirectChatMessage",
+                        variant(
+                            v,
+                            &["ServerMessage", "ENUM", "32", "EncryptedDirectChatMessage"],
+                        ),
+                    ),
+                    (
+                        traced::<Poke24>(),
+                        "PokeReceived",
+                        variant(v, &["ServerMessage", "ENUM", "36", "PokeReceived"]),
+                    ),
+                ]
+            }))
             .chain((OLDEST_RELAY_PROTOCOL..16).flat_map(|v| {
                 [
                     (
@@ -1049,6 +1412,78 @@ mod tests {
             variant(14, &["ClientMessage", "ENUM", "46", "EmoteRemove"]),
             serde_json::json!({ "STRUCT": [{ "name": "STR" }] })
         );
+    }
+
+    /// `ServerMessage::AdminLoad` at 25 as the golden file has it, around the report. The
+    /// decode arm reads `LoadReport25` alone: one field's variant has that field's bytes.
+    #[derive(Serialize, Deserialize)]
+    #[serde(rename = "AdminLoad")]
+    struct AdminLoad25 {
+        report: LoadReport25,
+    }
+
+    #[test]
+    fn the_load_view_of_a_relay_at_25_has_no_edges_or_groups() {
+        let report = LoadReport25 {
+            online: 3,
+            max_users: 10,
+            in_rooms: 2,
+            lobby: 1,
+            live_lobby: 500,
+            shares: vec![ShareLoad25 {
+                channel_id: 4,
+                sharer: "ann".into(),
+                viewers: 2,
+                cap: 32,
+                kbps: 7500,
+            }],
+            video_kbps: 15_000,
+            video_budget_kbps: 1_000_000,
+            rss_mib: 60,
+            cpu_secs: 9,
+            udp_dropped: 1,
+            last_minute: vec!["a".into()],
+            warnings: vec!["w".into()],
+        };
+        let payload = postcard::to_allocvec(&(ADMIN_LOAD, AdminLoad25 { report })).unwrap();
+        let ServerMessage::AdminLoad { report } = decode_server_msg_from(&payload, 25).unwrap()
+        else {
+            panic!("not AdminLoad");
+        };
+        assert!(report.edges.is_empty());
+        assert!(report.groups.is_empty());
+        assert_eq!((report.online, report.udp_dropped), (3, 1));
+        assert_eq!(report.warnings, ["w"]);
+        assert_eq!(
+            report.shares,
+            [ShareLoad {
+                channel_id: 4,
+                sharer: "ann".into(),
+                viewers: 2,
+                cap: 32,
+                kbps: 7500,
+                on_edges: 0,
+            }]
+        );
+        // Today's comes through as it is
+        let edge = EdgeLoad {
+            name: "e1".into(),
+            online: true,
+            ..Default::default()
+        };
+        let msg = ServerMessage::AdminLoad {
+            report: LoadReport {
+                edges: vec![edge.clone()],
+                ..Default::default()
+            },
+        };
+        let bytes = encode_server_msg(&msg).unwrap();
+        let ServerMessage::AdminLoad { report } =
+            decode_server_msg_from(&bytes[4..], PROTOCOL_VERSION).unwrap()
+        else {
+            panic!("not AdminLoad");
+        };
+        assert_eq!(report.edges, [edge]);
     }
 
     /// The payloads of the frames, each checked to be exactly one frame.
@@ -1229,6 +1664,13 @@ mod tests {
                     offset: 0,
                 },
                 19,
+            ),
+            (
+                ClientMessage::EdgeFailed {
+                    sharer_user_id: 1,
+                    placement: 2,
+                },
+                25,
             ),
         ];
         for (msg, v) in cases {
@@ -1803,6 +2245,80 @@ mod tests {
                 (list[1].by_voice, list[1].by_text, list[1].wait_in_secs),
                 (false, false, Some(600))
             );
+        }
+    }
+
+    /// A relay before 24 never hears `DeviceForget`: it would not know the request.
+    #[test]
+    fn a_device_forget_goes_only_to_a_relay_at_24() {
+        let msg = ClientMessage::Account(AccountRequest::DeviceForget {
+            device_id: vec![7; 16],
+        });
+        for v in OLDEST_RELAY_PROTOCOL..24 {
+            assert!(
+                matches!(
+                    encode_client_msg_for(&msg, v),
+                    Err(ProtocolError::NotOnThisRelay(_))
+                ),
+                "protocol {v}"
+            );
+        }
+        for v in 24..=PROTOCOL_VERSION {
+            assert!(encode_client_msg_for(&msg, v).is_ok(), "protocol {v}");
+        }
+    }
+
+    #[test]
+    fn the_group_key_goes_only_to_a_relay_at_26() {
+        let msgs = [
+            ClientMessage::EpochFetch {
+                group: "c:1".into(),
+                have: None,
+                at: vec![],
+                seat: None,
+            },
+            ClientMessage::KeyholdReplace {
+                old: [1; 8],
+                pair: crate::gk::EndorsedPair {
+                    origin: crate::gk::origin::DESKTOP,
+                    u: 0,
+                    kem: vec![],
+                    dh: vec![],
+                    n: 1,
+                    made: 0,
+                    sig: vec![],
+                },
+            },
+            ClientMessage::Account(AccountRequest::SeatKeysPublish {
+                kem: vec![],
+                dh: vec![],
+                n: 1,
+                made: 0,
+                sig: vec![],
+            }),
+            ClientMessage::Account(AccountRequest::RowMakers {
+                group: "c:1".into(),
+                gen: [0; 16],
+                sk: [0; 8],
+                sx: [0; 8],
+                after: None,
+            }),
+            ClientMessage::Account(AccountRequest::KeptKemPublish {
+                kem: vec![],
+                sig: vec![],
+            }),
+        ];
+        for msg in &msgs {
+            for v in OLDEST_RELAY_PROTOCOL..26 {
+                assert!(
+                    matches!(
+                        encode_client_msg_for(msg, v),
+                        Err(ProtocolError::NotOnThisRelay(_))
+                    ),
+                    "{msg:?} at {v}"
+                );
+            }
+            assert!(encode_client_msg_for(msg, 26).is_ok(), "{msg:?}");
         }
     }
 

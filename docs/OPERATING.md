@@ -94,7 +94,9 @@ WantedBy=multi-user.target
   open.
 - **Certificates:** `LoadCredential` hands the relay its Let's Encrypt certificate and key
   without opening `/etc/letsencrypt` to it.
-- **Stopping:** the relay stops cleanly on SIGTERM, which is what `systemctl stop` sends.
+- **Stopping:** the relay stops cleanly on SIGTERM, which is what `systemctl stop` sends. It tells the clients, then
+  gives the group key up to 3 s to write what its channels still had queued (an exit, a keyholder removal, a seat asked);
+  the log names a channel that took longer.
 
 ## 4. TLS
 
@@ -131,6 +133,14 @@ WantedBy=multi-user.target
 - **The key file** (`key_file`, or `VOIPC_ACCOUNTS_KEY`) seals the two-factor secrets and keys
   everything the relay hashes. Without it the database is of no use: back the two up together.
 - **Postgres:** use `sslmode=verify-full` in the URL when the database is on another host.
+- **Database connections** (`db_connections`, 32): a sign-in is a few writes, and a write waits for the database's
+  disk. The more writes are waiting together, the more each flush carries, so this is how fast a relay signs people
+  back in after a restart. Postgres' own `max_connections` (100) has to hold it with everything else on that database.
+  Past them, sign-ins wait their turn for up to 10 s, then the app tries again a moment later. §10a has the numbers.
+- **Password sign-ins** (`password_sign_ins_per_15min`, 1000, everyone together): each new device signs in with the
+  password once; a remembered device signs with its key and is not counted. The cap holds off guessing spread over many
+  addresses, and once it is spent no new device signs in until the 15 minutes end. 1000 is about one a second: raise it
+  for a move or a big first evening, lower it while such guessing runs. Per address it stays 30.
 - **Commands:**
   - `admin grant|revoke <name> <group>` (`admin`, `moderator`, or one made in the app);
   - `admin reset-2fa <name>`;
@@ -223,9 +233,24 @@ WantedBy=multi-user.target
   A copy made before someone's deletion still holds their posts until it is deleted, which the timer below does within
   30 days. Put the database and its copies on an encrypted disk ([MOVING.md](MOVING.md#data-protection)).
 - **Restore:** stop the service, `gunzip` the copy first and copy the files back (Postgres: `pg_restore --clean --if-exists
-  -d voipc` from the dump), start it again. Test a restore once, before you need one.
-- **A restore puts back whoever left or was removed since the copy.** Their seat returns with the rest, and writers' apps
-  hand them keys again at their next post, each named as it happens, until someone removes them again.
+  -d voipc` from the dump), then, with the service still stopped,
+
+      sudo -u voipc voipc-server --config /etc/voipc/server.toml db new-incarnation
+
+  and start it again. Test a restore once, before you need one.
+- **`db new-incarnation` (1.14) belongs to every restore.** A channel's group key moved on after the copy was made, and
+  whoever left since was taken out of it there, which the copy does not know. The command marks the database as restored:
+  at its next start every channel with a key starts a new generation and its members are seated again, as after the
+  switch to the group key (§10a has what a re-seat costs). Members' apps see the new start as made anew. If it is
+  forgotten, an app whose keys are ahead of the database proves it with a signed header the relay can check, and the relay
+  starts that channel anew itself, at most once an hour, only on a header signed by one of the channel's keyholders now;
+  for a copy older than the channel's current generation it cannot check that, and only warns in the Load tab ("a member
+  reports it ahead of this database"), and it warns the same for a header signed by a keyholder the copy does not hold
+  or no longer counts among them. What kept history the copy
+  holds stays readable.
+- **A restore puts back whoever left or was removed since the copy.** Their seat returns with the rest. On the live path
+  writers' apps hand them keys again at their next post, each named as it happens; under the group key they are seated
+  again in the new generation, and in a gated channel named to its writers, until someone removes them again.
 - **A restore also takes back what members deleted since.** It is there again, and on a server that moved from Discord
   their wishes are gone too, so the next run files those posts again. To start a move over, use Undo instead
   ([MOVING.md](MOVING.md#undo-and-re-runs), which says what to do if you have to restore).
@@ -359,6 +384,31 @@ of them:
   proxy that passes TLS through is fine; one that ends it in front of the TCP fallback makes
   app sign-ins over that fallback fail.
 
+**From 1.12 to 1.14** (protocol 23 to 26; 1.12.1, 1.13 with protocol 24, and 25 were never released):
+- **Apps first**, as for any protocol: a 1.14 app talks to the 1.12 relay meanwhile, without the group key and
+  without edges there.
+- A device remembered again (a password or provider sign-in on a device that already was) now drops its old device
+  key at once; on 1.12 those stayed until the 90-day sweep.
+- **Two migrations:** `0013_group_keys.sql` adds the group key's tables, and `0014_group_keys_restart.sql` (after
+  rc.1) what a channel's keys held in memory alone until then: a keyholder's removal proposed, the seats asked for
+  accounts that keep the channel's history, how far a new start had asked them, the exits asked of members who left,
+  were kicked or put out, and that a channel's group came back to its stored id (a new start is due). Going back
+  takes the old binary and the backup.
+- **The group key is on by default** (`group_key`, §13; [GROUP-KEY.md](GROUP-KEY.md)). At the first start no channel has
+  keys yet, and each makes them at its first use: the first member who needs one asks, a volunteer's app starts the
+  channel's keys, and members are seated as they read or write. An account that keeps a channel's history is seated for
+  it from the first time one of its devices signs in with a 1.14 app; kept posts written under the group key before then
+  are not readable to it. What the channel kept before the update stays readable as before. Desktop apps help hold keys
+  unless their user turns that off; browsers and guests only as a last resort.
+- **`group_key = false` keeps 1.12's paths**: the live path in text channels and the 3N join in voice rooms, and the
+  relay still serves what the key kept, read-only. A start with it on again after a run with it off starts every
+  channel's keys anew, a full re-seat, so leave it as it is unless the group key is what fails you.
+- **A restore now ends with `db new-incarnation`** (§7).
+- **Keys whose defaults change something:** `[media] voice_room` (250): a voice room over 250 refuses the next joiner
+  until its limit or this is raised; `db_connections` (32, was 10). One channel message holds at most 16 KiB in voice
+  rooms too, as it always did in text channels. Every new key is listed in
+  [COMPATIBILITY.md](COMPATIBILITY.md) §3, "What changed in 1.14".
+
 **A later release that migrates the database** needs the old binary **and** the backup taken
 before the upgrade for a rollback: an older relay refuses a database that a newer one has
 migrated, by design. Release candidates (`-rc.N`) are for testing on a relay you can roll back.
@@ -393,7 +443,7 @@ The simplest way is a host directory that user 65532 owns:
     install -d -o 65532 -g 65532 -m 0700 /srv/voipc
     install -o 65532 -g 65532 -m 0600 server.toml cert.pem key.pem /srv/voipc/
     docker run -d --name voipc -v /srv/voipc:/data \
-      -p 9987:9987/tcp -p 9987:9987/udp ghcr.io/luki4fun/voipc-server:1.12.0
+      -p 9987:9987/tcp -p 9987:9987/udp ghcr.io/luki4fun/voipc-server:1.14.0-rc.2
     docker exec voipc /voipc-server --config /data/server.toml admin grant <name> admin
 
 With a named volume instead, copy the files in with a throwaway container first, then run the
@@ -427,8 +477,14 @@ warns at start if it got less. On the host, a container's included:
 sysctl -w net.core.rmem_max=4194304 net.core.wmem_max=4194304   # and the same in /etc/sysctl.d/ to keep it
 ```
 
+A relay for tens of thousands asks for 64 MiB: give it `33554432` (Linux doubles it) instead.
+
 At 2000 clients on this machine that took the packets dropped from 340,000 to under 11,000 a run, and all of them joining a
 channel from about 3 s to about 1 s. `nstat -az UdpRcvbufErrors` counts what the kernel has dropped this way.
+
+The relay also says so itself. In a minute when anything happened, it writes one line: who is online, connects refused
+and why, setups that failed, how sessions ended, and the datagrams dropped on its own socket, for example
+`last minute: 1998 online; ended: closed by peer 3, timed out 1; refused: per-IP limit reached 2; UDP datagrams dropped 412`.
 
 Measured with `community_load` (below) on one relay and one 32-thread machine with
 62 GiB, load clients on the same machine, 2026-11-04: guests, no voice, N clients arriving at
@@ -465,17 +521,22 @@ real community meets first are these:
 - **One message holds one list.** `UserList` fits 2621 guests, 1598 accounts, or 789 accounts with three
   badges each; `ChannelList` 1213 channels, 555 with a 64-byte description, 210 with 256 bytes. Past that
   the relay sends the rest in further messages and every app reads them, so a long list only takes longer.
-- **Joining a voice room takes time at the client.** A member joining a room of N sends 3N control messages
-  at 50 a second: 120 s at 2000. The crypto itself is small: 0.4 ms and about 4 KiB a member.
-- **In text channels a writer pays, at its first post.** Following them is one message however many there
-  are, and costs nobody else anything. A first post to 2000 online who have no session with the writer comes
-  to about 3.6 MB down and 360 KB up for that writer, and its readers can read within seconds. These are
-  sums, not yet a measured run.
+- **Joining a voice room took time at the client** before the group key, and still does with `group_key = false`: a
+  member joining a room of N sends 3N control messages at 50 a second, 120 s at 2000, though the crypto itself is small
+  (0.4 ms and about 4 KiB a member). Under the group key a join is one welcome from the room's keyholders.
+- **On the live path a writer in a text channel pays, at its first post.** Following them is one message however many
+  there are, and costs nobody else anything. A first post to 2000 online who have no session with the writer comes to
+  about 3.6 MB down and 360 KB up for that writer, and its readers can read within seconds. These are sums, not yet a
+  measured run. Under the group key (the default) a post costs its writer the post and, once an epoch, about 230 bytes,
+  however many read it; the channel's keyholders carry the rest (below).
 - **Finding someone's direct conversations reads every kept direct message on the relay,** at each connect, though no channel's:
   at a million of them, about 75 ms on SQLite and 155 ms on Postgres, measured with all of it in memory.
 - **Kept history is for 5000 members a channel** (`kept_seats`): the next joiner gets no offline catch-up there. Half of them
   take a seat by following a channel, the rest by asking for one or writing there. It is a guard for a small disk, not a wall: set
-  it lower on one. Past about 32,000 a writer's app no longer keeps a copy there, since it can hold no more pins.
+  it lower on one. Under the group key those accounts are seated in the channel's group at once, online or not, and that is
+  cheap to raise: a seat costs a keyholder one welcome of about 1.7 KB and a 60-byte row, and 100,000 seats took two minutes
+  (below). On the live path, past about 32,000 a writer's app no longer keeps a copy there, since it can hold no more pins;
+  the group key has no such limit.
 - **What kept messages cost the relay,** measured at 2000 and at 5000 members on a desktop NVMe, through the relay's own code, with a
   bare commit at about 3 ms. A post checks the channel's members against who holds its key, so it grows with members. A person does
   not wait for it: the live post goes first.
@@ -493,8 +554,16 @@ real community meets first are these:
 - **A channel keeps its newest 10,000 messages** (`kept_window`). The sweep deletes older ones for good, once the posts that
   pushed them out are three days old and have three days left: a raid cleaned up before then, or one on a short timer, takes
   nothing. Lowering it later only takes more; raising it brings nothing back. A big server should set it lower: keys grow with it.
+  Under the group key it is also what bounds the channel's key material: the relay keeps each epoch a kept message was
+  written in, its seals (about 97 KB at 100,000 members) and the rows of its buckets, until the sweep takes the last message
+  of it. At 100,000 members and the default, that is estimated at 1.6 to 6 GB a channel, by how often epochs change
+  ([GROUP-KEY.md](GROUP-KEY.md) §5.10); it was not measured yet.
 - **What a writer's keys take is counted against `quota_mb`**, a seat's row at half. So seat rows on disk are bounded by
-  accounts times that figure, and nothing evicts them: a writer over it stops being kept.
+  accounts times that figure, and nothing evicts them: a writer over it stops being kept. Under the group key, the rows a
+  writer who shares history gives newcomers (1,629 B at each of its chains no link reaches) are not counted: the relay
+  keeps them only for newcomers it owes an answer, and bounds them per seat taken instead, to those chains plus 4 rows:
+  about 8.1 KB at 5 such chains, and at most about 1.4 GB from one sharer that makes chains on purpose, at the default
+  `quota_mb` ([GROUP-KEY.md](GROUP-KEY.md) §8).
 - **A person's pins fit about 32,000 accounts,** in 56 pages of 48 KiB outside the sign-in message, read after it: at 2000 pins
   about 170 KB down at a sign-in, and nothing at a reconnect if the app stayed up and no page moved. People met only in open
   channels stop at half of that. A relay below protocol 21 keeps one item, about 560.
@@ -520,16 +589,329 @@ so no fsync cost and no cold reads, and these are floors.
 Discord's rate is what limits a run, never this. Search has no index of its own: it scans a channel, and at most two go
 at once.
 
-Not measured: voice in a big channel (`voice_load` is for that), accounts signing in at once, real
-networks.
+**Since 1.14 the lobby is not sent whole**, which was what made a join cost the relay more the more people were
+online. Measured on the same machine, 2026-11-16, guests connecting and staying (`community_load run N … --idle S`),
+load clients on the same machine:
+
+| Clients | Relay CPU to let them in | Relay RSS | Each | Connect p95 | Datagrams dropped |
+|---|---|---|---|---|---|
+| 5,000, before 1.14 | 197 s | 1,177 MiB | 241 KiB | 21 ms | 1,621 |
+| 5,000 | 7.9 s | 558 MiB | 114 KiB | 2 ms | 0 |
+| 10,000 | 17 s | 1,111 MiB | 113 KiB | 1 ms | 0 |
+| 25,000 | 103 s | 2,554 MiB | 104 KiB | 8 ms | 0 |
+| 50,000 | 158 s | 4,169 MiB | 85 KiB | 3 ms | 0 |
+
+An idle relay of 25,000 used 0.28 of a core. With text channels on the live path (`community_load follow`), the relay
+killed with `kill -9` halfway and started again: 10,000 were all back in 57 s, 25,000 in 89 s. At 25,000 with posts
+going out, every post to that many readers comes back as that many acknowledgements at once. An 8 MiB buffer dropped
+them: 750,000 datagrams, and 1,159 people who could not come back while their old session waited out its timeout. With
+`rmem_max` at 32 MiB (64 MiB given) nothing dropped while posting, 52,600 dropped in the minute everyone came back
+after `kill -9` (2,585 handshakes tried again), and nobody was lost: give such a relay the larger buffer above.
+
+Signing back in after a restart, with accounts on Postgres (`community_load seed`, then `run --accounts`): 50,000
+accounts with remembered devices arriving 2,000 a second, as after a relay restart. The relay keeps up as long as its
+database does, at 2.6 ms of relay CPU a sign-in. What the database does is its disk's flush:
+
+| Database | Signed in | Wait p95 |
+|---|---|---|
+| 10 connections, before 1.14 (busy refused at once) | stalled at 9,300 in a minute: every refusal came back as a new handshake | — |
+| 10 connections, waiting their turn | 17,700 in 350 s; the rest gave up | 274 s |
+| 32 connections, five runs | 50,000 in 51, 92, 141, 148 and 166 s, by how long the disk's flushes stalled (up to 100 s, this machine's btrfs) | 27 to 146 s |
+| 32 connections, `synchronous_commit = off` | 50,000 in 38 s, as fast as they came | 14 ms |
+
+Put a big relay's Postgres on a disk whose flushes are quick and steady (a server SSD that protects its cache on
+power loss), or set `synchronous_commit = off` for its database: a crash of Postgres then loses the last moment of
+writes, never the database, and a sign-in lost that way is made again.
+
+Screen shares (`share_load`, one HD share at 7.5 Mbit/s, 30 frames a second, viewers on the same machine):
+
+| Viewers | Sent to them | Frames a second each | Relay CPU | Datagrams dropped |
+|---|---|---|---|---|
+| 100 | 0.8 Gbit/s | 30 | 0.3 of a core | 0 |
+| 500 | 4.1 Gbit/s | 31 | 2 cores | 0 |
+| 1,000 | 8.5 Gbit/s | 32 | 4.4 cores | 0 |
+| 2,000 | 11.5 of 15 Gbit/s | 22 | 10 cores | 197,000 |
+| 500 over 5 shares | 4.2 Gbit/s | 32 | 4.5 cores; 2.3 with 4 threads | 0 |
+
+So a relay sends about 1,000 HD viewers before its network port is full, and its processor follows at about half a
+core per Gbit/s. `[media]` (§13) keeps it under what its port carries, and media edges (§10b) carry the rest.
+
+Through media edges (1.14), measured 2026-11-18 on the same machine, everything on loopback: the relay held to 4 CPUs
+(`taskset -c 0-3`, so 4 threads), each edge to 4 of its own (2 physical cores; `max_viewers` 1000, `egress_mbit` 8000),
+`share_load` on the other 16, one HD share at 7.5 Mbit/s and 30 frames a second for 30 s, `local_first` 8, `rmem_max` at
+32 MiB. A Firefox tab took about one core beside it, on no CPU of its own. The 2,000 run was made once with one load
+generator and once split over two of 1,000, each on CPUs of its own: both got every frame, and no generator went above
+43% of its CPUs, so the tool was not the limit there. The 3,000 run was split over three.
+
+| Viewers | Relay CPU, RSS | Each edge's CPU, RSS | Generator CPU, of its CPUs | Frames whole | Latency p50 / p95 | Refused | Datagrams dropped |
+|---|---|---|---|---|---|---|---|
+| 1,000, the relay alone | 2.2 cores, 206 MiB; 8.9 Gbit/s out | – | 20% of 16 | 100% | 13 / 17 ms | 0 | 0 |
+| 1,000, 1 edge (992 on it) | 0.03 of a core, 160 MiB | 2.2 cores, 156 MiB | 20% of 16 | 100% | 13 / 17 ms through the edge, 0 / 1 ms on the relay | 0 | 0 |
+| 2,000, 2 edges, one generator | 0.04 of a core, 339 MiB | 2.5 cores, about 227 MiB | 41% of 16 | 100% | 16 / 22 ms | 0 | 0 |
+| 2,000, 2 edges, two generators | 0.04 of a core, 341 MiB | 2.5 cores, up to 460 and 397 MiB | 43% and 42% of 8 | 100% | 16 / 22 ms | 0 | 0 |
+| 3,000, 3 edges, three generators | 0.14 to 0.26 of a core, 584 MiB | 3.3 to 3.5 of its 4 CPUs, about 830 MiB | 61 to 74% of 5 or 6 | 73% | 175-186 / 397-417 ms | 0 | 210, 3,086 and 0 at the edges, 0 at the relay |
+
+(The relay's 0.04 with two generators is 0.18 counted over the first generator's window, which takes in the second's
+arrivals.) A `kill -9` of one edge, 15 s after every viewer was watching:
+
+| Setup | The relay saw it go | Where its viewers went | Refused | Last frame to the next, p50 / p95 / max |
+|---|---|---|---|---|
+| 2 edges, 1,000 viewers | after 6.03 s ("timed out") | 496 to the other edge | 0 | 7.17 / 7.18 / 7.19 s |
+| 1 edge, 1,000 viewers | after 6.01 s | 992 back to the relay, which then used 1.03 cores | 0 | 6.07 / 6.08 / 6.08 s |
+
+So with edges a big share costs the relay its feeds alone: 0.04 of a core for 2,000 viewers on two edges, where 1,000 on
+the relay alone took 2.2 cores. An edge costs what the relay alone would: 2.2 to 2.5 cores and 160 to 460 MiB for 1,000
+HD viewers. The extra hop costs nothing measurable here: 1,000 viewers through an edge saw 13 / 17 ms, as 1,000 on the
+relay alone did. In the 3,000 run only 73% of frames came whole, with 22.5 Gbit/s over loopback and each edge at about
+85% of its CPUs. Why is not proven: most likely this one machine carrying a relay, three edges and 3,000 viewers at
+once, but only edges and viewers on machines of their own can tell that apart from a limit of the edges.
+
+Not measured: edges and viewers on other machines and real networks (none were available here), more than one share
+through edges, and Firefox and the desktop and Android apps watching through an edge. Chromium is, in the `EDGE=1`
+lane of `test-web.sh`.
+
+Voice (`voice_load 1000 127.0.0.1:9987 90 --rooms 20 --speakers 3`): 20 rooms of 50 people, three talking in each,
+147,000 packets a second to listeners. Loss was 0.001% (packets in flight at the ends) and the socket dropped none.
+The relay's CPU depends on how many threads it wakes, not on the work:
+
+| Relay threads (`TOKIO_WORKER_THREADS`) | Relay CPU |
+|---|---|
+| 2 | 0.9 of a core |
+| 8 | 3.3 cores |
+| 32, one per core here (the default) | 4.1 cores |
+| 32, held to 2 cores (`taskset -c 0-1`) | 0.85 of a core |
+
+The loss was the same in each run, so the extra CPU goes to the threads themselves (no profile yet says where). On a
+relay that mostly carries voice, `TOKIO_WORKER_THREADS=4` in its environment saves that. A relay that signs thousands
+in at once needs the cores (2.6 ms each, above). The screen-share CPU above ran with 32 threads, which costs it about
+twice what 4 do.
+
+Not measured: one voice room at its limit of 250, real networks.
+
+**The group key (1.14)**, measured with `group_load` on the same machine, 2026-11-19, relay and load clients together,
+every keyholder an app's own duty building its commits whole, the way the desktop app does. A re-seat is bound by its
+Join commits one after another (at most 256 seats each, 391 at 100,000), not by the keyholders' processors:
+
+| What | Seats | Took | Relay RSS | Relay CPU | Database |
+|---|---|---|---|---|---|
+| Offline accounts that keep the channel's history, seated at once (`seats N`), SQLite | 5,000 | 4.8 s | 48 MiB | 0.4 s | 44 MB |
+| the same | 20,000 | 13.1 s | 90 MiB | 2.1 s | 165 MB |
+| the same | 50,000 | 27.6 s | 150 MiB | 9.1 s | 404 MB |
+| the same | 100,000 | 117 s | 269 MiB | 30.2 s | 804 MB |
+| the same, Postgres | 100,000 | 118 s | 250 MiB | 23.1 s | 605 MB |
+| Guests connecting 1,000 a second and reading (`storm N`), no accounts | 50,000 | 52 s, each seated within 0.3 s (p95) | 4,976 MiB | 104 s | – |
+
+- The 100,000 runs include a stall of about 30 s, from the relay queueing each eager seat against the whole queue; that was
+  fixed after these runs (a seat index on the join queue) and they were not made again. Below 100,000 it cost little.
+- A keyholder spends about 28 ms building a Join of 256 and 10 ms more on its due's frames, mostly checking the 256
+  joiners' signatures: 15 s of keyholder CPU for a 100,000 re-seat. Each keyholder held about 50 MiB at 100,000.
+- A refresh at 100,000 builds in about 60 ms and sends 0.85 MB: about 10 MB an hour from the keyholders.
+- A keyholder's leaving is a full re-key: 3.6 s of build at 100,000. With guests leaving and coming back 20 a second for two
+  minutes (`exits 20`) and two writers posting each second, no post was dropped at 5,000 to 100,000 seats, and each member
+  took about 3.3 MB an hour, almost all of it the posts. Being seated costs a member 4 to 5 KB.
+- A relay's group memory is about 1.8 KB a guest seat (88 MB at 50,000). A reconnect storm of 50,000 guests is bound by
+  admission, as without the key: 189 Joins and one opening took 8.7 s of keyholder CPU, and nothing was missed. In that run
+  up to 8% of guests whose first ask came while the group's inbox was full stayed unseated until their next post; the apps
+  have asked again by themselves since, also not measured again.
+- In a browser a keyholder builds in steps of 2 ms in a call or while hidden, 8 ms otherwise: a cold re-key of 10,000,
+  about 0.8 s of work, ran as about 400 steps, the longest 5.3 ms; a Join's due still takes about 22 ms of the page at once
+  for its joiners' signatures ([GROUP-KEY.md](GROUP-KEY.md) §8 has the browser's numbers). A browser holds text keys for at
+  most 10,000 seats; above that only desktops do.
+- Not measured: a storm of 100,000 guests (it would need about 38 GiB here), keyholders on other machines, phones, and the
+  key material `kept_window` keeps.
+
+The Load tab (*Server admin*) shows a row for each group of at least 1,000 seats and for any group with something amiss, at
+most 50: its seats, keyholders online and in all, the age of its last commit, joins and exits waiting, missed deadlines, and
+about what it holds in memory and in the database. It shows a commit as soon as the relay has queued it to the members,
+a moment before their apps take it. Its warnings name the channel: no keyholder online for some minutes, keys
+late (no new epoch for 70 minutes), missed deadlines, and a member reporting the channel ahead of this database (a restore
+without `db new-incarnation`, §7). On a relay with accounts, a text channel that keeps its history (not an anonymous one or one
+that hides its members) waits, when its keyholders are all away, before a volunteer starts its keys anew: not at all
+where every keyholder was a browser or a guest (a volunteer starts anew as soon as none is online and someone waits to be
+seated or to leave), unless a new start began that set within the hour, else an hour. That hour counts the time its
+keyholders were away before a restart too, but not the relay's own downtime: after a start it ends 10 minutes later at the
+earliest, so the keyholders online when the relay stopped can reconnect first. Other text channels, voice rooms,
+and every channel on a relay without accounts start anew at once. A channel whose keyholders changed 2048 times starts
+anew too, once, so that every member can still follow its keys.
 
 ```sh
-cargo build -p voipc-server --release --bin voipc-server --example community_load
+cargo build -p voipc-server --release --bin voipc-server --examples
 target/release/voipc-server -c server.toml &   # max_users above N
 target/release/examples/community_load run 500 127.0.0.1:9987 "$!"
+target/release/examples/community_load run 5000 127.0.0.1:9987 "$!" --rate 200 --idle 60   # memory per connection
+target/release/examples/share_load 500 127.0.0.1:9987 "$!" --shares 1 --mbit 7.5 --fps 30   # [media] above what it asks
+target/release/examples/voice_load 1000 127.0.0.1:9987 90 --rooms 20 --speakers 3
 target/release/examples/community_load frames
 target/release/examples/community_load crypto 2000
+target/release/examples/group_load seats 20000      # the group key; starts a relay of its own (port 29900), --database postgres://… for Postgres
+target/release/examples/group_load storm 20000
+target/release/examples/group_load exits 20 --guests 20000
 ```
+
+With edges (`edge-core.toml` is `server.toml` with `[pool] edges = { e1 = "…" }`, `e1.toml` that edge's file, §10b),
+each process on CPUs of its own:
+
+```sh
+taskset -c 0-3 target/release/voipc-server -c edge-core.toml & relay=$!
+taskset -c 4-7 target/release/voipc-server -c e1.toml edge & edge=$!
+taskset -c 16-23 target/release/examples/share_load 1000 127.0.0.1:9987 "$relay" --edge-pids "$edge" --secs 34 &
+sleep 3   # the first one's share is up
+taskset -c 24-31 target/release/examples/share_load 1000 127.0.0.1:9987 "$relay" --edge-pids "$edge" --shares 0 --first 1000
+```
+
+## 10b. Big screen shares
+
+A relay sends each viewer of a share a copy of its own, so its network port is what a big share meets first: about 1,000
+HD viewers on 10 Gbit/s (§10a). Two things keep that in hand.
+
+**The caps, on every relay** (`[media]`, 1.14, §13):
+- `share_viewers` (100): the viewers of one share this relay serves itself.
+- `video_egress_mbit` (1000, a 1 Gbit port): the video it sends in all, counted at each share's resolution: 7.5 Mbit/s a
+  viewer at 1080p, 4 at 720p, 2 below. Give it what the port carries with room to spare for voice and the rest, about
+  8000 on a 10 Gbit port.
+- A viewer past either is told the share is full, or that the server is sending all the video it can, with a Retry.
+  Nothing else changes, and the sharer's own share goes on.
+
+**Media edges** (`[pool]`, 1.14) carry more. An edge is the same `voipc-server` binary, run as `voipc-server -c edge.toml
+edge`, best on a machine and a port of its own. It links to the relay over the relay's own UDP port, proves itself with a
+secret both hold, and forwards the shares the relay places viewers on: the relay sends it one copy of each, and it sends
+one to each viewer there.
+- **Who goes where.** The first `local_first` (8) viewers of each share stay on the relay, which is no farther away than
+  an edge. The next go to the edge with the most room, each up to its `max_viewers` and `egress_mbit`; one already
+  carrying that share is picked if it is close, which saves the relay a copy. The relay counts one copy per edge
+  against its `video_egress_mbit`. Where no edge has room, the relay serves the viewer itself, up to its `[media]` caps,
+  and refuses only past those; one of the first that the relay has no room for goes to an edge already carrying the
+  share, which costs the relay nothing more. A viewer on the TCP fallback always stays on the relay. With edges, `share_viewers` is
+  the relay's own part of a share, not the whole.
+- **What an edge has.** A UDP port for its viewers, and nothing else: no TCP port, page, accounts, files, emotes,
+  channels, bans or operator certificate. It makes a certificate of its own, renewed every 7 days, which viewers trust
+  by the hash the relay sends them, so an edge needs no DNS name or public certificate.
+- **What an edge sees.** The address of each viewer it serves, when they watch, and each frame's size and timing. Never
+  a name, a channel or a key: the sharer's app seals every frame ([THREAT-MODEL.md](THREAT-MODEL.md)). It does see each
+  share's sharer by session id, which is the sharer's user id: whoever runs an edge and also joins the relay (as a
+  guest, where guests may) can look that up to a name, and to the channel if they can see it. Still, run it where you
+  would run the relay. The relay logs each edge's address when it links (edges are infrastructure, not
+  users); an edge logs viewer addresses at `debug` only.
+- **When one goes away.** A stopped edge tells its viewers and the relay at once; a crashed or cut-off one the relay
+  notices within 6 s. Either way its viewers go to another edge or back to the relay at once, and only those nobody has
+  room for are refused (6.1 s back on the relay, 7.2 s on another edge, in §10a). A viewer whose edge sends no whole
+  frame for 10 s asks the relay to move it, and is not sent to that edge again for 60 s; while the share itself sends
+  nothing (its sharer's network stalls), nobody is moved. Nobody is moved back to an edge that returns.
+- **What edges do not carry:** voice (it never leaves the relay), and the sharer's upload. An edge is picked by its
+  room, not by where it or the viewer is.
+
+**How many a setup carries.** Estimates from §10a, not measured on separate machines: each machine with a 10 Gbit port
+used to about 80% (an edge's default `egress_mbit` of 8000), HD at 7.9 Mbit/s on the wire, so about 1,000 HD viewers
+a machine, and 5 big shares. The relay's `[media]` is raised to match (`share_viewers` 1000, `video_egress_mbit` 8000).
+With its defaults (100 a share, 1000 Mbit/s) the relay itself adds at most about 130 HD viewers in all, not 1,000, and
+its budget has to hold its feeds too: one copy per share per edge, the last column.
+
+| Setup | HD viewers | What the relay sends its edges |
+|---|---|---|
+| The relay alone | about 1,000 | 0 |
+| 1 edge | about 2,000 | 37 Mbit/s |
+| 3 edges | about 4,000 | 112 Mbit/s |
+| 10 edges | about 11,000 | 375 Mbit/s |
+
+An edge took 2.2 to 2.5 cores and 160 to 460 MiB per 1,000 HD viewers (§10a). A 720p share counts 4 Mbit/s a
+viewer and a smaller one 2, so an `egress_mbit` of 8000 has room for 2,000 or 4,000 of those: raise the edge's
+`max_viewers` (1000) to use it, if its processor keeps up. Smaller shares were not measured.
+
+**Setting one up:**
+1. Make a secret for the edge: `openssl rand -base64 32`. Each edge has its own.
+2. On the relay, in `server.toml`, then restart it:
+
+   ```toml
+   [pool]
+   local_first = 8                          # the first viewers of each share stay here
+   edges = { fra1 = "<that secret>" }       # name = secret, one per edge
+   ```
+
+   A name is 1 to 32 of `a-z`, `0-9` and `-`, and is what the Load tab shows; a secret has at least 32 characters.
+   `local_first` may not be above `[media] share_viewers`.
+3. On the edge's machine, `/etc/voipc/edge.toml`, every key with its default where it has one:
+
+   ```toml
+   core = "voice.example.org:9987"   # the relay's host and UDP port; an IPv6 address in brackets, as [2001:db8::1]:9987
+   # core_fingerprint = "AB:CD:…"    # see below; required when core is an IP address
+   name = "fra1"                     # its name in the relay's [pool] edges
+   secret = "<that secret>"          # and its secret there
+   host = "::"                       # the address viewers' QUIC is bound on
+   udp_port = 9987                   # where viewers connect
+   public = "fra1.example.org:9987"  # host:port viewers reach udp_port at; the relay sends it to them
+   max_viewers = 1000                # viewers at once
+   egress_mbit = 8000                # the video it may send; the relay places no more on it
+   max_shares = 16                   # shares it is fed at once, 1 to 64
+   max_connections_per_ip = 32       # at least 2
+   ```
+
+   The edge checks the file before it starts and names what is wrong. An unknown key stops it, `[update]` too: edges are
+   updated by hand.
+4. **Trusting the relay.** Unset, `core_fingerprint` leaves it to the public CAs: the relay's certificate must be issued
+   for `core`'s name, as a Let's Encrypt one is. Set it to what `voipc-server -c server.toml cert fingerprint` prints on
+   the relay (colons optional) when that certificate is self-signed or `core` is an IP address. It pins that one
+   certificate: after every renewal the edge cannot link (its log says so) until it has the new fingerprint, so do not
+   pin a certificate that renews by itself.
+5. **The secret stays in two files.** Keep both readable by the `voipc` user only:
+
+       useradd --system --no-create-home --shell /usr/sbin/nologin voipc   # if this machine has none
+       install -d -m 0755 /etc/voipc
+       install -o voipc -g voipc -m 0600 edge.toml /etc/voipc/edge.toml
+       chown voipc:voipc /etc/voipc/server.toml && chmod 0600 /etc/voipc/server.toml   # on the relay
+
+   Neither process logs a secret, and a printed config shows `<secret>`.
+6. **Network.** Open the edge's `udp_port` inbound: viewers connect there, over QUIC. The edge dials out to the relay's
+   UDP port, which is open already, so the relay needs no new rule. Behind NAT, forward that UDP port and put the outside
+   address in `public`. An edge asks for the same UDP buffers as a relay: set `rmem_max` and `wmem_max` as in §10a.
+7. **systemd:**
+
+   ```ini
+   # /etc/systemd/system/voipc-edge.service
+   [Unit]
+   Description=VoIPC media edge
+   After=network-online.target
+   Wants=network-online.target
+
+   [Service]
+   User=voipc
+   Group=voipc
+   ExecStart=/usr/local/bin/voipc-server -c /etc/voipc/edge.toml edge
+   UMask=0077
+   Restart=on-failure
+   # and every line of §3's unit from NoNewPrivileges=yes to LimitNOFILE=65536, as they are there
+
+   [Install]
+   WantedBy=multi-user.target
+   ```
+
+   `-c` goes before `edge`, as for every command. An edge writes nothing, so it needs no `StateDirectory` or
+   `WorkingDirectory`. `systemctl enable --now voipc-edge`, and `systemctl stop` tells its viewers before it goes.
+8. **Check it.** The relay logs `edge fra1 linked from <address> (pool v1, …)`, the edge `linked to the core at … as fra1`,
+   and the Load tab lists it as linked. Until it links, its viewers are served by the relay.
+
+**Running them.**
+- **The Load tab** (*Server admin*) lists every edge in `[pool]`, linked or not: its address and pool version, the
+  viewers and shares the relay gave it against its limits, the Mbit/s given and what it last said it sent, its processor
+  and memory, and how old its last report is, with frames it dropped. Each share says how many of its viewers are on
+  edges. It warns when an edge has been away for more than a minute, carries 90% of its viewers or its video, or when
+  feeds to edges dropped frames (the way from the relay to its edges is too slow). While an edge is not linked, it also
+  says when something naming itself that edge was refused for its pool version: unproven, since an edge of another pool
+  version cannot show its secret, so check that edge's own log.
+- **Logs.** The relay: `edge fra1 offline (why); N viewers moved, M refused` when one goes. The edge: its link going up
+  and down with the reason, and in a minute when anything happened one `last minute:` line: viewers, shares, Mbit/s,
+  frames dropped, tickets refused and why, and datagrams its socket dropped.
+- **Upgrading: the relay first, then its edges.** A relay and an edge talk when they speak the same pool version, whatever
+  their releases (1.14 speaks 1; both log it when they link); the client protocol has nothing to do with it. A relay
+  refuses an edge of another pool version, and says in its log and the Load tab which one to update. That edge logs an
+  error and asks again every minute, and until it is updated the viewers it would carry are served by the relay. Edges
+  do not update themselves: verify the new binary (§1), put it in place and restart them.
+- **Restarting the relay** ends every edge's link; they link again by themselves, at most 30 s after it is back, and
+  viewers come back as after any restart.
+- **Removing an edge, or one whose secret got out:** delete its line in `[pool] edges` and restart the relay. There is no
+  reload. A stolen secret lets its holder pose as that edge (which shuts the real one out) and get the shares the relay
+  places on it, still sealed, and send the apps of the viewers placed on it to any host and UDP port it names, as a
+  hostile relay could: one connection each, which shows that host their address.
+- **A new secret:** change it in both files, and restart both.
 
 ## 11. The file cache
 
@@ -635,18 +1017,31 @@ dir = "emotes"             # kept across restarts; never [files] dir, nor inside
 The server listens on port **9987** by default: UDP for the QUIC endpoint every client
 connects to, TCP for the browser page. Configure it with a TOML file, which it reads only when
 started with `-c` (`voipc-server -c server.toml`; the `admin` and `db` commands need the same
-`-c server.toml`, before the command):
+`-c server.toml`, before the command, and a media edge reads a file of its own, `voipc-server -c edge.toml edge`, §10b):
 
 ```toml
 host = "::"               # Bind address — "::" serves IPv6 and IPv4 from one listener; "0.0.0.0" for IPv4 only
 tcp_port = 9987           # HTTPS: the browser page, file transfers (and the TCP fallback)
 udp_port = 9987           # QUIC endpoint (all clients) — keep equal to tcp_port so one host:port reaches both
 tcp_fallback = false      # true: clients that cannot reach UDP carry everything over tcp_port (see below)
+group_key = true          # the group epoch key in every text channel and voice room (1.14, docs/GROUP-KEY.md); false keeps 1.12's paths
 max_users = 64
-max_connections_per_ip = 32   # A browser client holds two of these, a native client one — so 32 is sixteen browser users behind one NAT
+live_lobby = 2000         # While General holds at most this many, an app showing its list hears each join there by name; above it, counts and pages
+max_connections_per_ip = 32   # A browser client holds two of these, a native client one — so 32 is sixteen browser users behind one NAT.
+                              # Mobile carriers put thousands behind one address: raise it on a big public relay
+                              # (each 32 more also lets that address handshake and connect that much faster)
 cert_path = "certs/server.crt"
 key_path = "certs/server.key"
 admin_token = "change-me"  # optional; unset = a random token is printed in the log at every start (with accounts, only while no account is admin)
+
+[media]                    # what screen shares and voice rooms may cost (1.14, §10b)
+share_viewers = 100        # viewers of one share on this relay (its edges carry more); one more is told it is full
+video_egress_mbit = 1000   # video sent, all shares together, counted at each share's resolution (1080p 7.5, 720p 4, less 2 Mbit/s), one copy per edge fed
+voice_room = 250           # people in a voice room that names no limit (0: none); routed rooms keep none
+
+[pool]                     # media edges for big screen shares, none by default (1.14, §10b)
+local_first = 8            # the first viewers of each share stay on this relay; at most share_viewers
+# edges = { fra1 = "<openssl rand -base64 32>" }   # name = secret, as in that edge's edge.toml; keep this file 0600
 
 [files]                    # the encrypted file cache, on by default (§11 has every key)
 max_size_mb = 10           # largest file blob
@@ -770,7 +1165,8 @@ release_candidates = false # true: also take release candidates (rc.N), and thei
    is yours to back up). After a move from Discord each of those holds the archive too, so the
    disk needs room for one more, and an update stops if it cannot make the copy.
 5. It keeps the running binary as `voipc-server.previous`, puts the new one in its place,
-   tells every client "updating to VoIPC X", and restarts into it in the same process. Calls
+   tells every client "updating to VoIPC X", gives the group key up to 3 s to write what its
+   channels had queued (§3, "Stopping"), and restarts into it in the same process. Calls
    drop; the apps reconnect within seconds.
 
 A release that changes the protocol is taken like any other: apps older than the new protocol
@@ -802,7 +1198,9 @@ ready, puts `voipc-server.previous` back, lists that version in `voipc-server.fa
 starts the previous binary. `Restart=on-failure` (§3) is what starts it again. If the new
 binary had already migrated the accounts database, the previous one refuses it: stop the
 service, delete `voipc.db-wal` and `voipc.db-shm`, copy
-`voipc-server.accounts-before-<version>.db` over `voipc.db`, and start it.
+`voipc-server.accounts-before-<version>.db` over `voipc.db`, run `voipc-server --config …
+db new-incarnation` if the previous version knows that command (1.14 and later; one before the
+group key has no group key tables to start anew), and start it. The relay's log says the same.
 
 **By hand:** `enabled = false` stops the checks. The binary in place stays whatever it is; put
 another one there to go back (§8).

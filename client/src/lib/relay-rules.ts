@@ -3,6 +3,12 @@
 // down to it as this one does. `null` is a relay of our own protocol.
 // Pure, for relay-rules.test.ts.
 
+/** The lobby not sent whole (protocol 25): how many stand there, pages of who, lookups by id,
+ *  name or account, and its joins by name only while its list is on screen and it is small. */
+export function lazyLobby(p: number | null): boolean {
+  return p === null || p >= 25;
+}
+
 /** Edits, deletes, reactions, pins and forwards (protocol 13). A 1.0 app
  *  shows each event as "a message from a newer VoIPC", and a forward as the
  *  forwarder's own words. */

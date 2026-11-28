@@ -1,8 +1,5 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
-  import { voice, voiceChannel } from "../stores/channels.js";
-  import { voiceListenOnly } from "../stores/channel-ui.js";
-  import { voiceRestriction } from "../stores/restrictions.js";
   import {
     isSharingScreen,
     viewerCount,
@@ -19,25 +16,8 @@
   import { updateUiPrefs } from "../stores/ui-prefs.js";
   import { addNotification } from "../stores/notifications.js";
   import { isWeb } from "../stores/platform.js";
+  import { openSharePicker as openPicker, shareControlsShown, stopSharing } from "../stores/share-controls.js";
   import Icon from "./Icons.svelte";
-
-  // A share goes to the voice channel we are in, on whichever server that is
-  let inLobby = $derived($voice === null);
-  // A channel can switch sharing off, its gate can leave us listening only, and
-  // a moderator or the wait can hold our voice (the server refuses them all too)
-  let shareOff = $derived(
-    $voiceChannel?.screen_share === false ||
-      (!!$voiceChannel && $voiceListenOnly.has($voiceChannel.channel_id)) ||
-      !!$voiceRestriction?.voice,
-  );
-
-  // The browser client shares through WebCodecs + getDisplayMedia; a browser
-  // without them (or a mobile one) keeps the button hidden.
-  const canShare =
-    !isWeb ||
-    (typeof VideoEncoder !== "undefined" &&
-      typeof VideoFrame !== "undefined" &&
-      !!navigator.mediaDevices?.getDisplayMedia);
 
   let resLabel = $derived(
     $shareResolution === 1080 ? "1080p" :
@@ -59,24 +39,9 @@
         : "no-signal"
   );
 
-  async function openPicker() {
-    pickerSwitchMode.set(false);
-    showSourcePicker.set(true);
-  }
-
   function openSwitchPicker() {
     pickerSwitchMode.set(true);
     showSourcePicker.set(true);
-  }
-
-  async function stopSharing() {
-    try {
-      await invoke("stop_screen_share");
-      isSharingScreen.set(false);
-      viewerCount.set(0);
-    } catch (e: any) {
-      addNotification(e.toString(), "error");
-    }
   }
 
   /** Our own preview: the floating card, or off (and out of the stream view). */
@@ -96,9 +61,8 @@
   }
 </script>
 
-<!-- Switching sharing off mid-share must not strand the sharer: keep the
-     controls (i.e. Stop) while they are still sending. -->
-{#if !inLobby && canShare && (!shareOff || $isSharingScreen)}
+<!-- Which: stores/share-controls.ts (Stop stays while still sending) -->
+{#if $shareControlsShown}
   <div class="divider"></div>
 
   {#if $isSharingScreen}

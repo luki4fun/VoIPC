@@ -8,9 +8,12 @@ mod app_state;
 mod commands;
 mod config;
 mod crypto;
+mod edge_view;
 mod emote_sources;
 mod emotes;
 mod files;
+mod gk_local;
+mod gk_net;
 mod global_keys;
 mod import;
 mod media;
@@ -23,6 +26,8 @@ mod transport;
 mod updater;
 #[cfg(test)]
 mod upgrade_fixtures;
+mod view_queue;
+mod view_timing;
 
 use app_state::AppState;
 use tauri::Manager;
@@ -119,7 +124,13 @@ pub fn run() {
             tauri::plugin::Builder::<tauri::Wry>::new("no-file-pages")
                 .on_navigation(|_, url| page_may_open(url))
                 .build(),
-        );
+        )
+        // A watched share's frames, as bytes, for a WebView that decodes them (1.13)
+        .register_asynchronous_uri_scheme_protocol(view_queue::SCHEME, |_, request, responder| {
+            tauri::async_runtime::spawn(async move {
+                responder.respond(view_queue::serve(request).await);
+            });
+        });
     // No `updater:*` capability: the page reaches it only through updater.rs
     #[cfg(not(target_os = "android"))]
     let builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
@@ -348,6 +359,14 @@ pub fn run() {
                     request_quit(window.app_handle());
                 }
             }
+            // A push-to-talk key held in the window loses its key-up to the
+            // window that takes focus (dive 6 F2, global_keys.rs)
+            #[cfg(not(target_os = "android"))]
+            if let tauri::WindowEvent::Focused(false) = event {
+                if window.label() == "main" {
+                    global_keys::window_lost_focus(window.app_handle());
+                }
+            }
             #[cfg(target_os = "android")]
             let _ = (window, event);
         })
@@ -386,6 +405,9 @@ pub fn run() {
             commands::join_text_channels,
             commands::set_quiet,
             commands::request_channel_page,
+            commands::request_lobby_page,
+            commands::lookup_users,
+            commands::watch_lobby,
             commands::set_metered,
             commands::key_job_answer,
             commands::create_channel,
@@ -435,6 +457,7 @@ pub fn run() {
             files::set_file_cache_mb,
             files::save_file,
             commands::set_history_sharing,
+            commands::set_help_hold_keys,
             commands::request_channel_history,
             commands::start_transmit,
             commands::stop_transmit,
@@ -448,6 +471,12 @@ pub fn run() {
             commands::set_volume,
             commands::set_input_gain,
             commands::get_voice_stats,
+            commands::report_view_timing,
+            commands::set_view_decoder,
+            commands::share_again_known,
+            commands::source_preview,
+            commands::forget_share_again,
+            commands::view_fallback,
             commands::set_mute_key,
             commands::set_deafen_key,
             commands::set_chat_history_disabled,
@@ -519,6 +548,7 @@ pub fn run() {
             commands::admin_unban,
             commands::admin_ban_account,
             commands::admin_list_bans,
+            commands::admin_load,
             commands::admin_bans_page,
             // Persistent config
             commands::load_config,

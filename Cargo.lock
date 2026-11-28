@@ -318,9 +318,9 @@ dependencies = [
 
 [[package]]
 name = "async-executor"
-version = "1.14.0"
+version = "1.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c96bf972d85afc50bf5ab8fe2d54d1586b4e0b46c97c50a0c9e71e2f7bcd812a"
+checksum = "f426a31126c735126297bc5ea7a521263c9faff4f63ca415267ee625651c4f37"
 dependencies = [
  "async-task",
  "concurrent-queue",
@@ -577,7 +577,7 @@ dependencies = [
  "regex",
  "rustc-hash",
  "shlex 2.0.1",
- "syn 3.0.8",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -1084,9 +1084,9 @@ checksum = "18f12cc9948ed9604230cdddc7c86e270f9401ccbe3c2e98a4378c5e7632212f"
 
 [[package]]
 name = "cookie"
-version = "0.18.2"
+version = "0.18.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a373e3602691c3cdea496d2f0ee5935151e6168fe87739483c463db1b2f2f87"
+checksum = "d55f2d6c30eeec7d5c6f98bd4395d4abb1895629eab97ee6522d340623615f8a"
 dependencies = [
  "time",
  "version_check",
@@ -1397,7 +1397,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d045de693cb712d0b22c6a64be5b953f67b3ce00ab5ad3dd5d8b441886ab8e1a"
 dependencies = [
  "quote",
- "syn 3.0.8",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -2142,9 +2142,9 @@ checksum = "aa9a19cbb55df58761df49b23516a86d432839add4af60fc256da840f66ed35b"
 
 [[package]]
 name = "form_urlencoded"
-version = "1.2.2"
+version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
+checksum = "afa489199eaffb1211795df1c6236ce1ad0d41a6fa45250add73e3b02420f06e"
 dependencies = [
  "percent-encoding",
 ]
@@ -3396,7 +3396,7 @@ dependencies = [
 [[package]]
 name = "l4f-accounts"
 version = "0.1.0"
-source = "git+https://github.com/luki4fun/l4f-accounts.git?tag=v0.14.1#9c07090c588d6bdd8bbbec6331a13698d10dab71"
+source = "git+https://github.com/luki4fun/l4f-accounts.git?tag=v0.15.0#e4d1c3b3384c4dc3b0f91557bd34139f5ba5e180"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -7640,9 +7640,9 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "url"
-version = "2.5.8"
+version = "2.5.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff67a8a4397373c3ef660812acab3268222035010ab8680ec4215f38ba3d0eed"
+checksum = "f00cd2407bb42c0ef17be88d4cf020f5cceffd121665bac9b8b9493a369b3b1a"
 dependencies = [
  "form_urlencoded",
  "idna",
@@ -7720,7 +7720,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "voipc-audio"
-version = "1.12.0"
+version = "1.14.0-rc.2"
 dependencies = [
  "anyhow",
  "audiopus",
@@ -7739,7 +7739,7 @@ dependencies = [
 
 [[package]]
 name = "voipc-client"
-version = "1.12.0"
+version = "1.14.0-rc.2"
 dependencies = [
  "anyhow",
  "ashpd 0.9.3",
@@ -7753,6 +7753,7 @@ dependencies = [
  "pipewire",
  "postcard",
  "rand 0.8.8",
+ "raw-window-handle",
  "rcgen",
  "rdev",
  "reqwest",
@@ -7788,7 +7789,7 @@ dependencies = [
 
 [[package]]
 name = "voipc-crypto"
-version = "1.12.0"
+version = "1.14.0-rc.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7812,7 +7813,7 @@ dependencies = [
 
 [[package]]
 name = "voipc-import"
-version = "1.12.0"
+version = "1.14.0-rc.2"
 dependencies = [
  "postcard",
  "serde",
@@ -7823,7 +7824,7 @@ dependencies = [
 
 [[package]]
 name = "voipc-media"
-version = "1.12.0"
+version = "1.14.0-rc.2"
 dependencies = [
  "gif",
  "image-webp",
@@ -7835,7 +7836,7 @@ dependencies = [
 
 [[package]]
 name = "voipc-protocol"
-version = "1.12.0"
+version = "1.14.0-rc.2"
 dependencies = [
  "bytes",
  "postcard",
@@ -7848,7 +7849,7 @@ dependencies = [
 
 [[package]]
 name = "voipc-server"
-version = "1.12.0"
+version = "1.14.0-rc.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -7891,7 +7892,7 @@ dependencies = [
 
 [[package]]
 name = "voipc-video"
-version = "1.12.0"
+version = "1.14.0-rc.2"
 dependencies = [
  "anyhow",
  "ffmpeg-next",
@@ -8745,8 +8746,7 @@ dependencies = [
 [[package]]
 name = "wtransport"
 version = "0.7.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4273ce3157a3262a68665f8d3f20a0ac0c5b8a69ffd67f05ae986832ebec036"
+source = "git+https://github.com/luki4fun/wtransport.git?tag=0.7.2-voipc.1#3a749b0349d4fb0fcdc23afcbe2a6af439c25b1c"
 dependencies = [
  "bytes",
  "pem 3.0.6",
@@ -8769,8 +8769,7 @@ dependencies = [
 [[package]]
 name = "wtransport-proto"
 version = "0.7.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aad9059572c7dbd6901ccef37f3b7321678cd708dcf58a64b1921dbeab7bfede"
+source = "git+https://github.com/luki4fun/wtransport.git?tag=0.7.2-voipc.1#3a749b0349d4fb0fcdc23afcbe2a6af439c25b1c"
 dependencies = [
  "httlib-huffman",
  "octets",

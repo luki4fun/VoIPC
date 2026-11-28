@@ -172,3 +172,17 @@ test("the driver reads the machine's state, and nothing once it is over", () => 
   d.dispose();
   assert.equal(d.midPairing, false);
 });
+
+test("signed in again, the session hears the device this browser held for that account on that relay", () => {
+  const relay = Array.from({ length: 16 }, (_, i) => i + 1);
+  const { d, host } = driver([]);
+  const told: number[][] = [];
+  const session = { setHeldDevice: (id: number[]) => told.push(id), free: () => {} };
+  d.signIn.finish = () => ({ relay_id: new Uint8Array(relay), name: "luki" });
+  d.signIn.startSession = () => ({ session, actions: { send: [], emit: [] } });
+  const record = (name: string, relay_id: number[], id: number) => ({ server: "a:1", name, relay_id, device_id: [id], device_key: [], dek: [] });
+  d.held = [record("other", relay, 1), record("luki", relay.map((b) => b ^ 0xff), 2), record("luki", relay, 3)];
+  d.onAuthenticated(host, {});
+  assert.deepEqual(told, [[3]], "only the record of this account on this relay");
+  d.dispose();
+});

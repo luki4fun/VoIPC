@@ -115,8 +115,70 @@ export interface SignalClient {
   /** The connection ends: the posts that waited, per channel. */
   liveEnd(): { channel_id: number; expired: number }[];
 
+  // The group epoch key (voipc_crypto::group_state, plan 3i), written once for both
+  // backends: the page sends and emits what `GkOut` says, as network.rs does.
+  /** `GroupKeys`: `on`, its 16-byte `run`, its `clock` (seconds); `kept`, taken over; `mirror`,
+   *  what this browser kept of a signed-in account's counters past its pages (gk-mirror.ts). */
+  gkStart(on: boolean, run: Uint8Array, clock: number, help: boolean, visible: boolean, inCall: boolean, kept?: KeptGk | null, mirror?: Uint8Array | null): GkOut;
+  /** A channel we are in: a text channel we follow, or the voice room we stand in. */
+  gkTrack(channelId: number, text: boolean, log: string, anonymous: boolean, hideMembers: boolean, viewerAdmin: boolean): GkOut;
+  gkUntrack(channelId: number): GkOut;
+  /** `TextJoined` refused this channel: posts that waited for it are dropped, told why. */
+  gkJoinRefused(channelId: number): GkOut;
+  /** A frame `isGkFrame` named, as its postcard bytes. */
+  gkFrame(payload: Uint8Array): GkOut;
+  /** A post of ours under its message id; with the channel's `log` its kept copy goes once it does. */
+  gkPost(channelId: number, messageId: string, envelope: Uint8Array, log: string, ttlSecs?: number | null): GkOut;
+  /** Each second. */
+  gkTick(): GkOut;
+  /** After the account's own calls: what they said for the group key. */
+  gkNews(): GkOut;
+  /** The keyholder's next upload's postcard bytes. */
+  gkNextFrame(inCall: boolean): Uint8Array | undefined;
+  /** One step of the keyholder's build; undefined when none waits. */
+  gkBuildStep(budgetMs: number): GkOut | undefined;
+  /** "Help hold keys", switched live. */
+  gkSetVolunteer(on: boolean): GkOut;
+  /** The page shown or hidden, a call begun or ended. */
+  gkVisibility(visible: boolean, inCall: boolean): GkOut;
+  /** `GkOut.voice`: the room's keys into `keys`. Whether it took any. */
+  gkVoiceInto(keys: MediaKeys, ownChannel: number): boolean;
+  /** `UserLeft`, for the names the group key's events carry. */
+  gkUserLeft(userId: number, channelId: number): void;
+  /** The connection ends: the posts given up. */
+  gkEnd(): GkOut;
+  /** What the next connection to this relay takes over: before `free`. */
+  gkKeep(): KeptGk | undefined;
+  /** A signed-in account's seat-key counters, for this browser to keep past the page (dive 1
+   *  F1): `gkStart`'s `mirror`. Undefined for a guest, and when nothing moved since the last.
+   *  After `gkEnd` too, before `free`. */
+  gkMirror(): Uint8Array | undefined;
+
   free(): void;
   [Symbol.dispose](): void;
+}
+
+/** What the page does after a call of the group key (voipc-web gk.rs `Out`). */
+export interface GkOut {
+  /** Who posted, for the pins first: the live path's `seen`. */
+  seen: { user_id: number; account: number[] | null; name: string }[];
+  /** Postcard bytes of each frame to send. */
+  send: Uint8Array[];
+  /** Front-end events (`gk-*`, `channel-chat-message`), to emit as they are. */
+  emit: { name: string; payload: unknown }[];
+  /** Voice keys wait: `gkVoiceInto`. */
+  voice: boolean;
+  /** A keyholder's build waits: `gkBuildStep`. */
+  build: boolean;
+  /** The account holds events or read cursors for the page: its next call carries them. */
+  held: boolean;
+  /** What this browser keeps of the account's counters may have moved: `gkMirror`. */
+  kept: boolean;
+}
+
+/** The group key's floors, between one connection to a relay and its next in this page. */
+export interface KeptGk {
+  free(): void;
 }
 
 /** What the page does after a call on the live path (voipc_crypto::LiveOut). */
@@ -345,6 +407,8 @@ export interface AccountActions {
 /** What follows a sign-in — the stored log, the pins, remembering this
  *  browser — as the desktop client runs it too (voipc_crypto::account_session). */
 export interface AccountSession {
+  /** The device id of the record this browser holds for the account, before `afterConnect`. */
+  setHeldDevice(deviceId: number[]): void;
   /** Once the session is listed. */
   afterConnect(): AccountActions;
   /** Every couple of seconds while connected: reads refused for now go on. */
@@ -490,6 +554,10 @@ export interface WasmApi {
   encodeClientMsg(msg: unknown): Uint8Array;
   /** Decodes postcard bytes (without length prefix) into a ServerMessage object. */
   decodeServerMsg(bytes: Uint8Array): unknown;
+  /** A viewer's hello to a media edge (`pool::ViewerMsg::Hello`), WITH its u32 length prefix. */
+  encodeViewerHello(ticket: Uint8Array): Uint8Array;
+  /** An edge's word to its viewer (`pool::EdgeViewMsg`, no length prefix): "Ready" or { Ended: { reason } }. */
+  decodeEdgeViewMsg(bytes: Uint8Array): unknown;
   /** Fresh ephemeral identity + registration id + signed pre-key 1 + 100 one-time pre-keys. */
   newSignalClient(): SignalClient;
   /** The PBKDF2 rounds a password is stretched with. */
@@ -508,6 +576,11 @@ export interface WasmApi {
   newVideoAssembler(): VideoAssembler;
   /** Largest opaque blob the relay will re-wrap and forward. */
   maxRelayCiphertext(): number;
+  /** Whether a channel post of `len` envelope bytes, sealed as it goes (`underKey`: under the
+   *  group key; else the old path's), stays within what the relay takes. */
+  postFits(len: number, underKey: boolean): boolean;
+  /** The most a channel post's ciphertext may be. */
+  maxPostSealed(): number;
   /**
    * Of the members who offer a channel's recent chat, the few actually asked —
    * picked at random, so a whole server reconnecting does not aim every
@@ -516,6 +589,13 @@ export interface WasmApi {
   pickHistorySources(sharers: Uint32Array): Uint32Array;
   /** Control messages a second one connection may send (we stay under it). */
   controlMsgsPerSec(): number;
+  /** Whether a server frame's postcard bytes are the group key's: `gkFrame` takes it undecoded. */
+  isGkFrame(payload: Uint8Array): boolean;
+  /** What to write over a kept copy of an account's counters with ours (`gkMirror`'s): the two
+   *  as one, the higher of each, so another tab's are not lost; ours alone over one that does
+   *  not read; undefined (write nothing) over another relay's or account's, or a newer
+   *  VoIPC's. */
+  gkMirrorMerge(stored: Uint8Array, ours: Uint8Array): Uint8Array | undefined;
   pinHeldMost(): number;
   /** A fresh message id: 16 random bytes, hex. */
   newMessageId(): string;
@@ -632,6 +712,8 @@ export async function loadWasm(): Promise<WasmApi> {
     appVersion: () => mod.appVersion(),
     encodeClientMsg: (m) => mod.encodeClientMsg(m),
     decodeServerMsg: (b) => mod.decodeServerMsg(b),
+    encodeViewerHello: (t) => mod.encodeViewerHello(t),
+    decodeEdgeViewMsg: (b) => mod.decodeEdgeViewMsg(b),
     newSignalClient: () => new mod.SignalClient(),
     kdfRounds: () => mod.kdfRounds(),
     newAccountSignIn: (name, method) => new mod.AccountSignIn(name, method),
@@ -642,8 +724,12 @@ export async function loadWasm(): Promise<WasmApi> {
     newMediaKeys: () => new mod.MediaKeys(),
     newVideoAssembler: () => new mod.VideoAssembler(),
     maxRelayCiphertext: () => mod.maxRelayCiphertext(),
+    postFits: (len, underKey) => mod.postFits(len, underKey),
+    maxPostSealed: () => mod.maxPostSealed(),
     pickHistorySources: (s) => mod.pickHistorySources(s),
     controlMsgsPerSec: () => mod.controlMsgsPerSec(),
+    isGkFrame: (p) => mod.isGkFrame(p),
+    gkMirrorMerge: (a, b) => mod.gkMirrorMerge(a, b),
     pinHeldMost: () => mod.pinHeldMost(),
     newMessageId: () => mod.newMessageId(),
     envelope: (id, text, ttlSecs, refs) =>

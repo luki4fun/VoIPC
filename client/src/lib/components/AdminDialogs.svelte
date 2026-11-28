@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { adminOps, community, moderation, moves } from "../relay-rules.js";
+  import { adminOps, community, lazyLobby, moderation, moves } from "../relay-rules.js";
   import { removalHint, removalReachesAccount, removalWindows } from "../modlog-rules.js";
   import { backdrop, dialog } from "../actions/dialog.js";
   import { roving } from "../actions/roving.js";
@@ -48,10 +48,11 @@
   import AdminChannels from "./AdminChannels.svelte";
   import AdminModLog from "./AdminModLog.svelte";
   import AdminMove from "./AdminMove.svelte";
+  import AdminLoad from "./AdminLoad.svelte";
   import Icon from "./Icons.svelte";
   import type { BanInfo } from "../types.js";
 
-  type Tab = "bans" | "emotes" | "users" | "groups" | "channels" | "modlog" | "server" | "move";
+  type Tab = "bans" | "emotes" | "users" | "groups" | "channels" | "modlog" | "server" | "move" | "load";
   let tab = $state<Tab>("bans");
   // A chat picture's "Make an emote or sticker…": straight to the importer
   $effect(() => {
@@ -71,6 +72,8 @@
     if ($relayAccounts && community($olderRelay?.protocol ?? null) && $can("*")) t.push(["server", "Server"]);
     // Asked as the account: a token admin has none to ask as
     if ($relayAccounts && $account && moves($olderRelay?.protocol ?? null) && $can("*")) t.push(["move", "Discord move"]);
+    // A token admin too: a relay without accounts is often run by one
+    if (lazyLobby($olderRelay?.protocol ?? null) && $can("*")) t.push(["load", "Load"]);
     return t;
   });
   /** What was picked, or the first tab still open to us. */
@@ -211,6 +214,8 @@
           <AdminServer />
         {:else if shown === "move"}
           <AdminMove />
+        {:else if shown === "load"}
+          <AdminLoad />
         {:else}
           {#if $relayAccounts}
             <section class="section">

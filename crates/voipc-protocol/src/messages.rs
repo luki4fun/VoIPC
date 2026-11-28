@@ -6,6 +6,11 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::gk::{
+    CommitPiece, DuePiece, EndorsedPair, EpochRef, FloorRef, GkChainKey, GkMember, GkWriter,
+    HeaderIn, InPiece, KeyringPiece, ListIn, NamesPiece, NamesRef, RowMaker, SeedWelcomeOut,
+    SelfRowIn, VoiceSeatsPiece, WalkLinkIn,
+};
 use crate::types::*;
 
 /// Messages sent from client to server over the control stream.
@@ -417,6 +422,129 @@ pub enum ClientMessage {
         kyber_prekey: Vec<u8>,
         kyber_prekey_signature: Vec<u8>,
     },
+
+    // ── The lobby on a big relay (protocol v25) ─────────────────────
+    /// A page of who stands in the lobby, sections first and then A-Z, from past `after`
+    /// (`None` from the start). A `prefix` keeps the names that start with it, whatever
+    /// their case. `ServerMessage::LobbyPage` answers. Since 25 the lobby is not sent whole.
+    RequestLobbyPage {
+        after: Option<LobbyCursor>,
+        prefix: String,
+    },
+    /// Who these are, if they are online: by id, by name, by account, exact matches only,
+    /// at most `MAX_LOOKUP` of all three together. `ServerMessage::Users` answers.
+    LookupUsers {
+        ids: Vec<UserId>,
+        names: Vec<String>,
+        accounts: Vec<[u8; 16]>,
+    },
+    /// The app shows the lobby's list. While the lobby is small, a watcher is told each
+    /// join and leave there by name; past that, only `ChannelCounts`.
+    WatchLobby { on: bool },
+    /// What the relay carries now, for an admin: `ServerMessage::AdminLoad` answers.
+    AdminLoad,
+
+    // ── The media edge pool (protocol v26) ──────────────────────────
+    /// The edge of the `WatchAt` numbered `placement` failed this viewer: no connection,
+    /// no `Ready`, the edge ended the link, or no whole frame came for 10 s. The relay
+    /// moves the viewer to another edge or back to itself with a new `WatchAt`. One that
+    /// names an older placement is ignored, so a late word about edge A never moves the
+    /// viewer off edge B.
+    EdgeFailed {
+        sharer_user_id: UserId,
+        placement: u64,
+    },
+
+    // ── The group epoch key (protocol v26, docs/GROUP-KEY.md) ───────
+    // Sent only after `ServerMessage::GroupKeys`; `gk` holds the types, codes and caps.
+    /// The headers since `have` and this seat's key material: `ServerMessage::EpochIn`
+    /// answers, or `EpochWait`. `at`: past epochs for kept history, at most `FETCH_AT_MAX`.
+    /// `seat`: this connection's seat pair, on its first fetch that needs one and again
+    /// after `NO_SEAT_KEYS`.
+    EpochFetch {
+        group: String,
+        have: Option<FloorRef>,
+        at: Vec<EpochRef>,
+        seat: Option<EndorsedPair>,
+    },
+    /// One part of a keyholder's commit for due `due`, at most `PIECE_MAX_BYTES`; nothing
+    /// applies before `last`.
+    EpochCommit {
+        group: String,
+        due: u64,
+        part: u16,
+        last: bool,
+        piece: CommitPiece,
+    },
+    /// A keyholder refusing a whole due; `why` is a `decline` code.
+    EpochDecline {
+        group: String,
+        due: u64,
+        why: u8,
+        detail: String,
+    },
+    /// A page of a seed roll's welcomes, at most `WELCOMES_PER_FRAME`.
+    EpochWelcomes {
+        group: String,
+        due: u64,
+        gen: [u8; 16],
+        seed: u32,
+        welcomes: Vec<SeedWelcomeOut>,
+    },
+    /// The seat lists of these `(b, v)`, at most `LISTS_WANTED_MAX`: `EpochLists` answers.
+    EpochListsWanted {
+        group: String,
+        gen: [u8; 16],
+        versions: Vec<(u64, u64)>,
+    },
+    /// The keyring from `have`, the `(epoch, join)` it is at: `KeyringIn` answers.
+    KeyringWanted {
+        group: String,
+        gen: [u8; 16],
+        have: Option<(u32, u32)>,
+    },
+    /// A post under `epoch`, with this writer's blob at its first post in the epoch.
+    EpochPost {
+        channel_id: ChannelId,
+        group: String,
+        gen: [u8; 16],
+        epoch: u32,
+        blob: Option<Vec<u8>>,
+        ciphertext: Vec<u8>,
+    },
+    /// A writer's blobs of `epoch`: `EpochBlob` answers.
+    EpochBlobWanted {
+        group: String,
+        gen: [u8; 16],
+        epoch: u32,
+        writer: GkWriter,
+    },
+    /// The gated lists between two headers (each Join's `added`, each opening's that
+    /// removes seats with its `removed`): `EpochNamesIn` answers.
+    EpochNames {
+        group: String,
+        from: NamesRef,
+        to: NamesRef,
+    },
+    /// A header past the relay's head, which this member holds.
+    EpochFloorAhead { group: String, header: HeaderIn },
+    /// Offer to hold keys, or stop. `platform` is a `platform` code (a browser hidden or in
+    /// a call: `BROWSER_BUSY`, offered again at each change); `pair`: a desktop's keyholder
+    /// pair (0x03), or the connection's seat pair (0x02).
+    KeyholdVolunteer {
+        on: bool,
+        platform: u8,
+        pair: Option<EndorsedPair>,
+    },
+    /// Stop holding this group's keys. `entry`: the `KX` of an own-account entry a
+    /// KeyholdersReplace this device did not make swapped in.
+    KeyholdResign {
+        group: String,
+        entry: Option<[u8; 32]>,
+    },
+    /// A desktop keyholder's new pair at a seat-key rotation; `old` is `tag(KX)` of its
+    /// old one.
+    KeyholdReplace { old: [u8; 8], pair: EndorsedPair },
 }
 
 /// The client's side of an account sign-in, between `Authenticate` and
@@ -846,6 +974,71 @@ pub enum AccountRequest {
         identity_sig: Vec<u8>,
         pass_slot: Option<Vec<u8>>,
         web: bool,
+    },
+    /// Drops one of this account's own device keys (protocol v24): the one this device held
+    /// before it was remembered again with a new key, which nothing could use any more.
+    /// `DeviceForgotten` answers; a key of another account, or none, is an `Error`.
+    DeviceForget {
+        device_id: Vec<u8>,
+    },
+
+    // ── The group epoch key (protocol v26) ──
+    /// The account's seat keys (origin 0x01), after the vault save settled.
+    /// `SeatKeysStored` answers.
+    SeatKeysPublish {
+        kem: Vec<u8>,
+        dh: Vec<u8>,
+        n: u32,
+        made: u64,
+        sig: Vec<u8>,
+    },
+    /// Self-rows and history rows to keep, at most `SELF_ROWS_MAX`; stored `c:` groups
+    /// only. `SelfRowsStored` answers.
+    SelfRowPut {
+        rows: Vec<SelfRowIn>,
+    },
+    /// A kept chain under the group key: its one frame, sealed under `gk_epoch`'s key.
+    /// `ChainStored` answers.
+    EpochChainStart {
+        conv: String,
+        /// The chain epoch, as `ChainPut`'s.
+        epoch: u32,
+        self_wrap: Vec<u8>,
+        link: Option<(u32, Vec<u8>)>,
+        group: String,
+        gen: [u8; 16],
+        gk_epoch: u32,
+        sealed: Vec<u8>,
+        last: bool,
+    },
+    /// The group-key seals of these `(owner, chain)`, at most `CHAIN_KEYS_MAX`.
+    /// `AccountReply::EpochChainKeys` answers.
+    EpochChainKeys {
+        conv: String,
+        chains: Vec<([u8; 16], u32)>,
+    },
+    /// This account's self-rows and history rows, every group, generation and seed, a page
+    /// at a time. `SelfRows` answers.
+    SelfRowsList {
+        after: Option<Vec<u8>>,
+        limit: u16,
+    },
+    /// The keyholders that made live rows to one of this account's seats. `RowMakers`
+    /// answers.
+    RowMakers {
+        group: String,
+        gen: [u8; 16],
+        sk: [u8; 8],
+        sx: [u8; 8],
+        after: Option<Vec<u8>>,
+    },
+    /// This account's Kyber1024 kept key (`item.kept`, 1569 bytes) and its identity's
+    /// signature over it, after the vault save settled: what a sharer seals a newcomer's row
+    /// of a gk chain's start to. `KeptKemStored` answers. The relay sends what it holds of
+    /// these as `KeptKems` right before every `LogKeysFound`.
+    KeptKemPublish {
+        kem: Vec<u8>,
+        sig: Vec<u8>,
     },
 }
 
@@ -1480,6 +1673,49 @@ pub enum AccountReply {
     SteppedUp,
     /// `LoginKeySet` held.
     LoginKeySaved,
+    /// `DeviceForget` held (protocol v24).
+    DeviceForgotten,
+
+    // ── The group epoch key (protocol v26) ──
+    /// `SeatKeysPublish` held, at counter `n`.
+    SeatKeysStored {
+        n: u32,
+    },
+    /// `SeatKeysPublish` refused: the relay holds other seat keys of this account, `held` as
+    /// they were published (origin 0x01, endorsed by the account's identity), at a counter at
+    /// or above the one offered. Another device's rotation, or keys a holder of the account's
+    /// identity key published that its vault does not hold: the app checks the endorsement
+    /// and its vault, and goes above `held.n` if they are not the account's there. A relay
+    /// cannot name a counter the account's identity never endorsed.
+    SeatKeysBehind {
+        held: EndorsedPair,
+    },
+    /// `SelfRowPut` held.
+    SelfRowsStored {
+        count: u32,
+    },
+    /// What `AccountRequest::EpochChainKeys` asked, for those it holds.
+    EpochChainKeys {
+        conv: String,
+        keys: Vec<GkChainKey>,
+    },
+    /// A page of `SelfRowsList`; `next`: ask on from it.
+    SelfRows {
+        rows: Vec<SelfRowIn>,
+        next: Option<Vec<u8>>,
+    },
+    /// A page of `RowMakers`; `next`: ask on from it.
+    RowMakers {
+        makers: Vec<RowMaker>,
+        next: Option<Vec<u8>>,
+    },
+    /// `KeptKemPublish` held.
+    KeptKemStored,
+    /// The kept keys of the accounts a `LogKeys` named, for those that have one, sent right
+    /// before its `LogKeysFound` (in pages, at most `KEPT_KEMS_PER_REPLY` each).
+    KeptKems {
+        keys: Vec<KeptKemInfo>,
+    },
 }
 
 /// Answers to `AdminOp`.
@@ -1770,6 +2006,18 @@ pub struct WrapOut {
     pub wrapped: Vec<u8>,
 }
 
+/// An account's Kyber1024 kept key as the relay has it; the client checks the signature
+/// against the identity it pinned for `account` before sealing anything to it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeptKemInfo {
+    pub account: [u8; 16],
+    pub kem: Vec<u8>,
+    pub sig: Vec<u8>,
+}
+
+/// Most `KeptKemInfo` in one `KeptKems` (about 1.65 KB each), under a frame.
+pub const KEPT_KEMS_PER_REPLY: usize = 24;
+
 /// An account's keys as the relay has them; the client checks the
 /// signature against the identity it pinned before using `logkey`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1956,6 +2204,9 @@ pub enum ServerMessage {
         ciphertext: Vec<u8>,
         message_type: u8,
         timestamp: u64,
+        /// The sender's account, as a roster row would show it (since 25: the lobby is
+        /// not sent whole, so an app may hold no row for them).
+        account: Option<[u8; 16]>,
     },
 
     /// An encrypted channel message was received.
@@ -1993,6 +2244,8 @@ pub enum ServerMessage {
         from_username: String,
         ciphertext: Vec<u8>,
         message_type: u8,
+        /// As on `EncryptedDirectChatMessage`.
+        account: Option<[u8; 16]>,
     },
 
     // ── Moderation ───────────────────────────────────────────────────
@@ -2301,6 +2554,166 @@ pub enum ServerMessage {
         channel_id: ChannelId,
         user_id: UserId,
     },
+
+    // ── The lobby on a big relay (protocol v25) ─────────────────────
+    /// How many are in the channels whose count changed, the lobby's included, at most
+    /// once a second. Since 25 the joins and leaves of the lobby are not told to everyone.
+    ChannelCounts { counts: Vec<(ChannelId, u32)> },
+    /// What `RequestLobbyPage` asked. `next`: where to ask on from, `None` at the end.
+    /// `total`: everyone it lists, those matching with a prefix. `sections`: each
+    /// section's rank and how many stand in it, of the whole lobby. `prefix`: as asked, so
+    /// an app tells a list's page from a search for a name being typed.
+    LobbyPage {
+        rows: Vec<UserInfo>,
+        next: Option<LobbyCursor>,
+        total: u32,
+        sections: Vec<(u16, u32)>,
+        prefix: String,
+    },
+    /// What `LookupUsers` asked: whoever was found. `gone`: asked ids that are not online.
+    Users {
+        rows: Vec<UserInfo>,
+        gone: Vec<UserId>,
+    },
+    /// A watch the relay will not start: the share is full, the relay sends all the video
+    /// it may, or the share is gone. Unlike `ScreenShareError` it is no word about one's
+    /// own share (protocol v25).
+    WatchRefused {
+        sharer_user_id: UserId,
+        reason: String,
+    },
+    /// What `ClientMessage::AdminLoad` asked.
+    AdminLoad { report: LoadReport },
+
+    // ── The media edge pool (protocol v26) ──────────────────────────
+    /// Where the share being watched comes from, when the relay places the viewer on an
+    /// edge (right after `WatchingScreenShare`) or moves it: `Some`, from that edge;
+    /// `None`, over this connection again, as it does without any `WatchAt`. `placement`
+    /// is new on every one, and `EdgeFailed` names it. One for a share the app is not
+    /// watching is ignored.
+    WatchAt {
+        sharer_user_id: UserId,
+        placement: u64,
+        edge: Option<EdgeView>,
+    },
+    /// To a sharer with more than 8 viewers, at most once a second, in place of each
+    /// viewer's `VideoLossReported`: how many of the `viewers` reported loss lately.
+    VideoLossSummary { reporters: u32, viewers: u32 },
+
+    // ── The group epoch key (protocol v26, docs/GROUP-KEY.md) ───────
+    // The multi-part ones go in order on the control stream (`gk::Parts`).
+    /// The frame right after `Authenticated`: whether this relay uses the group key
+    /// (`on`), the run of its `r:` ids, and its clock (unix seconds).
+    GroupKeys { on: bool, run: [u8; 16], clock: u64 },
+    /// One part of what `EpochFetch` asked, or a push.
+    EpochIn {
+        group: String,
+        part: u16,
+        last: bool,
+        piece: Box<InPiece>,
+    },
+    /// The fetch is queued, or cannot be answered yet; `why` is a `wait` code.
+    EpochWait {
+        group: String,
+        why: u8,
+        detail: String,
+    },
+    /// One part of due `due`, to one keyholder.
+    EpochDue {
+        group: String,
+        due: u64,
+        part: u16,
+        last: bool,
+        piece: Box<DuePiece>,
+    },
+    /// The commit for `due` lost or failed; `reason` is a `stale` code, and `head` lets
+    /// the keyholder rebase.
+    EpochStale {
+        group: String,
+        due: u64,
+        reason: u8,
+        detail: String,
+        head: Option<WalkLinkIn>,
+    },
+    /// What `EpochListsWanted` asked, at most `LISTS_PER_FRAME` lists a frame; `more`: and
+    /// more after this.
+    EpochLists {
+        group: String,
+        gen: [u8; 16],
+        lists: Vec<ListIn>,
+        more: bool,
+    },
+    /// One part of the keyring at `(epoch, join)`, for `KeyringWanted`.
+    KeyringIn {
+        group: String,
+        gen: [u8; 16],
+        epoch: u32,
+        join: u32,
+        part: u16,
+        last: bool,
+        piece: KeyringPiece,
+    },
+    /// An exit entered a batch: writers start a new chain.
+    EpochExit {
+        group: String,
+        gen: [u8; 16],
+        seq: u64,
+    },
+    /// A post under the group key: `TextPost`'s fields and the group's. `writer` opens
+    /// its blob.
+    EpochPostIn {
+        channel_id: ChannelId,
+        group: String,
+        gen: [u8; 16],
+        epoch: u32,
+        user_id: UserId,
+        username: String,
+        account: Option<[u8; 16]>,
+        is_admin: bool,
+        is_moderator: bool,
+        writer: GkMember,
+        blob: Option<Vec<u8>>,
+        ciphertext: Vec<u8>,
+        timestamp: u64,
+    },
+    /// What `EpochBlobWanted` asked: at most `BLOBS_MAX` blobs.
+    EpochBlob {
+        group: String,
+        gen: [u8; 16],
+        epoch: u32,
+        writer: GkWriter,
+        blobs: Vec<Vec<u8>>,
+    },
+    /// One part of what `EpochNames` asked, or the push of a gated Join.
+    EpochNamesIn {
+        group: String,
+        part: u16,
+        last: bool,
+        piece: NamesPiece,
+    },
+    /// A request refused; `what` and `why` are `refused_what` and `refused_why` codes.
+    EpochRefused {
+        group: String,
+        what: u8,
+        why: u8,
+        detail: String,
+    },
+    /// One part of a voice room's seats.
+    VoiceSeats {
+        channel_id: ChannelId,
+        group: String,
+        part: u16,
+        last: bool,
+        piece: VoiceSeatsPiece,
+    },
+    /// To an account's sessions: `left` groups are not yet re-seated at seat-key counter
+    /// `n`.
+    EpochReseated { n: u32, left: u32 },
+    /// To the writer's own connection: its `EpochPost` in `group` was taken (went to the
+    /// channel's readers), never sent for one refused. `post` is the first 16 bytes of
+    /// SHA-256 over the post's `ciphertext` (voipc-crypto `group_key::wire::post_digest`): the
+    /// app files that post's kept copy now, under the epoch it went under.
+    EpochPostTaken { group: String, post: [u8; 16] },
 }
 
 /// A relay's refusal of `AccountRequest::KeyChallenge` for an account whose password is not a

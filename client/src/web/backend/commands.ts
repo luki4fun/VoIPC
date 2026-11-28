@@ -13,6 +13,7 @@ import { getConfig, onShareMoved, resetConfig, updateConfig } from "./config";
 import { emit as emitEvent } from "./events";
 import * as session from "./session";
 import { forgetDevice, listDevices } from "./devices";
+import { forgetMirror, mirrorKey } from "./gk-mirror";
 import { wasm } from "./wasm";
 import { forgetRelayId, type AccountArgs, type ProviderAnswer } from "./account";
 import { playCue } from "./sounds";
@@ -97,6 +98,25 @@ function ids(v: unknown, name: string): number[] {
 
 function bool(v: unknown, name: string): boolean {
   return typeof v === "boolean" ? v : fail(`invalid ${name}`);
+}
+
+/** Where a lobby page ended (protocol 25), or null from the start. */
+function lobbyCursor(v: unknown): { section: number; name: string; user_id: number } | null {
+  if (v === null || v === undefined) return null;
+  if (typeof v !== "object") fail("invalid after");
+  const c = v as Record<string, unknown>;
+  const section = u32(c.section, "after.section");
+  if (section > 0xffff) fail("invalid after.section");
+  return { section, name: str(c.name, "after.name"), user_id: u32(c.user_id, "after.user_id") };
+}
+
+/** Account ids: 16 bytes each. */
+function accountIds(v: unknown): number[][] {
+  if (!Array.isArray(v)) fail("invalid accounts");
+  return v.map((a) => {
+    if (!Array.isArray(a) || a.length !== 16) fail("invalid account");
+    return a.map((b) => (Number.isInteger(b) && b >= 0 && b <= 255 ? (b as number) : fail("invalid account")));
+  });
 }
 
 function clamp(v: number, lo: number, hi: number): number {
@@ -300,9 +320,18 @@ const handlers: Record<string, Handler> = {
       name: d.name,
       relay_id: toHex(d.relay_id),
     })),
-  forget_device: ({ server, name }) => {
-    session.forgetKept(str(server, "server"));
-    return forgetDevice(str(server, "server"), str(name, "name"));
+  forget_device: async ({ server, name }) => {
+    const at = str(server, "server");
+    const who = str(name, "name");
+    session.forgetKept(at);
+    // The group key's counters kept for the account go with it, as its read cursors do: the
+    // row the record names, and the row of a connection signed in as it now (a password
+    // sign-in has no record), which writes there no more, so the row stays gone
+    const live = session.forgetMirrorOf(at, who);
+    const known = await forgetDevice(at, who);
+    for (const key of new Set([live, known && mirrorKey(known.relay_id, known.name)])) {
+      if (key) await forgetMirror(key);
+    }
   },
   send_kept_dm: ({ server, account, content, ttlSecs, replyTo, thread, file, fwd, event }) =>
     need(server).sendKeptDm(
@@ -358,7 +387,7 @@ const handlers: Record<string, Handler> = {
   get_platform: () => "web",
 
   // ── channels ──
-  join_channel: ({ server, channelId, password }) => {
+  join_channel: async ({ server, channelId, password }) => {
     const s = need(server);
     const channel = u32(channelId, "channelId");
     // Subscribing to a text channel is not a move, so it costs no share and no
@@ -366,6 +395,9 @@ const handlers: Record<string, Handler> = {
     if (!s.isTextChannel(channel)) {
       s.clearWatching();
       if (channel !== 0) s.askVoice();
+      // Leaving the call: the microphone shuts here, not when the relay answers, and stays
+      // shut until it does (dive 6 F10). The room's state still waits for the answer
+      else if (session.voiceSession() === s) await audio.closeForLeave();
     }
     s.sendControl({ JoinChannel: { channel_id: channel, password: optStr(password, "password") } });
   },
@@ -376,6 +408,13 @@ const handlers: Record<string, Handler> = {
   set_quiet: ({ server, channels, quiet }) => need(server).setQuiet(ids(channels, "channels"), bool(quiet, "quiet")),
   request_channel_page: ({ server, channelId, after }) =>
     need(server).sendControl({ RequestChannelPage: { channel_id: u32(channelId, "channelId"), after: u32(after, "after") } }),
+  request_lobby_page: ({ server, after, prefix }) =>
+    need(server).sendControl({ RequestLobbyPage: { after: lobbyCursor(after), prefix: str(prefix ?? "", "prefix") } }),
+  lookup_users: ({ server, ids: asked, names, accounts }) => {
+    const n = Array.isArray(names) ? names.map((x) => str(x, "names")) : fail("invalid names");
+    need(server).sendControl({ LookupUsers: { ids: ids(asked, "ids"), names: n, accounts: accountIds(accounts) } });
+  },
+  watch_lobby: ({ server, on }) => need(server).sendControl({ WatchLobby: { on: bool(on, "on") } }),
   set_metered: ({ metered }) => session.setMetered(bool(metered, "metered")),
   key_job_answer: ({ server, channelId, go }) => need(server).keyJobAnswer(u32(channelId, "channelId"), bool(go, "go")),
   create_channel: ({ server, name, password, proximity, anonymous, text }) => {
@@ -629,6 +668,7 @@ const handlers: Record<string, Handler> = {
     return need(server).sendControl({ AdminUnban: { id } });
   },
   admin_list_bans: ({ server }) => need(server).sendControl("AdminListBans"),
+  admin_load: ({ server }) => need(server).sendControl("AdminLoad"),
   admin_bans_page: ({ server, search, offset }) =>
     need(server).sendControl({ AdminBansPage: { search: str(search, "search"), offset: u32(offset, "offset") } }),
 
@@ -966,9 +1006,19 @@ const handlers: Record<string, Handler> = {
       c.open_servers = list;
     });
   },
-  reset_config: () => {
+  reset_config: async () => {
+    // The microphone closes first, as on the desktop (commands.rs `reset_config`): the default
+    // mode is push-to-talk, and a capture left running under it sends every frame (dive 6 F1)
+    await audio.stopTransmit();
+    const [wasMuted, wasDeafened] = [audio.muted, audio.deafened];
     resetConfig();
     audio.applySettings(getConfig());
+    // Every server hears the mute and deafen the reset cleared, as the desktop tells them
+    // (review D-P1): else others go on seeing the user muted while they are not
+    for (const s of session.allSessions()) {
+      if (audio.muted !== wasMuted) s.sendControl({ SetMuted: { muted: audio.muted } });
+      if (audio.deafened !== wasDeafened) s.sendControl({ SetDeafened: { deafened: audio.deafened } });
+    }
   },
   // The appearance blob, stored verbatim. Same contract as set_ui_prefs in
   // commands.rs, including refusing anything that is not an object.
@@ -979,6 +1029,11 @@ const handlers: Record<string, Handler> = {
     updateConfig((c) => {
       c.ui_prefs = prefs as Record<string, unknown>;
     });
+  },
+  // "Help hold keys", live on every open connection (the browser keeps no switch of it)
+  set_help_hold_keys: ({ enabled }) => {
+    const on = bool(enabled, "enabled");
+    for (const s of session.allSessions()) s.gkSetVolunteer(on);
   },
   set_config_bool: ({ key, value }) => {
     const enabled = bool(value, "value");

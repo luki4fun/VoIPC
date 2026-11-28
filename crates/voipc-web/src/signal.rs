@@ -32,6 +32,8 @@ pub struct SignalCore {
     /// native client keeps the same struct beside the same stores; sharing it
     /// is what stops the two drifting, as they did over rotation.
     pub keying: ChannelKeying,
+    /// The group epoch key (plan 3i), the native client's `GroupKeying` too.
+    pub gk: crate::gk::Gk,
 }
 
 impl SignalCore {
@@ -52,6 +54,7 @@ impl SignalCore {
         Ok(Self {
             stores,
             keying: ChannelKeying::default(),
+            gk: crate::gk::Gk::default(),
         })
     }
 
@@ -233,7 +236,9 @@ impl SignalCore {
             .live_answer_job(&mut self.stores, channel_id, go, now)
     }
 
+    /// The group key's events name people from the same rows.
     pub fn live_note_rows(&mut self, rows: &[UserInfo]) -> Vec<Seen> {
+        self.gk.roster.note(rows);
         self.keying.live_note_rows(&self.stores, rows)
     }
 
@@ -243,6 +248,11 @@ impl SignalCore {
 
     pub fn live_keep_sessions(&mut self, now: u64) -> KeptSessions {
         self.keying.live_keep_sessions(&self.stores, now)
+    }
+
+    /// What an earlier connection kept: its sessions, and into these stores what it read.
+    pub fn live_adopt_kept(&mut self, kept: KeptSessions) {
+        self.keying.live_adopt_kept(&mut self.stores, kept);
     }
 
     pub fn live_drop_kept_session(&mut self, user_id: u32) -> bool {
@@ -259,5 +269,37 @@ impl SignalCore {
     ) -> anyhow::Result<ClientMessage> {
         self.keying
             .live_seal_answer(&mut self.stores, channel_id, target, messages, now)
+    }
+
+    // ── The group epoch key: `gk::Gk`'s, with the stores it needs ───────
+
+    pub fn gk_start(&mut self, start: crate::gk::Start) -> anyhow::Result<crate::gk::Out> {
+        self.gk.start(&self.stores, start)
+    }
+
+    pub fn gk_frame(&mut self, payload: &[u8]) -> anyhow::Result<crate::gk::Out> {
+        self.gk.frame(&mut self.stores, payload)
+    }
+
+    pub fn gk_post(
+        &mut self,
+        channel_id: u32,
+        post_id: [u8; 16],
+        envelope: Vec<u8>,
+        log: String,
+        ttl_secs: Option<u32>,
+    ) -> crate::gk::Out {
+        self.gk.post(
+            &mut self.stores,
+            channel_id,
+            post_id,
+            envelope,
+            log,
+            ttl_secs,
+        )
+    }
+
+    pub fn gk_tick(&mut self) -> crate::gk::Out {
+        self.gk.tick(&mut self.stores)
     }
 }

@@ -685,7 +685,7 @@ async fn send_marks_once(relay: &Relay, tx: &ControlTx) -> bool {
         return false;
     };
     for data in frames.iter() {
-        let _ = tx.try_send(data.clone());
+        let _ = tx.try_send(data.clone().into());
     }
     true
 }

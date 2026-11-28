@@ -17,7 +17,9 @@
     STREAM_CHAT_WIDTH_MIN,
   } from "../ui-prefs.js";
   import { activeStreamChat, uiLayout, updateActiveStreamChat } from "../stores/ui-prefs.js";
-  import { streamStage } from "../stores/screenshare.js";
+  import { isSharingScreen, streamStage } from "../stores/screenshare.js";
+  import { openSharePicker, shareControlsShown, stopSharing } from "../stores/share-controls.js";
+  import { isMobile } from "../stores/platform.js";
   import { displayChannel, displayChannelId, shownMessages } from "../stores/roster.js";
   import { activeDmUserId, activeDmUsername } from "../stores/chat.js";
   import { serverAddress } from "../stores/connection.js";
@@ -122,6 +124,19 @@
 </div>
 
 {#snippet controls()}
+  <!-- The stream view covers the voice bar's Share in a narrow window: its own here.
+       Not on a phone, which shares nothing (the voice bar hides it there too). -->
+  {#if $shareControlsShown && !$isMobile}
+    {#if $isSharingScreen}
+      <button aria-label="Stop sharing your screen" class="stage-btn share-toggle on" onclick={stopSharing} title="Stop sharing your screen">
+        <Icon name="monitor-off" size={16} />
+      </button>
+    {:else}
+      <button aria-label="Share your screen" class="stage-btn share-toggle" onclick={openSharePicker} title="Share your screen">
+        <Icon name="monitor" size={16} />
+      </button>
+    {/if}
+  {/if}
   <button
     class="stage-btn chat-toggle"
     class:on={prefs.open}

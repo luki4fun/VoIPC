@@ -43,6 +43,7 @@ use voipc_protocol::types::{
 
 use crate::config::{AccountsConfig, AccountsMode, RegistrationMode};
 use crate::control::ControlTx;
+use crate::gk::group::cause as gk_cause;
 use crate::state::ServerState;
 
 /// The privileges this relay checks (1.7). Each is a scope a group (an l4f
@@ -189,6 +190,13 @@ const VAULT_TOTAL_BYTES: usize = 56 * 1024;
 /// one at a time after sign-in.
 pub(crate) const PINS_NS: &str = "voipc.pins";
 const PINS_TOTAL_BYTES: usize = PIN_PAGES as usize * VAULT_MAX_BYTES;
+/// The group key's floor pages (`gkf.0`–`gkf.15`, counters `gkc.0`–`gkc.31`, plan 2g), asked
+/// for one at a time like the pins'; their index `item.gk_floors` stays in the vault.
+pub(crate) const GK_NS: &str = "voipc.gkfloors";
+const GK_FLOOR_PAGES: u16 = 16;
+const GK_COUNTER_PAGES: u16 = 32;
+const GK_PAGES: u16 = GK_FLOOR_PAGES + GK_COUNTER_PAGES;
+const GK_TOTAL_BYTES: usize = GK_PAGES as usize * VAULT_MAX_BYTES;
 
 /// The derived secret is 32 bytes; l4f stores it as if it were a password.
 const SECRET_LEN: usize = 32;
@@ -210,6 +218,11 @@ const PENDING_SIGN_INS: usize = 32;
 /// Of those, at most this many from one address (IPv6: one /64), so one
 /// address cannot hold them all.
 const PENDING_PER_ADDRESS: usize = 4;
+/// How long a sign-in waits its turn when all of `PENDING_SIGN_INS` are working.
+#[cfg(not(test))]
+const SLOT_WAIT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const SLOT_WAIT: Duration = Duration::from_millis(300);
 /// Closes a connection that only asked something (`AccountStart::Providers`,
 /// `Provider`); its `AuthStep` was the answer.
 const ANSWERED: &str = "Answered.";
@@ -242,6 +255,7 @@ pub mod archive;
 pub mod at_connect;
 pub mod bans;
 pub mod gates;
+pub mod gk;
 pub mod import;
 #[cfg(test)]
 mod kept_sync_tests;
@@ -443,6 +457,12 @@ pub struct Relay {
     claiming: tokio::sync::Mutex<()>,
     /// What every connect is told before its join, kept a while (W2-16).
     pub(crate) at_connect: at_connect::AtConnect,
+    /// The relay's group keys (`bind_gk`): told who left a log, was reset or deleted (C4).
+    /// Never set in a shell command's process, which runs no groups.
+    gk: std::sync::OnceLock<Arc<crate::gk::Groups>>,
+    /// The device each device-key sign-in came from, by its session's token, until its
+    /// connection is up (`gk_device_at_connect`): what a keyholder entry is removed by.
+    devkey_signins: DashMap<String, (Vec<u8>, i64)>,
 }
 
 /// A key slot as `voipc_crypto::account::Vault` writes it: version byte,
@@ -450,6 +470,10 @@ pub struct Relay {
 const SLOT_LEN: usize = 1 + 32 + 8 + 12 + 48;
 /// `slot.reset`: the reset key's public half (Ed25519).
 const SLOT_RESET: &str = voipc_crypto::account::SLOT_RESET;
+
+/// `voipc_meta`'s key prefix for an identity reset the relay's groups have not heard of yet,
+/// before the account in unpadded base64url (26 characters of the 32 a key may hold).
+const GK_RESET: &str = "gkr:";
 const RESET_KEY_LEN: usize = 32;
 /// What a recovery key that does not open the account hears, on a real one and a decoy.
 const NOT_THIS_KEY: &str = "That recovery key is not this account's.";
@@ -474,7 +498,11 @@ impl Drop for PendingSlot {
 impl Relay {
     /// Connects, migrates, and reads or makes the relay id and the master key.
     pub async fn open(cfg: &AccountsConfig) -> Result<Relay> {
-        let store = Store::connect(&cfg.database)
+        let pool = l4f_accounts::store::PoolConfig {
+            max_connections: cfg.db_connections.max(1),
+            ..Default::default()
+        };
+        let store = Store::connect_with(&cfg.database, pool)
             .await
             .with_context(|| format!("accounts database {}", redact(&cfg.database)))?;
         owner_only_sqlite(&cfg.database);
@@ -554,7 +582,10 @@ impl Relay {
             archive_held: tokio::sync::Mutex::default(),
             archive_kick: tokio::sync::Notify::new(),
             archive_searches: Semaphore::new(archive::SEARCHES),
-            pending: Arc::new(Semaphore::new(PENDING_SIGN_INS)),
+            // As many at once as the database takes, so a storm keeps it busy
+            pending: Arc::new(Semaphore::new(
+                PENDING_SIGN_INS.max(cfg.db_connections as usize),
+            )),
             pending_by_address: Arc::default(),
             pow_key,
             link_lock: tokio::sync::Mutex::new(()),
@@ -567,6 +598,8 @@ impl Relay {
             claiming: tokio::sync::Mutex::new(()),
             logkey_changes: DashMap::new(),
             at_connect: Default::default(),
+            gk: std::sync::OnceLock::new(),
+            devkey_signins: DashMap::new(),
         };
         placeholder::load(&relay).await?;
         archive::load(&relay).await?;
@@ -575,6 +608,216 @@ impl Relay {
 
     pub fn store(&self) -> &Store {
         &self.accounts.store
+    }
+
+    /// The relay's group keys, which the accounts paths tell of exits from here on (C4).
+    pub fn bind_gk(&self, gk: &Arc<crate::gk::Groups>) {
+        let _ = self.gk.get_or_init(|| gk.clone());
+    }
+
+    /// The group keys, with the switch on: off, no account hook runs (2i).
+    pub(crate) fn gk(&self) -> Option<&crate::gk::Groups> {
+        self.gk.get().map(|g| &**g).filter(|g| g.on)
+    }
+
+    /// `me` keeps `conv`'s log now: it takes a seat in the conversation's group at once, with
+    /// its published seat keys (plan 2d, C4), up to `kept_seats` a group.
+    pub(crate) async fn gk_joined_log(&self, conv: &str, me: &[u8; 16]) {
+        let Some(gk) = self.gk() else {
+            return;
+        };
+        match self.identity(AccountId(*me)).await {
+            Ok(ik) => {
+                if let Some(ik) = ik.as_deref().and_then(crate::gk::store::ik_raw) {
+                    gk.on_log_join(conv, *me, ik).await;
+                }
+            }
+            Err(e) => warn!("reading an identity for a seat: {e:#}"),
+        }
+    }
+
+    /// The exit of `accounts`' seats in `conv`'s group for `cause`, asked in the store before
+    /// what takes them out is done (`Groups::ask_exit`): when, or `None` (the switch off, or
+    /// the write failed).
+    pub(crate) async fn gk_ask_exit(
+        &self,
+        conv: &str,
+        accounts: &[[u8; 16]],
+        cause: u8,
+    ) -> Option<u64> {
+        self.gk()?.ask_exit(conv, accounts, cause).await
+    }
+
+    /// `account` stops keeping `conv`'s log (`log::leave`, `remove` its membership's removal):
+    /// its seats' exit is asked before `remove` runs and posted after (dive 4 F7, review R2-1),
+    /// so a stop between the two still exits them at the group's next start. What `remove`
+    /// gave: whether a membership row went.
+    pub(crate) async fn gk_log_leave(
+        &self,
+        conv: &str,
+        account: [u8; 16],
+        remove: impl std::future::Future<Output = Result<bool>>,
+    ) -> Result<bool> {
+        let cause = gk_cause::LEAVE;
+        let asked = self.gk_ask_exit(conv, &[account], cause).await;
+        let gone = remove.await;
+        let Some(gk) = self.gk() else {
+            return gone;
+        };
+        match gone {
+            // A failed delete exits all the same: the ask is there, and the app asks again
+            Ok(true) | Err(_) => gk.exit_from_log(conv, vec![account], cause, asked),
+            // No membership row (a leave asked again after a stop cut the first one off): a
+            // seat no session of it holds here exits, and the ask is settled either way
+            Ok(false) => {
+                if let Some(at) = asked {
+                    gk.exit_unless_held(conv, account, cause, at);
+                }
+            }
+        }
+        gone
+    }
+
+    /// `log::keep_only` (a new password), and the seats of all but `keep` in the
+    /// conversation's group exit: those of a live follow alone too, which no stored member
+    /// names (plan 2d). Who goes is asked first, so a stop while the members are taken out
+    /// one by one still exits them all at the group's next start (dive 4 F7); their exit is
+    /// one message, taken in one walk of the group.
+    pub async fn log_keep_only(&self, conv: &str, keep: &[[u8; 16]]) -> Result<()> {
+        let Some(gk) = self.gk() else {
+            log::keep_only(self.store(), conv, keep).await?;
+            return Ok(());
+        };
+        let mut gone = log::members_in(self.store(), conv).await?;
+        gone.extend(gk::seated_accounts(self.store(), conv).await?);
+        gone.retain(|a| !keep.contains(a));
+        gone.sort_unstable();
+        gone.dedup();
+        let asked = gk.ask_exit(conv, &gone, gk_cause::GATE).await;
+        let out = log::keep_only(self.store(), conv, keep).await;
+        gk.exit_from_log(conv, gone, gk_cause::GATE, asked);
+        out.map(|_| ())
+    }
+
+    /// A deleted account's group-key rows, at the tombstone sweep (`log::sweep_tombstones`):
+    /// its seat keys and self-rows go, and its seats exit and its keyholder entries are
+    /// removed, whatever path deleted it. How many of its seats and entries are left, which
+    /// keep the stone (each sweep asks again: a group's actor may have stopped meanwhile).
+    pub(crate) async fn gk_tombstone(&self, account: &[u8; 16]) -> Result<i64> {
+        gk::forget_account(self.store(), account).await?;
+        let m = voipc_crypto::group_key::MemberId::Account(*account).seat_id();
+        let left = gk::seats_of(self.store(), account).await?
+            + gk::holders_of(self.store(), &m, None).await?.len() as i64;
+        if left > 0 {
+            self.gk_account_gone(account, gk_cause::DELETED).await;
+        }
+        Ok(left)
+    }
+
+    /// Every seat of `account` exits, online or not, and (a ban, an identity reset, a
+    /// deletion) its keyholder entries are removed.
+    pub(crate) async fn gk_account_gone(&self, account: &[u8; 16], cause: u8) {
+        if let Some(gk) = self.gk() {
+            gk.on_account_gone(*account, cause).await;
+        }
+    }
+
+    /// An identity reset (plan 2g): the seat keys the old identity endorsed, the self-rows
+    /// sealed under them and the keyholder entries made with them are nobody's now. Every
+    /// seat of the account exits, each entry is removed (its row tells where it is), and its
+    /// next `SeatKeysPublish` seats it anew. In a process
+    /// with no groups (the shell's `reclaim`) the relay is told by a mark it reads with the
+    /// bans (`gk_shell_resets`).
+    pub(crate) async fn gk_identity_reset(&self, account: &[u8; 16]) {
+        if let Err(e) = gk::forget_account(self.store(), account).await {
+            warn!("dropping an account's group-key rows after a reset: {e:#}");
+        }
+        use base64::Engine;
+        let a = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(account);
+        let k = format!("{GK_RESET}{a}");
+        if self.gk.get().is_some() {
+            // A mark the shell left is this reset's now (the claim after `reclaim`): read
+            // later, it would take the new identity's seats and entries
+            let dropped: Result<()> = async {
+                db!(self.store(), pool => {
+                    sqlx::query("DELETE FROM voipc_meta WHERE k = $1").bind(&k).execute(pool).await?;
+                });
+                Ok(())
+            }
+            .await;
+            if let Err(e) = dropped {
+                warn!("dropping an identity reset's mark: {e:#}");
+            }
+            self.gk_account_gone(account, gk_cause::RESET).await;
+            return;
+        }
+        let marked: Result<()> = async {
+            db!(self.store(), pool => {
+                sqlx::query("INSERT INTO voipc_meta (k, v) VALUES ($1, $2) ON CONFLICT (k) DO NOTHING")
+                    .bind(&k)
+                    .bind(&[0u8; 0][..])
+                    .execute(pool)
+                    .await?;
+            });
+            Ok(())
+        }
+        .await;
+        if let Err(e) = marked {
+            warn!("marking an identity reset for the relay: {e:#}");
+        }
+    }
+
+    /// The identity resets another process marked (`gk_identity_reset`): their seats exit
+    /// here, online or not. Run with the bans, at start and every `REVALIDATE_MINUTES`; a
+    /// shell command reading the bans (`ban list`) reaches no group and leaves them.
+    pub async fn gk_shell_resets(&self) -> Result<()> {
+        if !self.gk().is_some_and(|g| g.attached()) {
+            return Ok(());
+        }
+        let marks: Vec<String> = db!(self.store(), pool => {
+            sqlx::query_scalar("SELECT k FROM voipc_meta WHERE k LIKE $1").bind(format!("{GK_RESET}%")).fetch_all(pool).await?
+        });
+        use base64::Engine;
+        for k in marks {
+            let account = k
+                .strip_prefix(GK_RESET)
+                .and_then(|a| {
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .decode(a)
+                        .ok()
+                })
+                .and_then(|a| <[u8; 16]>::try_from(a).ok());
+            if let Some(a) = account {
+                self.gk_account_gone(&a, gk_cause::RESET).await;
+            }
+            db!(self.store(), pool => {
+                sqlx::query("DELETE FROM voipc_meta WHERE k = $1").bind(&k).execute(pool).await?;
+            });
+        }
+        Ok(())
+    }
+
+    /// A device-key sign-in's device, until its connection is up (`gk_device_at_connect`).
+    fn devkey_signed_in(&self, token: &str, device: Vec<u8>) {
+        let now = util::now();
+        self.devkey_signins
+            .retain(|_, (_, at)| now - *at < STEP_WAIT.as_secs() as i64 * 10);
+        self.devkey_signins.insert(token.to_string(), (device, now));
+    }
+}
+
+/// A device-key sign-in's connection is up: the keyholder entries it makes are its device's
+/// (`Groups::set_device`), which `DeviceForget` then removes (plan 2d).
+fn gk_device_at_connect(state: &ServerState, session_id: u32) {
+    let Some(relay) = state.accounts.as_ref().filter(|_| state.gk.on) else {
+        return;
+    };
+    let token = state
+        .sessions
+        .get(&session_id)
+        .and_then(|s| s.account.as_ref().map(|a| a.token.clone()));
+    if let Some((_, (device, _))) = token.and_then(|t| relay.devkey_signins.remove(&t)) {
+        state.gk.set_device(session_id, device);
     }
 }
 
@@ -600,9 +843,11 @@ pub async fn sqlite_backup(store: &Store, path: &std::path::Path) -> Result<()> 
 }
 
 impl Relay {
-    /// A slot for a sign-in from `ip`, or `None` while the relay, or that
-    /// address, has as many open as it takes.
-    pub fn pending_slot(&self, ip: IpAddr) -> Option<PendingSlot> {
+    /// A slot for a sign-in from `ip`: `None` at once while that address has as many open as
+    /// it takes, and when the relay's are all in use for `SLOT_WAIT`. A storm waits in turn
+    /// for the database: refused at once, each sign-in came back with a new handshake, and a
+    /// 50,000-account storm went from 390 sign-ins a second to 10 (63,000 refusals a minute).
+    pub async fn pending_slot(&self, ip: IpAddr) -> Option<PendingSlot> {
         let key = util::ip_key(ip);
         {
             let mut n = self.pending_by_address.entry(key.clone()).or_insert(0);
@@ -617,7 +862,8 @@ impl Relay {
             by_address: self.pending_by_address.clone(),
             key,
         };
-        slot._permit = Some(self.pending.clone().try_acquire_owned().ok()?);
+        let permit = tokio::time::timeout(SLOT_WAIT, self.pending.clone().acquire_owned());
+        slot._permit = Some(permit.await.ok()?.ok()?);
         Some(slot)
     }
 
@@ -664,20 +910,20 @@ impl Relay {
             .collect())
     }
 
-    /// One page of an account's pins.
+    /// One page of an account's pins, or of its group-key floors.
     pub async fn vault_page(&self, user: AccountId, k: &str) -> Result<AccountReply> {
-        if !is_pin_page(k) {
+        let ns = if is_pin_page(k) {
+            PINS_NS
+        } else if is_gk_page(k) {
+            GK_NS
+        } else {
             return Ok(refused("VaultPage", "No such page."));
-        }
-        let blob = self
-            .store()
-            .blob(user, PINS_NS, k)
-            .await?
-            .map(|b| VaultBlob {
-                k: b.k,
-                v: b.v,
-                version: b.version,
-            });
+        };
+        let blob = self.store().blob(user, ns, k).await?.map(|b| VaultBlob {
+            k: b.k,
+            v: b.v,
+            version: b.version,
+        });
         Ok(AccountReply::VaultPageFound {
             k: k.to_string(),
             blob,
@@ -717,21 +963,31 @@ impl Relay {
             ));
         }
         // The count and the size are checked inside the write's transaction, so
-        // two writes at once cannot both pass. The vault and the pins are all an
-        // account keeps in l4f's storage, each with its own total there, and the pins'
-        // leave room in the quota for a vault at its fullest: a password change writes
-        // there under the quota alone.
-        let (ns, other, max_items, room) = if k.starts_with("pins.") {
+        // two writes at once cannot both pass. The vault, the pins and the group key's
+        // floors are all an account keeps in l4f's storage, each with its own total there,
+        // which l4f adds up across all three: each is let have its room plus what the
+        // other two hold. The pins' room leaves the quota a vault at its fullest, and the
+        // floors' a vault and the pins at theirs, so a password change or a seat-key
+        // rotation always writes there under the quota alone.
+        let vault_room = self.quota.min(VAULT_TOTAL_BYTES as i64);
+        let pins_room = (self.quota - vault_room).clamp(0, PINS_TOTAL_BYTES as i64);
+        let gk_room = (self.quota - vault_room - pins_room).clamp(0, GK_TOTAL_BYTES as i64);
+        let (ns, others, max_items, room) = if k.starts_with("pins.") {
             if !is_pin_page(k) {
                 return Ok(refused("VaultPut", "No such page."));
             }
-            let room = (self.quota - VAULT_TOTAL_BYTES as i64).clamp(0, PINS_TOTAL_BYTES as i64);
-            (PINS_NS, VAULT_NS, i64::from(PIN_PAGES), room)
+            (PINS_NS, [VAULT_NS, GK_NS], i64::from(PIN_PAGES), pins_room)
+        } else if k.starts_with("gkf.") || k.starts_with("gkc.") {
+            if !is_gk_page(k) {
+                return Ok(refused("VaultPut", "No such page."));
+            }
+            (GK_NS, [VAULT_NS, PINS_NS], i64::from(GK_PAGES), gk_room)
         } else {
-            let room = self.quota.min(VAULT_TOTAL_BYTES as i64);
-            (VAULT_NS, PINS_NS, VAULT_MAX_ITEMS, room)
+            (VAULT_NS, [PINS_NS, GK_NS], VAULT_MAX_ITEMS, vault_room)
         };
-        let quota = room + self.blob_bytes(user, other).await?;
+        let quota = room
+            + self.blob_bytes(user, others[0]).await?
+            + self.blob_bytes(user, others[1]).await?;
         Ok(
             match self
                 .store()
@@ -996,7 +1252,7 @@ pub(crate) fn l4f_config(cfg: &AccountsConfig, relay_id: [u8; 16]) -> Config {
         // Every new device signs in with the password once: a LAN party does
         // that together. The per-account cap still stops guessing at one name.
         login_per_15min: 30,
-        login_per_15min_global: 1000,
+        login_per_15min_global: cfg.password_sign_ins_per_15min as usize,
         reserved_usernames: vec![
             "voipc".into(),
             "guest".into(),
@@ -1073,9 +1329,22 @@ fn redact(url: &str) -> String {
 
 /// `pins.0` to `pins.55`, written one way, so one page has one name.
 fn is_pin_page(k: &str) -> bool {
-    k.strip_prefix("pins.")
-        .and_then(|n| n.parse::<u16>().ok().filter(|n| k == format!("pins.{n}")))
-        .is_some_and(|n| n < PIN_PAGES)
+    page_of(k, "pins.", PIN_PAGES)
+}
+
+/// `gkf.0` to `gkf.15` and `gkc.0` to `gkc.31`, written one way.
+fn is_gk_page(k: &str) -> bool {
+    page_of(k, "gkf.", GK_FLOOR_PAGES) || page_of(k, "gkc.", GK_COUNTER_PAGES)
+}
+
+fn page_of(k: &str, prefix: &str, pages: u16) -> bool {
+    k.strip_prefix(prefix)
+        .and_then(|n| {
+            n.parse::<u16>()
+                .ok()
+                .filter(|n| k == format!("{prefix}{n}"))
+        })
+        .is_some_and(|n| n < pages)
 }
 
 fn vault_item_ok(k: &str, v: &[u8]) -> Result<(), &'static str> {
@@ -1099,6 +1368,8 @@ pub(crate) fn asked(ask: Option<u32>, reply: AccountReply) -> AccountReply {
         None => reply,
     }
 }
+
+const GROUP_KEY_OFF: &str = "This relay does not use the group key.";
 
 fn refused(request: &str, reason: &str) -> AccountReply {
     AccountReply::Error {
@@ -1210,13 +1481,13 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
     let mut answers = 0u32;
     let mut registered = false;
     let mut by_secret = false;
-    let work = || relay.pending_slot(ip).ok_or_else(|| BUSY.to_string());
+    let work = || async { relay.pending_slot(ip).await.ok_or_else(|| BUSY.to_string()) };
     let session: NewSession = match start {
         AccountStart::Login => {
             // An account whose password is its login key (22) proves it over this
             // connection; any other name, and an account that has not moved yet, as before
             let keyed = {
-                let _work = work()?;
+                let _work = work().await?;
                 match scope::normalize_username(name, &[]) {
                     Ok(clean) => match relay.store().user_by_username(&clean).await {
                         Ok(Some(u)) => relay.accounts.hostkey(u.id).await.ok().flatten().is_some(),
@@ -1245,7 +1516,7 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
                 let Some(b) = Binding::claimed(web, binding) else {
                     return Err(NOT_THIS_CONNECTION.into());
                 };
-                let _work = work()?;
+                let _work = work().await?;
                 relay
                     .accounts
                     .login_hostkey(&ctx, name, &challenge, &nonce, None, |key| {
@@ -1274,7 +1545,7 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
                     return Err(unexpected());
                 };
                 let pw = secret_text(&auth_secret)?;
-                let _work = work()?;
+                let _work = work().await?;
                 by_secret = true;
                 relay.accounts.login_password(&ctx, name, &pw, None).await
             };
@@ -1309,7 +1580,7 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
             else {
                 return Err(unexpected());
             };
-            let _work = work()?;
+            let _work = work().await?;
             // Before l4f makes a session: the device's own key over this connection
             let key = relay
                 .store()
@@ -1335,11 +1606,13 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
                 info!("device key sign-in refused: not made on this connection");
                 return Err(NOT_THIS_CONNECTION.into());
             }
-            relay
+            let session = relay
                 .accounts
                 .devkey_login(&ctx, &challenge, &nonce, &device_id, &signature)
                 .await
-                .map_err(|e| e.message().to_string())?
+                .map_err(|e| e.message().to_string())?;
+            relay.devkey_signed_in(&session.token, device_id);
+            session
         }
         AccountStart::Reset => {
             return reset(
@@ -1469,7 +1742,7 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
             {
                 return Err(unexpected());
             }
-            let _work = work()?;
+            let _work = work().await?;
             let s = if let Some(code) = invite.as_deref().filter(|c| links::is_link_code(c)) {
                 links::register(
                     relay,
@@ -1591,7 +1864,10 @@ async fn reset<S: AsyncRead + AsyncWrite + Unpin>(
         return Err("Too many resets from your address. Try again later.".into());
     }
     let (user, identity, vault) = {
-        let _work = relay.pending_slot(ip).ok_or_else(|| BUSY.to_string())?;
+        let _work = relay
+            .pending_slot(ip)
+            .await
+            .ok_or_else(|| BUSY.to_string())?;
         let Ok(clean) = scope::normalize_username(name, &[]) else {
             return Err("No account of that name.".into());
         };
@@ -1678,7 +1954,10 @@ async fn reset<S: AsyncRead + AsyncWrite + Unpin>(
     if pass_slot.len() != SLOT_LEN {
         return Err(unexpected());
     }
-    let _work = relay.pending_slot(ip).ok_or_else(|| BUSY.to_string())?;
+    let _work = relay
+        .pending_slot(ip)
+        .await
+        .ok_or_else(|| BUSY.to_string())?;
     if second_factor {
         let factor = match (&totp, &recovery_code) {
             (Some(code), _) => l4f_accounts::service::SecondFactor::Totp(code),
@@ -1792,7 +2071,10 @@ async fn second_factor<S: AsyncRead + AsyncWrite + Unpin>(
         loop {
             step(stream, AuthStep::NeedTotp).await?;
             let answer = next(stream, buf, TOTP_WAIT, answers).await?;
-            let _work = relay.pending_slot(ip).ok_or_else(|| BUSY.to_string())?;
+            let _work = relay
+                .pending_slot(ip)
+                .await
+                .ok_or_else(|| BUSY.to_string())?;
             let r = match answer {
                 AuthContinue::Totp { code } => {
                     relay
@@ -1834,9 +2116,9 @@ async fn finish<S: AsyncRead + AsyncWrite + Unpin>(
     ip: IpAddr,
 ) -> Result<SignedIn, String> {
     let gone = || "Something went wrong. Please try again.".to_string();
-    let work = || relay.pending_slot(ip).ok_or_else(|| BUSY.to_string());
+    let work = || async { relay.pending_slot(ip).await.ok_or_else(|| BUSY.to_string()) };
     let (user, info, scopes, blobs) = {
-        let _work = work()?;
+        let _work = work().await?;
         let (user, info, scopes) = relay
             .accounts
             .session_from_token(&session.token, util::now())
@@ -1869,9 +2151,10 @@ async fn finish<S: AsyncRead + AsyncWrite + Unpin>(
     if identity_key.is_empty() || identity_key.len() > 64 {
         return Err("malformed identity key".into());
     }
-    let _work = work()?;
-    match relay.identity(user.id).await.map_err(|_| gone())? {
-        Some(known) if known == identity_key => {}
+    let _work = work().await?;
+    let known = relay.identity(user.id).await.map_err(|_| gone())?;
+    match &known {
+        Some(known) if *known == identity_key => {}
         Some(_) if !reset_identity => {
             return Err("This device's identity key is not your account's. Open your vault, or reset your identity in the account settings.".into());
         }
@@ -1881,10 +2164,16 @@ async fn finish<S: AsyncRead + AsyncWrite + Unpin>(
         Some(_) if !relay.accounts.fresh(&info, util::now()) => {
             return Err("Sign in with your password to reset your identity.".into());
         }
-        _ => relay
-            .set_identity(user.id, &identity_key)
-            .await
-            .map_err(|_| gone())?,
+        _ => {
+            relay
+                .set_identity(user.id, &identity_key)
+                .await
+                .map_err(|_| gone())?;
+            if known.is_some() {
+                // Boxed: the sign-in's future is every connection's while it waits
+                Box::pin(relay.gk_identity_reset(&user.id.0)).await;
+            }
+        }
     }
     let account = relay.info_of(&user, &scopes).await.map_err(|_| gone())?;
     let standing = relay.standing(&user, &scopes).await.map_err(|_| gone())?;
@@ -2288,6 +2577,8 @@ async fn delete_account(
     if let Err(e) = log::walk(relay.store(), &user.id.0).await {
         warn!("marking a deleted account's rows: {e:#}");
     }
+    // Its seats everywhere exit now; the rest of its group-key rows go with the tombstone
+    relay.gk_account_gone(&user.id.0, gk_cause::DELETED).await;
     // `Host::delete_user` left them out for good: a frame coming now must know, and no
     // reader gets what they wrote from here on
     if let Err(e) = archive::load(relay).await {
@@ -2436,6 +2727,7 @@ pub async fn handle_request(
             &reply(refused("Account", "This relay has no accounts.")),
         );
     };
+    relay.bind_gk(&state.gk);
     let Some((user, info, peer_ip, vault_proven, binding)) =
         state.sessions.get(&session_id).and_then(|s| {
             s.account.as_ref().map(|a| {
@@ -2473,6 +2765,9 @@ pub async fn handle_request(
             | AccountRequest::BucketLists { .. }
             | AccountRequest::OwnChainRows { .. }
             | AccountRequest::VaultPage { .. }
+            | AccountRequest::EpochChainKeys { .. }
+            | AccountRequest::SelfRowsList { .. }
+            | AccountRequest::RowMakers { .. }
     );
     let searches = matches!(req, AccountRequest::ArchiveSearch { .. });
     let allowed = state.sessions.get_mut(&session_id).is_some_and(|mut s| {
@@ -2539,6 +2834,28 @@ pub async fn handle_request(
                         Ok(()) => AccountReply::DeviceAdded,
                         Err(e) => refused("DeviceAdd", e.message()),
                     }
+                }
+            }
+        }
+        // Only a key of this account goes (l4f looks it up by the user), from any session of
+        // theirs and without a recent sign-in: dropping your own key gives nothing
+        AccountRequest::DeviceForget { device_id } => {
+            if !(16..=64).contains(&device_id.len()) {
+                refused("DeviceForget", "Not a device of this account.")
+            } else {
+                match relay
+                    .accounts
+                    .remove_credential(&ctx, &user, DEVKEY_KIND, &device_id)
+                    .await
+                {
+                    Ok(()) => {
+                        // The keyholder entries it made go too (plan 2d)
+                        if let Some(gk) = relay.gk() {
+                            gk.on_device_removed(user.id.0, &device_id).await;
+                        }
+                        AccountReply::DeviceForgotten
+                    }
+                    Err(e) => refused("DeviceForget", e.message()),
                 }
             }
         }
@@ -2668,7 +2985,8 @@ pub async fn handle_request(
             return Ok(());
         }
         AccountRequest::PairApprove { pair, wrapped } => {
-            if wrapped.len() <= 256 {
+            // Hybrid since 26 (RV g4 review): a Kyber1024 ciphertext as well
+            if wrapped.len() <= voipc_crypto::pair::WRAPPED_LEN {
                 relay
                     .pair_event(user.id, pair, provider::PairEvent::Wrapped(wrapped))
                     .await;
@@ -2757,9 +3075,25 @@ pub async fn handle_request(
         AccountRequest::LogKeyPublish { logkey, sig } => {
             log::publish(&relay, user.id, &logkey, &sig).await?
         }
-        AccountRequest::LogKeys { accounts } => log::keys(&relay, &accounts)
-            .await
-            .unwrap_or_else(|e| read_failed("LogKeys", e)),
+        AccountRequest::LogKeys { accounts } => {
+            // Their kept keys first, so a sharer holds them by the time it holds the log keys.
+            // Kept keys not read fail the answer, which the app asks again: the log keys alone
+            // would have a sharer seal a newcomer a blank for good (RV g4 review)
+            match log::kept_kems(&relay, &accounts).await {
+                Ok(pages) => {
+                    for kems in pages {
+                        let _ = crate::session::send_msg(tx, &ServerMessage::Account(kems));
+                    }
+                    log::keys(&relay, &accounts)
+                        .await
+                        .unwrap_or_else(|e| read_failed("LogKeys", e))
+                }
+                Err(e) => read_failed("LogKeys", e),
+            }
+        }
+        AccountRequest::KeptKemPublish { kem, sig } => {
+            log::publish_kem(&relay, user.id, &kem, &sig).await?
+        }
         AccountRequest::EpochPut { conv, epoch, wraps } => {
             let (out, told) = log::epoch_put(&relay, user.id, &conv, epoch, &wraps).await?;
             // A direct conversation's news, told the moment its writer goes by a pseudonym,
@@ -2833,8 +3167,11 @@ pub async fn handle_request(
                 }),
                 None => false,
             };
-            let (out, owners) = log::join(&relay, user.id, &conv, present).await?;
-            for o in owners {
+            let (out, taken) = log::join(&relay, user.id, &conv, present).await?;
+            if taken.is_some() {
+                relay.gk_joined_log(&conv, &user.id.0).await;
+            }
+            for o in taken.unwrap_or_default() {
                 tell(
                     state,
                     &o,
@@ -2863,6 +3200,7 @@ pub async fn handle_request(
             let present: Vec<bool> = convs.iter().map(|c| here.contains(c)).collect();
             let (out, told) = log::join_many(&relay, user.id, &convs, &present).await?;
             for (conv, owners) in told {
+                relay.gk_joined_log(&conv, &user.id.0).await;
                 for o in owners {
                     tell(
                         state,
@@ -3073,8 +3411,222 @@ pub async fn handle_request(
         AccountRequest::ArchiveChannels => archive::channels(state, &relay, session_id)
             .await
             .unwrap_or_else(|e| read_failed("ArchiveChannels", e)),
+        // The group key's (C4). With the switch off only the kept reads are served (1h).
+        AccountRequest::SeatKeysPublish { .. } if !state.gk.on => {
+            refused("SeatKeysPublish", GROUP_KEY_OFF)
+        }
+        AccountRequest::SelfRowPut { .. } if !state.gk.on => refused("SelfRowPut", GROUP_KEY_OFF),
+        AccountRequest::EpochChainStart { .. } if !state.gk.on => {
+            refused("EpochChainStart", GROUP_KEY_OFF)
+        }
+        AccountRequest::SeatKeysPublish {
+            kem,
+            dh,
+            n,
+            made,
+            sig,
+        } => {
+            let keys = gk::SeatKeys {
+                n,
+                kem,
+                dh,
+                made,
+                sig,
+                published: log::now_ms().max(0) as u64,
+            };
+            seat_keys_publish(state, &relay, user.id, keys).await?
+        }
+        AccountRequest::SelfRowPut { rows } => {
+            if rows.len() > voipc_protocol::gk::SELF_ROWS_MAX {
+                refused("SelfRowPut", "too many rows at once")
+            } else {
+                AccountReply::SelfRowsStored {
+                    count: gk::put_self_rows(relay.store(), &user.id.0, &rows).await?,
+                }
+            }
+        }
+        AccountRequest::EpochChainStart {
+            conv,
+            epoch,
+            self_wrap,
+            link,
+            group,
+            gen,
+            gk_epoch,
+            sealed,
+            last,
+        } => {
+            let sharing = state
+                .sessions
+                .get(&session_id)
+                .map(|s| log::Sharing {
+                    shares: s.shares_history,
+                    may: holds_share_history(&s),
+                })
+                .unwrap_or(log::Sharing {
+                    shares: false,
+                    may: false,
+                });
+            let start = log::GkChainStart {
+                epoch,
+                self_wrap,
+                link,
+                group,
+                gen,
+                gk_epoch,
+                sealed,
+                last,
+            };
+            let (out, told) = log::chain_start(&relay, user.id, &conv, start, sharing).await?;
+            for r in told {
+                tell(state, &r, AccountReply::LogNews { conv: conv.clone() }).await;
+            }
+            out
+        }
+        AccountRequest::EpochChainKeys { conv, chains } => {
+            log::gk_chain_keys(&relay, user.id, &conv, &chains)
+                .await
+                .unwrap_or_else(|e| read_failed("EpochChainKeys", e))
+        }
+        AccountRequest::SelfRowsList { after, limit } => {
+            let limit = limit.min(voipc_protocol::gk::SELF_ROWS_MAX as u16);
+            let (rows, next) = state.gk.rows_of(user.id.0, after.as_deref(), limit).await;
+            AccountReply::SelfRows { rows, next }
+        }
+        AccountRequest::RowMakers {
+            group,
+            gen,
+            sk,
+            sx,
+            after,
+        } => row_makers(state, user.id.0, &group, &gen, (sk, sx), after.as_deref()).await,
     };
     crate::session::send_msg(tx, &reply(out))
+}
+
+// ── The group key's account requests (C4, plan 3e) ────────────────────────
+
+/// `RowMakers` a page holds at most, about 80 B each, under the 64 KiB frame.
+const ROW_MAKERS_PAGE: usize = 256;
+
+/// `SeatKeysPublish` (§5.11): the account's seat keys, current from here if their counter is
+/// above every one before, and its seats made anew by them (`Groups::on_seat_keys`, with this
+/// pair, now its highest). The same keys again are held already. Only keys the account's
+/// identity endorsed: an identity reset wipes the counter, and an old identity's device
+/// would otherwise seat the account under keys its new devices cannot open.
+async fn seat_keys_publish(
+    state: &ServerState,
+    relay: &Relay,
+    user: AccountId,
+    keys: gk::SeatKeys,
+) -> Result<AccountReply> {
+    let wire = voipc_protocol::gk::EndorsedPair {
+        origin: voipc_protocol::gk::origin::VAULT_SEAT,
+        u: 0,
+        kem: keys.kem.clone(),
+        dh: keys.dh.clone(),
+        n: keys.n,
+        made: keys.made,
+        sig: keys.sig.clone(),
+    };
+    let member = voipc_protocol::gk::GkMember::Account(user.0);
+    let pair = voipc_crypto::group_key::wire::pair(&wire, member);
+    let (Ok(pair), Ok(_)) = (pair, i64::try_from(keys.made)) else {
+        return Ok(refused("SeatKeysPublish", "malformed"));
+    };
+    let identity = relay.identity(user).await?;
+    let Some(ik) = identity.as_deref().and_then(crate::gk::store::ik_raw) else {
+        return Ok(refused("SeatKeysPublish", "Open your vault first."));
+    };
+    let endorsed = voipc_crypto::identity::identity_key_from_bytes(&[&[0x05][..], &ik].concat())
+        .is_ok_and(|k| pair.endorsement.verify(&k, &pair.keys));
+    if !endorsed {
+        return Ok(refused(
+            "SeatKeysPublish",
+            "Those seat keys are not your identity's. Open your vault again.",
+        ));
+    }
+    let n = keys.n;
+    match gk::put_seat_keys_or(relay.store(), &user.0, &keys).await? {
+        gk::SeatKeysPut::Stored => {}
+        gk::SeatKeysPut::Behind(top) => {
+            // A signature is new each time (its nonce): the same keys are the same counter,
+            // keys and time
+            let held = gk::seat_keys(relay.store(), &user.0).await?;
+            return Ok(match held {
+                Some(k) if (k.n, &k.kem, &k.dh, k.made) == (n, &keys.kem, &keys.dh, keys.made) => {
+                    AccountReply::SeatKeysStored { n }
+                }
+                // Other keys at or above this counter: another device's rotation, or keys
+                // this device's vault does not hold (a device with the account's identity key
+                // published them). The app checks their endorsement and its vault and, if
+                // they are not the account's there, warns and goes above them (RV q8-q11)
+                Some(k) => AccountReply::SeatKeysBehind {
+                    held: voipc_protocol::gk::EndorsedPair {
+                        origin: voipc_protocol::gk::origin::VAULT_SEAT,
+                        u: 0,
+                        kem: k.kem,
+                        dh: k.dh,
+                        n: k.n,
+                        made: k.made,
+                        sig: k.sig,
+                    },
+                },
+                None => refused(
+                    "SeatKeysPublish",
+                    &format!("This account's seat keys are at counter {top} already."),
+                ),
+            });
+        }
+        gk::SeatKeysPut::Skips(top) => {
+            return Ok(refused(
+                "SeatKeysPublish",
+                &format!(
+                    "Those seat keys skip too far past this account's counter ({top}): at most {} above it.",
+                    gk::SEAT_KEYS_STEP
+                ),
+            ));
+        }
+    }
+    state.gk.on_seat_keys(user.0, pair, ik).await;
+    Ok(AccountReply::SeatKeysStored { n })
+}
+
+/// The keyholders that made live rows to one of this account's seats (`RowMakers`, C4), a
+/// page at a time by version; `next` is opaque to the app.
+async fn row_makers(
+    state: &ServerState,
+    account: [u8; 16],
+    group: &str,
+    gen: &[u8; 16],
+    (tag_sk, tag_sx): ([u8; 8], [u8; 8]),
+    after: Option<&[u8]>,
+) -> AccountReply {
+    let seat = voipc_crypto::group_key::SeatRef {
+        m: voipc_crypto::group_key::MemberId::Account(account),
+        tag_sk,
+        tag_sx,
+    };
+    let makers = state.gk.row_makers(group, gen, &seat).await;
+    let (makers, next) = makers_page(makers, after);
+    AccountReply::RowMakers { makers, next }
+}
+
+/// The page of `makers` after `after` (by version, a seat's rows have one each), and where
+/// the next starts while more remain.
+fn makers_page(
+    mut makers: Vec<voipc_protocol::gk::RowMaker>,
+    after: Option<&[u8]>,
+) -> (Vec<voipc_protocol::gk::RowMaker>, Option<Vec<u8>>) {
+    let from: Option<(u64, u64)> = after.and_then(|a| postcard::from_bytes(a).ok());
+    makers.sort_unstable_by_key(|m| (m.b, m.v));
+    makers.retain(|m| from.is_none_or(|f| (m.b, m.v) > f));
+    let next = makers
+        .get(ROW_MAKERS_PAGE)
+        .and(makers.get(ROW_MAKERS_PAGE - 1))
+        .and_then(|m| postcard::to_allocvec(&(m.b, m.v)).ok());
+    makers.truncate(ROW_MAKERS_PAGE);
+    (makers, next)
 }
 
 /// A channel's stored copy is held to the channel's own rules, as the live
@@ -3169,13 +3721,40 @@ async fn leave_log(state: &ServerState, channel_id: u32, session_id: u32, waits:
     if conv.is_empty() {
         return;
     }
+    // Kicked or gone of their own accord, which a stored seat's exit does not tell apart:
+    // the live seat's cause comes from the follow's own end (`Groups::on_kick`)
+    let cause = if waits {
+        gk_cause::LEAVE
+    } else {
+        gk_cause::GATE
+    };
+    // The exit is asked first, log member or not (dive 4 F7): a stop from here on still exits
+    // the account's seats at the group's next start, its log row gone or not
+    let asked = relay.gk_ask_exit(&conv, &[account], cause).await;
     let out = if waits {
         log::remove(relay.store(), &conv, &account).await
     } else {
         log::unseat(relay.store(), &conv, &account).await
     };
-    if let Err(e) = out {
-        warn!("log membership after a kick: {e}");
+    let Some(gk) = relay.gk() else {
+        if let Err(e) = out {
+            warn!("log membership after a kick: {e}");
+        }
+        return;
+    };
+    match out {
+        Ok(true) => gk.exit_from_log(&conv, vec![account], cause, asked),
+        // It keeps no log here: a follow alone seated it, and its session's own `Leave` (sent
+        // before this) exits its seat unless another session of it holds one
+        Ok(false) => {
+            if let Some(at) = asked {
+                gk.exit_unless_held(&conv, account, cause, at);
+            }
+        }
+        Err(e) => {
+            warn!("log membership after a kick: {e}");
+            gk.exit_from_log(&conv, vec![account], cause, asked);
+        }
     }
 }
 
@@ -3216,7 +3795,7 @@ pub async fn locked_logs_at_boot(state: &ServerState) -> Result<()> {
             continue;
         }
         if !fp.is_empty() {
-            log::keep_only(relay.store(), &conv, &[]).await?;
+            relay.log_keep_only(&conv, &[]).await?;
             info!(conv, "a channel's password changed while the server was down: its stored members join again");
         }
         db!(relay.store(), pool => {
@@ -3255,7 +3834,7 @@ pub async fn locked_log(state: &ServerState, channel_id: u32) {
                 .and_then(|s| s.account.as_ref().map(|a| a.user.id.0))
         })
         .collect();
-    if let Err(e) = log::keep_only(relay.store(), &conv, &keep).await {
+    if let Err(e) = relay.log_keep_only(&conv, &keep).await {
         warn!("log membership after a new password: {e}");
     }
 }
@@ -3332,54 +3911,81 @@ pub async fn revalidate(state: &Arc<ServerState>) {
             })
         })
         .collect();
+    // A few at a time, under the pool's ten connections: one after another, a big relay's pass
+    // took longer than its period
+    let mut checks = tokio::task::JoinSet::new();
     for (session_id, token, scopes, needs_2fa, standing) in live {
-        let read = scope_read(state, session_id);
-        match relay.accounts.session_from_token(&token, util::now()).await {
-            Ok(None) => {
-                // The token may have been rotated while this pass ran (turning
-                // codes on does that): only the token the session still holds
-                // counts (1.0 audit H1-11)
-                let current = state
-                    .sessions
-                    .get(&session_id)
-                    .and_then(|s| s.account.as_ref().map(|a| a.token.clone()));
-                if current.as_deref() == Some(token.as_str()) {
-                    crate::session::eject(state, session_id, "You were signed out of this server.")
-                        .await;
-                }
-            }
-            Ok(Some((user, _, now))) => {
-                // A role given to an account without codes changes no scope
-                // (its rights wait for them), only what the account is asked.
-                // A group without privileges changes standing alone
-                let changed = now != scopes
-                    || relay
-                        .accounts
-                        .needs_2fa(&user)
-                        .await
-                        .is_ok_and(|n| n != needs_2fa)
-                    || relay
-                        .standing(&user, &now)
-                        .await
-                        .is_ok_and(|s| s != standing);
-                if changed {
-                    // The list of who holds what is read once, below
-                    if let Err(e) =
-                        apply_scopes_then(state, &relay, session_id, user, now, read).await
-                    {
-                        warn!("a change from the server's shell: {e}");
-                    }
-                }
-            }
-            Err(e) => warn!("checking a signed-in connection: {e}"),
+        if checks.len() >= REVALIDATE_AT_ONCE {
+            checks.join_next().await;
         }
+        let (state, relay) = (state.clone(), relay.clone());
+        checks.spawn(async move {
+            revalidate_one(
+                &state, &relay, session_id, token, scopes, needs_2fa, standing,
+            )
+            .await
+        });
     }
+    while checks.join_next().await.is_some() {}
     // Holders who are not here too, and every change above: a stored hide is read
     // against them
     refresh_chat_mods(state).await;
     // And the share flag of someone away, whose session cannot clear it
     if let Err(e) = log::recheck_shares(&relay).await {
         warn!("rechecking who shares: {e:#}");
+    }
+}
+
+/// Sessions `revalidate` checks at once.
+const REVALIDATE_AT_ONCE: usize = 8;
+
+/// One signed-in session against what the database says now.
+async fn revalidate_one(
+    state: &Arc<ServerState>,
+    relay: &Relay,
+    session_id: u32,
+    token: String,
+    scopes: Vec<String>,
+    needs_2fa: bool,
+    standing: Standing,
+) {
+    let read = scope_read(state, session_id);
+    match relay.accounts.session_from_token(&token, util::now()).await {
+        Ok(None) => {
+            // The token may have been rotated while this pass ran (turning
+            // codes on does that): only the token the session still holds
+            // counts (1.0 audit H1-11)
+            let current = state
+                .sessions
+                .get(&session_id)
+                .and_then(|s| s.account.as_ref().map(|a| a.token.clone()));
+            if current.as_deref() == Some(token.as_str()) {
+                crate::session::eject(state, session_id, "You were signed out of this server.")
+                    .await;
+            }
+        }
+        Ok(Some((user, _, now))) => {
+            // A role given to an account without codes changes no scope
+            // (its rights wait for them), only what the account is asked.
+            // A group without privileges changes standing alone
+            let changed = now != scopes
+                || relay
+                    .accounts
+                    .needs_2fa(&user)
+                    .await
+                    .is_ok_and(|n| n != needs_2fa)
+                || relay
+                    .standing(&user, &now)
+                    .await
+                    .is_ok_and(|s| s != standing);
+            if changed {
+                // The list of who holds what is read once, at the pass's end
+                if let Err(e) = apply_scopes_then(state, relay, session_id, user, now, read).await {
+                    warn!("a change from the server's shell: {e}");
+                }
+            }
+        }
+        Err(e) => warn!("checking a signed-in connection: {e}"),
     }
 }
 
@@ -3579,13 +4185,17 @@ pub async fn mention_power_at_connect(
     user_id: u32,
     tx: &crate::control::ControlTx,
 ) {
-    let holders: Vec<u32> = state
-        .sessions
-        .iter()
-        .filter(|s| holds_mention_power(s))
-        .map(|s| s.user_id)
-        .collect();
-    if holders.contains(&user_id) {
+    // At every connect, before anything it sends: where its keyholder entries come from
+    gk_device_at_connect(state, session_id);
+    let holds = state.sessions.get(&session_id).is_some_and(|s| {
+        let holds = holds_mention_power(&s);
+        if holds {
+            state.mention_holders.insert(user_id);
+        }
+        holds
+    });
+    let holders: Vec<u32> = state.mention_holders.iter().map(|u| *u).collect();
+    if holds {
         if let Ok(data) = encode_server_msg(&ServerMessage::MentionPower {
             user_ids: vec![user_id],
             on: true,
@@ -3673,6 +4283,12 @@ async fn apply_scopes_then(
             .map(|n| n.my_badges.clone());
         calls = holds_mention_power(&s);
         called_before = could_call;
+        // Under this session's guard, as the connect's own look is
+        if calls {
+            state.mention_holders.insert(s.user_id);
+        } else {
+            state.mention_holders.remove(&s.user_id);
+        }
         editor_changed = s.powers.has(Powers::CHANNELS) != was_editor;
         (
             s.control_tx.clone(),
@@ -3729,6 +4345,78 @@ async fn apply_scopes_then(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C4 `RowMakers`: a seat's makers a page at a time, in one order whatever the database
+    /// gave, each once, from the `next` of the page before.
+    #[test]
+    fn row_makers_go_a_page_at_a_time_from_the_cursor_of_the_page_before() {
+        use voipc_protocol::gk::{GkMember, HolderRef, RowMaker};
+        let made = |i: u64| RowMaker {
+            from: HolderRef {
+                m: GkMember::Account([1; 16]),
+                kx: [2; 32],
+            },
+            s: 1,
+            b: u64::MAX - i % 3,
+            v: i.wrapping_mul(0x9e37_79b9_7f4a_7c15),
+        };
+        let all: Vec<RowMaker> = (0..600).map(made).collect();
+        let (mut seen, mut after) = (Vec::new(), None::<Vec<u8>>);
+        loop {
+            let mut shuffled = all.clone();
+            shuffled.reverse();
+            let (page, next) = makers_page(shuffled, after.as_deref());
+            assert!(page.len() <= ROW_MAKERS_PAGE);
+            seen.extend(page.iter().map(|m| (m.b, m.v)));
+            match next {
+                Some(n) => after = Some(n),
+                None => break,
+            }
+        }
+        let mut want: Vec<(u64, u64)> = all.iter().map(|m| (m.b, m.v)).collect();
+        want.sort_unstable();
+        assert_eq!(seen, want);
+    }
+
+    /// A device-key sign-in's device reaches its connection once that is up, and only its
+    /// own: its keyholder entries are that device's (`Groups::set_device`), which `DeviceForget`
+    /// removes.
+    #[tokio::test]
+    async fn a_device_key_sign_ins_device_is_taken_at_its_own_connection_only() {
+        let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../../target/k2-devkey-{:08x}.db",
+            rand::random::<u32>()
+        ));
+        let store = Store::connect(&format!("sqlite://{}?mode=rwc", file.display()))
+            .await
+            .unwrap();
+        let mut config = crate::config::ServerConfig::default();
+        config.accounts.mode = AccountsMode::Optional;
+        config.group_key = true;
+        let relay = Relay::open_with(&config.accounts, store, &[9u8; 32])
+            .await
+            .unwrap();
+        relay.devkey_signed_in("token-a", b"device-a-0000000".to_vec());
+        relay.devkey_signed_in("token-b", b"device-b-0000000".to_vec());
+        let mut state = ServerState::new(
+            &config,
+            crate::settings::ServerSettings::default(),
+            Vec::new(),
+            "test-admin-token".into(),
+        );
+        state.accounts = Some(Arc::new(relay));
+        let (_, sid) = crate::state::test_support::add_user(&state, "kim");
+        let mut a = crate::gk_e2e_tests::account_session([1; 16]);
+        a.token = "token-a".into();
+        state.sessions.get_mut(&sid).unwrap().account = Some(a);
+        gk_device_at_connect(&state, sid);
+        let left = &state.accounts.as_ref().unwrap().devkey_signins;
+        assert!(!left.contains_key("token-a"));
+        assert!(left.contains_key("token-b"));
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", file.display()));
+        }
+    }
 
     #[test]
     fn a_database_url_is_logged_without_its_password() {

@@ -9,6 +9,8 @@
 pub mod account;
 #[cfg(any(test, fuzzing))]
 pub mod fuzz;
+pub mod gk;
+pub mod gk_bench;
 pub mod media;
 pub mod signal;
 
@@ -16,7 +18,9 @@ use serde::Serialize;
 use voipc_crypto::file::FileError;
 use voipc_crypto::time::now_millis;
 use voipc_protocol::codec::{APP_VERSION, PROTOCOL_VERSION};
+use voipc_protocol::conv::unhex16;
 use voipc_protocol::messages::ClientMessage;
+use voipc_protocol::pool::{self, ViewerMsg};
 use voipc_protocol::types::{PreKeyBundleData, UserInfo};
 use wasm_bindgen::prelude::*;
 
@@ -86,6 +90,25 @@ pub fn decode_server_msg(bytes: &[u8]) -> Result<JsValue, JsError> {
     let serializer =
         serde_wasm_bindgen::Serializer::new().serialize_large_number_types_as_bigints(true);
     Ok(msg.serialize(&serializer)?)
+}
+
+// ── Media edge pool ──────────────────────────────────────────────────────
+
+/// A viewer's hello to a media edge, with its length prefix: the first frame on the
+/// edge's `/voipc-view` stream. The ticket is `EdgeView.ticket`, as the relay sent it.
+/// Built here so the browser's bytes are the native app's.
+#[wasm_bindgen(js_name = encodeViewerHello)]
+pub fn encode_viewer_hello(ticket: Vec<u8>) -> Result<Vec<u8>, JsError> {
+    Ok(pool::encode_viewer_msg(&ViewerMsg::Hello { ticket })?)
+}
+
+/// A media edge's word to its viewer from its postcard bytes (no length prefix), as
+/// `decodeServerMsg` reads: `"Ready"` or `{ Ended: { reason } }`.
+#[wasm_bindgen(js_name = decodeEdgeViewMsg)]
+pub fn decode_edge_view_msg(bytes: &[u8]) -> Result<JsValue, JsError> {
+    Ok(serde_wasm_bindgen::to_value(&pool::decode_edge_view_msg(
+        bytes,
+    )?)?)
 }
 
 // ── Signal Protocol ──────────────────────────────────────────────────────
@@ -358,10 +381,11 @@ impl SignalClient {
         self.core.keying.live_set_quiet(&channels, quiet);
     }
 
-    /// Takes over what an earlier connection of this account kept.
+    /// Takes over what an earlier connection of this account kept: its sessions, and what it
+    /// read.
     #[wasm_bindgen(js_name = liveAdoptKept)]
     pub fn live_adopt_kept(&mut self, kept: KeptSessions) {
-        self.core.keying.live_adopt_kept(kept.inner);
+        self.core.live_adopt_kept(kept.inner);
     }
 
     /// The pages of pins are out: no key job until `livePinsIn`.
@@ -544,10 +568,233 @@ impl SignalClient {
     pub fn live_answer_job(&mut self, channel_id: u32, go: bool) -> Result<JsValue, JsError> {
         live_out(self.core.live_answer_job(channel_id, go, now_millis()))
     }
+
+    // ── The group epoch key (`gk`, plan 3i) ──────────────────────────────
+    //
+    // `voipc_crypto::group_state`, written once for both backends: session.ts sends and
+    // emits what `GkOut` says, as network.rs does. Frames cross as postcard bytes.
+
+    /// `GroupKeys`: `GkOut`. `run` is its 16 bytes, `clock` its seconds; `kept`: what an
+    /// earlier connection to this relay kept in this page; `mirror`: what this browser kept
+    /// of a signed-in account's counters past its pages (`gkMirror`'s bytes, gk-mirror.ts).
+    #[wasm_bindgen(js_name = gkStart)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gk_start(
+        &mut self,
+        on: bool,
+        run: &[u8],
+        clock: f64,
+        help: bool,
+        visible: bool,
+        in_call: bool,
+        kept: Option<KeptGk>,
+        mirror: Option<Vec<u8>>,
+    ) -> Result<JsValue, JsError> {
+        let run: [u8; 16] = run
+            .try_into()
+            .map_err(|_| JsError::new("a relay run is 16 bytes"))?;
+        let start = gk::Start {
+            on,
+            run,
+            clock: clock as u64,
+            help,
+            visible,
+            in_call,
+            local: kept.map(|k| k.local),
+            mirror,
+        };
+        gk_out(self.core.gk_start(start).map_err(js_err)?)
+    }
+
+    /// A channel we are in, followed or stood in: `GkOut`.
+    #[wasm_bindgen(js_name = gkTrack)]
+    pub fn gk_track(
+        &mut self,
+        channel_id: u32,
+        text: bool,
+        log: &str,
+        anonymous: bool,
+        hide_members: bool,
+        viewer_admin: bool,
+    ) -> Result<JsValue, JsError> {
+        gk_out(
+            self.core
+                .gk
+                .track(channel_id, text, log, anonymous, hide_members, viewer_admin),
+        )
+    }
+
+    #[wasm_bindgen(js_name = gkUntrack)]
+    pub fn gk_untrack(&mut self, channel_id: u32) -> Result<JsValue, JsError> {
+        gk_out(self.core.gk.untrack(channel_id))
+    }
+
+    /// `TextJoined` refused `channel_id`: posts that waited for it are dropped, told why.
+    #[wasm_bindgen(js_name = gkJoinRefused)]
+    pub fn gk_join_refused(&mut self, channel_id: u32) -> Result<JsValue, JsError> {
+        gk_out(self.core.gk.join_refused(channel_id))
+    }
+
+    /// A frame `isGkFrame` named, as its postcard bytes: `GkOut`.
+    #[wasm_bindgen(js_name = gkFrame)]
+    pub fn gk_frame(&mut self, payload: &[u8]) -> Result<JsValue, JsError> {
+        gk_out(self.core.gk_frame(payload).map_err(js_err)?)
+    }
+
+    /// A post of ours, as `envelope` packed it, under its message id (hex): `GkOut`. With
+    /// `log` (the channel's, "" for none) its kept copy is filed once it goes.
+    #[wasm_bindgen(js_name = gkPost)]
+    pub fn gk_post(
+        &mut self,
+        channel_id: u32,
+        message_id: &str,
+        envelope: Vec<u8>,
+        log: String,
+        ttl_secs: Option<u32>,
+    ) -> Result<JsValue, JsError> {
+        let post_id =
+            unhex16(message_id).ok_or_else(|| JsError::new("a message id is 32 hex digits"))?;
+        gk_out(
+            self.core
+                .gk_post(channel_id, post_id, envelope, log, ttl_secs),
+        )
+    }
+
+    /// Each second: `GkOut`.
+    #[wasm_bindgen(js_name = gkTick)]
+    pub fn gk_tick(&mut self) -> Result<JsValue, JsError> {
+        gk_out(self.core.gk_tick())
+    }
+
+    /// After the account's own calls: what they said for the group key, as `GkOut`.
+    #[wasm_bindgen(js_name = gkNews)]
+    pub fn gk_news(&mut self) -> Result<JsValue, JsError> {
+        gk_out(self.core.gk.news())
+    }
+
+    /// The keyholder's next upload's postcard bytes.
+    #[wasm_bindgen(js_name = gkNextFrame)]
+    pub fn gk_next_frame(&mut self, in_call: bool) -> Option<Vec<u8>> {
+        self.core.gk.next_frame(in_call)
+    }
+
+    /// One step of the keyholder's build, at most `budget_ms`: `GkOut`, or undefined when
+    /// no build waits.
+    #[wasm_bindgen(js_name = gkBuildStep)]
+    pub fn gk_build_step(&mut self, budget_ms: f64) -> Result<JsValue, JsError> {
+        match self.core.gk.build_step(budget_ms) {
+            Some(out) => gk_out(out),
+            None => Ok(JsValue::UNDEFINED),
+        }
+    }
+
+    /// "Help hold keys", switched live: `GkOut`.
+    #[wasm_bindgen(js_name = gkSetVolunteer)]
+    pub fn gk_set_volunteer(&mut self, on: bool) -> Result<JsValue, JsError> {
+        gk_out(self.core.gk.set_volunteer(on))
+    }
+
+    /// The page shown or hidden, a call begun or ended: `GkOut`.
+    #[wasm_bindgen(js_name = gkVisibility)]
+    pub fn gk_visibility(&mut self, visible: bool, in_call: bool) -> Result<JsValue, JsError> {
+        gk_out(self.core.gk.visibility(visible, in_call))
+    }
+
+    /// `GkOut.voice`: the room's keys into `keys` (its group-key mode). Whether it took any.
+    #[wasm_bindgen(js_name = gkVoiceInto)]
+    pub fn gk_voice_into(&mut self, keys: &mut MediaKeys, own_channel: u32) -> bool {
+        self.core.gk.voice_into(&mut keys.inner, own_channel)
+    }
+
+    /// `UserLeft`, for the names the group key's events carry.
+    #[wasm_bindgen(js_name = gkUserLeft)]
+    pub fn gk_user_left(&mut self, user_id: u32, channel_id: u32) {
+        self.core.gk.roster.left(user_id, channel_id);
+    }
+
+    /// The connection ends: `GkOut` (the posts given up).
+    #[wasm_bindgen(js_name = gkEnd)]
+    pub fn gk_end(&mut self) -> Result<JsValue, JsError> {
+        gk_out(self.core.gk.end())
+    }
+
+    /// What the next connection to this relay takes over, in this page: before `free`.
+    #[wasm_bindgen(js_name = gkKeep)]
+    pub fn gk_keep(&self) -> Option<KeptGk> {
+        self.core.gk.keep().map(|local| KeptGk { local })
+    }
+
+    /// A signed-in account's seat-key counters this page checked or raised, for this browser
+    /// to keep past the page (dive 1 F1): bytes for `gkStart`'s `mirror`, or undefined for a
+    /// guest and when nothing moved since they were last handed out. After `gkEnd` too.
+    #[wasm_bindgen(js_name = gkMirror)]
+    pub fn gk_mirror(&mut self) -> Option<Vec<u8>> {
+        self.core.gk.mirror()
+    }
 }
 
-/// Sessions with accounts, between one connection of an account to a server and its next.
-/// They stay in this page's memory (`voipc_crypto::KeptSessions`).
+/// What to write over a kept copy of an account's counters with ours (`gkMirror`'s bytes):
+/// the two as one, the higher of each standing, so another tab's are not lost; ours alone over
+/// one that does not read; undefined (write nothing) over another relay's or account's, or
+/// one a newer VoIPC wrote (`gk::mirror_merge`).
+#[wasm_bindgen(js_name = gkMirrorMerge)]
+pub fn gk_mirror_merge(stored: &[u8], ours: &[u8]) -> Option<Vec<u8>> {
+    gk::mirror_merge(stored, ours)
+}
+
+/// The group key's floors, between one connection to a relay and its next in this page
+/// (plan 3d: the browser keeps floors for the page's life, signed in or not).
+#[wasm_bindgen]
+pub struct KeptGk {
+    local: voipc_crypto::group_state::LocalGk,
+}
+
+/// Whether a server frame (its postcard bytes) is one of the group key's: `gkFrame` takes
+/// it as it is, undecoded.
+#[wasm_bindgen(js_name = isGkFrame)]
+pub fn is_gk_frame(payload: &[u8]) -> bool {
+    gk::is_gk_frame(payload)
+}
+
+/// A keyholder's build costs (tools/gk-wasm-bench.mjs): one bench step as JSON. Only a build
+/// made with `VOIPC_GK_BENCH` set runs it; in any other it throws and carries no bench code.
+#[wasm_bindgen(js_name = gkBench)]
+pub fn gk_bench(op: &str, arg: u32, budget_ms: f64) -> Result<String, JsError> {
+    gk_bench::run(op, arg, budget_ms).map_err(|e| JsError::new(&e))
+}
+
+/// `gk::Out` for the page: `{ seen: { user_id, account, name }[], send: Uint8Array[], emit:
+/// { name, payload }[], voice: boolean, build: boolean, held: boolean, kept: boolean }`.
+fn gk_out(out: gk::Out) -> Result<JsValue, JsError> {
+    let send = js_sys::Array::new();
+    for frame in &out.send {
+        send.push(&uint8array(&postcard::to_allocvec(frame)?));
+    }
+    let emit: Vec<_> = out
+        .emit
+        .iter()
+        .map(|(name, payload)| serde_json::json!({ "name": name, "payload": payload }))
+        .collect();
+    let seen: Vec<_> = out
+        .seen
+        .iter()
+        .map(|(user_id, account, name)| {
+            serde_json::json!({ "user_id": user_id, "account": account, "name": name })
+        })
+        .collect();
+    Ok(js_object(&[
+        ("seen", plain(&serde_json::Value::Array(seen))?),
+        ("send", send.into()),
+        ("emit", plain(&serde_json::Value::Array(emit))?),
+        ("voice", JsValue::from_bool(out.voice)),
+        ("build", JsValue::from_bool(out.build)),
+        ("held", JsValue::from_bool(out.held)),
+        ("kept", JsValue::from_bool(out.kept)),
+    ]))
+}
+
+/// Sessions with accounts, between one connection of an account to a server and its next,
+/// and what was read on it. They stay in this page's memory (`voipc_crypto::KeptSessions`).
 #[wasm_bindgen]
 pub struct KeptSessions {
     inner: voipc_crypto::KeptSessions,
@@ -643,6 +890,21 @@ pub fn pin_held_most() -> usize {
 #[wasm_bindgen(js_name = maxRelayCiphertext)]
 pub fn max_relay_ciphertext() -> usize {
     voipc_protocol::codec::MAX_RELAY_CIPHERTEXT
+}
+
+/// Whether a channel post of `len` envelope bytes, sealed as it goes (`under_key`: an
+/// `EpochPost`; else the old path's `SendEncryptedChannelMessage`), stays within what the relay
+/// takes (`EarlyPost::fits`, the group key's own rule). The page sends none past it, and
+/// marks its row as not sent.
+#[wasm_bindgen(js_name = postFits)]
+pub fn post_fits(len: usize, under_key: bool) -> bool {
+    voipc_crypto::group_state::EarlyPost::fits(len, under_key)
+}
+
+/// The most a channel post's ciphertext may be (`EarlyPost::MAX_SEALED`).
+#[wasm_bindgen(js_name = maxPostSealed)]
+pub fn max_post_sealed() -> usize {
+    voipc_crypto::group_state::EarlyPost::MAX_SEALED
 }
 
 /// Of the members who offer a channel's recent chat, the few actually asked —
@@ -854,6 +1116,10 @@ fn file_error(e: FileError) -> JsValue {
 ///
 /// A ring rather than one key because a member leaving re-keys the channel, and
 /// a packet already in flight still names the generation before.
+///
+/// In a room under the group epoch key (`SignalClient.gkVoiceInto`) nothing is minted or
+/// handed out: ours and every sender's own come from the room's epoch key, and the packet
+/// exports below look a received packet's key up by its sender (`MediaKeyRing::get_for`).
 #[wasm_bindgen]
 pub struct MediaKeys {
     inner: voipc_crypto::MediaKeyRing,
@@ -966,14 +1232,15 @@ pub fn parse_voice_header(data: &[u8]) -> Result<JsValue, JsError> {
 }
 
 /// `{ packet_type, session_id, sequence, opus }` from an encrypted voice
-/// packet (0x05) decrypted with `key`; any other type is an error.
+/// packet (0x05) decrypted with its sender's key; any other type is an error.
 #[wasm_bindgen(js_name = decryptVoicePacket)]
 pub fn decrypt_voice_packet(
-    keys: &MediaKeys,
+    keys: &mut MediaKeys,
     channel_id: u32,
     data: &[u8],
 ) -> Result<JsValue, JsError> {
-    let info = media::parse_voice_packet(Some(&keys.inner), channel_id, data).map_err(js_err)?;
+    let info =
+        media::parse_voice_packet(Some(&mut keys.inner), channel_id, data).map_err(js_err)?;
     if info.opus.is_none() {
         return Err(JsError::new("not an encrypted voice packet"));
     }
@@ -993,14 +1260,14 @@ pub fn build_position_packet(
     media::build_position_packet(&keys.inner, session_id, sequence, x, y, z).map_err(js_err)
 }
 
-/// `{ session_id, x, y, z }` from a position beacon decrypted with `key`.
+/// `{ session_id, x, y, z }` from a position beacon decrypted with its sender's key.
 #[wasm_bindgen(js_name = decryptPositionPacket)]
 pub fn decrypt_position_packet(
-    keys: &MediaKeys,
+    keys: &mut MediaKeys,
     channel_id: u32,
     data: &[u8],
 ) -> Result<JsValue, JsError> {
-    let info = media::parse_position_packet(&keys.inner, channel_id, data).map_err(js_err)?;
+    let info = media::parse_position_packet(&mut keys.inner, channel_id, data).map_err(js_err)?;
     Ok(js_object(&[
         ("session_id", JsValue::from(info.session_id)),
         ("x", JsValue::from(info.x)),
@@ -1062,11 +1329,12 @@ pub fn build_video_frame_stream(
 /// audio packet (0x15).
 #[wasm_bindgen(js_name = parseScreenAudioPacket)]
 pub fn parse_screen_audio_packet(
-    keys: &MediaKeys,
+    keys: &mut MediaKeys,
     channel_id: u32,
     data: &[u8],
 ) -> Result<JsValue, JsError> {
-    let info = media::parse_screen_audio_packet(&keys.inner, channel_id, data).map_err(js_err)?;
+    let info =
+        media::parse_screen_audio_packet(&mut keys.inner, channel_id, data).map_err(js_err)?;
     Ok(js_object(&[
         ("session_id", JsValue::from(info.session_id)),
         ("sequence", JsValue::from(info.sequence)),
@@ -1092,13 +1360,13 @@ impl VideoAssembler {
     /// `{ frame?: Uint8Array, is_keyframe, timestamp, frame_dropped }`.
     pub fn push(
         &mut self,
-        keys: &MediaKeys,
+        keys: &mut MediaKeys,
         channel_id: u32,
         data: &[u8],
     ) -> Result<JsValue, JsError> {
         let result = self
             .core
-            .push(&keys.inner, channel_id, data)
+            .push(&mut keys.inner, channel_id, data)
             .map_err(js_err)?;
         let mut fields = vec![
             ("is_keyframe", JsValue::from_bool(result.is_keyframe)),
@@ -1113,5 +1381,50 @@ impl VideoAssembler {
 
     pub fn reset(&mut self) {
         self.core.reset();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use voipc_protocol::pool::EdgeViewMsg;
+
+    /// The browser's hello is the native app's, byte for byte, and the frozen bytes
+    /// tests/golden.rs and transport.test.ts pin.
+    #[test]
+    fn a_viewer_hello_from_wasm_is_the_native_one() {
+        for ticket in [vec![], vec![1, 2, 3], vec![0xff; pool::MAX_TICKET_BYTES]] {
+            assert_eq!(
+                encode_viewer_hello(ticket.clone()).unwrap(),
+                pool::encode_viewer_msg(&ViewerMsg::Hello { ticket }).unwrap()
+            );
+        }
+        assert_eq!(
+            encode_viewer_hello(vec![1, 2, 3]).unwrap(),
+            [0, 0, 0, 5, 0, 3, 1, 2, 3]
+        );
+    }
+
+    /// What `decodeEdgeViewMsg` reads is what an edge writes, in the externally tagged form
+    /// serde gives JS (serde_json stands in for serde_wasm_bindgen, which needs a browser).
+    #[test]
+    fn an_edge_answer_decodes_to_what_transport_ts_reads() {
+        for (msg, js) in [
+            (EdgeViewMsg::Ready, serde_json::json!("Ready")),
+            (
+                EdgeViewMsg::Ended {
+                    reason: "revoked".into(),
+                },
+                serde_json::json!({ "Ended": { "reason": "revoked" } }),
+            ),
+        ] {
+            let framed = pool::encode_edge_view_msg(&msg).unwrap();
+            let decoded = pool::decode_edge_view_msg(&framed[4..]).unwrap();
+            assert_eq!(decoded, msg);
+            assert_eq!(serde_json::to_value(&decoded).unwrap(), js);
+        }
+        // A length prefix is not part of what it reads
+        let framed = pool::encode_edge_view_msg(&EdgeViewMsg::Ready).unwrap();
+        assert!(pool::decode_edge_view_msg(&framed).is_err());
     }
 }

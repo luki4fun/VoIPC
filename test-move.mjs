@@ -119,7 +119,8 @@ spawnSync(
 );
 writeFileSync(
   join(WORK, "server.toml"),
-  `host = "127.0.0.1"
+  // GK=0 (test-web.sh's switch): the relay with the group key off, on the old paths
+  `${process.env.GK === "0" ? "group_key = false\n" : ""}host = "127.0.0.1"
 tcp_port = ${PORT}
 udp_port = ${PORT}
 cert_path = "server.crt"

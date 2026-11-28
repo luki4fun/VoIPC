@@ -44,8 +44,14 @@ import {
   MAX_REACTION_EMOJI,
   MAX_REACTORS,
   MAX_RECEIVED_BYTES,
+  MAX_POST_BYTES,
+  POST_WRAP_BYTES,
+  FILE_WRAP_BYTES,
+  TOO_LARGE_REASON,
+  channelErrorText,
   notificationBody,
   receivedText,
+  tooLongToSend,
   type EventIn,
   placedByTime,
   readingAt,
@@ -704,6 +710,42 @@ test("a message's text is cut to 16 KiB where it arrives, at a character's edge 
   assert.ok(!/[\ud800-\udbff]$/.test(emoji), "no half of a pair left at the end");
   const edge = "a".repeat(MAX_RECEIVED_BYTES - 1) + "😀";
   assert.equal(receivedText(edge), "a".repeat(MAX_RECEIVED_BYTES - 1), "a character that does not fit goes whole");
+});
+
+test("the composer counts a post as it goes, and lets by none the relay refuses (owner, 2026-11-19)", () => {
+  // session_tests.rs post_cap asserts the same, against what each way of sealing a post adds
+  assert.equal(MAX_POST_BYTES, 16 * 1024);
+  assert.equal(POST_WRAP_BYTES, 1280);
+  assert.equal(FILE_WRAP_BYTES, 2560);
+  // The most it lets by: the text as a JSON string (its two quotes too), and what goes around it
+  const most = MAX_POST_BYTES - POST_WRAP_BYTES - 2;
+  assert.equal(tooLongToSend("hello"), null);
+  assert.equal(tooLongToSend("a".repeat(most)), null, "the longest it lets by");
+  assert.ok(tooLongToSend("a".repeat(most + 1)), "one byte over");
+  assert.ok(tooLongToSend("a".repeat(MAX_POST_BYTES)), "16 KiB of words is past 16 KiB as a post");
+  // Bytes as JSON writes them, as the envelope does: a quote is two, a control character six
+  assert.equal(tooLongToSend('"'.repeat(Math.floor(most / 2))), null);
+  assert.ok(tooLongToSend('"'.repeat(Math.floor(most / 2) + 1)), "a quote is two bytes as sent");
+  assert.ok(tooLongToSend("\u0001".repeat(Math.floor(most / 6) + 1)), "a control character six");
+  assert.equal(tooLongToSend("€".repeat(Math.floor(most / 3))), null, "bytes, not characters");
+  assert.ok(tooLongToSend("€".repeat(Math.floor(most / 3) + 1)), "three bytes a character");
+  assert.ok(tooLongToSend("😀".repeat(Math.floor(most / 4) + 1)), "four bytes a pair");
+  // A file going with it takes room of its own
+  assert.equal(tooLongToSend("a".repeat(most - FILE_WRAP_BYTES), true), null);
+  assert.ok(tooLongToSend("a".repeat(most - FILE_WRAP_BYTES + 1), true), "with a file");
+  // Said as the post it would be
+  const over = tooLongToSend(`long${"z".repeat(20_000)}`);
+  assert.ok(over?.includes("20.8 KiB") && over.includes("at most 16 KiB"), over ?? "");
+});
+
+test("only a post past 16 KiB is told as one: the relay's other too large is its own words", () => {
+  // session.rs `POST_TOO_LARGE`, on every path a post takes
+  assert.equal(TOO_LARGE_REASON, "post too large: one message holds at most 16 KiB");
+  assert.equal(channelErrorText(TOO_LARGE_REASON), "Your message was not sent: one message holds at most 16 KiB.");
+  // `relayable`'s, for any frame past what the relay passes on: a member who only handed on
+  // history (a hand-off checked before Signal's overhead) wrote no message and sent none
+  assert.equal(channelErrorText("message too large"), "message too large");
+  assert.equal(channelErrorText("sending too fast, slow down"), "sending too fast, slow down");
 });
 
 test("a notification never carries the text of a message with a timer (R2-14)", () => {

@@ -4,11 +4,14 @@
 //! Only the packet header is parsed — payloads are end-to-end encrypted and
 //! relayed verbatim, with no per-packet payload allocation on the hot path.
 
+use std::sync::atomic::Ordering;
+
 use bytes::Bytes;
 use tokio::sync::mpsc;
 use tracing::{debug, trace, warn};
 
 use voipc_protocol::types::{ProximityMode, SessionId};
+use voipc_protocol::video::VideoPacketType;
 use voipc_protocol::voice::{VoicePacketType, POSITION_PACKET_SIZE, VOICE_HEADER_SIZE};
 
 use crate::state::ServerState;
@@ -166,6 +169,9 @@ async fn handle_voice_packet(session_id: SessionId, data: Bytes, state: &ServerS
 }
 
 /// Video / screen audio: forward ONLY to viewers of this sharer.
+///
+/// Through the share's `Fan`, with no `channels` lock: the fan-out list is the two `Arc`s
+/// cloned under the map's shard guard, which is dropped before anything is sent.
 async fn handle_video_packet(session_id: SessionId, data: Bytes, state: &ServerState) {
     let allowed = state.spend(session_id, |s| &mut s.video_rate);
     if !allowed {
@@ -182,10 +188,20 @@ async fn handle_video_packet(session_id: SessionId, data: Bytes, state: &ServerS
         return;
     }
 
-    for tx in state
-        .get_screen_share_viewer_txs(sharer_user_id, channel_id)
-        .await
-    {
+    let video = data[0] != VideoPacketType::EncryptedScreenShareAudio as u8;
+    let Some((local, feeds)) = state.share_fans.get(&sharer_user_id).and_then(|fan| {
+        (fan.channel_id == channel_id).then(|| {
+            if video {
+                fan.last_packet_ms
+                    .store(state.uptime_ms(), Ordering::Relaxed);
+            }
+            (fan.local.clone(), fan.feeds.clone())
+        })
+    }) else {
+        return;
+    };
+    for tx in local.iter().chain(feeds.iter()) {
+        // A full queue drops the packet, as UDP would.
         let _ = tx.try_send(data.clone());
     }
 }
@@ -524,7 +540,7 @@ mod tests {
         )
         .await;
         state
-            .start_screen_share(alice_uid, alice_sid, 5, VideoCodec::H264)
+            .start_screen_share(alice_uid, alice_sid, 5, VideoCodec::H264, 1080)
             .await
             .unwrap();
         state
@@ -540,5 +556,97 @@ mod tests {
 
         assert_eq!(bob_media.try_recv().unwrap(), packet);
         assert!(carol_media.try_recv().is_err());
+    }
+
+    /// Alice shares in channel 5 and Bob watches: Alice's session, and Bob's media queue.
+    async fn alice_shares_to_bob(state: &ServerState) -> (SessionId, mpsc::Receiver<Bytes>) {
+        let (alice_uid, alice_sid, _) = add_user_with_media(state, "alice");
+        let (bob_uid, bob_sid, bob_media) = add_user_with_media(state, "bob");
+        put_in_channel(state, 5, &[(alice_uid, alice_sid), (bob_uid, bob_sid)]).await;
+        state
+            .start_screen_share(alice_uid, alice_sid, 5, VideoCodec::H264, 1080)
+            .await
+            .unwrap();
+        state
+            .watch_screen_share(bob_uid, bob_sid, alice_uid, 5)
+            .await
+            .unwrap();
+        (alice_sid, bob_media)
+    }
+
+    fn video_fragment(session_id: u32) -> Bytes {
+        Bytes::from(
+            VideoPacket::encrypted_fragment(false, session_id, 1, 0, 1, 0, 1, 0x5EED, vec![7; 100])
+                .to_bytes(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_held_channels_write_lock_does_not_hold_up_video() {
+        let state = make_state();
+        let (alice_sid, mut bob_media) = alice_shares_to_bob(&state).await;
+        let packet = video_fragment(alice_sid);
+
+        // A join, a leave or a watch elsewhere, in the middle of its change
+        let held = state.channels.write().await;
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            handle_packet(alice_sid, packet.clone(), &state),
+        )
+        .await
+        .expect("the video path waited for the channels lock");
+        drop(held);
+
+        assert_eq!(bob_media.try_recv().unwrap(), packet);
+    }
+
+    #[tokio::test]
+    async fn a_video_fragment_marks_when_the_share_last_sent() {
+        let state = make_state();
+        let (alice_sid, mut bob_media) = alice_shares_to_bob(&state).await;
+        let sent = || {
+            state
+                .share_fans
+                .get(&alice_sid)
+                .unwrap()
+                .last_packet_ms
+                .load(Ordering::Relaxed)
+        };
+        assert_eq!(sent(), 0, "nothing sent yet");
+
+        // Screen audio is not what a viewer judges an edge by
+        let audio = Bytes::from(
+            voipc_protocol::video::ScreenShareAudioPacket::new_encrypted(
+                alice_sid,
+                1,
+                0,
+                1,
+                0x5EED,
+                vec![5; 40],
+            )
+            .to_bytes(),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        handle_packet(alice_sid, audio.clone(), &state).await;
+        assert_eq!(bob_media.try_recv().unwrap(), audio, "audio still goes out");
+        assert_eq!(sent(), 0);
+
+        handle_packet(alice_sid, video_fragment(alice_sid), &state).await;
+        let first = sent();
+        assert!(first > 0);
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        handle_packet(alice_sid, video_fragment(alice_sid), &state).await;
+        assert!(sent() > first, "the mark moves with every fragment");
+    }
+
+    #[tokio::test]
+    async fn a_share_sends_nothing_once_its_sharer_is_out_of_the_channel() {
+        let state = make_state();
+        let (alice_sid, mut bob_media) = alice_shares_to_bob(&state).await;
+        // Into another room before the share there is ended, as a move can leave it
+        put_in_channel(&state, 6, &[(alice_sid, alice_sid)]).await;
+
+        handle_packet(alice_sid, video_fragment(alice_sid), &state).await;
+        assert!(bob_media.try_recv().is_err());
     }
 }

@@ -68,6 +68,13 @@ async function wrapKey(db: IDBDatabase): Promise<CryptoKey> {
   }
 }
 
+/** The key the remembered devices are sealed under, for what else this browser keeps of an
+ *  account at rest (gk-mirror.ts): one that opens either opens the other, so nothing new is
+ *  laid open. Throws where IndexedDB is off. */
+export async function wrappingKey(): Promise<CryptoKey> {
+  return wrapKey(await open());
+}
+
 /** Where this browser keeps what it read of an account's stored log (account.ts). */
 export function cursorStorageKey(relayId: ArrayLike<number>, name: string): string {
   return `voipc.cursors.${toHex(relayId)}|${name}`;
@@ -109,7 +116,9 @@ export async function saveDevice(rec: DeviceRecord): Promise<void> {
   await request(db.transaction(DEVICES, "readwrite").objectStore(DEVICES).put({ iv, ct }, idOf(rec.server, rec.name)));
 }
 
-export async function forgetDevice(server: string, name: string): Promise<void> {
+/** The record it forgot, if one was kept: what else goes with it is the caller's
+ *  (commands.ts `forget_device`, the group key's counters). */
+export async function forgetDevice(server: string, name: string): Promise<DeviceRecord | undefined> {
   const known = await findDevice(server, name);
   const db = await open();
   await request(db.transaction(DEVICES, "readwrite").objectStore(DEVICES).delete(idOf(server, name)));
@@ -123,4 +132,5 @@ export async function forgetDevice(server: string, name: string): Promise<void> 
       // Storage off: nothing was kept either.
     }
   }
+  return known;
 }

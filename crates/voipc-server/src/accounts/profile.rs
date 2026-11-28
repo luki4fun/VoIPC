@@ -480,7 +480,7 @@ pub async fn send_server_profile(state: &ServerState, tx: &ControlTx) {
         None => read().await.map(Arc::new),
     };
     for data in frames.iter().flat_map(|f| f.iter()) {
-        let _ = tx.try_send(data.clone());
+        let _ = tx.try_send(data.clone().into());
     }
 }
 

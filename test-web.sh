@@ -14,9 +14,33 @@
 # every check below then proves the tunnel carries what QUIC does — and a mixed
 # run, that the relay is the same across the two.
 #
+# SHARE_RES (480, 720, 1080), SHARE_FPS (15, 30, 60) and SHARE_NOISE (random blocks a
+# frame, so the encoder needs its bitrate) set what alice's share sends (default 480p at
+# 15 fps, no noise). EXPECT_LADDER=1 is the capped-link lane (CI rates loopback):
+# bob's voice loses at most 2 %, his canvas gets pictures in every 10 s window, and
+# alice's quality ladder (its changes, as her sharer logs them) steps down at least once.
+# Voice is counted over the first 4 s alice talks once video flows (the lane's own bar,
+# as it was measured over a 4 s talk), and over the 4 s after a climb, if one came while
+# she talked (shown, not gated). Give it DURATION=45000, and TALK_MS (how long alice
+# talks, default 4000) long enough that her voice crosses the share's start and its climb.
+#
 # EXPECT_FALLBACK=1 is for a run with the relay's UDP ports blocked (the CI
 # lane drops them with iptables): both browsers ask for QUIC as usual, and
 # both must have raced over to the TCP fallback on their own.
+#
+# EDGE=1 puts a media edge between alice's share and bob (protocol 26): the relay lists
+# edge e1 in its [pool] with local_first = 0, one `voipc-server -c edge.toml edge` links to
+# it, and bob, the share's first viewer, is sent there. He must report the edge ready, never
+# failed, and decode alice's frames, which then came through the edge.
+#
+# The relays run with the group key on (group_key's default): text channels and voice
+# rooms take their keys from it, and the run checks a text post and a voice join under it.
+# With alice in Chromium her page is hidden (DevTools: a blank tab of her own browser in
+# front of it) from before bob comes until he has read her in the text channel: she made the
+# voice room and the text channel, so she holds their keys, as a browser hidden or in a call
+# does when nobody else can, and both of bob's joins must land. Whether her timers were clamped
+# meanwhile is said (in a call they are not), and who held the keys.
+# GK=0 runs the relays with the key off (group_key = false): the old paths, still tested.
 #
 # UI_TEST=0 skips test-ui.mjs. It drives its own Chromium and reads none of the
 # settings above, so CI runs it only where the network differs.
@@ -89,6 +113,13 @@ on_exit() {
     kept="$KEEP_LOGS/test-web-$(date +%H%M%S)-$$"
     mkdir -p "$kept" 2>/dev/null &&
       find "$WORK" -maxdepth 1 -type f \( -name '*.txt' -o -name '*.log' \) -exec cp {} "$kept/" \; 2>/dev/null || true
+    # The UI browsers' network logs, only when the UI lane failed: soak 45269825608 lost a wasm
+    # body there ("Response body loading was aborted") and only a NetLog names why
+    if grep -qs "FAIL the UI regression test" "$WORK/fails.txt"; then
+      for f in "$WORK"/ui-netlog-*.json; do
+        [ -s "$f" ] && gzip -c "$f" > "$kept/$(basename "$f").gz" 2>/dev/null || true
+      done
+    fi
   fi
   if [ -n "${WORK:-}" ]; then rm -rf "$WORK" 2>/dev/null || true; fi
 }
@@ -130,9 +161,14 @@ for t in "$TRANSPORT_ALICE" "$TRANSPORT_BOB"; do
     *) die "unknown transport '$t' (quic or tcp)" ;;
   esac
 done
+GK="${GK:-1}"
+case "$GK" in
+  0 | 1) ;;
+  *) die "unknown GK '$GK' (1, the group key on, or 0, off)" ;;
+esac
 # The query parameter that puts a side on the TCP fallback
 via() { [ "$1" = tcp ] && echo "&transport=tcp" || true; }
-echo "browsers: alice=$BROWSER_ALICE over $TRANSPORT_ALICE, bob=$BROWSER_BOB over $TRANSPORT_BOB"
+echo "browsers: alice=$BROWSER_ALICE over $TRANSPORT_ALICE, bob=$BROWSER_BOB over $TRANSPORT_BOB; group key $([ "$GK" = 0 ] && echo off || echo on)"
 SERVER="${SERVER:-target/release/voipc-server}"
 [ -x "$SERVER" ] || die "$SERVER missing — run VOIPC_SELFTEST=1 npm run web first"
 grep -qs SELFTEST client/dist-web/assets/*.js ||
@@ -142,6 +178,9 @@ grep -qs SELFTEST client/dist-web/assets/*.js ||
 
 TCP_PORT="${TCP_PORT:-19987}"
 DURATION="${DURATION:-15000}"
+SHARE_PARAMS="&share_res=${SHARE_RES:-480}&share_fps=${SHARE_FPS:-15}&share_noise=${SHARE_NOISE:-0}"
+# The capped-link lane also prints what its share and voice did on the way (share-trace.ts)
+if [ "${EXPECT_LADDER:-}" = 1 ]; then SHARE_PARAMS="$SHARE_PARAMS&trace=1"; fi
 # alice sends bob a file this size (KiB) while she talks; 0 sends none
 FILE_KIB="${FILE_KIB:-10240}"
 WORK="$(mktemp -d)"
@@ -180,6 +219,22 @@ open_in_chrome() { # cdp-port url
     ws.onmessage = () => { ws.close(); process.exit(0); };
     setTimeout(() => process.exit(1), 30000);
   ' "$1" "$2" || echo "warning: the browser on $1 did not take its page"
+}
+# A page hidden and shown again, as a tab behind another is: through DevTools a blank tab
+# opens in front of it (hide), and goes again with the page brought back to the front (show)
+page_cover() { # cdp-port hide|show
+  node --input-type=module -e '
+    const [port, what] = process.argv.slice(1);
+    const at = `http://127.0.0.1:${port}/json`;
+    const tabs = await (await fetch(`${at}/list`)).json();
+    if (what === "hide") {
+      await fetch(`${at}/new?about:blank`, { method: "PUT" });
+    } else {
+      for (const t of tabs) if (t.type === "page" && t.url === "about:blank") await fetch(`${at}/close/${t.id}`);
+      const page = tabs.find((t) => t.type === "page" && t.url.includes("selftest=1"));
+      if (page) await fetch(`${at}/activate/${page.id}`);
+    }
+  ' "$1" "$2" || echo "warning: the browser on $1 did not $2 the page"
 }
 [ "$BROWSER_ALICE" = firefox ] || boot_chrome alice "$WORK/alice.log"
 [ "$BROWSER_BOB" = firefox ] || boot_chrome bob "$WORK/bob.log"
@@ -222,6 +277,14 @@ key_path = "server.key"
 [files]
 cache_mins = 1
 TOML
+# GK=0: the group key off, a top-level key, so before any table
+if [ "$GK" = 0 ]; then sed -i '1i group_key = false' "$WORK/server.toml"; fi
+# EDGE=1: edge e1 may link, and takes a share's viewers from the first on
+EDGE_PORT=$((TCP_PORT + 3))
+EDGE_SECRET="e2e-edge-secret-of-at-least-32-chars"
+if [ "${EDGE:-}" = 1 ]; then
+  printf '[pool]\nedges = { e1 = "%s" }\nlocal_first = 0\n' "$EDGE_SECRET" >> "$WORK/server.toml"
+fi
 (cd "$WORK" && exec "$SCRIPT_DIR/$SERVER" --config server.toml --host 127.0.0.1 --tcp-port "$TCP_PORT" --udp-port "$TCP_PORT" \
   --cert server.crt --key server.key --admin-token e2e-admin-token-0001 --channels channels.json --tcp-fallback \
   > "$WORK/server.log" 2>&1) &
@@ -233,6 +296,31 @@ done
 grep -q '"hash"' "$WORK/wt.json" || die "server did not come up: $(cat "$WORK/server.log")"
 echo "server up: $(cat "$WORK/wt.json")"
 
+# The edge pins the relay's certificate by what `cert fingerprint` prints, as OPERATING
+# tells an operator to: the relay is an IP here, which no public certificate names.
+# -c before the command: it is not a global argument.
+if [ "${EDGE:-}" = 1 ]; then
+  mkdir -p "$WORK/edge"
+  fingerprint=$(cd "$WORK" && "$SCRIPT_DIR/$SERVER" -c server.toml cert fingerprint)
+  cat > "$WORK/edge/edge.toml" <<TOML
+core = "127.0.0.1:$TCP_PORT"
+core_fingerprint = "$fingerprint"
+name = "e1"
+secret = "$EDGE_SECRET"
+host = "127.0.0.1"
+udp_port = $EDGE_PORT
+public = "127.0.0.1:$EDGE_PORT"
+TOML
+  (cd "$WORK/edge" && exec "$SCRIPT_DIR/$SERVER" -c edge.toml edge > "$WORK/edge.log" 2>&1) &
+  for _ in $(seq 1 100); do
+    grep -q 'edge e1 linked from' "$WORK/server.log" && break
+    sleep 0.2
+  done
+  grep -q 'edge e1 linked from' "$WORK/server.log" ||
+    die "the edge did not link: $(cat "$WORK/edge.log")"
+  echo "edge up: $(grep -o 'edge e1 linked from.*' "$WORK/server.log")"
+fi
+
 # A second, empty server for test-ui.mjs's multi-server lane: one client holding
 # two connections at once is the thing to prove, and two ports on one host are
 # two servers as far as the client can tell. Its own directory, because a server
@@ -240,7 +328,9 @@ echo "server up: $(cat "$WORK/wt.json")"
 TCP_PORT2=$((TCP_PORT + 1))
 mkdir -p "$WORK/s2"
 cp "$WORK/server.crt" "$WORK/server.key" "$WORK/s2/"
-(cd "$WORK/s2" && exec "$SCRIPT_DIR/$SERVER" --host 127.0.0.1 --tcp-port "$TCP_PORT2" --udp-port "$TCP_PORT2" \
+printf 'cert_path = "server.crt"\nkey_path = "server.key"\n' > "$WORK/s2/server.toml"
+if [ "$GK" = 0 ]; then sed -i '1i group_key = false' "$WORK/s2/server.toml"; fi
+(cd "$WORK/s2" && exec "$SCRIPT_DIR/$SERVER" --config server.toml --host 127.0.0.1 --tcp-port "$TCP_PORT2" --udp-port "$TCP_PORT2" \
   --cert server.crt --key server.key --tcp-fallback > "$WORK/server2.log" 2>&1) &
 for _ in $(seq 1 50); do
   curl -sk --http2-prior-knowledge "https://127.0.0.1:$TCP_PORT2/wt.json" 2>/dev/null | grep -q '"hash"' && break
@@ -259,6 +349,7 @@ key_path = "server.key"
 mode = "optional"
 registration = "open"
 TOML
+if [ "$GK" = 0 ]; then sed -i '1i group_key = false' "$WORK/s3/server.toml"; fi
 # One persistent text channel everyone lands in: its log is what the accounts
 # lane reads back after its writer's reader was away.
 cat > "$WORK/s3/channels.json" <<'CHANNELS'
@@ -332,7 +423,7 @@ start_page() { # as run_browser
 # alice creates the channel, becomes admin at the end and kicks bob; bob joins
 # through an invite-link fragment (#channel=…) and expects the kick
 # alice also shares her (synthetic) screen; bob watches it
-start_page alice talker "&channel=e2e&textchannel=e2e-text&dm=bob&admin=e2e-admin-token-0001&kick=bob&share=1&proximity=2d&pos=3,0,0&spatialtest=3d&file=$FILE_KIB$(via "$TRANSPORT_ALICE")" \
+start_page alice talker "&channel=e2e&textchannel=e2e-text&dm=bob&admin=e2e-admin-token-0001&kick=bob&share=1$SHARE_PARAMS&proximity=2d&pos=3,0,0&spatialtest=3d&file=$FILE_KIB&talk_ms=${TALK_MS:-4000}$(via "$TRANSPORT_ALICE")" \
   "$WORK/alice.log" "$BROWSER_ALICE"
 # Not a fixed stagger: the run asserts that a message alice sent *before* bob
 # arrived reaches him as channel history, so the harness has to make "before"
@@ -342,18 +433,46 @@ start_page alice talker "&channel=e2e&textchannel=e2e-text&dm=bob&admin=e2e-admi
 # the channel, alice is the late joiner who gets the empty history, and the only
 # check that fails is the one that names neither cause ("bob joined via the
 # invite link" passes on a channel he created himself).
-# alice logs early-chat-sent once her message is in her own history. With UDP blocked she
-# gives up on QUIC first, which took a cold runner over 30 s.
+# alice logs early-chat-sent once her message is in her own history, and only after her text
+# channel and its first line (made after it, on her hidden page, they once took 18 s; and her
+# schedule then runs from 4 s after bob is seated, so a late bob meets all of it: selftest.ts). With
+# UDP blocked she gives up on QUIC first, which took a cold runner over 30 s.
 for _ in $(seq 1 900); do
   if grep -q 'SELFTEST early-chat-sent' "$WORK/alice.log"; then break; fi
   sleep 0.1
 done
 grep -q 'SELFTEST early-chat-sent' "$WORK/alice.log" ||
   echo "warning: alice never reported her first message — bob starts anyway, expect a history failure"
-start_page bob listener "&textchannel=e2e-text&dm=alice&expect_kick=1&watch=1&pos=-3,0,0$(via "$TRANSPORT_BOB")#channel=e2e" \
+# The group key on and alice in Chromium: her page hidden before bob comes (the header).
+# Not in the capped-link lane, which measures what her share sends.
+hide_alice=0
+if [ "$GK" = 1 ] && [ "$BROWSER_ALICE" = chromium ] && [ "${EXPECT_LADDER:-}" != 1 ]; then
+  hide_alice=1
+  page_cover "${chrome_cdp[alice]}" hide
+  for _ in $(seq 1 300); do
+    grep -qa 'SELFTEST page-visibility.*hidden' "$WORK/alice.log" && break
+    sleep 0.1
+  done
+  grep -qa 'SELFTEST page-visibility.*hidden' "$WORK/alice.log" ||
+    echo "warning: alice's page never said it was hidden — bob starts anyway"
+fi
+start_page bob listener "&textchannel=e2e-text&dm=alice&expect_kick=1$([ "$FILE_KIB" != 0 ] && printf '&expect_file=1')&watch=1$SHARE_PARAMS&pos=-3,0,0$(via "$TRANSPORT_BOB")#channel=e2e" \
   "$WORK/bob.log" "$BROWSER_BOB"
 
 deadline=$(( $(date +%s) + DURATION / 1000 + 30 ))
+# Her page comes back once bob holds the voice room's keys and has read her in the text
+# channel: both of his joins landed while it was hidden. Or once his run is over.
+joined_hidden=0
+if [ "$hide_alice" = 1 ]; then
+  until grep -qa 'media-key-installed' "$WORK/bob.log" &&
+    grep -qa 'event channel-chat-message.*text hello from alice' "$WORK/bob.log"; do
+    if grep -qa 'SELFTEST done' "$WORK/bob.log" || [ "$(date +%s)" -ge "$deadline" ]; then break; fi
+    sleep 0.2
+  done
+  if grep -qa 'media-key-installed' "$WORK/bob.log" &&
+    grep -qa 'event channel-chat-message.*text hello from alice' "$WORK/bob.log"; then joined_hidden=1; fi
+  page_cover "${chrome_cdp[alice]}" show
+fi
 until grep -q "SELFTEST done" "$WORK/alice.log" && grep -q "SELFTEST done" "$WORK/bob.log"; do
   [ "$(date +%s)" -lt "$deadline" ] || { echo "timeout waiting for the self-tests"; break; }
   sleep 1
@@ -365,14 +484,25 @@ extract() { grep -ao 'SELFTEST .*' "$1" | sed 's/", source:.*$//; s/\\"/"/g' > "
 extract "$WORK/alice.log" "$WORK/alice.txt"
 extract "$WORK/bob.log" "$WORK/bob.txt"
 echo "--- self-test: $blank_loads blank first load(s) tried again"
-echo "--- alice"; cat "$WORK/alice.txt"
-echo "--- bob";   cat "$WORK/bob.txt"
+# The capped-link lane's raw trace rows (share-trace.ts) stay in the kept files: what they say
+# is printed below, in one line
+echo "--- alice"; grep -v '^SELFTEST trace-' "$WORK/alice.txt" || true
+echo "--- bob";   grep -v '^SELFTEST trace-' "$WORK/bob.txt" || true
 
 fail=0
 : > "$WORK/fails.txt"
 check() { # description file pattern
   if grep -q "$3" "$2"; then echo "PASS $1"; else echo "FAIL $1" | tee -a "$WORK/fails.txt"; fail=1; fi
 }
+# The voice room's id and the text channel's, as alice made them: a check of a channel's
+# messages reads that channel's alone ("hello from alice" is also in "text hello from alice")
+channel_of() { # name
+  grep -oh "\"channel_id\":[0-9]*,\"name\":\"$1\"" "$WORK/alice.txt" "$WORK/bob.txt" | head -1 | grep -o '[0-9]*' | head -1 || true
+}
+room_id=$(channel_of e2e)
+text_id=$(channel_of e2e-text)
+in_room="\"channel_id\":${room_id:-none},"
+in_text="\"channel_id\":${text_id:-none},"
 check "alice connected"                 "$WORK/alice.txt" 'SELFTEST connected'
 check "bob connected"                   "$WORK/bob.txt"   'SELFTEST connected'
 check "alice got a media key"           "$WORK/alice.txt" 'media-key-installed'
@@ -390,8 +520,8 @@ check "alice placed bob from his beacon" "$WORK/alice.txt" 'event user-position.
 # spatial test's synthetic voice going through the real mixer
 check "alice ran the spatial test"      "$WORK/alice.txt" 'spatial-test-started.*"mode":"3d"'
 check "alice's mixer played the test"   "$WORK/alice.txt" 'voice-stats.*played.*:[1-9]'
-check "bob read alice's channel message" "$WORK/bob.txt"  'channel-chat-message.*hello from alice'
-check "alice read bob's channel message" "$WORK/alice.txt" 'channel-chat-message.*hello from bob'
+check "bob read alice's channel message" "$WORK/bob.txt"  "channel-chat-message.*$in_room.*\"content\":\"hello from alice\""
+check "alice read bob's channel message" "$WORK/alice.txt" "channel-chat-message.*$in_room.*\"content\":\"hello from bob\""
 check "bob read alice's DM"             "$WORK/bob.txt"   'direct-chat-message.*dm from alice'
 check "alice read bob's DM"             "$WORK/alice.txt" 'direct-chat-message.*dm from bob'
 # Files (protocol 13): over HTTPS beside the session, sealed in a worker
@@ -403,15 +533,54 @@ fi
 # because he beat alice to it also logs source":"invite", and then quietly fails
 # the history check three lines down instead of this one.
 check "bob joined via the invite link"  "$WORK/bob.txt"   'channel-requested.*"existing":true.*"source":"invite"'
-check "bob received channel history"    "$WORK/bob.txt"   'channel-history-received.*early from alice'
+check "bob received channel history"    "$WORK/bob.txt"   "channel-history-received.*$in_room.*\"content\":\"early from alice\""
 # The text channel: bob subscribes to it long after the two already hold a
 # pairwise session, which is where the group key used to go missing. Every one
 # of these failed together when it did.
 check "bob joined the text channel"     "$WORK/bob.txt"   'text-channel-joined'
 check "bob read alice's text message"   "$WORK/bob.txt"   'text-channel-read.*text hello from alice'
-check "bob received the text history"   "$WORK/bob.txt"   'channel-history-received.*text early from alice'
+check "bob received the text history"   "$WORK/bob.txt"   "channel-history-received.*$in_text.*\"content\":\"text early from alice\""
 check "alice read bob's first text line" "$WORK/alice.txt" 'text-channel-read.*text first from bob'
 check "alice read bob's text message"   "$WORK/alice.txt" 'text-channel-read.*text hello from bob'
+# The group key (stores/gk.ts's events, which only it sends): who held each channel's keys,
+# as bob last heard; no post of either side held back and given up, and no key refused. Off,
+# none of its lines at all.
+keyholders() { # channel-id
+  grep -h "event gk-keyholders {\"channel_id\":$1," "$WORK/bob.txt" | tail -1 |
+    grep -o '"name":"[^"]*","online":[a-z]*' | sed 's/"name":"\([^"]*\)","online":true/\1/; s/"name":"\([^"]*\)","online":false/\1 (away)/' |
+    paste -sd, - || true
+}
+if [ "$GK" = 1 ]; then
+  # The voice join and the text posts above went under the key: its lines for those channels
+  check "bob's voice join went under the group key" "$WORK/bob.txt" "event gk-keyholders {$in_room"
+  check "alice wrote in the text channel under it" "$WORK/alice.txt" "event gk-state {$in_text\"state\":\"ok\""
+  check "bob read and wrote there under it"  "$WORK/bob.txt"   "event gk-state {$in_text\"state\":\"ok\""
+  echo "--- keyholders as bob last heard: voice room ${room_id:-?}: $(keyholders "${room_id:-none}" | grep . || echo none said), text channel ${text_id:-?}: $(keyholders "${text_id:-none}" | grep . || echo none said)"
+  if [ "$hide_alice" = 1 ]; then
+    check "alice's page was hidden before bob came" "$WORK/alice.txt" 'SELFTEST page-visibility.*"state":"hidden"'
+    # Measured, and said: a page in a call keeps its timers on time (Chrome clamps a hidden page's
+    # only once it has been silent a while; alice's came 11 s after she left the room), so this
+    # is choice 31's fallback, not the clamp. A keyholder's parts going out without timer
+    # polling is live-gk.test.ts's; a hidden keyholder in no call is in no lane yet.
+    clamp=$(grep -ah 'SELFTEST page-timers-clamped' "$WORK/alice.txt" | head -1 | grep -o '{.*}' || true)
+    echo "--- alice's timers while hidden: ${clamp:+clamped $clamp}${clamp:-on time (in a call: not clamped)}"
+    if [ "$joined_hidden" = 1 ]; then
+      echo "PASS bob joined the room and the text channel while alice's page was hidden"
+    else
+      echo "FAIL bob's joins did not both land while alice's page was hidden" | tee -a "$WORK/fails.txt"; fail=1
+    fi
+    check "alice's page was shown again"    "$WORK/alice.txt" 'SELFTEST page-visibility.*"state":"visible"'
+  else
+    echo "--- alice's page stays shown: $([ "$BROWSER_ALICE" = chromium ] && echo "the capped-link lane" || echo "no DevTools in Firefox")"
+  fi
+  if grep -q 'event gk-post-dropped\|event gk-state.*"state":"refused"' "$WORK/alice.txt" "$WORK/bob.txt"; then
+    echo "FAIL the group key dropped a post or refused one:" | tee -a "$WORK/fails.txt"
+    grep -h 'event gk-post-dropped\|event gk-state.*"state":"refused"' "$WORK/alice.txt" "$WORK/bob.txt" | tee -a "$WORK/fails.txt"; fail=1
+  fi
+elif grep -q 'SELFTEST event gk-' "$WORK/alice.txt" "$WORK/bob.txt"; then
+  echo "FAIL a group-key line with the key off:" | tee -a "$WORK/fails.txt"
+  grep -h 'SELFTEST event gk-' "$WORK/alice.txt" "$WORK/bob.txt" | head -5 | tee -a "$WORK/fails.txt"; fail=1
+fi
 if grep -q 'decryption failed' "$WORK/alice.txt" "$WORK/bob.txt"; then
   echo "FAIL a message could not be decrypted:" | tee -a "$WORK/fails.txt"
   grep -h 'decryption failed' "$WORK/alice.txt" "$WORK/bob.txt" | tee -a "$WORK/fails.txt"; fail=1
@@ -423,6 +592,85 @@ check "alice sent video frames"         "$WORK/alice.txt" 'screenshare-stats.*"f
 check "bob watched the share"           "$WORK/bob.txt"   'watching-screenshare'
 check "bob decoded video frames"        "$WORK/bob.txt"   'screenshare-stats.*"frames_recv":[1-9]'
 check "bob drew a frame on the canvas"  "$WORK/bob.txt"   'screenshare-stats.*"frames_drawn":[1-9]'
+if [ "${EDGE:-}" = 1 ]; then
+  # Only a relay that lost him (an EdgeFailed, the edge gone) would feed bob itself: then
+  # his frames above did not come through the edge
+  check "bob watched from the edge"     "$WORK/bob.txt"   'event edge-view.*"state":"ready"'
+  if grep -q 'event edge-view.*"state":"failed"' "$WORK/bob.txt" || grep -q 'edge e1 offline' "$WORK/server.log"; then
+    echo "FAIL bob's edge failed him, or went:" | tee -a "$WORK/fails.txt"
+    grep -h 'event edge-view.*"state":"failed"\|edge e1 offline' "$WORK/bob.txt" "$WORK/server.log" | tee -a "$WORK/fails.txt"; fail=1
+  fi
+fi
+if [ "${EXPECT_LADDER:-}" = 1 ]; then
+  # Under the cap: voice first, the picture keeps coming, and the ladder gives way (H3-14)
+  ladder=$(node -e '
+    const fs = require("fs");
+    const TALK = +process.argv[3];
+    const rows = (f, what) => fs.readFileSync(f, "utf8").split("\n").filter((l) => l.includes(what))
+      .map((l) => JSON.parse(l.slice(l.indexOf("{"), l.lastIndexOf("}") + 1)));
+    const voice = rows(process.argv[2], "SELFTEST voice-stats").pop() ?? { played: 0, lost: 1 };
+    // Each row with the wall clock its line ends with ("@<ms>")
+    const stamped = (f, what) => fs.readFileSync(f, "utf8").split("\n").filter((l) => l.includes(what))
+      .map((l) => ({ ...(l.includes("{") ? JSON.parse(l.slice(l.indexOf("{"), l.lastIndexOf("}") + 1)) : {}), t: +l.slice(l.lastIndexOf("@") + 1) }));
+    const ticks = stamped(process.argv[2], "SELFTEST voice-tick");
+    const talkAt = stamped(process.argv[1], "SELFTEST transmit-started").map((r) => r.t).pop() ?? 0;
+    // Loss in [from, from + 4 s], from the counters bob logged around it
+    const windowLoss = (from) => {
+      const a = ticks.filter((k) => k.t <= from).pop() ?? { played: 0, lost: 0 };
+      const b = ticks.find((k) => k.t >= from + 4000) ?? ticks[ticks.length - 1] ?? a;
+      const played = b.played - a.played, lost = b.lost - a.lost;
+      return { lost, of: played + lost, share: +(lost / Math.max(1, played + lost)).toFixed(4) };
+    };
+    const seen = rows(process.argv[2], "SELFTEST share-window").map((w) => w.drawn);
+    const kbps = rows(process.argv[1], "SELFTEST share-window").map((w) => w.kbps);
+    // As her sharer logged it: a step inside one 10 s window shows in no window average
+    const steps = (rows(process.argv[1], "SELFTEST share-ladder").pop() ?? { steps: [] }).steps;
+    const lost = voice.lost / Math.max(1, voice.played + voice.lost);
+    // The first 4 s of talk once video flows; a climb inside the talk, its 4 s
+    const videoAt = (steps.find((s) => s.change === "start") ?? { t: 0 }).t;
+    const atStart = windowLoss(Math.max(talkAt, videoAt));
+    const climb = steps.find((s) => s.change === "up" && s.t >= talkAt && s.t + 4000 <= talkAt + TALK);
+    const atClimb = climb ? windowLoss(climb.t) : null;
+    const stepped = steps.some((s) => s.change === "down");
+    const ladder = steps.map((s) => `${s.change} ${s.level} @${s.at}`).join(", ");
+    console.log(JSON.stringify({ lost: +lost.toFixed(4), played: voice.played, atStart, atClimb, drawn: seen, kbps, ladder }));
+    console.log(atStart.of >= 150 && atStart.share <= 0.02 ? "PASS" : "FAIL", "bob lost at most 2 % of voice in the first 4 s of talk as the share starts");
+    console.log(lost <= 0.02 ? "PASS" : "FAIL", "bob lost at most 2 % of voice under the cap");
+    console.log(seen.length >= 2 && seen.every((n) => n > 0) ? "PASS" : "FAIL", "bob drew pictures in every 10 s window");
+    console.log(stepped ? "PASS" : "FAIL", "the quality ladder of alice stepped down under the cap");
+  ' "$WORK/alice.txt" "$WORK/bob.txt" "${TALK_MS:-4000}")
+  echo "--- capped link: $(head -1 <<< "$ladder")"
+  # What lay behind those numbers (share-trace.ts, test builds): alice's voice as bob got it in
+  # the same 4 s, and her share's first 4 s as it went to her link
+  echo "--- capped link trace: $(node -e '
+    const fs = require("fs");
+    const lines = (f) => fs.readFileSync(f, "utf8").split("\n");
+    const body = (l) => JSON.parse(l.slice(l.indexOf(" ", 9) + 1, l.lastIndexOf(" @")));
+    const rows = (f, what) => lines(f).filter((l) => l.startsWith(`SELFTEST trace-${what} `)).flatMap(body);
+    const A = process.argv[1], B = process.argv[2];
+    const ladder = lines(A).filter((l) => l.startsWith("SELFTEST share-ladder ")).map(body).pop() ?? { steps: [] };
+    const videoAt = (ladder.steps.find((s) => s.change === "start") ?? { t: 0 }).t;
+    const talk = lines(A).find((l) => l.startsWith("SELFTEST transmit-started"));
+    const from = Math.max(videoAt, talk ? +talk.slice(talk.lastIndexOf("@") + 1) : 0);
+    const heard = new Map();
+    for (const [, seq, at] of rows(B, "voice-in")) heard.set(seq, at);
+    const out = rows(A, "voice-out").filter(([, at]) => at >= from && at < from + 4000);
+    const late = out.filter(([seq]) => heard.has(seq)).map(([seq, at]) => heard.get(seq) - at).sort((x, y) => x - y);
+    const pick = (xs, q) => (xs.length ? Math.round(xs[Math.min(xs.length - 1, Math.floor(q * xs.length))]) : null);
+    const frames = rows(A, "frames").filter(([at]) => at >= videoAt && at < videoAt + 4000);
+    const closed = rows(A, "writes").filter(([at, , , end]) => at >= videoAt && at < videoAt + 4000 && end > 0).map(([at, , , end]) => end - at).sort((x, y) => x - y);
+    console.log(JSON.stringify({
+      voice: { sent: out.length, never_came: out.filter(([seq]) => !heard.has(seq)).length, one_way_ms: { p50: pick(late, 0.5), p90: pick(late, 0.9), max: pick(late, 1) } },
+      video_first_4s: { frames: frames.filter((f) => f[4]).length, kbps: Math.round(frames.filter((f) => f[4]).reduce((n, f) => n + f[1], 0) * 8 / 4000), keys: frames.filter((f) => f[2]).length,
+        stream_done_ms: { p50: pick(closed, 0.5), max: pick(closed, 1) } },
+      paced_skips: ladder.paced_skips ?? null,
+    }));
+  ' "$WORK/alice.txt" "$WORK/bob.txt" 2>&1 | head -1)"
+  while read -r verdict what; do
+    echo "$verdict $what"
+    if [ "$verdict" != PASS ]; then echo "FAIL $what" >> "$WORK/fails.txt"; fail=1; fi
+  done < <(tail -n +2 <<< "$ladder")
+fi
 if grep -q 'screenshare-error' "$WORK/alice.txt" "$WORK/bob.txt"; then
   echo "FAIL screen share error reported:" | tee -a "$WORK/fails.txt"
   grep -h 'screenshare-error' "$WORK/alice.txt" "$WORK/bob.txt" | tee -a "$WORK/fails.txt"; fail=1
@@ -467,6 +715,7 @@ elif [ "$BROWSER_ALICE" = chromium ] || [ "$BROWSER_BOB" = chromium ]; then
     "$CHROME" --headless=new --no-sandbox --disable-gpu --ignore-certificate-errors \
       --use-fake-ui-for-media-stream --use-fake-device-for-media-stream \
       --autoplay-policy=no-user-gesture-required --disable-background-timer-throttling \
+      --log-net-log="$WORK/ui-netlog-$cdp.json" \
       --remote-debugging-port="$cdp" --user-data-dir="$WORK/profile-ui-$cdp" about:blank > "$WORK/ui-browser-$cdp.log" 2>&1 &
     ui_browsers+=($!)
     for _ in $(seq 1 50); do
@@ -588,7 +837,7 @@ if [ "$fail" -ne 0 ]; then
   annotate "test-web $BROWSER_ALICE -> $BROWSER_BOB" "$(
     cat "$WORK/fails.txt"
     echo "--- UDP packets dropped for a full socket buffer during this run: $udp_dropped"
-    echo "--- alice"; tail -20 "$WORK/alice.txt"
-    echo "--- bob";   tail -20 "$WORK/bob.txt")"
+    echo "--- alice"; grep -v '^SELFTEST trace-' "$WORK/alice.txt" | tail -20
+    echo "--- bob";   grep -v '^SELFTEST trace-' "$WORK/bob.txt" | tail -20)"
 fi
 exit $fail

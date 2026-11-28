@@ -27,6 +27,25 @@ const FRAME_NAMES = {
   46: "Account", 47: "PreKeysLow", 73: "TextJoined", 74: "KeysOwed", 75: "SessionAsked", 76: "SessionHello",
   77: "TextKeyReceived", 78: "KeyWanted", 79: "ChannelPage", 80: "ChannelMarks", 81: "Evicted", 82: "ChannelExits",
   83: "TextPost", 85: "MemberGone",
+  // The group key's (protocol 26, golden v26)
+  93: "GroupKeys", 94: "EpochIn", 95: "EpochWait", 96: "EpochDue", 97: "EpochStale", 98: "EpochLists",
+  99: "KeyringIn", 100: "EpochExit", 101: "EpochPostIn", 102: "EpochBlob", 103: "EpochNamesIn",
+  104: "EpochRefused", 105: "VoiceSeats", 106: "EpochReseated",
+};
+/** The live path's frames, the old way's and the group key's: frameSummary lists them in order. */
+const LIVE_FRAME = (i) => (i >= 73 && i <= 85) || (i >= 93 && i <= 106);
+
+/**
+ * ClientMessage variants a page sends raw, by their index (`__voipc_said` names them "#27"):
+ * the live path's (a post, a key check, a session's opening, hello and keys) and the group
+ * key's frames, which the wasm side encodes itself.
+ */
+export const SENT_NAMES = {
+  27: "SendEncryptedChannelMessage",
+  56: "KeyCheck", 57: "OpenSessions", 58: "SessionHello", 59: "DistributeSenderKeys",
+  69: "EpochFetch", 70: "EpochCommit", 71: "EpochDecline", 72: "EpochWelcomes", 73: "EpochListsWanted",
+  74: "KeyringWanted", 75: "EpochPost", 76: "EpochBlobWanted", 77: "EpochNames", 78: "EpochFloorAhead",
+  79: "KeyholdVolunteer", 80: "KeyholdResign", 81: "KeyholdReplace",
 };
 
 /**
@@ -88,12 +107,13 @@ export async function frameSummary(tab, ms = null) {
   const name = (i) => FRAME_NAMES[i] ?? `#${i}`;
   const counts = {};
   for (const [, i] of got) counts[name(i)] = (counts[name(i)] ?? 0) + 1;
-  const live = got.filter(([, i]) => i >= 73 && i <= 85).slice(-40).map(([ago, i]) => `${name(i)} -${(ago / 1000).toFixed(1)}s`);
+  const live = got.filter(([, i]) => LIVE_FRAME(i)).slice(-40).map(([ago, i]) => `${name(i)} -${(ago / 1000).toFixed(1)}s`);
   // A test build also logs, by name, what the session took in and what it sent since the
   // load (session.ts __voipc_heard, __voipc_said): whether it joined, answered an ask, wanted a key
   const tags = await tab
     .evaluate(`window.__voipc_heard ? JSON.stringify({ heard: window.__voipc_heard.map(([t]) => t), sent: window.__voipc_said.map((m) => typeof m === "string" ? m : Object.keys(m ?? {})[0]) }) : "null"`)
     .then(JSON.parse, () => null);
+  if (tags) tags.sent = tags.sent.map((t) => (typeof t === "string" && t.startsWith("#") && SENT_NAMES[t.slice(1)]) || t);
   const tally = (list) => {
     const n = {};
     for (const t of list) if (t !== "Ping" && t !== "Pong") n[t] = (n[t] ?? 0) + 1;
@@ -104,6 +124,16 @@ export async function frameSummary(tab, ms = null) {
     + (live.length ? `\n--- live path, oldest first: ${live.join(", ")}` : "")
     + (tags ? `\n--- the session took in: ${tally(tags.heard)}\n--- and sent: ${tally(tags.sent)}` : "")
     + (said.length ? `\n--- the page last said: ${said.join(" | ").slice(-2000)}` : "");
+}
+
+/**
+ * The names of the frames a tab with `frames: true` read from `since` until `before` (the
+ * page's Date.now()), in order. The group key's go to its wasm side undecoded and never
+ * reach `__voipc_heard`: this is where a lane sees them.
+ */
+export async function framesRead(tab, since = 0, before = Number.MAX_SAFE_INTEGER) {
+  const got = await tab.evaluate(`JSON.stringify((window.__frames ?? []).filter(([t]) => t >= ${since} && t < ${before}).map(([, i]) => i))`).then(JSON.parse, () => []);
+  return got.map((i) => FRAME_NAMES[i] ?? `#${i}`);
 }
 
 /**
@@ -186,9 +216,15 @@ export async function openTab(cdpPort, opts = {}) {
   // says so (test-web.sh counts it); what the broken load threw is not the page's error.
   // A file that failed for a reason of its own (a reset, a close, a timeout) is the relay's or the
   // link's: once one has, no ERR_FAILED alongside it loads the tab again either.
+  // Nor what the document that lost it threw, whatever file it names: soak 45445910136 lost
+  // core-*.js, and the broken page's dynamic import of ui-prefs-*.js (which needs it) failed
+  // under that chunk's name. `doc` counts the tab's documents (a navigation clears every
+  // context); entries already in `errors` stay, as lanes count from an index into it.
   const verifierFailed = new Set();
   let reloaded = false;
   let ownCause = false;
+  let doc = 0;
+  let brokenDoc = -1;
   const ownAsset = (url) => {
     try {
       return new URL(url).pathname.startsWith("/assets/");
@@ -240,16 +276,20 @@ export async function openTab(cdpPort, opts = {}) {
         verifierFailed.add(url);
         if (!reloaded) {
           reloaded = true;
+          brokenDoc = doc;
           console.log(`NOTE chrome lost a file of the page (${p.errorText} ${url}): the tab loads again`);
           send("Page.reload", { ignoreCache: true }).catch(() => {});
         }
       }
+    } else if (msg.method === "Runtime.executionContextsCleared") {
+      doc++;
     } else if (msg.method === "Runtime.exceptionThrown") {
       // A rejection with a plain object describes itself as "Object": its
       // preview and where it was thrown are what make the report readable (detailed)
       const d = p.exceptionDetails;
       const at = d.stackTrace?.callFrames?.[0] ?? (d.url ? { url: d.url, lineNumber: d.lineNumber ?? 0 } : null);
       if (foreign(at?.url)) return;
+      if (doc === brokenDoc) return;
       if (byVerifier(`${d.text ?? ""} ${d.exception?.description ?? ""}`)) return;
       // A file that did not load says why it did not, from the network's side
       const why = /dynamically imported module|preload CSS/.test(`${d.exception?.description}`)
@@ -264,6 +304,7 @@ export async function openTab(cdpPort, opts = {}) {
     if (msg.method === "Runtime.consoleAPICalled" && p.type === "error" && consoleErrors) {
       const at = p.stackTrace?.callFrames?.[0];
       if (foreign(at?.url)) return;
+      if (doc === brokenDoc) return;
       if (byVerifier(p.args.map((a) => a.value ?? a.description ?? "").join(" "))) return;
       // test-ui's lines never had the prefix, test-move's always did
       errors.push(`${detailed ? "" : "console: "}${p.args.map((a) => a.value ?? (preview(a) || a.description) ?? "").join(" ")}${where(at)}`);
@@ -405,13 +446,17 @@ export const probe = (tab, expression, timeoutMs) =>
 /** An expression: this page has queued a frame of `kind` since `__voipc_said` was emptied
  *  (a variant name, or "#27" for a live post, which goes raw). */
 export const sentKind = (kind) => `window.__voipc_said.some((m) => m && typeof m === "object" && ${JSON.stringify(kind)} in m)`;
+/** An expression: this page has sent a text channel's post since `__voipc_said` was emptied,
+ *  raw either way: `EpochPost` (#75) under the group key, the old live post (#27) off it. */
+export const sentPost = `(${sentKind("#75")} || ${sentKind("#27")})`;
 
 /**
  * Rule 5's barrier: each tab in turn has the relay answer a Ping (the self-test build's
  * `__voipc_barrier`). After it, everything the earlier tabs sent has been handled, and what
  * the relay passed on from it is in the later tabs' queues and recorded (`__voipc_heard`).
  * Only for what an app sends as part of a step: a send behind an app's own timer is not
- * covered. False: a tab had no session there.
+ * covered, nor what the relay sends on its own ticks (ChannelExits, ChannelCounts: wait for
+ * those). False: a tab had no session there.
  */
 export async function barrier(server, ...tabs) {
   for (const tab of tabs) {

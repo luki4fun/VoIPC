@@ -1,6 +1,6 @@
 <script lang="ts">
   import { backdrop, dialog } from "../actions/dialog.js";
-  import { onMount } from "svelte";
+  import { onDestroy, onMount } from "svelte";
   import Icon from "./Icons.svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { addNotification } from "../stores/notifications.js";
@@ -14,6 +14,7 @@
     currentSourceType,
     currentSourceId,
     viewerCount,
+    lastShareFrame,
   } from "../stores/screenshare.js";
 
   interface DisplayInfo {
@@ -39,6 +40,65 @@
   let starting = $state(false);
   let loading = $state(true);
   let platform = $state<string>("linux");
+  /** Linux: the portal can restore the last screen or window without its dialog. */
+  let againKnown = $state(false);
+
+  // ── Windows: a picture on every tile (source_preview: a still, a window's icon) ──
+  interface SourcePicture {
+    picture: string | null;
+    icon: string | null;
+  }
+  /** By "display:<id>" / "window:<id>". Drawn here only: never sent, never stored. */
+  let pictures = $state<Record<string, SourcePicture>>({});
+  /** Asked at most this many at a time: each is a GDI draw, a window's one can be slow. */
+  const PICTURES_AT_ONCE = 4;
+  const REFRESH_MS = 3000;
+  let refreshing = false;
+  let refreshTimer: ReturnType<typeof setInterval> | null = null;
+  let closed = false;
+
+  async function fetchPictures() {
+    if (refreshing || closed || platform !== "windows") return;
+    refreshing = true;
+    const items = [
+      ...displays.map((d) => ({ kind: "display", id: d.id })),
+      ...windows.map((w) => ({ kind: "window", id: w.id })),
+    ];
+    let next = 0;
+    const worker = async () => {
+      while (next < items.length && !closed) {
+        const it = items[next++];
+        const got = await invoke<SourcePicture>("source_preview", { sourceType: it.kind, sourceId: it.id }).catch(() => null);
+        if (got && !closed) pictures = { ...pictures, [`${it.kind}:${it.id}`]: got };
+      }
+    };
+    await Promise.all(Array.from({ length: PICTURES_AT_ONCE }, worker));
+    refreshing = false;
+  }
+
+  onDestroy(() => {
+    closed = true;
+    if (refreshTimer !== null) clearInterval(refreshTimer);
+  });
+
+  /** Arrows move the selection over the tiles, Enter starts (Windows). */
+  function onListKey(e: KeyboardEvent) {
+    if (platform !== "windows" || starting) return;
+    const ids = (activeTab === "displays" ? displays : windows).map((x) => x.id);
+    if (e.key === "Enter" && selectedId) {
+      e.preventDefault();
+      void startOrSwitch();
+      return;
+    }
+    const list = e.currentTarget as HTMLElement;
+    const columns = Math.max(1, getComputedStyle(list).gridTemplateColumns.split(" ").filter(Boolean).length);
+    const step = { ArrowRight: 1, ArrowLeft: -1, ArrowDown: columns, ArrowUp: -columns }[e.key];
+    if (step === undefined || ids.length === 0) return;
+    e.preventDefault();
+    const at = Math.max(0, ids.indexOf(selectedId ?? ids[0]));
+    selectedId = ids[Math.min(ids.length - 1, Math.max(0, at + step))];
+    list.querySelector<HTMLElement>(`[data-id="${CSS.escape(selectedId)}"]`)?.focus();
+  }
 
   // Load sources on mount — once: an effect would fetch again whenever
   // something the fetch reads changed
@@ -55,6 +115,12 @@
         loading = false;
         return;
       }
+      // Linux: the portal's dialog lists the screens and windows, with its own pictures
+      if (platform === "linux") {
+        againKnown = await invoke<boolean>("share_again_known").catch(() => false);
+        loading = false;
+        return;
+      }
       const [d, w] = await Promise.all([
         invoke<DisplayInfo[]>("enumerate_displays"),
         invoke<WindowInfo[]>("enumerate_windows"),
@@ -65,6 +131,11 @@
       if (platform === "windows" && displays.length > 0) {
         const primary = displays.find((d) => d.is_primary);
         selectedId = primary ? primary.id : displays[0].id;
+      }
+      // The names show at once; the pictures follow, and keep up while the picker is open
+      if (platform === "windows") {
+        void fetchPictures();
+        refreshTimer = setInterval(() => void fetchPictures(), REFRESH_MS);
       }
     } catch (e: any) {
       addNotification("Failed to enumerate sources: " + e.toString(), "error");
@@ -98,8 +169,16 @@
     }
   }
 
-  async function startOrSwitch() {
-    const sourceType = activeTab === "displays" ? "display" : "window";
+  /** Linux: forget the remembered screen or window; the next share asks again. */
+  async function forgetAgain() {
+    await invoke("forget_share_again").catch((e) => addNotification(String(e), "error"));
+    againKnown = false;
+  }
+
+  /** `again` (Linux): restore the last screen or window without the portal's dialog. */
+  async function startOrSwitch(again = false) {
+    // Linux asks the portal for either, in one step: its dialog lists both
+    const sourceType = platform === "linux" ? "any" : activeTab === "displays" ? "display" : "window";
     // Linux and the browser ignore source_id — their own picker decides
     const sourceId = usesOwnPicker ? "0" : (selectedId ?? "0");
 
@@ -117,6 +196,7 @@
           sourceId,
           resolution,
           fps,
+          again,
         });
       } else {
         await invoke("start_screen_share", {
@@ -124,6 +204,7 @@
           sourceId,
           resolution,
           fps,
+          again,
         });
         // A new share starts unwatched: a count left from the last one would
         // start capture (in the browser, encoding) for nobody
@@ -153,15 +234,18 @@
       ? usesOwnPicker
         ? "Opening picker..."
         : "Starting..."
-      : $pickerSwitchMode
-        ? "Switch source"
-        : "Start sharing"
+      : platform === "linux"
+        ? "Choose screen or window…"
+        : $pickerSwitchMode
+          ? "Switch source"
+          : "Start sharing"
   );
 </script>
 
 <div class="overlay" onclick={backdrop(close)} role="presentation">
   <div
     class="picker"
+    class:wide={platform === "windows"}
     aria-label={$pickerSwitchMode ? "Switch source" : "Share screen"}
     use:dialog={{ onclose: starting ? undefined : close }}
   >
@@ -170,7 +254,8 @@
       <button class="close-btn" onclick={close} disabled={starting} aria-label="Close">&times;</button>
     </div>
 
-    <!-- Tabs -->
+    <!-- Tabs: not on Linux, whose portal dialog offers screens and windows together -->
+    {#if platform !== "linux"}
     <div class="tabs">
       <button
         class="tab"
@@ -189,11 +274,39 @@
         Windows
       </button>
     </div>
+    {/if}
 
     <!-- Source list -->
-    <div class="source-list">
+    <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+    <div
+      class="source-list"
+      class:tiles={platform === "windows"}
+      onkeydown={onListKey}
+      role={platform === "windows" ? "listbox" : undefined}
+      aria-label={platform === "windows" ? "Sources" : undefined}
+    >
       {#if loading}
         <div class="placeholder">Loading sources...</div>
+      {:else if platform === "linux"}
+        <div class="linux-pick">
+          {#if againKnown}
+            <button class="again-tile" onclick={() => startOrSwitch(true)} disabled={starting}>
+              {#if $lastShareFrame}
+                <img src={$lastShareFrame} alt="" class="again-picture" />
+              {:else}
+                <span class="again-picture again-icon" aria-hidden="true"><Icon name="monitor" size={28} /></span>
+              {/if}
+              <span class="again-text">
+                <span class="again-title">Share again</span>
+                <span class="again-sub">What you shared last, without your system's dialog</span>
+              </span>
+            </button>
+            <button class="forget-btn" onclick={forgetAgain} disabled={starting}>Forget it</button>
+          {/if}
+          <p class="portal-sub">
+            {againKnown ? "Or choose" : "Choose"} a screen or a window in your system's dialog.
+          </p>
+        </div>
       {:else if usesOwnPicker}
         <!-- Linux portal and the browser enumerate sources themselves -->
         <div class="portal-hint">
@@ -229,12 +342,21 @@
         {:else}
           {#each displays as display (display.id)}
             <button
-              class="source-card"
+              class="source-card source-tile"
               class:selected={selectedId === display.id}
               onclick={() => selectSource(display.id)}
               disabled={starting}
+              data-id={display.id}
+              role="option"
+              aria-selected={selectedId === display.id}
             >
-              <div class="source-icon" aria-hidden="true"><Icon name="monitor" size={20} /></div>
+              <div class="tile-picture" aria-hidden="true">
+                {#if pictures[`display:${display.id}`]?.picture}
+                  <img src={pictures[`display:${display.id}`].picture} alt="" />
+                {:else}
+                  <Icon name="monitor" size={28} />
+                {/if}
+              </div>
               <div class="source-info">
                 <span class="source-title">
                   {display.name}
@@ -253,12 +375,23 @@
         {:else}
           {#each windows as win (win.id)}
             <button
-              class="source-card"
+              class="source-card source-tile"
               class:selected={selectedId === win.id}
               onclick={() => selectSource(win.id)}
               disabled={starting}
+              data-id={win.id}
+              role="option"
+              aria-selected={selectedId === win.id}
             >
-              <div class="source-icon" aria-hidden="true"><Icon name="split-side" size={20} /></div>
+              <div class="tile-picture" aria-hidden="true">
+                {#if pictures[`window:${win.id}`]?.picture}
+                  <img src={pictures[`window:${win.id}`].picture} alt="" />
+                {:else if pictures[`window:${win.id}`]?.icon}
+                  <img src={pictures[`window:${win.id}`].icon} alt="" class="tile-icon" />
+                {:else}
+                  <Icon name="split-side" size={28} />
+                {/if}
+              </div>
               <div class="source-info">
                 <span class="source-title">{win.title}</span>
                 {#if win.app_name}
@@ -295,7 +428,7 @@
       <button class="cancel-btn" onclick={close} disabled={starting}>Cancel</button>
       <button
         class="start-btn btn btn-primary"
-        onclick={startOrSwitch}
+        onclick={() => startOrSwitch()}
         disabled={starting}
       >{buttonLabel}</button>
     </div>
@@ -440,6 +573,127 @@
     line-height: 1.5;
   }
 
+  .linux-pick {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    justify-content: center;
+    gap: 8px;
+    min-height: 120px;
+    padding: 12px;
+    text-align: center;
+  }
+
+  .again-tile {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 8px;
+    background: var(--bg-primary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    cursor: pointer;
+    text-align: left;
+    transition: background-color var(--dur-fast), border-color var(--dur-fast);
+  }
+
+  .again-tile:hover {
+    background: var(--bg-hover);
+    border-color: var(--text-secondary);
+  }
+
+  .again-picture {
+    flex-shrink: 0;
+    width: 128px;
+    aspect-ratio: 16 / 9;
+    max-width: 100%;
+    object-fit: cover;
+    border-radius: 4px;
+    background: var(--bg-tertiary);
+  }
+
+  .again-icon {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-secondary);
+  }
+
+  .again-text {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+
+  .again-title {
+    color: var(--text-primary);
+    font-size: var(--fs-body);
+    font-weight: 600;
+  }
+
+  .again-sub {
+    color: var(--text-secondary);
+    font-size: 12px;
+  }
+
+  .forget-btn {
+    align-self: flex-end;
+    padding: 2px 6px;
+    background: transparent;
+    border: none;
+    color: var(--text-secondary);
+    font-size: 12px;
+    text-decoration: underline;
+    cursor: pointer;
+  }
+
+  .linux-pick .portal-sub {
+    margin: 4px 0 0;
+  }
+
+  .picker.wide {
+    width: min(720px, calc(100vw - 32px));
+  }
+
+  .source-list.tiles {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+    align-content: start;
+    gap: 8px;
+  }
+
+  .source-card.source-tile {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 6px;
+    padding: 6px;
+  }
+
+  .tile-picture {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    max-width: 100%;
+    aspect-ratio: 16 / 9;
+    overflow: hidden;
+    border-radius: 4px;
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+  }
+
+  .tile-picture img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+  }
+
+  .tile-picture img.tile-icon {
+    width: 32px;
+    height: 32px;
+  }
+
   .source-card {
     display: flex;
     align-items: center;
@@ -464,13 +718,6 @@
     background: var(--bg-hover);
   }
 
-  .source-icon {
-    font-size: var(--fs-2xl);
-    color: var(--text-secondary);
-    flex-shrink: 0;
-    width: 28px;
-    text-align: center;
-  }
 
   .source-info {
     display: flex;

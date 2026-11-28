@@ -11,13 +11,13 @@ use voipc_crypto::{MediaKey, MediaKeyRing};
 pub fn fuzz_web_media(data: &[u8]) {
     let mut keys = MediaKeyRing::default();
     keys.install(MediaKey::new(1, 1, 7, [9; 32]), 1);
-    let _ = media::parse_voice_packet(Some(&keys), 1, data);
+    let _ = media::parse_voice_packet(Some(&mut keys), 1, data);
     let _ = media::parse_voice_packet(None, 1, data);
-    let _ = media::parse_position_packet(&keys, 1, data);
-    let _ = media::parse_screen_audio_packet(&keys, 1, data);
+    let _ = media::parse_position_packet(&mut keys, 1, data);
+    let _ = media::parse_screen_audio_packet(&mut keys, 1, data);
     let mut video = VideoAssemblerCore::new();
     for chunk in data.chunks(data.first().map_or(1, |&b| b.max(16) as usize)) {
-        let _ = video.push(&keys, 1, chunk);
+        let _ = video.push(&mut keys, 1, chunk);
     }
 }
 

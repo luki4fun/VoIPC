@@ -331,8 +331,9 @@ jobs:
         env: { VOIPC_SELFTEST: '1' }
 
       # What test-move.mjs imports with: the importer's real driver against the
-      # stand-in Discord. An example, which `npm run web` does not build.
-      - run: cargo build --release --locked -p voipc-server --example import_replay
+      # stand-in Discord, and group_load, the group key's smoke run below. Examples, which
+      # `npm run web` does not build.
+      - run: cargo build --release --locked -p voipc-server --example import_replay --example group_load
         env: { VOIPC_SELFTEST: '1' }
 
       # A fresh runner's first browser start is slow, and once stalled past Chromium's own
@@ -350,10 +351,11 @@ jobs:
       #
       # test-ui.mjs (its file section waits out the relay's one-minute file
       # cache) drives its own Chromium and reads none of these settings, so it
-      # is the same test in every lane but where the network differs. It runs
-      # in the `quic` part and with UDP blocked (the TCP fallback); UI_TEST:
-      # '0' skips it in the others, and Firefox ↔ Firefox has no Chromium for
-      # it. Those two lanes get 25 minutes, the others 10. test-web.sh runs its browser lanes
+      # is the same test in every lane but where the network or the relays'
+      # group key differ. It runs in the `quic` part, with UDP blocked (the TCP
+      # fallback) and with the group key off; UI_TEST: '0' skips it in the others,
+      # and Firefox ↔ Firefox has no Chromium for it. Those three lanes get 25
+      # minutes, the others 10. test-web.sh runs its browser lanes
       # one after another here: SIDE_BY_SIDE: '1' takes 4 minutes off, and its failures on 4
       # cores were web.rs `LINGER`'s bug. Worth trying again once a few runs have been clean.
       - name: Chromium ↔ Chromium
@@ -376,6 +378,33 @@ jobs:
         timeout-minutes: 10
         run: ./test-web.sh
         env: { BROWSER_ALICE: firefox, BROWSER_BOB: chromium, UI_TEST: '0' }
+      # The relays with the group key off (group_key = false): the old paths, text channels'
+      # sender keys and voice rooms' media keys handed member to member, still work. With
+      # test-ui and the lanes after it (community, moderation, move honour GK too): the only
+      # run of the old text path past the self-test, its sessions after a cut and a reload,
+      # quiet mode and the 0010 chains, since every other part runs with the key on.
+      - name: Chromium, group key off
+        if: ${{ !cancelled() && matrix.part == 'lanes' }}
+        timeout-minutes: 25
+        run: ./test-web.sh
+        env: { BROWSER: chromium, GK: '0' }
+      # The group key at a few hundred members, in under a minute (examples/group_load.rs
+      # --check): a relay of its own, guests that storm in and leave, keyholders that build;
+      # red when a commit sent is not taken, or anyone stays unseated, stale or declined.
+      - name: Group key load smoke
+        if: ${{ !cancelled() && matrix.part == 'lanes' }}
+        timeout-minutes: 5
+        run: |
+          bash tools/ci-run.sh "group_load --check" target/release/examples/group_load --check \
+            --relay "$GITHUB_WORKSPACE/target/release/voipc-server" --dir "$RUNNER_TEMP/group_load"
+      # A media edge (protocol 26): the relay sends bob, the share's first viewer, to an
+      # edge linked to it (`[pool] local_first = 0`), and alice's frames reach him through
+      # it. Chromium only: Firefox takes the same pinned certificates in its own lanes.
+      - name: Chromium through an edge
+        if: ${{ !cancelled() && matrix.part == 'lanes' }}
+        timeout-minutes: 10
+        run: ./test-web.sh
+        env: { BROWSER: chromium, EDGE: '1', UI_TEST: '0' }
       # The TCP fallback for servers whose UDP is blocked: the whole run over
       # the WebSocket tunnel, then a Firefox sharer on the tunnel (its
       # WebSocket must land on http/1.1, not the page's h2) against a
@@ -422,6 +451,48 @@ jobs:
           trap 'sudo tc qdisc del dev lo root' EXIT
           ./test-web.sh
         env: { BROWSER: chromium, UI_TEST: '0', FILE_KIB: '0' }
+      # A 6 Mbit/s link with a router's short queue (100 packets, about 160 ms). A 720p30
+      # share whose picture costs its 3 Mbit/s (SHARE_NOISE; ~3.4 measured uncapped) crosses
+      # loopback twice, sharer to relay and relay to viewer, so the link gives way: voice
+      # loses at most 2 %, the viewer draws in every 10 s window, and the sharer's ladder steps
+      # down (H3-14; EXPECT_LADDER in test-web.sh, from the changes the sharer logs). Uncapped,
+      # the ladder check fails: that is the control that it measures the cap, not the picture.
+      # TALK_MS: alice talks across the share's start and its first climb. Voice is gated
+      # over the first 4 s of her talk as the share starts (the bar as it was measured, over a
+      # 4 s talk) and over all of it. SHARE_NOISE's blocks make Chromium's encoder send what they
+      # cost, whatever bitrate it is asked for (3.2 Mbit/s at 720p30), which filled the link for
+      # 3-4 s: 1.6-8.6 % / 0.4-2.1 % on 4 cores here in 6 runs, 4.3-8.3 % / 1.1-2.0 % on the
+      # runners (6 runs: CI 45375049972, soak 45375328410). The browser watches its own uplink now
+      # (lib/video-pacer.ts UplinkControl): once three 200 ms windows of frame acks show the link
+      # delivering at its own steady rate it finds the queue, 0.62-0.67 s after the video starts
+      # here, steps down at once, paces the share at what the link delivers and, 2 s later with
+      # no queue found, sends it unpaced again (the 15 fps level fits this link): 0-0.53 % /
+      # 0-0.13 % here in 3 runs (2026-11-24). Its climb, 30 s in and outside the talk, finds the
+      # link too small again and steps back; in the 4 s after it voice lost 3.1 % in a longer run.
+      # The "capped link trace" line says where voice went: one-way delay, packets that
+      # never came, and the share's first 4 s as it went out (share-trace.ts; the raw rows in the
+      # kept alice.txt and bob.txt); the share-ladder line in alice's output lists each find.
+      - name: Capped link (netem rate)
+        if: ${{ !cancelled() && matrix.part == 'lanes' }}
+        timeout-minutes: 15
+        run: |
+          if ! sudo modprobe sch_netem; then
+            sudo apt-get install -y "linux-modules-extra-$(uname -r)"
+            sudo modprobe sch_netem
+          fi
+          sudo tc qdisc add dev lo root netem rate 6mbit delay 20ms limit 100
+          trap 'sudo tc qdisc del dev lo root' EXIT
+          ./test-web.sh
+        env:
+          BROWSER: chromium
+          UI_TEST: '0'
+          FILE_KIB: '0'
+          SHARE_RES: '720'
+          SHARE_FPS: '30'
+          SHARE_NOISE: '100'
+          EXPECT_LADDER: '1'
+          DURATION: '45000'
+          TALK_MS: '15000'
 
       # The relay on Postgres, which nothing above reaches: the accounts tests that take a
       # second database, and the lanes that read and write it most. The runner's own Postgres,
@@ -436,11 +507,13 @@ jobs:
             PGPASSWORD=voipc createdb -h 127.0.0.1 -U voipc "$name"
           done
       # --release: `npm run web` has built every dependency that way already. Only the tests
-      # that take a second database: all the others stay on SQLite whatever this says.
+      # that take a second database: all the others stay on SQLite whatever this says. `gk`:
+      # the group key's store (accounts::gk) and the relay tests that run on it (gk_tests,
+      # gk_e2e_*).
       - name: Accounts tests on Postgres
         if: matrix.part == 'postgres'
         timeout-minutes: 15
-        run: bash tools/ci-run.sh "accounts tests on Postgres" cargo test --release --locked -p voipc-server --bin voipc-server -- moderator_group accounts::placeholder::tests
+        run: bash tools/ci-run.sh "accounts tests on Postgres" cargo test --release --locked -p voipc-server --bin voipc-server -- moderator_group accounts::placeholder::tests gk
         env: { VOIPC_SELFTEST: '1', VOIPC_TEST_POSTGRES: 'postgres://voipc:voipc@127.0.0.1:5432/tests' }
       - name: Community lane on Postgres
         if: ${{ !cancelled() && matrix.part == 'postgres' }}

@@ -190,12 +190,10 @@ impl ChannelKeying {
         self.history_wanted.remove(&channel_id);
         self.live.gated.remove(&channel_id);
         self.live.quiet.remove(&channel_id);
-        self.live
-            .wraps
-            .retain(|(channel, _)| *channel != channel_id);
+        self.live.wraps.forget_channel(channel_id);
         self.live
             .opens
-            .retain(|(channel, _)| *channel != channel_id);
+            .retain(|(channel, ..)| *channel != channel_id);
         let held_bytes = &mut self.live.held_bytes;
         self.live.held.retain(|(channel, _), held| {
             if *channel == channel_id {
@@ -351,24 +349,61 @@ pub fn pick_history_sources(sharers: &[u32]) -> HashSet<u32> {
 
 /// How long a round answers a late hello or `KeyWanted` from the position it was named at,
 /// which is what opens the post that went before its key. As long as a reader holds a post.
+/// Once its chain has ended too (`Writing::end_chain`), but never past that chain's age, and
+/// only while its chain is among the newest that owe the reader (`MAX_SENDER_KEY_STATES`).
 const ROUND_LIFE_MS: u64 = 60_000;
 /// A check unanswered this long drops the posts behind it, and says so.
 const CHECK_WAIT_MS: u64 = 10_000;
-/// A chain ends at its next post once this old, by the writer's own count of whom it named,
-/// so a relay naming four million still gets an hour. What it covers is someone gone
-/// offline, and a stolen chain key alone: a relay hiding that someone left simply names
-/// them again at the restart.
+/// A chain ends once this old, at its next post, at the answer to a check already out, or at
+/// a yes to the mobile-data question, by the writer's own count of whom it named, so a relay
+/// naming four million still gets an hour. What it covers is someone gone offline, and a
+/// stolen chain key alone: a relay hiding that someone left simply names them again at the
+/// restart. Past it nothing of the chain goes to anyone, not even a round's own message once
+/// the chain has ended.
 const CHAIN_AGE_PER_NAMED_MS: u64 = 2_000;
 const CHAIN_AGE_MIN_MS: u64 = 60_000;
 const CHAIN_AGE_MAX_MS: u64 = 3_600_000;
-/// Exits rotate at most once per this, per the same count: a raid of leavers can cost a
-/// writer no more than it. Longer than a key job, so an exit cannot kill a round mid-job.
+/// Exits rotate at most once per this, per the same count, from the chain's start: a raid of
+/// leavers can cost a writer no more than it. Past it, what is sealed next goes on a new
+/// chain: a post written then, one waiting behind a check that was out (`keys_owed`), or one
+/// waiting behind the mobile-data question (`live_answer_job`). Inside it, still on this one.
+/// It is no guard for a key job, being shorter than a heal's round trip (40 ms with three
+/// online), so a round begun before the chain was over still answers whom it named while it
+/// lives, over the exit and over the chain's end, as `Writing::answers` says (CI soak
+/// 45269825608).
 const EXIT_GAP_PER_NAMED_MS: u64 = 20;
 const EXIT_GAP_MAX_MS: u64 = 36_000;
 /// Wraps in one frame, and the bytes that end a frame sooner: a wrap in a session this
-/// device opened is 1.9 KB until the peer answers once.
+/// device opened is 1.9 KB until the peer answers once. A reader's keys go in one frame
+/// together, at most `MAX_SENDER_KEY_STATES` of them: a reader whose keys would take a frame
+/// that has keys already past this many (`wraps_most`), or at `WRAP_MOST_BYTES` each past
+/// `WRAP_FRAME_BYTES`, goes first in the next. So no frame passes either, and one reader's
+/// keys alone always fit one (asserted below), well under `MAX_MSG_SIZE`.
 pub const WRAPS_A_FRAME: usize = 256;
 const WRAP_FRAME_BYTES: usize = 56 * 1024;
+/// The most one wrap takes of a frame, as `next_wraps` counts it: the ciphertext, and 8 bytes
+/// for its id, kind and length. The largest is a pre-key message, 1.9 KB with the Kyber
+/// ciphertext in it (`no_wrap_takes_more_of_a_frame_than_counted`).
+const WRAP_MOST_BYTES: usize = 4 * 1024;
+/// Sender-key states a reader keeps per writer and channel: libsignal's own
+/// `consts::MAX_SENDER_KEY_STATES` (v0.105.4), private to it, which
+/// `SenderKeyRecord::add_sender_key_state` in rust/protocol/src/sender_keys.rs keeps to by
+/// dropping the state least lately taken, to make room for a key it does not hold. A key it
+/// holds keeps its state; one it does not starts afresh at that key's position. What was read
+/// stays read either way, at the reader, which keeps that apart from libsignal's states, by
+/// the key each chain signs with (`group::open_once`, stores.rs "What was read"): a key a
+/// relay held back and lets go late, or hands again, opens nothing read before, under
+/// whichever id the relay names the writer by, and after a reconnect that kept the sessions
+/// (`KeptSessions`), within `READ_CHAINS` chains read since. So a hand-off, and a frame,
+/// carries one reader at most this many keys: with more, one would drop another handed with
+/// it, for nothing, and a relay's made-up ask costs five keys a reader at most. The newest chains that owe them, the oldest
+/// first and the current chain last, so it is the last a later key drops. A chain older than
+/// those is not handed, though it still owes them: posts of it they still hold may not open.
+const MAX_SENDER_KEY_STATES: usize = 5;
+// One reader's keys fit a frame alone, and a full frame fits a message with room to spare
+// for the frame's own fields (its kind, channel and count, under 16 bytes in postcard).
+const _: () = assert!(MAX_SENDER_KEY_STATES * WRAP_MOST_BYTES <= WRAP_FRAME_BYTES);
+const _: () = assert!(WRAP_FRAME_BYTES + 64 <= voipc_protocol::codec::MAX_MSG_SIZE as usize);
 /// In a browser, in a call: wraps run on the page thread that also feeds the microphone.
 pub const WRAPS_A_FRAME_BROWSER_CALL: usize = 8;
 /// People asked to open a session in one frame, and in a call, where each brings back a hello.
@@ -491,15 +526,121 @@ struct Round {
     named: HashSet<u32>,
 }
 
+/// A round of a chain that ended, kept by `Writing::end_chain` for whom it named: its message
+/// is a whole distribution message, which our sender key going does not undo. It names whom
+/// its round named, less anyone a newer live round of the chain named and anyone told of as
+/// gone (`MemberGone`), but not less one who left (`ChannelExits`): see `end_chain`.
+struct Retired {
+    /// The number of its chain (`Writing::chain`).
+    chain: u64,
+    round: Round,
+    /// When it stops: its round's life, or its chain's age as it stood at the end, if sooner.
+    until: u64,
+}
+
+impl Retired {
+    /// Whether it still owes `id` its message.
+    fn owes(&self, id: u32, now: u64) -> bool {
+        now < self.until && self.round.named.contains(&id)
+    }
+}
+
+/// What a wrap or an ask to open waiting in the queue is for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum For {
+    /// A round of the chain with this number named them: that chain's key.
+    Chain(u64),
+    /// They asked, or a hello came: whatever the channel's chains still owe them, of the
+    /// newest that do (`Writing::hand_off`).
+    Owed,
+}
+
+impl For {
+    fn covers(self, chain: u64) -> bool {
+        match self {
+            For::Chain(number) => number == chain,
+            For::Owed => true,
+        }
+    }
+}
+
+/// Wraps to make, in the order they were first owed. A reader is in it once a channel: what
+/// else is owed them there joins their place, so a frame touches only the readers it takes,
+/// and each takes in one hand-off whatever was queued for them (`next_wraps`).
+#[derive(Default)]
+struct Wraps {
+    order: VecDeque<(u32, u32)>,
+    /// By (channel, reader): each `For` once, or `Owed` alone, which covers every chain.
+    whats: HashMap<(u32, u32), Vec<For>>,
+}
+
+impl Wraps {
+    fn push(&mut self, channel_id: u32, id: u32, what: For) {
+        match self.whats.entry((channel_id, id)) {
+            std::collections::hash_map::Entry::Occupied(mut whats) => {
+                let whats = whats.get_mut();
+                if what == For::Owed {
+                    *whats = vec![For::Owed];
+                } else if !whats.contains(&what) && !whats.contains(&For::Owed) {
+                    whats.push(what);
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(whats) => {
+                whats.insert(vec![what]);
+                self.order.push_back((channel_id, id));
+            }
+        }
+    }
+
+    /// The next reader: their channel and id.
+    fn front(&self) -> Option<(u32, u32)> {
+        self.order.front().copied()
+    }
+
+    /// What the next reader waits for.
+    fn front_whats(&self) -> &[For] {
+        self.front()
+            .and_then(|key| self.whats.get(&key))
+            .map_or(&[][..], Vec::as_slice)
+    }
+
+    fn pop_front(&mut self) -> Vec<For> {
+        let key = self.order.pop_front();
+        key.and_then(|key| self.whats.remove(&key))
+            .unwrap_or_default()
+    }
+
+    fn forget_channel(&mut self, channel_id: u32) {
+        self.order.retain(|(channel, _)| *channel != channel_id);
+        self.whats.retain(|(channel, _), _| *channel != channel_id);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.order.is_empty()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.order.len()
+    }
+}
+
 /// Our writing in one text channel.
 #[derive(Default)]
 struct Writing {
+    /// This chain's number, one up at each end: which chain's key a queued hand-off is for.
+    chain: u64,
     /// When this chain started. None: no chain, the next post starts one.
     started: Option<u64>,
     /// Everyone this chain has been named to: its readers, by our own count.
     named: HashSet<u32>,
     rounds: Vec<Round>,
-    /// Someone it reached is out. It ends at the next post `exit_gap` allows.
+    /// Rounds of chains that ended here, still owed to whom they named (`end_chain`).
+    retired: Vec<Retired>,
+    /// Someone it reached is out. With no chain up, the chain that the check or the question
+    /// then out starts takes this on; a post that starts one itself clears it. It ends a
+    /// chain once `exit_gap` allows, at the next post, at the answer to a check already out,
+    /// or at a yes to the question.
     exited: bool,
     /// A check is out: since when, and whether it asked for everyone.
     check_out: Option<(u64, bool)>,
@@ -517,8 +658,11 @@ struct Writing {
 }
 
 impl Writing {
-    /// A chain past its age, or an exit's gap, or none: it answers nobody, and the next
-    /// post starts a new one.
+    /// Past its age or an exit's gap, or no chain: nothing more is sealed on it. A post starts
+    /// a new one; an answer that finds a chain so, a check's (`keys_owed`) or a yes to the
+    /// question (`live_answer_job`), ends it and asks for everyone again. Past its age, or
+    /// none, this chain answers nobody; past an exit's gap, see `chain_answers`. Rounds of a
+    /// chain that ended before are not this chain's (`answers`).
     fn over(&self, now: u64) -> bool {
         let Some(started) = self.started else {
             return true;
@@ -528,7 +672,107 @@ impl Writing {
             || (self.exited && age >= exit_gap(self.named.len()))
     }
 
-    fn end_chain(&mut self) {
+    /// Whether this chain still hands `id` its key. Anyone it named, while it is not over;
+    /// past its age, or with no chain, nobody. Past an exit's gap alone, only whom a round
+    /// still live named, from that round's position and never the current one: the exit's
+    /// timer can land between a post and the heal of its round (CI soak 45269825608). Such a
+    /// round began before the chain was over, before the exit or inside its gap, as every
+    /// post on this chain was sealed then: whatever finds a chain over ends it (`over`). The
+    /// one who left gets by it no more than being named gave them: a round names them only
+    /// if they were owed its key when it began, before the chain was over, and nothing sealed
+    /// once it was over is on this chain. What was sealed on it after the exit, inside its
+    /// gap, is open to whoever holds it, them too. The honest relay passes a leaver no ask,
+    /// hello or wrap; through one that does, a live round that named them still hands them
+    /// its message, which they may never have got, and with it the posts inside the gap, until
+    /// the round's life ends, past the chain's end too (`end_chain`).
+    fn chain_answers(&self, id: u32, now: u64) -> bool {
+        let Some(started) = self.started else {
+            return false;
+        };
+        if !self.named.contains(&id) {
+            return false;
+        }
+        if !self.over(now) {
+            return true;
+        }
+        now.saturating_sub(started) < chain_age_limit(self.named.len())
+            && self.round_for(id, now).is_some()
+    }
+
+    /// Whether a hand-off to `id` for `what` may still go: a key, an ask to open, a wrap
+    /// after a hello. That is, whether `hand_off` has a key for it: from this chain
+    /// (`chain_answers`), or from a round of a chain that ended here and still owes them
+    /// (`end_chain`), if that chain is among the newest that owe them. Nobody a round did not
+    /// name gets a key from it, and nothing sealed after a chain ended is on it.
+    fn answers(&self, id: u32, what: For, now: u64) -> bool {
+        !self.hand_off(id, &[what], now).is_empty()
+    }
+
+    /// The keys a hand-off to `id` for any of `whats` carries now, one a chain, the oldest
+    /// chain first by chain number: a round's own message, or None for this chain's current
+    /// position, which only a chain not over gives. Of the chains that owe them, the newest
+    /// `MAX_SENDER_KEY_STATES` alone, and of those whichever `whats` covers: so this chain,
+    /// when it owes them, is always the last, and nothing goes for an older chain past those,
+    /// not even for its own `For::Chain`, as its key could drop one of the newest at them.
+    fn hand_off(
+        &self,
+        id: u32,
+        whats: &[For],
+        now: u64,
+    ) -> Vec<(u64, Option<&Zeroizing<Vec<u8>>>)> {
+        let mut keys: Vec<(u64, Option<&Zeroizing<Vec<u8>>>)> = self
+            .retired
+            .iter()
+            .filter(|r| r.owes(id, now))
+            .map(|r| (r.chain, Some(&r.round.message)))
+            .collect();
+        if self.chain_answers(id, now) {
+            let round = self.round_for(id, now).map(|round| &round.message);
+            keys.push((self.chain, round));
+        }
+        // `retired` goes up by chain, one round a reader a chain (`end_chain`)
+        let older = keys.len().saturating_sub(MAX_SENDER_KEY_STATES);
+        keys.drain(..older);
+        keys.retain(|(chain, _)| whats.iter().any(|what| what.covers(*chain)));
+        keys
+    }
+
+    /// The newest round of this chain still live that named `id`.
+    fn round_for(&self, id: u32, now: u64) -> Option<&Round> {
+        self.rounds.iter().rev().find(|round| {
+            round.named.contains(&id) && now.saturating_sub(round.started) < ROUND_LIFE_MS
+        })
+    }
+
+    /// The chain ends: nothing more is sealed on it, nor handed out at its current position.
+    /// Its rounds still live go on answering whom each named, from its own message, until
+    /// that round's life ends, and never past this chain's age as it stands now: a reader
+    /// whose heal or open for a post before the end is in flight still gets that post, and
+    /// the next chain's key too, while it is among the newest chains that owe them
+    /// (`hand_off`). Each reader only from the round `round_for` gives them, so one round a
+    /// reader a chain. One who left stays on them, as on this chain (`chain_answers`): a
+    /// relay passing what an honest one would not can still hand them a round's message, and
+    /// with it what went on this chain inside the exit's gap.
+    fn end_chain(&mut self, now: u64) {
+        if let Some(started) = self.started {
+            let limit = started.saturating_add(chain_age_limit(self.named.len()));
+            let mut seen = HashSet::new();
+            for mut round in std::mem::take(&mut self.rounds).into_iter().rev() {
+                let until = round.started.saturating_add(ROUND_LIFE_MS).min(limit);
+                if now >= until {
+                    continue;
+                }
+                round.named.retain(|id| seen.insert(*id));
+                if !round.named.is_empty() {
+                    self.retired.push(Retired {
+                        chain: self.chain,
+                        round,
+                        until,
+                    });
+                }
+            }
+        }
+        self.chain += 1;
         self.started = None;
         self.named.clear();
         self.rounds.clear();
@@ -606,9 +850,12 @@ struct Live {
     moved: HashMap<u32, u64>,
 
     writing: HashMap<u32, Writing>,
-    /// Wraps to make, and people to ask to open, in the order they were owed.
-    wraps: VecDeque<(u32, u32)>,
-    opens: VecDeque<(u32, u32)>,
+    /// Wraps to make, by channel and reader, in the order they were first owed: a reader's
+    /// in a channel go as one hand-off, in the first frame that takes them, however many were
+    /// queued (`Wraps`, `next_wraps`). And people to ask to open, in the order they were owed:
+    /// by channel, reader, and what for.
+    wraps: Wraps,
+    opens: VecDeque<(u32, u32, For)>,
     /// Asked to open, no hello yet. Out of how many, when.
     awaiting: HashSet<u32>,
     open_frame: usize,
@@ -673,16 +920,23 @@ impl ChannelKeying {
         }
     }
 
-    /// Takes over what an earlier connection of this account kept (`live_keep_sessions`).
-    pub fn live_adopt_kept(&mut self, kept: KeptSessions) {
+    /// Takes over what an earlier connection of this account kept (`live_keep_sessions`):
+    /// its sessions, and into `stores` what it read, so a key of then the relay held back
+    /// opens nothing read then (`group::open_once`).
+    pub fn live_adopt_kept(&mut self, stores: &mut SignalStores, mut kept: KeptSessions) {
+        stores
+            .sender_key
+            .adopt_reads(std::mem::take(&mut kept.reads));
         self.live.kept = kept;
     }
 
     /// What this connection hands to the next: every session with an account, by account,
-    /// over what it took over and did not use. Called before the stores go. A guest passes
-    /// nothing on, and calls nothing.
+    /// over what it took over and did not use, and what was read here, its own included.
+    /// Called before the stores go. A guest passes nothing on, and calls nothing.
     pub fn live_keep_sessions(&mut self, stores: &SignalStores, now: u64) -> KeptSessions {
         let mut kept = std::mem::take(&mut self.live.kept);
+        // A copy: a frame the host still feeds this connection before the end reads by it
+        kept.reads = stores.sender_key.kept_reads();
         // Oldest id first: a peer who reconnected here is the same account twice, and the
         // later session is the one both ends hold.
         let mut sessions: Vec<(u32, &[u8])> = stores.session.by_user().collect();
@@ -868,9 +1122,10 @@ impl ChannelKeying {
             return Ok(out);
         }
         if w.over(now) {
-            // Forgotten here, not when the answer comes: from now on it answers nobody
+            // Forgotten here, not when the answer comes: nothing more is sealed on it, nor
+            // handed out at its position; its live rounds still answer whom they named
             group::forget_own_sender_key(stores, own, channel_id);
-            w.end_chain();
+            w.end_chain(now);
             w.check_out = Some((now, true));
             w.waiting.push_back(payload);
             out.send.push(ClientMessage::KeyCheck {
@@ -907,11 +1162,13 @@ impl ChannelKeying {
         };
         // What was true when it was asked may not be now (R3 F13). A chain past its age while
         // the question was up answers nobody: sealed on it the posts would open for none of
-        // those just told they can read them. A check for everyone starts again, as a post on
-        // an over chain does. (Someone told of as gone meanwhile is off `asking` already.)
+        // those just told they can read them. Past an exit's gap, for the one who left. A
+        // check for everyone starts again, as a post on an over chain does, and the chain's
+        // live rounds still answer whom they named (`end_chain`). (Someone told of as gone
+        // meanwhile is off `asking` already.)
         if go && w.started.is_some() && w.over(now) {
             group::forget_own_sender_key(stores, stores.own_user_id, channel_id);
-            w.end_chain();
+            w.end_chain(now);
             w.check_out = Some((now, true));
             out.send.push(ClientMessage::KeyCheck {
                 channel_id,
@@ -1040,13 +1297,18 @@ impl ChannelKeying {
                 user_id,
             } => {
                 // Whatever the relay says about keys, this chain ends: a person told of as
-                // gone and seated again without a word is named again that way.
+                // gone and seated again without a word is named again that way. Nor does a
+                // round of a chain that ended answer them.
                 if let Some(w) = self.live.writing.get_mut(channel_id) {
                     w.exited = true;
                     w.named.remove(user_id);
                     for round in &mut w.rounds {
                         round.named.remove(user_id);
                     }
+                    w.retired.retain_mut(|r| {
+                        r.round.named.remove(user_id);
+                        !r.round.named.is_empty()
+                    });
                     // Nor named by a yes to a question asked before they went (R3 F13)
                     if let Some(asked) = w.asking.as_mut() {
                         asked.retain(|id| id != user_id);
@@ -1202,6 +1464,23 @@ impl ChannelKeying {
         }
         let owed = std::mem::take(&mut w.owed);
         w.check_out = None;
+        // The chain went over while the check was out (CI soak 45269825608): past its age,
+        // or past an exit's gap, the exit having come while the check was out or before it,
+        // inside the gap. Sealed on this chain what waits would go on one the one who left
+        // holds, or past its age, open for nobody. A check for everyone starts again, as a
+        // post on an over chain does, and what waits stays for its answer, which finds no
+        // chain and starts one: so this asks once. The chain's live rounds still answer whom
+        // they named (`end_chain`), so a heal in flight for a post before still comes.
+        if w.started.is_some() && w.over(now) {
+            group::forget_own_sender_key(stores, own, channel_id);
+            w.end_chain(now);
+            w.check_out = Some((now, true));
+            out.send.push(ClientMessage::KeyCheck {
+                channel_id,
+                restart: true,
+            });
+            return;
+        }
         let gated = self.live.gated.contains(&channel_id);
         let (mut named, mut unlisted, mut guests) = (Vec::with_capacity(owed.len()), false, false);
         for id in owed {
@@ -1297,6 +1576,7 @@ impl ChannelKeying {
                 .push(("nobody-here", json!({ "channel_id": channel_id })));
         }
         w.started.get_or_insert(now);
+        let chain = w.chain;
         if !named.is_empty() {
             w.named.extend(named.iter().copied());
             w.rounds.push(Round {
@@ -1323,13 +1603,17 @@ impl ChannelKeying {
             let mut sorted = named;
             sorted.sort_unstable();
             // By whether a session is there, then by id, and never by who was mentioned,
-            // which would show the relay who was.
+            // which would show the relay who was. This chain's key alone: what one that
+            // ended still owes them is out already, or queued as its own, which goes with
+            // this in one hand-off; a hello or an ask brings what the newest chains owe.
             for id in sorted {
                 let account = self.live.people.get(&id).copied().flatten();
                 if self.find_session(stores, id, account, now) {
-                    self.live.wraps.push_back((channel_id, id));
+                    self.live.wraps.push(channel_id, id, For::Chain(chain));
                 } else {
-                    self.live.opens.push_back((channel_id, id));
+                    self.live
+                        .opens
+                        .push_back((channel_id, id, For::Chain(chain)));
                 }
             }
             self.live.renew_due = true;
@@ -1417,7 +1701,10 @@ impl ChannelKeying {
     }
 
     /// A reader opened a session. It names nobody: a wrap goes only for a chain that has
-    /// already named them, and only while that chain still answers.
+    /// already named them, and only while that chain still answers them: past an exit's gap,
+    /// or once it ended, from a live round that named them (`Writing::answers`). Which ask
+    /// it answers it does not say, so it gets them whatever is owed, in one session, of the
+    /// newest chains that owe them (`Writing::hand_off`).
     fn session_hello(
         &mut self,
         stores: &mut SignalStores,
@@ -1443,8 +1730,8 @@ impl ChannelKeying {
         out.made.push(from);
         let Live { writing, wraps, .. } = &mut self.live;
         for (channel_id, w) in writing.iter() {
-            if w.named.contains(&from) && !w.over(now) {
-                wraps.push_back((*channel_id, from));
+            if w.answers(from, For::Owed, now) {
+                wraps.push(*channel_id, from, For::Owed);
                 out.work = true;
             }
         }
@@ -1512,8 +1799,12 @@ impl ChannelKeying {
         });
     }
 
-    /// A reader lacks our key here. From a round naming them, or else at the current
-    /// position; a stale chain answers nothing, and someone it never named gets nothing.
+    /// A reader lacks our key here, of which chain it does not say: whatever is owed them, of
+    /// the newest chains that owe them (`Writing::hand_off`).
+    /// From a round naming them, or else at the current position; past an exit's gap only
+    /// from a live round that named them, which began before the chain was over; and from a
+    /// live round of a chain that ended, that named them. A chain past its age answers
+    /// nothing, and someone it never named gets nothing (`Writing::answers`).
     fn key_wanted(
         &mut self,
         stores: &mut SignalStores,
@@ -1526,8 +1817,7 @@ impl ChannelKeying {
         let Some(w) = self.live.writing.get(&channel_id) else {
             return;
         };
-        if w.over(now) || !w.named.contains(&from) || !self.live.wanted_bucket.take(64.0, 2.0, now)
-        {
+        if !w.answers(from, For::Owed, now) || !self.live.wanted_bucket.take(64.0, 2.0, now) {
             return;
         }
         out.work = true;
@@ -1545,14 +1835,14 @@ impl ChannelKeying {
                 self.live.moved.remove(&from);
                 out.gone.push(from);
             }
-            self.live.opens.push_back((channel_id, from));
+            self.live.opens.push_back((channel_id, from, For::Owed));
             return;
         }
         let account = self.live.people.get(&from).copied().flatten();
         if self.find_session(stores, from, account, now) {
-            self.live.wraps.push_back((channel_id, from));
+            self.live.wraps.push(channel_id, from, For::Owed);
         } else {
-            self.live.opens.push_back((channel_id, from));
+            self.live.opens.push_back((channel_id, from, For::Owed));
         }
     }
 
@@ -1713,6 +2003,7 @@ impl ChannelKeying {
         for (channel_id, w) in &mut self.live.writing {
             w.rounds
                 .retain(|round| now.saturating_sub(round.started) < ROUND_LIFE_MS);
+            w.retired.retain(|r| now < r.until);
             if w.check_out
                 .is_some_and(|(at, _)| now.saturating_sub(at) >= CHECK_WAIT_MS)
             {
@@ -1832,6 +2123,12 @@ impl ChannelKeying {
         None
     }
 
+    /// A frame of wraps, all for one channel. Everything a reader waits for there goes as one
+    /// hand-off, whatever queued it, in the first frame they go in: each chain's key once,
+    /// the newest few, the oldest first and the current chain last (`Writing::hand_off`).
+    /// A reader's keys go together, so a frame ends before a reader whose keys would take it
+    /// past `most`, or past `WRAP_FRAME_BYTES` at the most a wrap can take. A frame touches
+    /// only the readers it takes, and the one it leaves first for the next (`Wraps`).
     fn next_wraps(
         &mut self,
         stores: &mut SignalStores,
@@ -1839,52 +2136,65 @@ impl ChannelKeying {
         most: usize,
     ) -> Option<ClientMessage> {
         let own = stores.own_user_id;
-        while let Some(&(channel_id, _)) = self.live.wraps.front() {
+        while let Some((channel_id, _)) = self.live.wraps.front() {
             let mut keys = Vec::new();
             let mut bytes = 0;
             // Made once per frame, and only if somebody needs it
             let mut current: Option<Zeroizing<Vec<u8>>> = None;
-            while let Some(&(channel, id)) = self.live.wraps.front() {
+            while let Some((channel, id)) = self.live.wraps.front() {
                 if channel != channel_id || keys.len() >= most || bytes >= WRAP_FRAME_BYTES {
                     break;
                 }
-                self.live.wraps.pop_front();
-                let Some(w) = self.live.writing.get(&channel) else {
-                    continue;
+                let owed: Vec<Option<Zeroizing<Vec<u8>>>> = match self.live.writing.get(&channel) {
+                    Some(w) => w
+                        .hand_off(id, self.live.wraps.front_whats(), now)
+                        .into_iter()
+                        .map(|(_, message)| message.cloned())
+                        .collect(),
+                    None => Vec::new(),
                 };
-                if w.over(now) || !w.named.contains(&id) {
-                    continue;
+                // A reader's keys go together: first in the next frame, if not all fit this one
+                if !keys.is_empty()
+                    && (keys.len() + owed.len() > most
+                        || bytes + owed.len() * WRAP_MOST_BYTES > WRAP_FRAME_BYTES)
+                {
+                    break;
                 }
-                let round = w.rounds.iter().rev().find(|round| {
-                    round.named.contains(&id) && now.saturating_sub(round.started) < ROUND_LIFE_MS
-                });
-                let message = match round {
-                    Some(round) => round.message.clone(),
-                    None => {
-                        if current.is_none() {
-                            current =
-                                ready(group::create_distribution_message(stores, own, channel_id))
-                                    .map(Zeroizing::new)
-                                    .ok();
+                let whats = self.live.wraps.pop_front();
+                for message in owed {
+                    let message = match message {
+                        Some(message) => message,
+                        None => {
+                            if current.is_none() {
+                                current = ready(group::create_distribution_message(
+                                    stores, own, channel_id,
+                                ))
+                                .map(Zeroizing::new)
+                                .ok();
+                            }
+                            match &current {
+                                Some(message) => message.clone(),
+                                None => continue,
+                            }
                         }
-                        match &current {
-                            Some(message) => message.clone(),
-                            None => continue,
+                    };
+                    match ready(session::encrypt_message(stores, id, &message)) {
+                        Ok((ciphertext, message_type)) => {
+                            bytes += ciphertext.len() + 8;
+                            keys.push((id, message_type, ciphertext));
                         }
-                    }
-                };
-                match ready(session::encrypt_message(stores, id, &message)) {
-                    Ok((ciphertext, message_type)) => {
-                        bytes += ciphertext.len() + 8;
-                        keys.push((id, message_type, ciphertext));
-                    }
-                    Err(e) => {
-                        // A record that will not do: they open a new one
-                        tracing::info!(id, channel_id, "could not wrap a key: {e}");
-                        if stores.session.take(id).is_some() {
-                            self.live.moved.remove(&id);
+                        Err(e) => {
+                            // A record that will not do: they open a new one, whose hello
+                            // brings back what is owed them
+                            tracing::info!(id, channel_id, "could not wrap a key: {e}");
+                            if stores.session.take(id).is_some() {
+                                self.live.moved.remove(&id);
+                            }
+                            for what in &whats {
+                                self.live.opens.push_back((channel_id, id, *what));
+                            }
+                            break;
                         }
-                        self.live.opens.push_back((channel_id, id));
                     }
                 }
             }
@@ -1908,24 +2218,27 @@ impl ChannelKeying {
         } else {
             OPENS_A_FRAME
         };
-        while let Some(&(channel_id, _)) = self.live.opens.front() {
+        while let Some(&(channel_id, ..)) = self.live.opens.front() {
             let mut targets = Vec::new();
-            while let Some(&(channel, id)) = self.live.opens.front() {
+            // Once a frame each, whatever for: the one hello it brings answers them all, and
+            // each time the relay hands out a one-time key of ours
+            let mut asked = HashSet::new();
+            while let Some(&(channel, id, what)) = self.live.opens.front() {
                 if channel != channel_id || targets.len() >= most {
                     break;
                 }
                 self.live.opens.pop_front();
-                let named = self
+                let owed = self
                     .live
                     .writing
                     .get(&channel)
-                    .is_some_and(|w| !w.over(now) && w.named.contains(&id));
-                if named {
+                    .is_some_and(|w| w.answers(id, what, now));
+                if owed && asked.insert(id) {
                     targets.push(id);
                 }
             }
             if !targets.is_empty() {
-                self.live.awaiting = targets.iter().copied().collect();
+                self.live.awaiting = asked;
                 self.live.open_frame = targets.len();
                 self.live.opens_sent_at = now;
                 return Some(ClientMessage::OpenSessions {
@@ -2183,9 +2496,15 @@ struct KeptSession {
 /// ids change, the identity keys a session's MAC binds do not. Both apps up, and a writer's
 /// return costs 176 B a reader, not a new session. A reader that restarted fails the
 /// wrap, and heals by one reset. Never on disk, wiped at sign-out, none for a guest.
+///
+/// What was read goes with them (stores.rs, "What was read"): a wrap a relay made within a
+/// round and held back opens by a kept session for as long as that lives, a week, and with
+/// it a chain read before, installed afresh; what this connection read refuses its posts on
+/// the next one too. Both apps move this whole, as they move the sessions.
 #[derive(Default)]
 pub struct KeptSessions {
     rows: HashMap<[u8; 16], KeptSession>,
+    reads: crate::stores::Reads,
 }
 
 impl KeptSessions {
@@ -2225,10 +2544,12 @@ impl KeptSessions {
         }
     }
 
+    /// Sessions kept, what was read aside.
     pub fn len(&self) -> usize {
         self.rows.len()
     }
 
+    /// No session kept, what was read aside.
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }
@@ -2719,7 +3040,7 @@ mod tests {
                 let kept = old.k.live_keep_sessions(&old.stores, now);
                 let mut d = Device::new(new, old.account, old.identity);
                 if keep {
-                    d.k.live_adopt_kept(kept);
+                    d.k.live_adopt_kept(&mut d.stores, kept);
                 }
                 d.k.live_start(now);
                 self.devices.insert(new, d);
@@ -3124,6 +3445,8 @@ mod tests {
             assert_eq!(net.devices[&2].wrote(is_wanted), 0);
         }
 
+        /// Past an exit a live round still answers whom it named (the tests after
+        /// `member_gone_ends_the_chain_and_takes_them_off_it`); past that round, nobody.
         #[test]
         fn a_stale_chain_answers_no_hello_and_no_key_wanted() {
             let mut net = Net::with(&[1, 2, 3]);
@@ -3131,9 +3454,13 @@ mod tests {
             net.post(1, "hi");
             net.pump();
             net.hold_hellos = false;
-            // Someone left, and the gap has passed: the old key goes to nobody now
+            // A chain with enough readers to outlive the round that named 2
+            let w = net.devices.get_mut(&1).unwrap().k.live.writing.get_mut(&CH);
+            w.unwrap().named.extend(100..200);
+            // Someone left, and the gap and the round have passed: the old key goes to
+            // nobody now
             net.tell(1, ServerMessage::ChannelExits { channels: vec![CH] });
-            net.now += exit_gap(2);
+            net.now += ROUND_LIFE_MS;
             net.pump();
             let before = net.devices[&1].wrote(is_wraps);
             net.tell(
@@ -3304,6 +3631,1534 @@ mod tests {
             net.post(1, "next");
             let w = &net.devices[&1].k.live.writing[&CH];
             assert!(w.started.is_none(), "a new chain");
+        }
+
+        /// Hand-offs `from` sent `to`: wraps for them, and asks to open.
+        fn handed(net: &Net, from: u32, to: u32) -> usize {
+            net.devices[&from]
+                .sent
+                .iter()
+                .map(|m| match m {
+                    ClientMessage::DistributeSenderKeys { keys, .. } => {
+                        keys.iter().filter(|(id, ..)| *id == to).count()
+                    }
+                    ClientMessage::OpenSessions { targets, .. } => {
+                        targets.iter().filter(|id| **id == to).count()
+                    }
+                    _ => 0,
+                })
+                .sum()
+        }
+
+        /// The relay sends exits on a one-second timer, so one can land after a post went on
+        /// the old chain and before the heal of its round is done. CI soak 45269825608,
+        /// copy 2: the wrap went over a record moved from the reader's old id, their reset
+        /// came after the exit, and the post never opened.
+        #[test]
+        fn a_reset_that_comes_after_an_exit_still_heals_the_post_before_it() {
+            let mut net = Net::with(&[1, 2, 3]);
+            net.post(1, "a");
+            net.pump();
+            net.now += 1_000;
+            // Back under a new id, nothing kept: the writer's record moves to it, stale
+            net.reconnect(3, 13, false);
+            net.hold_wraps = true;
+            net.post(1, "b");
+            net.pump();
+            assert_eq!(net.devices[&2].shown(), vec!["a", "b"]);
+            // The exit lands after the wrap went and before the reset is back
+            net.tell(1, ServerMessage::ChannelExits { channels: vec![CH] });
+            net.release_wraps();
+            net.pump();
+            let reader = &net.devices[&13];
+            assert!(
+                reader
+                    .sent
+                    .iter()
+                    .any(|m| matches!(m, ClientMessage::KeyWanted { reset: true, .. })),
+                "the stale wrap did not open: a reset"
+            );
+            assert_eq!(reader.shown(), vec!["b"]);
+        }
+
+        /// CI soak 45269825608, copy 4: the exit came after the answer named a new reader
+        /// and before the open for them was pulled.
+        #[test]
+        fn an_exit_before_the_hand_off_still_opens_for_whom_the_round_named() {
+            let mut net = Net::with(&[1, 2, 3]);
+            net.post(1, "a");
+            net.pump();
+            net.now += 1_000;
+            net.add(4, Some([4; 16]));
+            net.list_everyone();
+            net.post(1, "b");
+            // The answer, alone: the round names 4, and nothing is pulled yet
+            let now = net.now;
+            let d = net.devices.get_mut(&1).unwrap();
+            let owed = d.inbox.pop_front().unwrap();
+            assert!(matches!(owed, ServerMessage::KeysOwed { .. }), "{owed:?}");
+            let out = d.k.live_frame(&mut d.stores, 0, &owed, now);
+            net.apply(1, out);
+            let w = &net.devices[&1].k.live.writing[&CH];
+            assert!(w.rounds.last().unwrap().named.contains(&4));
+            assert_eq!(handed(&net, 1, 4), 0);
+            net.tell(1, ServerMessage::ChannelExits { channels: vec![CH] });
+            net.pump();
+            assert!(handed(&net, 1, 4) >= 1, "an open or a wrap for 4");
+            assert_eq!(net.devices[&4].shown(), vec!["b"]);
+            assert_eq!(net.devices[&2].shown(), vec!["a", "b"]);
+        }
+
+        /// The control: an exit before the post. It goes on a new chain, which heals as any.
+        #[test]
+        fn an_exit_before_the_post_starts_a_new_chain_its_readers_read() {
+            let mut net = Net::with(&[1, 2, 3]);
+            net.post(1, "a");
+            net.pump();
+            net.now += 1_000;
+            net.reconnect(3, 13, false);
+            net.tell(1, ServerMessage::ChannelExits { channels: vec![CH] });
+            net.pump();
+            net.post(1, "b");
+            assert!(matches!(
+                net.devices[&1].sent.last(),
+                Some(ClientMessage::KeyCheck { restart: true, .. })
+            ));
+            net.pump();
+            assert_eq!(net.devices[&13].shown(), vec!["b"]);
+            assert_eq!(net.devices[&2].shown(), vec!["a", "b"]);
+            assert_eq!(net.devices[&1].k.live.writing[&CH].started, Some(net.now));
+        }
+
+        /// After an exit a chain answers nobody its live rounds did not name, at no position,
+        /// and the one who left is named by nothing that comes after.
+        #[test]
+        fn after_an_exit_whom_no_live_round_named_gets_nothing() {
+            let mut net = Net::with(&[1, 2, 3, 4]);
+            net.post(1, "a");
+            net.pump();
+            // A chain with enough readers to outlive the round that named 2, 3 and 4
+            let w = net.devices.get_mut(&1).unwrap().k.live.writing.get_mut(&CH);
+            w.unwrap().named.extend(100..200);
+            net.now += ROUND_LIFE_MS;
+            net.add(5, Some([5; 16]));
+            net.list_everyone();
+            net.post(1, "b");
+            net.pump();
+            assert_eq!(net.devices[&5].shown(), vec!["b"]);
+            let rounds = &net.devices[&1].k.live.writing[&CH].rounds;
+            assert!(!rounds.last().unwrap().named.contains(&2));
+            // Before the exit, 2 would get the key at the current position
+            let want = |from| ServerMessage::KeyWanted {
+                channel_id: CH,
+                from,
+                reset: false,
+            };
+            let before = handed(&net, 1, 2);
+            net.tell(1, want(2));
+            net.pump();
+            assert_eq!(handed(&net, 1, 2), before + 1, "the control");
+
+            // 4 leaves: the relay names them no more
+            net.leaves_out = vec![4];
+            net.tell(1, ServerMessage::ChannelExits { channels: vec![CH] });
+            net.pump();
+            let (to_2, to_4) = (handed(&net, 1, 2), handed(&net, 1, 4));
+            net.tell(1, want(2));
+            net.tell(
+                1,
+                ServerMessage::KeyWanted {
+                    channel_id: CH,
+                    from: 2,
+                    reset: true,
+                },
+            );
+            net.tell(1, want(4));
+            net.pump();
+            assert_eq!(handed(&net, 1, 2), to_2, "no current position past an exit");
+            assert_eq!(handed(&net, 1, 4), to_4);
+
+            net.post(1, "c");
+            net.pump();
+            for id in [2, 3, 5] {
+                assert_eq!(net.devices[&id].shown().last().unwrap(), "c", "{id}");
+            }
+            assert!(!net.devices[&1].k.live.writing[&CH].named.contains(&4));
+            net.tell(1, want(4));
+            net.pump();
+            assert_eq!(handed(&net, 1, 4), to_4, "the leaver");
+            assert!(!net.devices[&4].shown().contains(&"c".to_string()));
+        }
+
+        /// An exit while a check is out, before its answer: what waits behind it, written
+        /// before the exit came or after, goes on a new chain, so the one who left, who holds
+        /// the old one, reads none of it. The old chain's round that named them still answers
+        /// them, with what they hold.
+        #[test]
+        fn an_exit_while_a_check_is_out_puts_what_waits_on_a_new_chain() {
+            let mut net = Net::with(&[1, 2, 3]);
+            net.post(1, "a");
+            net.pump();
+            net.now += 1_000;
+            net.add(4, Some([4; 16]));
+            net.list_everyone();
+            let (old, to_3, wraps_3) = (
+                net.devices[&1].k.live.writing[&CH].started,
+                handed(&net, 1, 3),
+                wraps_to(&net, 1, 3),
+            );
+            // The check for "b" is out; then 3 leaves, and the exit comes before the answer
+            net.post(1, "b");
+            net.leaves_out = vec![3];
+            let now = net.now;
+            let d = net.devices.get_mut(&1).unwrap();
+            let exits = ServerMessage::ChannelExits { channels: vec![CH] };
+            let out = d.k.live_frame(&mut d.stores, 0, &exits, now);
+            net.apply(1, out);
+            net.post(1, "c");
+            net.pump();
+            let restarts = net.devices[&1]
+                .sent
+                .iter()
+                .filter(|m| matches!(m, ClientMessage::KeyCheck { restart: true, .. }))
+                .count();
+            assert_eq!(restarts, 2, "a check for everyone again");
+            let w = &net.devices[&1].k.live.writing[&CH];
+            assert_ne!(w.started, old, "a new chain");
+            assert!(!w.named.contains(&3));
+            assert_eq!(net.devices[&4].shown(), vec!["b", "c"]);
+            assert_eq!(net.devices[&2].shown(), vec!["a", "b", "c"]);
+
+            // "b" and "c" forced on the one who left do not open, nor when they ask
+            let posts: Vec<Vec<u8>> = net.devices[&1]
+                .sent
+                .iter()
+                .filter_map(|m| match m {
+                    ClientMessage::SendEncryptedChannelMessage { ciphertext, .. } => {
+                        Some(ciphertext.clone())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(posts.len(), 3);
+            raw_post(&mut net, 3, 1, posts[1].clone());
+            raw_post(&mut net, 3, 1, posts[2].clone());
+            net.pump();
+            net.now += KEY_WANTED_AFTER_MS;
+            net.tick();
+            assert_eq!(net.devices[&3].shown(), vec!["a"]);
+            assert_eq!(net.devices[&3].wrote(is_wanted), 1, "it asked");
+            // The chain that ended still answers whom its first round named, with that round's
+            // own message, which they hold from there already; the new chain, nothing
+            assert_eq!(handed(&net, 1, 3), to_3 + 1, "the first post's round again");
+            assert_eq!(
+                wraps_to(&net, 1, 3),
+                wraps_3 + 1,
+                "a wrap, in the session they have"
+            );
+        }
+
+        /// A chain past its age answers nobody, even whom a round still live named: the age
+        /// is what bounds someone gone offline, and a stolen chain key.
+        #[test]
+        fn a_chain_past_its_age_answers_nobody_from_a_live_round() {
+            let mut net = Net::with(&[1, 2]);
+            net.post(1, "a");
+            net.pump();
+            net.now = 50_000;
+            net.add(3, Some([3; 16]));
+            net.list_everyone();
+            net.post(1, "b");
+            net.pump();
+            assert_eq!(net.devices[&3].shown(), vec!["b"]);
+            let want = ServerMessage::KeyWanted {
+                channel_id: CH,
+                from: 3,
+                reset: false,
+            };
+            // The control: under its age, the round answers
+            net.now = 59_999;
+            let before = handed(&net, 1, 3);
+            net.tell(1, want.clone());
+            net.pump();
+            assert_eq!(handed(&net, 1, 3), before + 1, "the control");
+
+            // Past its age, with no exit, while the round that named 3 is 11 s old
+            net.now = 61_000;
+            let w = &net.devices[&1].k.live.writing[&CH];
+            assert!(!w.exited && w.over(net.now));
+            assert!(w.round_for(3, net.now).is_some());
+            let before = handed(&net, 1, 3);
+            net.tell(1, want);
+            net.pump();
+            assert_eq!(handed(&net, 1, 3), before, "past its age");
+        }
+
+        /// 2a's other half: a chain that passes its age while a check is out, with no exit.
+        /// What waits goes on a new chain, which the one its answer named reads.
+        #[test]
+        fn a_chain_past_its_age_while_a_check_is_out_puts_what_waits_on_a_new_chain() {
+            let mut net = Net::with(&[1, 2]);
+            net.post(1, "a");
+            net.pump();
+            net.now = chain_age_limit(1) - 1;
+            net.add(3, Some([3; 16]));
+            net.list_everyone();
+            // The check goes out under the age, and its answer comes past it
+            net.post(1, "b");
+            net.now = chain_age_limit(1) + 10;
+            net.pump();
+            net.now += KEY_WANTED_AFTER_MS;
+            net.tick();
+            assert_eq!(restarts(&net, 1), 2, "a check for everyone again");
+            assert_eq!(net.devices[&3].shown(), vec!["b"]);
+            assert_eq!(net.devices[&2].shown(), vec!["a", "b"]);
+        }
+
+        // ── A chain that ended ──────────────────────────────────────────────
+
+        /// The exit, as the relay's timer sends it: to the writer at once, ahead of whatever
+        /// waits in its inbox.
+        fn exit_lands(net: &mut Net, at: u32) {
+            let now = net.now;
+            let d = net.devices.get_mut(&at).unwrap();
+            let exits = ServerMessage::ChannelExits { channels: vec![CH] };
+            let out = d.k.live_frame(&mut d.stores, 0, &exits, now);
+            net.apply(at, out);
+        }
+
+        /// The answer to the check out, alone: what it starts is queued, and nothing pulled.
+        fn answer_alone(net: &mut Net, at: u32) {
+            let now = net.now;
+            let d = net.devices.get_mut(&at).unwrap();
+            let owed = d.inbox.pop_front().unwrap();
+            assert!(matches!(owed, ServerMessage::KeysOwed { .. }), "{owed:?}");
+            let out = d.k.live_frame(&mut d.stores, 0, &owed, now);
+            net.apply(at, out);
+        }
+
+        fn restarts(net: &Net, id: u32) -> usize {
+            net.devices[&id]
+                .sent
+                .iter()
+                .filter(|m| matches!(m, ClientMessage::KeyCheck { restart: true, .. }))
+                .count()
+        }
+
+        /// Wraps `from` sent `to`.
+        fn wraps_to(net: &Net, from: u32, to: u32) -> usize {
+            net.devices[&from]
+                .sent
+                .iter()
+                .map(|m| match m {
+                    ClientMessage::DistributeSenderKeys { keys, .. } => {
+                        keys.iter().filter(|(id, ..)| *id == to).count()
+                    }
+                    _ => 0,
+                })
+                .sum()
+        }
+
+        /// What `from` posted, sealed, in order.
+        fn sealed_posts(net: &Net, from: u32) -> Vec<Vec<u8>> {
+            net.devices[&from]
+                .sent
+                .iter()
+                .filter_map(|m| match m {
+                    ClientMessage::SendEncryptedChannelMessage { ciphertext, .. } => {
+                        Some(ciphertext.clone())
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// Copy 2's shape, and a second post written before the exit came, whose answer finds
+        /// the chain over and starts a new one (`keys_owed`). The first post's heal is still in
+        /// flight, and it still comes, from the round that named them, with the new chain's
+        /// key (review 2 of CI soak 45269825608).
+        #[test]
+        fn a_heal_in_flight_when_an_answer_restarts_the_chain_still_brings_the_post_before() {
+            let mut net = Net::with(&[1, 2, 3]);
+            net.post(1, "a");
+            net.pump();
+            net.now += 1_000;
+            net.reconnect(3, 13, false);
+            net.hold_wraps = true;
+            net.post(1, "b");
+            net.pump();
+            // "c" was written before the exit came: its answer waits in 1's inbox
+            net.post(1, "c");
+            exit_lands(&mut net, 1);
+            net.release_wraps();
+            net.pump();
+            assert_eq!(restarts(&net, 1), 2, "c on a new chain");
+            net.now += KEY_WANTED_AFTER_MS;
+            net.tick();
+            assert_eq!(net.devices[&2].shown(), vec!["a", "b", "c"]);
+            assert_eq!(net.devices[&13].shown(), vec!["b", "c"]);
+        }
+
+        /// Copy 4's shape with the ask to open already out, and the second post's answer
+        /// restarting the chain before the hello is back.
+        #[test]
+        fn an_open_out_when_an_answer_restarts_the_chain_still_brings_the_post_before() {
+            let mut net = Net::with(&[1, 2, 3]);
+            net.post(1, "a");
+            net.pump();
+            net.now += 1_000;
+            net.add(4, Some([4; 16]));
+            net.list_everyone();
+            net.post(1, "b");
+            answer_alone(&mut net, 1);
+            // The ask to open 4 goes; the hello is still to come
+            let now = net.now;
+            let d = net.devices.get_mut(&1).unwrap();
+            let open =
+                d.k.live_next_frame(&mut d.stores, now, false, WRAPS_A_FRAME);
+            let open = open.unwrap();
+            assert!(
+                matches!(open, ClientMessage::OpenSessions { .. }),
+                "{open:?}"
+            );
+            d.sent.push(open.clone());
+            net.deliver(1, open);
+            net.post(1, "c");
+            net.leaves_out = vec![3];
+            exit_lands(&mut net, 1);
+            net.pump();
+            assert_eq!(restarts(&net, 1), 2, "c on a new chain");
+            net.now += KEY_WANTED_AFTER_MS;
+            net.tick();
+            assert_eq!(net.devices[&2].shown(), vec!["a", "b", "c"]);
+            assert_eq!(net.devices[&4].shown(), vec!["b", "c"]);
+        }
+
+        /// The same with the ask to open still queued when the answer restarts the chain. Who
+        /// had their key already gets the new chain's alone, though a round of the old one
+        /// still answers them.
+        #[test]
+        fn an_open_queued_when_an_answer_restarts_the_chain_still_brings_the_post_before() {
+            let mut net = Net::with(&[1, 2, 3]);
+            net.post(1, "a");
+            net.pump();
+            net.now += 1_000;
+            net.add(4, Some([4; 16]));
+            net.list_everyone();
+            net.post(1, "b");
+            answer_alone(&mut net, 1);
+            net.post(1, "c");
+            exit_lands(&mut net, 1);
+            net.pump();
+            assert_eq!(restarts(&net, 1), 2, "c on a new chain");
+            net.now += KEY_WANTED_AFTER_MS;
+            net.tick();
+            assert_eq!(net.devices[&2].shown(), vec!["a", "b", "c"]);
+            assert_eq!(net.devices[&4].shown(), vec!["b", "c"]);
+            for id in [2, 3] {
+                assert_eq!(wraps_to(&net, 1, id), 2, "{id}: a wrap a chain");
+            }
+        }
+
+        /// A post after the exit restarts the chain itself (`live_post`), with no check out,
+        /// while the heal of the post before is in flight: the heal still brings it.
+        #[test]
+        fn a_heal_in_flight_when_a_post_restarts_the_chain_still_brings_the_post_before() {
+            let mut net = Net::with(&[1, 2, 3]);
+            net.post(1, "a");
+            net.pump();
+            net.now += 1_000;
+            net.reconnect(3, 13, false);
+            net.hold_wraps = true;
+            net.post(1, "b");
+            net.pump();
+            exit_lands(&mut net, 1);
+            net.post(1, "c");
+            assert!(matches!(
+                net.devices[&1].sent.last(),
+                Some(ClientMessage::KeyCheck { restart: true, .. })
+            ));
+            net.release_wraps();
+            net.pump();
+            net.now += KEY_WANTED_AFTER_MS;
+            net.tick();
+            assert_eq!(net.devices[&2].shown(), vec!["a", "b", "c"]);
+            assert_eq!(net.devices[&13].shown(), vec!["b", "c"]);
+        }
+
+        /// An ask to open queued for a round before a restart, and one for the new chain's,
+        /// go as one: nobody twice in a frame, so one of our one-time keys, and the one hello
+        /// brings both posts.
+        #[test]
+        fn an_open_queued_across_a_restart_goes_once_and_brings_both_posts() {
+            let mut net = Net::with(&[1, 2, 3]);
+            net.post(1, "a");
+            net.pump();
+            net.now += 1_000;
+            net.add(4, Some([4; 16]));
+            net.list_everyone();
+            net.post(1, "b");
+            answer_alone(&mut net, 1);
+            exit_lands(&mut net, 1);
+            net.post(1, "c");
+            net.pump();
+            assert_eq!(restarts(&net, 1), 2, "c on a new chain");
+            for m in &net.devices[&1].sent {
+                if let ClientMessage::OpenSessions { targets, .. } = m {
+                    let once: HashSet<&u32> = targets.iter().collect();
+                    assert_eq!(once.len(), targets.len(), "{targets:?}");
+                }
+            }
+            assert_eq!(net.devices[&4].wrote(is_hello), 1);
+            assert_eq!(net.devices[&4].shown(), vec!["b", "c"]);
+        }
+
+        /// After a restart the chain that ended answers only whom a round of it still live
+        /// named: not whom only the new chain named, not whom a round gone by then named, not
+        /// the one who left. Nothing after the restart is on it.
+        #[test]
+        fn after_a_restart_the_ended_chain_answers_only_whom_its_live_rounds_named() {
+            let mut net = Net::with(&[1, 2, 3]);
+            net.post(1, "a");
+            net.pump();
+            // A chain that outlives the round that named 2 and 3
+            let w = net.devices.get_mut(&1).unwrap().k.live.writing.get_mut(&CH);
+            w.unwrap().named.extend(100..200);
+            net.now = ROUND_LIFE_MS + 1_000;
+            net.add(4, Some([4; 16]));
+            net.list_everyone();
+            // "b" names 4, whose ask to open is lost
+            net.drop_opens = true;
+            net.post(1, "b");
+            net.pump();
+            net.drop_opens = false;
+            // The next ask to open waits a second for the lost one
+            net.now += OPEN_WAIT_MS;
+            // 3 leaves, 5 comes, and "c" goes on a new chain
+            net.leaves_out = vec![3];
+            exit_lands(&mut net, 1);
+            net.add(5, Some([5; 16]));
+            net.list_everyone();
+            let to_3 = handed(&net, 1, 3);
+            net.post(1, "c");
+            net.pump();
+            assert_eq!(restarts(&net, 1), 2, "c on a new chain");
+            assert_eq!(net.devices[&5].shown(), vec!["c"]);
+            assert_eq!(net.devices[&3].shown(), vec!["a", "b"]);
+
+            let posts = sealed_posts(&net, 1);
+            assert_eq!(posts.len(), 3);
+            let (wraps_2, wraps_5) = (wraps_to(&net, 1, 2), wraps_to(&net, 1, 5));
+            // 5 holds "b", forced on them, and asks at ten seconds
+            raw_post(&mut net, 5, 1, posts[1].clone());
+            // 2, whom only a round gone by named, asks outright
+            net.tell(
+                1,
+                ServerMessage::KeyWanted {
+                    channel_id: CH,
+                    from: 2,
+                    reset: false,
+                },
+            );
+            // The one who left, every way: "c" forced on them, both asks, and a hello
+            raw_post(&mut net, 3, 1, posts[2].clone());
+            for reset in [false, true] {
+                net.tell(
+                    1,
+                    ServerMessage::KeyWanted {
+                        channel_id: CH,
+                        from: 3,
+                        reset,
+                    },
+                );
+            }
+            let r = net.devices.get_mut(&3).unwrap();
+            let (ciphertext, message_type) =
+                ready(session::encrypt_message(&mut r.stores, 1, HELLO)).unwrap();
+            net.tell(
+                1,
+                ServerMessage::SessionHello {
+                    from: 3,
+                    message_type,
+                    ciphertext,
+                },
+            );
+            net.pump();
+            net.now += KEY_WANTED_AFTER_MS;
+            net.tick();
+            assert_eq!(net.devices[&5].wrote(is_wanted), 1, "5 asked");
+            assert_eq!(
+                wraps_to(&net, 1, 5),
+                wraps_5 + 1,
+                "the new chain's key alone"
+            );
+            assert_eq!(net.devices[&5].shown(), vec!["c"]);
+            assert_eq!(
+                wraps_to(&net, 1, 2),
+                wraps_2 + 1,
+                "the new chain's key alone"
+            );
+            assert_eq!(handed(&net, 1, 3), to_3, "the one who left");
+            assert_eq!(net.devices[&3].shown(), vec!["a", "b"]);
+        }
+
+        /// "b" names 4 at one second and reaches them at two, and every ask to open 4 is lost
+        /// until `ask_at`, when 4 asks for the key; "c" restarts the chain at 31 s. `long`: a
+        /// chain whose age outlasts the round. Back: the wraps 4 got once it asked, and what 4
+        /// shows. 4 holds "b" to 62 s, past its round's life (61 s) and the short chain's age
+        /// (60 s), so whether "b" shows says whether its round still answered.
+        fn ask_after_a_restart(long: bool, ask_at: u64) -> (usize, Vec<String>) {
+            let mut net = Net::with(&[1, 2, 3]);
+            net.post(1, "a");
+            net.pump();
+            if long {
+                let w = net.devices.get_mut(&1).unwrap().k.live.writing.get_mut(&CH);
+                w.unwrap().named.extend(100..200);
+            }
+            net.now = 1_000;
+            net.add(4, Some([4; 16]));
+            net.list_everyone();
+            net.drop_opens = true;
+            net.post(1, "b");
+            answer_alone(&mut net, 1);
+            let late: Vec<ServerMessage> =
+                net.devices.get_mut(&4).unwrap().inbox.drain(..).collect();
+            assert_eq!(late.len(), 1, "{late:?}");
+            net.pump();
+            net.now = 2_000;
+            net.devices.get_mut(&4).unwrap().inbox.extend(late);
+            net.pump();
+            net.now = 31_000;
+            exit_lands(&mut net, 1);
+            net.post(1, "c");
+            net.pump();
+            assert_eq!(restarts(&net, 1), 2, "c on a new chain");
+            assert!(net.devices[&4].shown().is_empty());
+            net.now = ask_at;
+            net.drop_opens = false;
+            let before = wraps_to(&net, 1, 4);
+            // Only 4's tick: the writer's own tick, a second apart, is not what ends a round
+            let d = net.devices.get_mut(&4).unwrap();
+            let out = d.k.live_tick(&mut d.stores, ask_at);
+            net.apply(4, out);
+            net.pump();
+            assert_eq!(net.devices[&4].wrote(is_wanted), 1, "it asked");
+            (wraps_to(&net, 1, 4) - before, net.devices[&4].shown())
+        }
+
+        /// Past its round's life, or past its chain's age as it stood at the end, whichever
+        /// comes first, a round of a chain that ended hands nothing more to whom it named:
+        /// they get the new chain's key alone, and "b", still held, does not open.
+        #[test]
+        fn past_its_life_or_its_chains_age_an_ended_round_answers_nothing() {
+            let c = vec!["c".to_string()];
+            // Its life, at 61 s: the chain would have lasted to 206 s, and 4 holds "b" to 62 s
+            assert_eq!(ask_after_a_restart(true, 61_000), (1, c.clone()));
+            // Its chain's age, at 60 s: the round would have lasted to 61 s
+            assert_eq!(ask_after_a_restart(false, 60_000), (1, c));
+        }
+
+        /// The control: up to its last millisecond it hands them its own message with the new
+        /// chain's key, and the post before the restart opens.
+        #[test]
+        fn an_ended_round_answers_up_to_its_life_or_its_chains_age() {
+            let both = (2, vec!["b".to_string(), "c".to_string()]);
+            assert_eq!(ask_after_a_restart(true, 60_999), both);
+            assert_eq!(ask_after_a_restart(false, 59_999), both);
+        }
+
+        /// Someone told of as gone is off the rounds of a chain that ended too: nothing of it,
+        /// nor of the new one, answers them any more.
+        #[test]
+        fn member_gone_takes_them_off_an_ended_chains_rounds_too() {
+            let mut net = Net::with(&[1, 2, 3]);
+            net.post(1, "a");
+            net.pump();
+            net.now = 1_000;
+            net.add(4, Some([4; 16]));
+            net.list_everyone();
+            // "b" names 4, and "c" restarts the chain while every ask to open 4 is lost
+            net.drop_opens = true;
+            net.post(1, "b");
+            net.pump();
+            net.now = 31_000;
+            exit_lands(&mut net, 1);
+            net.post(1, "c");
+            net.pump();
+            assert_eq!(restarts(&net, 1), 2, "c on a new chain");
+            net.drop_opens = false;
+            net.tell(
+                1,
+                ServerMessage::MemberGone {
+                    channel_id: CH,
+                    user_id: 4,
+                },
+            );
+            net.pump();
+            // Past the second the next ask to open waits for the lost one
+            net.now += OPEN_WAIT_MS;
+            let before = handed(&net, 1, 4);
+            for reset in [false, true] {
+                net.tell(
+                    1,
+                    ServerMessage::KeyWanted {
+                        channel_id: CH,
+                        from: 4,
+                        reset,
+                    },
+                );
+            }
+            net.pump();
+            assert_eq!(handed(&net, 1, 4), before);
+            assert!(net.devices[&4].shown().is_empty());
+        }
+
+        // ── A reader's keys: the newest five, in one frame ──────────────────
+
+        /// `chains` chains a second apart, the exit landing before each post past the first,
+        /// each post read by 2 and 3.
+        fn chains_a_second_apart(chains: usize) -> Net {
+            let mut net = Net::with(&[1, 2, 3]);
+            for i in 0..chains {
+                if i > 0 {
+                    exit_lands(&mut net, 1);
+                }
+                net.now += 1_000;
+                net.post(1, &format!("p{i}"));
+                net.pump();
+            }
+            let all: Vec<String> = (0..chains).map(|i| format!("p{i}")).collect();
+            assert_eq!(net.devices[&2].shown(), all);
+            assert_eq!(restarts(&net, 1), chains, "a chain a post");
+            net
+        }
+
+        fn wanted_by(from: u32) -> ServerMessage {
+            ServerMessage::KeyWanted {
+                channel_id: CH,
+                from,
+                reset: false,
+            }
+        }
+
+        /// A relay replays post `which`, which 2 has read, before and after one ask from 2
+        /// (or one it made up). Back: how often 2 shows it before the ask and after, and the
+        /// wraps the ask brought.
+        fn replay_around_an_ask(chains: usize, which: usize) -> (usize, usize, usize) {
+            let mut net = chains_a_second_apart(chains);
+            let posts = sealed_posts(&net, 1);
+            let text = format!("p{which}");
+            let shown = |net: &Net| {
+                let shown = net.devices[&2].shown();
+                shown.iter().filter(|s| **s == text).count()
+            };
+            raw_post(&mut net, 2, 1, posts[which].clone());
+            net.pump();
+            let before = (shown(&net), wraps_to(&net, 1, 2));
+            net.tell(1, wanted_by(2));
+            net.pump();
+            let wraps = wraps_to(&net, 1, 2) - before.1;
+            raw_post(&mut net, 2, 1, posts[which].clone());
+            net.pump();
+            (before.0, shown(&net), wraps)
+        }
+
+        /// Six chains owe 2 their key, and libsignal keeps five a writer. Handed all six at
+        /// once, the oldest would drop the next oldest at 2, that one the one after, and so
+        /// on, each coming back afresh at its round's position: a post 2 had read would open
+        /// again to a relay replaying it, an old edit with it (review 3 of CI soak
+        /// 45269825608). The newest five go, and what was read stays read.
+        #[test]
+        fn an_ask_hands_the_newest_five_chains_and_nothing_read_opens_again() {
+            for which in [3, 5] {
+                let five = (1, 1, MAX_SENDER_KEY_STATES);
+                assert_eq!(replay_around_an_ask(6, which), five, "p{which}");
+            }
+            // The control: five chains, all five go
+            assert_eq!(replay_around_an_ask(5, 3), (1, 1, 5));
+        }
+
+        /// 2's keys of the chains in `withheld` are held back by a relay, everyone else's let
+        /// through, and let go in order once the last chain's key reached 2. Then the relay
+        /// replays post `which`, which 2 has read, before and after an ask it made up from 2.
+        /// Back: how often 2 shows it before the ask and after, and the wraps the ask brought.
+        fn replay_after_late_keys(
+            chains: usize,
+            withheld: std::ops::Range<usize>,
+            which: usize,
+        ) -> (usize, usize, usize) {
+            let mut net = Net::with(&[1, 2, 3]);
+            let mut kept = Vec::new();
+            for i in 0..chains {
+                if i > 0 {
+                    exit_lands(&mut net, 1);
+                }
+                net.now += 1_000;
+                net.hold_wraps = withheld.contains(&i);
+                net.post(1, &format!("p{i}"));
+                net.pump();
+                net.hold_wraps = false;
+                for (from, m) in std::mem::take(&mut net.held_wraps) {
+                    let ClientMessage::DistributeSenderKeys { channel_id, keys } = m else {
+                        continue;
+                    };
+                    let (to_2, rest): (Vec<_>, Vec<_>) =
+                        keys.into_iter().partition(|(id, ..)| *id == 2);
+                    kept.push((from, channel_id, to_2));
+                    let keys = rest;
+                    net.deliver(
+                        from,
+                        ClientMessage::DistributeSenderKeys { channel_id, keys },
+                    );
+                }
+                net.pump();
+            }
+            for (from, channel_id, keys) in kept {
+                net.deliver(
+                    from,
+                    ClientMessage::DistributeSenderKeys { channel_id, keys },
+                );
+            }
+            net.pump();
+            let mut all: Vec<String> = (0..chains).map(|i| format!("p{i}")).collect();
+            let mut shown = net.devices[&2].shown();
+            all.sort();
+            shown.sort();
+            assert_eq!(shown, all, "2 read every post once");
+            let posts = sealed_posts(&net, 1);
+            let text = format!("p{which}");
+            let shown = |net: &Net| {
+                let shown = net.devices[&2].shown();
+                shown.iter().filter(|s| **s == text).count()
+            };
+            raw_post(&mut net, 2, 1, posts[which].clone());
+            net.pump();
+            let before = (shown(&net), wraps_to(&net, 1, 2));
+            net.tell(1, wanted_by(2));
+            net.pump();
+            let wraps = wraps_to(&net, 1, 2) - before.1;
+            raw_post(&mut net, 2, 1, posts[which].clone());
+            net.pump();
+            (before.0, shown(&net), wraps)
+        }
+
+        /// A relay holds back 2's key of the first chain past five newer ones, lets it go, so
+        /// that libsignal drops the second chain's state at 2 for it, then makes up an ask: the
+        /// newest five go, each, missing at 2, dropping the next as it comes back afresh at its
+        /// round's position. A post 2 read must not open again for it (review 4 of CI soak
+        /// 45269825608): what 2 read stays read at 2 (`group::decrypt_group_message`).
+        #[test]
+        fn an_old_key_let_go_late_and_an_ask_open_nothing_read_again() {
+            for which in [1, 3, 5] {
+                let once = (1, 1, MAX_SENDER_KEY_STATES);
+                assert_eq!(replay_after_late_keys(6, 0..1, which), once, "p{which}");
+            }
+        }
+
+        /// The same with 2's keys of the first five chains held back, which reached the
+        /// current chain before this round too: libsignal holds the five let go late, the
+        /// current one dropped for them, and the ask brings it back afresh.
+        #[test]
+        fn five_keys_let_go_late_and_an_ask_open_nothing_read_again() {
+            for which in [0, 3, 5] {
+                let once = (1, 1, MAX_SENDER_KEY_STATES);
+                assert_eq!(replay_after_late_keys(6, 0..5, which), once, "p{which}");
+            }
+            // The control: nothing held back
+            assert_eq!(replay_after_late_keys(6, 0..0, 5), (1, 1, 5));
+        }
+
+        // ── What was read, under another id and across a reconnect (review 5) ──
+
+        fn shown_at(net: &Net, at: u32, text: &str) -> usize {
+            net.devices[&at]
+                .shown()
+                .iter()
+                .filter(|s| *s == text)
+                .count()
+        }
+
+        /// 1's post, as a relay that names 1's account under `id` sends it.
+        fn post_as(net: &Net, id: u32, ciphertext: Vec<u8>) -> ServerMessage {
+            ServerMessage::TextPost {
+                channel_id: CH,
+                user_id: id,
+                username: "user1".into(),
+                account: Some([1u8; 16]),
+                is_admin: false,
+                is_moderator: false,
+                ciphertext,
+                timestamp: net.now,
+            }
+        }
+
+        /// One wrap of a `DistributeSenderKeys`: its reader, kind and ciphertext.
+        type Wrap = (u32, u8, Vec<u8>);
+
+        /// 1's wrap to a reader, as a relay that names 1's account under `id` hands it.
+        fn key_as(id: u32, (_, message_type, ciphertext): Wrap) -> ServerMessage {
+            ServerMessage::TextKeyReceived {
+                channel_id: CH,
+                from: id,
+                account: Some([1u8; 16]),
+                message_type,
+                ciphertext,
+            }
+        }
+
+        /// 1 posts p0 and 3 reads it. A relay makes up an ask from 3 and keeps the wrap it
+        /// brings: p0's round message, at its first position. Back: 1's posts, and that wrap.
+        fn a_wrap_of_what_3_read() -> (Net, Vec<Vec<u8>>, Vec<Wrap>) {
+            let mut net = Net::with(&[1, 2, 3]);
+            net.now += 1_000;
+            net.post(1, "p0");
+            net.pump();
+            assert_eq!(net.devices[&3].shown(), vec!["p0"]);
+            net.hold_wraps = true;
+            net.tell(1, wanted_by(3));
+            net.pump();
+            net.hold_wraps = false;
+            let mut to_3 = Vec::new();
+            for (_, m) in std::mem::take(&mut net.held_wraps) {
+                if let ClientMessage::DistributeSenderKeys { keys, .. } = m {
+                    to_3.extend(keys.into_iter().filter(|(id, ..)| *id == 3));
+                }
+            }
+            assert_eq!(to_3.len(), 1, "p0's round message");
+            let posts = sealed_posts(&net, 1);
+            (net, posts, to_3)
+        }
+
+        /// A relay names 1's account under 11, nobody's id: p0 first, so 3 notes 11 as 1's
+        /// next id, then the wrap it kept as from 11, which moves 3's session with 1 there
+        /// (`find_session`) and installs p0's chain afresh in the record of user 11 (review 5).
+        /// What 3 read is known by the key that chain signs with, which no relay can rename:
+        /// p0 opens no second time, and is refused as a duplicate is.
+        #[test]
+        fn a_writer_named_under_another_id_opens_nothing_read_again() {
+            let (mut net, posts, kept) = a_wrap_of_what_3_read();
+            raw_post(&mut net, 3, 1, posts[0].clone());
+            net.pump();
+            assert_eq!(shown_at(&net, 3, "p0"), 1, "under its own id: refused");
+            let rings = net.devices[&3].events("channel-ring");
+            let post = post_as(&net, 11, posts[0].clone());
+            net.tell(3, post);
+            net.pump();
+            for key in kept {
+                net.tell(3, key_as(11, key));
+            }
+            net.pump();
+            assert_eq!(
+                shown_at(&net, 3, "p0"),
+                1,
+                "a post read once opened again under another id"
+            );
+            assert_eq!(
+                net.devices[&3].events("channel-ring"),
+                rings + 1,
+                "the key opened, and the post it held was refused"
+            );
+        }
+
+        /// The same with nothing made up: the relay hands 3 the round's only wrap, and p0, as
+        /// from 11, then p0 as from 1, which waits for a key under 1. 3's own ask at ten
+        /// seconds brings p0's round message again, under 1: p0 still shows once.
+        #[test]
+        fn a_writer_named_under_two_ids_shows_a_post_once() {
+            let mut net = Net::with(&[1, 2, 3]);
+            net.now += 1_000;
+            net.hold_wraps = true;
+            net.post(1, "p0");
+            net.pump();
+            net.hold_wraps = false;
+            let mut to_3 = Vec::new();
+            for (from, m) in std::mem::take(&mut net.held_wraps) {
+                if let ClientMessage::DistributeSenderKeys { channel_id, keys } = m {
+                    let (mine, rest): (Vec<_>, Vec<_>) =
+                        keys.into_iter().partition(|(id, ..)| *id == 3);
+                    to_3.extend(mine);
+                    let keys = rest;
+                    net.deliver(
+                        from,
+                        ClientMessage::DistributeSenderKeys { channel_id, keys },
+                    );
+                }
+            }
+            // p0 as the relay sent it to 3 under 1 goes: it comes again below
+            net.devices
+                .get_mut(&3)
+                .unwrap()
+                .inbox
+                .retain(|m| !matches!(m, ServerMessage::TextPost { .. }));
+            net.pump();
+            let posts = sealed_posts(&net, 1);
+            let post = post_as(&net, 11, posts[0].clone());
+            net.tell(3, post);
+            net.pump();
+            for key in to_3 {
+                net.tell(3, key_as(11, key));
+            }
+            net.pump();
+            assert_eq!(shown_at(&net, 3, "p0"), 1, "as from 11");
+            raw_post(&mut net, 3, 1, posts[0].clone());
+            net.pump();
+            let asked = net.devices[&3].wrote(is_wanted);
+            net.now += KEY_WANTED_AFTER_MS;
+            net.tick();
+            assert!(
+                net.devices[&3].wrote(is_wanted) > asked,
+                "3 asked 1 for the key"
+            );
+            assert_eq!(
+                shown_at(&net, 3, "p0"),
+                1,
+                "a post read once opened again under the writer's first id"
+            );
+        }
+
+        /// 3's app comes back as 13, and the relay hands 13 the wrap it kept from before,
+        /// then replays p0 (review 5). With the sessions kept, what 3 read came along with
+        /// them, so p0 opens no second time; without, the wrap opens nothing. Either way 13
+        /// reads on.
+        #[test]
+        fn a_reconnect_keeps_what_was_read_with_the_sessions() {
+            for keep in [true, false] {
+                let (mut net, posts, kept) = a_wrap_of_what_3_read();
+                net.now += 1_000;
+                net.reconnect(3, 13, keep);
+                net.devices.get_mut(&13).unwrap().k.join_text(CH);
+                for key in kept {
+                    net.tell(13, key_as(1, key));
+                }
+                net.pump();
+                raw_post(&mut net, 13, 1, posts[0].clone());
+                net.pump();
+                assert_eq!(
+                    shown_at(&net, 13, "p0"),
+                    0,
+                    "kept {keep}: a post read before the reconnect opened again"
+                );
+                net.post(1, "p1");
+                net.pump();
+                assert_eq!(net.devices[&13].shown(), vec!["p1"], "kept {keep}");
+            }
+        }
+
+        /// What came along is no reason to refuse what an honest relay brings: a reader back
+        /// with its sessions kept reads the chain it read before on, a new one after an exit,
+        /// and its writer's chain once the writer is back too, and nothing rings.
+        #[test]
+        fn a_reader_back_with_what_it_read_reads_on_and_nothing_rings() {
+            let mut net = Net::with(&[1, 2, 3]);
+            net.now += 1_000;
+            net.post(1, "p0");
+            net.post(1, "p1");
+            net.pump();
+            assert_eq!(net.devices[&3].shown(), vec!["p0", "p1"]);
+            net.now += 1_000;
+            net.reconnect(3, 13, true);
+            net.devices.get_mut(&13).unwrap().k.join_text(CH);
+            net.post(1, "p2");
+            net.pump();
+            exit_lands(&mut net, 1);
+            net.now += 1_000;
+            net.post(1, "p3");
+            net.pump();
+            net.now += 1_000;
+            net.reconnect(1, 11, true);
+            net.devices.get_mut(&11).unwrap().k.join_text(CH);
+            net.post(11, "p4");
+            net.pump();
+            assert_eq!(net.devices[&13].shown(), vec!["p2", "p3", "p4"]);
+            assert_eq!(net.devices[&13].events("channel-ring"), 0);
+            assert_eq!(net.devices[&2].shown(), vec!["p0", "p1", "p2", "p3", "p4"]);
+        }
+
+        /// Asks a relay made up, 64 of them from 2 and 3 in turn, in a browser call: each
+        /// reader's go as one hand-off, five keys, however many asks there were.
+        #[test]
+        fn asks_in_turn_cost_five_keys_a_reader() {
+            let mut net = chains_a_second_apart(6);
+            let before = wraps_to(&net, 1, 2) + wraps_to(&net, 1, 3);
+            for i in 0..64u32 {
+                net.tell(1, wanted_by(2 + i % 2));
+            }
+            let now = net.now;
+            let asks: Vec<ServerMessage> =
+                net.devices.get_mut(&1).unwrap().inbox.drain(..).collect();
+            for msg in asks {
+                let d = net.devices.get_mut(&1).unwrap();
+                let out = d.k.live_frame(&mut d.stores, 0, &msg, now);
+                net.apply(1, out);
+            }
+            let mut frames = 0;
+            loop {
+                let d = net.devices.get_mut(&1).unwrap();
+                let Some(frame) =
+                    d.k.live_next_frame(&mut d.stores, now, true, WRAPS_A_FRAME_BROWSER_CALL)
+                else {
+                    break;
+                };
+                frames += usize::from(is_wraps(&frame));
+                d.sent.push(frame);
+            }
+            let wraps = wraps_to(&net, 1, 2) + wraps_to(&net, 1, 3) - before;
+            assert_eq!((wraps, frames), (2 * MAX_SENDER_KEY_STATES, 2));
+        }
+
+        /// Every key frame `from` sent: one the host can send, under the bytes a frame counts
+        /// to, with no reader given more than five keys. Back: the keys each gave `to`.
+        fn frames_fit(net: &Net, from: u32, to: u32) -> Vec<usize> {
+            let mut given = Vec::new();
+            for m in &net.devices[&from].sent {
+                let ClientMessage::DistributeSenderKeys { keys, .. } = m else {
+                    continue;
+                };
+                if let Err(e) = voipc_protocol::codec::client_payload(m) {
+                    panic!("a frame of {} keys the host cannot send: {e}", keys.len());
+                }
+                let counted: usize = keys.iter().map(|(_, _, ct)| ct.len() + 8).sum();
+                assert!(
+                    counted <= WRAP_FRAME_BYTES,
+                    "a frame of {} keys counts {counted} bytes",
+                    keys.len()
+                );
+                let mut each: HashMap<u32, usize> = HashMap::new();
+                for (id, ..) in keys {
+                    *each.entry(*id).or_default() += 1;
+                }
+                assert!(
+                    each.values().all(|n| *n <= MAX_SENDER_KEY_STATES),
+                    "{each:?}"
+                );
+                given.push(each.get(&to).copied().unwrap_or(0));
+            }
+            given
+        }
+
+        /// A session this device opened, so every wrap is a 1.9 KB pre-key message, and forty
+        /// chains in four seconds, each owing 2: one ask hands 2 the newest five, in a frame
+        /// the host can send. All forty would be 74 KB, past what one message may be, which
+        /// ends a native live task and a browser's connection (review 3).
+        #[test]
+        fn a_readers_keys_from_forty_chains_fit_one_frame() {
+            let mut net = Net::with(&[1, 2]);
+            let bundle = prekey::bundle(&net.devices[&2].stores).unwrap();
+            let w = net.devices.get_mut(&1).unwrap();
+            ready(session::establish_session(&mut w.stores, 2, &bundle)).unwrap();
+            for i in 0..40 {
+                exit_lands(&mut net, 1);
+                net.now += 100;
+                net.post(1, &format!("p{i}"));
+                net.pump();
+            }
+            assert_eq!(net.devices[&2].shown().len(), 40);
+            net.now += 100;
+            net.tell(1, wanted_by(2));
+            net.pump();
+            let given = frames_fit(&net, 1, 2);
+            assert_eq!(given.last(), Some(&MAX_SENDER_KEY_STATES));
+        }
+
+        /// Thirty readers on pre-key messages, whose key of the new chain fills most of a
+        /// frame, and the last of them, owed eight chains, asking right behind the restart's
+        /// answer: their five go whole in the next frame, not on top of a nearly full one.
+        #[test]
+        fn a_nearly_full_frame_leaves_a_readers_keys_to_the_next() {
+            let ids: Vec<u32> = (1..=31).collect();
+            let mut net = Net::with(&ids);
+            for r in 2..=31u32 {
+                let bundle = prekey::bundle(&net.devices[&r].stores).unwrap();
+                let w = net.devices.get_mut(&1).unwrap();
+                ready(session::establish_session(&mut w.stores, r, &bundle)).unwrap();
+            }
+            for i in 0..7 {
+                exit_lands(&mut net, 1);
+                net.now += 1_000;
+                net.post(1, &format!("p{i}"));
+                net.pump();
+            }
+            exit_lands(&mut net, 1);
+            net.now += 1_000;
+            net.post(1, "p7");
+            net.tell(1, wanted_by(31));
+            net.pump();
+            let given = frames_fit(&net, 1, 31);
+            let last: Vec<usize> = given[given.len() - 2..].to_vec();
+            assert_eq!(last, vec![0, MAX_SENDER_KEY_STATES], "{given:?}");
+            assert_eq!(net.devices[&31].shown().len(), 8);
+        }
+
+        /// A round's wrap of the chain it started, and the same reader's ask right behind it,
+        /// in one frame (review 3): the post after opens at once.
+        #[test]
+        fn a_round_and_an_ask_in_one_frame_leave_the_next_post_readable() {
+            let mut net = Net::with(&[1, 2]);
+            for i in 0..7 {
+                exit_lands(&mut net, 1);
+                net.now += 100;
+                net.post(1, &format!("p{i}"));
+                net.pump();
+            }
+            exit_lands(&mut net, 1);
+            net.now += 100;
+            net.post(1, "p7");
+            net.tell(1, wanted_by(2));
+            net.pump();
+            assert_eq!(net.devices[&2].shown().len(), 8);
+            // The next post, on the same chain
+            net.now += 100;
+            net.post(1, "p8");
+            net.pump();
+            assert_eq!(
+                net.devices[&2].shown().last().map(String::as_str),
+                Some("p8"),
+                "p8 opened at once"
+            );
+        }
+
+        /// The keys each frame `from` sent and the relay held gave `to`, read there, as
+        /// `from`'s chain numbers.
+        fn chains_handed(net: &mut Net, from: u32, to: u32) -> Vec<Vec<u64>> {
+            let chain_id = |message: &[u8]| {
+                let message = libsignal_protocol::SenderKeyDistributionMessage::try_from(message);
+                message.unwrap().chain_id().unwrap()
+            };
+            let w = &net.devices[&from].k.live.writing[&CH];
+            let mut number: HashMap<u32, u64> = w
+                .retired
+                .iter()
+                .map(|r| (chain_id(&r.round.message), r.chain))
+                .collect();
+            for round in &w.rounds {
+                number.insert(chain_id(&round.message), w.chain);
+            }
+            let r = net.devices.get_mut(&to).unwrap();
+            let mut frames = Vec::new();
+            for (by, m) in std::mem::take(&mut net.held_wraps) {
+                let ClientMessage::DistributeSenderKeys { keys, .. } = m else {
+                    continue;
+                };
+                if by != from {
+                    continue;
+                }
+                let mut chains = Vec::new();
+                for (id, kind, ct) in keys.iter().filter(|(id, ..)| *id == to) {
+                    let plain = ready(session::decrypt_message(&mut r.stores, from, ct, *kind));
+                    let plain = plain.unwrap_or_else(|e| panic!("{id}: {e}"));
+                    chains.push(number[&chain_id(&plain)]);
+                }
+                frames.push(chains);
+            }
+            frames
+        }
+
+        /// The same frame, read at the reader: the newest five chains that owe them, each once,
+        /// the oldest first and the current one last. libsignal drops the state taken least
+        /// lately, so the current chain, taken last, is the one a later key drops last.
+        #[test]
+        fn a_frame_hands_a_reader_the_newest_five_chains_the_current_last() {
+            let mut net = Net::with(&[1, 2]);
+            for i in 0..7 {
+                exit_lands(&mut net, 1);
+                net.now += 100;
+                net.post(1, &format!("p{i}"));
+                net.pump();
+            }
+            exit_lands(&mut net, 1);
+            net.now += 100;
+            net.hold_wraps = true;
+            net.post(1, "p7");
+            net.tell(1, wanted_by(2));
+            net.pump();
+            let now = net.devices[&1].k.live.writing[&CH].chain;
+            let newest: Vec<u64> = (now - 4..=now).collect();
+            assert_eq!(chains_handed(&mut net, 1, 2), vec![newest]);
+        }
+
+        /// In a browser call, eight keys a frame: seven readers' key of the new chain, then one
+        /// owed six chains, whose five keys wait whole for the next frame. A second apart, past
+        /// the exit's gap with nine online.
+        #[test]
+        fn a_readers_keys_wait_whole_for_the_next_frame() {
+            let ids: Vec<u32> = (1..=9).collect();
+            let mut net = Net::with(&ids);
+            for i in 0..5 {
+                exit_lands(&mut net, 1);
+                net.now += 1_000;
+                net.post(1, &format!("p{i}"));
+                net.pump();
+            }
+            exit_lands(&mut net, 1);
+            net.now += 1_000;
+            net.post(1, "p5");
+            net.tell(1, wanted_by(9));
+            let now = net.now;
+            let answer: Vec<ServerMessage> =
+                net.devices.get_mut(&1).unwrap().inbox.drain(..).collect();
+            for msg in answer {
+                let d = net.devices.get_mut(&1).unwrap();
+                let out = d.k.live_frame(&mut d.stores, 0, &msg, now);
+                net.apply(1, out);
+            }
+            let mut frames: Vec<Vec<u32>> = Vec::new();
+            loop {
+                let d = net.devices.get_mut(&1).unwrap();
+                let Some(frame) =
+                    d.k.live_next_frame(&mut d.stores, now, true, WRAPS_A_FRAME_BROWSER_CALL)
+                else {
+                    break;
+                };
+                d.sent.push(frame.clone());
+                if let ClientMessage::DistributeSenderKeys { keys, .. } = &frame {
+                    frames.push(keys.iter().map(|(id, ..)| *id).collect());
+                }
+                net.deliver(1, frame);
+            }
+            let others: Vec<u32> = (2..=8).collect();
+            assert_eq!(frames, vec![others, vec![9; MAX_SENDER_KEY_STATES]]);
+            net.pump();
+            assert_eq!(net.devices[&9].shown().len(), 6);
+        }
+
+        /// 28 readers on pre-key messages, and the last of them, owed five chains, asking right
+        /// behind the restart's answer: 27 single keys take 50 KB, so the last reader's five
+        /// (9.3 KB) wait for the next frame. Counted as one wrap, they would go in, past the
+        /// bytes a frame counts to (review 4).
+        #[test]
+        fn a_readers_keys_count_whole_against_the_frames_bytes() {
+            let ids: Vec<u32> = (1..=29).collect();
+            let mut net = Net::with(&ids);
+            for r in 2..=29u32 {
+                let bundle = prekey::bundle(&net.devices[&r].stores).unwrap();
+                let w = net.devices.get_mut(&1).unwrap();
+                ready(session::establish_session(&mut w.stores, r, &bundle)).unwrap();
+            }
+            for i in 0..7 {
+                exit_lands(&mut net, 1);
+                net.now += 1_000;
+                net.post(1, &format!("p{i}"));
+                net.pump();
+            }
+            exit_lands(&mut net, 1);
+            net.now += 1_000;
+            net.post(1, "p7");
+            net.tell(1, wanted_by(29));
+            net.pump();
+            let given = frames_fit(&net, 1, 29);
+            let last: Vec<usize> = given[given.len() - 2..].to_vec();
+            assert_eq!(last, vec![0, MAX_SENDER_KEY_STATES], "{given:?}");
+            assert_eq!(net.devices[&29].shown().len(), 8);
+        }
+
+        /// One reader owed a key in two channels: taking them in the first channel's frame
+        /// leaves what the second owes them to the second's (review 4).
+        #[test]
+        fn a_reader_owed_in_two_channels_gets_both_keys() {
+            let mut net = Net::with(&[1, 2]);
+            let bundle = prekey::bundle(&net.devices[&2].stores).unwrap();
+            let now = net.now;
+            let d = net.devices.get_mut(&1).unwrap();
+            ready(session::establish_session(&mut d.stores, 2, &bundle)).unwrap();
+            for ch in [CH, CH + 1] {
+                let w = d.k.live.writing.entry(ch).or_default();
+                w.started = Some(now);
+                w.named.insert(2);
+                d.k.live.wraps.push(ch, 2, For::Chain(0));
+            }
+            let mut got = Vec::new();
+            while let Some(f) =
+                d.k.live_next_frame(&mut d.stores, now, false, WRAPS_A_FRAME)
+            {
+                if let ClientMessage::DistributeSenderKeys { channel_id, keys } = &f {
+                    got.push((*channel_id, keys.len()));
+                }
+            }
+            assert_eq!(got, vec![(CH, 1), (CH + 1, 1)]);
+        }
+
+        /// A writer who leaves a channel with keys still queued there, and comes back: what
+        /// was queued goes with the channel, all of it, so the new chain's key reaches the
+        /// same readers again (review 5).
+        #[test]
+        fn a_writer_back_in_a_channel_hands_its_new_key() {
+            let mut net = Net::with(&[1, 2, 3]);
+            net.post(1, "a");
+            net.pump();
+            assert_eq!(net.devices[&2].shown(), vec!["a"]);
+            exit_lands(&mut net, 1);
+            net.now += 1_000;
+            net.post(1, "b");
+            // The restart's check answered, the wraps queued, no frame pulled yet
+            let now = net.now;
+            let msgs: Vec<ServerMessage> =
+                net.devices.get_mut(&1).unwrap().inbox.drain(..).collect();
+            for msg in msgs {
+                let d = net.devices.get_mut(&1).unwrap();
+                let out = d.k.live_frame(&mut d.stores, 0, &msg, now);
+                net.apply(1, out);
+            }
+            let d = net.devices.get_mut(&1).unwrap();
+            assert_eq!(d.k.live.wraps.len(), 2, "2 and 3 queued");
+            d.k.forget_channel(Some(&mut d.stores), 1, CH);
+            assert!(d.k.live.wraps.is_empty() && d.k.live.wraps.whats.is_empty());
+            d.k.join_text(CH);
+            net.now += 1_000;
+            net.post(1, "c");
+            net.pump();
+            net.now += KEY_WANTED_AFTER_MS;
+            net.tick();
+            net.pump();
+            for id in [2, 3] {
+                assert!(
+                    net.devices[&id].shown().contains(&"c".to_string()),
+                    "{id} reads c"
+                );
+            }
+        }
+
+        /// A wrap that cannot be made, for a reader owed both the new chain's key and what an
+        /// ask brought: the record goes, and they are asked to open a new one at once, whose
+        /// hello brings back all four chains. Not only the reader's own ask ten seconds on.
+        #[test]
+        fn a_wrap_that_cannot_be_made_asks_them_to_open_at_once() {
+            let mut net = Net::with(&[1, 2, 3]);
+            // A session the writer opened: 2 never took an ask to open from 1, so takes one now
+            let bundle = prekey::bundle(&net.devices[&2].stores).unwrap();
+            let w = net.devices.get_mut(&1).unwrap();
+            ready(session::establish_session(&mut w.stores, 2, &bundle)).unwrap();
+            for i in 0..3 {
+                if i > 0 {
+                    exit_lands(&mut net, 1);
+                }
+                net.now += 1_000;
+                net.post(1, &format!("p{i}"));
+                net.pump();
+            }
+            exit_lands(&mut net, 1);
+            net.now += 1_000;
+            net.post(1, "p3");
+            net.tell(1, wanted_by(2));
+            // The restart's answer and 2's ask, taken; then 2's record will not do
+            let now = net.now;
+            let msgs: Vec<ServerMessage> =
+                net.devices.get_mut(&1).unwrap().inbox.drain(..).collect();
+            for msg in msgs {
+                let d = net.devices.get_mut(&1).unwrap();
+                let out = d.k.live_frame(&mut d.stores, 0, &msg, now);
+                net.apply(1, out);
+            }
+            let opens = |net: &Net| {
+                net.devices[&1]
+                    .sent
+                    .iter()
+                    .filter(|m| matches!(m, ClientMessage::OpenSessions { targets, .. } if targets.contains(&2)))
+                    .count()
+            };
+            let before = opens(&net);
+            net.devices.get_mut(&1).unwrap().stores.session.take(2);
+            net.pump();
+            assert_eq!(opens(&net) - before, 1, "asked to open at once");
+            assert_eq!(net.devices[&2].shown(), vec!["p0", "p1", "p2", "p3"]);
+        }
+
+        /// A reader's ask behind the new chain's key joins them where they were first owed: in
+        /// a browser call, eight keys a frame, 2's five go first, then 3's and 4's one.
+        #[test]
+        fn an_ask_joins_the_reader_where_they_were_first_owed() {
+            let mut net = Net::with(&[1, 2, 3, 4]);
+            for i in 0..5 {
+                if i > 0 {
+                    exit_lands(&mut net, 1);
+                }
+                net.now += 1_000;
+                net.post(1, &format!("p{i}"));
+                net.pump();
+            }
+            exit_lands(&mut net, 1);
+            net.now += 1_000;
+            net.post(1, "p5");
+            net.tell(1, wanted_by(2));
+            let now = net.now;
+            let answer: Vec<ServerMessage> =
+                net.devices.get_mut(&1).unwrap().inbox.drain(..).collect();
+            for msg in answer {
+                let d = net.devices.get_mut(&1).unwrap();
+                let out = d.k.live_frame(&mut d.stores, 0, &msg, now);
+                net.apply(1, out);
+            }
+            let mut frames: Vec<Vec<u32>> = Vec::new();
+            loop {
+                let d = net.devices.get_mut(&1).unwrap();
+                let Some(frame) =
+                    d.k.live_next_frame(&mut d.stores, now, true, WRAPS_A_FRAME_BROWSER_CALL)
+                else {
+                    break;
+                };
+                d.sent.push(frame.clone());
+                if let ClientMessage::DistributeSenderKeys { keys, .. } = &frame {
+                    frames.push(keys.iter().map(|(id, ..)| *id).collect());
+                }
+                net.deliver(1, frame);
+            }
+            assert_eq!(frames, vec![vec![2, 2, 2, 2, 2, 3, 4]]);
+            net.pump();
+            for r in 2..=4 {
+                assert_eq!(net.devices[&r].shown().len(), 6, "{r}");
+            }
+        }
+
+        /// A relay names 2 again on the same chain: once it ends, 2 is owed one key of it, the
+        /// newer round's, and the new chain's, not a key a round.
+        #[test]
+        fn a_reader_named_twice_on_a_chain_is_owed_one_key_of_it() {
+            let mut net = Net::with(&[1, 2, 3]);
+            net.post(1, "a");
+            net.pump();
+            net.now = 1_000;
+            net.keyed.get_mut(&1).unwrap().remove(&2);
+            net.post(1, "b");
+            net.pump();
+            let w = &net.devices[&1].k.live.writing[&CH];
+            assert_eq!(w.rounds.len(), 2);
+            assert!(w.rounds.iter().all(|round| round.named.contains(&2)));
+            net.now = 2_000;
+            exit_lands(&mut net, 1);
+            net.post(1, "c");
+            net.pump();
+            assert_eq!(restarts(&net, 1), 2, "c on a new chain");
+            assert_eq!(net.devices[&2].shown(), vec!["a", "b", "c"]);
+            let before = wraps_to(&net, 1, 2);
+            net.tell(1, wanted_by(2));
+            net.pump();
+            assert_eq!(wraps_to(&net, 1, 2) - before, 2, "one key a chain");
+        }
+
+        /// The most a frame counts a wrap at holds for the largest, a pre-key message, and a
+        /// reader's most, alone in a frame, is a message the host can send.
+        #[test]
+        fn no_wrap_takes_more_of_a_frame_than_counted() {
+            let mut net = Net::with(&[1, 2]);
+            let bundle = prekey::bundle(&net.devices[&2].stores).unwrap();
+            let w = net.devices.get_mut(&1).unwrap();
+            ready(session::establish_session(&mut w.stores, 2, &bundle)).unwrap();
+            let message = ready(group::create_distribution_message(&mut w.stores, 1, CH)).unwrap();
+            let (ct, kind) = ready(session::encrypt_message(&mut w.stores, 2, &message)).unwrap();
+            assert_eq!(kind, 1, "a pre-key message");
+            assert!(ct.len() + 8 <= WRAP_MOST_BYTES, "{}", ct.len());
+            for n in [MAX_SENDER_KEY_STATES, WRAP_FRAME_BYTES / (ct.len() + 8)] {
+                let keys = (0..n).map(|_| (u32::MAX, kind, ct.clone())).collect();
+                let frame = ClientMessage::DistributeSenderKeys {
+                    channel_id: u32::MAX,
+                    keys,
+                };
+                let payload = voipc_protocol::codec::client_payload(&frame).unwrap();
+                assert!(
+                    payload.len() <= n * (ct.len() + 8) + 16,
+                    "{n}: {}",
+                    payload.len()
+                );
+            }
         }
 
         // ── Who is owed ─────────────────────────────────────────────────────
@@ -3778,6 +5633,7 @@ mod tests {
                 ciphertext: vec![],
                 message_type: 1,
                 timestamp: 0,
+                account: None,
             };
             assert!(
                 d.k.live_holds_frame(&dm),
@@ -4165,7 +6021,7 @@ mod tests {
             let w = k.live.writing.entry(CH).or_default();
             w.started = Some(0);
             w.named.extend(10..710);
-            k.live.opens.extend((10..710).map(|id| (CH, id)));
+            k.live.opens.extend((10..710).map(|id| (CH, id, For::Owed)));
 
             let frame = |k: &mut ChannelKeying, s: &mut SignalStores, now, call| match k
                 .live_next_frame(s, now, call, WRAPS_A_FRAME)
@@ -4206,7 +6062,7 @@ mod tests {
                 let bundle = prekey::bundle(&net.devices[id].stores).unwrap();
                 let d = net.devices.get_mut(&1).unwrap();
                 ready(session::establish_session(&mut d.stores, *id, &bundle)).unwrap();
-                d.k.live.wraps.push_back((CH, *id));
+                d.k.live.wraps.push(CH, *id, For::Owed);
             }
             let d = net.devices.get_mut(&1).unwrap();
             let Some(ClientMessage::DistributeSenderKeys { keys, .. }) =
@@ -4235,7 +6091,7 @@ mod tests {
                 let bundle = prekey::bundle(&net.devices[id].stores).unwrap();
                 let d = net.devices.get_mut(&1).unwrap();
                 ready(session::establish_session(&mut d.stores, *id, &bundle)).unwrap();
-                d.k.live.wraps.push_back((CH, *id));
+                d.k.live.wraps.push(CH, *id, For::Owed);
             }
             let d = net.devices.get_mut(&1).unwrap();
             for (made, left) in [(8, 12), (8, 4), (4, 0)] {

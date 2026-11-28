@@ -54,8 +54,8 @@ use voipc_protocol::types::{LinkedProvider, PowChallenge, ProviderKind, VaultBlo
 
 use super::links;
 use super::{
-    next, refused, second_factor, step, unexpected, vault_item_ok, Relay, SignedIn, BUSY, PINS_NS,
-    RESET_KEY_LEN, SLOT_RESET, STEP_WAIT, VAULT_MAX_ITEMS, VAULT_NS, VAULT_TOTAL_BYTES,
+    next, refused, second_factor, step, unexpected, vault_item_ok, Relay, SignedIn, BUSY, GK_NS,
+    PINS_NS, RESET_KEY_LEN, SLOT_RESET, STEP_WAIT, VAULT_MAX_ITEMS, VAULT_NS, VAULT_TOTAL_BYTES,
 };
 use crate::state::{RateLimiter, ServerState};
 
@@ -997,7 +997,10 @@ async fn signup<S: AsyncRead + AsyncWrite + Unpin>(
             ts: &ts,
             ..Default::default()
         };
-        let _work = relay.pending_slot(ip).ok_or_else(|| BUSY.to_string())?;
+        let _work = relay
+            .pending_slot(ip)
+            .await
+            .ok_or_else(|| BUSY.to_string())?;
         if let Some(code) = invite.filter(|c| links::is_link_code(c)) {
             let how = links::How::Provider(cookie);
             match links::register(relay, ctx, code, &name, how, &altcha, &ts).await {
@@ -1080,8 +1083,10 @@ pub(crate) async fn claim(
         warn!(user = %user.hex(), "a claim refused: {e:#}");
         return Err(gone());
     }
-    // What a claim that died halfway left, which nobody could open
-    for ns in [VAULT_NS, PINS_NS] {
+    // What a claim that died halfway left, which nobody could open, and what an identity
+    // before it endorsed in the group key (`reclaim` in the shell reaches no live group)
+    relay.gk_identity_reset(&user.0).await;
+    for ns in [VAULT_NS, PINS_NS, GK_NS] {
         relay
             .store()
             .delete_blobs(user, ns)
@@ -1148,7 +1153,10 @@ async fn pick_name<S: AsyncRead + AsyncWrite + Unpin>(
         if name.trim().eq_ignore_ascii_case(&user.username) {
             return Ok(());
         }
-        let _work = relay.pending_slot(ip).ok_or_else(|| BUSY.to_string())?;
+        let _work = relay
+            .pending_slot(ip)
+            .await
+            .ok_or_else(|| BUSY.to_string())?;
         match relay.placeholder_rename(ctx, user.id, &name).await? {
             Ok(new) => {
                 user.username = new;
@@ -1175,9 +1183,9 @@ async fn finish<S: AsyncRead + AsyncWrite + Unpin>(
     binding: Option<[u8; voipc_crypto::bind::BIND_LEN]>,
 ) -> Result<SignedIn, String> {
     let gone = || "Something went wrong. Please try again.".to_string();
-    let work = || relay.pending_slot(ip).ok_or_else(|| BUSY.to_string());
+    let work = || async { relay.pending_slot(ip).await.ok_or_else(|| BUSY.to_string()) };
     let (mut user, info, scopes, blobs, known) = {
-        let _work = work()?;
+        let _work = work().await?;
         let (user, info, scopes) = relay
             .accounts
             .session_from_token(&session.token, util::now())
@@ -1213,7 +1221,7 @@ async fn finish<S: AsyncRead + AsyncWrite + Unpin>(
                 identity_key,
                 vault,
             } if claim_it => {
-                let _work = work()?;
+                let _work = work().await?;
                 claim(relay, user.id, &user.username, &identity_key, &vault).await?;
                 info!(user = %user.id.hex(), "account claimed through a provider");
                 break identity_key;
@@ -1261,7 +1269,7 @@ async fn finish<S: AsyncRead + AsyncWrite + Unpin>(
     if sent != identity_key {
         return Err("This device's identity key is not your account's.".into());
     }
-    let _work = work()?;
+    let _work = work().await?;
     let account = relay.info_of(&user, &scopes).await.map_err(|_| gone())?;
     let standing = relay.standing(&user, &scopes).await.map_err(|_| gone())?;
     info!(user = %user.id.hex(), method = %info.method, "account signed in");
@@ -1439,7 +1447,7 @@ impl Relay {
             .reset_2fa_as_host(ctx, user.id)
             .await
             .map_err(|e| e.message().to_string())?;
-        for ns in [VAULT_NS, PINS_NS] {
+        for ns in [VAULT_NS, PINS_NS, GK_NS] {
             self.store()
                 .delete_blobs(user.id, ns)
                 .await
@@ -1452,6 +1460,7 @@ impl Relay {
             for q in [
                 "DELETE FROM voipc_identity WHERE account = $1",
                 "DELETE FROM voipc_logkeys WHERE account = $1",
+                "DELETE FROM voipc_log_kems WHERE account = $1",
                 "DELETE FROM voipc_members WHERE account = $1",
                 "DELETE FROM voipc_pending WHERE owner = $1 OR recipient = $1",
             ] {
@@ -1462,6 +1471,9 @@ impl Relay {
         super::log::walk(self.store(), &user.id.0)
             .await
             .map_err(|e| e.to_string())?;
+        // Its seat keys and what they made go too; its seats exit at the claim that opens it
+        // anew, in the relay's own process
+        self.gk_identity_reset(&user.id.0).await;
         info!(user = %user.id.hex(), "account reclaimed from the shell");
         Ok(())
     }

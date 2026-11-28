@@ -544,7 +544,8 @@ cd .. && cargo build -p voipc-server --release
 
 The web end-to-end test starts a server on test ports with a throwaway certificate, runs two headless
 browsers with a fake microphone through the in-page self-test, and checks that they see each
-other, exchange the media key over Signal, hear each other's voice, read each other's channel
+other, get the voice room's media key (from the room's epoch key under the group key, over Signal with
+`GK=0`), hear each other's voice, read each other's channel
 messages and DMs, and that one watches the other's screen share (an animated canvas stands in
 for the display, so no real capture is needed). Set `CHROME=/path/to/chrome` if Chromium is not
 on `PATH`.
@@ -554,6 +555,7 @@ npm run test:web                                  # Chromium on both sides
 BROWSER=firefox ./test-web.sh                     # Firefox on both sides
 BROWSER_ALICE=chromium BROWSER_BOB=firefox ./test-web.sh   # Chromium shares H.264, Firefox watches
 BROWSER_ALICE=firefox BROWSER_BOB=chromium ./test-web.sh   # Firefox shares VP9, Chromium watches
+GK=0 ./test-web.sh                                # the same with the group key off (the live path)
 ```
 
 The Firefox lane needs `certutil` (Arch: `nss`, Debian/Ubuntu: `libnss3-tools`) to trust the

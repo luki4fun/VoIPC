@@ -22,6 +22,8 @@ pub mod file;
 #[cfg(any(test, fuzzing))]
 pub mod fuzz;
 pub mod group;
+pub mod group_key;
+pub mod group_state;
 pub mod identity;
 pub mod log;
 pub mod media_keys;
