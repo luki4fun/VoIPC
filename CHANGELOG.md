@@ -182,6 +182,10 @@ No outside cryptographer has reviewed it.
 
   Nothing becomes readable that was not readable already. A writer also hands one reader at most 5 keys at a time,
   which bounds what a made-up request costs, and keeps every key message under the size limit.
+- **Two advisories fixed in the lockfile:** `url` 2.5.9 (RUSTSEC-2026-0592, a stack overflow in `Url::origin()` on
+  nested `blob:` URLs; the relay has it through l4f-accounts' HTTP client, the desktop app through Tauri) and `cookie`
+  0.18.3 (RUSTSEC-2026-0594, private cookie nonces that can repeat after a fork; through Tauri). `async-executor`
+  1.14.0, which was yanked, is 1.14.1.
 
 ### Added
 - **The group epoch key in every text channel and voice room** (`group_key = true`, [GROUP-KEY.md](docs/GROUP-KEY.md)).
