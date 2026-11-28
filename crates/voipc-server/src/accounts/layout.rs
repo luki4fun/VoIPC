@@ -328,7 +328,7 @@ impl Relay {
     /// rows (a chain counts as its steps) and gives the writer back. Stops, and forgets the
     /// purge, if a channel of that log is back.
     async fn purge_rows(&self, conv: &str) -> Result<()> {
-        const BATCHED: [(&str, i64); 18] = [
+        const BATCHED: [(&str, i64); 20] = [
             (
                 "DELETE FROM voipc_log WHERE seq IN (SELECT seq FROM voipc_log WHERE conv = $1 LIMIT $2)",
                 PURGE_BATCH,
@@ -421,6 +421,18 @@ impl Relay {
             (
                 "DELETE FROM voipc_gk_self WHERE (grp, account, gen, seed, tag_sk, tag_sx, kind) IN
                  (SELECT grp, account, gen, seed, tag_sk, tag_sx, kind FROM voipc_gk_self WHERE grp = $1 LIMIT $2)",
+                PURGE_BATCH,
+            ),
+            // What a restart would ask again (0014): eager seats (up to `kept_seats`, or every
+            // member's) and exits asked (a new password's can name every member)
+            (
+                "DELETE FROM voipc_gk_eager WHERE (grp, account) IN
+                 (SELECT grp, account FROM voipc_gk_eager WHERE grp = $1 LIMIT $2)",
+                PURGE_BATCH,
+            ),
+            (
+                "DELETE FROM voipc_gk_exit_asks WHERE (grp, account) IN
+                 (SELECT grp, account FROM voipc_gk_exit_asks WHERE grp = $1 LIMIT $2)",
                 PURGE_BATCH,
             ),
         ];

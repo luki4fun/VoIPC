@@ -950,7 +950,7 @@ fn a_busy_browser_is_asked_only_when_no_better_volunteer_is_online_and_hands_ove
     let (b1, b2, shown) = (browser(1), browser(2), browser(3));
     let busy = |p: &Person| p.volunteer(gk::platform::BROWSER_BUSY);
     let mut vols: HashMap<UserId, Volunteer> = [(1, busy(&b1))].into();
-    let first = crate::gk::holders::starter(text, &vols, false).map(|v| v.sid);
+    let first = crate::gk::holders::starter(text, &vols, false, &Default::default()).map(|v| v.sid);
     assert_eq!(first, Some(1), "the only volunteer starts the group");
     let mut h = Holders::default();
     h.set_to(vec![b1.entry()], |_| None);
@@ -1661,6 +1661,16 @@ async fn the_account_hooks_seat_an_account_eagerly_and_exit_its_seat_at_a_rotati
     net.groups
         .on_follow(7, &id, GroupKind::Text, asid, Some(a.0));
     net.groups.on_log_join("lounge", a.0, raw(&ann)).await;
+    let old = seat1.public().seat(MemberId::Account(a.0));
+    // The eager seat is asked in the store before the actor hears of it (dive 4 F7)
+    let ask = crate::accounts::gk::EagerAsk {
+        account: a.0,
+        seat: seat_record(&old),
+    };
+    assert_eq!(
+        crate::accounts::gk::eager_asks(&db, &id).await.unwrap(),
+        vec![ask]
+    );
     let (due, piece) = due_within(&mut net, k.sid, 5_000)
         .await
         .expect("a Genesis for the eager seat");
@@ -1691,7 +1701,6 @@ async fn the_account_hooks_seat_an_account_eagerly_and_exit_its_seat_at_a_rotati
     let b = join_on(&k, &id, &head, &mut h, &piece, true, net.groups.now());
     let gen = b.header.header().gen;
     net.commit(k.sid, &id, due, &b).await;
-    let old = seat1.public().seat(MemberId::Account(a.0));
     // Stored once the actor took it (a Postgres commit takes its time)
     let mut makers = vec![];
     for _ in 0..100 {
@@ -1707,6 +1716,16 @@ async fn the_account_hooks_seat_an_account_eagerly_and_exit_its_seat_at_a_rotati
         "a stored Join rows each new account seat (open choice 24)"
     );
     assert_eq!(makers[0].from.kx, k.wire().kx());
+    // Seated: asked no more
+    let mut left = vec![ask];
+    for _ in 0..100 {
+        left = crate::accounts::gk::eager_asks(&db, &id).await.unwrap();
+        if left.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(left.is_empty(), "{left:?}");
     // A rotation: the old seat exits, the new one waits to be seated
     let (seat2, e2) = publish(2);
     let pair = Pair {
@@ -1714,6 +1733,15 @@ async fn the_account_hooks_seat_an_account_eagerly_and_exit_its_seat_at_a_rotati
         endorsement: e2,
     };
     net.groups.on_seat_keys(a.0, pair, raw(&ann)).await;
+    let new = seat2.public().seat(MemberId::Account(a.0));
+    assert_eq!(
+        crate::accounts::gk::eager_asks(&db, &id).await.unwrap(),
+        vec![crate::accounts::gk::EagerAsk {
+            account: a.0,
+            seat: seat_record(&new),
+        }],
+        "the new seat is asked"
+    );
     let reseated = |frames: Vec<ServerMessage>| {
         frames
             .into_iter()
@@ -1733,7 +1761,6 @@ async fn the_account_hooks_seat_an_account_eagerly_and_exit_its_seat_at_a_rotati
         }
     }
     assert_eq!(got, vec![(2, 1)], "one group to re-seat");
-    let new = seat2.public().seat(MemberId::Account(a.0));
     net.groups.reseat_done_for_test(&id, &new);
     let got = drain(net.rxs.get_mut(&asid).unwrap()).await;
     assert_eq!(reseated(got), vec![(2, 0)], "done: the old keys may go");
@@ -1747,7 +1774,7 @@ async fn the_account_hooks_seat_an_account_eagerly_and_exit_its_seat_at_a_rotati
         (gk::due::EXITS, old.into())
     );
     // The account is gone: its waiting seat with it
-    net.groups.on_log_leave("lounge", a.0, cause::LEAVE);
+    net.groups.on_log_leave("lounge", a.0, cause::LEAVE).await;
     net.groups.on_account_gone(a.0, cause::DELETED).await;
     let row = stats_until(&net, 7, |r| r.joins_waiting == 0).await;
     assert_eq!(row.joins_waiting, 0);
@@ -3786,6 +3813,8 @@ async fn a_seed_page_takes_only_its_own_seats_under_its_seed_and_pushes_each_wel
         seed: 2,
         seats: [mine].into(),
         deadline: now + 60_000,
+        parent: [0; 32],
+        moved: false,
     });
     let w = |seat: SeatRef| gk::SeedWelcomeOut {
         seat: seat.into(),
@@ -4267,7 +4296,7 @@ async fn with_the_switch_off_the_account_hooks_start_no_group_and_write_no_gk_ta
     let ann = db_account(&db, 50, Some("c:den-off")).await;
     let a = ann.account.unwrap();
     groups.on_log_join("c:den-off", a, raw(&ann.ik)).await;
-    groups.on_log_leave("c:den-off", a, cause::LEAVE);
+    groups.on_log_leave("c:den-off", a, cause::LEAVE).await;
     groups.on_seat_keys(a, ann.wire(), raw(&ann.ik)).await;
     groups.on_device_removed(a, &[1; 16]).await;
     groups.on_account_gone(a, cause::LEAVE).await;
@@ -4312,7 +4341,7 @@ async fn a_deleted_channel_names_its_group_no_more() {
     net.groups.on_channel_gone(5, id);
     assert!(!net.groups.gated(5), "its gate went with it");
     assert!(net.groups.stats().is_empty(), "its group stopped");
-    net.groups.on_log_leave(id, [1; 16], cause::LEAVE);
+    net.groups.on_log_leave(id, [1; 16], cause::LEAVE).await;
     let rows = net.groups.stats();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].channel_id, 0, "it names no channel that is gone");
@@ -4562,6 +4591,8 @@ async fn a_declined_seed_page_is_asked_again_at_once_and_is_no_miss() {
         seed: 2,
         seats: [people[0].seat()].into(),
         deadline: now + 60_000,
+        parent: [0; 32],
+        moved: false,
     });
     g.next_page = now + 10_000;
     let mut out = vec![];
@@ -4712,6 +4743,370 @@ async fn a_text_roll_ends_at_its_24_h_and_the_pages_go_on_for_the_seats_behind()
     now += 60_000;
     assert_eq!(g.page_wanted(now), None);
     assert!(!g.left_behind && !g.paging());
+}
+
+// ── dive 3 P3: seed welcomes owed to eager seats ─────────────────────────
+
+/// A stored text group on a memory store: guest keyholder 1's Genesis, dated `back` ms ago (a
+/// seed old enough to roll), then a Join that seats account 2 with no session waiting for it
+/// (an eager seat, plan 2d) and account 3 for its session's fetch.
+async fn eager_seated(
+    store: &Store,
+    back: u64,
+) -> (GroupState, Person, Holds, Person, Person, u64) {
+    let mut g = new_group(true);
+    let k = Person::guest(1);
+    let mut now = now_ms();
+    let mut out = vec![];
+    g.follow(1, None);
+    g.volunteer(1, Some(k.volunteer(gk::platform::DESKTOP)), now, &mut out);
+    g.fetch(1, k.fetch(), now, &mut out);
+    let (due, piece) = dues(&out, 1).pop().expect("a Genesis due");
+    let b = genesis(&k, ID, &piece, true, now - back);
+    let mut out = vec![];
+    let t = send(&mut g, 1, due, &b, now, &mut out).expect("taken");
+    land(&mut g, store, t, now, &mut out).await;
+    let mut h = Holds {
+        ring: b.ring,
+        krk: b.krk,
+        cache: RowBases::new(),
+    };
+    let (eager, waiting) = (Person::account(2, [2; 16]), Person::account(3, [3; 16]));
+    let mut out = vec![];
+    g.eager(eager.joiner(), [2; 16], now, &mut out);
+    g.follow(3, Some([3; 16]));
+    assert_eq!(g.fetch(3, waiting.fetch(), now, &mut out), Fetched::Not);
+    now += 2_000;
+    let mut out = vec![];
+    g.tick(now, &mut out);
+    let (due, piece) = dues(&out, 1).pop().expect("a Join due");
+    assert_eq!((piece.kind, piece.joins.len()), (gk::due::JOIN, 2));
+    let b = join(&g, &k, &mut h, &piece, now);
+    let mut out = vec![];
+    let t = send(&mut g, 1, due, &b, now, &mut out).expect("taken");
+    land(&mut g, store, t, now, &mut out).await;
+    h.took(b);
+    (g, k, h, eager, waiting, now)
+}
+
+/// The page `out` sends keyholder 1, with its id.
+fn page_out(out: &[Out]) -> (u64, DuePiece) {
+    let (id, piece) = dues(out, 1).pop().expect("a page");
+    assert_eq!(piece.kind, gk::due::SEED_WELCOMES);
+    (id, piece)
+}
+
+/// dive 3 P3: an account seat a Join seated with no session waiting for it holds its member
+/// secret under the head seed only in that seat welcome, which no device takes. It is owed a
+/// seed welcome under the head seed, roll or not, and the relay pages it; the seat a session
+/// waited for (its device takes its seat welcome and writes its self-row) is not. Once the
+/// welcome is stored, nothing is owed.
+#[tokio::test]
+async fn an_eager_seat_is_paged_a_seed_welcome_under_the_head_seed_with_no_roll() {
+    let store = Store::memory();
+    let (mut g, k, _, eager, waiting, now) = eager_seated(&store, 0).await;
+    assert!(!g.paging(), "no roll runs");
+    assert_eq!(g.seed_owed, [eager.seat()].into(), "the eager seat alone");
+    assert!(g.seats.contains_key(&waiting.seat()));
+    assert_eq!(g.page_wanted(now), Some(vec![eager.seat()]));
+    let mut out = vec![];
+    g.ask_page(
+        vec![(eager.seat(), raw(&eager.ik), eager.wire())],
+        vec![],
+        now,
+        &mut out,
+    );
+    let (id, piece) = page_out(&out);
+    assert_eq!(piece.seed_seats.len(), 1);
+    assert_eq!(
+        g.page.as_ref().map(|p| p.seed),
+        Some(1),
+        "under the head seed"
+    );
+    let gen = g.gen().unwrap();
+    let w = gk::SeedWelcomeOut {
+        seat: eager.seat().into(),
+        bytes: vec![7; gk::SEED_WELCOME_BYTES],
+    };
+    let mut out = vec![];
+    let (by, took) = g.take_welcomes(1, id, gen, 1, vec![w], &mut out).unwrap();
+    store.seeds(ID, &gen, 1, &by, &took, now).await.unwrap();
+    g.seeded(by, 1, &took, now, &mut out);
+    assert!(g.seed_owed.is_empty() && g.page.is_none(), "owed no more");
+    assert_eq!(g.page_wanted(now + 60_000), None, "nothing left to page");
+    assert!(
+        store
+            .seed_welcome(ID, &gen, &eager.seat(), 1)
+            .await
+            .is_some(),
+        "kept for the seat's next connection"
+    );
+    let _ = k;
+}
+
+/// dive 3 P3: a keyholder works one due of a group at a time, and a page is one (holder.rs
+/// `on_due` drops what it had in hand). A due to the page's keyholder lets the page go, with
+/// no miss (it waited out its 60 s and counted toward a healthy keyholder's removal), and no
+/// page is asked of a keyholder while it has a due out (that dropped the due); the page is
+/// asked again once the due landed.
+#[tokio::test]
+async fn a_due_to_the_pages_keyholder_lets_the_page_go_with_no_miss_and_waits_for_it() {
+    let store = Store::memory();
+    let (mut g, k, mut h, eager, _, mut now) = eager_seated(&store, 0).await;
+    g.page_wanted(now).expect("a page");
+    let mut out = vec![];
+    g.ask_page(
+        vec![(eager.seat(), raw(&eager.ik), eager.wire())],
+        vec![],
+        now,
+        &mut out,
+    );
+    assert!(g.page.is_some());
+    // A guest fetches: its Join goes to the only keyholder, the page's
+    let p = Person::guest(5);
+    g.follow(5, None);
+    let mut out = vec![];
+    g.fetch(5, p.fetch(), now, &mut out);
+    now += 2_000;
+    let mut out = vec![];
+    g.tick(now, &mut out);
+    let (due, piece) = dues(&out, 1).pop().expect("a Join due");
+    assert_eq!(piece.kind, gk::due::JOIN);
+    assert!(g.page.is_none(), "the page is let go");
+    assert_eq!(g.next_page, now, "and asked again as soon as it may");
+    assert!(stales(&out, 1).is_empty(), "no stale: it was no miss");
+    assert_eq!(
+        g.page_wanted(now),
+        None,
+        "no page while its keyholder has a due out"
+    );
+    let b = join(&g, &k, &mut h, &piece, now);
+    let mut out = vec![];
+    let t = send(&mut g, 1, due, &b, now, &mut out).expect("taken");
+    land(&mut g, &store, t, now, &mut out).await;
+    assert_eq!(
+        g.page_wanted(now),
+        Some(vec![eager.seat()]),
+        "asked again once the Join landed"
+    );
+    assert!(
+        g.holders
+            .stats
+            .get(&k.wire().kx())
+            .is_none_or(|s| s.missed.is_empty()),
+        "no miss"
+    );
+}
+
+/// Fix review P3-R3: a page keeps the head it was asked at, and a keyholder that fetches the
+/// keyring builds it there only (holder.rs `advance`; the relay hands the ring at its head).
+/// Another keyholder's commit landing first left it unbuildable: it waited out its 60 s and
+/// counted a miss toward a healthy keyholder's removal. Now a head move under the page's seed
+/// waits 5 s more for an answer on its way, then lets the page go with no miss and asks it
+/// again at the head. The control: a page under an unmoved head still misses at 60 s.
+#[tokio::test]
+async fn a_page_the_head_moved_under_goes_soon_with_no_miss_and_is_asked_again() {
+    let ask = |g: &mut GroupState, eager: &Person, now: u64| {
+        g.page_wanted(now).expect("a page");
+        let mut out = vec![];
+        g.ask_page(
+            vec![(eager.seat(), raw(&eager.ik), eager.wire())],
+            vec![],
+            now,
+            &mut out,
+        );
+        // Out to a second keyholder (sid 9): a due to keyholder 1 does not drop it
+        let p = g.page.as_mut().expect("asked");
+        assert_eq!(
+            p.parent,
+            g.head.as_ref().unwrap().sh.d(),
+            "asked at the head"
+        );
+        p.sid = 9;
+        p.by = HolderRef {
+            m: MemberId::Conn(9),
+            kx: [9; 32],
+        };
+    };
+    let misses = |g: &GroupState| g.holders.stats.get(&[9; 32]).map_or(0, |s| s.missed.len());
+    // The control: nothing moves, the page misses at its 60 s
+    let store = Store::memory();
+    let (mut g, _, _, eager, _, now) = eager_seated(&store, 0).await;
+    ask(&mut g, &eager, now);
+    let mut out = vec![];
+    g.tick(now + 59_000, &mut out);
+    assert!(g.page.is_some(), "the control: still out at 59 s");
+    g.tick(now + 60_000, &mut out);
+    assert!(g.page.is_none());
+    assert_eq!(misses(&g), 1, "the control: a miss at 60 s");
+    // Keyholder 1 commits a guest's Join while the page is out: the head moves
+    let store = Store::memory();
+    let (mut g, k, mut h, eager, _, mut now) = eager_seated(&store, 0).await;
+    ask(&mut g, &eager, now);
+    let p = Person::guest(5);
+    g.follow(5, None);
+    let mut out = vec![];
+    g.fetch(5, p.fetch(), now, &mut out);
+    now += 2_000;
+    let mut out = vec![];
+    g.tick(now, &mut out);
+    let (due, piece) = dues(&out, 1).pop().expect("a Join due");
+    assert_eq!(piece.kind, gk::due::JOIN);
+    assert!(
+        g.page.is_some(),
+        "a due to another keyholder leaves the page"
+    );
+    let b = join(&g, &k, &mut h, &piece, now);
+    let mut out = vec![];
+    let t = send(&mut g, 1, due, &b, now, &mut out).expect("taken");
+    land(&mut g, &store, t, now, &mut out).await;
+    let p = g.page.as_ref().expect("still waited for");
+    assert!(p.moved, "the head moved under it");
+    assert_eq!(p.deadline, now + 5_000, "for 5 s more");
+    let mut out = vec![];
+    g.tick(now + 5_000, &mut out);
+    assert!(g.page.is_none(), "let go");
+    assert_eq!(
+        stales(&out, 9),
+        vec![stale::TIMED_OUT],
+        "its keyholder told"
+    );
+    assert_eq!(misses(&g), 0, "no miss for it");
+    assert_eq!(g.next_page, now + 5_000, "asked again as soon as it may");
+    assert_eq!(
+        g.page_wanted(now + 5_000),
+        Some(vec![eager.seat()]),
+        "asked again, at the head"
+    );
+}
+
+/// dive 3 P3: once a roll starts, a seed welcome under the old seed can no longer be made
+/// (keyholders page under the head's): the owed seats are behind, and the roll's pages take
+/// them, under the new seed.
+#[tokio::test]
+async fn a_roll_start_leaves_the_owed_seats_to_the_rolls_pages() {
+    let store = Store::memory();
+    let (mut g, k, mut h, eager, _, mut now) = eager_seated(&store, 25 * 3_600_000).await;
+    assert_eq!(g.seed_owed, [eager.seat()].into());
+    g.rolls.removal = true;
+    now += 61_000;
+    let mut out = vec![];
+    g.tick(now, &mut out);
+    let (due, piece) = dues(&out, 1).pop().expect("a refresh");
+    assert_eq!(piece.kind, gk::due::REFRESH);
+    let b = opening(&g, &k, &mut h, &piece, now);
+    let mut out = vec![];
+    let t = send(&mut g, 1, due, &b, now, &mut out).expect("taken");
+    land(&mut g, &store, t, now, &mut out).await;
+    assert!(g.roll_runs(), "the refresh started a roll");
+    assert!(g.seed_owed.is_empty(), "nothing owed under the old seed");
+    let want = g.page_wanted(now).expect("the roll's page");
+    assert!(want.contains(&eager.seat()), "the roll's page has the seat");
+}
+
+/// dive 3 P3: an owed seat whose keys the relay cannot find (rotated since, or no identity
+/// key) gets no seed welcome, but it holds the head seed and so holds no roll open: it is let
+/// go, not exited, as a seat behind a roll is.
+#[tokio::test]
+async fn an_owed_seat_with_no_keys_found_is_let_go_not_exited() {
+    let store = Store::memory();
+    let (mut g, _, _, eager, _, now) = eager_seated(&store, 0).await;
+    let mut out = vec![];
+    g.ask_page(vec![], vec![(eager.seat(), cause::ROTATION)], now, &mut out);
+    assert!(g.seed_owed.is_empty(), "let go");
+    assert!(!g.exits.has(&eager.seat()), "not exited");
+    assert!(g.page.is_none());
+}
+
+/// The seats a stored group's load owes a seed welcome (dive 3 P3).
+async fn owed_after_load(store: &Store, id: &str) -> std::collections::HashSet<SeatRef> {
+    let mut g = GroupState::new(
+        id.into(),
+        GroupKind::Text,
+        true,
+        Arc::new(OpenCaps::default()),
+    );
+    store.load(&mut g).await.unwrap();
+    g.seed_owed
+}
+
+/// dive 3 P3: the seats owed a seed welcome outlive a restart or an idle stop before their
+/// page lands. A stored group's load owes one to each account seat under the head seed whose
+/// member secret is in no seed welcome and no self-row of its account, and to none once
+/// either is stored.
+#[tokio::test]
+async fn a_loaded_stored_group_owes_a_seed_welcome_to_each_account_seat_whose_secret_is_nowhere() {
+    let id = "c:lounge-p3";
+    let (db, file) = scratch_db().await;
+    let inc = crate::accounts::gk::gk_start(&db, true)
+        .await
+        .unwrap()
+        .unwrap();
+    let store = Store::Db(Arc::new(crate::gk::store::DbStore {
+        db: db.clone(),
+        incarnation: inc,
+    }));
+    let mut g = GroupState::new(
+        id.into(),
+        GroupKind::Text,
+        true,
+        Arc::new(OpenCaps::default()),
+    );
+    let k = Person::guest(1);
+    let mut now = now_ms();
+    let mut out = vec![];
+    g.follow(1, None);
+    g.volunteer(1, Some(k.volunteer(gk::platform::DESKTOP)), now, &mut out);
+    g.fetch(1, k.fetch(), now, &mut out);
+    let (due, piece) = dues(&out, 1).pop().unwrap();
+    let b = genesis(&k, id, &piece, true, now);
+    let mut out = vec![];
+    let t = send_to(&mut g, id, 1, due, &b, now, &mut out).expect("taken");
+    land(&mut g, &store, t, now, &mut out).await;
+    let head = b.header.clone();
+    let mut h = Holds {
+        ring: b.ring,
+        krk: b.krk,
+        cache: RowBases::new(),
+    };
+    let (x, y) = (Person::account(2, [2; 16]), Person::account(3, [3; 16]));
+    let mut out = vec![];
+    g.eager(x.joiner(), [2; 16], now, &mut out);
+    g.eager(y.joiner(), [3; 16], now, &mut out);
+    now += 2_000;
+    let mut out = vec![];
+    g.tick(now, &mut out);
+    let (due, piece) = dues(&out, 1).pop().expect("a Join due");
+    let b = join_on(&k, id, &head, &mut h, &piece, true, now);
+    let mut out = vec![];
+    let t = send_to(&mut g, id, 1, due, &b, now, &mut out).expect("taken");
+    land(&mut g, &store, t, now, &mut out).await;
+    let both: std::collections::HashSet<SeatRef> = [x.seat(), y.seat()].into();
+    assert_eq!(g.seed_owed, both, "owed as seated");
+    assert_eq!(owed_after_load(&store, id).await, both, "and after a load");
+    // x's seed welcome under seed 1, y's self-row for it: owed no more
+    let gen = g.gen().unwrap();
+    let by = HolderRef {
+        m: k.m(),
+        kx: k.wire().kx(),
+    };
+    let w = vec![(x.seat(), vec![7; gk::SEED_WELCOME_BYTES])];
+    store.seeds(id, &gen, 1, &by, &w, now).await.unwrap();
+    let row = gk::SelfRowIn {
+        group: id.into(),
+        gen,
+        seed: 1,
+        sk: y.seat().tag_sk,
+        sx: y.seat().tag_sx,
+        kind: gk::self_row::SELF_ROW,
+        sealed: vec![7; gk::SELF_ROW_BYTES],
+    };
+    let kept = crate::accounts::gk::put_self_rows(&db, &[3; 16], &[row])
+        .await
+        .unwrap();
+    assert_eq!(kept, 1);
+    assert!(owed_after_load(&store, id).await.is_empty());
+    drop_db(&file);
 }
 
 /// Review 8: a rotation exited the old seat in stored groups only, so in a memory group it
@@ -5364,7 +5759,8 @@ fn a_voice_room_starts_with_its_lowest_user_id_on_any_platform_and_takes_no_volu
         .zip(platforms)
         .map(|(p, platform)| (p.sid, p.volunteer(platform)))
         .collect();
-    let first = |kind| crate::gk::holders::starter(kind, &vols, false).map(|v| v.sid);
+    let first =
+        |kind| crate::gk::holders::starter(kind, &vols, false, &Default::default()).map(|v| v.sid);
     assert_eq!(first(GroupKind::Voice), Some(3));
     assert_eq!(first(GroupKind::Text), Some(6));
     let mut g = voice_group();
@@ -6100,4 +6496,452 @@ async fn an_at_once_regenesis_comes_no_sooner_than_the_gap_after_the_last_openin
     g.tick(at, &mut out);
     let kinds: Vec<u8> = dues(&out, v.sid).into_iter().map(|(_, p)| p.kind).collect();
     assert_eq!(kinds, vec![gk::due::REGENESIS], "once the gap is out");
+}
+
+// ── Dive 4 F7: the shutdown drain ─────────────────────────────────────────
+
+/// The scratch database `file` names, connected again (after its pool was closed).
+async fn reopen(file: &std::path::Path) -> l4f_accounts::store::Store {
+    let url = match std::env::var("VOIPC_TEST_POSTGRES") {
+        Ok(server) => {
+            let id = file
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.rsplit('-').next())
+                .unwrap();
+            let (base, _) = server.rsplit_once('/').unwrap();
+            format!("{base}/voipc_gkt_{id}")
+        }
+        Err(_) => format!("sqlite://{}?mode=rwc", file.display()),
+    };
+    l4f_accounts::store::Store::connect(&url).await.unwrap()
+}
+
+/// Dive 4 F7: a shutdown (or a self-update's exec) closed the pool 500 ms after its broadcast,
+/// whatever the group actors still had queued: a message a hook had sent was never handled or
+/// never written. `Groups::drain` waits until each stored group's actor handled and wrote what
+/// was queued before it. Here the keyholder's seat exits as its connection unfollows, and the
+/// relay shuts down at once: the exit is written before the pool closes.
+#[tokio::test]
+async fn a_shutdown_drains_what_the_stored_groups_had_queued_before_the_pool_closes() {
+    let (db, file) = scratch_db().await;
+    let inc = crate::accounts::gk::gk_start(&db, true)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut net = Net::new();
+    net.groups.attach(db.clone(), inc);
+    let id = net.groups.id_for(7, Some("c:drain"));
+    let k = net.guest(7, &id);
+    net.volunteer(&k).await;
+    let p = net.guest(7, &id);
+    net.fetch(&p, &id).await;
+    let (due, piece) = due_within(&mut net, k.sid, 5_000).await.expect("a Genesis");
+    assert_eq!(piece.kind, gk::due::GENESIS);
+    let b = genesis(&k, &id, &piece, true, net.groups.now());
+    net.commit(k.sid, &id, due, &b).await;
+    let mut moved = false;
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if crate::accounts::gk::group(&db, &id)
+            .await
+            .unwrap()
+            .is_some()
+        {
+            moved = true;
+            break;
+        }
+    }
+    assert!(moved, "the Genesis is stored");
+    let seat = seat_record(&k.seat());
+    // Its exit is queued, then the relay shuts down: `main`'s order
+    net.groups.on_unfollow(7, k.sid);
+    net.groups.drain(std::time::Duration::from_secs(3)).await;
+    db.close().await;
+    let db = reopen(&file).await;
+    let rows = crate::accounts::gk::exits(&db, &id).await.unwrap();
+    assert!(
+        rows.iter().any(|e| e.seat == seat),
+        "the exit queued before the shutdown was written before the pool closed: {rows:?}"
+    );
+    drop_db(&file);
+}
+
+/// Review P3 of dive 4's fixes: a new start's eager pages are read and asked by a task beside
+/// the actor, a page at a time, once the head moved. A stop before they were all asked (a
+/// crash, a shutdown, a page read that failed) left the rest unasked until the next new start:
+/// asks are kept page by page, and a start asked again only the asks kept. Here the stop cuts
+/// the pages before the first is read; the relay's next start asks them, from where they
+/// stopped, and is done with them.
+#[tokio::test]
+async fn a_new_starts_eager_pages_cut_off_by_a_stop_are_asked_at_the_next_start() {
+    let (db, file) = scratch_db().await;
+    let inc = crate::accounts::gk::gk_start(&db, true)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut net = Net::new();
+    net.groups.attach(db.clone(), inc);
+    let id = net.groups.id_for(7, Some("c:pages"));
+    let (ann, ann_seat) = log_member(&db, &id, "ann", now_ms()).await;
+    let ask = crate::accounts::gk::EagerAsk {
+        account: ann,
+        seat: seat_record(&ann_seat.public().seat(MemberId::Account(ann))),
+    };
+    net.groups.cut_eager_for_test();
+    let k = net.guest(7, &id);
+    net.volunteer(&k).await;
+    let p = net.guest(7, &id);
+    net.fetch(&p, &id).await;
+    let (due, piece) = due_within(&mut net, k.sid, 5_000).await.expect("a Genesis");
+    assert_eq!(piece.kind, gk::due::GENESIS);
+    let b = genesis(&k, &id, &piece, true, net.groups.now());
+    net.commit(k.sid, &id, due, &b).await;
+    let mut stored = false;
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if crate::accounts::gk::group(&db, &id)
+            .await
+            .unwrap()
+            .is_some()
+        {
+            stored = true;
+            break;
+        }
+    }
+    assert!(stored, "the Genesis is stored");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let cut = crate::accounts::gk::eager_asks(&db, &id).await.unwrap();
+    assert!(
+        cut.is_empty(),
+        "the stop came before ann was asked: {cut:?}"
+    );
+    // The relay stops, and starts again over the same database
+    net.groups.on_purge(&id);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let mut again = Net::new();
+    again.groups.attach(db.clone(), inc);
+    let _q = again.guest(7, &id);
+    let mut asks = vec![];
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        asks = crate::accounts::gk::eager_asks(&db, &id).await.unwrap();
+        if !asks.is_empty() {
+            break;
+        }
+    }
+    let gen = b.header.header().gen;
+    let mut left = Some(None);
+    for _ in 0..100 {
+        left = crate::accounts::gk::eager_after(&db, &id, &gen)
+            .await
+            .unwrap();
+        if left.is_none() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        asks == vec![ask] && left.is_none(),
+        "after the start ann is asked: {asks:?}; pages still to ask, from: {left:?}"
+    );
+    again.groups.on_purge(&id);
+    drop_db(&file);
+}
+
+// ── Dive 4 round 2 (d4-r2-plan.md) ────────────────────────────────────────
+
+/// The one-column rows `q` reads.
+async fn blobs(db: &l4f_accounts::store::Store, q: &str) -> Vec<Vec<u8>> {
+    let q = sqlx::AssertSqlSafe(q.to_string());
+    match db {
+        l4f_accounts::store::Store::Lite(b) => sqlx::query_scalar(q).fetch_all(&b.0).await.unwrap(),
+        l4f_accounts::store::Store::Pg(b) => sqlx::query_scalar(q).fetch_all(&b.0).await.unwrap(),
+    }
+}
+
+/// Polls up to 5 s until `done` holds of what `read` gives; the last read.
+async fn until<T, F: std::future::Future<Output = T>>(
+    read: impl Fn() -> F,
+    done: impl Fn(&T) -> bool,
+) -> T {
+    let mut got = read().await;
+    for _ in 0..100 {
+        if done(&got) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        got = read().await;
+    }
+    got
+}
+
+/// Item 1, the live settle. ann's account joins the log while a guest keyholder is online: a
+/// Genesis, then a Join due seating her. Her account leaves the log while that Join is out: the
+/// hook asks her exit in the store, and the group enters it only once the Join lands
+/// (`exit_late`, memory alone). The ask stays until then, so a stop meanwhile still exits her;
+/// once the Join landed and her exit is written, the ask goes.
+#[tokio::test]
+async fn an_exit_asked_while_its_seat_is_being_seated_is_kept_until_the_exit_is_written() {
+    let (db, file) = scratch_db().await;
+    let inc = crate::accounts::gk::gk_start(&db, true)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut net = Net::new();
+    net.groups.attach(db.clone(), inc);
+    let id = net.groups.id_for(7, Some("lounge"));
+    let (a, seat1) = log_member(&db, &id, "ann", now_ms()).await;
+    let q = format!(
+        "SELECT identity_key FROM voipc_identity WHERE account = {}",
+        blob(&db, &a)
+    );
+    let ik = crate::gk::store::ik_raw(&blobs(&db, &q).await[0]).unwrap();
+    let k = net.guest(7, &id);
+    net.volunteer(&k).await;
+    net.groups.on_log_join("lounge", a, ik).await;
+    let (due, piece) = due_within(&mut net, k.sid, 5_000)
+        .await
+        .expect("a Genesis for the eager seat");
+    let joiner = Joiner::try_from(&piece.joins[0]).unwrap();
+    let st = Start {
+        kind: GroupKind::Text,
+        id: &id,
+        me: k.me(),
+        ik: &k.ik,
+        entry: k.entry(),
+        joiners: &[&joiner],
+        gated: false,
+        stored: true,
+        now: net.groups.now() / 1000,
+    };
+    let b = build_genesis(&st, &mut RowBases::new()).unwrap();
+    net.commit(k.sid, &id, due, &b).await;
+    let head = b.header.clone();
+    let mut h = Holds {
+        ring: b.ring,
+        krk: b.krk,
+        cache: RowBases::new(),
+    };
+    let (due, piece) = due_within(&mut net, k.sid, 10_000)
+        .await
+        .expect("a Join of the account's seat");
+    // Out of the log while the Join is out
+    net.groups.on_log_leave("lounge", a, cause::LEAVE).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let kept = crate::accounts::gk::exit_asks(&db, &id).await.unwrap();
+    let b = join_on(&k, &id, &head, &mut h, &piece, true, net.groups.now());
+    net.commit(k.sid, &id, due, &b).await;
+    let rec = seat_record(&seat1.public().seat(MemberId::Account(a)));
+    let written = until(
+        || async {
+            crate::accounts::gk::exits(&db, &id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|e| e.seat == rec && e.cause == cause::LEAVE)
+        },
+        |w| *w,
+    )
+    .await;
+    let left = until(
+        || async { crate::accounts::gk::exit_asks(&db, &id).await.unwrap() },
+        |l| l.is_empty(),
+    )
+    .await;
+    net.groups.on_purge(&id);
+    drop_db(&file);
+    assert!(
+        kept.len() == 1 && kept[0].account == a && written && left.is_empty(),
+        "while the Join was out the ask was kept: {kept:?}; once it landed her exit was \
+         written: {written}, asks left: {left:?}"
+    );
+}
+
+/// Item 1: an exit whose write failed was never written again (`exits_entered` only warned),
+/// and a restart before its opening had the seat back. The group writes it again at its next
+/// turn once the database takes it; its ask is kept until then.
+#[tokio::test]
+async fn a_failed_exit_write_is_written_again_and_its_ask_kept_until_then() {
+    let (db, file, net, a, _ann, seat1) = an_account_seated_in_a_stored_group().await;
+    let id = "c:lounge";
+    exec(
+        &db,
+        "ALTER TABLE voipc_gk_exits RENAME TO voipc_gk_exits_away".into(),
+    )
+    .await;
+    net.groups.on_log_leave("lounge", a, cause::LEAVE).await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let kept = crate::accounts::gk::exit_asks(&db, id).await.unwrap();
+    exec(
+        &db,
+        "ALTER TABLE voipc_gk_exits_away RENAME TO voipc_gk_exits".into(),
+    )
+    .await;
+    let rec = seat_record(&seat1.public().seat(MemberId::Account(a)));
+    let written = until(
+        || async {
+            crate::accounts::gk::exits(&db, id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|e| e.seat == rec)
+        },
+        |w| *w,
+    )
+    .await;
+    let left = until(
+        || async { crate::accounts::gk::exit_asks(&db, id).await.unwrap() },
+        |l| l.is_empty(),
+    )
+    .await;
+    net.groups.on_purge(id);
+    drop_db(&file);
+    assert!(
+        kept.len() == 1 && written && left.is_empty(),
+        "while the write failed the ask was kept: {kept:?}; once the database took it the exit \
+         was written: {written}, asks left: {left:?}"
+    );
+}
+
+/// Item 2: a device removed from its account marks the keyholder entries it made in the store
+/// (`forced`) before any group hears of it, so a stop before a group's actor took the message
+/// still proposes their removal at its next start. Another device's entry is left as it is.
+#[tokio::test]
+async fn a_device_removal_marks_its_entries_in_the_store_before_the_groups_hear() {
+    let (db, file) = scratch_db().await;
+    let inc = crate::accounts::gk::gk_start(&db, true)
+        .await
+        .unwrap()
+        .unwrap();
+    let net = Net::new();
+    net.groups.attach(db.clone(), inc);
+    let a = [0x5a; 16];
+    let entry = |kx: u8, device: &[u8]| crate::accounts::gk::Holder {
+        kx: [kx; 32],
+        m: MemberId::Account(a).seat_id(),
+        device: Some(device.to_vec()),
+        rank: 0,
+        last_online: 5,
+        missed: crate::accounts::gk::Misses::default(),
+        pair: None,
+    };
+    for (grp, h) in [
+        ("c:dev1", entry(7, b"laptop")),
+        ("c:dev2", entry(8, b"laptop")),
+        ("c:dev2", entry(9, b"phone")),
+    ] {
+        crate::accounts::gk::put_holder(&db, grp, &h).await.unwrap();
+    }
+    net.groups.on_device_removed(a, b"laptop").await;
+    let marked = blobs(
+        &db,
+        "SELECT kx FROM voipc_gk_holders WHERE forced ORDER BY kx",
+    )
+    .await;
+    for grp in ["c:dev1", "c:dev2"] {
+        net.groups.on_purge(grp);
+    }
+    drop_db(&file);
+    assert_eq!(
+        marked,
+        vec![vec![7u8; 32], vec![8u8; 32]],
+        "the laptop's entries are marked as the hook returns, the phone's is not"
+    );
+}
+
+/// Item 3, `moved_back`, with the stored group's actor running: its channel's group id moved
+/// away (anonymous on) and back. While it was away a hook (a log leave) started the stored
+/// group, so `start` never read the mark and the followers came back into the old generation:
+/// a seat that should have gone meanwhile (a kick under the other id) stayed keyed. Back, a
+/// new start is asked of the keyholder that volunteers, and the store keeps the mark until a
+/// new generation is stored: a fresh load of the group asks one too.
+#[tokio::test]
+async fn a_stored_group_moved_back_to_starts_anew_with_its_actor_running_and_after_a_restart() {
+    let (db, file, mut net, _a, _ann, _seat1) = an_account_seated_in_a_stored_group().await;
+    let id = "c:lounge";
+    let gen = crate::accounts::gk::group(&db, id)
+        .await
+        .unwrap()
+        .unwrap()
+        .head
+        .gen;
+    let away = net.groups.id_for(7, None);
+    net.groups.on_group_moved(7, id, &away);
+    net.groups
+        .on_log_leave("lounge", [9; 16], cause::LEAVE)
+        .await;
+    assert!(
+        net.groups.get(id).is_some(),
+        "a hook started the stored group"
+    );
+    net.groups.on_group_moved(7, &away, id);
+    let k2 = net.guest(7, id);
+    net.volunteer(&k2).await;
+    let p = net.guest(7, id);
+    net.fetch(&p, id).await;
+    let asked = due_within(&mut net, k2.sid, 5_000)
+        .await
+        .map(|(_, p)| p.kind);
+    let marked = until(
+        || async {
+            crate::accounts::gk::moved_back(&db, id, &gen)
+                .await
+                .unwrap()
+        },
+        |m| *m,
+    )
+    .await;
+    // A restart: the group loads anew
+    let inc = crate::accounts::gk::gk_incarnation(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    let store = Store::Db(Arc::new(crate::gk::store::DbStore {
+        db: db.clone(),
+        incarnation: inc,
+    }));
+    let mut g = new_group(true);
+    g.id = id.into();
+    store.load(&mut g).await.unwrap();
+    net.groups.on_purge(id);
+    drop_db(&file);
+    assert!(
+        asked == Some(gk::due::GENESIS) && marked && g.new_gen,
+        "back under its stored id the keyholder was asked {:?}; the store keeps the mark: \
+         {marked}; a fresh load asks a new generation: {}",
+        asked.map(gk::due::name),
+        g.new_gen
+    );
+}
+
+/// Item 3, `moved_back`, nobody following: the channel's id came back to the stored group
+/// while no actor ran it, so only memory knew a new generation was due, and a restart before
+/// anyone followed resumed the old one. The mark is in the store now.
+#[tokio::test]
+async fn a_stored_group_moved_back_to_while_nobody_follows_starts_anew_after_a_restart() {
+    let (db, file, net, _a, _ann, _seat1) = an_account_seated_in_a_stored_group().await;
+    let id = "c:lounge";
+    let gen = crate::accounts::gk::group(&db, id)
+        .await
+        .unwrap()
+        .unwrap()
+        .head
+        .gen;
+    let away = net.groups.id_for(7, None);
+    net.groups.on_group_moved(7, id, &away);
+    assert!(net.groups.get(id).is_none(), "the stored group stopped");
+    net.groups.on_group_moved(7, &away, id);
+    let marked = until(
+        || async {
+            crate::accounts::gk::moved_back(&db, id, &gen)
+                .await
+                .unwrap()
+        },
+        |m| *m,
+    )
+    .await;
+    net.groups.on_purge(id);
+    drop_db(&file);
+    assert!(marked, "the store keeps that a new generation is due");
 }

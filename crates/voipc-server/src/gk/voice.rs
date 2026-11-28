@@ -317,6 +317,8 @@ impl GroupState {
             .values()
             .filter(|v| !set.iter().any(|k| k.kx == v.pair.kx()))
             .filter(|v| seated(v) && v.entry(GroupKind::Voice).is_some())
+            .filter(|v| !self.holders.unable.contains(&v.sid))
+            .filter(|v| !self.holders.refused.contains(&v.pair.kx()))
             .min_by_key(|v| v.sid)
             .filter(|v| lowest.iter().take(LOWEST).any(|u| *u == v.sid))
             .cloned()

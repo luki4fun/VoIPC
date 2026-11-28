@@ -237,9 +237,18 @@ pub struct HeadMove<'a> {
     /// A Regenesis: every version this commit did not make stops. Its seats are left to
     /// `sweep_stale`, since no read returns a seat whose bucket has no current version.
     pub retire_all: bool,
-    /// Every exit of this generation up to it is done, and its seat goes.
+    /// Every exit of this generation up to it is done.
     pub exits_upto: u64,
+    /// The seats the commit removed (`Applied.removed`, as seat records): their rows go. Not
+    /// read from `voipc_gk_exits`, whose write may have failed while memory went on (dive 4
+    /// F2), and whose rows a Regenesis left behind may name a seat seated again since (F1).
+    pub removed: &'a [Vec<u8>],
     pub names: &'a [Names],
+    /// The keyholder entries the commit adds, with their pairs: written with the head, so a
+    /// stop before the actor writes its entries loses no new entry's pair (dive 4 F5). A row
+    /// already there stays but for a removal marked on it, which goes; the actor's own write
+    /// brings it up to date.
+    pub holders: &'a [Holder],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1052,6 +1061,8 @@ pub async fn put_krk(store: &Store, grp: &str, c: CommitId, gen: &Gen, krk: &[Kr
 /// `move_head`: the commit's lists become current, its seats seated, its version ids used.
 const LISTS_LAND: &str = "UPDATE voipc_gk_lists SET current = TRUE WHERE (grp, gen, b, v) IN
      (SELECT grp, gen, b, v FROM voipc_gk_lists WHERE grp = $1 AND commit_id = $2)";
+/// Seats a head move deletes in one statement (bind parameters stay far under both stores' caps).
+const REMOVED_PER_STATEMENT: usize = 400;
 const SEATS_LAND: &str = "UPDATE voipc_gk_seats SET b = next_b, next_b = NULL, next_commit = NULL
      WHERE (grp, gen, seat) IN (SELECT grp, gen, seat FROM voipc_gk_seats WHERE grp = $1 AND next_commit = $2)";
 const VIDS_LAND: &str = "UPDATE voipc_gk_vids SET commit_id = NULL WHERE (grp, gen, v) IN
@@ -1059,8 +1070,9 @@ const VIDS_LAND: &str = "UPDATE voipc_gk_vids SET commit_id = NULL WHERE (grp, g
 
 /// The one small transaction that makes commit `c` the head: the group's row, its headers and
 /// names, the lists' `current`/`epoch_until`, its seats, its version ids, the exits it dealt
-/// with and their seats, and its pending row. Each step is one statement over many rows, never
-/// a statement a row, but for `drops` and `keep`. Only after `Moved::Done` may pushes go out.
+/// with and their seats, the keyholder entries it adds, and its pending row. Each step is one
+/// statement over many rows, never a statement a row, but for `drops`, `keep` and the entries
+/// (at most 8). Only after `Moved::Done` may pushes go out.
 ///
 /// A statement that finds its rows by a secondary index names them by key through a subquery
 /// on that index: without ANALYZE, SQLite would rather scan the primary key's `(grp, gen)`
@@ -1084,6 +1096,12 @@ pub async fn move_head(
     for n in mv.names {
         names.push((n, count(n.time, "names time")?));
     }
+    let mut holders = Vec::with_capacity(mv.holders.len());
+    for h in mv.holders {
+        let missed = postcard::to_allocvec(&h.missed)?;
+        let pair = h.pair.as_ref().map(postcard::to_allocvec).transpose()?;
+        holders.push((h, missed, pair, count(h.last_online, "last_online")?));
+    }
     let epoch = i64::from(head.epoch);
     let now = now_ms();
     let moved = write_tx!(store, tx => {
@@ -1096,23 +1114,52 @@ pub async fn move_head(
         if pending == 0 {
             return Ok(Moved::NotPending);
         }
-        let old: Option<(Vec<u8>, Vec<u8>, i64)> =
-            sqlx::query_as("SELECT gen, head_d, head_epoch FROM voipc_gk_groups WHERE grp = $1")
-                .bind(grp)
-                .fetch_optional(&mut *tx)
-                .await?;
-        if old.as_ref().map(|o| o.1.as_slice()) != mv.was.as_ref().map(|d| &d[..]) {
+        // gen, head_d, head_epoch, incarnation
+        type Row = (Vec<u8>, Vec<u8>, i64, Vec<u8>);
+        let row: Option<Row> = sqlx::query_as(
+            "SELECT gen, head_d, head_epoch, incarnation FROM voipc_gk_groups WHERE grp = $1",
+        )
+        .bind(grp)
+        .fetch_optional(&mut *tx)
+        .await?;
+        // A row of an older incarnation (a restore, or the switch off and on, §5.7 "Restore") is no
+        // head to race: the actor loaded it as a new generation with no head, and its Genesis
+        // goes over it. A row of this incarnation is taken over only by the head it holds, so a
+        // read that failed at the actor's start never starts a new generation over a healthy one
+        // (dive 3 F6, dive 4 F4)
+        let mut stale = mv.was.is_none()
+            && row
+                .as_ref()
+                .is_some_and(|r| r.3.as_slice() != head.incarnation.as_slice());
+        // So is a row whose head header the store lost (`load` starts anew over it too)
+        if let (true, false, Some(r)) = (mv.was.is_none(), stale, &row) {
+            let held: Option<i64> =
+                sqlx::query_scalar("SELECT CAST(1 AS BIGINT) FROM voipc_gk_headers WHERE grp = $1 AND d = $2")
+                    .bind(grp)
+                    .bind(r.1.as_slice())
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            stale = held.is_none();
+        }
+        let was: Option<&[u8]> = match (&row, stale) {
+            (Some(r), true) => Some(r.1.as_slice()),
+            _ => mv.was.as_ref().map(|d| &d[..]),
+        };
+        if row.as_ref().map(|o| o.1.as_slice()) != was {
             return Ok(Moved::OtherHead);
         }
-        // Written only over the head the commit was built on
+        let old = row.as_ref().map(|r| (r.0.clone(), r.1.clone(), r.2));
+        // Written only over the head the commit was built on. A new generation's eager pages
+        // are all still to be asked (`eager_after` empty: from the first account, review P3)
         let n = sqlx::query(
-            "INSERT INTO voipc_gk_groups (grp, kind, gen, gen_time, incarnation, head_d, head_epoch, head_join, exits_next, rolls, gated, updated)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            "INSERT INTO voipc_gk_groups (grp, kind, gen, gen_time, incarnation, head_d, head_epoch, head_join, exits_next, rolls, gated, updated, eager_after)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $14)
              ON CONFLICT (grp) DO UPDATE SET kind = excluded.kind, gen = excluded.gen, gen_time = excluded.gen_time,
              incarnation = excluded.incarnation, head_d = excluded.head_d, head_epoch = excluded.head_epoch,
              head_join = excluded.head_join,
              exits_next = CASE WHEN voipc_gk_groups.exits_next > excluded.exits_next THEN voipc_gk_groups.exits_next ELSE excluded.exits_next END,
-             rolls = excluded.rolls, gated = excluded.gated, updated = excluded.updated
+             rolls = excluded.rolls, gated = excluded.gated, updated = excluded.updated,
+             eager_after = CASE WHEN voipc_gk_groups.gen = excluded.gen THEN voipc_gk_groups.eager_after ELSE excluded.eager_after END
              WHERE voipc_gk_groups.head_d = $13",
         )
         .bind(grp)
@@ -1127,7 +1174,8 @@ pub async fn move_head(
         .bind(rolls.as_slice())
         .bind(head.gated)
         .bind(now)
-        .bind(mv.was.as_ref().map_or(&[][..], |d| &d[..]))
+        .bind(was.unwrap_or(&[][..]))
+        .bind(&[0u8; 0][..])
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -1200,20 +1248,39 @@ pub async fn move_head(
             .bind(bits(c.0))
             .execute(&mut *tx)
             .await?;
+        // A Regenesis seats only its volunteer: every exit it did not carry is over, as the
+        // relay's memory has it (`Exits::keep`), and a row left would remove a seat seated
+        // again later (dive 4 F1)
+        if mv.retire_all {
+            sqlx::query(
+                "DELETE FROM voipc_gk_exits WHERE grp = $1 AND gen = $2 AND seat NOT IN
+                 (SELECT seat FROM voipc_gk_seats WHERE grp = $1 AND gen = $2 AND next_commit = $3)",
+            )
+            .bind(grp)
+            .bind(&head.gen[..])
+            .bind(bits(c.0))
+            .execute(&mut *tx)
+            .await?;
+        }
         sqlx::query(SEATS_LAND)
         .bind(grp)
         .bind(bits(c.0))
         .execute(&mut *tx)
         .await?;
-        sqlx::query(
-            "DELETE FROM voipc_gk_seats WHERE (grp, gen, seat) IN
-             (SELECT grp, gen, seat FROM voipc_gk_exits WHERE grp = $1 AND gen = $2 AND seq <= $3)",
-        )
-        .bind(grp)
-        .bind(&head.gen[..])
-        .bind(exits_upto)
-        .execute(&mut *tx)
-        .await?;
+        for part in mv.removed.chunks(REMOVED_PER_STATEMENT) {
+            let marks: Vec<String> = (0..part.len()).map(|i| format!("${}", i + 3)).collect();
+            let q = format!(
+                "DELETE FROM voipc_gk_seats WHERE grp = $1 AND gen = $2 AND seat IN ({})",
+                marks.join(", ")
+            );
+            let mut del = sqlx::query(sqlx::AssertSqlSafe(q))
+                .bind(grp)
+                .bind(&head.gen[..]);
+            for seat in part {
+                del = del.bind(seat.as_slice());
+            }
+            del.execute(&mut *tx).await?;
+        }
         sqlx::query("DELETE FROM voipc_gk_exits WHERE grp = $1 AND gen = $2 AND seq <= $3")
             .bind(grp)
             .bind(&head.gen[..])
@@ -1265,6 +1332,24 @@ pub async fn move_head(
             .bind(*time)
             .bind(&n.names_hash[..])
             .bind(n.list.as_slice())
+            .execute(&mut *tx)
+            .await?;
+        }
+        // An entry the set takes in starts with no removal marked: a row left from its last
+        // time in the set (its drop not yet written) keeps the rest for `put_holders`
+        for (h, missed, pair, last_online) in &holders {
+            sqlx::query(
+                "INSERT INTO voipc_gk_holders (grp, kx, m, device, rank, last_online, missed, pair) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                 ON CONFLICT (grp, kx) DO UPDATE SET forced = FALSE",
+            )
+            .bind(grp)
+            .bind(&h.kx[..])
+            .bind(&h.m[..])
+            .bind(h.device.as_deref())
+            .bind(i16::from(h.rank))
+            .bind(*last_online)
+            .bind(missed.as_slice())
+            .bind(pair.as_deref())
             .execute(&mut *tx)
             .await?;
         }
@@ -2043,6 +2128,278 @@ pub async fn exits(store: &Store, grp: &str) -> Result<Vec<Exit>> {
     Ok(out)
 }
 
+// --- eager seats asked (0014) ---
+
+/// An account's eager seat asked of a stored group: the record its keys made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EagerAsk {
+    pub account: [u8; 16],
+    pub seat: SeatRec,
+}
+
+/// Eager seats asked in `grp` (a log join, a seat-key rotation, a new start's page), each in
+/// place of its account's earlier ask there, written before the group's actor is told: kept
+/// until a Join seats it or the relay drops it, so an actor's next start asks it again
+/// (dive 4 F7). An account named twice keeps its last ask: one statement may not upsert a row
+/// twice on Postgres (review P1).
+pub async fn put_eager(store: &Store, grp: &str, asks: &[EagerAsk], at: u64) -> Result<()> {
+    let at = count(at, "ask time")?;
+    let mut seen = std::collections::HashSet::new();
+    let mut asks: Vec<&EagerAsk> = asks
+        .iter()
+        .rev()
+        .filter(|a| seen.insert(a.account))
+        .collect();
+    asks.reverse();
+    for batch in asks.chunks(STORE_BATCH) {
+        write_tx!(store, tx => {
+            for part in batch.chunks(PER_INSERT) {
+                let mut q = sqlx::QueryBuilder::new("INSERT INTO voipc_gk_eager (grp, account, seat, at) ");
+                q.push_values(part, |mut t, a| {
+                    t.push_bind(grp)
+                        .push_bind(&a.account[..])
+                        .push_bind(&a.seat[..])
+                        .push_bind(at);
+                });
+                q.push(" ON CONFLICT (grp, account) DO UPDATE SET seat = excluded.seat, at = excluded.at");
+                q.build().persistent(false).execute(&mut *tx).await?;
+            }
+            tx.commit().await?;
+        });
+    }
+    Ok(())
+}
+
+/// Eager seats seated, refused or dropped: their asks go, each only while it still names that
+/// seat (a later rotation's ask stays).
+pub async fn drop_eager(store: &Store, grp: &str, asks: &[EagerAsk]) -> Result<()> {
+    for batch in asks.chunks(STORE_BATCH) {
+        write_tx!(store, tx => {
+            for a in batch {
+                sqlx::query("DELETE FROM voipc_gk_eager WHERE grp = $1 AND account = $2 AND seat = $3")
+                    .bind(grp)
+                    .bind(&a.account[..])
+                    .bind(&a.seat[..])
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            tx.commit().await?;
+        });
+    }
+    Ok(())
+}
+
+/// Where the eager pages of `grp`'s new start in generation `gen` are, while some are still to
+/// be asked (`eager_after`, 0014): `Some(None)` from the first account, `Some(Some(a))` after
+/// account `a`. `None` once all were asked, or when the head is another generation's.
+pub async fn eager_after(store: &Store, grp: &str, gen: &Gen) -> Result<Option<Option<[u8; 16]>>> {
+    let row: Option<Option<Vec<u8>>> = db!(store, pool => {
+        sqlx::query_scalar("SELECT eager_after FROM voipc_gk_groups WHERE grp = $1 AND gen = $2")
+            .bind(grp)
+            .bind(&gen[..])
+            .fetch_optional(pool)
+            .await?
+    });
+    Ok(row
+        .flatten()
+        .map(|a| <[u8; 16]>::try_from(a.as_slice()).ok()))
+}
+
+/// The eager pages of `grp`'s new start in generation `gen` asked up to account `upto`
+/// (`None`: all of them). Only while some are still to be asked and the head is of that
+/// generation: a task of an older start, or one behind another that finished, changes nothing.
+pub async fn eager_upto(
+    store: &Store,
+    grp: &str,
+    gen: &Gen,
+    upto: Option<&[u8; 16]>,
+) -> Result<()> {
+    db!(store, pool => {
+        sqlx::query(
+            "UPDATE voipc_gk_groups SET eager_after = $3 WHERE grp = $1 AND gen = $2 AND eager_after IS NOT NULL",
+        )
+        .bind(grp)
+        .bind(&gen[..])
+        .bind(upto.map(|a| &a[..]))
+        .execute(pool)
+        .await?;
+    });
+    Ok(())
+}
+
+/// The eager seats asked in `grp`, by account.
+#[cfg(test)]
+pub async fn eager_asks(store: &Store, grp: &str) -> Result<Vec<EagerAsk>> {
+    let rows: Vec<(Vec<u8>, Vec<u8>)> = db!(store, pool => {
+        sqlx::query_as("SELECT account, seat FROM voipc_gk_eager WHERE grp = $1 ORDER BY account")
+            .bind(grp)
+            .fetch_all(pool)
+            .await?
+    });
+    rows.into_iter()
+        .map(|(a, s)| {
+            Ok(EagerAsk {
+                account: fixed(a, "account")?,
+                seat: fixed(s, "seat")?,
+            })
+        })
+        .collect()
+}
+
+// --- exits asked (0014) ---
+
+/// An exit of an account's seats asked of a stored group ahead of its actor (a log leave, a
+/// gate, a new password, a kick or leave of the channel): why, and when it was asked (unix ms).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExitAsk {
+    pub account: [u8; 16],
+    pub cause: u8,
+    pub at: u64,
+}
+
+/// The exits of `accounts`' seats in `grp` asked for `cause` at `at`, each in place of the
+/// account's earlier ask there: written before the group's actor is told, kept until the exits
+/// it enters are written (`settle_exit_asks`), so an actor's next start enters them (dive 4 F7).
+/// An account named twice is asked once.
+pub async fn put_exit_asks(
+    store: &Store,
+    grp: &str,
+    accounts: &[[u8; 16]],
+    cause: u8,
+    at: u64,
+) -> Result<()> {
+    let at = count(at, "ask time")?;
+    let mut seen = std::collections::HashSet::new();
+    let accounts: Vec<&[u8; 16]> = accounts.iter().filter(|a| seen.insert(**a)).collect();
+    for batch in accounts.chunks(STORE_BATCH) {
+        write_tx!(store, tx => {
+            for part in batch.chunks(PER_INSERT) {
+                let mut q = sqlx::QueryBuilder::new("INSERT INTO voipc_gk_exit_asks (grp, account, cause, at) ");
+                q.push_values(part, |mut t, a| {
+                    t.push_bind(grp)
+                        .push_bind(&a[..])
+                        .push_bind(i16::from(cause))
+                        .push_bind(at);
+                });
+                q.push(" ON CONFLICT (grp, account) DO UPDATE SET cause = excluded.cause, at = excluded.at");
+                q.build().persistent(false).execute(&mut *tx).await?;
+            }
+            tx.commit().await?;
+        });
+    }
+    Ok(())
+}
+
+/// Exit asks whose exits are written: each `(account, at)` goes while its row is no newer than
+/// `at` (a later ask of the account stays for its own message). One statement per ask time and
+/// `PER_DELETE` accounts: a new password's asks share one time, and 100k of them are 200
+/// statements, not 100k round trips in the group's turn.
+pub async fn settle_exit_asks(store: &Store, grp: &str, asks: &[([u8; 16], u64)]) -> Result<()> {
+    const PER_DELETE: usize = 500;
+    let mut by_at: std::collections::BTreeMap<u64, Vec<&[u8; 16]>> = Default::default();
+    for (a, at) in asks {
+        by_at.entry(*at).or_default().push(a);
+    }
+    for (at, accounts) in by_at {
+        let at = count(at, "ask time")?;
+        for part in accounts.chunks(PER_DELETE) {
+            db!(store, pool => {
+                let mut q = sqlx::QueryBuilder::new("DELETE FROM voipc_gk_exit_asks WHERE grp = ");
+                q.push_bind(grp);
+                q.push(" AND at <= ");
+                q.push_bind(at);
+                q.push(" AND account IN (");
+                let mut each = q.separated(", ");
+                for a in part {
+                    each.push_bind(&a[..]);
+                }
+                each.push_unseparated(")");
+                q.build().persistent(false).execute(pool).await?;
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Every exit ask of `grp` made at `before` (unix ms) or earlier goes: an actor's start that
+/// finds no head to exit seats from (a new generation seats whom it seats anew).
+pub async fn drop_exit_asks(store: &Store, grp: &str, before: u64) -> Result<()> {
+    db!(store, pool => {
+        sqlx::query("DELETE FROM voipc_gk_exit_asks WHERE grp = $1 AND at <= $2")
+            .bind(grp)
+            .bind(count(before, "ask time")?)
+            .execute(pool)
+            .await?;
+    });
+    Ok(())
+}
+
+type ExitAskTuple = (Vec<u8>, i16, i64);
+
+/// A page of `grp`'s exit asks after account `after`, by account.
+pub async fn exit_asks_page(
+    store: &Store,
+    grp: &str,
+    after: Option<&[u8; 16]>,
+    limit: u32,
+) -> Result<Vec<ExitAsk>> {
+    let rows: Vec<ExitAskTuple> = db!(store, pool => {
+        sqlx::query_as(
+            "SELECT account, cause, at FROM voipc_gk_exit_asks WHERE grp = $1 AND account > $2
+             ORDER BY account LIMIT $3",
+        )
+        .bind(grp)
+        .bind(after.map_or(&[][..], |a| &a[..]))
+        .bind(i64::from(limit))
+        .fetch_all(pool)
+        .await?
+    });
+    rows.into_iter()
+        .map(|(a, cause, at)| {
+            Ok(ExitAsk {
+                account: fixed(a, "account")?,
+                cause: u8_of(cause, "cause")?,
+                at: u64_of(at, "at")?,
+            })
+        })
+        .collect()
+}
+
+/// The exit asks of `grp`, by account.
+#[cfg(test)]
+pub async fn exit_asks(store: &Store, grp: &str) -> Result<Vec<ExitAsk>> {
+    exit_asks_page(store, grp, None, u32::MAX >> 1).await
+}
+
+// --- a channel moved back (0014) ---
+
+/// `grp`'s channel moved back to it: a new generation is asked while the head is of the one it
+/// holds now (`moved_back`), here and at the actor's next start. No row, no head: a Genesis
+/// comes anyway.
+pub async fn set_moved_back(store: &Store, grp: &str) -> Result<()> {
+    db!(store, pool => {
+        sqlx::query("UPDATE voipc_gk_groups SET moved_back = gen WHERE grp = $1")
+            .bind(grp)
+            .execute(pool)
+            .await?;
+    });
+    Ok(())
+}
+
+/// Whether `grp`'s channel moved back onto generation `gen` and no new one is stored since.
+pub async fn moved_back(store: &Store, grp: &str, gen: &Gen) -> Result<bool> {
+    let hit: Option<i64> = db!(store, pool => {
+        sqlx::query_scalar(
+            "SELECT CAST(1 AS BIGINT) FROM voipc_gk_groups WHERE grp = $1 AND gen = $2 AND moved_back = gen",
+        )
+        .bind(grp)
+        .bind(&gen[..])
+        .fetch_optional(pool)
+        .await?
+    });
+    Ok(hit.is_some())
+}
+
 // --- keyholders ---
 
 type HolderTuple = (
@@ -2181,6 +2538,22 @@ pub async fn holders_of(
             ))
         })
         .collect()
+}
+
+/// The keyholder entries member `m` made on `device`, in every group: their removal proposed
+/// outright (`forced`) before the groups' actors are told (a device removed from its account),
+/// so a stop before an actor takes it still proposes it at its next start (dive 4 F6). No
+/// actor writes it back (`put_holders` keeps a mark; an entry the set takes in again starts
+/// without one, `move_head`). How many.
+pub async fn force_device_holders(store: &Store, m: &MemberRec, device: &[u8]) -> Result<u64> {
+    Ok(db!(store, pool => {
+        sqlx::query("UPDATE voipc_gk_holders SET forced = TRUE WHERE m = $1 AND device = $2")
+            .bind(&m[..])
+            .bind(device)
+            .execute(pool)
+            .await?
+            .rows_affected()
+    }))
 }
 
 // --- names (gated groups) ---
@@ -2507,7 +2880,8 @@ pub async fn put_self_rows(store: &Store, account: &[u8; 16], rows: &[SelfRowIn]
 }
 
 /// What an account's identity endorsed, gone (an identity reset, a deleted account's
-/// tombstone): its seat keys and its self-rows. No foreign key takes these (plan 2g). Its
+/// tombstone): its seat keys, its self-rows and its eager seats and exits asked (the reset's or
+/// deletion's own exit, `on_account_gone`, takes every seat). No foreign key takes these (plan 2g). Its
 /// seats go by their groups' exits, and its keyholder entries by their groups' Removes: the
 /// signed head names them, and their rows tell `Groups::on_account_gone` (in this process or,
 /// after the shell's reset, the relay's) where they are; each goes once its Remove lands.
@@ -2515,6 +2889,8 @@ pub async fn forget_account(store: &Store, account: &[u8; 16]) -> Result<()> {
     write_tx!(store, tx => {
         sqlx::query("DELETE FROM voipc_gk_seatkeys WHERE account = $1").bind(&account[..]).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM voipc_gk_self WHERE account = $1").bind(&account[..]).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM voipc_gk_eager WHERE account = $1").bind(&account[..]).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM voipc_gk_exit_asks WHERE account = $1").bind(&account[..]).execute(&mut *tx).await?;
         tx.commit().await?;
     });
     Ok(())
@@ -2534,6 +2910,9 @@ pub async fn stored_bytes(store: &Store, grp: &str) -> Result<u64> {
         "SELECT CAST(COALESCE(SUM(LENGTH(seats)), 0) AS BIGINT) FROM voipc_gk_lists WHERE grp = $1",
         "SELECT CAST(COALESCE(SUM(LENGTH(body) + LENGTH(sig)), 0) AS BIGINT) FROM voipc_gk_headers WHERE grp = $1",
         "SELECT CAST(COALESCE(SUM(LENGTH(list)), 0) AS BIGINT) FROM voipc_gk_names WHERE grp = $1",
+        // What a restart asks again (0014): up to `kept_seats` eager seats, and the exits asked
+        "SELECT CAST(COALESCE(SUM(LENGTH(account) + LENGTH(seat)), 0) AS BIGINT) FROM voipc_gk_eager WHERE grp = $1",
+        "SELECT CAST(COALESCE(SUM(LENGTH(account)), 0) AS BIGINT) FROM voipc_gk_exit_asks WHERE grp = $1",
     ] {
         let n: i64 = db!(store, pool => {
             sqlx::query_scalar(q).bind(grp).fetch_one(pool).await?
@@ -2817,13 +3196,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_13_comes_once_on_top_of_todays_head() {
+    async fn migrations_13_and_14_come_once_on_top_of_todays_head() {
         // Renumber when another migration lands first (plan, open choice 20)
         let head = sqlx::migrate!("migrations/sqlite")
             .iter()
             .map(|m| m.version)
             .max();
-        assert_eq!(head, Some(13));
+        assert_eq!(head, Some(14));
         let dbs = databases().await;
         for store in &dbs.stores {
             // As 1.12.0 left it, then a start of this build, then another start
@@ -2841,15 +3220,13 @@ mod tests {
             assert_eq!(scalar(store, before).await, 12);
             open(store).await;
             open(store).await;
-            assert_eq!(scalar(store, before).await, 13);
-            assert_eq!(
-                scalar(
-                    store,
-                    "SELECT COUNT(*) FROM voipc_migrations WHERE version = 13"
-                )
-                .await,
-                1
-            );
+            assert_eq!(scalar(store, before).await, 14);
+            for v in [
+                "SELECT COUNT(*) FROM voipc_migrations WHERE version = 13",
+                "SELECT COUNT(*) FROM voipc_migrations WHERE version = 14",
+            ] {
+                assert_eq!(scalar(store, v).await, 1, "{v}");
+            }
             for t in [
                 "SELECT COUNT(*) FROM voipc_gk_groups",
                 "SELECT COUNT(*) FROM voipc_gk_gens",
@@ -2869,9 +3246,162 @@ mod tests {
                 "SELECT COUNT(*) FROM voipc_gk_chains",
                 "SELECT COUNT(*) FROM voipc_gk_self",
                 "SELECT COUNT(*) FROM voipc_gk_seatkeys",
+                "SELECT COUNT(*) FROM voipc_gk_eager",
+                "SELECT COUNT(*) FROM voipc_gk_exit_asks",
             ] {
                 assert_eq!(scalar(store, t).await, 0, "{t}");
             }
+        }
+    }
+
+    /// 1.14's release candidates ran 0013: 0014 goes on top of it, a keyholder entry kept as it
+    /// was (its removal not proposed), and the eager seats asked start empty and take asks.
+    #[tokio::test]
+    async fn a_database_at_0013_upgrades_to_0014_and_keeps_its_keyholder_entries() {
+        let dbs = databases().await;
+        for store in &dbs.stores {
+            l4f_accounts::migrate::run(store).await.unwrap();
+            let shipped = relay_migrator(match store {
+                Store::Pg(_) => sqlx::migrate!("migrations/postgres"),
+                Store::Lite(_) => sqlx::migrate!("migrations/sqlite"),
+            });
+            match store {
+                Store::Pg(b) => shipped.run_to(13, &b.0).await,
+                Store::Lite(b) => shipped.run_to(13, &b.0).await,
+            }
+            .unwrap();
+            let before = "SELECT MAX(version) FROM voipc_migrations";
+            assert_eq!(scalar(store, before).await, 13);
+            // An entry as rc.1 wrote it
+            db!(store, pool => {
+                sqlx::query("INSERT INTO voipc_gk_holders (grp, kx, m, device, rank, last_online, missed, pair) VALUES ($1, $2, $3, NULL, 0, 5, $4, NULL)")
+                    .bind(GRP)
+                    .bind(&[7u8; 32][..])
+                    .bind(&[1u8; 17][..])
+                    .bind(&postcard::to_allocvec(&Misses::default()).unwrap()[..])
+                    .execute(pool)
+                    .await
+                    .unwrap();
+            });
+            open(store).await;
+            assert_eq!(scalar(store, before).await, 14);
+            let kept = holders(store, GRP).await.unwrap();
+            assert_eq!(kept.len(), 1);
+            assert_eq!((kept[0].kx, kept[0].last_online), ([7; 32], 5));
+            assert_eq!(
+                scalar(store, "SELECT COUNT(*) FROM voipc_gk_holders WHERE forced").await,
+                0
+            );
+            let ask = EagerAsk {
+                account: [3; 16],
+                seat: [4; 33],
+            };
+            put_eager(store, GRP, &[ask], 9).await.unwrap();
+            assert_eq!(eager_asks(store, GRP).await.unwrap(), vec![ask]);
+            // Another seat of that account asked later stays when the first is settled
+            let later = EagerAsk {
+                seat: [5; 33],
+                ..ask
+            };
+            put_eager(store, GRP, &[later], 10).await.unwrap();
+            drop_eager(store, GRP, &[ask]).await.unwrap();
+            assert_eq!(eager_asks(store, GRP).await.unwrap(), vec![later]);
+            drop_eager(store, GRP, &[later]).await.unwrap();
+            assert!(eager_asks(store, GRP).await.unwrap().is_empty());
+            // A group from before 0014 has no eager pages left to ask
+            assert_eq!(
+                scalar(
+                    store,
+                    "SELECT COUNT(*) FROM voipc_gk_groups WHERE eager_after IS NOT NULL"
+                )
+                .await,
+                0
+            );
+            // Nor exits asked, nor a channel moved back (d4 round 2)
+            assert_eq!(
+                scalar(store, "SELECT COUNT(*) FROM voipc_gk_exit_asks").await,
+                0
+            );
+            assert_eq!(
+                scalar(
+                    store,
+                    "SELECT COUNT(*) FROM voipc_gk_groups WHERE moved_back IS NOT NULL"
+                )
+                .await,
+                0
+            );
+        }
+    }
+
+    /// Dive 4 round 2: what a restart asks again counts in a group's bytes (AdminLoad): its
+    /// eager seats and its exits asked.
+    #[tokio::test]
+    async fn a_groups_bytes_count_its_eager_seats_and_exits_asked() {
+        let dbs = databases().await;
+        for store in &dbs.stores {
+            open(store).await;
+            let before = stored_bytes(store, GRP).await.unwrap();
+            let ask = EagerAsk {
+                account: [3; 16],
+                seat: [4; 33],
+            };
+            put_eager(store, GRP, &[ask], 9).await.unwrap();
+            put_exit_asks(store, GRP, &[[5; 16]], 1, 9).await.unwrap();
+            assert_eq!(
+                stored_bytes(store, GRP).await.unwrap(),
+                before + 16 + 33 + 16
+            );
+        }
+    }
+
+    /// Review P3 of dive 4's fixes: a new generation's head move keeps that its eager pages
+    /// are all still to be asked; the pages move that on and clear it, a later head move of
+    /// the same generation leaves it, and a task of another generation changes nothing.
+    #[tokio::test]
+    async fn a_new_generations_eager_pages_are_kept_until_all_are_asked() {
+        let dbs = databases().await;
+        for store in &dbs.stores {
+            open(store).await;
+            genesis(store, &[]).await;
+            assert_eq!(eager_after(store, GRP, &GEN).await.unwrap(), Some(None));
+            assert_eq!(eager_after(store, GRP, &GEN2).await.unwrap(), None);
+            eager_upto(store, GRP, &GEN, Some(&[4; 16])).await.unwrap();
+            let at = Some(Some([4; 16]));
+            assert_eq!(eager_after(store, GRP, &GEN).await.unwrap(), at);
+            let moved = open_epoch(store, 1, 2, 2, V2, &[rec(1)], HeadMove::default()).await;
+            assert_eq!(moved, Moved::Done);
+            assert_eq!(
+                eager_after(store, GRP, &GEN).await.unwrap(),
+                at,
+                "an opening keeps it"
+            );
+            eager_upto(store, GRP, &GEN2, None).await.unwrap();
+            assert_eq!(
+                eager_after(store, GRP, &GEN).await.unwrap(),
+                at,
+                "another generation's"
+            );
+            eager_upto(store, GRP, &GEN, None).await.unwrap();
+            assert_eq!(eager_after(store, GRP, &GEN).await.unwrap(), None);
+            eager_upto(store, GRP, &GEN, Some(&[5; 16])).await.unwrap();
+            assert_eq!(
+                eager_after(store, GRP, &GEN).await.unwrap(),
+                None,
+                "once over"
+            );
+            // A Regenesis: the new generation's pages are all to be asked
+            let c = begin_commit(store, GRP).await.unwrap();
+            let hs = [header_at(3, GEN2, 1, 0, Kind::Regenesis)];
+            let mv = HeadMove {
+                was: Some([2; 32]),
+                headers: &hs,
+                retire_all: true,
+                ..Default::default()
+            };
+            let moved = move_head(store, GRP, c, &head(3, GEN2, 1, 0), &mv).await;
+            assert_eq!(moved.unwrap(), Moved::Done);
+            assert_eq!(eager_after(store, GRP, &GEN2).await.unwrap(), Some(None));
+            assert_eq!(eager_after(store, GRP, &GEN).await.unwrap(), None);
         }
     }
 
@@ -3896,9 +4426,11 @@ mod tests {
                 .map(|e| e.seq)
                 .collect();
             assert_eq!(seqs, vec![1, 2, 4]);
-            // The opening that deals with 1 and 2
+            // The opening that deals with 1 and 2, and removes their seats (its `removed`)
+            let removed = [rec(2).to_vec(), rec(3).to_vec()];
             let mv = HeadMove {
                 exits_upto: 2,
+                removed: &removed,
                 ..Default::default()
             };
             let moved = open_epoch(store, 1, 2, 2, V2, &[rec(1), rec(4)], mv).await;

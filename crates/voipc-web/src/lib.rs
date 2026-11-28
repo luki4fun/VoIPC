@@ -575,7 +575,8 @@ impl SignalClient {
     // emits what `GkOut` says, as network.rs does. Frames cross as postcard bytes.
 
     /// `GroupKeys`: `GkOut`. `run` is its 16 bytes, `clock` its seconds; `kept`: what an
-    /// earlier connection to this relay kept in this page.
+    /// earlier connection to this relay kept in this page; `mirror`: what this browser kept
+    /// of a signed-in account's counters past its pages (`gkMirror`'s bytes, gk-mirror.ts).
     #[wasm_bindgen(js_name = gkStart)]
     #[allow(clippy::too_many_arguments)]
     pub fn gk_start(
@@ -587,6 +588,7 @@ impl SignalClient {
         visible: bool,
         in_call: bool,
         kept: Option<KeptGk>,
+        mirror: Option<Vec<u8>>,
     ) -> Result<JsValue, JsError> {
         let run: [u8; 16] = run
             .try_into()
@@ -599,6 +601,7 @@ impl SignalClient {
             visible,
             in_call,
             local: kept.map(|k| k.local),
+            mirror,
         };
         gk_out(self.core.gk_start(start).map_err(js_err)?)
     }
@@ -720,6 +723,23 @@ impl SignalClient {
     pub fn gk_keep(&self) -> Option<KeptGk> {
         self.core.gk.keep().map(|local| KeptGk { local })
     }
+
+    /// A signed-in account's seat-key counters this page checked or raised, for this browser
+    /// to keep past the page (dive 1 F1): bytes for `gkStart`'s `mirror`, or undefined for a
+    /// guest and when nothing moved since they were last handed out. After `gkEnd` too.
+    #[wasm_bindgen(js_name = gkMirror)]
+    pub fn gk_mirror(&mut self) -> Option<Vec<u8>> {
+        self.core.gk.mirror()
+    }
+}
+
+/// What to write over a kept copy of an account's counters with ours (`gkMirror`'s bytes):
+/// the two as one, the higher of each standing, so another tab's are not lost; ours alone over
+/// one that does not read; undefined (write nothing) over another relay's or account's, or
+/// one a newer VoIPC wrote (`gk::mirror_merge`).
+#[wasm_bindgen(js_name = gkMirrorMerge)]
+pub fn gk_mirror_merge(stored: &[u8], ours: &[u8]) -> Option<Vec<u8>> {
+    gk::mirror_merge(stored, ours)
 }
 
 /// The group key's floors, between one connection to a relay and its next in this page
@@ -744,7 +764,7 @@ pub fn gk_bench(op: &str, arg: u32, budget_ms: f64) -> Result<String, JsError> {
 }
 
 /// `gk::Out` for the page: `{ seen: { user_id, account, name }[], send: Uint8Array[], emit:
-/// { name, payload }[], voice: boolean, build: boolean, held: boolean }`.
+/// { name, payload }[], voice: boolean, build: boolean, held: boolean, kept: boolean }`.
 fn gk_out(out: gk::Out) -> Result<JsValue, JsError> {
     let send = js_sys::Array::new();
     for frame in &out.send {
@@ -769,6 +789,7 @@ fn gk_out(out: gk::Out) -> Result<JsValue, JsError> {
         ("voice", JsValue::from_bool(out.voice)),
         ("build", JsValue::from_bool(out.build)),
         ("held", JsValue::from_bool(out.held)),
+        ("kept", JsValue::from_bool(out.kept)),
     ]))
 }
 

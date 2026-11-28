@@ -117,8 +117,9 @@ export interface SignalClient {
 
   // The group epoch key (voipc_crypto::group_state, plan 3i), written once for both
   // backends: the page sends and emits what `GkOut` says, as network.rs does.
-  /** `GroupKeys`: `on`, its 16-byte `run`, its `clock` (seconds); `kept`, taken over. */
-  gkStart(on: boolean, run: Uint8Array, clock: number, help: boolean, visible: boolean, inCall: boolean, kept?: KeptGk | null): GkOut;
+  /** `GroupKeys`: `on`, its 16-byte `run`, its `clock` (seconds); `kept`, taken over; `mirror`,
+   *  what this browser kept of a signed-in account's counters past its pages (gk-mirror.ts). */
+  gkStart(on: boolean, run: Uint8Array, clock: number, help: boolean, visible: boolean, inCall: boolean, kept?: KeptGk | null, mirror?: Uint8Array | null): GkOut;
   /** A channel we are in: a text channel we follow, or the voice room we stand in. */
   gkTrack(channelId: number, text: boolean, log: string, anonymous: boolean, hideMembers: boolean, viewerAdmin: boolean): GkOut;
   gkUntrack(channelId: number): GkOut;
@@ -148,6 +149,10 @@ export interface SignalClient {
   gkEnd(): GkOut;
   /** What the next connection to this relay takes over: before `free`. */
   gkKeep(): KeptGk | undefined;
+  /** A signed-in account's seat-key counters, for this browser to keep past the page (dive 1
+   *  F1): `gkStart`'s `mirror`. Undefined for a guest, and when nothing moved since the last.
+   *  After `gkEnd` too, before `free`. */
+  gkMirror(): Uint8Array | undefined;
 
   free(): void;
   [Symbol.dispose](): void;
@@ -167,6 +172,8 @@ export interface GkOut {
   build: boolean;
   /** The account holds events or read cursors for the page: its next call carries them. */
   held: boolean;
+  /** What this browser keeps of the account's counters may have moved: `gkMirror`. */
+  kept: boolean;
 }
 
 /** The group key's floors, between one connection to a relay and its next in this page. */
@@ -584,6 +591,11 @@ export interface WasmApi {
   controlMsgsPerSec(): number;
   /** Whether a server frame's postcard bytes are the group key's: `gkFrame` takes it undecoded. */
   isGkFrame(payload: Uint8Array): boolean;
+  /** What to write over a kept copy of an account's counters with ours (`gkMirror`'s): the two
+   *  as one, the higher of each, so another tab's are not lost; ours alone over one that does
+   *  not read; undefined (write nothing) over another relay's or account's, or a newer
+   *  VoIPC's. */
+  gkMirrorMerge(stored: Uint8Array, ours: Uint8Array): Uint8Array | undefined;
   pinHeldMost(): number;
   /** A fresh message id: 16 random bytes, hex. */
   newMessageId(): string;
@@ -717,6 +729,7 @@ export async function loadWasm(): Promise<WasmApi> {
     pickHistorySources: (s) => mod.pickHistorySources(s),
     controlMsgsPerSec: () => mod.controlMsgsPerSec(),
     isGkFrame: (p) => mod.isGkFrame(p),
+    gkMirrorMerge: (a, b) => mod.gkMirrorMerge(a, b),
     pinHeldMost: () => mod.pinHeldMost(),
     newMessageId: () => mod.newMessageId(),
     envelope: (id, text, ttlSecs, refs) =>

@@ -60,7 +60,7 @@ pub struct Clock {
 }
 
 impl Clock {
-    fn new() -> Clock {
+    pub(crate) fn new() -> Clock {
         Clock {
             unix0: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -94,6 +94,18 @@ enum Msg {
         account: [u8; 16],
         cause: u8,
     },
+    /// The seats of `accounts` exit (`exit`: a log leave, a gate, a new password), or (not
+    /// `exit`) each one's no session here holds (a leave or kick of an account that keeps no
+    /// log, whose own `Leave` went first). `at`: when the exit was asked in the store
+    /// (`Groups::ask_exit`), settled once what this enters is written.
+    AskedExit {
+        accounts: Vec<[u8; 16]>,
+        cause: u8,
+        at: Option<u64>,
+        exit: bool,
+    },
+    /// The channel's group id came back to this stored group: a new generation.
+    MovedBack,
     Eager {
         joiner: Joiner,
         account: [u8; 16],
@@ -210,6 +222,11 @@ enum Msg {
     Rotated {
         account: [u8; 16],
         keep: SeatRef,
+    },
+    /// Told once everything queued before it was handled and the turn's writes are done
+    /// (`Groups::drain`).
+    Flush {
+        ack: oneshot::Sender<()>,
     },
 }
 
@@ -365,6 +382,9 @@ fn send_current(shared: &Shared, id: &str, msg: Msg) -> bool {
 /// Lookups a message to a group is tried with: each failed one met a handle whose actor
 /// stopped or moved on to a new handle between its lookup and its send.
 const SEND_TRIES: usize = 8;
+/// A group's load that failed is tried again after this, doubling up to the most.
+const LOAD_RETRY_MS: u64 = 1_000;
+const LOAD_RETRY_MOST_MS: u64 = 30_000;
 
 /// An idle actor stops (`actor`), under its map entry's lock so that no lookup finds the
 /// handle meanwhile: its inbox is closed, so a send to it from here on fails and the sender
@@ -404,9 +424,8 @@ fn stop_idle(shared: &Shared, h: &Arc<Handle>, rx: &mut Inbox) -> Option<(Arc<Ha
     Some((next, next_rx))
 }
 
-/// The live group `id`, its actor started if it was not (a stored group whose channel
-/// moved back to it starts a new generation), knowing its channel's gate from its first
-/// due. A group a sweep or an account hook started takes its channel, and that channel's
+/// The live group `id`, its actor started if it was not (a stored group whose channel was
+/// deleted starts a new generation), knowing its channel's gate from its first due. A group a sweep or an account hook started takes its channel, and that channel's
 /// gate, from the first hook that names one: no due goes before a follow, which names it.
 /// So does a group another channel named before (a deleted one whose conversation came
 /// back in a new channel).
@@ -433,7 +452,7 @@ fn start(shared: &Arc<Shared>, id: &str, kind: GroupKind, channel: ChannelId) ->
     let (h, rx) = Handle::new(id, kind, channel, Arc::new(store));
     e.insert(h.clone());
     let mut g = GroupState::new(id.to_string(), kind, h.store.stored(), shared.caps.clone());
-    g.new_gen = shared.moved_back.remove(id).is_some();
+    g.new_gen = shared.gone.remove(id).is_some();
     g.kept_seats = shared.kept_seats.load(Ordering::Relaxed);
     g.gate = shared.gated.contains(&channel);
     tokio::spawn(actor(shared.clone(), h.clone(), rx, g));
@@ -466,10 +485,11 @@ pub struct Shared {
     kept_seats: AtomicUsize,
     /// Each stored group's bytes in the database, as the last sweep counted them.
     db_bytes: DashMap<String, u64>,
-    /// Stored groups whose channel moved back to them: a new generation at their start.
-    moved_back: DashSet<String>,
     /// The channels whose gate is on, as `on_gate` last told: a group's start reads its own.
     gated: DashSet<ChannelId>,
+    /// Stored groups whose channel was deleted: a new generation at their next start here
+    /// (their store keeps it too, written a moment later, for a start after a restart).
+    gone: DashSet<String>,
     /// Tests: how long an actor idles before it stops (`ACTOR_IDLE_MS` else).
     #[cfg(test)]
     idle_ms: std::sync::atomic::AtomicU64,
@@ -486,6 +506,12 @@ pub struct Shared {
     /// Tests: the next commit's store write takes this long in real time first.
     #[cfg(test)]
     stall: Mutex<Option<(u64, Stalled)>>,
+    /// Tests: the next new start's eager pages stop before the first is read.
+    #[cfg(test)]
+    eager_cut: std::sync::atomic::AtomicBool,
+    /// Tests: no group asks a refresh while set (`hold_refresh_for_test`).
+    #[cfg(test)]
+    refresh_held: std::sync::atomic::AtomicBool,
 }
 
 /// Tests: what a stalled store write saw (`stall_next_commit_for_test`): the relay's clock
@@ -673,8 +699,8 @@ impl Groups {
                 devices: DashMap::new(),
                 kept_seats: AtomicUsize::new(group::KEPT_SEATS),
                 db_bytes: DashMap::new(),
-                moved_back: DashSet::new(),
                 gated: DashSet::new(),
+                gone: DashSet::new(),
                 #[cfg(test)]
                 idle_ms: std::sync::atomic::AtomicU64::new(ACTOR_IDLE_MS),
                 #[cfg(test)]
@@ -685,6 +711,10 @@ impl Groups {
                 work: Arc::default(),
                 #[cfg(test)]
                 stall: Mutex::default(),
+                #[cfg(test)]
+                eager_cut: std::sync::atomic::AtomicBool::new(false),
+                #[cfg(test)]
+                refresh_held: std::sync::atomic::AtomicBool::new(false),
             }),
             by_channel: DashMap::new(),
             follows: DashMap::new(),
@@ -735,6 +765,49 @@ impl Groups {
 
     pub fn now(&self) -> u64 {
         self.shared.clock.now()
+    }
+
+    /// Waits until every stored group's actor has handled what was queued before this call
+    /// and written it, at most `timeout`: a shutdown's or a self-update's last step before
+    /// the pool closes (dive 4 F7). An actor's inbox is read in order, so its `Flush` answers
+    /// once the hooks' messages before it (an exit, a forced removal, an eager seat) are
+    /// written. A group still loading, or slower than that, is left as it is and said.
+    pub async fn drain(&self, timeout: Duration) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let ids: Vec<String> = self
+            .shared
+            .map
+            .iter()
+            .filter(|h| h.store.stored())
+            .map(|h| h.key().clone())
+            .collect();
+        let mut acks = Vec::with_capacity(ids.len());
+        for id in ids {
+            let (ack, done) = oneshot::channel();
+            if send_current(&self.shared, &id, Msg::Flush { ack }) {
+                acks.push((id, done));
+            }
+        }
+        let (n, mut late) = (acks.len(), vec![]);
+        for (id, done) in acks {
+            if !matches!(tokio::time::timeout_at(deadline, done).await, Ok(Ok(()))) {
+                late.push(id);
+            }
+        }
+        if late.is_empty() {
+            if n > 0 {
+                tracing::info!("group keys: {n} stored groups wrote what they had queued");
+            }
+        } else {
+            let named: Vec<&str> = late.iter().take(10).map(String::as_str).collect();
+            warn!(
+                "group keys: {} of {n} stored groups had not written what they had queued \
+                 within {} ms (first ones: {})",
+                late.len(),
+                timeout.as_millis(),
+                named.join(", ")
+            );
+        }
     }
 
     /// A channel's group id: `c:<conv>` for a stored conversation on a relay with
@@ -924,26 +997,44 @@ impl Groups {
 
     /// The channel's group id moved (anonymous or `hide_members` flip, `refresh_log`):
     /// the old group stops (an `r:` one is gone, a `c:` one is frozen in its store); the
-    /// new one starts with no keyring; back to a stored `c:` group, a new generation.
-    /// Followers follow again under the new id.
+    /// new one starts with no keyring; back to a stored `c:` group, a new generation: its
+    /// actor is told before any follower comes back (started if it was not; one a hook
+    /// started meanwhile runs on), and keeps that in its store for a start after a restart
+    /// (`moved_back`). Followers follow again under the new id.
     pub fn on_group_moved(&self, channel: ChannelId, old: &str, new: &str) {
         self.retire(old);
         self.by_channel.insert(channel, new.to_string());
         for mut f in self.follows.iter_mut() {
             f.remove(old);
         }
-        if new.starts_with("c:") {
-            self.shared.moved_back.insert(new.to_string());
+        if new.starts_with("c:") && new != old {
+            self.post_live(new, GroupKind::Text, channel, Msg::MovedBack);
         }
     }
 
     /// The channel is deleted: its group stops as a moved one does, and the channel names
     /// it no more and keeps no gate, so a hook that starts the group again (its rows outlive
-    /// the channel) takes no channel that is gone.
+    /// the channel) takes no channel that is gone. A stored group starts a new generation if
+    /// it comes back (its conversation in a new channel): kept in its store, with no actor
+    /// started (a purge may be taking its rows).
     pub fn on_channel_gone(&self, channel: ChannelId, id: &str) {
-        self.on_group_moved(channel, id, id);
+        self.retire(id);
+        for mut f in self.follows.iter_mut() {
+            f.remove(id);
+        }
         self.by_channel.remove(&channel);
         self.shared.gated.remove(&channel);
+        if let (true, Some(db)) = (id.starts_with("c:"), self.shared.db.get()) {
+            self.shared.gone.insert(id.to_string());
+            let (db, grp) = (db.clone(), id.to_string());
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                rt.spawn(async move {
+                    if let Err(e) = crate::accounts::gk::set_moved_back(&db.db, &grp).await {
+                        warn!(group = %grp, "keeping that the channel went failed: {e}");
+                    }
+                });
+            }
+        }
     }
 
     /// A conversation is purged: its group stops (K2 deletes its rows in batches).
@@ -973,6 +1064,9 @@ impl Groups {
         let Some(joiner) = self.account_joiner(account, ik).await else {
             return;
         };
+        if let Some(db) = self.shared.db.get() {
+            ask_eager(db, &id, &[joiner.seat], self.now()).await;
+        }
         let channel = self.channel_of(&id);
         self.post_live(
             &id,
@@ -982,19 +1076,71 @@ impl Groups {
         );
     }
 
-    /// Every seat of `account` in a stored conversation's group exits.
-    pub fn on_log_leave(&self, conv: &str, account: [u8; 16], cause: u8) {
+    /// Every seat of `account` in a stored conversation's group exits (its membership went:
+    /// `ask_exit`, then `exit_from_log`). The relay's own paths ask before the membership row
+    /// goes and post after (`log::leave`, `leave_log`, `log_keep_only`); tests take both at once.
+    #[cfg(test)]
+    pub async fn on_log_leave(&self, conv: &str, account: [u8; 16], cause: u8) {
+        let at = self.ask_exit(conv, &[account], cause).await;
+        self.exit_from_log(conv, vec![account], cause, at);
+    }
+
+    /// The exit of `accounts`' seats in a stored conversation's group, asked in the store
+    /// ahead of its actor (dive 4 F7): kept until what the exit enters is written, so a stop
+    /// before then (a crash, an actor still loading, a drain that ran out) still exits them at
+    /// the group's next start. When it was asked; `None` when it was not (the switch off, no
+    /// database, or the write failed: said, and the exit goes to the live group all the same).
+    pub async fn ask_exit(&self, conv: &str, accounts: &[[u8; 16]], cause: u8) -> Option<u64> {
+        let db = self
+            .shared
+            .db
+            .get()
+            .filter(|_| self.on && !accounts.is_empty())?;
+        let (grp, at) = (stored_id(conv), self.now());
+        match crate::accounts::gk::put_exit_asks(&db.db, &grp, accounts, cause, at).await {
+            Ok(()) => Some(at),
+            Err(e) => {
+                warn!(group = %grp, "keeping exits asked failed: {e}");
+                None
+            }
+        }
+    }
+
+    /// Every seat of `accounts` in a stored conversation's group exits with `cause` (a log
+    /// leave, a gate, a new password), `at` its ask (`ask_exit`): one message however many
+    /// accounts, taken in one walk of the group.
+    pub fn exit_from_log(&self, conv: &str, accounts: Vec<[u8; 16]>, cause: u8, at: Option<u64>) {
+        if !self.on || accounts.is_empty() {
+            return;
+        }
+        let id = stored_id(conv);
+        let channel = self.channel_of(&id);
+        let msg = Msg::AskedExit {
+            accounts,
+            cause,
+            at,
+            exit: true,
+        };
+        self.post_live(&id, GroupKind::Text, channel, msg);
+    }
+
+    /// The exit asked of an account that keeps no log of the conversation (`ask_exit`), as it
+    /// left the channel or was kicked: its session's own `Leave` went to the group first, and
+    /// the group exits the account's seats unless another session of it holds one there (its
+    /// other device, as `GroupState::leave` keeps it), then settles the ask.
+    pub fn exit_unless_held(&self, conv: &str, account: [u8; 16], cause: u8, at: u64) {
         if !self.on {
             return;
         }
         let id = stored_id(conv);
         let channel = self.channel_of(&id);
-        self.post_live(
-            &id,
-            GroupKind::Text,
-            channel,
-            Msg::AccountExit { account, cause },
-        );
+        let msg = Msg::AskedExit {
+            accounts: vec![account],
+            cause,
+            at: Some(at),
+            exit: false,
+        };
+        self.post_live(&id, GroupKind::Text, channel, msg);
     }
 
     /// A ban, identity reset or account deletion: its seats exit everywhere, online or not,
@@ -1094,6 +1240,7 @@ impl Groups {
             let _ = send_current(&self.shared, id, Msg::Supersede { account, n });
         }
         for id in &groups {
+            ask_eager(db, id, &[new], self.now()).await;
             let channel = self.channel_of(id);
             let exit = Msg::AccountExit {
                 account,
@@ -1146,6 +1293,7 @@ impl Groups {
                 if !stored {
                     continue;
                 }
+                ask_eager(db, &id, &[new], self.now()).await;
                 let channel = self.channel_of(&id);
                 // No seat here: the seats it went above may wait here still
                 self.post_live(&id, GroupKind::Text, channel, Msg::Supersede { account, n });
@@ -1171,6 +1319,11 @@ impl Groups {
         let mut ids: HashSet<String> = self.shared.map.iter().map(|h| h.key().clone()).collect();
         if let Some(db) = self.shared.db.get() {
             let m = voipc_crypto::group_key::MemberId::Account(account).seat_id();
+            // Marked in the store first (dive 4 F6): a stop before a group's actor takes the
+            // message still proposes the removal at its next start
+            if let Err(e) = crate::accounts::gk::force_device_holders(&db.db, &m, device).await {
+                warn!("marking a removed device's keyholder entries failed: {e}");
+            }
             if let Ok(rows) = crate::accounts::gk::holders_of(&db.db, &m, Some(device)).await {
                 ids.extend(rows.into_iter().map(|(grp, _)| grp));
             }
@@ -1530,12 +1683,19 @@ async fn answer(
     // The seed welcome under the seed of the row it is keyed by (a connection that never
     // took it, a seat offline through a roll, §5.6), else a running roll's
     let hd = snap.head.header();
-    if let Some(s) = p.seat.as_ref().filter(|k| k.row.is_some()).map(|k| k.s) {
+    let row_seed = p.seat.as_ref().filter(|k| k.row.is_some()).map(|k| k.s);
+    if let Some(s) = row_seed {
         p.seed_welcome = h.store.seed_welcome(&h.id, &gen, seat, s).await;
     }
     // Pages go on past a roll that ended at its 24 h with seats behind (§5.6)
     let rolls = hd.seed_floor < hd.seed || snap.left_behind;
-    if rolls && p.seed_welcome.as_ref().is_none_or(|w| w.s != hd.seed) {
+    // A row under an older seed with no self-row opens only by that seed's welcome (a seat
+    // no device opened its welcome of, back while a roll runs): it goes, and the head seed's
+    // comes with a later answer. Else the member takes no key until its bucket is re-keyed
+    // under the head seed, up to an hour (dive 3 P3)
+    let only =
+        row_seed.is_some_and(|s| s < hd.seed) && p.seed_welcome.is_some() && p.self_rows.is_empty();
+    if rolls && !only && p.seed_welcome.as_ref().is_none_or(|w| w.s != hd.seed) {
         p.seed_welcome = h
             .store
             .seed_welcome(&h.id, &gen, seat, hd.seed)
@@ -1553,22 +1713,70 @@ async fn answer(
     (push::epoch_in(&h.id, p), sent)
 }
 
+/// The group as the store holds it. A read that failed is no reason for a new generation
+/// (§5.7 names those): the load is tried again from the state the group started with, with
+/// a growing wait, while what comes in waits in the inbox (dive 4 F4). `None`: stopped.
+pub(crate) async fn load_retrying(
+    store: &Store,
+    g: GroupState,
+    clock: Clock,
+    stop: &tokio::sync::Notify,
+) -> Option<GroupState> {
+    let blank = |g: &GroupState| {
+        let mut b = GroupState::new(g.id.clone(), g.kind, g.stored, g.caps.clone());
+        b.new_gen = g.new_gen;
+        b.kept_seats = g.kept_seats;
+        b.gate = g.gate;
+        b
+    };
+    let start = blank(&g);
+    let mut g = g;
+    let mut wait = LOAD_RETRY_MS;
+    loop {
+        match store.load(&mut g).await {
+            Ok(()) => return Some(g),
+            Err(e) => {
+                warn!(group = %g.id, "loading the group failed, trying again in {wait} ms: {e}")
+            }
+        }
+        g = blank(&start);
+        tokio::select! {
+            _ = stop.notified() => return None,
+            _ = tokio::time::sleep_until(clock.at(clock.now() + wait)) => {}
+        }
+        wait = (wait * 2).min(LOAD_RETRY_MOST_MS);
+    }
+}
+
 async fn actor(
     shared: Arc<Shared>,
     mut h: Arc<Handle>,
     mut rx: mpsc::UnboundedReceiver<(Msg, usize)>,
-    mut g: GroupState,
+    g: GroupState,
 ) {
     let clock = shared.clock;
-    if let Err(e) = h.store.load(&mut g).await {
-        warn!(group = %h.id, "loading the group failed: {e}");
-        g.new_gen = true;
-    }
+    let Some(loaded) = load_retrying(&h.store, g, clock, &h.stop).await else {
+        #[cfg(test)]
+        drop_inbox(&shared, &mut rx);
+        return;
+    };
+    let mut g = loaded;
     let mut out = vec![];
     let now = clock.now();
+    g.restarted(now);
     let conns: Vec<SeatRef> = g.seats.keys().filter(|s| s.m.is_conn()).copied().collect();
     for s in conns {
         g.exit(s, group::cause::RESTART, now, &mut out);
+    }
+    // Exit asks whose exits wait to be written, and the first exit whose write failed: both
+    // carried from turn to turn until the database takes them (dive 4 F7, F2)
+    let store::Reconciled {
+        mut unwritten,
+        asks: mut exit_asks,
+    } = h.store.reconcile(&mut g, now, &mut out).await;
+    // A new start's eager pages that a stop cut off go on from where they stopped (review P3)
+    if let Some((gen, after)) = h.store.eager_left(&g).await {
+        eager_all(&shared, &h, g.kept_seats, gen, after);
     }
     publish_snap(&h, &g);
     publish(&h, &g, now);
@@ -1580,6 +1788,10 @@ async fn actor(
     let mut was = g.head.as_ref().map(|x| x.sh.d());
     let mut ticked = 0;
     loop {
+        #[cfg(test)]
+        {
+            g.refresh_held = shared.refresh_held.load(Ordering::Relaxed);
+        }
         let wake = g.wake(ticked);
         let idle_at = idle_since.map(|t| t + shared.idle_ms());
         let next = [wake, idle_at].into_iter().flatten().min();
@@ -1615,6 +1827,9 @@ async fn actor(
         let mark = g.due_mark();
         let exits_from = g.exits.next;
         let mut answers: Vec<(UserId, SeatRef, Option<FloorRef>, bool)> = vec![];
+        // Eager seats seated, refused or dropped in this turn: their asks go once its pushes
+        // are out (a stop before that leaves the ask to the next start, which drops it)
+        let mut settled: Vec<SeatRef> = vec![];
         let touched = match &msg {
             Some(
                 Msg::Fetch { sid, .. }
@@ -1626,28 +1841,37 @@ async fn actor(
         };
         // Many sessions' seats may move: an account's exit, a voice room's seats named anew
         let named = (g.anonymous, g.gate);
-        let mut all = matches!(msg, Some(Msg::AccountExit { .. }));
+        let mut all = matches!(
+            msg,
+            Some(Msg::AccountExit { .. } | Msg::AskedExit { .. } | Msg::MovedBack)
+        );
+        let mut flushed = None;
         match msg {
             None => {
                 g.tick(now, &mut out);
                 ticked = now;
             }
-            Some(m) => handle_msg(&shared, &h, &mut g, m, now, &mut out, &mut answers).await,
+            Some(Msg::Flush { ack }) => flushed = Some(ack),
+            Some(m) => {
+                let (o, a, s) = (&mut out, &mut answers, &mut settled);
+                handle_msg(&shared, &h, &mut g, m, now, o, a, s, &mut exit_asks).await
+            }
         }
         all |= (g.anonymous, g.gate) != named;
-        if g.exits.next != exits_from {
-            h.store.exits_entered(&h.id, &g, exits_from, now).await;
+        // The turn's exits, and any a failed write left, from the first not written
+        if g.exits.next != exits_from || unwritten.is_some() {
+            let from = unwritten.map_or(exits_from, |u| u.min(exits_from));
+            unwritten = (!h.store.exits_entered(&h.id, &g, from, now).await).then_some(from);
         }
         // A seed-welcome page, with the KEM keys of its seats (plan 2d "Seed rolls")
         if let Some(want) = g.page_wanted(now) {
             let (keyed, gone) = page_keys(&shared, &g, &want).await;
             g.ask_page(keyed, gone, now, &mut out);
         }
-        // The keyholder entries, their pairs and when each was last online outlive a
-        // restart (2i): written when the set or who of it is online changes
+        // The keyholder entries, their pairs, when each was last online and a removal
+        // proposed outright outlive a restart (2i, dive 4 F6): written when one changes
         let kh_now = holders_now(&g);
-        if kh_now != kh_was {
-            h.store.put_holders(&g, now).await;
+        if kh_now != kh_was && h.store.put_holders(&g, now).await {
             kh_was = kh_now;
         }
         // Before the dues go out: a keyholder's first part may come back at once
@@ -1672,6 +1896,14 @@ async fn actor(
             touch(&h, &g, sid);
         }
         answer_all(&shared, &h, answers).await;
+        if !settled.is_empty() {
+            h.store.eager_settled(&h.id, &settled).await;
+        }
+        settle_exits(&h, &g, &mut exit_asks, unwritten).await;
+        // Everything before it is handled and written (`Groups::drain`)
+        if let Some(ack) = flushed {
+            let _ = ack.send(());
+        }
         if g.idle() {
             let since = *idle_since.get_or_insert(now);
             // What is queued is read first: the stop takes only what came in meanwhile
@@ -1691,10 +1923,32 @@ async fn actor(
     }
 }
 
+/// Exit asks (account, when asked) whose exits are all written go: none waits for a write that
+/// failed (`unwritten`), and no seat of the account exits only once a due out lands
+/// (`exit_late`, memory alone). The rest wait for a later turn, as do those whose delete
+/// failed.
+async fn settle_exits(
+    h: &Handle,
+    g: &GroupState,
+    asks: &mut Vec<([u8; 16], u64)>,
+    unwritten: Option<u64>,
+) {
+    if asks.is_empty() || unwritten.is_some() {
+        return;
+    }
+    let (done, wait): (Vec<_>, Vec<_>) = asks.drain(..).partition(|(a, _)| !g.exiting_late(a));
+    *asks = wait;
+    if !h.store.exits_settled(&h.id, &done).await {
+        asks.extend(done);
+    }
+}
+
 type Answer = (UserId, SeatRef, Option<FloorRef>, bool);
 
-/// The keyholder set and its online entries, by KX.
-fn holders_now(g: &GroupState) -> (Vec<[u8; 32]>, Vec<[u8; 32]>) {
+/// The keyholder set, its online entries and those whose removal is proposed outright, by KX.
+type HoldersNow = (Vec<[u8; 32]>, Vec<[u8; 32]>, Vec<[u8; 32]>);
+
+fn holders_now(g: &GroupState) -> HoldersNow {
     (
         g.holders.set.iter().map(|k| k.kx).collect(),
         g.holders
@@ -1702,6 +1956,7 @@ fn holders_now(g: &GroupState) -> (Vec<[u8; 32]>, Vec<[u8; 32]>) {
             .iter()
             .map(|v| v.pair.kx())
             .collect(),
+        g.holders.forced.iter().map(|r| r.kx).collect(),
     )
 }
 
@@ -1754,19 +2009,27 @@ async fn page_keys(shared: &Shared, g: &GroupState, seats: &[SeatRef]) -> PageKe
 /// only until it went out, rows only of re-keyed versions, and a seed welcome only until it
 /// went out (2b), so a seat seated by a welcome another connection took has no base, and
 /// one keyed by a row has no `s_m` to open it without its seed's welcome (no self-rows).
+///
+/// A stored group keeps welcomes and self-rows, but a seat seated while no device of its
+/// account was there (an eager seat) has its member secret only in its Join's welcome: once
+/// its bucket is re-keyed by rows, the relay keys it by a row, which opens only with that
+/// secret. With no seed welcome under the row's seed and no self-row of the account, the seat
+/// is seated again: the new Join's welcome carries the same secret (it is the seed's and the
+/// seat's), and the rows made meanwhile open with it (dive 3 F2).
 async fn lost(h: &Handle, seat: &SeatRef) -> bool {
-    if h.store.stored() {
-        return false;
-    }
+    let stored = h.store.stored();
     let snap = h.snap.read().unwrap_or_else(|e| e.into_inner()).clone();
     let Some((snap, at)) = snap.and_then(|s| s.base_of(seat).map(|at| (s, at))) else {
         return false;
     };
     let gen = snap.gen();
     match h.store.base(&h.id, &gen, seat, at).await {
-        None => true,
+        None => !stored,
         Some((_, _, true, _)) => false,
-        Some((s, _, false, _)) => h.store.seed_welcome(&h.id, &gen, seat, s).await.is_none(),
+        Some((s, _, false, _)) => {
+            h.store.seed_welcome(&h.id, &gen, seat, s).await.is_none()
+                && (!stored || !h.store.self_row_held(&h.id, &gen, seat, s).await)
+        }
     }
 }
 
@@ -1815,12 +2078,37 @@ async fn answer_all(shared: &Shared, h: &Handle, answers: Vec<Answer>) {
 /// Eager seats asked a page at a time (plan 2d).
 const EAGER_PAGE: u32 = 256;
 
-/// After a stored group's Genesis or Regenesis: every account that keeps its conversation's
-/// log with published seat keys is queued eagerly, online or not (plan 2d "Eager seats"),
-/// since they never send `LogJoin` again; not one whose keys the relay first held more than
-/// the seat expiry and a rotation's age ago (120 days). Read a page at a time off the actor,
-/// at most `kept_seats`, each page queued to it.
-fn eager_all(shared: &Arc<Shared>, h: &Handle, kept_seats: usize) {
+/// Eager seats asked of stored group `grp`, written before its actor is told and kept until
+/// a Join seats them or the relay drops them (`Store::eager_settled`): a restart meanwhile,
+/// or while they wait for a keyholder, asks them again (`Store::reconcile`, dive 4 F7). A
+/// failed write is said (`false`); the seat is still asked of the live actor.
+async fn ask_eager(db: &DbStore, grp: &str, seats: &[SeatRef], now: u64) -> bool {
+    let asks = store::eager_asks(seats);
+    if asks.is_empty() {
+        return true;
+    }
+    if let Err(e) = crate::accounts::gk::put_eager(&db.db, grp, &asks, now).await {
+        warn!(group = grp, "keeping eager seats asked failed: {e}");
+        return false;
+    }
+    true
+}
+
+/// After a stored group's Genesis or Regenesis (`gen`, its new generation): every account
+/// that keeps its conversation's log with published seat keys is queued eagerly, online or
+/// not (plan 2d "Eager seats"), since they never send `LogJoin` again; not one whose keys the
+/// relay first held more than the seat expiry and a rotation's age ago (120 days). Read a page
+/// at a time off the actor, at most `kept_seats`, each page queued to it. Where the pages are
+/// is kept with the group (`eager_after`, set by the start's head move), moved on once a page's
+/// asks are written and cleared at the end: an actor's start after a stop that cut them goes
+/// on after `from` (review P3).
+fn eager_all(
+    shared: &Arc<Shared>,
+    h: &Handle,
+    kept_seats: usize,
+    gen: [u8; 16],
+    from: Option<[u8; 16]>,
+) {
     let Store::Db(db) = &*h.store else {
         return;
     };
@@ -1833,12 +2121,20 @@ fn eager_all(shared: &Arc<Shared>, h: &Handle, kept_seats: usize) {
         .now()
         .saturating_sub((SEAT_EXPIRY_SECS + SEAT_KEYS_ROTATE_SECS) * 1000);
     let busy = Busy::start(shared);
+    #[cfg(test)]
+    let cut = shared.eager_cut.swap(false, Ordering::Relaxed);
     let (db, shared, conv) = (db.clone(), Arc::downgrade(shared), h.id.clone());
     tokio::spawn(async move {
         let _busy = busy;
-        let mut after: Option<[u8; 16]> = None;
-        let mut queued = 0;
-        while queued < kept_seats {
+        #[cfg(test)]
+        if cut {
+            return;
+        }
+        let mut after = from;
+        // Whether every ask so far is written: where the pages are moves on only then, so
+        // the next start reads a page whose asks were lost again
+        let (mut queued, mut kept) = (0, true);
+        loop {
             // The group id is its conversation's (`stored_id`), as `voipc_members` names it
             let page =
                 match store::eager_page(&db.db, &conv, since, after.as_ref(), EAGER_PAGE).await {
@@ -1850,17 +2146,46 @@ fn eager_all(shared: &Arc<Shared>, h: &Handle, kept_seats: usize) {
                 };
             let full = page.len() == EAGER_PAGE as usize;
             queued += page.len();
-            after = page.last().map(|(a, _)| *a);
+            let Some(s) = shared.upgrade() else {
+                return;
+            };
+            if let Some((a, _)) = page.last() {
+                after = Some(*a);
+                // Kept until seated, so a restart meanwhile asks them again (dive 4 F7)
+                let seats: Vec<SeatRef> = page.iter().map(|(_, j)| j.seat).collect();
+                kept &= ask_eager(&db, &conv, &seats, s.clock.now()).await;
+            }
+            let more = full && queued < kept_seats;
+            if kept {
+                let upto = if more { after.as_ref() } else { None };
+                if let Err(e) = crate::accounts::gk::eager_upto(&db.db, &conv, &gen, upto).await {
+                    warn!(group = %conv, "keeping where the eager seats are failed: {e}");
+                    kept = false;
+                }
+            }
             // To the group's actor whichever handle names it now (`stop_idle`)
-            let sent = !page.is_empty()
-                && shared
-                    .upgrade()
-                    .is_some_and(|s| send_current(&s, &conv, Msg::EagerMany(page)));
-            if !sent || !full {
+            if page.is_empty() || !send_current(&s, &conv, Msg::EagerMany(page)) || !more {
                 return;
             }
         }
     });
+}
+
+/// Session `sid` leaves `g` with `cause` (`Msg::Leave`): the seat its leave took out of the
+/// join queue unseated, whose eager ask is settled with it (review P2). An unfollow or a kick
+/// of the seat's last session is an exit (§5.4): the live relay does not seat it, so neither
+/// may the next start. A disconnect, or a seat another session holds, keeps the join, and the
+/// ask with it.
+pub(crate) fn leave(
+    g: &mut GroupState,
+    sid: UserId,
+    cause: u8,
+    now: u64,
+    out: &mut Vec<Out>,
+) -> Option<SeatRef> {
+    let seat = g.members.get(&sid).and_then(|m| m.seat);
+    g.leave(sid, cause, now, out);
+    seat.filter(|s| g.stored && !g.joins.has(s) && !g.seats.contains_key(s))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1872,6 +2197,8 @@ async fn handle_msg(
     now: u64,
     out: &mut Vec<Out>,
     answers: &mut Vec<(UserId, SeatRef, Option<FloorRef>, bool)>,
+    settled: &mut Vec<SeatRef>,
+    exit_asks: &mut Vec<([u8; 16], u64)>,
 ) {
     match m {
         Msg::Follow {
@@ -1887,15 +2214,40 @@ async fn handle_msg(
         Msg::Leave { sid, cause } => {
             h.kh_sent.remove(&sid);
             h.keyed.remove(&sid);
-            g.leave(sid, cause, now, out)
+            settled.extend(leave(g, sid, cause, now, out));
         }
         Msg::AccountExit { account, cause } => g.account_exit(&account, cause, now, out),
+        Msg::AskedExit {
+            accounts,
+            cause,
+            at,
+            exit,
+        } => {
+            let asks: HashMap<[u8; 16], u8> = accounts.iter().map(|a| (*a, cause)).collect();
+            match exit {
+                true => g.accounts_exit(&asks, now, out),
+                false => g.accounts_exit_unheld(&asks, now, out),
+            }
+            if let Some(at) = at.filter(|_| g.stored) {
+                exit_asks.extend(accounts.into_iter().map(|a| (a, at)));
+            }
+        }
+        Msg::MovedBack => {
+            if g.stored && g.head.is_some() {
+                h.store.moved_back(&h.id).await;
+            }
+            g.moved_back(now, out);
+        }
         Msg::Supersede { account, n } => g.supersede(&account, n, now, out),
         Msg::Eager { joiner, account } => {
             let seat = joiner.seat;
             g.eager(joiner, account, now, out);
             if g.seats.contains_key(&seat) {
                 shared.reseat_done(&h.id, &seat);
+            }
+            // Seated already, below a rotation or past `kept_seats`: its ask goes
+            if !g.joins.has(&seat) {
+                settled.push(seat);
             }
         }
         Msg::Volunteer { sid, v, device } => {
@@ -1947,8 +2299,10 @@ async fn handle_msg(
                     for s in &dealt {
                         shared.reseat_done(&h.id, s);
                     }
-                    if anew && g.stored {
-                        eager_all(shared, h, g.kept_seats);
+                    // Eager seats seated or refused: asked no more
+                    settled.extend(dealt);
+                    if let Some(gen) = g.gen().filter(|_| anew && g.stored) {
+                        eager_all(shared, h, g.kept_seats, gen, None);
                     }
                 }
                 Err(Fail::Check(d)) => {
@@ -2020,6 +2374,8 @@ async fn handle_msg(
             };
             if let Err(e) = h.store.seeds(&h.id, &gen, seed, &by, &took, now).await {
                 warn!(group = %h.id, "storing seed welcomes failed: {e}");
+                // The relay's failure: no miss for the keyholder, the page asked again
+                g.page_unstored(due, now);
                 return;
             }
             let mut pushed = vec![];
@@ -2049,7 +2405,11 @@ async fn handle_msg(
         Msg::DeviceRemoved { account, device } => g.device_removed(&account, &device, now, out),
         Msg::EagerMany(page) => {
             for (account, joiner) in page {
+                let seat = joiner.seat;
                 g.eager(joiner, account, now, out);
+                if !g.joins.has(&seat) {
+                    settled.push(seat);
+                }
             }
         }
         Msg::Sweep { daily } => {
@@ -2060,6 +2420,10 @@ async fn handle_msg(
         }
         Msg::Expire(seats) => g.expire(&seats, now, out),
         Msg::Rotated { account, keep } => g.rotated(&account, &keep, now, out),
+        // Taken by `actor` itself
+        Msg::Flush { ack } => {
+            let _ = ack.send(());
+        }
     }
 }
 
@@ -2230,6 +2594,19 @@ impl Groups {
         let seen = Stalled::default();
         *self.shared.stall.lock().unwrap() = Some((ms, seen.clone()));
         seen
+    }
+
+    /// The next new start's eager pages stop before the first is read, as a stop (a crash, a
+    /// shutdown) right after its head move cuts them.
+    pub fn cut_eager_for_test(&self) {
+        self.shared.eager_cut.store(true, Ordering::Relaxed);
+    }
+
+    /// No group asks a refresh while `held` (from each actor's next turn on): a scene that
+    /// must land many commits in one epoch is not cut by the 5-minute refresh, however much
+    /// real time a slow database takes for it.
+    pub fn hold_refresh_for_test(&self, held: bool) {
+        self.shared.refresh_held.store(held, Ordering::Relaxed);
     }
 }
 

@@ -24,7 +24,15 @@ mod fsutil;
 mod gates;
 mod gk;
 #[cfg(test)]
+mod gk_d4_tests;
+#[cfg(test)]
 mod gk_e2e_c3c;
+#[cfg(test)]
+mod gk_e2e_d1;
+#[cfg(test)]
+mod gk_e2e_d2;
+#[cfg(test)]
+mod gk_e2e_d3;
 #[cfg(test)]
 mod gk_e2e_j10b;
 #[cfg(test)]
@@ -1618,6 +1626,9 @@ async fn main() -> Result<()> {
     if let Some(store) = &state.emotes {
         store.flush().await;
     }
+    // What the group keys' actors had queued (an exit, a removal proposed, an eager seat),
+    // handled and written before the pool closes or the process ends (dive 4 F7)
+    state.gk.drain(Duration::from_secs(3)).await;
     if let (Some(version), Some(paths)) = (updating_to, &update_paths) {
         // Its locks go with the pool, not with the exec
         if let Some(relay) = &state.accounts {

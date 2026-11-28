@@ -10,12 +10,13 @@ use std::rc::Rc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use voipc_crypto::account_session::{AccountSession, Actions};
 use voipc_crypto::group_key::{GroupKind, MemberId};
 use voipc_crypto::group_state::{
     group_id, BuildJob, Copies, Early, EarlyPost, GkCtx, GkEpoch, GkNames, GkOut, GkPins, GkStart,
-    GkTrack, GroupKeying, KeptCopy, LocalGk, MemoryPins, OpenedPost, PastEpoch, Platform,
+    GkTrack, GroupKeying, KeptCopy, LocalGk, MemoryPins, OpenedPost, PastEpoch, Platform, SeenBook,
     VaultFloor, VoiceKeys,
 };
 use voipc_crypto::time::now_millis;
@@ -27,6 +28,75 @@ use crate::account::AccountLink;
 
 /// Rounds of account news one call settles; what is left goes at the next call.
 const SETTLE_ROUNDS: usize = 4;
+
+/// What this browser keeps of a signed-in account's `LocalGk::mirror` past the page (dive 1
+/// F1): the seat-key counters its pages checked or raised, which a relay that withholds the
+/// vault's group-key pages would otherwise take with them at a reload. gk-mirror.ts seals
+/// these postcard bytes into IndexedDB. They name the relay and the account, and a sign-in
+/// of another takes none of them.
+#[derive(Serialize, Deserialize)]
+struct StoredMirror<B> {
+    version: u32,
+    relay: [u8; 16],
+    account: [u8; 16],
+    book: B,
+}
+
+/// `StoredMirror::version`.
+const MIRROR_VERSION: u32 = 1;
+/// Stored bytes past this are not read. A mirror at its bound (`group_state::MIRROR_MOST`,
+/// 32,768 accounts, and its slack) is about 1.1 MB: at most 32 bytes a row.
+const MIRROR_MOST_BYTES: usize = 4 << 20;
+
+impl StoredMirror<SeenBook> {
+    fn read(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() > MIRROR_MOST_BYTES {
+            return None;
+        }
+        let m: Self = postcard::from_bytes(bytes).ok()?;
+        (m.version == MIRROR_VERSION).then_some(m)
+    }
+}
+
+fn mirror_bytes(relay: [u8; 16], account: [u8; 16], book: &SeenBook) -> Vec<u8> {
+    let m = StoredMirror {
+        version: MIRROR_VERSION,
+        relay,
+        account,
+        book,
+    };
+    postcard::to_allocvec(&m).expect("a mirror encodes")
+}
+
+/// What to write over a stored mirror with ours (`Gk::mirror`'s bytes): of one relay and
+/// account, the two as one, the higher of each counter standing and bounded as the mirror is,
+/// so what another tab of this browser kept meanwhile is not lost; over one that does not read
+/// (or none), ours alone. `None`: write nothing, over one of another relay or account, over
+/// one a newer VoIPC wrote (an older build never writes over newer data, COMPATIBILITY.md), or
+/// when ours do not read. Another account's is left because the account id is the relay's
+/// word (`Authenticated`): one sign-in it names under another id must not cost the next
+/// honest one these counters. The cost: a name a new account took after the old one was
+/// deleted elsewhere keeps its counters only for the page, until the old row is forgotten
+/// (gk-mirror.ts `forgetMirror`: the device forgotten, or the account deleted, here).
+pub fn mirror_merge(stored: &[u8], ours: &[u8]) -> Option<Vec<u8>> {
+    let b = StoredMirror::read(ours)?;
+    let newer = postcard::take_from_bytes::<u32>(stored).is_ok_and(|(v, _)| v > MIRROR_VERSION);
+    if newer {
+        return None;
+    }
+    let Some(a) = StoredMirror::read(stored) else {
+        return Some(ours.to_vec());
+    };
+    if (a.relay, a.account) != (b.relay, b.account) {
+        return None;
+    }
+    let mut local = LocalGk {
+        mirror: b.book,
+        ..LocalGk::default()
+    };
+    local.mirror_in(&a.book);
+    Some(mirror_bytes(b.relay, b.account, &local.mirror))
+}
 
 /// The variant tags of the group key's frames: from the one after `GroupKeys` to
 /// `EpochPostTaken`, the last (protocol 26 appended them in that order).
@@ -113,6 +183,8 @@ pub struct Out {
     pub voice: bool,
     pub build: bool,
     pub held: bool,
+    /// What this browser keeps of the account's counters may have moved: `Gk::mirror`.
+    pub kept: bool,
 }
 
 /// One connection's group keys in the browser.
@@ -133,6 +205,11 @@ pub struct Gk {
     copies: Copies,
     /// Our posts to channels not tracked yet (their join not answered).
     early: Early,
+    /// The relay and the account of a signed-in connection, whose counters this browser
+    /// keeps past the page (`mirror`).
+    mirror_of: Option<([u8; 16], [u8; 16])>,
+    /// The bytes `mirror` last handed out, or `Start::mirror` handed in: those again are not.
+    mirror_sent: Option<Vec<u8>>,
 }
 
 /// A connection's start (`GroupKeys`), with the page's state.
@@ -145,6 +222,9 @@ pub struct Start {
     pub in_call: bool,
     /// The floors an earlier connection to this relay kept, in this page.
     pub local: Option<LocalGk>,
+    /// A signed-in account's counters as this browser kept them past the page (`mirror`'s
+    /// bytes): merged into `local`'s, the higher of each standing. A guest's are ignored.
+    pub mirror: Option<Vec<u8>>,
 }
 
 impl Gk {
@@ -176,6 +256,27 @@ impl Gk {
         if let (None, Some(local)) = (account, &s.local) {
             self.pins.counters = local.counters.clone();
         }
+        let mut local = s.local;
+        // An account's counters this browser kept past its last page, with what this page
+        // kept (dive 1 F1): a reload no longer loses them to a relay that withholds the
+        // vault's pages
+        let relay = self
+            .account
+            .as_ref()
+            .and_then(|l| l.whose.borrow().as_ref().map(|w| w.0));
+        self.mirror_of = None;
+        self.mirror_sent = None;
+        if let (Some(id), Some(relay)) = (account, relay) {
+            self.mirror_of = Some((relay, id));
+            let stored = s.mirror.as_deref().and_then(StoredMirror::read);
+            if let Some(m) = stored.filter(|m| m.relay == relay && m.account == id) {
+                local
+                    .get_or_insert_with(LocalGk::default)
+                    .mirror_in(&m.book);
+                self.mirror_sent = s.mirror;
+            }
+            out.kept = true;
+        }
         let o = self.keying.start(GkStart {
             on: s.on,
             run: s.run,
@@ -186,7 +287,7 @@ impl Gk {
             identity,
             account,
             seat_keys,
-            local: s.local,
+            local,
             visible: s.visible && !s.in_call,
         });
         self.take(o, &mut out);
@@ -479,6 +580,24 @@ impl Gk {
         Some(local)
     }
 
+    /// A signed-in account's counters (`LocalGk::mirror`, every one this page checked or
+    /// raised), as bytes for `Start::mirror`, for this browser to keep past the page: when
+    /// they differ from those last handed out or in. Also after `end`.
+    pub fn mirror(&mut self) -> Option<Vec<u8>> {
+        let (relay, account) = self.mirror_of?;
+        let book = &self.keying.local()?.mirror;
+        // Nothing met, and nothing kept to go on from
+        if self.mirror_sent.is_none() && *book == SeenBook::default() {
+            return None;
+        }
+        let bytes = mirror_bytes(relay, account, book);
+        if self.mirror_sent.as_ref() == Some(&bytes) {
+            return None;
+        }
+        self.mirror_sent = Some(bytes.clone());
+        Some(bytes)
+    }
+
     /// A call that checks against the book: the account's, else the guest's.
     fn call(&mut self, f: impl FnOnce(&mut GroupKeying, GkCtx) -> GkOut) -> GkOut {
         let now = now_millis();
@@ -498,6 +617,7 @@ impl Gk {
     /// The posts that went are noted before their frames go (`Copies::sent`).
     fn take(&mut self, o: GkOut, out: &mut Out) {
         self.copies.sent(&o, now_millis());
+        out.kept |= o.local_dirty && self.mirror_of.is_some();
         let GkOut {
             send,
             posts,
@@ -666,6 +786,7 @@ mod tests {
             visible: true,
             in_call,
             local: None,
+            mirror: None,
         };
         core.gk_start(s).unwrap()
     }
@@ -1198,6 +1319,7 @@ mod tests {
                 visible: true,
                 in_call: false,
                 local: None,
+                mirror: None,
             };
             core.gk_start(s).unwrap();
         };
@@ -1228,6 +1350,7 @@ mod tests {
             visible: true,
             in_call: false,
             local: Some(kept),
+            mirror: None,
         };
         next.gk_start(s).unwrap();
         assert_eq!(next.gk.pins.counters.seen(&[4; 16]).map(|s| s.n), Some(3));
@@ -1250,10 +1373,605 @@ mod tests {
             visible: true,
             in_call: false,
             local: Some(kept),
+            mirror: None,
         };
         assert!(
             volunteers(&next.gk_start(s).unwrap()).is_empty(),
             "help off"
         );
+    }
+}
+
+// Dive 1 F1 in the browser: a signed-in account's counters, past a reload. A page is a fresh
+// `SignalCore` and a fresh `AccountSession` of the same account, fed by a relay that is this
+// test; what the browser keeps between the two is `Gk::mirror`'s bytes (gk-mirror.ts keeps
+// them in IndexedDB), and nothing else of the page.
+#[cfg(test)]
+mod reload_tests {
+    use std::collections::{HashMap, VecDeque};
+
+    use serde::Serialize;
+    use voipc_crypto::account::{SignedIn, Vault};
+    use voipc_crypto::group_key::commit::Pair;
+    use voipc_crypto::group_key::{
+        names_hash, Added, Endorsement, Keyholder, Kind, Origin, Removed, SeatPair, SignedHeader,
+    };
+    use voipc_crypto::group_key::{GroupKind, HeaderV1, MemberId, Seen};
+    use voipc_crypto::sync::{Counter, GkIndex, LogMemory, ITEM_GK_FLOORS};
+    use voipc_crypto::IdentityKeyPair;
+    use voipc_protocol::gk::{HeaderIn, InPiece};
+    use voipc_protocol::messages::{AccountReply, AccountRequest, ClientMessage, ServerMessage};
+    use voipc_protocol::types::{AccountInfo, VaultBlob};
+
+    use super::*;
+    use crate::signal::SignalCore;
+
+    const RELAY: [u8; 16] = [9; 16];
+    const ME: [u8; 16] = [1; 16];
+    const ALICE: [u8; 16] = [0xa1; 16];
+    const K1: [u8; 16] = [0x11; 16];
+    const RUN: [u8; 16] = [0x22; 16];
+    const CHANNEL: u32 = 1;
+    const GROUP: &str = "c:lounge-4";
+    const DAY: u64 = 24 * 60 * 60;
+
+    fn now() -> u64 {
+        now_millis() / 1000
+    }
+
+    fn raw(ik: &IdentityKeyPair) -> [u8; 32] {
+        ik.public_key().public_key_bytes().try_into().unwrap()
+    }
+
+    /// `sync::gk_floors::CounterRow`, field for field (postcard is positional): a `gkc.N` page
+    /// is `Vec<CounterRow>`, sealed as that vault item.
+    #[derive(Serialize)]
+    struct CounterRow {
+        account: [u8; 16],
+        counter: Option<Counter>,
+        pin: Option<(u64, [u8; 8])>,
+    }
+
+    /// The account's vault on the relay, and what the relay does with it.
+    #[derive(Default)]
+    struct Relay {
+        items: HashMap<String, VaultBlob>,
+        /// Hostile: the group key's index is left out of the sign-in frame, its pages are
+        /// answered as not there (dive 1 F1).
+        withholds_gk: bool,
+    }
+
+    impl Relay {
+        fn hidden(&self, k: &str) -> bool {
+            self.withholds_gk
+                && (k == ITEM_GK_FLOORS || k.starts_with("gkf.") || k.starts_with("gkc."))
+        }
+
+        fn sign_in(&self) -> Vec<VaultBlob> {
+            self.items
+                .values()
+                .filter(|b| b.k.starts_with("item.") && !self.hidden(&b.k))
+                .cloned()
+                .collect()
+        }
+
+        fn answer(&mut self, m: ClientMessage) -> Option<AccountReply> {
+            match m {
+                ClientMessage::Account(AccountRequest::VaultPut { k, v, expect }) => {
+                    if self.hidden(&k) {
+                        return None;
+                    }
+                    let held = self.items.get(&k).map_or(0, |b| b.version);
+                    if held != expect {
+                        return Some(AccountReply::VaultConflict {
+                            blob: self.items.get(&k).cloned(),
+                            k,
+                        });
+                    }
+                    let version = held + 1;
+                    self.items.insert(
+                        k.clone(),
+                        VaultBlob {
+                            k: k.clone(),
+                            v,
+                            version,
+                        },
+                    );
+                    Some(AccountReply::VaultStored { k, version })
+                }
+                ClientMessage::Account(AccountRequest::VaultPage { k }) => {
+                    let blob = self.items.get(&k).filter(|_| !self.hidden(&k)).cloned();
+                    Some(AccountReply::VaultPageFound { k, blob })
+                }
+                _ => None,
+            }
+        }
+    }
+
+    /// Alice's counter 5 in the account's vault, seen a month ago, as an honest relay holds it.
+    struct World {
+        relay: Relay,
+        dek: [u8; 32],
+        identity: IdentityKeyPair,
+        alice: IdentityKeyPair,
+        k1: IdentityKeyPair,
+        seen_at: u64,
+    }
+
+    fn world() -> World {
+        let vault = Vault::create(RELAY, "writer");
+        let seen_at = now() - 30 * DAY;
+        let mut relay = Relay::default();
+        let rows = vec![CounterRow {
+            account: ALICE,
+            counter: Some(Counter {
+                n: 5,
+                made: seen_at,
+                rotation: true,
+            }),
+            pin: None,
+        }];
+        let page = vault.seal_item("gkc.0", 1, &postcard::to_allocvec(&rows).unwrap());
+        relay
+            .items
+            .insert("gkc.0".into(), VaultBlob { version: 1, ..page });
+        let index = GkIndex {
+            format: 1,
+            floor_pages: vec![],
+            counter_pages: vec![1],
+        };
+        relay.items.insert(
+            ITEM_GK_FLOORS.into(),
+            VaultBlob {
+                version: 1,
+                ..vault.seal_item(ITEM_GK_FLOORS, 1, &index.to_bytes())
+            },
+        );
+        World {
+            relay,
+            dek: vault.dek(),
+            identity: voipc_crypto::generate_identity_key_pair(),
+            alice: voipc_crypto::generate_identity_key_pair(),
+            k1: voipc_crypto::generate_identity_key_pair(),
+            seen_at,
+        }
+    }
+
+    /// One page of the account: signed in, the group key on with `mirror` handed in (what
+    /// this browser kept), every page the relay gives read, and the channel followed.
+    struct Page {
+        core: SignalCore,
+        link: Rc<AccountLink>,
+    }
+
+    impl Page {
+        fn open(w: &mut World, mirror: Option<Vec<u8>>) -> Page {
+            Page::open_with(w, None, mirror)
+        }
+
+        /// With `local`: what an earlier connection kept in this page (`Gk::keep`).
+        fn open_with(w: &mut World, local: Option<LocalGk>, mirror: Option<Vec<u8>>) -> Page {
+            Page::open_as(w, ME, local, mirror)
+        }
+
+        /// Signed in as the account the relay names `id` (`Authenticated`'s `AccountInfo`).
+        fn open_as(
+            w: &mut World,
+            id: [u8; 16],
+            local: Option<LocalGk>,
+            mirror: Option<Vec<u8>>,
+        ) -> Page {
+            let signed = SignedIn {
+                relay_id: RELAY,
+                name: "writer".into(),
+                vault: Vault::from_dek(RELAY, "writer", w.dek),
+                identity: w.identity,
+                recovery: None,
+                blobs: w.relay.sign_in(),
+                binding: None,
+                keyed: false,
+                login_key: None,
+            };
+            let info = AccountInfo {
+                id,
+                name: "writer".into(),
+                scopes: Vec::new(),
+                needs_2fa: false,
+                totp_enabled: false,
+            };
+            let (session, _) = AccountSession::start(
+                signed,
+                &info,
+                LogMemory::default(),
+                false,
+                false,
+                voipc_protocol::codec::PROTOCOL_VERSION,
+            );
+            let link = Rc::new(AccountLink::default());
+            *link.session.borrow_mut() = Some(session);
+            *link.whose.borrow_mut() = Some((RELAY, "writer".into()));
+            let mut core = SignalCore::with_identity(&w.identity).unwrap();
+            core.gk.account = Some(link.clone());
+            core.set_own_user_id(20);
+            let mut page = Page { core, link };
+            let first = page.session(|s| s.after_connect());
+            page.serve(&mut w.relay, first.send);
+            let out = page
+                .core
+                .gk_start(Start {
+                    on: true,
+                    run: RUN,
+                    clock: now(),
+                    help: false,
+                    visible: true,
+                    in_call: false,
+                    local,
+                    mirror,
+                })
+                .unwrap();
+            assert!(out.kept, "a signed-in page keeps its counters");
+            page.serve(&mut w.relay, out.send);
+            for _ in 0..8 {
+                let a = page.session(|s| s.tick());
+                page.serve(&mut w.relay, a.send);
+            }
+            assert!(
+                page.session(|s| s.gk_pins().ready()),
+                "the pins and the group key's pages are in"
+            );
+            let out = page
+                .core
+                .gk
+                .track(CHANNEL, true, GROUP, false, false, false);
+            page.serve(&mut w.relay, out.send);
+            page
+        }
+
+        fn session<R>(&self, f: impl FnOnce(&mut AccountSession) -> R) -> R {
+            f(self.link.session.borrow_mut().as_mut().unwrap())
+        }
+
+        /// What goes out, answered as the relay answers until nothing more comes; what the
+        /// account says for the group key goes to it, as account.ts and session.ts hand it.
+        fn serve(&mut self, relay: &mut Relay, out: Vec<ClientMessage>) {
+            let mut queue: VecDeque<ClientMessage> = out.into();
+            while let Some(m) = queue.pop_front() {
+                let Some(reply) = relay.answer(m) else {
+                    continue;
+                };
+                let mut a = self.session(|s| s.on_reply(&reply));
+                self.link.news.borrow_mut().take_from(&mut a);
+                queue.extend(a.send);
+                queue.extend(self.core.gk.news().send);
+            }
+        }
+
+        /// The relay pushes `h`. Whether what this browser keeps may have moved (`Out::kept`).
+        fn push(&mut self, relay: &mut Relay, h: &SignedHeader) -> bool {
+            let msg = ServerMessage::EpochIn {
+                group: GROUP.into(),
+                part: 0,
+                last: true,
+                piece: Box::new(InPiece {
+                    chain: vec![HeaderIn {
+                        body: h.body().to_vec(),
+                        sig: h.sig().to_vec(),
+                    }],
+                    ..InPiece::default()
+                }),
+            };
+            let out = self
+                .core
+                .gk_frame(&postcard::to_allocvec(&msg).unwrap())
+                .unwrap();
+            self.serve(relay, out.send);
+            out.kept
+        }
+
+        /// The header the page holds the group's floor at.
+        fn floor(&self) -> Option<[u8; 32]> {
+            self.core
+                .gk
+                .keying
+                .local()
+                .and_then(|l| l.floors.get(GROUP))
+                .map(|f| f.floor.d)
+        }
+
+        /// The page goes (a reload, a closed tab): what this browser keeps of it.
+        fn close(mut self, relay: &mut Relay) -> Option<Vec<u8>> {
+            let out = self.core.gk.end();
+            self.serve(relay, out.send);
+            self.core.gk.mirror()
+        }
+
+        /// The counter the page checks `account` against now, book and mirror both.
+        fn counter(&self, account: &[u8; 16]) -> Option<u32> {
+            let mirror = self.core.gk.keying.local()?.mirror.seen(account);
+            let book = self.session(|s| s.gk_pins().seen(account));
+            mirror.into_iter().chain(book).map(|s| s.n).max()
+        }
+    }
+
+    /// A desktop keyholder entry (origin 0x03) of `account` under its `ik`, at counter `n`.
+    fn keyholder(account: [u8; 16], ik: &IdentityKeyPair, n: u32, made: u64) -> Keyholder {
+        let pair = SeatPair::generate();
+        let m = MemberId::Account(account);
+        let endorsement =
+            Endorsement::sign(ik, Origin::Desktop, m, n, made, &pair.public()).unwrap();
+        Pair {
+            keys: pair.public(),
+            endorsement,
+        }
+        .entry(GroupKind::Text, m, raw(ik))
+        .expect("a desktop keyholder entry")
+    }
+
+    /// A Genesis of generation `gen`, signed by K1, at `time`, with Alice's desktop pair of
+    /// counter `n` (made `made`) among its keyholders.
+    fn genesis(w: &World, gen: [u8; 16], time: u64, n: u32, made: u64) -> SignedHeader {
+        let mut hd = HeaderV1 {
+            group_kind: GroupKind::Text,
+            group: GROUP.into(),
+            gen,
+            epoch: 1,
+            join: 0,
+            kind: Kind::Genesis,
+            time,
+            parent: [0; 32],
+            epoch_parent: [0; 32],
+            kh_parent: [0; 32],
+            signer: MemberId::Account(K1),
+            keyholders: vec![
+                keyholder(K1, &w.k1, 1, time - 60),
+                keyholder(ALICE, &w.alice, n, made),
+            ],
+            gated: true,
+            seed: 1,
+            seed_floor: 1,
+            exits_upto: 0,
+            seats: 2,
+            buckets: 1,
+            conn_seats: 0,
+            bucket_root: [1; 32],
+            keyring_hash: [1; 32],
+            names_hash: [0; 32],
+            added: Added::List(vec![]),
+            removed: Removed::List(vec![]),
+            confirm: [1; 32],
+        };
+        hd.names_hash = names_hash(None, &hd);
+        SignedHeader::sign(hd, &w.k1).expect("a header of a valid shape")
+    }
+
+    /// The first page, under an honest relay: the vault holds Alice's counter 5, and the page
+    /// checks a Genesis naming her current pair against it. What this browser kept of it.
+    fn first_page(w: &mut World) -> Option<Vec<u8>> {
+        let mut page = Page::open(w, None);
+        let t = now();
+        let g = genesis(w, [7; 16], t - 3000, 5, t - 4000);
+        page.push(&mut w.relay, &g);
+        assert_eq!(page.floor(), Some(g.d()), "the page took K1's Genesis");
+        page.close(&mut w.relay)
+    }
+
+    /// The control: after a reload under an honest relay the vault's pages hold Alice's
+    /// counter 5, and a new start naming her old pair (counter 3) is refused (§4.4 rule 8 on a
+    /// keyholder entry). It passes today, and shows the page reaches the rule.
+    #[test]
+    fn control_after_a_reload_with_the_vault_handed_over_an_old_counter_is_refused() {
+        let mut w = world();
+        first_page(&mut w);
+        let mut page = Page::open(&mut w, None);
+        let old = genesis(&w, [8; 16], now() - 60, 3, w.seen_at - 30 * DAY);
+        page.push(&mut w.relay, &old);
+        assert_eq!(page.floor(), None, "refused");
+    }
+
+    /// Dive 1 F1, the browser: a page that met Alice's counter 5 is reloaded, and the relay
+    /// leaves the group key's index and pages out of the next sign-in. The new page has no
+    /// page memory of the last, and its book no counter of Alice's; what this browser kept
+    /// (IndexedDB) still holds her 5, so her old pair (counter 3) is refused (§6 hostile relay,
+    /// Cannot: "Seat an account's old seat keys again once a keyholder has seen its newer
+    /// counter, or past a writer that has seen it"). Her current pair is taken: the refusal is
+    /// the counter's.
+    #[test]
+    fn f1_after_a_reload_a_withheld_gk_index_does_not_let_an_old_counter_past_the_page() {
+        let mut w = world();
+        let kept = first_page(&mut w);
+        w.relay.withholds_gk = true;
+        let mut page = Page::open(&mut w, kept);
+        assert_eq!(
+            page.session(|s| s.gk_pins().seen(&ALICE)),
+            None,
+            "the book holds no counter for Alice now"
+        );
+        let old = genesis(&w, [8; 16], now() - 60, 3, w.seen_at - 30 * DAY);
+        page.push(&mut w.relay, &old);
+        assert_eq!(
+            page.floor(),
+            None,
+            "a new start naming Alice's pair of counter 3 must be refused by a browser whose \
+             last page met her counter 5; the reloaded page took it"
+        );
+        let current = genesis(&w, [9; 16], now() - 60, 5, now() - 120);
+        page.push(&mut w.relay, &current);
+        assert_eq!(
+            page.floor(),
+            Some(current.d()),
+            "her pair of counter 5 is taken"
+        );
+    }
+
+    /// The bytes name their relay and account: a copy of another's is not taken (here under
+    /// the same keys in this browser, which gk-mirror.ts never hands over either).
+    #[test]
+    fn a_kept_copy_of_another_relay_or_account_is_not_taken() {
+        let mut w = world();
+        let kept = first_page(&mut w).expect("the first page met Alice's counter");
+        let book = StoredMirror::read(&kept).expect("it reads").book;
+        assert_eq!(book.seen(&ALICE).map(|s| s.n), Some(5));
+        w.relay.withholds_gk = true;
+        for other in [
+            mirror_bytes([8; 16], ME, &book),
+            mirror_bytes(RELAY, [2; 16], &book),
+        ] {
+            let mut page = Page::open(&mut w, Some(other));
+            assert_eq!(page.counter(&ALICE), None, "nothing of it is taken");
+            let old = genesis(&w, [8; 16], now() - 60, 3, w.seen_at - 30 * DAY);
+            page.push(&mut w.relay, &old);
+            assert_eq!(
+                page.floor(),
+                Some(old.d()),
+                "taken: no counter of hers here"
+            );
+        }
+    }
+
+    /// The account id is the relay's word (`Authenticated`), bound to nothing the vault or
+    /// the sign-in proofs hold. A relay that names another one at one sign-in gets that
+    /// connection checked without what this browser kept, and what that page meets is not
+    /// written over the account's copy (`mirror_merge`, as gk-mirror.ts `write` merges): the
+    /// next sign-in under the real id, with the group key's pages withheld, still refuses
+    /// Alice's old pair.
+    #[test]
+    fn a_sign_in_under_another_account_id_leaves_the_kept_counters_for_the_next() {
+        let mut w = world();
+        let stored = first_page(&mut w).expect("the first page met Alice's counter");
+        let mut lie = Page::open_as(&mut w, [2; 16], None, Some(stored.clone()));
+        let g = genesis(&w, [9; 16], now() - 60, 5, now() - 120);
+        lie.push(&mut w.relay, &g);
+        assert_eq!(lie.floor(), Some(g.d()), "it took her current pair");
+        let ours = lie.close(&mut w.relay).expect("it met her counter");
+        // gk-mirror.ts `write`: the stored row merged with ours; nothing written on `None`
+        let row = mirror_merge(&stored, &ours).unwrap_or(stored);
+        w.relay.withholds_gk = true;
+        let mut page = Page::open(&mut w, Some(row));
+        assert_eq!(
+            page.counter(&ALICE),
+            Some(5),
+            "the account's copy is still there"
+        );
+        let old = genesis(&w, [8; 16], now() - 60, 3, w.seen_at - 30 * DAY);
+        page.push(&mut w.relay, &old);
+        assert_eq!(page.floor(), None, "refused");
+    }
+
+    /// What this page kept for its next connection (`keep`) and what the browser kept past
+    /// its pages both count, the higher of each.
+    #[test]
+    fn a_reconnect_in_the_page_merges_its_kept_counters_with_the_browsers() {
+        let mut w = world();
+        let mut page = Page::open(&mut w, None);
+        let t = now();
+        let g = genesis(&w, [7; 16], t - 3000, 5, t - 4000);
+        page.push(&mut w.relay, &g);
+        page.core.gk.end();
+        let local = page.core.gk.keep().expect("kept for the page's life");
+        let mut other = SeenBook::default();
+        other.raise(K1, Seen { n: 2, made: t - 50 }, true);
+        other.raise(
+            ALICE,
+            Seen {
+                n: 4,
+                made: t - 9 * DAY,
+            },
+            true,
+        );
+        w.relay.withholds_gk = true;
+        let next = Page::open_with(&mut w, Some(local), Some(mirror_bytes(RELAY, ME, &other)));
+        assert_eq!(next.counter(&ALICE), Some(5), "the page's, the higher");
+        assert_eq!(next.counter(&K1), Some(2), "the browser's");
+    }
+
+    /// The counters go out for the browser to keep when they moved, once; a page that met
+    /// nothing new since it came in hands none out.
+    #[test]
+    fn the_counters_are_handed_out_once_each_time_they_move() {
+        let mut w = world();
+        let mut page = Page::open(&mut w, None);
+        assert_eq!(page.core.gk.mirror(), None, "nothing met yet");
+        let t = now();
+        let g = genesis(&w, [7; 16], t - 3000, 5, t - 4000);
+        assert!(page.push(&mut w.relay, &g));
+        let first = page.core.gk.mirror().expect("Alice's counter met");
+        assert_eq!(page.core.gk.mirror(), None, "handed out once");
+        assert_eq!(page.close(&mut w.relay), None, "nothing moved since");
+        let mut next = Page::open(&mut w, Some(first));
+        assert_eq!(next.core.gk.mirror(), None, "what came in, as it came");
+    }
+
+    /// A guest keeps nothing past the page (no account to keep it under) and takes nothing.
+    #[test]
+    fn a_guest_keeps_no_counters_past_the_page_and_takes_none() {
+        let mut book = SeenBook::default();
+        book.raise(ALICE, Seen { n: 5, made: 100 }, true);
+        let mut core = SignalCore::new().unwrap();
+        core.set_own_user_id(7);
+        let out = core
+            .gk_start(Start {
+                on: true,
+                run: RUN,
+                clock: now(),
+                help: false,
+                visible: true,
+                in_call: false,
+                local: None,
+                mirror: Some(mirror_bytes(RELAY, ME, &book)),
+            })
+            .unwrap();
+        assert!(!out.kept);
+        assert_eq!(core.gk.keying.local().unwrap().mirror, SeenBook::default());
+        assert_eq!(core.gk.pins.counters.seen(&ALICE), None);
+        assert_eq!(core.gk.mirror(), None);
+    }
+
+    /// Two tabs' copies merge, the higher of each. Over one that does not read, ours go
+    /// alone. Over a copy of another relay or account, nothing goes: the account id is the
+    /// relay's word, and one sign-in under another must not cost the next honest one what
+    /// this browser kept. Over one a newer VoIPC wrote, nothing goes either (COMPATIBILITY:
+    /// an older build never writes over newer data).
+    #[test]
+    fn two_tabs_copies_merge_and_others_do_not() {
+        let mut a = SeenBook::default();
+        a.raise(ALICE, Seen { n: 5, made: 100 }, true);
+        let mut b = SeenBook::default();
+        b.raise(ALICE, Seen { n: 4, made: 10 }, true);
+        b.raise(K1, Seen { n: 2, made: 50 }, true);
+        let ours = mirror_bytes(RELAY, ME, &b);
+        let merged = mirror_merge(&mirror_bytes(RELAY, ME, &a), &ours).expect("one account's");
+        let m = StoredMirror::read(&merged).unwrap();
+        assert_eq!((m.relay, m.account), (RELAY, ME));
+        assert_eq!(m.book.seen(&ALICE), Some(Seen { n: 5, made: 100 }));
+        assert_eq!(m.book.seen(&K1), Some(Seen { n: 2, made: 50 }));
+        assert_eq!(
+            mirror_merge(&mirror_bytes(RELAY, [2; 16], &a), &ours),
+            None,
+            "another account's is left alone"
+        );
+        assert_eq!(
+            mirror_merge(&mirror_bytes([8; 16], ME, &a), &ours),
+            None,
+            "another relay's is left alone"
+        );
+        let alone = Some(ours.clone());
+        assert_eq!(mirror_merge(&[1, 2, 3], &ours), alone, "unreadable");
+        assert_eq!(mirror_merge(&[], &ours), alone, "empty");
+        let mut v2 = mirror_bytes(RELAY, ME, &a);
+        v2[0] = 2;
+        assert!(StoredMirror::read(&v2).is_none(), "another version");
+        assert_eq!(
+            mirror_merge(&v2, &ours),
+            None,
+            "a newer VoIPC's is left alone"
+        );
+        assert_eq!(
+            mirror_merge(&ours, &[1, 2, 3]),
+            None,
+            "ours do not read: nothing"
+        );
+        let mut big = ours.clone();
+        big.resize(MIRROR_MOST_BYTES + 1, 0);
+        assert!(StoredMirror::read(&big).is_none(), "past the bound");
     }
 }

@@ -8,7 +8,8 @@ Protocol 26: a 1.14 relay admits only 1.14 apps, so update the apps first. A 1.1
 down to 1.0. 1.12.1 and 1.13.0 (protocol 24) were never released: their changes come with 1.14.0, listed at the end of
 this section (protocol 25 was a step on the way here and never shipped either). Bugs found and fixed during 1.14's
 own development, which no release carried, are not listed. Media edges speak a version of their own (pool 1): update a
-relay before its edges. One database migration (`0013_group_keys.sql`), and l4f-accounts 0.15.
+relay before its edges. Two database migrations (`0013_group_keys.sql`, and `0014_group_keys_restart.sql` after rc.1),
+and l4f-accounts 0.15.
 **Text channels and voice rooms move to a group epoch key, which weakens several security claims** (Security, below).
 No outside cryptographer has reviewed it.
 
@@ -67,6 +68,8 @@ No outside cryptographer has reviewed it.
 - **No outside cryptographer has reviewed the group key** (owner, 2026-11-17). It had adversarial reviews of our own
   while it was built, and one more before the release (2026-11-21) worked through GROUP-KEY.md §7 against the code:
   of its 50 findings, 29 were confirmed (7 high), and each is fixed below or decided by the owner. §7 gives its answers.
+  Six deep dives by a stronger model followed (2026-11-27): a hostile relay, liveness, kept history, restarts, the
+  browser share's uplink watch and the microphone. Each finding came with a failing test, and each is fixed below.
   The owner's review comes last.
 - **What that review found, fixed in 1.14.** Each fix has tests of its own (GROUP-KEY.md §7 names them).
   - A member took a channel's keys from whichever keyholder the relay named, and a relay seating a member of its own
@@ -108,6 +111,53 @@ No outside cryptographer has reviewed it.
   - Seat keys dated ahead switched the counter check off; they now count from when they were met.
   - After a recovery-key reset an app could hand its channels the seat keys from before the rotation the reset asks
     for. It now rotates them first; that a reset asks for one is still held in memory only (Known, below).
+- **What the deep dives found in the group key, fixed in 1.14.** Each fix has a test that failed before it.
+  - A relay could get a swapped identity key past a pinned writer by withholding the vault's group-key pages. A pin
+    with no time on those pages counted from "now", so a new device took every header of the last minutes as "pinned
+    since, unknown before" and showed it with no warning. A pin with no time now counts from before any header; only a
+    pin that changed is timed when it changed.
+  - Withholding those pages also took the seat-key counters a device had met, so it no longer refused that account's
+    older seat keys at its fold or in a keyholder entry. Each signed-in device now keeps the counters it checked or
+    raised itself: the desktop and Android apps in `gk_local.bin`, a browser in IndexedDB, sealed under the key its
+    remembered devices are, per relay and account. Forgetting the device forgets them. (A device that kept none: Known,
+    below.)
+  - Another device of the account could move a floor this device had checked. The vault floor replaced a desktop's own
+    floor and names floor when it was higher, so a fresh device that took a removed keyholder's fork, or a generation
+    the desktop had left, carried the desktop there, and past names nobody had folded. A device that holds a floor of
+    its own now keeps it; the vault floor stands in only where it holds none (GROUP-KEY.md §5.7).
+  - A gate turned off and on again hid whoever was seated meanwhile from writers that were away, and a member that took
+    no header while it was off could no longer post. The names hash now starts again where the gate came back on, and
+    a writer whose gated names are older than that is told the channel was open to readers who are not listed.
+  - A channel the relay moved to another group id started anew with nobody told. The first generation a device takes
+    in a channel it followed under another id is now told as made anew by its signer; desktops and phones remember each
+    channel's id across restarts (`gk_local.bin` version 2, which reads version 1).
+  - Kept history: after a seat-key rotation the relay answered a past read with the seat welcome, which only the
+    deleted keys open; it now answers with the row beside it. An account seated while none of its devices was online
+    (every account that keeps a channel's history, at every new start) was locked out once its bucket was re-keyed,
+    for up to 30 days, and lost the posts of a seed that came and went while it was away: the relay now gives such a
+    seat a seed welcome at once, keeps an unopened one while kept posts under that seed are stored, and seats the
+    account again when it comes back. A rotation left unfinished on its device lost everything kept before it once the
+    next sign-in came 7 days later: the old keys now go only after that sign-in's kept reads (5 minutes at most). A
+    kept copy filed just after the next opening could land under an epoch whose opening header the sweep had taken.
+  - After `db new-incarnation`, or the group key switched off and on, no stored channel got a key again: the store
+    refused every Genesis over the old row. One failed read while a channel's keys loaded was taken for "start a new
+    generation", and a commit the database applied but answered with an error left the relay one head behind for good.
+    All three are fixed.
+  - Seated members could not post once the epoch was 70 minutes old after every keyholder had gone: the relay now asks
+    the new start as the epoch nears that age. A keyholder that declines every due (its clock more than 5 minutes off,
+    a browser past 10,000 seats) no longer counts as online, and a candidate the keyholders refuse no longer holds up
+    every join, exit and refresh of its channel. An exits opening that must re-key every version gets 60 s, not 4 s.
+    A device whose clock is more than 10 minutes off is told so, where it was told only "keys late".
+  - A new start left exit rows in the database that later removed a member seated again, after which a restart could
+    leave the channel unable to open an epoch; seats are now removed by what each commit removed, and an exit whose
+    write failed is written again. A restart right after a keyholder change no longer forgets the new keyholder's pair,
+    and the removal of a banned, reset or removed device's keyholder entry outlives one. Leaving a channel's kept
+    history, a kick, a gate unseat and a removed device are written down before they take effect, so a relay that
+    stops in between still carries them out at the channel's next start; it also exits the seats of banned accounts
+    and of seat keys no longer current then, asks again the eager seats that were on their way, and starts anew a
+    channel whose group id came back to its stored one, as a running relay does. The hour a channel waits for its keyholders before a new
+    start counts their absence before a restart, but not the relay's own downtime: after a start it ends no sooner
+    than 10 minutes later, so keyholders that were online at the stop can come back first (OPERATING.md §3).
 - **A relay could show you a post you had already read**, and an old edit or reaction with it. On a relay with
   `group_key = false` (or one from before 1.14) it had to hold back a key and hand it over late: with a made-up key
   request (five keys before, one during 1.14's development), by naming the writer's account under another id, or after
@@ -258,6 +308,44 @@ No outside cryptographer has reviewed it.
   own uplink took the rest (Fixed, below).
 
 ### Fixed
+- **A relay's shutdown or self-update cut off the group key's last writes** (rc.1): it closed the database 500 ms after
+  telling the clients, whatever a channel's keys still had queued, so an exit or a keyholder's removal could be lost.
+  It now gives them up to 3 s to write it and logs a channel that took longer (OPERATING.md §3).
+- **In the browser, "Reset all settings" during a call left the microphone sending every frame** while the UI showed
+  push-to-talk and "not talking" (from 0.4.0; the desktop has stopped the capture first since 0.10.0). The reset now
+  closes the microphone first, and tells every server the mute and deafen it cleared, as the desktop does.
+- **After a relay's shutdown notice the capture ran on until the reconnect's first step** (0.5 to 1.5 s), while the UI
+  already showed the call gone: a relay that sent the notice and kept the link open went on receiving the microphone.
+  Both apps now leave the call locally as the notice comes, as they do for a dead link.
+- **After a relay restart, the reconnect walked you into any voice room that now had the old room's name**, with your
+  microphone live, even a room with no password in place of one that had one. Rooms that users make do not outlive
+  the relay's run, so after a restart a room of that name could be anyone's. The reconnect now puts you back in voice
+  by itself only in the same room (the same relay run and room id) or in one of the relay's own rooms, never in a room
+  with no password in place of one that had one, and says "Not back in" the room otherwise. Text channels rejoin by
+  name, as before.
+- **The relay that carries a call could move your open microphone into another of its voice rooms** without an ask, and
+  the app showed it as an ordinary room change (0.10.0's "a voice seat needs an ask" covered only a call's start). A
+  move the app did not ask for now leaves the call, and the microphone closes at once.
+- **"Leave voice" closed the microphone only when the relay answered**: a relay that did not answer kept a
+  voice-activated or always-on microphone open. It now closes as you press Leave, and a leave the relay refused is
+  sent again.
+- **When the chosen microphone went away, the capture reopened on the system's default microphone** within about a
+  second and said nothing, so pulling a headset's plug went on sending from a laptop's built-in microphone. A capture
+  on a chosen microphone now stays off until it is back, and says so. At a call's start a chosen microphone that is
+  not there is refused on the desktop; the browser falls back to the default and says so, since its device names
+  change with the system default.
+- **On the desktop, a push-to-talk key held in the window stayed held for good** when the window lost focus before
+  the release, wherever the system-wide key hook is not available (Linux under Wayland without access to the input
+  devices): the microphone stayed open. Losing focus now lets go of a key the hook did not see.
+- **On the desktop, in voice activation or always on, every release of the push-to-talk key anywhere on the system
+  closed the microphone** for the time a capture restart takes (the default key is Space). A release now closes it
+  only in push-to-talk mode.
+- **In the browser, a push-to-talk release and press while the app reopened a lost microphone left a second capture
+  open** that nothing closed (the browser's recording mark stayed on, and both fed the encoder while talking).
+- **The mute and deafen marks on your own row in the member list were whatever the relay said**; they now follow your
+  own buttons, as the voice bar does.
+- **The reconnect's wait on a big relay never applied** (rc.1): the online count it is spread by was cleared one line
+  before the reconnect read it, so every app of a relay of 100,000 that went down came back within 0.5 to 1.5 s.
 - **Voice lost frames for the first seconds of a screen share from the browser on an uplink too small for it**, and CI's
   capped-link lane was red for it (4.3-8.3 % in the first 4 s, in 6 runs of 6). A browser's video encoder keeps to no
   rate: WebCodecs has no VBV, and Chromium's software H.264 encoder sends what the picture costs whatever bitrate it is
@@ -273,7 +361,11 @@ No outside cryptographer has reviewed it.
   queue. Two other things back video up and do not count: a new connection's slow start, whose rate doubles each round
   trip (on a 300 ms round trip a QUIC path's first frames' acks take 0.7-1.3 s, and a TCP connection's window of ten
   segments takes four or five round trips to carry a share's first keyframe), and a path that stalls both ways for a
-  moment, as Wi-Fi can, after acks that came on time. While there is no queue, the share goes out as before, as fast as
+  moment, as Wi-Fi can, after acks that came on time. Nor does a path that got longer: a queue of ours grows, while a
+  longer path is one step up and then flat, and becomes the link's new shortest round trip; over the TCP fallback the
+  pongs have to keep the link's pace, not the pings'. rc.1 took a round trip that rose once or wandered, on a link with
+  room, for a queue, and paced such a share down to 5-7 pictures a second again and again; uneven pongs over the TCP
+  fallback did the same there. While there is no queue, the share goes out as before, as fast as
   it comes. Once there is one,
   the share steps down at once instead of after the ladder's 3 s hold, and goes out paced at what the link was seen to
   deliver (half of that for up to a second, to drain what queued), rising slowly while the encoder wants more; the
@@ -344,6 +436,15 @@ No outside cryptographer has reviewed it.
   whoever it named, and later posts go on a new key. CI hit this in 1 to 5 runs in 100.
 
 ### Known
+- **A browser share over WebTransport on a path whose round trip swings by a few times its length** (40 ms, then 140 ms
+  for a second, in turn) is still paced down a few times a minute: Chromium's own QUIC queues the share in each long
+  spell, and voice waits behind that queue too, so the watch takes it as the queue it is. A single rise, and the
+  same swings over the TCP fallback, now keep the share at its full rate.
+- **A relay that withholds an account's group-key vault pages takes with them the seat-key counters only another device
+  of the account met**, and every counter on a device that kept none (a new install or browser profile, cleared site
+  data, storage off). There, an account's older seat keys are not refused at the fold until the pages come back. A
+  device that saw the pages says the account settings are missing, as for the pins (THREAT-MODEL). Pins it holds are
+  still checked against every header.
 - Watching through an edge was tested in Chromium (the `EDGE=1` lane of test-web.sh, in CI). Firefox, the desktop
   apps and Android were not tried yet, nor an edge or a viewer on another machine.
 - **The browser share's uplink watch was measured in Chromium**, a Firefox sharer only under the 6 Mbit/s cap and in
@@ -394,9 +495,9 @@ No outside cryptographer has reviewed it.
   against it by hand yet, nor keyholders on machines of their own, nor how long a browser's stepped builds take on a busy
   page against the 4 s a keyholder has for an exit's commit.
 - **Planned after 1.14**, from the final review and the owner's decisions of 2026-11-22: a key per join, which ends the
-  unnamed accounts a relay can seat for up to about 80 minutes per keyholder ask; an asymmetric hybrid recovery slot,
-  so that a password change can give the vault a new key; and a deeper review of the group key by a stronger model, in
-  the manner of an outside review, postponed. None of these is an outside cryptographer's review.
+  unnamed accounts a relay can seat for up to about 80 minutes per keyholder ask; and an asymmetric hybrid recovery
+  slot, so that a password change can give the vault a new key. Neither is an outside cryptographer's review, and
+  nor were the deep dives (Security, above).
 - **Left open by the final review** (GROUP-KEY.md §7): an exit batch that rides a keyholder change waits for its 60 s
   deadline, so a leaver may read up to 46 s then; a hostile keyholder with the relay can list an account at a counter of
   its choosing, so writers in gated channels where that account sits hold their posts, and its devices warn falsely; a

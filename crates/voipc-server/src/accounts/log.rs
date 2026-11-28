@@ -1144,22 +1144,20 @@ pub(crate) async fn join_many(
     ))
 }
 
-/// `me` stops keeping a channel's log; also whether it held a seat there.
-pub(super) async fn leave(
-    relay: &Relay,
-    me: AccountId,
-    conv: &str,
-) -> Result<(AccountReply, bool)> {
+/// `me` stops keeping a channel's log, and its seats in the channel's stored group exit (C4).
+/// The exit is asked in the store before the membership row goes (dive 4 F7, review R2-1), so
+/// a stop between the two still exits them at the group's next start: the row gone and no ask
+/// left a seat keyed at every opening until its 90-day expiry.
+pub(super) async fn leave(relay: &Relay, me: AccountId, conv: &str) -> Result<AccountReply> {
     if !is_channel(conv) {
-        return Ok((refused("LogLeave", "not a channel's log"), false));
+        return Ok(refused("LogLeave", "not a channel's log"));
     }
-    let gone = remove(relay.store(), conv, &me.0).await?;
-    Ok((
-        AccountReply::LogLeft {
-            conv: conv.to_string(),
-        },
-        gone,
-    ))
+    relay
+        .gk_log_leave(conv, me.0, remove(relay.store(), conv, &me.0))
+        .await?;
+    Ok(AccountReply::LogLeft {
+        conv: conv.to_string(),
+    })
 }
 
 /// Deletes what `me` wrote to the stored logs, in `conv` or everywhere, and
@@ -1193,7 +1191,7 @@ pub(super) async fn purge(
 /// Takes `account` out of a channel's log: it leaves, is kicked, or no longer
 /// knows the channel's password. Every writer's next entry needs a new key, so if it
 /// held one, a seat here waits (`take_seats`). Whether it held a seat: then the caller tells
-/// the group key (`Relay::gk_left_log`).
+/// the group key, its exit asked before this (`Relay::gk_ask_exit`, then `Groups::exit_from_log`).
 pub async fn remove(store: &Store, conv: &str, account: &[u8; 16]) -> Result<bool> {
     let held: Option<i64> = db!(store, pool => {
         sqlx::query_scalar(
@@ -1238,14 +1236,23 @@ pub async fn unseat(store: &Store, conv: &str, account: &[u8; 16]) -> Result<boo
     Ok(gone > 0)
 }
 
-/// Keeps only `keep` of a channel's stored members (a new password: those in
-/// the channel now are the ones who knew it). The members taken out.
-pub async fn keep_only(store: &Store, conv: &str, keep: &[[u8; 16]]) -> Result<Vec<[u8; 16]>> {
+/// The accounts keeping `conv`'s log.
+pub async fn members_in(store: &Store, conv: &str) -> Result<Vec<[u8; 16]>> {
     let rows: Vec<Vec<u8>> = db!(store, pool => {
         sqlx::query_scalar("SELECT account FROM voipc_members WHERE conv = $1").bind(conv).fetch_all(pool).await?
     });
+    Ok(rows.into_iter().map(id16).collect())
+}
+
+/// Keeps only `keep` of a channel's stored members (a new password: those in
+/// the channel now are the ones who knew it). The members taken out.
+pub async fn keep_only(store: &Store, conv: &str, keep: &[[u8; 16]]) -> Result<Vec<[u8; 16]>> {
     let mut out = Vec::new();
-    for a in rows.into_iter().map(id16).filter(|a| !keep.contains(a)) {
+    for a in members_in(store, conv)
+        .await?
+        .into_iter()
+        .filter(|a| !keep.contains(a))
+    {
         if remove(store, conv, &a).await? {
             out.push(a);
         }

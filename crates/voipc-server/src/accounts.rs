@@ -636,45 +636,67 @@ impl Relay {
         }
     }
 
-    /// `account` is out of `conv`'s log, for `cause`: its seats in the conversation's group
-    /// exit too (C4), whatever took it out.
-    pub(crate) fn gk_left_log(&self, conv: &str, account: &[u8; 16], cause: u8) {
-        if let Some(gk) = self.gk() {
-            gk.on_log_leave(conv, *account, cause);
-        }
+    /// The exit of `accounts`' seats in `conv`'s group for `cause`, asked in the store before
+    /// what takes them out is done (`Groups::ask_exit`): when, or `None` (the switch off, or
+    /// the write failed).
+    pub(crate) async fn gk_ask_exit(
+        &self,
+        conv: &str,
+        accounts: &[[u8; 16]],
+        cause: u8,
+    ) -> Option<u64> {
+        self.gk()?.ask_exit(conv, accounts, cause).await
     }
 
-    /// `log::remove`, and its seats there exit.
-    pub async fn log_remove(&self, conv: &str, account: &[u8; 16], cause: u8) -> Result<()> {
-        if log::remove(self.store(), conv, account).await? {
-            self.gk_left_log(conv, account, cause);
+    /// `account` stops keeping `conv`'s log (`log::leave`, `remove` its membership's removal):
+    /// its seats' exit is asked before `remove` runs and posted after (dive 4 F7, review R2-1),
+    /// so a stop between the two still exits them at the group's next start. What `remove`
+    /// gave: whether a membership row went.
+    pub(crate) async fn gk_log_leave(
+        &self,
+        conv: &str,
+        account: [u8; 16],
+        remove: impl std::future::Future<Output = Result<bool>>,
+    ) -> Result<bool> {
+        let cause = gk_cause::LEAVE;
+        let asked = self.gk_ask_exit(conv, &[account], cause).await;
+        let gone = remove.await;
+        let Some(gk) = self.gk() else {
+            return gone;
+        };
+        match gone {
+            // A failed delete exits all the same: the ask is there, and the app asks again
+            Ok(true) | Err(_) => gk.exit_from_log(conv, vec![account], cause, asked),
+            // No membership row (a leave asked again after a stop cut the first one off): a
+            // seat no session of it holds here exits, and the ask is settled either way
+            Ok(false) => {
+                if let Some(at) = asked {
+                    gk.exit_unless_held(conv, account, cause, at);
+                }
+            }
         }
-        Ok(())
-    }
-
-    /// `log::unseat`, and its seats there exit.
-    pub async fn log_unseat(&self, conv: &str, account: &[u8; 16], cause: u8) -> Result<()> {
-        if log::unseat(self.store(), conv, account).await? {
-            self.gk_left_log(conv, account, cause);
-        }
-        Ok(())
+        gone
     }
 
     /// `log::keep_only` (a new password), and the seats of all but `keep` in the
     /// conversation's group exit: those of a live follow alone too, which no stored member
-    /// names (plan 2d).
+    /// names (plan 2d). Who goes is asked first, so a stop while the members are taken out
+    /// one by one still exits them all at the group's next start (dive 4 F7); their exit is
+    /// one message, taken in one walk of the group.
     pub async fn log_keep_only(&self, conv: &str, keep: &[[u8; 16]]) -> Result<()> {
-        let mut gone = log::keep_only(self.store(), conv, keep).await?;
-        if self.gk().is_some() {
-            let seated = gk::seated_accounts(self.store(), conv).await?;
-            gone.extend(seated.into_iter().filter(|a| !keep.contains(a)));
-            gone.sort_unstable();
-            gone.dedup();
-        }
-        for a in gone {
-            self.gk_left_log(conv, &a, gk_cause::GATE);
-        }
-        Ok(())
+        let Some(gk) = self.gk() else {
+            log::keep_only(self.store(), conv, keep).await?;
+            return Ok(());
+        };
+        let mut gone = log::members_in(self.store(), conv).await?;
+        gone.extend(gk::seated_accounts(self.store(), conv).await?);
+        gone.retain(|a| !keep.contains(a));
+        gone.sort_unstable();
+        gone.dedup();
+        let asked = gk.ask_exit(conv, &gone, gk_cause::GATE).await;
+        let out = log::keep_only(self.store(), conv, keep).await;
+        gk.exit_from_log(conv, gone, gk_cause::GATE, asked);
+        out.map(|_| ())
     }
 
     /// A deleted account's group-key rows, at the tombstone sweep (`log::sweep_tombstones`):
@@ -3264,13 +3286,7 @@ pub async fn handle_request(
                 .await
                 .unwrap_or_else(|e| read_failed("OwnChainRows", e))
         }
-        AccountRequest::LogLeave { conv } => {
-            let (out, gone) = log::leave(&relay, user.id, &conv).await?;
-            if gone {
-                relay.gk_left_log(&conv, &user.id.0, gk_cause::LEAVE);
-            }
-            out
-        }
+        AccountRequest::LogLeave { conv } => log::leave(&relay, user.id, &conv).await?,
         AccountRequest::LogMembers { conv } => log::members_of(&relay, user.id, &conv)
             .await
             .unwrap_or_else(|e| read_failed("LogMembers", e)),
@@ -3707,13 +3723,38 @@ async fn leave_log(state: &ServerState, channel_id: u32, session_id: u32, waits:
     }
     // Kicked or gone of their own accord, which a stored seat's exit does not tell apart:
     // the live seat's cause comes from the follow's own end (`Groups::on_kick`)
-    let out = if waits {
-        relay.log_remove(&conv, &account, gk_cause::LEAVE).await
+    let cause = if waits {
+        gk_cause::LEAVE
     } else {
-        relay.log_unseat(&conv, &account, gk_cause::GATE).await
+        gk_cause::GATE
     };
-    if let Err(e) = out {
-        warn!("log membership after a kick: {e}");
+    // The exit is asked first, log member or not (dive 4 F7): a stop from here on still exits
+    // the account's seats at the group's next start, its log row gone or not
+    let asked = relay.gk_ask_exit(&conv, &[account], cause).await;
+    let out = if waits {
+        log::remove(relay.store(), &conv, &account).await
+    } else {
+        log::unseat(relay.store(), &conv, &account).await
+    };
+    let Some(gk) = relay.gk() else {
+        if let Err(e) = out {
+            warn!("log membership after a kick: {e}");
+        }
+        return;
+    };
+    match out {
+        Ok(true) => gk.exit_from_log(&conv, vec![account], cause, asked),
+        // It keeps no log here: a follow alone seated it, and its session's own `Leave` (sent
+        // before this) exits its seat unless another session of it holds one
+        Ok(false) => {
+            if let Some(at) = asked {
+                gk.exit_unless_held(&conv, account, cause, at);
+            }
+        }
+        Err(e) => {
+            warn!("log membership after a kick: {e}");
+            gk.exit_from_log(&conv, vec![account], cause, asked);
+        }
     }
 }
 

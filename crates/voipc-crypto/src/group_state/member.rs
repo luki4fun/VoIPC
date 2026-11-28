@@ -135,6 +135,10 @@ pub(super) struct Member {
     /// Every generation taken while this member was held, newest last: one the floor's list
     /// of the last 8 let go is not taken again either (§5.7).
     gens_run: Vec<[u8; 16]>,
+    /// This device followed the channel under another group id (a stored one, or to one):
+    /// the first generation it takes here is told as made anew, though it holds no floor
+    /// (dive 1 F6).
+    pub(super) group_moved: bool,
     /// The keyholder header whose set was last told (`GkEvent::Keyholders`): once a run, and
     /// again at each change of the set in force, however it was reached.
     kh_told: Option<[u8; 32]>,
@@ -227,6 +231,7 @@ impl Member {
             told: None,
             old_epoch: false,
             gens_run: Vec::new(),
+            group_moved: false,
             kh_told: None,
         };
         if let Some(l) = local {
@@ -255,12 +260,19 @@ impl Member {
         m
     }
 
-    /// The vault's floor: the floor in use is the higher (3d).
+    /// The vault's floor, where this member holds none (3d). A floor this device took under
+    /// its own rules (its local file, or this session) stays: the vault's is what another
+    /// device of the account took, maybe on trust with no floor of its own (§5.7), and
+    /// putting it in use would skip the take rules (a removed keyholder's fork, a generation
+    /// left) and the names fold (dive 1 F2, F3).
     pub(super) fn vault_in(&mut self, floor: Floor, names: Option<NamesFloor>) {
-        let pair = match self.floor.take() {
-            Some(local) => crate::sync::higher_floor(&(local, self.names.floor), &(floor, names)),
-            None => (floor, names),
-        };
+        // A channel this device followed under another id takes its first header with no
+        // floor, so the new start is told (dive 1 F6): another device's vault floor there
+        // may be the relay's start taken on trust (review A-P2)
+        if self.floor.is_some() || self.group_moved {
+            return;
+        }
+        let pair = (floor, names);
         if self.kh.as_ref().is_some_and(|k| k.d() != pair.0.kh) {
             self.kh = None;
         }
@@ -1014,6 +1026,7 @@ impl Member {
                     check_new_generation(prev.as_ref(), clock, hd)?;
                     signers.push((hd.signer, check_signer(h, None, &pin)?));
                     anew = prev.as_ref().map(|_| hd.signer);
+                    anew = anew.or(self.group_moved.then_some(hd.signer));
                     (vec![], vec![], false)
                 }
                 // A device with no floor may start at a Regenesis, on trust (§5.7)
@@ -1021,6 +1034,7 @@ impl Member {
                     let p = parent.ok_or(Refusal::Walk("a Regenesis needs its parent"))?;
                     check_regenesis(None, clock, h, p)?;
                     signers.push((hd.signer, check_signer(h, None, &pin)?));
+                    anew = self.group_moved.then_some(hd.signer);
                     (vec![], vec![], false)
                 }
                 _ => {
@@ -1037,6 +1051,7 @@ impl Member {
                     if let Some(s) = &w.start {
                         gen_time = s.header().time;
                         anew = prev.as_ref().map(|_| s.header().signer);
+                        anew = anew.or(self.group_moved.then_some(s.header().signer));
                     }
                     let walked: Vec<&SignedHeader> = walk.iter().rev().map(|(x, _)| x).collect();
                     (set_named(&walked, &hd.kh_parent), walked, true)
@@ -1096,6 +1111,7 @@ impl Member {
         }
         let walked: Vec<SignedHeader> = walked.into_iter().cloned().collect();
         self.moved_to(who, duty, h, prev, gen_time, &walked, c, out);
+        self.group_moved = false;
         if let Some(by) = anew {
             let by = self.t.shows_names().then_some(by);
             out.events.push(GkEvent::Anew {

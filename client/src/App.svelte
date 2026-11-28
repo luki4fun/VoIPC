@@ -100,12 +100,15 @@
   import AudioSetup from "./lib/components/AudioSetup.svelte";
   import type { ChannelInfo, ChatMessage, LobbyCursor, UserInfo } from "./lib/types.js";
   import { parseInviteFragment, parseJoinFragment } from "./lib/invite.js";
+  import { roomAtDrop } from "./lib/rejoin-rules.js";
   import {
     channelListArrived,
     disconnectServer,
     fromServer,
     listenServer,
+    noteRelayRun,
     reconnectAll,
+    relayRun,
     withReloadServers,
     autoConnectList,
     serverId,
@@ -1389,6 +1392,12 @@
         });
       }),
 
+      // The relay's run (`GroupKeys`): a reconnect puts the user back in a room a person made
+      // only on the same run (dive 6 F6)
+      listenServer<{ run: string }>("relay-run", (server, data) => {
+        if (typeof data?.run === "string") noteRelayRun(server, data.run);
+      }),
+
       listenServer<{ ms: number; tcp?: boolean }>("latency-update", (server, data) => {
         latency.of(server).set(data.ms);
         viaTcp.of(server).set(data.tcp === true);
@@ -1420,13 +1429,14 @@
 
         // Play disconnected sound on initial loss (not during reconnect retries)
         playDisconnectedSound();
-        // By name, both of them, and read here because this runs while the
-        // channel list is still ours: the reconnect may land on a restarted
-        // server, where the ids are new but the channels people were in are
-        // the same ones they would recognise. The voice channel only if the
-        // call was on this server.
+        // Read here because this runs while the channel list is still ours: the
+        // reconnect may land on a restarted server, where the ids are new but the
+        // channels people were in are the same ones they would recognise. The text
+        // channels by name; the voice room with what tells it from another room of
+        // that name, and only if the call was on this server (dive 6 F6).
         const seat = get(voice);
-        const prevVoice = seat?.server === server ? channelNameById(server, seat.channelId) : "";
+        const seatRoom = seat?.server === server ? get(channels.peek(server)).find((c) => c.channel_id === seat.channelId) : undefined;
+        const prevVoice = seatRoom ? roomAtDrop(seatRoom, relayRun(server)) : null;
         const prevText = [...get(joinedTextChannelIds.peek(server))]
           .map((id) => channelNameById(server, id))
           .filter((n) => n !== "");
@@ -1435,8 +1445,11 @@
         // What the connection held goes now, the call with it if it was this
         // server's: a channel id is a slot in one server's run, and the
         // reconnect may land on a restarted server that hands them out again.
+        // How many were online, read before the stores go: on a big relay the first try
+        // waits its turn (dive 6 F5)
+        const online = get(channels.peek(server)).find((c) => c.channel_id === 0)?.user_count ?? 0;
         resetServer(server);
-        void startReconnect(server, { voice: prevVoice, text: prevText, open: prevOpen }, reason);
+        void startReconnect(server, { voice: prevVoice, text: prevText, open: prevOpen, online }, reason);
       }),
 
       listen<{ error: string; retrying?: boolean }>("audio-device-error", (event) => {

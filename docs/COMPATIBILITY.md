@@ -246,6 +246,12 @@ and an older app leaves an item it does not know alone. So what an account newly
 - The vault item `item.seat_kem`: the account's seat keys (a Kyber1024 and an X25519 pair, the self key, when they were
   made and their counter), about 4.9 KB, 9.7 KB while a rotation keeps the old ones. Every device of the account reads it;
   an older app leaves it alone.
+- The browser's IndexedDB database `voipc-gk-mirror` (version 1, store `mirrors`): per relay id and account name, the
+  seat-key counters a signed-in account's pages checked or raised (up to about 32,000 accounts), as postcard bytes with
+  their own format version (1), relay id and account id, sealed with AES-GCM under the wrapping key in `voipc-accounts`
+  (which stays at version 1), with the row's id as additional data. A newer database version is not opened (the
+  counters then last the page), and a row in a newer format is neither read nor written over. Lost, the page has only
+  the vault's pages.
 - The vault item `item.kept`: the account's kept keys (32 random bytes and a Kyber1024 pair, which never change), about
   4.8 KB, made at the account's first sign-in with 1.14. Kept chain starts under the group key and sharers' rows to this
   account open with them. An older app leaves it alone.
@@ -255,11 +261,20 @@ and an older app leaves an item it does not know alone. So what an account newly
   like the pins' pages.
 - `gk_local.bin` in the data directory of the desktop and phone apps (0600): each relay's floors, a desktop keyholder's own
   pair and the seats it sealed that no header named yet, with the head each stands on, per channel it holds keys in each
-  account's highest desktop counter, beside each floor up to 8 keyholder headers before it, and a guest's highest
-  counters. It is not encrypted at rest. A file in an older 1.14 development format is set aside and started anew.
+  account's highest desktop counter, beside each floor up to 8 keyholder headers before it, a guest's highest
+  counters, and for a signed-in account the seat-key counters that device checked or raised (up to about 32,000
+  accounts), the id of the group each text channel was last followed under, and nothing else. It is not encrypted at
+  rest. Version 2 (1.14) reads a version 1 file; a file in an older 1.14 development format is set aside and started
+  anew.
   Lost, a device falls back to the vault floor or to the rule for no floor.
 - The accounts database: migration `0013_group_keys.sql` adds the `voipc_gk_*` tables, `voipc_log_kems` (each account's
-  kept Kyber1024 key) and the column `voipc_pending.gk_rows`. The relay keeps `gk_incarnation`
+  kept Kyber1024 key) and the column `voipc_pending.gk_rows`. Migration `0014_group_keys_restart.sql` (after rc.1)
+  adds `voipc_gk_eager` (each eager seat asked, kept until it is seated or dropped), `voipc_gk_exit_asks` (each exit
+  of an account's seats asked ahead of its group: a log leave, a gate, a new password, a kick or leave of the channel;
+  kept until the exit is written) and the columns `voipc_gk_holders.forced` (a keyholder entry whose removal is
+  proposed outright), `voipc_gk_groups.eager_after` (how far a new start's eager seats were asked) and
+  `voipc_gk_groups.moved_back` (the generation a channel's group id came back onto: a new one is due while the head is
+  of it). The relay keeps `gk_incarnation`
   and `gk_switch` in `voipc_meta`, written at its first start with the key on and by `db new-incarnation`.
   Only stored channels are there; anonymous rooms, channels that hide their members, voice rooms and relays without
   accounts keep it all in memory.
@@ -312,7 +327,7 @@ loads the page its relay serves. The relay's side is in [OPERATING.md](OPERATING
 - a "newer than me" test per format.
 
 Each release adds its own fixture directories (a release-checklist step). 1.14's, with the group key's vault items,
-`gk_local.bin` and a database at `0013`, are still to be written.
+`gk_local.bin` and a database at `0014`, are still to be written.
 
 ## 5. Security claims
 

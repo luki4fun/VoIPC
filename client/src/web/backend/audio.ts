@@ -140,6 +140,9 @@ function describeError(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
+/** The microphone chosen by name is not listed (dive 6 F8). */
+class DeviceGone extends Error {}
+
 function fallbackDeviceName(kind: MediaDeviceKind, index: number): string {
   return `${kind === "audioinput" ? "Microphone" : "Speaker"} ${index + 1}`;
 }
@@ -275,6 +278,21 @@ export class AudioEngine implements AudioApi {
   private captureGen = 0;
   private micTestGen = 0;
   private capture: Capture | null = null;
+  /** `capture` opened on the microphone chosen by name, not on the default (dive 6 F8). */
+  private captureChosen = false;
+  /** The chosen microphone last said to be missing, so a press does not say it again. */
+  private saidMissing: string | null = null;
+  /**
+   * Set from a leave (or a seat the relay gave unasked, which is left) until the relay's
+   * answer: the microphone shuts at once and stays shut (dive 6 F10). The answer is `detach`
+   * (the lobby) or `onChannelChanged` (a seat somewhere new); `attach` starts over.
+   */
+  private leaving = false;
+
+  /** A leave of ours is out and the relay has not answered it yet (`closeForLeave`). */
+  get leavePending(): boolean {
+    return this.leaving;
+  }
   private captureRestartTimer: ReturnType<typeof setTimeout> | null = null;
   private encoder: AudioEncoder | null = null;
   private encodeTimestampUs = 0;
@@ -380,6 +398,9 @@ export class AudioEngine implements AudioApi {
 
   attach(ctx: SessionContext): void {
     this.ctx = ctx;
+    this.leaving = false;
+    // Each call says once that the chosen microphone is missing (review R3)
+    this.saidMissing = null;
     this.framesPlayed = 0;
     this.framesLost = 0;
     this.screenAudioRecv = 0;
@@ -409,6 +430,7 @@ export class AudioEngine implements AudioApi {
 
   detach(): void {
     this.ctx = null;
+    this.leaving = false;
     this.transmitting = false;
     this.stopCapture();
     this.stopScreenAudio();
@@ -434,6 +456,7 @@ export class AudioEngine implements AudioApi {
    * leak into the next channel.
    */
   onChannelChanged(proximity: ProximityMode = "off"): void {
+    this.leaving = false;
     this.dropSources();
     this.mixer?.port.postMessage({ type: "clear" });
     this.positionSync = false;
@@ -724,6 +747,50 @@ export class AudioEngine implements AudioApi {
 
   private async openCapture(ac: AudioContext, onFrame: (f: CaptureFrame) => void): Promise<Capture> {
     const deviceId = await this.findDeviceId("audioinput", this.inputDevice);
+    return this.openDevice(ac, deviceId, onFrame);
+  }
+
+  /**
+   * The voice capture, on the microphone chosen in Settings (by name). One that is not listed
+   * (unplugged, switched off, a name from another machine) gives way to the system's default
+   * only where `orDefault`, and then it is said; else the open fails with `DeviceGone`. The
+   * user picked a device, and is not to be heard through another without a word (dive 6 F8).
+   * `chosen`: it opened on the chosen one.
+   */
+  private async openVoiceCapture(ac: AudioContext, orDefault: boolean): Promise<{ cap: Capture; chosen: boolean }> {
+    const name = this.inputDevice;
+    const media = navigator.mediaDevices;
+    let deviceId = await this.findDeviceId("audioinput", name);
+    if (name && deviceId === undefined && typeof media?.getUserMedia === "function") {
+      // Labels show only after a grant (Firefox keeps none between visits), and a name is not
+      // found without them: ask the way the device list does (`listDevices`), then look again
+      const all = (await media.enumerateDevices()).filter((d) => d.kind === "audioinput");
+      if (all.length > 0 && all.every((d) => !d.label)) {
+        try {
+          const probe = await media.getUserMedia({ audio: true });
+          deviceId = await this.findDeviceId("audioinput", name);
+          for (const t of probe.getTracks()) t.stop();
+        } catch {
+          // refused: the open below says so
+        }
+      }
+    }
+    const chosen = deviceId !== undefined;
+    if (chosen) this.saidMissing = null;
+    else if (name && typeof media?.enumerateDevices === "function") {
+      if (!orDefault) throw new DeviceGone(`${name} is not connected`);
+      if (this.saidMissing !== name) {
+        this.saidMissing = name;
+        emit("audio-device-error", { error: `${name} is not connected: using the default microphone`, retrying: false });
+      }
+    }
+    const cap = await this.openDevice(ac, deviceId, (f) => this.onCaptureFrame(f));
+    return { cap, chosen };
+  }
+
+  /** The browser's open of one input (undefined: the default), on its own so a Node test can
+   *  stand in for it (d6-mic.test.ts). */
+  private openDevice(ac: AudioContext, deviceId: string | undefined, onFrame: (f: CaptureFrame) => void): Promise<Capture> {
     return Capture.open(ac, deviceId, this.noiseSuppression, this.inputGain, onFrame);
   }
 
@@ -732,6 +799,7 @@ export class AudioEngine implements AudioApi {
   async startTransmit(): Promise<void> {
     const c = this.ctx;
     if (!c) throw new Error("Not in a voice channel");
+    if (this.leaving) throw new Error("Leaving the voice channel");
     if (this.transmitting) return;
     if (c.channelId === 0) throw new Error("Join a voice channel first");
     if (this._muted) return;
@@ -744,13 +812,14 @@ export class AudioEngine implements AudioApi {
           "This browser has no WebCodecs audio encoder (needs Chrome/Edge 94+, Firefox 130+ or Safari 17+)",
         );
       }
-      const cap = await this.openCapture(ac, (f) => this.onCaptureFrame(f));
+      const { cap, chosen } = await this.openVoiceCapture(ac, true);
       if (!this.transmitting || gen !== this.captureGen) {
         cap.close(); // released, or started again, while the device was opening
         return;
       }
       cap.onended = () => this.onCaptureEnded();
       this.capture = cap;
+      this.captureChosen = chosen;
     } catch (e) {
       if (gen !== this.captureGen) return; // a later start owns the capture now
       // Like the native capture task: report and give up this transmission,
@@ -760,6 +829,12 @@ export class AudioEngine implements AudioApi {
       emit("audio-device-error", { error: describeError(e), retrying: false });
       throw e;
     }
+  }
+
+  /** The user leaves voice: the microphone shuts now, not at the relay's answer (dive 6 F10). */
+  async closeForLeave(): Promise<void> {
+    this.leaving = true;
+    await this.stopTransmit();
   }
 
   /** Never fails: without a voice session nothing is transmitting (detach stopped it). */
@@ -792,26 +867,47 @@ export class AudioEngine implements AudioApi {
     }
   }
 
-  /** The device went away (unplugged): report and retry every second. */
+  /**
+   * The device went away (unplugged): report and retry every second.
+   *
+   * The retry belongs to the transmission it was armed in: a stop or a new start moves
+   * `captureGen`, and an open that lands after that closes itself, as a start's does, instead
+   * of taking the place of the capture that start opened (dive 6 F9). A capture that was on
+   * the chosen microphone comes back on that one only, or on another the user chooses
+   * meanwhile, never on the default (dive 6 F8): unplugging it is a way to stop talking.
+   */
   private onCaptureEnded(): void {
     if (!this.transmitting) return;
     console.warn("capture device error — attempting recovery");
     emit("audio-device-error", { error: "capture device error", retrying: true });
     this.capture?.close();
     this.capture = null;
+    const gen = this.captureGen;
+    const orDefault = !this.captureChosen;
+    let saidGone = false;
     const retry = async () => {
       this.captureRestartTimer = null;
-      if (!this.transmitting || !this.audioContext) return;
+      if (!this.transmitting || gen !== this.captureGen || !this.audioContext) return;
       try {
-        const cap = await this.openCapture(this.audioContext, (f) => this.onCaptureFrame(f));
-        if (!this.transmitting) {
+        const { cap, chosen } = await this.openVoiceCapture(this.audioContext, orDefault);
+        if (!this.transmitting || gen !== this.captureGen) {
           cap.close();
           return;
         }
         cap.onended = () => this.onCaptureEnded();
         this.capture = cap;
+        this.captureChosen = chosen;
         emit("audio-device-restored");
       } catch (e) {
+        // Stopped, or started again with a capture of its own, while this one tried
+        if (!this.transmitting || gen !== this.captureGen) return;
+        if (e instanceof DeviceGone && !saidGone) {
+          saidGone = true;
+          emit("audio-device-error", {
+            error: `${e.message}: the microphone stays off until it is back, or until you choose another in Settings`,
+            retrying: true,
+          });
+        }
         console.warn("capture restart failed (retrying):", e);
         this.captureRestartTimer = setTimeout(retry, CAPTURE_RESTART_MS);
       }
@@ -1338,13 +1434,14 @@ export class AudioEngine implements AudioApi {
       this.capture = null;
       const gen = ++this.captureGen;
       try {
-        const cap = await this.openCapture(this.audioContext, (f) => this.onCaptureFrame(f));
+        const { cap, chosen } = await this.openVoiceCapture(this.audioContext, true);
         if (!this.transmitting || gen !== this.captureGen) {
           cap.close();
           return;
         }
         cap.onended = () => this.onCaptureEnded();
         this.capture = cap;
+        this.captureChosen = chosen;
       } catch (e) {
         emit("audio-device-error", { error: describeError(e) });
       }

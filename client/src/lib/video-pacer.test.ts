@@ -19,6 +19,7 @@ import {
   PROBE_MAX_MS,
   UPLINK_FLOOR_FRAMES,
   UPLINK_FLOOR_PROBES,
+  UPLINK_GROW_MS,
   UPLINK_KEPT,
   UPLINK_MARGIN_MS,
   UplinkControl,
@@ -222,8 +223,9 @@ test("the uplink: a queue is acks past max(2 x the least, the least + 60 ms) fra
     foundAt = queue;
   }
   assert.ok(c.queuedAt > 0, "found");
-  // Its floor of eight past 100: the queue had reached 30 ms past what a frame took on time
-  assert.ok(foundAt >= 30 && foundAt <= 30 + UPLINK_FLOOR_FRAMES * 4 + 4, `found at ${foundAt} ms of queue`);
+  // Its floor of eight past 100 (the queue had reached 30 ms past what a frame took on time),
+  // and grown UPLINK_GROW_MS since: a longer path is late too, but does not grow
+  assert.ok(foundAt >= 30 && foundAt <= 30 + UPLINK_FLOOR_FRAMES * 4 + UPLINK_GROW_MS + 4, `found at ${foundAt} ms of queue`);
   // Drained at half what the link delivered (8 KB / 33 ms ~ 1.94 Mbit/s), then paced at 0.85 of it
   const delivered = (8_000 * 8000) / 33;
   const draining = c.rate(t);
@@ -240,9 +242,10 @@ test("the uplink: a drain that does not end is paced again after DRAIN_MAX_MS, a
   const c = new UplinkControl(UPLINK_FLOOR_FRAMES, true);
   c.base(40, 0);
   const sent = { total: 0 };
-  // A second on time, then every ack late: the link delivers 10 KB a frame all along
+  // A second on time, then every ack later than the one before (a queue grows): the link
+  // delivers 10 KB a frame all along
   let t = frames(c, 1000, 30, () => 50, 10_000, sent);
-  t = frames(c, t, 10, () => 300, 10_000, sent);
+  t = frames(c, t, 10, (i) => 110 + 30 * i, 10_000, sent);
   assert.ok(c.queuedAt > 0);
   const first = c.queuedAt;
   // Still late (what queued before the cut): no second cut while it drains
@@ -253,8 +256,8 @@ test("the uplink: a drain that does not end is paced again after DRAIN_MAX_MS, a
   while (t < first + DRAIN_MAX_MS) t = frames(c, t, 1, () => 280, 6_000, sent);
   const paced = c.rate(t);
   assert.ok(paced > 0 && c.paced());
-  // Still queued once paced: cut again, from what it delivered now
-  t = frames(c, t, 10, () => 300, 6_000, sent);
+  // Still queued once paced, and growing: cut again, from what it delivered now
+  t = frames(c, t, 10, (i) => 290 + 10 * i, 6_000, sent);
   assert.equal(c.finds.length, 2);
   assert.ok(c.queuedAt > first);
   assert.ok(c.rate(t) < paced, "the second cut is lower");
@@ -331,7 +334,7 @@ test("the uplink: paced, the rate rises while the encoder wants more, not while 
   c.base(40, 0);
   const sent = { total: 0 };
   let t = frames(c, 1000, 30, () => 50, 10_000, sent);
-  frames(c, t, 10, () => 200, 10_000, sent);
+  frames(c, t, 10, (i) => 110 + 30 * i, 10_000, sent);
   t = c.queuedAt + DRAIN_MAX_MS;
   const start = c.rate(t);
   // Held back until just before the probe: about 5 % a second, compounded
@@ -347,7 +350,7 @@ test("the uplink: paced, the rate rises while the encoder wants more, not while 
   const again = new UplinkControl(UPLINK_FLOOR_FRAMES, true);
   again.base(40, 0);
   let u = frames(again, 1000, 30, () => 50, 10_000);
-  frames(again, u, 10, () => 200, 10_000, { total: 300_000 });
+  frames(again, u, 10, (i) => 110 + 30 * i, 10_000, { total: 300_000 });
   u = again.queuedAt + DRAIN_MAX_MS;
   again.binding(u);
   for (let k = 0; k < 60; k++) again.rate((u += 10));
@@ -360,7 +363,7 @@ test("the uplink: a new share starts unpaced; the least stays, and a longer path
   const c = new UplinkControl(UPLINK_FLOOR_FRAMES, true);
   c.base(40, 0);
   const sent = { total: 0 };
-  frames(c, frames(c, 1000, 30, () => 50, 12_000, sent), 10, () => 300, 12_000, sent);
+  frames(c, frames(c, 1000, 30, () => 50, 12_000, sent), 10, (i) => 110 + 30 * i, 12_000, sent);
   assert.ok(c.paced());
   c.reset();
   assert.ok(!c.paced());
@@ -381,7 +384,7 @@ test("the uplink: never paced under MIN_RATE_BPS, however little got through", (
   const c = new UplinkControl(UPLINK_FLOOR_FRAMES, true);
   c.base(40, 0);
   const sent = { total: 0 };
-  frames(c, frames(c, 1000, 30, () => 50, 10, sent), 10, () => 900, 10, sent);
+  frames(c, frames(c, 1000, 30, () => 50, 10, sent), 10, (i) => 200 + 100 * i, 10, sent);
   assert.ok(c.queuedAt > 0);
   assert.equal(c.rate(c.queuedAt), MIN_RATE_BPS);
   assert.equal(c.rate(c.queuedAt + DRAIN_MAX_MS), MIN_RATE_BPS);
@@ -634,14 +637,16 @@ test("the uplink: a probe that meets the queue again doubles the wait for the ne
   const c = new UplinkControl(UPLINK_FLOOR_FRAMES, true);
   c.base(40, 0);
   // A link that queues whenever the share is unpaced and carries it paced: a frame each 33 ms
-  // delivered, acked on time paced and 200 ms late unpaced
+  // delivered, acked on time paced, and unpaced each 15 ms later than the one before
   let room = false;
   let delivered = 0;
   let t = 1000;
+  let queue = 0;
   const step = () => {
     t += 33;
     delivered += 10_000;
-    c.sample(c.rate(t) === 0 && !room ? 200 : 50, delivered, t);
+    queue = c.rate(t) === 0 && !room ? queue + 15 : 0;
+    c.sample(50 + queue, delivered, t);
   };
   while (t < 2_000) step();
   const waits: number[] = [];
@@ -668,7 +673,7 @@ test("the uplink: a probe that meets the queue again doubles the wait for the ne
   while (c.finds.length === found) {
     t += 33;
     delivered += 10_000;
-    c.sample(200, delivered, t);
+    c.sample(50 + (queue += 15), delivered, t);
   }
   const at = c.queuedAt;
   while (c.probes.length === from + 1) step();
@@ -881,10 +886,13 @@ test("the uplink: finds and probes keep the last UPLINK_KEPT, for a share of any
   let delivered = 0;
   let found = 0;
   let last = 0;
+  let queue = 0;
   while (t < 3_600_000) {
     t += 33;
     delivered += 6_000;
-    c.sample(c.rate(t) === 0 ? 300 : 50, delivered, t);
+    // Unpaced, each ack 30 ms later than the one before; paced, on time
+    queue = c.rate(t) === 0 ? queue + 30 : 0;
+    c.sample(50 + queue, delivered, t);
     if (c.queuedAt !== last) {
       last = c.queuedAt;
       found++;

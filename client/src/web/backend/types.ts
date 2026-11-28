@@ -49,6 +49,18 @@ export function entryAsksHistory(gkRoom: boolean, channelId: number): boolean {
   return gkRoom && channelId !== 0;
 }
 
+/**
+ * Whether a voice seat the relay gave (`UserList` for a voice channel) needs this connection's
+ * own ask first: "a voice seat needs an ask" (0.10.0). The lobby never does, nor a list for the
+ * room the call already stands in. A move to another room does, on the connection carrying the
+ * call too (dive 6 F7): no honest relay moves a seated user unasked (a kick goes to the lobby,
+ * there is no moderator move), and the open microphone would follow it into a room whose
+ * members the relay picks. Mirrors network.rs handle_server_message.
+ */
+export function seatNeedsAsk(channelId: number, holdsVoice: boolean, standsIn: number): boolean {
+  return channelId !== 0 && (!holdsVoice || channelId !== standsIn);
+}
+
 /** What the media modules may use from the voice session. */
 export interface SessionContext {
   readonly sessionId: number;
@@ -123,6 +135,8 @@ export interface AudioApi {
   onChannelChanged(proximity?: ProximityMode): void;
   /** The current channel's proximity mode changed under us. */
   setProximityMode(proximity: ProximityMode): void;
+  /** A leave of ours is out and not answered yet: the microphone stays shut for it. */
+  readonly leavePending: boolean;
   /** Raw 0x05 packet from the server (decrypt with ctx.mediaKeys inside). */
   onVoicePacket(bytes: Uint8Array): void;
   /** Raw 0x02 EndOfTransmission packet. */
@@ -138,6 +152,11 @@ export interface AudioApi {
   startTransmit(): Promise<void>;
   /** Never fails, attached or not. */
   stopTransmit(): Promise<void>;
+  /**
+   * The user leaves voice (or a seat the relay gave unasked is left): the microphone shuts now
+   * and no start opens it until the relay's answer (`detach`, `onChannelChanged`) (dive 6 F10).
+   */
+  closeForLeave(): Promise<void>;
   /** Flip the global flag, attached or not; commands.ts tells every server. */
   toggleMute(): Promise<boolean>;
   toggleDeafen(): Promise<boolean>;

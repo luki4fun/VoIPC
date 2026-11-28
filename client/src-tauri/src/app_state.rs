@@ -624,7 +624,7 @@ pub struct ActiveConnection {
     /// a join, a voice channel's creation, an accepted invite, a game's
     /// `hello`. Only such an ask lets this server take voice (network.rs
     /// `take_voice_ask`).
-    pub voice_asked_at: Arc<AtomicU64>,
+    pub voice_asked_at: Arc<crate::network::VoiceAsks>,
     /// Sender for control messages (framed, onto the control stream).
     pub tcp_tx: crate::network::ControlTx,
     /// The relay account this connection signed in with; `None` for a guest.

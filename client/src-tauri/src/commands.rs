@@ -132,6 +132,7 @@ pub async fn disconnect_all(
 #[tauri::command]
 pub async fn join_channel(
     state: State<'_, AppState>,
+    app: tauri::AppHandle,
     server: String,
     channel_id: u32,
     password: Option<String>,
@@ -174,6 +175,11 @@ pub async fn join_channel(
     // the readers' voice handover all take it.
     drop(conns);
     wait_for_capture(capture).await;
+    // A leave is the user's to make, not the server's to confirm: the
+    // microphone closes now (dive 6 F10)
+    if channel_id == 0 {
+        network::leave_voice_now(&state, &app, &server).await;
+    }
     Ok(())
 }
 

@@ -208,3 +208,19 @@ export function takesSwitch(channel: Pick<ChannelInfo, "anonymous"> | undefined,
 export function summonOffered(room: ChannelInfo | undefined, holds: boolean, protocol: number | null): boolean {
   return holds && moderation(protocol) && !!room && room.channel_id !== 0 && !room.anonymous;
 }
+
+/**
+ * The mute and deafen marks a row is drawn with. The user's own row shows this device's own
+ * flags, which only the user changes, never the relay's word (`UserList`, `UserMuted`): a
+ * relay could otherwise mark the user muted in every list while their microphone is open
+ * (dive 6 F11). Everybody else's are what the relay said. `me` 0 is not signed in.
+ */
+export function shownMarks(
+  row: Pick<UserInfo, "user_id" | "is_muted" | "is_deafened">,
+  me: number,
+  muted: boolean,
+  deafened: boolean,
+): { muted: boolean; deafened: boolean } {
+  if (me !== 0 && row.user_id === me) return { muted, deafened };
+  return { muted: row.is_muted, deafened: row.is_deafened };
+}

@@ -446,6 +446,11 @@ pub(super) struct GkReads {
 }
 
 impl GkReads {
+    /// Past epochs asked of the relay or of the host and not answered yet.
+    pub(super) fn busy(&self) -> bool {
+        !self.asked.is_empty() || !self.new.is_empty() || !self.waiting.is_empty()
+    }
+
     /// The seals asked for count as lost: the reads they were for go again.
     pub(super) fn lost(&mut self) {
         self.asked.clear();
@@ -3051,6 +3056,23 @@ impl AccountSync {
         self.gk_reads.waiting.remove(&past);
         self.gk_reads.new.retain(|p| *p != past);
         self.gk_reads.none.insert(past);
+        if self.waiting.iter().any(|(c, _)| c == group) {
+            self.fetch(group)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// A member secret of `group` is held now (this device wrote a self-row for it): the past
+    /// epochs given up for want of it are asked again, the channel's read with them (dive 3
+    /// F2: an account seated while away gets it in a new Join's welcome, which can come later
+    /// than the tries above last; review B-P4).
+    pub(super) fn gk_secret_in(&mut self, group: &str) -> Vec<ClientMessage> {
+        let before = self.gk_reads.none.len();
+        self.gk_reads.none.retain(|(g, _, _)| g != group);
+        if self.gk_reads.none.len() == before {
+            return Vec::new();
+        }
         if self.waiting.iter().any(|(c, _)| c == group) {
             self.fetch(group)
         } else {

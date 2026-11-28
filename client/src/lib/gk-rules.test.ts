@@ -118,7 +118,12 @@ test("each warning kind has its line, and a kind this build does not know says n
   assert.equal(warned("floor_ahead")[0].line, "The server's keys for #general are older than what this device saw.");
   assert.equal(warned("entry_swapped")[0].line, "Your key-holding entry in #general was replaced by a device that is not this one.");
   assert.equal(warned("leaver_may_hear")[0].line, "Someone who left may still hear this room.");
-  assert.equal(warned("gated_opened")[0].line, "#general was closed to listed readers and is now open.");
+  assert.equal(
+    warned("gated_opened")[0].line,
+    "#general was open to readers who are not listed: people may have joined whose names you were not shown.",
+  );
+  assert.match(warned("clock_slow")[0].line, /This device's clock is \d+ min behind the server's/);
+  assert.match(warned("clock_fast")[0].line, /This device's clock is \d+ min ahead of the server's/);
   assert.deepEqual(warned("from_a_later_build"), []);
 });
 

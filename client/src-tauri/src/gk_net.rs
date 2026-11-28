@@ -743,6 +743,15 @@ async fn file(conn: &GkLink, copies: Vec<(KeptCopy, GkEpoch)>) {
 /// The account's seat keys come along, and after a reset with the recovery key they rotate
 /// (3e): the first sign-in after one does it, before anything else (`AccountSession::gk_begin`).
 pub(crate) async fn group_keys(conn: &GkLink, on: bool, run: [u8; 16], clock: u64) {
+    // The relay's run, for the front end's reconnect: a room is the same room only on the
+    // same run (dive 6 F6, lib/rejoin-rules.ts `rejoinsVoice`). Said whatever the key does
+    let shown: String = run.iter().map(|b| format!("{b:02x}")).collect();
+    emit_server(
+        &conn.app,
+        &conn.server,
+        "relay-run",
+        json!({ "run": shown }),
+    );
     {
         let sig = conn.lock();
         if sig.gk.started || !matches!(sig.gk.path, Path::On | Path::Kept) {

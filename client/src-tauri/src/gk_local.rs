@@ -1,7 +1,8 @@
 //! What this device keeps of the group key (plan 3d): `gk_local.bin` in the data directory,
 //! per relay and account. Each group's floor (and the keyholder header it names), the
-//! keyholder's own pair and the seats it sealed that no header named yet, and a guest's
-//! highest counters seen. A floor that is lost lets a relay that kept an old backup take this
+//! keyholder's own pair and the seats it sealed that no header named yet, a guest's
+//! highest counters seen, a signed-in account's counters this device checked or raised (the
+//! mirror, dive 1 F1), and the group id each text channel was last followed under (dive 1 F6). A floor that is lost lets a relay that kept an old backup take this
 //! device back to it; one that survives a restart does not.
 //!
 //! Not encrypted at rest (owner, open choice 10): readable by this user only (`write_atomic`
@@ -20,12 +21,54 @@ use voipc_crypto::group_state::LocalGk;
 pub type Scope = (String, Option<[u8; 16]>);
 
 const FILE: &str = "gk_local.bin";
-const VERSION: u32 = 1;
+/// 2: `LocalGk.channels` (1.14, dive 1 F6) and `LocalGk.mirror` (1.14, dive 1 F1). The
+/// second came in the same unreleased 1.14 work, so it takes no version of its own: a file
+/// of 2 written between the two (a 1.14 build before its release) does not read, and is
+/// kept aside and started anew as any unreadable one (`read`). A file of 1 is read and
+/// written as 2.
+const VERSION: u32 = 2;
 
 #[derive(Default, Serialize, Deserialize)]
 struct GkFile {
     version: u32,
     relays: BTreeMap<Scope, LocalGk>,
+}
+
+/// The file as version 1 wrote it: `LocalGk` without `channels` and `mirror`.
+#[derive(Deserialize)]
+struct GkFileV1 {
+    /// 1, read first (`read`)
+    _version: u32,
+    relays: BTreeMap<Scope, LocalGkV1>,
+}
+
+#[derive(Deserialize)]
+struct LocalGkV1 {
+    floors: BTreeMap<String, voipc_crypto::group_state::LocalFloor>,
+    counters: voipc_crypto::group_state::SeenBook,
+    holder: voipc_crypto::group_state::HolderKeep,
+}
+
+impl From<GkFileV1> for GkFile {
+    fn from(f: GkFileV1) -> GkFile {
+        GkFile {
+            version: VERSION,
+            relays: f
+                .relays
+                .into_iter()
+                .map(|(scope, l)| {
+                    let local = LocalGk {
+                        floors: l.floors,
+                        counters: l.counters,
+                        holder: l.holder,
+                        channels: BTreeMap::new(),
+                        mirror: Default::default(),
+                    };
+                    (scope, local)
+                })
+                .collect(),
+        }
+    }
 }
 
 /// The file as this run has it.
@@ -102,7 +145,20 @@ fn read(path: &std::path::Path) -> Loaded {
     let Ok(bytes) = std::fs::read(path) else {
         return loaded;
     };
-    match postcard::from_bytes::<GkFile>(&bytes) {
+    // The version first (the file's first field), then the layout it names
+    #[derive(Deserialize)]
+    struct Version {
+        version: u32,
+    }
+    let decoded = match postcard::from_bytes::<Version>(&bytes) {
+        Ok(Version { version: 1 }) => postcard::from_bytes::<GkFileV1>(&bytes).map(GkFile::from),
+        Ok(Version { version }) if version > VERSION => Ok(GkFile {
+            version,
+            relays: BTreeMap::new(),
+        }),
+        _ => postcard::from_bytes::<GkFile>(&bytes),
+    };
+    match decoded {
         Ok(file) if file.version > VERSION => {
             tracing::warn!("{} was written by a newer VoIPC: not used", path.display());
             loaded.writable = false;
@@ -175,6 +231,15 @@ mod tests {
             },
             true,
         );
+        // A signed-in account's counters, kept here as well as in its vault (dive 1 F1)
+        l.mirror.raise(
+            [8; 16],
+            Seen {
+                n: 6,
+                made: 1_700_000_050,
+            },
+            false,
+        );
         l
     }
 
@@ -188,6 +253,7 @@ mod tests {
         let again = Store::new(Some(path.clone())).load(&scope).expect("kept");
         assert_eq!(again.floors.get("c:42"), Some(&floor(7)));
         assert_eq!(again.counters, local(7).counters);
+        assert_eq!(again.mirror, local(7).mirror);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -271,6 +337,39 @@ mod tests {
         assert!(store.load(&scope).is_none());
         store.save(|| Some((scope.clone(), local(2)))).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn a_file_of_version_1_keeps_its_floors_and_is_written_as_version_2() {
+        #[derive(Serialize)]
+        struct V1 {
+            version: u32,
+            relays: BTreeMap<Scope, (BTreeMap<String, LocalFloor>, SeenBook, HolderKeep)>,
+        }
+        use voipc_crypto::group_state::{HolderKeep, SeenBook};
+        let path = dir("v1").join(FILE);
+        let scope: Scope = ("aa".repeat(16), None);
+        let l = local(5);
+        let mut v1 = V1 {
+            version: 1,
+            relays: BTreeMap::new(),
+        };
+        v1.relays.insert(
+            scope.clone(),
+            (l.floors.clone(), l.counters.clone(), l.holder.clone()),
+        );
+        std::fs::write(&path, postcard::to_allocvec(&v1).unwrap()).unwrap();
+        let store = Store::new(Some(path.clone()));
+        let read = store.load(&scope).expect("a version 1 file reads");
+        assert_eq!(read.floors["c:42"], floor(5));
+        assert!(read.channels.is_empty());
+        assert_eq!(read.mirror, SeenBook::default(), "version 1 kept no mirror");
+        let mut again = read.clone();
+        again.channels.insert(1, "c:42".into());
+        store.save(|| Some((scope.clone(), again))).unwrap();
+        let back = Store::new(Some(path)).load(&scope).unwrap();
+        assert_eq!(back.channels.get(&1).map(String::as_str), Some("c:42"));
+        assert_eq!(back.floors["c:42"], floor(5));
     }
 
     #[test]

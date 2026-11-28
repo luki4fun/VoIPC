@@ -201,9 +201,20 @@ impl Names {
             .as_ref()
             .filter(|(g, s)| *g == from.gen && (from.epoch, from.join) < (s.epoch, s.join))
             .map(|(_, s)| *s);
-        let lists = self.merged(&from.gen, |epoch, join| {
+        let mut lists = self.merged(&from.gen, |epoch, join| {
             at(&from.gen, epoch, join, from) && upto(epoch, join, to)
         });
+        // A fold to `to` cannot pass a list its hash starts again at (a gate-on opening, a
+        // Regenesis): from the newest such list on only, so a writer whose names floor is
+        // before it learns where its gated period began (dive 1 F5)
+        let start = lists
+            .iter()
+            .rev()
+            .find(|(_, (l, hash))| NamesList::try_from(l).is_ok_and(|l| names_start(&l) == *hash))
+            .map(|(at, _)| *at);
+        if let Some(start) = start.filter(|s| *s > (from.epoch, from.join)) {
+            lists = lists.split_off(&start);
+        }
         NamesPiece {
             lists: lists.into_values().map(|(l, _)| l).collect(),
             gone,

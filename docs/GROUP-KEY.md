@@ -356,6 +356,16 @@ history_row = AEAD(HKDF(self, c), c, list of (K, tag(KX_K), RB))
   and seed, and at most 8 seat-and-seed pairs in all, the lowest seed dropped first (`member.rs` `key_in`, `pend_s_m`; tests
   `no_self_row_is_written_for_an_s_m_no_confirmed_key_came_through`,
   `a_welcome_whose_seal_fails_confirm_leaves_the_seats_s_m_as_it_was`).
+- A kept read (§5.10) writes one too, for the `s_m` of the welcome or seed welcome that keyed its
+  epoch where no self-row showed that `s_m` ours: only when the read was anchored and `confirm`
+  passed, the keying's maker is an entry of the epoch's keyholder set, and its seed is no higher
+  than the epoch's, so no keyholder plants one under a seed it never held (after its removal, or
+  above the head). Without it, an account seated while no device of it was there kept those
+  epochs only until its next seat-key rotation, whose history rows come from self-rows (§5.11
+  step 2) (`kept.rs` `take`, `self_row_for`; dive 3 P3 and its fix review P3-R1, P3-R2; tests
+  `a_kept_row_opened_by_a_seed_welcome_writes_its_self_row_only_from_a_maker_of_the_set`,
+  `a_kept_read_writes_no_self_row_under_a_seed_above_the_epochs`,
+  `a_kept_read_by_a_welcome_no_self_row_showed_ours_writes_its_self_row`).
 - History rows exist only in groups that keep history (§5.10, §5.11). They let the account open rows
   made to seat keys whose private parts it has deleted.
 - A guest keeps nothing past its connection.
@@ -694,6 +704,16 @@ Two exceptions:
   clock (`gk/store.rs` `eager_page`; test
   `a_new_start_does_not_seat_again_an_account_gone_longer_than_the_seat_expiry`). An app signing in
   with keys 30 days old rotates first, so older keys mean no sign-in for over 90 days.
+  An account seat a Join seated with no session waiting for it (this eager seat, or the re-seat
+  of a rotation) is owed a seed welcome under the head seed: no device takes its seat welcome,
+  the only other place its member secret is, and once its bucket is re-keyed by rows and the
+  seed rolls, the kept posts in between open only with that secret. The relay's pages give it
+  one at once, roll or not (§5.6; `gk/group.rs` `seed_owed`, dive 3 P3; test
+  `e2e_d3_p3_an_eager_seat_away_across_a_seed_roll_reads_what_was_kept_before_it`).
+  A stored group writes each eager seat it is asked for (`voipc_gk_eager`) before its actor hears,
+  and drops it once a Join seats it, a leave or kick drops it, or the account goes; a new start
+  notes how far its pages were asked (`voipc_gk_groups.eager_after`). An actor's start asks again
+  what is left, so a restart or a crash does not lose them (dive 4 F7; `gk/store.rs` `reconcile`).
 - Voice seats are taken at room join (§5.9).
 
 The member sends `EpochFetch{group, have}`. A connection attaches its seat pair the first time. With
@@ -838,6 +858,14 @@ Going offline is not an exit for an account. These are exits:
   group, an account seat no session has held for 90 days;
 - a purge of the channel (`purge_begin`), which drops the group's rows; the next keyring starts a
   new generation.
+
+In a stored group every way out of the channel's log, the member's own "Stop keeping this channel"
+included, a kick, a gate unseat and a new password's, asks the seat's exit in the store
+(`voipc_gk_exit_asks`) before the membership row is deleted, and a device removal marks its
+keyholder entries `forced` before the groups hear. An actor's start enters the exits still asked
+(with the bans and seat keys no longer current), so a stop between the two still exits the seat
+(dive 4 F7; `gk/store.rs` `reconcile`). A replayed exit that a second device of the account did
+not need costs one re-key: its sessions fetch again after the restart.
 
 The relay numbers exits per group with a sequence number `seq` (u64):
 - An exit enters the open batch, which closes `exit_gap(N)` after its first exit. `N` is the group's
@@ -1085,10 +1113,24 @@ connection (§2), so every rule below is per keyholder entry, not per account.
   welcome under `s + 1` before any row is made to it.
 - Keyholders then give every remaining seat a seed welcome (§3.2) under `s + 1`: on the seat's next
   fetch, and by the relay's pages of seats (a background sweep). Seed welcomes change no bucket, so
-  they travel outside commits (`EpochWelcomes`).
+  they travel outside commits (`EpochWelcomes`). The relay keeps the first seed welcome per seat of
+  a page and drops the rest; a page its own store failed to write is asked again at once, with no
+  miss counted against the keyholder.
 - A seat **holds** `s + 1` once the relay has stored a seed welcome for it. From then on rows to that
   seat use `s + 1`, and the row's context says which. A seat that is offline for weeks opens its
-  welcome when it is back; it does not hold the roll open.
+  welcome when it is back; it does not hold the roll open. One back while the roll runs, keyed by
+  a row under `s` with no self-row for `s`, is sent its seed welcome under `s` (a §5.2 eager
+  seat's), and the one under `s + 1` with a later answer (dive 3 P3).
+- **Pages without a roll.** The same pages give each seat owed one (§5.2) a seed welcome under the
+  head seed: a keyholder builds a page under its head's seed whether a roll runs or not. A seat
+  owed one when the seed rises is behind, and the roll's pages take it. A keyholder works one due
+  or page of a group at a time (a new one drops what it had in hand), so the relay asks a page
+  only of a keyholder with no due out, and lets the page go, with no miss, when it asks that
+  keyholder a due (dive 3 P3). A page keeps the head it was asked at, and a keyholder that fetches
+  the keyring builds it there only; when another keyholder's commit moves the head under the
+  page's seed, the relay waits 5 s more for an answer already on its way, then lets the page go
+  with no miss and asks it again at the head (fix review P3-R3; test
+  `a_page_the_head_moved_under_goes_soon_with_no_miss_and_is_asked_again`).
 - When every seat holds `s + 1` or has gone, the next opening commit other than a KeyholdersReplace
   sets `seed_floor = s + 1`. The keyring then drops `seed_s`, and members drop `s_m` under `s`.
 - **24 h to finish, whatever the relay says** (owner, 2026-11-22, RV q1-q2:1210). Let `R` be the
@@ -1156,6 +1198,13 @@ connection (§2), so every rule below is per keyholder entry, not per account.
     online and a seat or exit waits. Its validator refuses a Regenesis that comes earlier (tests
     `an_at_once_regenesis_waits_for_no_head_dated_ahead_of_the_relay_clock`,
     `an_at_once_regenesis_comes_no_sooner_than_the_gap_after_the_last_opening`).
+    The hour counts how long the keyholders were away before a relay restart, read from their
+    entries' last-online times, but not the relay's own downtime: after a start it ends no sooner
+    than 10 minutes later (the period in which an online entry's last-online is written), so
+    keyholders who were online at the stop can reconnect before a volunteer is asked to replace
+    them. Under a set of connection entries alone there is still no wait (dive 4; `group.rs`
+    `restarted`; tests `d4_r2_a_restart_does_not_start_the_hour_without_keyholders_again`,
+    `d4_r2_review_a_long_stop_leaves_the_keyholders_time_to_come_back`).
   - A volunteer that holds no seat is first sent the head, from its last floor, as a fetch answer
     carries it, so it can build the Regenesis it is asked for (`group.rs` `ask_start`; test
     `e2e_j10b_a_page_never_seated_makes_the_regenesis_it_is_asked`). This is tested for a head
@@ -1207,7 +1256,11 @@ Where floors live:
     never reaches the vault.
   - Two devices merge per group: the generation with the later `gen_time` wins; within one
     generation, the higher `(epoch, join)`; and the generation lists are joined, keeping the newest 8.
-  - The floor in use is the higher of the local and the vault floor, by the same order.
+  - The floor in use is the device's own where it holds one (its local floor, or one it took in
+    this session); the vault floor stands in only where it holds none (a browser page's start,
+    a new install, a group its local file dropped). A vault floor is whatever another device of
+    the account took, maybe on trust with no floor of its own, so it never moves a floor this
+    device checked, nor its names floor (dive 1, 2026-11-27).
 - A browser keeps no local floor. Signed in, it has the vault floor, which the relay can roll back
   (THREAT-MODEL). As a guest it has a floor only for the page's life.
 
@@ -1516,6 +1569,11 @@ Kept history keeps its chains and step rows per writer (`log.rs`). What changes:
   `e2e_j8k_a_relay_that_seats_a_new_device_from_a_keyholder_pair_of_its_own_gets_no_key_taken`). A
   hostile relay can force the binding alone, by not answering the live fetch. A past header never
   moves the floor.
+- A kept ask sent with no anchor (before the live answer brought one, as a sign-in's catch-up
+  reads) whose answer is keyed by a welcome, or by a row and a seed welcome, with no self-row to
+  show the `s_m` ours, is left unanswered rather than given up for the run, so the sync's next try
+  goes with the anchor (`kept.rs` `past_in`; fix review P3-R1; test
+  `a_kept_read_sent_with_no_anchor_waits_for_one_to_open_by_a_seed_welcome`).
 - A kept ask names the device's floor (`have`) only when the device holds the keyholder header that
   floor names. A floor read from the vault alone, as a reloaded page has before its live answer, is
   no anchor (`kept.rs` `send`; tests `a_kept_ask_names_the_floor_only_with_its_keyholder_header_held`,
@@ -1598,7 +1656,11 @@ pins of writers at their fold, and of keyholders, only where they hold one, and 
 - removal of a device;
 - every 30 days. An app signing in with keys older than that rotates before anything else
   (`gk_begin`, the hosts' one way in, rotates before it publishes or hands over any key; test
-  `a_rotation_after_a_reset_comes_before_anything_else`). The age is read by the earlier of the
+  `a_rotation_after_a_reset_comes_before_anything_else`), unless the last rotation's old keys are
+  still kept: then the sign-in publishes the keys it has, seals the kept rows again under them,
+  and rotates once the old keys go, since rotating first would drop the old self key those rows
+  are still sealed under (dive 3 F4, 2026-11-27). A reset or keys dated ahead rotate first
+  whatever is kept. The age is read by the earlier of the
   device's clock and the relay's, never more than 30 days before the device's own, so a relay that
   lies about its clock holds a rotation off by 30 days at most (test
   `a_relay_clock_far_behind_holds_a_rotation_off_by_a_rotations_age_at_most`). Keys dated more than a
@@ -1624,7 +1686,16 @@ pins of writers at their fold, and of keyholders, only where they hold one, and 
      `the_same_keys_again_above_a_thiefs_drop_the_thiefs_seat_still_waiting`,
      `a_seat_below_a_rotation_heard_is_not_queued_after_it`).
 2. In every group that keeps history where the old seat is seated:
-   - open any welcome still waiting for the old keys;
+   - open any welcome still waiting for the old keys. A kept read does, while they are kept: the
+     self-row it writes for the old seat (§3.11) runs the re-seal again for that seed (test
+     `e2e_d3_p3_what_an_eager_seat_read_by_its_seed_welcome_stays_readable_after_a_rotation`).
+     The old keys stay while the sign-in's kept reads are under way (the log's fetches, past
+     epochs asked), within 150 ticks (about 5 min): at a sign-in that rotates first, the
+     anchor such a read needs comes with the new seat's Join, the commit that lets the old keys
+     go, and an eager seat would else lose the posts under seeds no self-row of its old seat
+     holds (fix review P3-R1; test
+     `e2e_d3_p3_an_eager_seat_back_with_seat_keys_due_reads_what_was_kept_before_the_roll`).
+     A channel whose history this sign-in does not read in that time is read without them;
    - write a history row (§3.11) holding the row bases of every keyholder that made rows to the old
      seat, per seed;
    - seal every live self-row and history row again under the new self key.
@@ -1638,7 +1709,9 @@ pins of writers at their fold, and of keyholders, only where they hold one, and 
      and only while the relay's group key is on. A group with no keyholder online for that long would
      otherwise keep the old keys alive until the 90-day expiry. The account is then re-seated there
      lazily, as any newcomer. The vault keeps the old pair until a device signs in: a sign-in more
-     than 7 days after the rotation drops it at its first tick. With the relay's group key off, the
+     than 7 days after the rotation drops it once that sign-in has sealed the kept rows again (the
+     re-seal ended, done or refused), or after 150 ticks (about 5 min) of that sign-in; a sign-in
+     shorter than that leaves it for the next (dive 3 F4). With the relay's group key off, the
      vault keeps the old pair for good, for kept reads.
    - The relay's report is its word. A relay that reports too early only costs the account a welcome
      still waiting for the old keys; one that never reports meets the cap.
@@ -1818,13 +1891,13 @@ These rows are in THREAT-MODEL.md since 1.14, each with the tests that hold it.
 | Who | Can | Cannot | Compared with today |
 |---|---|---|---|
 | **The relay, honest or curious** | See who is seated and in which bucket, when epochs change, each commit's size, who holds keys and when they are online, when each member fetches, and when an account rotates its seat keys. With "Help hold keys" on (the default, guests included), when each browser page that offers to hold keys is hidden or shown, and which native connections are desktops and which phones (§5.6). In a stored channel's database, the day each seat last fetched keys or posted there, and when each keyholder device was last online, with its rank and device kind | Read `CK`, a bucket key, a seed, a keyring, a writer blob, a post, a kept chain start or media | Same, plus keyholders |
-| **The relay, hostile** | <ul><li>Seat a ghost, by asking a keyholder to. In a gated group the header names it to every writer seated before it: before that writer's next post under an honest relay, and whatever the relay does, before its first post in a later epoch (≤ 70 min) (§4.4 rule 4). Keyholders, and writers at their fold, refuse guests and old seat keys; a writer whose fold fails holds its posts until the seat is removed.</li><li>Give up to 256 accounts of its choice (each passing the keyholder's checks) the `CK_e` of the epochs opened within `CLOCK_SLACK` (10 min) of a keyholder's ask, with no taken header naming them, by leaving the Join commit that seated them out of the heads it shows. They read each such epoch from its start, up to about 80 min after the ask. The relay can repeat it with any keyholder, and each time that keyholder device warns (§5.2), unless the relay keeps that device on a branch of its own through a later epoch and then walks it back, or, in an open group, walks it back at any time, or shows it a new generation (owner, 2026-11-22: accepted for 1.14; a key per join is planned).</li><li>Withhold commits: newcomers wait, and writers stop 46 s after a named exit, and 70 min into an epoch. In a voice room a leaver keeps hearing, and the app warns after 46 s.</li><li>Delay the names of new readers to a writer by up to one epoch (≤ 70 min), by withholding the pushed lists and the Join headers. Past 90 days away, the writer's app says that people joined more than 90 days ago whose names it was not shown. A member that only reads is not shown them unless it asks.</li><li>Hide an exit, with no bound, as today, also by naming a told exit's number for another seat's exit.</li><li>Keep an offline account's seat fed with every epoch until it exits, rotates or expires (an honest relay exits it after 90 days unused and seats it again at a new start only within 120 days of its keys, so at most 210 days after its last sign-in, §5.11; a hostile relay can skip that exit, a hidden exit with no bound).</li><li>Choose which volunteer becomes a keyholder in a text group, within §5.6's rules.</li><li>Start a new generation: at will on a relay without accounts; on a relay with accounts by claiming a restore, or by a Regenesis once no keyholder has been online for the wait (§5.6). In a channel whose keyholders are all connection entries (browsers and guests), there is no wait (owner, 2026-11-22): by dropping their connections it can force a new start at once, and through a hand-over to a second connection again within seconds, no faster than it can already have one started by asking any volunteer for a Genesis. A channel with a desktop keyholder keeps the hour, and a set a Regenesis started keeps it for an hour. Members are told each time.</li><li>With a removed keyholder, fork members who have not yet seen the removal (below).</li><li>Split members onto two branches, which shows as posts they cannot open.</li><li>Roll a browser back within its vault floor's lag, or further by rolling back the vault item.</li><li>Make newcomers read up to 70 min back, by withholding refreshes.</li><li>Have a keyholder that never took a set naming an account's newer desktop counter promote that account's replaced desktop pair (§5.6).</li><li>Get a seed welcome made to a Kyber key of its own for an account the keyholder holds no pin for, by grinding seat keys to that seat's 64-bit tags (about 2^64/N work, N the seats), as before RV; and, after an account's identity changed, have keyholders with no pin for it decline whole seed pages, which counts toward their removal (§7 Q1).</li><li>With a holder of an account's `IK`, bring in a keyholder pair of that holder's by a KeyholdersAdd: members take its welcomes from then on, and no device warns (owner, 2026-11-22: accepted; thief row below).</li></ul> | <ul><li>Forge a header, a welcome, a row, a keyring or a writer blob.</li><li>Choose `CK` (confirm is in every header), a `BK` or an `s_m` (welcomes are authenticated, and members take a keying only from an entry of the keyholder set in force or of one since the last KeyholdersRemove, §3.2), or a keyring (its hash is in the header). This holds for the relay alone, not with a holder of an account's `IK` (above).</li><li>Have a keyholder make a keyring welcome or a seed welcome to a key that the entry's or seat's own `IK` did not endorse, but for the unpinned case above, or a row to an X25519 key the list digest does not bind.</li><li>Roll a desktop or phone app below its local floor, back into one of the last 64 generations it took since the app began following the group, or one of the last 8 it took, or into a generation that began more than `CLOCK_SLACK` before its floor.</li><li>Seat an account's old seat keys again once a keyholder has seen its newer counter, or past a writer that has seen it: that writer's fold fails, and it holds its posts. Have a replaced desktop pair promoted by a keyholder that took a set naming the newer counter, however soon after.</li><li>Skip a name in a writer's fold, move a list to another header, or pass off a shorter tail as the last 90 days: each step of `names_hash` binds its header's `time`, `epoch` and `join`. Count a removal of another branch, or one it signed itself, in a writer's fold: each `removed` list steps `names_hash`.</li><li>Hold a text seed roll open past 24 h: keyholders end it a day after its start whatever it says, and roll a 30-day seed (owner, 2026-11-22).</li><li>Have a removed or swapped-out keyholder's floor header start a new generation.</li><li>Make two voice senders share a media key.</li><li>Make a writer open sessions with members.</li></ul> | Ghosts and hidden exits as today. New: withholding commits, keyholders, the stale-join residue, new generations shown to members, offline accounts staying seated. Gone: the 180 MB first post and the forced session-start uploads. |
+| **The relay, hostile** | <ul><li>Seat a ghost, by asking a keyholder to. In a gated group the header names it to every writer seated before it: before that writer's next post under an honest relay, and whatever the relay does, before its first post in a later epoch (≤ 70 min) (§4.4 rule 4). Keyholders, and writers at their fold, refuse guests and old seat keys; a writer whose fold fails holds its posts until the seat is removed.</li><li>Give up to 256 accounts of its choice (each passing the keyholder's checks) the `CK_e` of the epochs opened within `CLOCK_SLACK` (10 min) of a keyholder's ask, with no taken header naming them, by leaving the Join commit that seated them out of the heads it shows. They read each such epoch from its start, up to about 80 min after the ask. The relay can repeat it with any keyholder, and each time that keyholder device warns (§5.2), unless the relay keeps that device on a branch of its own through a later epoch and then walks it back, or, in an open group, walks it back at any time, or shows it a new generation (owner, 2026-11-22: accepted for 1.14; a key per join is planned).</li><li>Withhold commits: newcomers wait, and writers stop 46 s after a named exit, and 70 min into an epoch. In a voice room a leaver keeps hearing, and the app warns after 46 s.</li><li>Delay the names of new readers to a writer by up to one epoch (≤ 70 min), by withholding the pushed lists and the Join headers. Past 90 days away, the writer's app says that people joined more than 90 days ago whose names it was not shown. A member that only reads is not shown them unless it asks.</li><li>Hide an exit, with no bound, as today, also by naming a told exit's number for another seat's exit.</li><li>Keep an offline account's seat fed with every epoch until it exits, rotates or expires (an honest relay exits it after 90 days unused and seats it again at a new start only within 120 days of its keys, so at most 210 days after its last sign-in, §5.11; a hostile relay can skip that exit, a hidden exit with no bound).</li><li>Choose which volunteer becomes a keyholder in a text group, within §5.6's rules.</li><li>Start a new generation: at will on a relay without accounts; on a relay with accounts by claiming a restore, or by a Regenesis once no keyholder has been online for the wait (§5.6). In a channel whose keyholders are all connection entries (browsers and guests), there is no wait (owner, 2026-11-22): by dropping their connections it can force a new start at once, and through a hand-over to a second connection again within seconds, no faster than it can already have one started by asking any volunteer for a Genesis. A channel with a desktop keyholder keeps the hour, and a set a Regenesis started keeps it for an hour. Members are told each time.</li><li>With a removed keyholder, fork members who have not yet seen the removal (below).</li><li>Split members onto two branches, which shows as posts they cannot open.</li><li>Roll a browser back within its vault floor's lag, or further by rolling back the vault item.</li><li>Make newcomers read up to 70 min back, by withholding refreshes.</li><li>Have a keyholder that never took a set naming an account's newer desktop counter promote that account's replaced desktop pair (§5.6).</li><li>Get a seed welcome made to a Kyber key of its own for an account the keyholder holds no pin for, by grinding seat keys to that seat's 64-bit tags (about 2^64/N work, N the seats), as before RV; and, after an account's identity changed, have keyholders with no pin for it decline whole seed pages, which counts toward their removal (§7 Q1).</li><li>With a holder of an account's `IK`, bring in a keyholder pair of that holder's by a KeyholdersAdd: members take its welcomes from then on, and no device warns (owner, 2026-11-22: accepted; thief row below).</li></ul> | <ul><li>Forge a header, a welcome, a row, a keyring or a writer blob.</li><li>Choose `CK` (confirm is in every header), a `BK` or an `s_m` (welcomes are authenticated, and members take a keying only from an entry of the keyholder set in force or of one since the last KeyholdersRemove, §3.2), or a keyring (its hash is in the header). This holds for the relay alone, not with a holder of an account's `IK` (above).</li><li>Have a keyholder make a keyring welcome or a seed welcome to a key that the entry's or seat's own `IK` did not endorse, but for the unpinned case above, or a row to an X25519 key the list digest does not bind.</li><li>Roll a desktop or phone app below its local floor, back into one of the last 64 generations it took since the app began following the group, or one of the last 8 it took, or into a generation that began more than `CLOCK_SLACK` before its floor.</li><li>Seat an account's old seat keys again once a keyholder has seen its newer counter, or past a writer that has seen it: that writer's fold fails, and it holds its posts. (A relay that withholds the account's group-key vault pages takes with them only the counters this device never met: each device keeps those it checked or raised itself too, `LocalGk.mirror`, the desktop and phone apps in `gk_local.bin`, a browser in IndexedDB (`voipc-gk-mirror`). A device that kept none, such as a new install or browser profile, has only the pages, and one that saw them warns, as for the pins.) Have a replaced desktop pair promoted by a keyholder that took a set naming the newer counter, however soon after.</li><li>Skip a name in a writer's fold, move a list to another header, or pass off a shorter tail as the last 90 days: each step of `names_hash` binds its header's `time`, `epoch` and `join`. Count a removal of another branch, or one it signed itself, in a writer's fold: each `removed` list steps `names_hash`.</li><li>Hold a text seed roll open past 24 h: keyholders end it a day after its start whatever it says, and roll a 30-day seed (owner, 2026-11-22).</li><li>Have a removed or swapped-out keyholder's floor header start a new generation.</li><li>Make two voice senders share a media key.</li><li>Make a writer open sessions with members.</li></ul> | Ghosts and hidden exits as today. New: withholding commits, keyholders, the stale-join residue, new generations shown to members, offline accounts staying seated. Gone: the 180 MB first post and the forced session-start uploads. |
 | **A keyholder, hostile** | Seat ghosts. With the relay's help they need not be named: seats in merge or re-version buckets, which members cannot see, and which an honest relay's validator refuses. It can also hand `CK` to anyone, which no design stops. Skip a leaver, only with the relay hiding the exit; stall commits until it is replaced; read everything the group carries while it holds keys; give away the seed. With the relay, list an account at a counter of its choosing in a gated header: writers then hold that account's real seats in every gated group, and its own devices warn of an old key (§5.11, open) | Open rows other keyholders made without breaking X25519; read bucket keys or keyrings from before its promotion; have members take a welcome or row from a pair in no keyholder set; hand other keyholders a keyring whose seeds, rolls or unchanged bucket keys differ from their own copy | New role |
 | **A removed keyholder that also left the group** | Keep `seed_s`, the head's seed at its removal, until every seat is given `s + 1`: in a text group up to about 48 h whatever the relay does, since the roll starts within 24 h of the removal and keyholders end it 24 h after its start; in a voice room the roll starts at the removal itself (§5.6). With the relay, fork members who have not yet seen its removal: sign headers on the keyholder set from before it, which they take, and read what they write until they see the removal and need a new generation (§5.7). With a quantum computer and the recordings, open the rows under `s` made after its removal, its own removal's re-key rows among them, and through them the new bucket keys and epoch keys, until `seed_floor` passes `s`, and bucket keys keyed under `s` for up to about 1 h after. A removed desktop whose account keeps another keyholder entry still holds the account's `IK`: with the relay it can sign a KeyholdersAdd of a pair of its own, and members take its welcomes from then on, with no warning (owner, 2026-11-22: accepted, §7 Q11) | Classically, open anything sealed from the KeyholdersRemove epoch on outside such a fork, or rows other keyholders made, unless it holds the `IK` of an account that keeps an entry (left): welcomes and rows from its own pair are refused, since it is in no set since the Remove | New |
 | **A removed keyholder still seated** (a resignation, a stall or away removal) | Read everything the group carries, as any member. The seed and fork items of the row above | Open the bucket keys or the keyring made after its removal, or rows to other seats, except as above | New |
 | **A thief of a replaced keyholder pair** (a copy stolen before its private parts went, §5.11) | Open the keyrings up to the swap, the current seed and bucket keys among them. Classically, read what those bucket keys seal for up to about 1 h after the swap under an honest relay, until rows re-key every version it held (§5.5). With a quantum computer and the recordings, open the rows under that seed until the next roll: at most about 31 days, by the 30-day seed age, whatever the relay does (§5.6). With the account's `IK` as well, and the relay, key members from that pair until the next KeyholdersRemove (§5.11) | Open a keyring after the swap, or a row the new pair makes, short of breaking X25519. Swap the entry again: the pair is no longer in the set. Have the pair promoted again by a keyholder that took a set naming its successor's counter (§5.6) | New |
 | **A quantum attacker with the database and recordings** | Recover every X25519 secret. With a seed some keyholder gave away or lost, open every row under it: back to the seed's start, forward until it rolls, and the rows made under it after a removal until `seed_floor` passes it. In a text group a seed is in use for at most about 31 days (§5.6). Open the 0010 kept copies: text history from before the switch, and a voice room's kept log. Open the vault's key of an account that paired a device with an earlier version, from the recording of that pairing, and with it every vault copy, `item.kept` included (§3.13). With a seat in the epoch as well, make a welcome as a real keyholder entry that passes `confirm`, and so have a member keep a `BK` and an `s_m` of its choosing (§7 Q1) | Open a welcome, a row, the keyring, a self-row, a kept chain start or a sharer's row of one to a newcomer without Kyber1024, `s_m`, the self key or the kept keys (§3.13) | Better: kept copies under the group key need Kyber1024 too, their chain starts and sharers' rows included; 0010 copies stay X25519-only (ACCOUNTS.md) |
-| **A thief of an account's vault or device** | Read what was recorded for its seats since the last seat-key rotation, and new epochs until the next rotation (≤ 30 days while a device of the account signs in; else until its seat exits or expires, at most 210 days after the last sign-in) or password change, if the relay names the rotation's exit. In groups that keep history, read that history, as today. Holding the vault's key (a remembered device, or the vault with the password), read every later vault copy, each rotation's seat keys among them, wherever it gets the relay's blobs: a password change ends its sessions and remembered devices, but the vault's key stays (§5.11; owner, 2026-11-22: accepted for 1.14). With a signed-in session, publish seat keys at most 4 counters above the account's per publish: every device warns and goes above them, unless the thief also writes the vault's seat-key item, which a holder of the vault's key can, and then no device can tell its keys from a rotation. A thief of a keyholder desktop also gets that device's keyring, until the account removes the device and another keyholder commits the removal; a vault alone opens no keyring. Sign headers as any keyholder entry of the account, since a header's signer is checked by its `IK` (§4.4 rule 2): without the entry's keyholder pair it makes no welcome, row or keyring the other keyholders or members take, so alone it can at most stall the group. With the relay it can bring in a pair of its own: by a KeyholdersReplace of one of the account's entries, which the other keyholders refuse and the device whose entry it swapped warns of, also right after a restart; or by a KeyholdersAdd of a new entry, which the other keyholders refuse and no device warns of (owner, 2026-11-22: accepted; whoever holds an account's `IK` is the account). Either way members on that branch take its keys until its entry is removed. With a swapped-out pair of the account as well, it keys members from that pair until the next KeyholdersRemove | Read live text recorded before the last rotation, once the old keys are gone: at the re-seat, or at the first sign-in of a device more than 7 days after the rotation while the relay's group key is on (with it off, the vault keeps the old pair for good). Seat the old keys again where the newer counter has been seen. Move the account's counter more than 4 a publish. Open a keyring with the vault alone | Worse for live text in groups without kept history: today a stolen device reads back only to its last renewal (hourly) |
+| **A thief of an account's vault or device** | Read what was recorded for its seats since the last seat-key rotation, and new epochs until the next rotation (≤ 30 days while a device of the account signs in; else until its seat exits or expires, at most 210 days after the last sign-in) or password change, if the relay names the rotation's exit. In groups that keep history, read that history, as today. Holding the vault's key (a remembered device, or the vault with the password), read every later vault copy, each rotation's seat keys among them, wherever it gets the relay's blobs: a password change ends its sessions and remembered devices, but the vault's key stays (§5.11; owner, 2026-11-22: accepted for 1.14). With a signed-in session, publish seat keys at most 4 counters above the account's per publish: every device warns and goes above them, unless the thief also writes the vault's seat-key item, which a holder of the vault's key can, and then no device can tell its keys from a rotation. A thief of a keyholder desktop also gets that device's keyring, until the account removes the device and another keyholder commits the removal; a vault alone opens no keyring. Sign headers as any keyholder entry of the account, since a header's signer is checked by its `IK` (§4.4 rule 2): without the entry's keyholder pair it makes no welcome, row or keyring the other keyholders or members take, so alone it can at most stall the group. With the relay it can bring in a pair of its own: by a KeyholdersReplace of one of the account's entries, which the other keyholders refuse and the device whose entry it swapped warns of, also right after a restart; or by a KeyholdersAdd of a new entry, which the other keyholders refuse and no device warns of (owner, 2026-11-22: accepted; whoever holds an account's `IK` is the account). Either way members on that branch take its keys until its entry is removed. With a swapped-out pair of the account as well, it keys members from that pair until the next KeyholdersRemove | Read live text recorded before the last rotation, once the old keys are gone: at the re-seat, or at the first sign-in of a device more than 7 days after the rotation that lasts through its re-seal (about 5 min at most) while the relay's group key is on (with it off, the vault keeps the old pair for good). Seat the old keys again where the newer counter has been seen. Move the account's counter more than 4 a publish. Open a keyring with the vault alone | Worse for live text in groups without kept history: today a stolen device reads back only to its last renewal (hourly) |
 | **An account that only went offline** | Stay seated until it exits, rotates at its next sign-in, or expires: 90 days unused, and a new start of a stored group seats it again only within 120 days of the relay first holding its current keys, so at most 210 days after its last sign-in; in a memory text group, 90 days with no session holding the seat. With a relay that keeps and feeds it the epochs, read them all when back | Read anything after its seat ends | Worse: today an offline device's chain covers at most an hour |
 | **A newcomer** | Read the current epoch from its start: ≤ 60 s in a one-bucket group and ≤ 5 min otherwise under an honest relay, up to twice that while people keep joining (§5.2); ≤ 70 min under a hostile one, where a keyholder declines a Join into an older epoch | Read earlier epochs, except through kept-history sharing | About 60 s back today |
 | **A leaver** | Text: read for up to `exit_gap(N) + CHECK_WAIT_MS` after the exit is named under an honest relay when an Exits due carries the batch, up to 46 s when a 60 s keyholder change carries it, and at most 46 s once writers are told; with no bound if the relay hides the exit, which includes naming the told number for another seat's exit. Voice: hear until the opening commit that removes them, about 2 s under an honest relay; with no bound if the relay withholds that commit or hides the exit, and the app, told of every exit while seated, warns after 46 s | Open any epoch after the opening header that removed them | Same for text. Voice: today the minter re-keys as soon as it sees the leave |
@@ -2804,6 +2877,7 @@ measured since is at the end of this section, under *Measured*. Sizes used:
 |---|---|---|---|
 | A post | — | The post + 52 B; 0.23 KB once per writer chain per epoch | Post + 0.23 KB once per epoch (today: 180 MB down, 17.6 MB up) |
 | First seat | ↑ 1.7 KB + 60 B + 0.1 KB | ↓ about 2.6 KB once; gated: up to about 18 KB more, the `added` list of the Join header that seated it | — |
+| An eager seat (§5.2: seated with no session waiting) | ↑ as a joiner, plus one 1.7 KB seed welcome under the head seed and one Kyber1024 encapsulation, by the relay's page (dive 3 P3): about 8.3 MB more for a new start's eager re-seat at `kept_seats` 5000 | Nothing until it is back | — |
 | Join commit of `n` joiners | ↑ `n` × 1.7 KB + 0.45 KB (gated: + 72 B × `n`) | Nothing, but for the joiners (First seat) | Gated: ↓ 72 B × `n` of names, pushed to each writer of the epoch, or 0.45 KB more as the whole header |
 | Exit batch of `E` | ↑ 97 KB seals + 160 KB keyring + `E` × 61 rows × 60 B + merges ≤ 150 KB: about 0.27 MB + 3.7 KB × `E`, up to 0.42 MB + 3.7 KB × `E` with a full merge | ↓ about 0.9 KB when it next reads (gated: + 33 B × `E`) | New chain, + 0.23 KB |
 | Refresh (every 5 min) | ↑ about 0.27 MB + one twelfth re-keyed (about 8.4k rows, 0.5 MB): about 0.8 MB, up to 0.95 MB with a full merge, so about 9–11 MB/h | ↓ about 0.9 KB per 5 min read; one 60 B row an hour | New chain |
@@ -2940,7 +3014,7 @@ then clashes with the user groups of 1.7 (`GroupSave`, `voipc_group_style`). Eve
 names its `group`, never a channel, since a channel's id can stand for groups of two kinds; one that
 names an epoch also names its `gen`. The crypto module is `voipc-crypto/src/group_key.rs` (and
 `group_state/` for the members' and keyholders' state), and the relay's is `gk/` with its store in
-`accounts/gk.rs`. The tables come in migration `0013_group_keys.sql`.
+`accounts/gk.rs`. The tables come in migrations `0013_group_keys.sql` and `0014_group_keys_restart.sql`.
 
 **The relay switch.** A new top-level key in `server.toml`: `group_key = true`.
 - With it on, a relay at 26 uses the group key everywhere. It refuses `KeyCheck`, `OpenSessions` and
@@ -3085,7 +3159,9 @@ timed out; the head moved.
 **Relay state** per group: the head, the headers it keeps (§4.4), each seat's bucket, version, seed
 and last use, the seat lists, the current seals, joins and exits due with the exit `seq`, the
 keyholders with who is online and missed deadlines, the open commit, writer blobs per `w` and epoch,
-the keyring pieces and `KRK` welcomes, and pending seed-roll welcomes. A memory text group also
+the keyring pieces and `KRK` welcomes, and pending seed-roll welcomes. A stored text group also
+keeps the account seats owed a seed welcome (§5.2), rebuilt at its load from the account seats
+under the head seed with no seed welcome and no self-row for it. A memory text group also
 keeps when each account seat lost its last session. That is about 15 MB for a 100k group (an
 estimate). A gated group also keeps 90 days of `added` lists, and of the opening
 headers that carry `removed` lists (§4.4): about 7 MB after a full re-seat at 100k, plus up to about
@@ -3100,6 +3176,13 @@ and about 0.6 MB of headers at one per exit batch). That is about 90 MB over the
   (misses and away times outlive one), `voipc_gk_chains`, `voipc_gk_self` (keyed by group, account,
   generation, seed and seat tags), and `voipc_gk_seatkeys` beside `voipc_logkeys`, with each
   account's counter, all in migration `0013_group_keys.sql`;
+- in `0014_group_keys_restart.sql`: `voipc_gk_eager` (each eager seat asked and not yet seated or
+  dropped, asked again at an actor's start), `voipc_gk_holders.forced` (an entry whose removal is
+  proposed outright, so a restart still asks it), `voipc_gk_exit_asks` (each exit asked before a
+  log membership went, entered at an actor's start until its exit is written),
+  `voipc_gk_groups.eager_after` (how far a new start's eager pages were asked; an actor's start
+  asks the rest) and `voipc_gk_groups.moved_back` (a generation a channel's group id came back
+  onto: it starts anew, after a restart too);
 - `voipc_log_kems`, each account's kept Kyber1024 key with its signature (§3.13), deleted with the
   log key, and the column `voipc_pending.gk_rows`, the rows a sharer stored for each answer it owes
   (§5.10), both in `0013`;

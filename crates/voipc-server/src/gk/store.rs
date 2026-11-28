@@ -10,7 +10,8 @@ use anyhow::Result;
 use l4f_accounts::store::Store as Db;
 use voipc_crypto::group_key::commit::{HolderRef, Joiner, Listed, Pair, RowsOut, WelcomeOut};
 use voipc_crypto::group_key::timers::{
-    refresh_ms, HOLD_MS, KEYHOLDER_SKEW_SECS, MATERIAL_SWEEP_MARGIN_MS,
+    refresh_ms, HOLD_MS, KEYHOLDER_SKEW_SECS, MATERIAL_SWEEP_MARGIN_MS, SEAT_EXPIRY_SECS,
+    SEAT_KEYS_ROTATE_SECS,
 };
 use voipc_crypto::group_key::tree::BucketTree;
 use voipc_crypto::group_key::{
@@ -22,7 +23,7 @@ use voipc_protocol::gk::{
 };
 
 use super::due::{Exits, Leaving};
-use super::group::{GroupState, Head, Seat, Taken};
+use super::group::{GroupState, Head, Out, Seat, Taken};
 use super::names::{starts_names, Kept};
 use super::snapshot::{header_in, link, Ver};
 use crate::accounts::gk as db;
@@ -185,12 +186,44 @@ impl Store {
                 self.commit_mem(t);
                 Ok(())
             }
-            Store::Db(d) => commit_db(d, g, t, now)
-                .await
-                .map_err(|e| match e.downcast::<Fail>() {
-                    Ok(f) => f,
-                    Err(e) => Fail::Store(e.to_string()),
-                }),
+            Store::Db(d) => {
+                match commit_db(d, g, t, now)
+                    .await
+                    .map_err(|e| match e.downcast::<Fail>() {
+                        Ok(f) => f,
+                        Err(e) => Fail::Store(e.to_string()),
+                    }) {
+                    // A COMMIT whose answer was lost (a connection dropped after the database
+                    // applied it): the stored head is this commit's, so it is taken as stored.
+                    // Told as failed, the relay would stay a head behind and every later commit
+                    // be refused as built on another (dive 4 F3). A stored text commit writes
+                    // nothing after its head move (seed welcomes are a voice room's, in memory)
+                    Err(Fail::Store(e)) => {
+                        // The read that decides can fail as the COMMIT's answer did (a
+                        // failover): tried for about 2 s (review C-P4)
+                        let mut wait = 100;
+                        let landed = loop {
+                            match db::group(&d.db, &g.id).await {
+                                Ok(Some(row)) => break row.head.d == t.applied.header.d(),
+                                Ok(None) => break false,
+                                Err(_) if wait <= 800 => {
+                                    tokio::time::sleep(std::time::Duration::from_millis(wait))
+                                        .await;
+                                    wait *= 2;
+                                }
+                                Err(_) => break false,
+                            }
+                        };
+                        if landed {
+                            tracing::warn!(group = %g.id, "a commit's answer was lost, but its head moved: {e}");
+                            Ok(())
+                        } else {
+                            Err(Fail::Store(e))
+                        }
+                    }
+                    r => r,
+                }
+            }
         }
     }
 
@@ -323,6 +356,17 @@ impl Store {
     }
 
     /// A seed welcome waiting for `seat` under `s`.
+    /// Whether the seat's account holds a self-row for seed `s` here: its member secret under
+    /// that seed, which a row needs. A read that fails counts as held (no seat again for it).
+    pub async fn self_row_held(&self, grp: &str, gen: &[u8; 16], seat: &SeatRef, s: u32) -> bool {
+        let (Store::Db(d), Some(a)) = (self, seat.m.account()) else {
+            return false;
+        };
+        own_rows(&d.db, grp, &a, gen, seat, s)
+            .await
+            .map_or(true, |rows| !rows.is_empty())
+    }
+
     pub async fn seed_welcome(
         &self,
         grp: &str,
@@ -399,13 +443,18 @@ impl Store {
     }
 
     /// The keyholder entries of a stored group as its actor holds them (2i): each with its
-    /// pair, rank, device and when it was last online; an entry no longer in the set goes.
-    pub async fn put_holders(&self, g: &GroupState, now: u64) {
+    /// pair, rank, device, when it was last online and whether its removal is proposed
+    /// outright (`Holders::forced`); an entry no longer in the set goes, its mark with it.
+    /// Whether the entries are written (memory: always). One not written is written again at
+    /// the actor's next turn (dive 4 F5).
+    pub async fn put_holders(&self, g: &GroupState, now: u64) -> bool {
         if let Store::Db(d) = self {
             if let Err(e) = put_holders(&d.db, g, now).await {
                 tracing::warn!(group = %g.id, "keeping the keyholders failed: {e}");
+                return false;
             }
         }
+        true
     }
 
     /// A live group's own sweep (plan 2e): a stored group's orphans, between its commits,
@@ -483,10 +532,13 @@ impl Store {
         }
     }
 
-    /// Exits entered since `from` (`seq`), kept so open batches survive a restart.
-    pub async fn exits_entered(&self, grp: &str, g: &GroupState, from: u64, now: u64) {
+    /// Exits entered since `from` (`seq`), kept so open batches survive a restart. Whether
+    /// they are written (or there was nothing to write): one that failed is written again from
+    /// `from` at the actor's next turn (rows already there are left as they are), since what a
+    /// restart reads of an exit is its row alone (dive 4 F2, F7).
+    pub async fn exits_entered(&self, grp: &str, g: &GroupState, from: u64, now: u64) -> bool {
         let (Store::Db(d), Some(gen)) = (self, g.gen()) else {
-            return;
+            return true;
         };
         let new: Vec<db::Exit> = g
             .exits
@@ -506,7 +558,36 @@ impl Store {
         if !new.is_empty() {
             if let Err(e) = db::add_exits(&d.db, grp, &new).await {
                 tracing::warn!(group = grp, "keeping exits failed: {e}");
+                return false;
             }
+        }
+        true
+    }
+
+    /// Exit asks whose exits are written (`settle_exit_asks`): whether they went. A failed
+    /// write is said; the actor tries again at its next turn.
+    pub async fn exits_settled(&self, grp: &str, asks: &[([u8; 16], u64)]) -> bool {
+        let Store::Db(d) = self else { return true };
+        if asks.is_empty() {
+            return true;
+        }
+        if let Err(e) = db::settle_exit_asks(&d.db, grp, asks).await {
+            tracing::warn!(group = grp, "dropping exits asked failed: {e}");
+            return false;
+        }
+        true
+    }
+
+    /// The channel's group id came back to this group: a new generation is due while the
+    /// head's stays, here and after a restart (`moved_back`, 0014). A failed write is said:
+    /// the live group starts anew all the same.
+    pub async fn moved_back(&self, grp: &str) {
+        let Store::Db(d) = self else { return };
+        if let Err(e) = db::set_moved_back(&d.db, grp).await {
+            tracing::warn!(
+                group = grp,
+                "keeping that the channel moved back failed: {e}"
+            );
         }
     }
 
@@ -583,6 +664,97 @@ impl Store {
             .collect()
     }
 
+    /// At an actor's start, after `load`: what an account-path change would have done that
+    /// never reached the group's actor, or reached it and lived in its memory alone (dive 4
+    /// F7). The accounts paths change the database first and tell the group after, so a stop
+    /// in between (a crash; a shutdown's drain that ran out) loses the message, and the next
+    /// start knows only what the database says:
+    /// - a seat or keyholder entry of an account banned now exits or is removed (a ban is
+    ///   relay-wide; `OUT_OF_LOGS` took it out of every log in the ban's transaction);
+    /// - an account seat whose keys are not its account's current ones exits, as a rotation
+    ///   (its current keys are seated eagerly, `on_seat_keys`) or, with none, as a reset;
+    /// - a keyholder entry made with an identity its account no longer has is removed;
+    /// - an exit asked ahead and not yet written (`voipc_gk_exit_asks`: a log leave, a gate,
+    ///   a new password, a kick or leave of the channel) is entered, before the checks below,
+    ///   so a later eager ask seats the account again and an earlier one is dropped with its
+    ///   membership;
+    /// - an eager seat asked and not yet seated (`voipc_gk_eager`) is asked again, while its
+    ///   account still keeps the log.
+    ///
+    /// What this enters is written at once, exits and entries. A read that fails is said and
+    /// skipped. The exit asks it entered go once their exits are written; those not (the write
+    /// failed) are the actor's to settle, with where its exit writes start again.
+    pub async fn reconcile(&self, g: &mut GroupState, now: u64, out: &mut Vec<Out>) -> Reconciled {
+        // Stored groups are text groups: a voice seat's keys are its connection's, not its
+        // account's published ones
+        let (Store::Db(d), GroupKind::Text) = (self, g.kind) else {
+            return Reconciled::default();
+        };
+        // With no head, a new start's eager pages seat the members (`eager_all`), and a new
+        // start seats whom it seats anew: an exit asked of the old head has no seat to take
+        let Some(gen) = g.gen().filter(|_| !g.new_gen) else {
+            if let Err(e) = db::drop_exit_asks(&d.db, &g.id, now).await {
+                tracing::warn!(group = %g.id, "dropping exits asked failed: {e}");
+            }
+            return Reconciled::default();
+        };
+        let (from, forced) = (g.exits.next, g.holders.forced.clone());
+        let asks = match reconcile_db(&d.db, g, &gen, now, out).await {
+            Ok(asks) => asks,
+            Err(e) => {
+                tracing::warn!(group = %g.id, "checking the group against its accounts failed: {e}");
+                vec![]
+            }
+        };
+        let written = g.exits.next == from || self.exits_entered(&g.id, g, from, now).await;
+        if g.holders.forced != forced {
+            self.put_holders(g, now).await;
+        }
+        let asks: Vec<([u8; 16], u64)> = asks.iter().map(|a| (a.account, a.at)).collect();
+        match written {
+            true if self.exits_settled(&g.id, &asks).await => Reconciled::default(),
+            true => Reconciled {
+                unwritten: None,
+                asks,
+            },
+            false => Reconciled {
+                unwritten: Some(from),
+                asks,
+            },
+        }
+    }
+
+    /// At an actor's start: where the head's new start's eager pages stopped, if a stop (a
+    /// crash, a shutdown, a page read that failed) cut them off before all were asked (review
+    /// P3): the head's generation and the account to go on after (`None`: from the first). A
+    /// read that fails is said, and the pages wait for the next start.
+    pub async fn eager_left(&self, g: &GroupState) -> Option<([u8; 16], Option<[u8; 16]>)> {
+        let (Store::Db(d), GroupKind::Text) = (self, g.kind) else {
+            return None;
+        };
+        let gen = g.gen().filter(|_| !g.new_gen && g.head.is_some())?;
+        match db::eager_after(&d.db, &g.id, &gen).await {
+            Ok(left) => left.map(|after| (gen, after)),
+            Err(e) => {
+                tracing::warn!(group = %g.id, "reading where the eager seats stopped failed: {e}");
+                None
+            }
+        }
+    }
+
+    /// Eager seats seated, refused or dropped: their asks go (dive 4 F7). A failed write is
+    /// said; the next start finds the ask settled and drops it then.
+    pub async fn eager_settled(&self, grp: &str, seats: &[SeatRef]) {
+        let Store::Db(d) = self else { return };
+        let asks = eager_asks(seats);
+        if asks.is_empty() {
+            return;
+        }
+        if let Err(e) = db::drop_eager(&d.db, grp, &asks).await {
+            tracing::warn!(group = grp, "dropping eager seats asked failed: {e}");
+        }
+    }
+
     /// A stored group as the database holds it, into `g`. An old incarnation's group is
     /// reset and starts a new generation at its next fetch (2i). Every connection seat is
     /// an exit at start: its connection is gone.
@@ -606,6 +778,11 @@ impl Store {
             return Ok(());
         }
         let gen = row.head.gen;
+        // The channel moved back onto this generation and no new one is stored since: one is
+        // asked, as the live relay asked it (`Groups::on_group_moved`)
+        if db::moved_back(&d.db, &grp, &gen).await? {
+            g.new_gen = true;
+        }
         let kind = g.kind;
         let decode = |h: &db::Header| SignedHeader::decode(&h.body, &h.sig, kind, &grp).ok();
         let mut headers: HashMap<[u8; 32], SignedHeader> = HashMap::new();
@@ -766,7 +943,8 @@ impl Store {
         }
         g.names.restore(lists, removals, step.map(|s| (gen, s)));
         // Keyholder entries with their pairs (a later Add, Remove or Replace makes `KRK`
-        // welcomes to offline ones too), ranks, devices, misses and last online (2i)
+        // welcomes to offline ones too), ranks, devices, misses, last online and whether
+        // their removal was proposed outright (2i)
         let kept = holder_rows(&d.db, &grp).await?;
         g.holders.set_to(kh.header().keyholders.clone(), |kx| {
             kept.iter()
@@ -774,8 +952,12 @@ impl Store {
                 .and_then(|r| r.pair.clone())
         });
         for r in kept {
-            if !g.holders.set.iter().any(|k| k.kx == r.kx) {
+            let Some(k) = g.holders.set.iter().find(|k| k.kx == r.kx) else {
                 continue;
+            };
+            // A removal proposed outright before the restart is proposed still (dive 4 F6)
+            if r.forced {
+                g.holders.forced.push(HolderRef::of(k));
             }
             if r.rank != u8::MAX {
                 g.holders.rank.insert(r.kx, r.rank);
@@ -788,6 +970,12 @@ impl Store {
             st.missed = r.misses.missed.into();
             st.declined = r.misses.declined.into();
         }
+        // No entry is online at a start: none has been since the latest any was seen (its
+        // `last_online`, written as it went offline, or by the sweep while it was online). The
+        // hour before a Regenesis counts from then, not from this start, so restarts (a crash
+        // loop, self-updates) do not hold a channel with no keyholder keyless (§5.6); the
+        // actor's start keeps its own downtime out of it (`GroupState::restarted`)
+        g.no_keyholder_since = g.holders.stats.values().filter_map(|s| s.away_since).max();
         // Each account entry's newest counter: below it seven days, an entry goes (2d)
         let accounts: HashSet<[u8; 16]> =
             g.holders.set.iter().filter_map(|k| k.m.account()).collect();
@@ -811,6 +999,13 @@ impl Store {
         // Seats a roll that ended at its 24 h left behind get their pages after a restart
         // too (GROUP-KEY §5.6)
         g.left_behind = g.seats.values().any(|x| x.seed < hd.seed);
+        // And so do the seats owed one under the head seed whose page a restart or an idle
+        // stop lost (dive 3 P3)
+        for seat in owed_seats(&d.db, &grp, &gen, hd.seed).await? {
+            if g.seats.get(&seat).is_some_and(|x| x.seed == hd.seed) {
+                g.seed_owed.insert(seat);
+            }
+        }
         g.head = Some(Head {
             parent: parent_of(&head),
             kh,
@@ -821,6 +1016,394 @@ impl Store {
         Ok(())
     }
 }
+
+/// What `Store::reconcile` leaves its actor: the exit asks it entered whose settle waits (each
+/// account and its ask's time), and the first exit `seq` whose write failed.
+#[derive(Default)]
+pub struct Reconciled {
+    pub unwritten: Option<u64>,
+    pub asks: Vec<([u8; 16], u64)>,
+}
+
+/// The asks of `seats`' account seats.
+pub fn eager_asks(seats: &[SeatRef]) -> Vec<db::EagerAsk> {
+    seats
+        .iter()
+        .filter_map(|s| {
+            Some(db::EagerAsk {
+                account: s.m.account()?,
+                seat: seat_record(s),
+            })
+        })
+        .collect()
+}
+
+/// Rows a start's checks read a page at a time.
+const CHECK_PAGE: u32 = 1000;
+
+/// `Store::reconcile` over the database.
+async fn reconcile_db(
+    store: &Db,
+    g: &mut GroupState,
+    gen: &[u8; 16],
+    now: u64,
+    out: &mut Vec<Out>,
+) -> Result<Vec<db::ExitAsk>> {
+    use super::group::cause;
+    let grp = g.id.clone();
+    let secs = i64::try_from(now / 1000)?;
+    // Banned accounts: their seats exit, their entries are removed (`account_exit`)
+    let entries: Vec<[u8; 16]> = g.holders.set.iter().filter_map(|k| k.m.account()).collect();
+    let mut banned = banned_seated(store, &grp, gen, secs).await?;
+    banned.extend(banned_of(store, &entries, secs).await?);
+    for a in &banned {
+        g.account_exit(a, cause::BAN, now, out);
+    }
+    // Exits asked ahead and not written (a log leave, a gate, a new password, a kick or leave
+    // of the channel): entered in one pass, before anything here seats an account again (the
+    // keys check below skips them; an eager ask made since seats them again)
+    let mut exits_asked: Vec<db::ExitAsk> = vec![];
+    loop {
+        let after = exits_asked.last().map(|a| a.account);
+        let page = db::exit_asks_page(store, &grp, after.as_ref(), CHECK_PAGE).await?;
+        let full = page.len() == CHECK_PAGE as usize;
+        exits_asked.extend(page);
+        if !full {
+            break;
+        }
+    }
+    let exited: HashMap<[u8; 16], u8> = exits_asked.iter().map(|a| (a.account, a.cause)).collect();
+    g.accounts_exit(&exited, now, out);
+    // Seats whose keys are not their account's current ones; the current ones are seated in
+    // their place if the relay first held them within the seat expiry and a rotation's age
+    // (`eager_all`)
+    let since = now.saturating_sub((SEAT_EXPIRY_SECS + SEAT_KEYS_ROTATE_SECS) * 1000);
+    let mut reset: HashSet<[u8; 16]> = HashSet::new();
+    // Each new seat once: an account with two seats on old keys (a second rotation before the
+    // first one's opening landed) has one current seat (review P1)
+    let mut rotated: Vec<SeatRef> = vec![];
+    let mut asked: HashSet<SeatRef> = HashSet::new();
+    let mut after: Vec<u8> = vec![];
+    loop {
+        let page = keys_off(store, &grp, gen, &after, CHECK_PAGE).await?;
+        let full = page.len() == CHECK_PAGE as usize;
+        for (rec, keys) in &page {
+            let Some(seat) = <[u8; 33]>::try_from(rec.as_slice())
+                .ok()
+                .and_then(|r| seat_of(&r))
+                .filter(|s| g.seats.contains_key(s))
+            else {
+                continue;
+            };
+            let Some(a) = seat
+                .m
+                .account()
+                .filter(|a| !banned.contains(a) && !exited.contains_key(a))
+            else {
+                continue;
+            };
+            match keys {
+                Current::Gone => {
+                    if reset.insert(a) {
+                        g.account_exit(&a, cause::RESET, now, out);
+                    }
+                }
+                Current::Bad => g.exit(seat, cause::ROTATION, now, out),
+                Current::Keys(k) if !reset.contains(&a) => {
+                    let (ik, pair, published) = &**k;
+                    g.exit(seat, cause::ROTATION, now, out);
+                    if *published < since {
+                        continue;
+                    }
+                    let joiner = Joiner {
+                        seat: pair.keys.seat(MemberId::Account(a)),
+                        ik: *ik,
+                        keys: pair.keys.clone(),
+                        endorsement: pair.endorsement.clone(),
+                        returning: false,
+                    };
+                    let new = joiner.seat;
+                    g.eager(joiner, a, now, out);
+                    if g.joins.has(&new) && asked.insert(new) {
+                        rotated.push(new);
+                    }
+                }
+                Current::Keys(..) => {}
+            }
+        }
+        match page.last() {
+            Some((rec, _)) if full => after = rec.clone(),
+            _ => break,
+        }
+    }
+    db::put_eager(store, &grp, &eager_asks(&rotated), now).await?;
+    // Entries made with an identity their account no longer has (a reset): removed
+    for (a, ik) in identities(store, &entries).await? {
+        for k in &g.holders.set {
+            let r = HolderRef::of(k);
+            if k.m.account() == Some(a) && k.ik != ik && !g.holders.forced.contains(&r) {
+                g.holders.forced.push(r);
+            }
+        }
+    }
+    // Eager seats asked and not seated: asked again while their account keeps the log, with
+    // keys as fresh
+    let mut after: Option<[u8; 16]> = None;
+    loop {
+        let page = eager_asked(store, &grp, since, after.as_ref(), CHECK_PAGE).await?;
+        let full = page.len() == CHECK_PAGE as usize;
+        after = page.last().map(|(ask, _)| ask.account);
+        let (mut done, mut moved) = (vec![], vec![]);
+        for (ask, joiner) in page {
+            let Some(joiner) = joiner.filter(|_| !banned.contains(&ask.account)) else {
+                done.push(ask);
+                continue;
+            };
+            let seat = joiner.seat;
+            g.eager(joiner, ask.account, now, out);
+            if !g.joins.has(&seat) {
+                // Seated already, or past `kept_seats`
+                done.push(ask);
+            } else if seat_record(&seat) != ask.seat {
+                // Its keys rotated since: the ask names the seat they make now
+                moved.push(seat);
+            }
+        }
+        db::drop_eager(store, &grp, &done).await?;
+        db::put_eager(store, &grp, &eager_asks(&moved), now).await?;
+        if !full {
+            break;
+        }
+    }
+    Ok(exits_asked)
+}
+
+/// The accounts with a seat in `grp`'s generation `gen` that a ban in force names (`secs`:
+/// now, unix s).
+async fn banned_seated(
+    store: &Db,
+    grp: &str,
+    gen: &[u8; 16],
+    secs: i64,
+) -> Result<HashSet<[u8; 16]>> {
+    let rows: Vec<Vec<u8>> = on!(store, pool => {
+        sqlx::query_scalar(
+            "SELECT DISTINCT s.account FROM voipc_gk_seats s
+             WHERE s.grp = $1 AND s.gen = $2 AND s.b IS NOT NULL AND s.account IN
+               (SELECT account FROM voipc_bans WHERE account IS NOT NULL
+                AND (expires_at IS NULL OR expires_at > $3))",
+        )
+        .bind(grp)
+        .bind(&gen[..])
+        .bind(secs)
+        .fetch_all(pool)
+        .await?
+    });
+    Ok(rows.into_iter().filter_map(|a| a.try_into().ok()).collect())
+}
+
+/// Which of `accounts` a ban in force names.
+async fn banned_of(store: &Db, accounts: &[[u8; 16]], secs: i64) -> Result<HashSet<[u8; 16]>> {
+    let mut out = HashSet::new();
+    for a in accounts {
+        let hit: Option<i64> = on!(store, pool => {
+            sqlx::query_scalar(
+                "SELECT CAST(1 AS BIGINT) FROM voipc_bans WHERE account = $1
+                 AND (expires_at IS NULL OR expires_at > $2)",
+            )
+            .bind(&a[..])
+            .bind(secs)
+            .fetch_optional(pool)
+            .await?
+        });
+        if hit.is_some() {
+            out.insert(*a);
+        }
+    }
+    Ok(out)
+}
+
+/// A seat's account's current seat keys, as `keys_off` finds them.
+enum Current {
+    /// None: an identity reset dropped them.
+    Gone,
+    /// Keys that do not decode: they seat nobody.
+    Bad,
+    /// A joiner's identity key and pair, and when the relay first held them (unix ms).
+    Keys(Box<([u8; 32], Pair, u64)>),
+}
+
+/// A page of `grp`'s account seats in generation `gen` after seat record `after` whose
+/// account has an identity and whose keys are not that account's current seat keys: each
+/// with what the current keys are. A seat's `dh` is its keys' as the
+/// account published them (`commit_db`). An account with no identity is the tombstone
+/// sweep's (a deleted account's seats exit with their cause there).
+async fn keys_off(
+    store: &Db,
+    grp: &str,
+    gen: &[u8; 16],
+    after: &[u8],
+    limit: u32,
+) -> Result<Vec<(Vec<u8>, Current)>> {
+    type T = (
+        Vec<u8>,
+        Vec<u8>,
+        Option<i64>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Option<i64>,
+        Option<Vec<u8>>,
+        Vec<u8>,
+        Option<i64>,
+    );
+    let rows: Vec<T> = on!(store, pool => {
+        sqlx::query_as(
+            "SELECT s.seat, s.account, k.n, k.kem, k.dh, k.made, k.sig, i.identity_key, k.published
+             FROM voipc_gk_seats s JOIN voipc_identity i ON i.account = s.account
+             LEFT JOIN voipc_gk_seatkeys k ON k.account = s.account AND k.current
+             WHERE s.grp = $1 AND s.gen = $2 AND s.seat > $3 AND s.b IS NOT NULL
+             AND (k.account IS NULL OR k.dh <> s.dh)
+             ORDER BY s.seat LIMIT $4",
+        )
+        .bind(grp)
+        .bind(&gen[..])
+        .bind(after)
+        .bind(i64::from(limit))
+        .fetch_all(pool)
+        .await?
+    });
+    Ok(rows
+        .into_iter()
+        .map(|(seat, a, n, kem, dh, made, sig, ik, published)| {
+            let keys = match (n, kem, dh, made, sig) {
+                (Some(n), Some(kem), Some(dh), Some(made), Some(sig)) => {
+                    let at = published.and_then(|p| u64::try_from(p).ok()).unwrap_or(0);
+                    keyed((a, n, kem, dh, made, sig, ik)).map_or(Current::Bad, |(_, ik, p)| {
+                        Current::Keys(Box::new((ik, p, at)))
+                    })
+                }
+                _ => Current::Gone,
+            };
+            (seat, keys)
+        })
+        .collect())
+}
+
+/// The identity keys of `accounts` that have one, raw.
+async fn identities(store: &Db, accounts: &[[u8; 16]]) -> Result<Vec<([u8; 16], [u8; 32])>> {
+    let mut out = vec![];
+    for a in accounts {
+        let k: Option<Vec<u8>> = on!(store, pool => {
+            sqlx::query_scalar("SELECT identity_key FROM voipc_identity WHERE account = $1")
+                .bind(&a[..])
+                .fetch_optional(pool)
+                .await?
+        });
+        if let Some(ik) = k.as_deref().and_then(ik_raw) {
+            out.push((*a, ik));
+        }
+    }
+    Ok(out)
+}
+
+/// A page of `grp`'s eager seats asked, after account `after`: each with the joiner its
+/// account's current seat keys make, `None` where it no longer keeps the log, or has no keys
+/// the relay first held at `since` (unix ms) or later.
+async fn eager_asked(
+    store: &Db,
+    grp: &str,
+    since: u64,
+    after: Option<&[u8; 16]>,
+    limit: u32,
+) -> Result<Vec<(db::EagerAsk, Option<Joiner>)>> {
+    type T = (
+        Vec<u8>,
+        Vec<u8>,
+        Option<Vec<u8>>,
+        Option<i64>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Option<i64>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Option<i64>,
+    );
+    // The group id is its conversation's (`stored_id`), as `voipc_members` names it
+    let rows: Vec<T> = on!(store, pool => {
+        sqlx::query_as(
+            "SELECT e.account, e.seat, m.account, k.n, k.kem, k.dh, k.made, k.sig, i.identity_key,
+             k.published FROM voipc_gk_eager e
+             LEFT JOIN voipc_members m ON m.conv = $2 AND m.account = e.account
+             LEFT JOIN voipc_gk_seatkeys k ON k.account = e.account AND k.current
+             LEFT JOIN voipc_identity i ON i.account = e.account
+             WHERE e.grp = $1 AND e.account > $3 ORDER BY e.account LIMIT $4",
+        )
+        .bind(grp)
+        .bind(grp)
+        .bind(after.map_or(&[][..], |a| &a[..]))
+        .bind(i64::from(limit))
+        .fetch_all(pool)
+        .await?
+    });
+    let mut out = Vec::with_capacity(rows.len());
+    let since = i64::try_from(since).unwrap_or(i64::MAX);
+    for (a, seat, member, n, kem, dh, made, sig, ik, published) in rows {
+        let (Ok(account), Ok(seat)) = (<[u8; 16]>::try_from(a.clone()), <[u8; 33]>::try_from(seat))
+        else {
+            continue;
+        };
+        let fresh = published.is_some_and(|p| p >= since);
+        let joiner = match (member.filter(|_| fresh), n, kem, dh, made, sig, ik) {
+            (Some(_), Some(n), Some(kem), Some(dh), Some(made), Some(sig), Some(ik)) => {
+                keyed((a, n, kem, dh, made, sig, ik)).map(|(a, ik, pair)| Joiner {
+                    seat: pair.keys.seat(MemberId::Account(a)),
+                    ik,
+                    keys: pair.keys,
+                    endorsement: pair.endorsement,
+                    returning: false,
+                })
+            }
+            _ => None,
+        };
+        out.push((db::EagerAsk { account, seat }, joiner));
+    }
+    Ok(out)
+}
+
+/// A stored group's account seats (records from 0x01 to 0x02) holding seed `s` with no seed
+/// welcome under it and no self-row of their account for it: their member secret under `s`
+/// is in their seat welcome alone, if anywhere, so each is owed a seed welcome (dive 3 P3).
+async fn owed_seats(store: &Db, grp: &str, gen: &[u8; 16], s: u32) -> Result<Vec<SeatRef>> {
+    let (lo, hi) = ([0x01u8; 1], [0x02u8; 1]);
+    let recs: Vec<Vec<u8>> = on!(store, pool => {
+        sqlx::query_scalar(
+            "SELECT t.seat FROM voipc_gk_seats t WHERE t.grp = $1 AND t.gen = $2 AND t.seed = $3
+             AND t.seat >= $4 AND t.seat < $5
+             AND NOT EXISTS (SELECT 1 FROM voipc_gk_welcomes w WHERE w.grp = t.grp AND w.gen = t.gen
+               AND w.seat = t.seat AND w.kind = 1 AND w.s = t.seed)
+             AND NOT EXISTS (SELECT 1 FROM voipc_gk_self x WHERE x.grp = t.grp AND x.gen = t.gen
+               AND x.seed = t.seed AND x.account = substr(t.seat, 2, 16)
+               AND x.tag_sk = substr(t.seat, 18, 8) AND x.tag_sx = substr(t.seat, 26, 8))",
+        )
+        .bind(grp)
+        .bind(&gen[..])
+        .bind(i64::from(s))
+        .bind(&lo[..])
+        .bind(&hi[..])
+        .fetch_all(pool)
+        .await?
+    });
+    Ok(recs
+        .into_iter()
+        .filter_map(|r| <[u8; 33]>::try_from(r).ok())
+        .filter_map(|r| seat_of(&r))
+        .collect())
+}
+
+/// Groups whose next head move answers with an error after the database applied it.
+#[cfg(test)]
+pub static LOSE_ANSWER: std::sync::LazyLock<Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(Default::default);
 
 async fn commit_db(d: &DbStore, g: &GroupState, t: &Taken, now: u64) -> Result<()> {
     let s = &d.db;
@@ -1041,6 +1624,15 @@ async fn commit_db(d: &DbStore, g: &GroupState, t: &Taken, now: u64) -> Result<(
         gated: h.gated,
     };
     let drops: Vec<u64> = t.commit.drops.clone();
+    // A start may carry the exit of a seat it seats again (its own volunteer's): memory
+    // removes before it seats, so that seat stays (review C-P3)
+    let removed: Vec<Vec<u8>> = a
+        .removed
+        .iter()
+        .filter(|r| !a.seated.iter().any(|(s, _)| s == *r))
+        .map(|s| seat_record(s).to_vec())
+        .collect();
+    let holders = new_holders(g, t, now);
     let moved = db::move_head(
         s,
         grp,
@@ -1053,10 +1645,20 @@ async fn commit_db(d: &DbStore, g: &GroupState, t: &Taken, now: u64) -> Result<(
             drops: &drops,
             retire_all: h.kind == Kind::Regenesis,
             exits_upto: upto,
+            removed: &removed,
             names: &names,
+            holders: &holders,
         },
     )
     .await?;
+    #[cfg(test)]
+    if LOSE_ANSWER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(grp)
+    {
+        return Err(anyhow::anyhow!("the answer to COMMIT was lost"));
+    }
     if moved != db::Moved::Done {
         return Err(Fail::Store(format!("{moved:?}")).into());
     }
@@ -1084,6 +1686,44 @@ async fn commit_db(d: &DbStore, g: &GroupState, t: &Taken, now: u64) -> Result<(
 
 // ── Keyholder entries (2i) ────────────────────────────────────────────────
 
+/// The entries a commit adds (a promotion's candidate, a Replace's new pair, a start's
+/// volunteer; a new start's whole set), each with its pair and, from the session that
+/// volunteered it, its rank and device, as `GroupState::apply` takes them: written with the
+/// head move (dive 4 F5), a removal marked on a row left from before cleared there.
+fn new_holders(g: &GroupState, t: &Taken, now: u64) -> Vec<db::Holder> {
+    let Some(set) = &t.applied.keyholders else {
+        return vec![];
+    };
+    // A new start's set is taken whole (`apply` clears what the relay held of the old one):
+    // an entry of both starts with no removal marked, as its memory does
+    let anew = t.applied.header.header().kind.starts_anew();
+    let d = &t.due.due;
+    let mut pairs: HashMap<[u8; 32], &Pair> =
+        g.vols.values().map(|v| (v.pair.kx(), &v.pair)).collect();
+    for c in d.candidate.iter().chain(d.volunteer.iter()) {
+        pairs.insert(c.pair.kx(), &c.pair);
+    }
+    if let Some(r) = &d.replace {
+        pairs.insert(r.pair.kx(), &r.pair);
+    }
+    set.iter()
+        .filter(|k| anew || !g.holders.set.iter().any(|o| o.kx == k.kx))
+        .filter_map(|k| {
+            let pair = pairs.get(&k.kx)?;
+            let vol = g.vols.values().find(|v| v.pair.kx() == k.kx);
+            Some(db::Holder {
+                kx: k.kx,
+                m: k.m.seat_id(),
+                device: vol.and_then(|v| g.devices.get(&v.sid).cloned()),
+                rank: vol.and_then(|v| v.rank(g.kind)).unwrap_or(u8::MAX),
+                last_online: now,
+                missed: db::Misses::default(),
+                pair: Some(gk::EndorsedPair::from(*pair)),
+            })
+        })
+        .collect()
+}
+
 /// A keyholder entry as the database keeps it, its pair in a column of its own.
 struct HolderRow {
     kx: [u8; 32],
@@ -1092,6 +1732,8 @@ struct HolderRow {
     last_online: u64,
     misses: db::Misses,
     pair: Option<Pair>,
+    /// Its removal is proposed outright (`Holders::forced`, 0014).
+    forced: bool,
 }
 
 async fn holder_rows(store: &Db, grp: &str) -> Result<Vec<HolderRow>> {
@@ -1103,15 +1745,16 @@ async fn holder_rows(store: &Db, grp: &str) -> Result<Vec<HolderRow>> {
         i64,
         Vec<u8>,
         Option<Vec<u8>>,
+        bool,
     );
     let rows: Vec<T> = on!(store, pool => {
-        sqlx::query_as("SELECT kx, m, device, rank, last_online, missed, pair FROM voipc_gk_holders WHERE grp = $1")
+        sqlx::query_as("SELECT kx, m, device, rank, last_online, missed, pair, forced FROM voipc_gk_holders WHERE grp = $1")
             .bind(grp)
             .fetch_all(pool)
             .await?
     });
     let mut out = vec![];
-    for (kx, m, device, rank, last_online, missed, pair) in rows {
+    for (kx, m, device, rank, last_online, missed, pair, forced) in rows {
         let Ok(kx) = <[u8; 32]>::try_from(kx) else {
             continue;
         };
@@ -1127,6 +1770,7 @@ async fn holder_rows(store: &Db, grp: &str) -> Result<Vec<HolderRow>> {
             last_online: u64::try_from(last_online).unwrap_or(0),
             misses,
             pair,
+            forced,
         });
     }
     Ok(out)
@@ -1140,12 +1784,17 @@ async fn put_holders(store: &Db, g: &GroupState, now: u64) -> Result<()> {
         .iter()
         .map(|v| v.pair.kx())
         .collect();
+    // A pair the relay lost from memory is not written over: an entry's KX is its pair's. Nor
+    // is a removal marked (a device removed, `force_device_holders`) that this memory has not
+    // heard of yet: a mark goes only with its row (the entry leaves the set) or when a head
+    // move takes the entry in again (`move_head`)
     const Q: &str =
-        "INSERT INTO voipc_gk_holders (grp, kx, m, device, rank, last_online, missed, pair)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        "INSERT INTO voipc_gk_holders (grp, kx, m, device, rank, last_online, missed, pair, forced)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
          ON CONFLICT (grp, kx) DO UPDATE SET m = excluded.m, device = excluded.device,
          rank = excluded.rank, last_online = excluded.last_online, missed = excluded.missed,
-         pair = excluded.pair";
+         pair = COALESCE(excluded.pair, voipc_gk_holders.pair),
+         forced = (voipc_gk_holders.forced OR excluded.forced)";
     for k in &g.holders.set {
         let st = g.holders.stats.get(&k.kx);
         let misses = db::Misses {
@@ -1170,6 +1819,7 @@ async fn put_holders(store: &Db, g: &GroupState, now: u64) -> Result<()> {
         };
         let rank = g.holders.rank.get(&k.kx).copied().unwrap_or(u8::MAX);
         let device = g.holders.device.get(&k.kx).cloned();
+        let forced = g.holders.forced.contains(&HolderRef::of(k));
         on!(store, pool => {
             sqlx::query(Q)
                 .bind(grp)
@@ -1180,6 +1830,7 @@ async fn put_holders(store: &Db, g: &GroupState, now: u64) -> Result<()> {
                 .bind(i64::try_from(last)?)
                 .bind(missed.as_slice())
                 .bind(pair.as_deref())
+                .bind(forced)
                 .execute(pool)
                 .await?;
         });
@@ -1448,7 +2099,7 @@ async fn member_bases(
     grp: &str,
     gen: &[u8; 16],
     m: &MemberId,
-) -> Result<HashMap<(u64, u64), (SeatRef, Base)>> {
+) -> Result<HashMap<(u64, u64), (SeatRef, Base, Option<Base>)>> {
     type T = (i64, i64, Vec<u8>, i64, Vec<u8>, Vec<u8>);
     let id = m.seat_id();
     let lo = [&id[..], &[0u8; 16][..]].concat();
@@ -1481,7 +2132,7 @@ async fn member_bases(
         .fetch_all(pool)
         .await?
     });
-    let mut out = HashMap::new();
+    let mut out: HashMap<(u64, u64), (SeatRef, Base, Option<Base>)> = HashMap::new();
     for (welcome, list) in [(true, welcomes), (false, rows)] {
         for (b, v, seat, s, mk, bytes) in list {
             let (Ok(rec), Ok(mk), Ok(s)) = (
@@ -1494,8 +2145,20 @@ async fn member_bases(
             let (Some(seat), Some(from)) = (seat_of(&rec), holder_of(&mk)) else {
                 continue;
             };
-            out.entry((b as u64, v as u64))
-                .or_insert((seat, (s, from, welcome, bytes)));
+            let base = (s, from, welcome, bytes);
+            match out.entry((b as u64, v as u64)) {
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert((seat, base, None));
+                }
+                // The row a Join stores beside its welcome (choice 24): `past` hands it once
+                // the account holds the seed's member secret in a self-row
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    let (held, first, row) = e.get_mut();
+                    if !welcome && first.2 && row.is_none() && *held == seat {
+                        *row = Some(base);
+                    }
+                }
+            }
         }
     }
     Ok(out)
@@ -1562,9 +2225,21 @@ pub async fn past(
         return Ok(None);
     };
     let l = &leaves[i];
-    let Some((seat, base)) = bases.get(&(l.leaf.b, l.base_v)) else {
+    let Some((seat, base, beside)) = bases.get(&(l.leaf.b, l.base_v)) else {
         return Ok(None);
     };
+    // A seat welcome opens only with the seat keys it went to, which a rotation deletes; the
+    // row beside it opens with the member secret, which the account's self-row keeps across
+    // rotations. So the row goes where the account holds that self-row (dive 3 F1)
+    let mut base = base.clone();
+    if let (Some(row), Some(a)) = (beside, seat.m.account()) {
+        if !own_rows(store, grp, &a, &at.gen, seat, row.0)
+            .await?
+            .is_empty()
+        {
+            base = row.clone();
+        }
+    }
     let Some(seal) = db::seal(store, grp, &at.gen, at.epoch, l.leaf.b, l.leaf.v).await? else {
         return Ok(None);
     };
@@ -1581,7 +2256,7 @@ pub async fn past(
         e = prev.epoch_made;
     }
     ratchets.reverse();
-    let (s, from, welcome, bytes) = base.clone();
+    let (s, from, welcome, bytes) = base;
     let keying = SeatKeying {
         b: l.leaf.b,
         base_v: l.base_v,
@@ -1899,23 +2574,36 @@ pub async fn sweep_material_from(
           LIMIT $2)",
         grp
     );
+    // A seed welcome under a seed below the floor stays while an account seat (records from
+    // $4 to $5) has rows under that seed in kept epochs and the account holds no self-row
+    // for it: it is the only place that seat's member secret is (dive 3 F3)
     let q = format!(
         "DELETE FROM voipc_gk_welcomes WHERE (grp, gen, seat, kind, s) IN
          (SELECT w.grp, w.gen, w.seat, w.kind, w.s FROM voipc_gk_welcomes w WHERE w.grp = $1
           AND ((w.kind = 0 AND NOT EXISTS (SELECT 1 FROM voipc_gk_lists l
                 WHERE l.grp = w.grp AND l.gen = w.gen AND l.b = w.b AND l.v = w.v))
-            OR (w.kind = 1 AND (w.gen <> {HEAD_GEN} OR (w.gen = $2 AND w.s < $3))))
+            OR (w.kind = 1 AND (w.gen <> {HEAD_GEN} OR (w.gen = $2 AND w.s < $3
+                AND NOT (w.seat >= $4 AND w.seat < $5
+                  AND EXISTS (SELECT 1 FROM voipc_gk_rows r
+                    WHERE r.grp = w.grp AND r.gen = w.gen AND r.seat = w.seat AND r.s = w.s)
+                  AND NOT EXISTS (SELECT 1 FROM voipc_gk_self x
+                    WHERE x.grp = w.grp AND x.gen = w.gen AND x.seed = w.s
+                    AND x.account = substr(w.seat, 2, 16) AND x.tag_sk = substr(w.seat, 18, 8)
+                    AND x.tag_sx = substr(w.seat, 26, 8)))))))
           AND NOT EXISTS (SELECT 1 FROM voipc_gk_pending p WHERE p.grp = w.grp AND p.commit_id = w.commit_id)
-          LIMIT $4)"
+          LIMIT $6)"
     );
+    let (accounts_lo, accounts_hi) = ([0x01u8; 1], [0x02u8; 1]);
     n += batched!(
         store,
         sqlx::AssertSqlSafe(q.as_str()),
         grp,
         gen.as_slice(),
-        i64::from(floor)
+        i64::from(floor),
+        &accounts_lo[..],
+        &accounts_hi[..]
     );
-    n += sweep_headers(store, grp).await?;
+    n += sweep_headers(store, grp, cut).await?;
     n += sweep_keyrings(store, grp, &gen, row.head.epoch).await?;
     n += sweep_stale(store, grp).await?;
     Ok(n)
@@ -1972,7 +2660,7 @@ pub(crate) async fn sweep_stale(store: &Db, grp: &str) -> Result<u64> {
 /// seat a Join added is answered there, `past`); of an older generation, while kept chains
 /// reference its epochs, those openings and last Joins, its keyholder headers and Regenesis
 /// parents (C4).
-async fn sweep_headers(store: &Db, grp: &str) -> Result<u64> {
+async fn sweep_headers(store: &Db, grp: &str, cut: i64) -> Result<u64> {
     type M = (Vec<u8>, Vec<u8>, i64, i64, i16, i64);
     let metas: Vec<M> = on!(store, pool => {
         sqlx::query_as("SELECT d, gen, epoch, j, kind, time FROM voipc_gk_headers WHERE grp = $1")
@@ -2015,9 +2703,14 @@ async fn sweep_headers(store: &Db, grp: &str) -> Result<u64> {
         let kh = kind.is_some_and(|k| k.sets_keyholders());
         let opening_ref = (*j == 0 || last_j.get(&(gen, *epoch)) == Some(j))
             && refs.contains(&(gen.clone(), *epoch));
+        // An epoch whose material is still kept (`cut`, HOLD_MS after the next opening) keeps
+        // its opening and last Join too: a kept chain filed late under it reads by them (dive
+        // 3 F5)
+        let held = *epoch >= cut && (*j == 0 || last_j.get(&(gen, *epoch)) == Some(j));
         let kept = if *gen == head_gen {
             last64.contains(&(*epoch, *j))
                 || *epoch == i64::from(row.head.epoch)
+                || held
                 || kh
                 || *time == row.head.rolls.raised as i64
                 || opening_ref

@@ -94,7 +94,9 @@ WantedBy=multi-user.target
   open.
 - **Certificates:** `LoadCredential` hands the relay its Let's Encrypt certificate and key
   without opening `/etc/letsencrypt` to it.
-- **Stopping:** the relay stops cleanly on SIGTERM, which is what `systemctl stop` sends.
+- **Stopping:** the relay stops cleanly on SIGTERM, which is what `systemctl stop` sends. It tells the clients, then
+  gives the group key up to 3 s to write what its channels still had queued (an exit, a keyholder removal, a seat asked);
+  the log names a channel that took longer.
 
 ## 4. TLS
 
@@ -387,7 +389,11 @@ of them:
   without edges there.
 - A device remembered again (a password or provider sign-in on a device that already was) now drops its old device
   key at once; on 1.12 those stayed until the 90-day sweep.
-- **A migration:** `0013_group_keys.sql` adds the group key's tables. Going back takes the old binary and the backup.
+- **Two migrations:** `0013_group_keys.sql` adds the group key's tables, and `0014_group_keys_restart.sql` (after
+  rc.1) what a channel's keys held in memory alone until then: a keyholder's removal proposed, the seats asked for
+  accounts that keep the channel's history, how far a new start had asked them, the exits asked of members who left,
+  were kicked or put out, and that a channel's group came back to its stored id (a new start is due). Going back
+  takes the old binary and the backup.
 - **The group key is on by default** (`group_key`, §13; [GROUP-KEY.md](GROUP-KEY.md)). At the first start no channel has
   keys yet, and each makes them at its first use: the first member who needs one asks, a volunteer's app starts the
   channel's keys, and members are seated as they read or write. An account that keeps a channel's history is seated for
@@ -722,7 +728,9 @@ late (no new epoch for 70 minutes), missed deadlines, and a member reporting the
 without `db new-incarnation`, §7). On a relay with accounts, a text channel that keeps its history (not an anonymous one or one
 that hides its members) waits, when its keyholders are all away, before a volunteer starts its keys anew: not at all
 where every keyholder was a browser or a guest (a volunteer starts anew as soon as none is online and someone waits to be
-seated or to leave), unless a new start began that set within the hour, else an hour. Other text channels, voice rooms,
+seated or to leave), unless a new start began that set within the hour, else an hour. That hour counts the time its
+keyholders were away before a restart too, but not the relay's own downtime: after a start it ends 10 minutes later at the
+earliest, so the keyholders online when the relay stopped can reconnect first. Other text channels, voice rooms,
 and every channel on a relay without accounts start anew at once. A channel whose keyholders changed 2048 times starts
 anew too, once, so that every member can still follow its keys.
 
@@ -1157,7 +1165,8 @@ release_candidates = false # true: also take release candidates (rc.N), and thei
    is yours to back up). After a move from Discord each of those holds the archive too, so the
    disk needs room for one more, and an update stops if it cannot make the copy.
 5. It keeps the running binary as `voipc-server.previous`, puts the new one in its place,
-   tells every client "updating to VoIPC X", and restarts into it in the same process. Calls
+   tells every client "updating to VoIPC X", gives the group key up to 3 s to write what its
+   channels had queued (§3, "Stopping"), and restarts into it in the same process. Calls
    drop; the apps reconnect within seconds.
 
 A release that changes the protocol is taken like any other: apps older than the new protocol

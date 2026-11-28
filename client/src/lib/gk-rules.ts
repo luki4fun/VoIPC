@@ -170,7 +170,9 @@ const WARNINGS: Record<string, (place: string, n: number) => string> = {
   floor_ahead: (p) => `The server's keys for ${p} are older than what this device saw.`,
   entry_swapped: (p) => `Your key-holding entry in ${p} was replaced by a device that is not this one.`,
   leaver_may_hear: () => "Someone who left may still hear this room.",
-  gated_opened: (p) => `${p} was closed to listed readers and is now open.`,
+  gated_opened: (p) => `${p} was open to readers who are not listed: people may have joined whose names you were not shown.`,
+  clock_slow: (p, n) => `This device's clock is ${n} min behind the server's, so ${p}'s keys cannot be checked. Set the clock right to read and write here.`,
+  clock_fast: (p, n) => `This device's clock is ${n} min ahead of the server's, so ${p}'s keys count as too old. Set the clock right to write here.`,
 };
 
 /**

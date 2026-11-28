@@ -208,7 +208,9 @@
     window.addEventListener("keyup", keyupHandler);
     // In a browser the window keys are the only keys: switch away while
     // holding push-to-talk and the release goes to another window, leaving
-    // the mic open. The desktop app's OS-wide hotkeys see that release.
+    // the mic open. The desktop app lets go in its backend when the window
+    // loses focus, unless its OS-wide hook saw the press and so sees the
+    // release (global_keys.rs `window_lost_focus`, dive 6 F2).
     if (__WEB__) window.addEventListener("blur", releaseOnBlur);
 
     // Tray menu and global hotkeys request toggles via these events —

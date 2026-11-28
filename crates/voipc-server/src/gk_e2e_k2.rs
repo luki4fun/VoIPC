@@ -1060,3 +1060,205 @@ async fn e2e_k2_a_session_from_before_an_identity_reset_volunteers_no_more() {
     });
     assert!(refused, "and told so");
 }
+
+// ── Dive 4 round 2, item 1 (d4-r2-plan.md) ────────────────────────────────
+
+/// Runs `q` (no binds) on the scratch database.
+async fn exec_sql(db: &Store, q: &str) {
+    let q = sqlx::AssertSqlSafe(q.to_string());
+    match db {
+        Store::Lite(b) => {
+            sqlx::query(q).execute(&b.0).await.unwrap();
+        }
+        Store::Pg(b) => {
+            sqlx::query(q).execute(&b.0).await.unwrap();
+        }
+    }
+}
+
+/// The accounts path of a kick or a text channel left (`out_of_log` -> `leave_log`): the exit
+/// of the account's seats in the conversation's group is asked in the store before anything
+/// else, for a log member (its membership row goes) and for an account that follows the
+/// channel without keeping its log (no row: its seat is the follow's alone). Here the group's
+/// actor cannot load yet (a table out of reach), as one that is loading or stopped by a crash:
+/// both asks are kept, with the cause. Once the group takes them and writes what they entered,
+/// they go.
+#[tokio::test]
+async fn k2_d4r2_a_kick_asks_the_exit_ahead_for_a_member_and_a_follow_only_account() {
+    let _ = tracing_on();
+    let (db, file) = scratch_db().await;
+    let inc = db::gk_start(&db, true).await.unwrap().unwrap();
+    let cfg = crate::config::AccountsConfig {
+        mode: crate::config::AccountsMode::Optional,
+        ..Default::default()
+    };
+    let relay = crate::accounts::Relay::open_with(&cfg, db.clone(), &[9u8; 32])
+        .await
+        .unwrap();
+    let mut state = ServerState::new(
+        &crate::config::ServerConfig {
+            group_key: true,
+            ..Default::default()
+        },
+        crate::settings::ServerSettings::default(),
+        vec![],
+        "test-admin-token".into(),
+    );
+    state.accounts = Some(Arc::new(relay));
+    let state = Arc::new(state);
+    state.gk.attach(db.clone(), inc);
+    state.accounts.as_ref().unwrap().bind_gk(&state.gk);
+    crate::state::test_support::put_in_channel(&state, CHAN, &[]).await;
+    {
+        let mut channels = state.channels.write().await;
+        let c = channels.get_mut(&CHAN).unwrap();
+        c.info.text = true;
+        c.info.log = CONV.into();
+        c.log_conv = CONV.into();
+    }
+    let mut sids = vec![];
+    for name in ["kim", "lou"] {
+        let id = AccountId::new();
+        state
+            .accounts
+            .as_ref()
+            .unwrap()
+            .store()
+            .create_user(
+                &NewUser {
+                    id,
+                    username: name.into(),
+                    display_name: name.into(),
+                    email_pending: None,
+                    password_hash: None,
+                    created_at: l4f_accounts::util::now(),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let (uid, sid) = crate::state::test_support::add_user(&state, name);
+        state.sessions.get_mut(&sid).unwrap().account = Some(account_session(id.0));
+        crate::state::test_support::put_in_channel(&state, CHAN, &[(uid, sid)]).await;
+        sids.push((id.0, sid));
+    }
+    let (kim, lou) = (sids[0], sids[1]);
+    // kim keeps the log; lou only follows the channel
+    let hex: String = kim.0.iter().map(|x| format!("{x:02x}")).collect();
+    let lit = match &db {
+        Store::Lite(_) => format!("x'{hex}'"),
+        Store::Pg(_) => format!("'\\x{hex}'::bytea"),
+    };
+    exec_sql(
+        &db,
+        &format!(
+            "INSERT INTO voipc_members (conv, account, joined_at) VALUES ('{CONV}', {lit}, 0)"
+        ),
+    )
+    .await;
+    exec_sql(
+        &db,
+        "ALTER TABLE voipc_gk_groups RENAME TO voipc_gk_groups_away",
+    )
+    .await;
+    crate::accounts::out_of_log(&state, CHAN, kim.1).await;
+    crate::accounts::out_of_log(&state, CHAN, lou.1).await;
+    let mut asked: Vec<([u8; 16], u8)> = db::exit_asks(&db, CONV)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|x| (x.account, x.cause))
+        .collect();
+    asked.sort_unstable();
+    let mut want = vec![
+        (kim.0, crate::gk::group::cause::LEAVE),
+        (lou.0, crate::gk::group::cause::LEAVE),
+    ];
+    want.sort_unstable();
+    let q = format!("SELECT COUNT(*) FROM voipc_members WHERE conv = '{CONV}' AND account = {lit}");
+    let q = sqlx::AssertSqlSafe(q);
+    let n: i64 = match &db {
+        Store::Lite(b) => sqlx::query_scalar(q).fetch_one(&b.0).await.unwrap(),
+        Store::Pg(b) => sqlx::query_scalar(q).fetch_one(&b.0).await.unwrap(),
+    };
+    let member_gone = n == 0;
+    exec_sql(
+        &db,
+        "ALTER TABLE voipc_gk_groups_away RENAME TO voipc_gk_groups",
+    )
+    .await;
+    let mut left = vec![];
+    for _ in 0..200 {
+        left = db::exit_asks(&db, CONV).await.unwrap();
+        if left.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    state.gk.on_purge(CONV);
+    drop_db(&file);
+    assert!(
+        asked == want && member_gone && left.is_empty(),
+        "with the group not yet loaded the asks kept: {asked:?} (want {want:?}); kim's \
+         membership gone: {member_gone}; once the group took them, asks left: {left:?}"
+    );
+}
+
+/// Dive 4 round 2 review R2-1: an account's own `LogLeave` ("Stop keeping this channel") took
+/// its membership row out before it asked its seats' exit, so a stop between the two left
+/// neither: the next start kept the seat, keyed at every opening until its 90-day expiry. The
+/// exit is asked first now, as every other way out of a log asks it. A probe in the database
+/// reads, as the membership row goes, whether the ask is there: what a stop at that point
+/// leaves for the next start. And a `LogLeave` that finds no membership row (the old order cut
+/// off by a stop, asked again) still exits a seat no session here holds, and settles its ask.
+#[tokio::test]
+async fn e2e_k2_d4r2_a_log_leave_asks_the_exit_before_its_membership_goes() {
+    let mut w = World::new().await;
+    let crowd = w.crowd(2).await;
+    assert!(
+        w.crowd_seated(&crowd).await,
+        "the crowd is seated by its LogJoin"
+    );
+    let probe: &[&str] = match &w.db {
+        Store::Lite(_) => &[
+            "CREATE TABLE d4r2_probe (n BIGINT)",
+            "CREATE TRIGGER d4r2_probe AFTER DELETE ON voipc_members BEGIN
+               INSERT INTO d4r2_probe SELECT COUNT(*) FROM voipc_gk_exit_asks WHERE account = OLD.account;
+             END",
+        ],
+        Store::Pg(_) => &[
+            "CREATE TABLE d4r2_probe (n BIGINT)",
+            "CREATE FUNCTION d4r2_probe() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+               INSERT INTO d4r2_probe SELECT COUNT(*) FROM voipc_gk_exit_asks WHERE account = OLD.account;
+               RETURN OLD;
+             END $$",
+            "CREATE TRIGGER d4r2_probe AFTER DELETE ON voipc_members FOR EACH ROW EXECUTE FUNCTION d4r2_probe()",
+        ],
+    };
+    for q in probe {
+        exec_sql(&w.db, q).await;
+    }
+    w.leave_log(crowd[0].1).await;
+    let asked = crate::accounts::raw(w.relay(), "SELECT MAX(n) FROM d4r2_probe")
+        .await
+        .unwrap();
+    let out = unseated(&mut w, &crowd[0].0).await;
+    // The other's membership row gone with no ask, as the old order left it after a stop
+    exec_sql(&w.db, "DELETE FROM voipc_members").await;
+    w.leave_log(crowd[1].1).await;
+    let out_again = unseated(&mut w, &crowd[1].0).await;
+    let mut left = vec![];
+    for _ in 0..100 {
+        left = db::exit_asks(&w.db, CONV).await.unwrap();
+        if left.is_empty() {
+            break;
+        }
+        w.until(50, |_| false).await;
+    }
+    assert!(
+        asked == 1 && out && out_again && left.is_empty(),
+        "exit asks as the membership row went: {asked}; the leaver's seat exits: {out}; with \
+         no membership row left, a LogLeave still exits the seat: {out_again}; asks left: \
+         {left:?}"
+    );
+}

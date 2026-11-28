@@ -128,14 +128,21 @@ test("WebTransport: frames acked late one after another pace what follows; a big
   try {
     const { link } = await open({ WebTransport: FakeWebTransport, search: "", tcp: false });
     link.uplinkPong(1, 40); // the keepalive, nothing shared yet: the link's least
-    // Frames of 12 KB at 30 fps, each acked 200 ms after it went: a queue
-    for (let i = 0; i < 20 && link.uplinkQueuedAt() === 0; i++) {
+    // Frames of 12 KB at 30 fps into a link 40 ms away that carries 2.4 Mbit/s: each acked a
+    // round trip after the link is done with it and every frame before it, 40 ms each. A queue
+    // grows: each ack later than the one before (one that is late by the same each time is a
+    // longer path, no queue of ours)
+    let linkFree = clock;
+    const due: number[] = [];
+    let acked = 0;
+    for (let i = 0; i < 40 && link.uplinkQueuedAt() === 0; i++) {
       assert.ok(link.sendVideoFrame(frameOf(10, i), i === 0));
       for (let k = 0; k < 3; k++) await settle();
+      linkFree = Math.max(linkFree, clock) + 40;
+      due.push(linkFree + 40);
       clock += 33;
-      const due = i - 6; // the frame sent 200 ms ago
-      if (due >= 0) {
-        streams.acks[due]();
+      while (acked < due.length && due[acked] <= clock) {
+        streams.acks[acked++]();
         for (let k = 0; k < 3; k++) await settle();
       }
     }

@@ -12,6 +12,7 @@
 //! Every rule a header must pass is C1's (`group_key::rules`); none is re-implemented here.
 //! Times: every `now` here is unix milliseconds; headers carry seconds.
 
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::task::{Context, Poll, Waker};
@@ -181,6 +182,102 @@ impl SeenBook {
         self.0.insert(account, merged);
         true
     }
+
+    /// Every row of `other` raised into this one, as `raise` takes each (`higher_counter`).
+    /// Whether any moved.
+    pub fn merge(&mut self, other: &SeenBook) -> bool {
+        let mut moved = false;
+        for (account, c) in &other.0 {
+            moved |= self.raise(*account, c.seen(), c.rotation);
+        }
+        moved
+    }
+
+    /// Once it holds more than `most + slack` accounts, back to `most`: those whose counter
+    /// is oldest (`made`) go, as on the vault's counter pages (`sync::gk_floors`). Whether
+    /// any went. The slack spares a full book a pass over every row at each new account.
+    pub fn bound(&mut self, most: usize, slack: usize) -> bool {
+        let over = self.0.len().saturating_sub(most);
+        if over <= slack {
+            return false;
+        }
+        let mut ages: Vec<(u64, [u8; 16])> = self.0.iter().map(|(a, c)| (c.made, *a)).collect();
+        ages.select_nth_unstable(over - 1);
+        for (_, account) in &ages[..over] {
+            self.0.remove(account);
+        }
+        true
+    }
+}
+
+/// At most this many accounts in `LocalGk::mirror`: about what the vault's 32 counter pages
+/// hold (`sync::gk_floors::COUNTER_PAGES`, rows of 25 to 40 bytes on pages of 47 KiB).
+const MIRROR_MOST: usize = 32 * 1024;
+
+/// A signed-in account's book (`AccountSync`) as `GroupKeying` checks against it on a
+/// device that keeps `LocalGk` (dive 1 F1): every counter the book answers and every one
+/// raised in it is copied into `mirror`, and `seen` answers the higher of the two. The
+/// book's counters live only in the vault's pages, and a relay that withholds them would
+/// otherwise take with them every counter this device met, and rule 8 with them, in folds,
+/// keyholder entries and a keyholder's checks alike. Of one `n` the earlier `made` stands, as
+/// `higher_counter` keeps it for two pair rows: a book row the relay let start afresh (the
+/// pages withheld, the row raised again from a new pair) must not move a counter this device
+/// met (review P1).
+struct Mirrored<'a> {
+    book: &'a mut dyn GkPins,
+    /// `seen` takes `&self`, and keeps what the book answered.
+    mirror: RefCell<SeenBook>,
+    moved: Cell<bool>,
+}
+
+impl Mirrored<'_> {
+    fn keep(&self, account: [u8; 16], seen: Seen, rotation: bool) {
+        if self.mirror.borrow_mut().raise(account, seen, rotation) {
+            self.moved.set(true);
+        }
+    }
+}
+
+impl GkPins for Mirrored<'_> {
+    fn ready(&self) -> bool {
+        self.book.ready()
+    }
+
+    fn pin(&self, account: &[u8; 16]) -> Option<[u8; 32]> {
+        self.book.pin(account)
+    }
+
+    fn pin_then(&self, account: &[u8; 16], time: u64) -> PinThen {
+        self.book.pin_then(account, time)
+    }
+
+    fn seen(&self, account: &[u8; 16]) -> Option<Seen> {
+        let book = self.book.seen(account);
+        // What the book answered, whether it was raised here or by another device of the
+        // account; a rotation's `made` is not told apart in an answer
+        if let Some(s) = book {
+            self.keep(*account, s, false);
+        }
+        let mine = self.mirror.borrow().seen(account);
+        match (book, mine) {
+            (Some(b), Some(m)) if m.n > b.n => Some(m),
+            (Some(b), Some(m)) if m.n == b.n => Some(Seen {
+                n: b.n,
+                made: b.made.min(m.made),
+            }),
+            (Some(b), _) => Some(b),
+            (None, m) => m,
+        }
+    }
+
+    fn pin_new(&mut self, account: [u8; 16], ik: [u8; 32], now: u64) {
+        self.book.pin_new(account, ik, now);
+    }
+
+    fn raise(&mut self, account: [u8; 16], seen: Seen, rotation: bool) {
+        self.book.raise(account, seen, rotation);
+        self.keep(account, seen, rotation);
+    }
 }
 
 /// `GkPins` for a guest, or a relay without accounts: pins taken this connection, each from
@@ -291,6 +388,24 @@ pub struct LocalGk {
     pub counters: SeenBook,
     /// The keyholder's own (C3c).
     pub holder: HolderKeep,
+    /// The group id each text channel was last followed under, where one was stored (a
+    /// relay that gives a channel another id gets a first generation told as made anew,
+    /// dive 1 F6).
+    pub channels: BTreeMap<u32, String>,
+    /// A signed-in account's: the highest counters this device raised in its book, or read
+    /// from it, kept here as well as in the vault's pages (`Mirrored`, dive 1 F1). Bounded
+    /// as those pages are (`MIRROR_MOST`). A guest's are `counters`, the host's own book.
+    pub mirror: SeenBook,
+}
+
+impl LocalGk {
+    /// Counters this device kept of the account apart from this `LocalGk` (the browser's,
+    /// past a reload) into `mirror`, the higher of each standing, and bounded as it is
+    /// (`MIRROR_MOST`). Whether it moved.
+    pub fn mirror_in(&mut self, kept: &SeenBook) -> bool {
+        let moved = self.mirror.merge(kept);
+        self.mirror.bound(MIRROR_MOST, MIRROR_MOST / 16) || moved
+    }
 }
 
 /// One group's floor as this device keeps it.
@@ -396,6 +511,10 @@ pub enum Warn {
     EntrySwapped,
     LeaverMayHear,
     GatedOpened,
+    /// This device's clock is behind the relay's by more than `CLOCK_SLACK` (`n`: minutes).
+    ClockSlow,
+    /// Ahead of it (`n`: minutes).
+    ClockFast,
 }
 
 impl Warn {
@@ -407,6 +526,8 @@ impl Warn {
             Warn::EntrySwapped => "entry_swapped",
             Warn::LeaverMayHear => "leaver_may_hear",
             Warn::GatedOpened => "gated_opened",
+            Warn::ClockSlow => "clock_slow",
+            Warn::ClockFast => "clock_fast",
         }
     }
 }
@@ -611,6 +732,10 @@ pub struct GroupKeying {
     voice: voice::Voice,
     /// The identity key each connection writer (`Conn(u)`) first signed with (§5.8).
     tofu: reader::Tofu,
+    /// The relay's clock less this device's at `start`, seconds.
+    skew: i64,
+    /// Channels told this device's clock is off (`clock_note`).
+    clock_told: std::collections::HashSet<u32>,
 }
 
 impl GroupKeying {
@@ -620,6 +745,8 @@ impl GroupKeying {
     /// groups' too: `local()` hands them to the next connection to the same relay.
     pub fn start(&mut self, s: GkStart) -> GkOut {
         let mut out = GkOut::default();
+        self.skew = s.relay_clock as i64 - (crate::time::now_millis() / 1000) as i64;
+        self.clock_told.clear();
         let mut local = s.local.unwrap_or_default();
         let run = voipc_protocol::conv::hex(&s.run);
         let before = local.floors.len();
@@ -678,6 +805,18 @@ impl GroupKeying {
             m.t = t;
             return out;
         }
+        // The id this channel was followed under before, this run or (kept locally) earlier.
+        // A move to or from a stored id is a new start the user is told of; a memory id's
+        // run changing is a relay start, which starts those anew by design
+        let before = self.channels.get(&t.channel_id).cloned().or_else(|| {
+            self.local
+                .as_ref()
+                .and_then(|l| l.channels.get(&t.channel_id).cloned())
+        });
+        let moved = t.kind == GroupKind::Text
+            && before.as_ref().is_some_and(|b| {
+                *b != t.group && (b.starts_with("c:") || t.group.starts_with("c:"))
+            });
         let mut out = self.untrack(t.channel_id);
         let local = self
             .local
@@ -685,8 +824,12 @@ impl GroupKeying {
             .and_then(|l| l.floors.get(&t.group))
             .cloned();
         let group = t.group.clone();
+        // `local.channels` takes the new id only once its group holds a floor (`local_floor`):
+        // until then a reconnect still finds the old id and tells the move (review A-P1)
         self.channels.insert(t.channel_id, group.clone());
+        let fresh = local.is_none();
         let mut m = Member::new(t, local);
+        m.group_moved = moved && fresh;
         match vault {
             VaultFloor::Pending => m.vault_pending = true,
             VaultFloor::None => {}
@@ -729,7 +872,82 @@ impl GroupKeying {
     }
 
     /// A frame from the relay.
-    pub fn frame(&mut self, st: &mut SignalStores, msg: &ServerMessage, mut c: GkCtx) -> GkOut {
+    pub fn frame(&mut self, st: &mut SignalStores, msg: &ServerMessage, c: GkCtx) -> GkOut {
+        let mut out = self.mirrored(c, |k, c| k.frame_in(st, msg, c));
+        self.clock_note(&mut out);
+        out
+    }
+
+    /// `f` with a signed-in account's book seen through this device's mirror of its counters
+    /// (`Mirrored`, dive 1 F1). Every call that checks against the book comes here. What
+    /// moved the mirror is saved with the floors (`local_dirty`).
+    fn mirrored(&mut self, c: GkCtx, f: impl FnOnce(&mut Self, GkCtx) -> GkOut) -> GkOut {
+        let signed_in = self.who.as_ref().is_some_and(|w| w.account.is_some());
+        let Some(local) = self.local.as_mut().filter(|_| signed_in) else {
+            return f(self, c);
+        };
+        let mut book = Mirrored {
+            book: c.pins,
+            mirror: RefCell::new(std::mem::take(&mut local.mirror)),
+            moved: Cell::new(false),
+        };
+        let mut out = f(
+            self,
+            GkCtx {
+                pins: &mut book,
+                now: c.now,
+            },
+        );
+        let mut mirror = book.mirror.into_inner();
+        let pruned = mirror.bound(MIRROR_MOST, MIRROR_MOST / 16);
+        out.local_dirty |= book.moved.get() || pruned;
+        if let Some(local) = self.local.as_mut() {
+            local.mirror = mirror;
+        }
+        out
+    }
+
+    /// Where keys come late on this device because its clock is more than `CLOCK_SLACK` off
+    /// the relay's, the channel is told so, once a connection: rule 7 refuses headers dated
+    /// ahead of a slow clock, and a fast one counts every epoch past the writers' 70 min,
+    /// and "keys late" alone points at the keyholders (dive 2 F5).
+    fn clock_note(&mut self, out: &mut GkOut) {
+        let off = self.skew.unsigned_abs();
+        if off <= CLOCK_SLACK {
+            return;
+        }
+        let late: Vec<u32> = out
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                GkEvent::State {
+                    channel_id,
+                    state: GkState::Late { .. },
+                }
+                | GkEvent::PostDropped {
+                    channel_id,
+                    why: Dropped::Late,
+                } => Some(*channel_id),
+                _ => None,
+            })
+            .collect();
+        for channel_id in late {
+            if self.clock_told.insert(channel_id) {
+                out.events.push(GkEvent::Warning {
+                    channel_id,
+                    // The relay ahead of this device: this device's clock is slow
+                    kind: if self.skew > 0 {
+                        Warn::ClockSlow
+                    } else {
+                        Warn::ClockFast
+                    },
+                    n: u32::try_from(off / 60).unwrap_or(u32::MAX),
+                });
+            }
+        }
+    }
+
+    fn frame_in(&mut self, st: &mut SignalStores, msg: &ServerMessage, mut c: GkCtx) -> GkOut {
         let mut out = GkOut::default();
         let Some(who) = self.who.as_mut() else {
             return out;
@@ -843,11 +1061,27 @@ impl GroupKeying {
         };
         if let Some(f) = m.local_floor() {
             local.floors.insert(group.to_string(), f);
+            if m.t.kind == GroupKind::Text && group.starts_with("c:") {
+                local.channels.insert(m.t.channel_id, group.to_string());
+            }
         }
     }
 
     /// A post of ours to `channel_id` (`post_id`: the app's, for `released`).
     pub fn post(
+        &mut self,
+        st: &mut SignalStores,
+        channel_id: u32,
+        post_id: [u8; 16],
+        envelope: &[u8],
+        c: GkCtx,
+    ) -> GkOut {
+        let mut out = self.mirrored(c, |k, c| k.post_in(st, channel_id, post_id, envelope, c));
+        self.clock_note(&mut out);
+        out
+    }
+
+    fn post_in(
         &mut self,
         st: &mut SignalStores,
         channel_id: u32,
@@ -869,7 +1103,13 @@ impl GroupKeying {
 
     /// Every second or so while connected: what waits goes again, what waited too long is
     /// given up.
-    pub fn tick(&mut self, st: &mut SignalStores, mut c: GkCtx) -> GkOut {
+    pub fn tick(&mut self, st: &mut SignalStores, c: GkCtx) -> GkOut {
+        let mut out = self.mirrored(c, |k, c| k.tick_in(st, c));
+        self.clock_note(&mut out);
+        out
+    }
+
+    fn tick_in(&mut self, st: &mut SignalStores, mut c: GkCtx) -> GkOut {
         let mut out = GkOut::default();
         let groups: Vec<String> = self.groups.keys().cloned().collect();
         for group in groups {
@@ -903,12 +1143,14 @@ impl GroupKeying {
     }
 
     /// A job back, finished or failed.
-    pub fn built(&mut self, b: Built, mut c: GkCtx) -> GkOut {
-        let mut out = GkOut::default();
-        if let Some(who) = self.who.as_mut() {
-            self.duty.built(who, &mut self.groups, b, &mut c, &mut out);
-        }
-        out
+    pub fn built(&mut self, b: Built, c: GkCtx) -> GkOut {
+        self.mirrored(c, |k, mut c| {
+            let mut out = GkOut::default();
+            if let Some(who) = k.who.as_mut() {
+                k.duty.built(who, &mut k.groups, b, &mut c, &mut out);
+            }
+            out
+        })
     }
 
     /// "Help hold keys" switched while connected.
@@ -1057,5 +1299,192 @@ impl GroupKeying {
             }
         }
         out
+    }
+}
+
+// Dive 1 F1: the signed-in account's counters kept on this device too (`Mirrored`).
+#[cfg(test)]
+mod mirror_tests {
+    use super::*;
+
+    const A: [u8; 16] = [0xa1; 16];
+
+    fn seen(n: u32, made: u64) -> Seen {
+        Seen { n, made }
+    }
+
+    fn book(counters: &[([u8; 16], Seen)]) -> MemoryPins {
+        let mut b = MemoryPins::default();
+        for (a, s) in counters {
+            b.counters.raise(*a, *s, true);
+        }
+        b
+    }
+
+    fn started(account: Option<[u8; 16]>) -> GroupKeying {
+        let mut k = GroupKeying::default();
+        let _ = k.start(GkStart {
+            on: true,
+            run: [3; 16],
+            relay_clock: crate::time::now_millis() / 1000,
+            platform: Platform::Desktop,
+            help_hold_keys: false,
+            user_id: 1,
+            identity: IdentityKeyPair::generate(&mut crate::rng()),
+            account,
+            seat_keys: None,
+            local: None,
+            visible: true,
+        });
+        k
+    }
+
+    /// What a check reads of `account` through `k`'s view of `book`, and whether the call
+    /// asked for a save.
+    fn read(k: &mut GroupKeying, book: &mut MemoryPins, account: [u8; 16]) -> (Option<Seen>, bool) {
+        let mut got = None;
+        let out = k.mirrored(GkCtx { pins: book, now: 0 }, |_, c| {
+            got = c.pins.seen(&account);
+            GkOut::default()
+        });
+        (got, out.local_dirty)
+    }
+
+    /// A counter the book answered, and one raised through it, stay with this device when a
+    /// later book has neither (the vault's pages withheld); each new one asks for a save.
+    #[test]
+    fn a_counter_read_or_raised_is_answered_after_the_book_lost_it() {
+        let mut k = started(Some([1; 16]));
+        let mut b = book(&[(A, seen(5, 100))]);
+        assert_eq!(read(&mut k, &mut b, A), (Some(seen(5, 100)), true));
+        assert_eq!(
+            read(&mut k, &mut b, A),
+            (Some(seen(5, 100)), false),
+            "kept once"
+        );
+        let out = k.mirrored(
+            GkCtx {
+                pins: &mut b,
+                now: 0,
+            },
+            |_, c| {
+                c.pins.raise([0xb2; 16], seen(2, 200), true);
+                GkOut::default()
+            },
+        );
+        assert!(out.local_dirty);
+        assert_eq!(
+            b.seen(&[0xb2; 16]),
+            Some(seen(2, 200)),
+            "raised in the book too"
+        );
+        let mut withheld = MemoryPins::default();
+        assert_eq!(read(&mut k, &mut withheld, A), (Some(seen(5, 100)), false));
+        assert_eq!(
+            read(&mut k, &mut withheld, [0xb2; 16]).0,
+            Some(seen(2, 200))
+        );
+        assert_eq!(withheld.seen(&A), None, "the book is not written by a read");
+    }
+
+    /// Every check takes the higher `n`; of one `n` the book's answer, which merges the
+    /// account's devices; a higher one in the book is kept.
+    #[test]
+    fn a_check_takes_the_higher_counter_and_of_one_n_the_earlier_made() {
+        let mut k = started(Some([1; 16]));
+        let _ = read(&mut k, &mut book(&[(A, seen(5, 100))]), A);
+        // A vault page rolled back to counter 4
+        assert_eq!(
+            read(&mut k, &mut book(&[(A, seen(4, 50))]), A).0,
+            Some(seen(5, 100))
+        );
+        assert_eq!(
+            read(&mut k, &mut book(&[(A, seen(5, 90))]), A).0,
+            Some(seen(5, 90))
+        );
+        // A book row started afresh with a later `made` (the pages withheld): the earlier the
+        // mirror holds stands (review P1, P4)
+        assert_eq!(
+            read(&mut k, &mut book(&[(A, seen(5, 200))]), A).0,
+            Some(seen(5, 90)),
+            "of one n the earlier made"
+        );
+        assert_eq!(
+            read(&mut k, &mut book(&[(A, seen(6, 300))]), A).0,
+            Some(seen(6, 300))
+        );
+        assert_eq!(
+            read(&mut k, &mut MemoryPins::default(), A).0,
+            Some(seen(6, 300))
+        );
+    }
+
+    /// A guest's book is the host's own (`LocalGk::counters`): nothing goes to the mirror.
+    #[test]
+    fn a_guest_keeps_no_mirror() {
+        let mut k = started(None);
+        assert_eq!(
+            read(&mut k, &mut book(&[(A, seen(5, 100))]), A),
+            (Some(seen(5, 100)), false)
+        );
+        assert_eq!(k.local().unwrap().mirror, SeenBook::default());
+    }
+
+    /// The mirror goes back to `most` once past `most + slack`: the oldest `made` first.
+    #[test]
+    fn the_mirror_drops_its_oldest_counters_past_its_bound() {
+        let mut m = SeenBook::default();
+        for i in 0..10u8 {
+            m.raise([i; 16], seen(1, 1000 - u64::from(i)), true);
+        }
+        assert!(!m.bound(8, 2), "within the slack");
+        m.raise([10; 16], seen(1, 5000), true);
+        assert!(m.bound(8, 2));
+        let left: Vec<u8> = m.0.keys().map(|a| a[0]).collect();
+        assert_eq!(left, vec![0, 1, 2, 3, 4, 5, 6, 10], "made 991 to 993 went");
+        assert!(!m.bound(8, 0));
+    }
+
+    /// Two books of the account merge row by row as `raise` takes a row: the higher `n`, of
+    /// one `n` a rotation's `made` over a pair's, else the earlier; a merge that adds nothing
+    /// says so.
+    #[test]
+    fn two_books_merge_by_the_higher_counter_and_of_one_n_as_raise_does() {
+        let mut a = SeenBook::default();
+        a.raise(A, seen(5, 100), false);
+        a.raise([2; 16], seen(3, 10), true);
+        let mut b = SeenBook::default();
+        b.raise(A, seen(5, 200), true);
+        b.raise([2; 16], seen(2, 5), true);
+        b.raise([3; 16], seen(1, 7), true);
+        assert!(a.merge(&b));
+        assert_eq!(a.seen(&A), Some(seen(5, 200)), "the rotation's made");
+        assert_eq!(a.seen(&[2; 16]), Some(seen(3, 10)), "the higher n stays");
+        assert_eq!(a.seen(&[3; 16]), Some(seen(1, 7)));
+        assert!(!a.merge(&b), "nothing new");
+        assert!(!a.merge(&SeenBook::default()));
+    }
+
+    /// What a host kept apart goes into the mirror, bounded as the mirror is.
+    #[test]
+    fn counters_kept_apart_go_into_the_mirror_within_its_bound() {
+        let mut local = LocalGk::default();
+        local.mirror.raise(A, seen(5, 100), true);
+        let mut kept = SeenBook::default();
+        kept.raise(A, seen(4, 50), true);
+        assert!(!local.mirror_in(&kept), "a lower counter moves nothing");
+        for i in 0..(MIRROR_MOST + MIRROR_MOST / 16 + 1) as u32 {
+            let mut a = [0u8; 16];
+            a[..4].copy_from_slice(&i.to_be_bytes());
+            a[15] = 0xee;
+            kept.raise(a, seen(1, 1000 + u64::from(i)), true);
+        }
+        assert!(local.mirror_in(&kept));
+        assert_eq!(local.mirror.0.len(), MIRROR_MOST, "back to the bound");
+        assert_eq!(
+            local.mirror.seen(&A),
+            None,
+            "the oldest made went first: A's 100"
+        );
     }
 }

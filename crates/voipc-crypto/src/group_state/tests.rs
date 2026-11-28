@@ -2912,3 +2912,64 @@ fn a_reader_on_new_stores_with_what_it_read_reads_on() {
         .collect();
     assert_eq!(opened, vec![b"one".to_vec(), b"two".to_vec()]);
 }
+
+/// Review A-P3: the writer is shown one gate-off opening (told) and the gate-on after it, but
+/// not a second off and on with a seat added in between. Its next post's fold starts at the
+/// second gate-on and tells the group was open: one open stretch seen hides no later one.
+#[test]
+fn a_second_gate_flip_the_writer_was_not_shown_is_told_at_its_fold() {
+    let mut w = World::text(true, true);
+    let keys = SeatKeys::generate(1, T0);
+    let (mut d, seat, _) = seated_account(&mut w, &keys, &[]);
+    let opened = |out: &GkOut| {
+        out.events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    GkEvent::Warning {
+                        kind: Warn::GatedOpened,
+                        ..
+                    }
+                )
+            })
+            .count()
+    };
+    // A fold while gated: the names floor is gated
+    let out = d.post(1, b"one", w.now * 1000);
+    assert_eq!(posted(&out).len(), 1, "{:?}", out.events);
+    // The first flip, shown
+    let off = w.open(&Due {
+        gated: false,
+        ..w.due(DueKind::Gate)
+    });
+    let out = d.take(piece(&w, &off, &seat, &[]), w.now);
+    assert_eq!(
+        opened(&out),
+        1,
+        "the gate-off taken is told: {:?}",
+        out.events
+    );
+    let on = w.open(&Due {
+        gated: true,
+        ..w.due(DueKind::Gate)
+    });
+    let out = d.take(piece(&w, &on, &seat, &[]), w.now);
+    assert_eq!(opened(&out), 0);
+    // The second flip, not shown: a seat added while the group is open
+    w.open(&Due {
+        gated: false,
+        ..w.due(DueKind::Gate)
+    });
+    let late = crate::group_key::build::world::Member::account(9);
+    w.join(&[&late]);
+    let on2 = w.open(&Due {
+        gated: true,
+        ..w.due(DueKind::Gate)
+    });
+    let mut told = opened(&d.take(piece(&w, &on2, &seat, &[]), w.now));
+    told += opened(&d.frame(&names_answer(&[&on2.header]), w.now));
+    told += opened(&d.post(2, b"two", w.now * 1000));
+    told += opened(&d.tick(w.now * 1000 + CHECK_WAIT_MS));
+    assert_eq!(told, 1, "the second open stretch is told once, at the fold");
+}

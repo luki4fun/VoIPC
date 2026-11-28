@@ -294,7 +294,10 @@ async fn j8r_an_account_exit_sent_in_an_idle_actors_last_turn_lands() {
         .await
         .expect("the idle actor comes to its stop");
     assert_eq!(exits(&db, &id, cause::LEAVE).await, 0);
-    w.relay.groups.on_log_leave("lounge", ann.a, cause::LEAVE);
+    w.relay
+        .groups
+        .on_log_leave("lounge", ann.a, cause::LEAVE)
+        .await;
     go.notify_one();
     let kept = exit_kept(&db, &id).await;
     drop_db(&file);
@@ -316,7 +319,10 @@ async fn j8r_an_account_exit_whose_actor_stopped_after_the_lookup_lands() {
         .await
         .expect("the idle actor comes to its stop");
     w.relay.groups.stop_between_for_test(go);
-    w.relay.groups.on_log_leave("lounge", ann.a, cause::LEAVE);
+    w.relay
+        .groups
+        .on_log_leave("lounge", ann.a, cause::LEAVE)
+        .await;
     let kept = exit_kept(&db, &id).await;
     drop_db(&file);
     assert!(
@@ -572,4 +578,51 @@ async fn j8r_a_promotion_that_takes_an_exit_batch_commits_and_a_newcomer_is_seat
     );
     assert!(promoted, "the promotion lands, bob reads its epoch");
     assert!(seated, "the newcomer is seated within 90 s");
+}
+
+// ── Dive 4 round 2, item 1 (d4-r2-plan.md) ────────────────────────────────
+
+/// The relay's real actor, stopped for good: ann's account leaves the log while the group's
+/// idle actor is in its last turn (held at its gate), so the hook's exit goes into an inbox
+/// nothing reads again, as a crash leaves it. Nothing in the database told her seat from a
+/// live follower's then: a new relay over the same database kept her seated. The hook asked
+/// the exit in the store first: the new relay's start enters it, writes it, and the ask goes.
+#[tokio::test]
+async fn j8r_d4r2_a_log_leave_cut_off_by_a_stop_exits_at_the_next_start() {
+    let (w, ann, db, file, id) = lounge().await;
+    let (reached, _go) = w.relay.groups.gate_idle_stop_for_test();
+    w.relay.groups.on_session_end(w.holder.sid);
+    w.relay.groups.on_session_end(w.members[0].sid);
+    tokio::time::timeout(Duration::from_secs(10), reached.notified())
+        .await
+        .expect("the idle actor comes to its stop");
+    w.relay
+        .groups
+        .on_log_leave("lounge", ann.a, cause::LEAVE)
+        .await;
+    // The relay stops there; another starts over the same database and someone follows
+    let inc = crate::accounts::gk::gk_incarnation(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut again = Relay::new();
+    again.groups.attach(db.clone(), inc);
+    again.groups.idle_ms_for_test(IDLE_MS);
+    let ik = voipc_crypto::generate_identity_key_pair();
+    let sid = again.session(&ik, None);
+    again.follow(sid, &id);
+    let kept = exit_kept(&db, &id).await;
+    let mut left = vec![];
+    for _ in 0..100 {
+        left = crate::accounts::gk::exit_asks(&db, &id).await.unwrap();
+        if left.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    drop_db(&file);
+    assert!(
+        kept && left.is_empty(),
+        "after the restart ann's exit is kept: {kept}; asks left: {left:?}"
+    );
 }

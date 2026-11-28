@@ -68,7 +68,7 @@ import {
   savedServers,
   type SavedServer,
 } from "./stores/settings.js";
-import { connectionLostLine, reconnectDelay, resolveRejoin } from "./rejoin-rules.js";
+import { connectionLostLine, reconnectDelay, rejoinsVoice, resolveRejoin, type RoomAtDrop } from "./rejoin-rules.js";
 import type { ChannelInfo } from "./types.js";
 
 export { serverId };
@@ -348,7 +348,7 @@ export async function connectTo(
         removeServer(server);
       } else {
         addNotification(`${serverName(server, get(savedServers))}: could not connect: ${error}`, "warning");
-        void startReconnect(server, { voice: "", text: [] }, error);
+        void startReconnect(server, { voice: null, text: [] }, error);
       }
       return { ok: false, error };
     }
@@ -515,6 +515,7 @@ function removeServer(server: string, told = false): void {
   dropKept(server);
   forgetRings(server);
   openAtDrop.delete(server);
+  relayRuns.delete(server);
   // The bot's token goes with the wizard that holds it. A cut keeps both, for a run to go on
   invoke("import_forget", { server }).catch(() => {});
   // What its sessions kept for a reconnect goes too, ratchets and all: given up on after the
@@ -581,6 +582,21 @@ const channelListWaiters = new Map<string, Array<(list: ChannelInfo[]) => void>>
 
 /** The text channel on screen when a connection dropped, by name, for the next list. */
 const openAtDrop = new Map<string, string>();
+/**
+ * Each connection's relay run (`relay-run`, from `GroupKeys`), kept past `resetServer`: a
+ * reconnect compares the run it finds with the one the call dropped on (dive 6 F6).
+ */
+const relayRuns = new Map<string, string>();
+
+/** App.svelte's `relay-run` handler reports each connection's run here. */
+export function noteRelayRun(server: string, run: string): void {
+  relayRuns.set(server, run);
+}
+
+/** The run the server's connection said, "" when it said none (a relay below 26). */
+export function relayRun(server: string): string {
+  return relayRuns.get(server) ?? "";
+}
 /** The toast each drop put up, which has said its piece once the server is back. */
 const lostToasts = new Map<string, number>();
 
@@ -627,12 +643,13 @@ function nextChannelList(server: string, timeoutMs = 15_000): Promise<ChannelInf
  * Keep trying to get a lost server back, with a backoff, for five minutes.
  * The server stays in the list the whole time, and its pane says so.
  *
- * `previous` is where the user was, by name: the voice channel (only if the
- * call was on this server), the text channels they had open, and the one on screen.
+ * `previous` is where the user was: the voice room (only if the call was on this
+ * server, `rejoin-rules.ts` `roomAtDrop`), and by name the text channels they had open
+ * and the one on screen.
  */
 export async function startReconnect(
   server: string,
-  previous: { voice: string; text: string[]; open?: string },
+  previous: { voice: RoomAtDrop | null; text: string[]; open?: string; online?: number },
   initialError = "",
 ): Promise<void> {
   const d = details.get(server);
@@ -656,7 +673,7 @@ export async function startReconnect(
 
 async function reconnectLoop(
   server: string,
-  previous: { voice: string; text: string[] },
+  previous: { voice: RoomAtDrop | null; text: string[]; online?: number },
   d: OpenDetails,
   run: { cancelled: boolean; voiceTaken: boolean },
 ): Promise<void> {
@@ -667,8 +684,10 @@ async function reconnectLoop(
   // Generous budget: a Wi-Fi roam, VPN flap, or laptop lid-close should
   // not end the session. The overlay has a Cancel button for giving up.
   const RECONNECT_TIMEOUT_MS = 300_000;
-  // How many were online as it dropped: on a big relay the first try waits its turn
-  const online = get(channels.peek(server)).find((c) => c.channel_id === 0)?.user_count ?? 0;
+  // How many were online as it dropped: on a big relay the first try waits its turn. The
+  // caller reads it before it drops the server's stores (dive 6 F5)
+  const online =
+    previous.online ?? get(channels.peek(server)).find((c) => c.channel_id === 0)?.user_count ?? 0;
 
   for (let attempt = 1; !run.cancelled; attempt++) {
     info.update((i) => ({ ...i, attempt }));
@@ -703,6 +722,8 @@ async function reconnectLoop(
       // Registered before connecting: the server sends the channel list while
       // logging us in, so it can be here before `connect` has resolved.
       const listArrived = nextChannelList(server);
+      // The run is this connection's to say: one from before must not pass for it (F6)
+      relayRuns.delete(server);
       loadGuestBlocks(server);
       const id = await invoke<number>("connect", {
         address: server,
@@ -739,20 +760,28 @@ async function reconnectLoop(
       // The room they were standing in — unless voice has gone somewhere
       // else in the meantime. They took it there themselves, and pulling it
       // back here would end that call.
-      const [room] = resolveRejoin(previous.voice ? [previous.voice] : [], list, "voice");
+      const was = previous.voice;
+      const [room] = resolveRejoin(was ? [was.name] : [], list, "voice");
       // A room that turned 18+ meanwhile waits for the user's own yes.
-      if (room && !run.voiceTaken && (!room.nsfw || hasNsfwConsent(server))) {
-        try {
-          // With the password, where this session knows one: a password room
-          // is exactly the room a reconnect must not silently drop you out
-          // of, and the text rejoin below has always carried it.
-          await invoke("join_channel", {
-            server,
-            channelId: room.channel_id,
-            password: room.has_password ? channelPassword(server, room.name) : null,
-          });
-        } catch {
-          // Password changed, full, gone — stay out of voice
+      if (was && room && !run.voiceTaken && (!room.nsfw || hasNsfwConsent(server))) {
+        // With the password, where this session knows one: a password room
+        // is exactly the room a reconnect must not silently drop you out
+        // of, and the text rejoin below has always carried it.
+        const password = room.has_password ? channelPassword(server, room.name) : null;
+        // Only the same room, not any room of that name: a relay restart frees the names of
+        // the rooms people made, for anybody to take (dive 6 F6, rejoin-rules.ts)
+        if (rejoinsVoice(was, room, relayRun(server), password !== null)) {
+          try {
+            await invoke("join_channel", { server, channelId: room.channel_id, password });
+          } catch {
+            // Password changed, full, gone — stay out of voice
+          }
+        } else if (!room.has_password || password !== null) {
+          // A password this session does not know was never a way back in, and said nothing
+          addNotification(
+            `${fromServer(server)}Not back in ${room.name}: it may not be the room you were in (a server restart ends the rooms people make, and frees their names). Join it yourself if it is.`,
+            "info",
+          );
         }
       }
       // ...and the text channels that were open. An auto-join one comes back

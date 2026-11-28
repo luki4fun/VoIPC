@@ -1440,15 +1440,23 @@ impl GkFloors {
         })
     }
 
-    /// Every pin the account holds, once the pages are in, at each connection: a pin with no
-    /// time for its key is timed now. So a pin met before group keys, or set by an app that
-    /// keeps no times, is checked from the first sign-in that saw it, and a relay seating a
-    /// ghost under it after that is caught. Pin times are not answered before this.
+    /// Every pin the account holds, once the pages are in, at each connection. A pin whose
+    /// row holds another pin's time changed since, and is timed now: headers before are
+    /// unknown (shown, not refused). A pin with no time at all is timed 0: it was the pin for
+    /// every header, whether it was met before group keys or the relay withheld the pages
+    /// (or pushed the row off them), so a swapped key under it fails the fold, on a fresh
+    /// device too (dive 1 F1). Pin times are not answered before this.
     pub fn pins_held(&mut self, pins: impl IntoIterator<Item = (Id, [u8; 32])>, now: u64) -> bool {
         let since = self.vouched(now);
         let mut moved = false;
         for (account, ik) in pins {
-            moved |= self.time_pin(account, &ik, since);
+            let changed = self
+                .counters
+                .rows
+                .get(&account)
+                .and_then(|h| h.row.pin)
+                .is_some_and(|(_, t)| t != tag(&ik));
+            moved |= self.time_pin(account, &ik, if changed { since } else { 0 });
         }
         self.pins_timed = true;
         moved
@@ -2714,7 +2722,9 @@ mod tests {
         let mut phone = Device::new(&vault, &relay, HashMap::new());
         phone.begin(&mut relay);
         let x = account(1);
-        let ik1 = [8; 32];
+        let (ik0, ik1) = ([7; 32], [8; 32]);
+        // The pin changes (from ik0, never timed: timed 0, dive 1 F1) on the phone
+        phone.book.pins_held([(x, ik0)], behind);
         phone.book.pins_held([(x, ik1)], behind);
         let newest = floor(1, NOW - 100, 3, 0).time;
         let since = phone.book.counters.rows[&x].row.pin.unwrap().0;

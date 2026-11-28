@@ -274,7 +274,7 @@ pub async fn connect_to_server(
     let output_device_live = Arc::new(std::sync::Mutex::new(output_device));
     let server: Arc<str> = Arc::from(address.as_str());
     let is_voice = Arc::new(AtomicBool::new(false));
-    let voice_asked_at = Arc::new(AtomicU64::new(0));
+    let voice_asked_at = Arc::new(VoiceAsks::default());
 
     // Control writer channel.
     //
@@ -1045,24 +1045,100 @@ async fn leave_voice(
     }
 }
 
+/// The user's own leave (`join_channel` to the lobby) ends the call on this
+/// connection here and now, as a disconnect does: the microphone, the
+/// speakers, the holds on them, and voice itself, so nothing opens the
+/// microphone again before the server seats us anew (which takes an ask).
+/// It used to close only when the server's answer came, and a server that
+/// never answered kept a voice-activated microphone open after the user
+/// pressed Leave (dive 6 F10). A leave the server refuses (its join budget)
+/// is sent again on its `ChannelError` (review F10-R1); the room's own state
+/// still waits for the answer (`leave_voice`).
+pub(crate) async fn leave_voice_now(state: &AppState, app: &tauri::AppHandle, server: &str) {
+    // In the order `start_capture` takes them: a device still opening is
+    // closed once it is open
+    let _gate = state.mic_gate.lock().await;
+    let (task, eot) = {
+        let mut conns = state.connections.write().await;
+        let Some(c) = conns
+            .get_mut(server)
+            .filter(|c| c.is_voice.load(Ordering::Relaxed))
+        else {
+            return; // the call is elsewhere, or there is none
+        };
+        c.is_voice.store(false, Ordering::Relaxed);
+        let was = c.transmitting.swap(false, Ordering::Relaxed);
+        (
+            c.capture_task.take(),
+            was.then(|| (c.session_id, c.voice_tx.clone())),
+        )
+    };
+    if clear_voice(state, server) {
+        release_holds(app);
+    }
+    // Bounded, as `stop_capture` is, with `connections` free
+    if let Some(task) = task {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), task).await;
+    }
+    // Behind the last voice frame, so the room hears the phrase end
+    if let Some((session_id, voice_tx)) = eot {
+        let eot = VoicePacket::end_of_transmission(session_id, 0);
+        let _ = voice_tx.send(eot.to_bytes()).await;
+    }
+    info!(
+        server,
+        "left voice: the microphone closed before the server's answer"
+    );
+}
+
 /// How long an ask for a voice seat stays good: the server's answer is one
 /// round trip away, a game's `hello` waits up to its own join timeout.
 const VOICE_ASK_TTL_MS: u64 = 10_000;
 
 /// We are about to ask this connection's server for a voice seat. Called
 /// before the request goes out, so the answer cannot beat it.
-pub fn ask_voice(asked_at: &AtomicU64) {
-    asked_at.store(screenshare::epoch_ms().max(1), Ordering::Relaxed);
+/// Asks for a voice seat not answered yet, oldest first: one ask a seat, so two joins
+/// clicked within one round trip both land (the browser keeps the same list, session.ts).
+/// Since dive 6 F7 a move on the connection that carries the call needs an ask as well, and
+/// one slot spent by the first seat refused the second (review F7-R1).
+pub type VoiceAsks = std::sync::Mutex<std::collections::VecDeque<u64>>;
+
+/// A handful is all a person clicks within the ask's life.
+const VOICE_ASKS_MOST: usize = 8;
+
+pub fn ask_voice(asked_at: &VoiceAsks) {
+    let mut asks = asked_at.lock().unwrap_or_else(PoisonError::into_inner);
+    asks.push_back(screenshare::epoch_ms().max(1));
+    while asks.len() > VOICE_ASKS_MOST {
+        asks.pop_front();
+    }
 }
 
 /// Whether a voice seat the server just gave us was asked for, spending the
 /// ask: one ask pays for one seat.
-fn take_voice_ask(asked_at: &AtomicU64) -> bool {
-    voice_ask_fresh(asked_at.swap(0, Ordering::Relaxed), screenshare::epoch_ms())
+fn take_voice_ask(asked_at: &VoiceAsks) -> bool {
+    let now = screenshare::epoch_ms();
+    let mut asks = asked_at.lock().unwrap_or_else(PoisonError::into_inner);
+    while asks.front().is_some_and(|t| !voice_ask_fresh(*t, now)) {
+        asks.pop_front();
+    }
+    asks.pop_front().is_some()
 }
 
 fn voice_ask_fresh(asked_at: u64, now: u64) -> bool {
     asked_at != 0 && now.saturating_sub(asked_at) < VOICE_ASK_TTL_MS
+}
+
+/// Whether a voice seat in `channel_id`, from a server whose connection stands in `current`
+/// and does (`holds_voice`) or does not carry the call, is taken only on an ask of ours.
+///
+/// Every seat but the lobby and the room the call already stands in. The relay that carries
+/// the call used to be let move it between its rooms unasked, and the open microphone went
+/// along into a room whose members it chose (dive 6 F7). No honest relay does that: it seats
+/// a session where the session asked (a join, a created channel, an accepted invite, a
+/// game's `hello`, each of which asks here) and a kick goes to the lobby.
+fn seat_wants_ask(channel_id: u32, current: u32, holds_voice: bool) -> bool {
+    channel_id != 0 && !(holds_voice && channel_id == current)
 }
 
 /// Send a client message over the control stream.
@@ -1408,7 +1484,7 @@ async fn control_reader_task<R: AsyncRead + Unpin>(
     channels_snapshot: Arc<std::sync::Mutex<Vec<ChannelInfo>>>,
     server: Arc<str>,
     is_voice: Arc<AtomicBool>,
-    voice_asked_at: Arc<AtomicU64>,
+    voice_asked_at: Arc<VoiceAsks>,
     transmitting: Arc<AtomicBool>,
     account: Option<Arc<crate::account::AccountLink>>,
     files: Arc<crate::files::Files>,
@@ -1801,7 +1877,7 @@ async fn handle_server_message(
     channels_snapshot: &Arc<std::sync::Mutex<Vec<ChannelInfo>>>,
     server: &str,
     is_voice: &Arc<AtomicBool>,
-    voice_asked_at: &AtomicU64,
+    voice_asked_at: &VoiceAsks,
     transmitting: &Arc<AtomicBool>,
     account: Option<&crate::account::AccountLink>,
     edge_cmd: &mpsc::Sender<EdgeCmd>,
@@ -2091,16 +2167,27 @@ async fn handle_server_message(
             // server had it and opens the microphone into this room — whose
             // members, and so whose media key, the server chooses. An honest
             // server only seats us where we asked (a join, a created channel,
-            // an accepted invite, a game's hello); one that already carries
-            // our voice may still move us between its own rooms.
-            if channel_id != 0
-                && !is_voice.load(Ordering::Relaxed)
-                && !take_voice_ask(voice_asked_at)
+            // an accepted invite, a game's hello), the one that carries our
+            // voice too (`seat_wants_ask`).
+            let holds_voice = is_voice.load(Ordering::Relaxed);
+            if seat_wants_ask(
+                channel_id,
+                channel_id_store.load(Ordering::Relaxed),
+                holds_voice,
+            ) && !take_voice_ask(voice_asked_at)
             {
                 warn!(
                     server,
                     channel_id, "server seated us in a voice channel we did not join; leaving it"
                 );
+                // The call it moved: the microphone closes here, not when the
+                // relay answers the leave below (dive 6 F7, as F10's leave), in
+                // the order a capture start takes its locks, so one already on
+                // its way is closed too (review F7-R2)
+                if holds_voice {
+                    leave_voice_now(&app_handle.state::<AppState>(), app_handle, server).await;
+                    leave_voice(app_handle, server, is_voice, transmitting).await;
+                }
                 let _ = send_tcp_message(
                     tcp_tx,
                     &ClientMessage::JoinChannel {
@@ -2121,8 +2208,9 @@ async fn handle_server_message(
             }
 
             // Update the Rust-side channel tracking so commands (PTT, chat, etc.)
-            // know which channel we're in. This handles server-initiated moves
-            // (create_channel auto-join, kicks, invites, etc.)
+            // know which channel we're in. This handles the moves the server
+            // makes for us: the ones we asked for above (create_channel
+            // auto-join, invites), and a kick to the lobby
             let old_ch = channel_id_store.swap(channel_id, Ordering::Relaxed);
             {
                 let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
@@ -2490,6 +2578,9 @@ async fn handle_server_message(
             // computing a "RTT" from it yielded clock skew, not latency.
         }
         ServerMessage::ServerShutdown { reason } => {
+            // The UI shows the call gone at once: so does the capture, without waiting for
+            // the link to close or the reconnect's first step (dive 6 F4)
+            leave_voice(app_handle, server, is_voice, transmitting).await;
             emit_server(
                 app_handle,
                 server,
@@ -2536,6 +2627,23 @@ async fn handle_server_message(
             );
         }
         ServerMessage::ChannelError { reason } => {
+            // A leave the relay refused (its join budget: the leave left voice here at
+            // once, dive 6 F10) still seats us in the room: asked again once the budget
+            // has a token (2 a second), until it is taken (review F10-R1)
+            if !is_voice.load(Ordering::Relaxed) && channel_id_store.load(Ordering::Relaxed) != 0 {
+                let tx = tcp_tx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                    let _ = send_tcp_message(
+                        &tx,
+                        &ClientMessage::JoinChannel {
+                            channel_id: 0,
+                            password: None,
+                        },
+                    )
+                    .await;
+                });
+            }
             emit_server(
                 app_handle,
                 server,
@@ -6664,6 +6772,17 @@ pub fn spawn_capture_encode_task(
             if capture_error.swap(false, Ordering::Relaxed) && !stream_dead {
                 stream_dead = true;
                 warn!("capture device error — attempting recovery");
+                // The reopen keeps to the chosen device, so this can last until
+                // it is plugged back in (dive 6 F8): the phrase ends now, for
+                // the room and for a mod, as a release ends it
+                if std::mem::take(&mut was_on_air) {
+                    let eot = VoicePacket::end_of_transmission(session_id, 0);
+                    let _ = voice_tx.blocking_send(eot.to_bytes());
+                    app_handle.state::<AppState>().sdk_event(SdkEvent::Talk {
+                        user_id: session_id,
+                        speaking: false,
+                    });
+                }
             }
             if stream_dead {
                 if last_rebuild.elapsed() >= std::time::Duration::from_secs(1) {
@@ -7634,6 +7753,31 @@ pub(crate) mod tests {
         assert!(!voice_ask_fresh(40_000, 40_000 + VOICE_ASK_TTL_MS), "stale");
         // A clock that stepped back is not an ask from the future
         assert!(voice_ask_fresh(40_000, 39_000));
+        // Two joins clicked within one round trip: two seats, each with its ask (review F7-R1)
+        let asks = VoiceAsks::default();
+        ask_voice(&asks);
+        ask_voice(&asks);
+        assert!(take_voice_ask(&asks), "the first seat");
+        assert!(take_voice_ask(&asks), "the second seat");
+        assert!(!take_voice_ask(&asks), "a third, unasked, is refused");
+    }
+
+    /// The relay that carries the call moved it into another of its rooms with no ask, and
+    /// the open microphone went along (dive 6 F7). No honest relay does: it seats a session
+    /// only where it asked, or kicks it to the lobby.
+    #[test]
+    fn a_relay_moving_the_call_needs_an_ask_too() {
+        assert!(seat_wants_ask(2, 1, true), "the call moved to another room");
+        // Controls: the room the call stands in (a roster refresh) and the lobby (a leave, a
+        // kick) need none; a seat on a connection without the call needs one, as before
+        assert!(!seat_wants_ask(1, 1, true));
+        assert!(!seat_wants_ask(0, 1, true));
+        assert!(!seat_wants_ask(0, 0, false));
+        assert!(seat_wants_ask(2, 0, false));
+        assert!(
+            seat_wants_ask(1, 1, false),
+            "the same room while voice is elsewhere"
+        );
     }
 
     /// Past 8 viewers the relay counts the reports itself: the same majority steps the

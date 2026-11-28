@@ -168,3 +168,29 @@ test("a pseudonym's row never takes the sharing switch, but its owner's and an a
   assert.equal(takesSwitch({ anonymous: false }, 7, 1, false), true, "the control: a row under the name");
   assert.equal(takesSwitch(undefined, 7, 1, false), true, "a channel not listed here");
 });
+
+// Dive 6 F11: the mute mark on the user's own row was whatever the relay said (`UserList`,
+// `UserMuted`), so a relay could show "muted" on the user's own name while the microphone was
+// open. The own row takes this device's flags; everybody else's stay the relay's word.
+test("the user's own row shows this device's mute and deafen, never the relay's", async () => {
+  const { shownMarks } = await import("./roster-rules.ts");
+  const row = (user_id: number, is_muted: boolean, is_deafened: boolean) => ({ user_id, is_muted, is_deafened });
+  // The relay says the user is muted and deafened; on this device they are neither
+  assert.deepEqual(shownMarks(row(4, true, true), 4, false, false), { muted: false, deafened: false });
+  assert.deepEqual(shownMarks(row(4, false, false), 4, true, false), { muted: true, deafened: false });
+  // Somebody else's is the relay's
+  assert.deepEqual(shownMarks(row(5, true, false), 4, false, true), { muted: true, deafened: false });
+  // Not signed in (0): a row of nobody (0, a count in a hidden room) is not ours
+  assert.deepEqual(shownMarks(row(0, true, false), 0, false, false), { muted: true, deafened: false });
+  // The lists draw it: each of them, for the own row
+  const { readFileSync } = await import("node:fs");
+  for (const [file, name] of [
+    ["./components/modern/MemberList.svelte", "user"],
+    ["./components/modern/ChannelSidebar.svelte", "member"],
+    ["./components/stage/SpeakerTile.svelte", "user"],
+  ]) {
+    const source = readFileSync(new URL(file, import.meta.url), "utf8");
+    assert.match(source, new RegExp(`shownMarks\\(${name}, \\$userId, \\$isMuted, \\$isDeafened\\)`), file);
+    assert.doesNotMatch(source, new RegExp(`${name}\\.is_(muted|deafened)\\b`), `${file} draws the relay's word`);
+  }
+});

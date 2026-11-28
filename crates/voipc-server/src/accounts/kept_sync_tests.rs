@@ -460,7 +460,7 @@ impl World {
                 }
                 out
             }
-            AccountRequest::LogLeave { conv } => log::leave(relay, me, conv).await.unwrap().0,
+            AccountRequest::LogLeave { conv } => log::leave(relay, me, conv).await.unwrap(),
             AccountRequest::LogMembers { conv } => log::members_of(relay, me, conv).await.unwrap(),
             AccountRequest::LogPurge { conv } => {
                 log::purge(relay, me, conv.as_deref()).await.unwrap()
@@ -4570,6 +4570,13 @@ async fn a_purged_channels_group_key_rows_go_with_it() {
             sqlx::query("INSERT INTO voipc_gk_self (grp, account, gen, seed, tag_sk, tag_sx, kind, sealed) VALUES ($1, $2, $2, 1, $3, $3, 0, $4)")
                 .bind(grp).bind(&GK_GEN[..]).bind(&[1u8; 8][..]).bind(&[9u8; 60][..])
                 .execute(pool).await.unwrap();
+            // What a restart asks again (0014): an eager seat and an exit
+            sqlx::query("INSERT INTO voipc_gk_eager (grp, account, seat, at) VALUES ($1, $2, $3, 1)")
+                .bind(grp).bind(&GK_GEN[..]).bind(&[1u8; 33][..])
+                .execute(pool).await.unwrap();
+            sqlx::query("INSERT INTO voipc_gk_exit_asks (grp, account, cause, at) VALUES ($1, $2, 1, 1)")
+                .bind(grp).bind(&GK_GEN[..])
+                .execute(pool).await.unwrap();
         });
     }
     w.relay.channel_purge(CONV).await.unwrap();
@@ -4578,6 +4585,8 @@ async fn a_purged_channels_group_key_rows_go_with_it() {
         "voipc_gk_seats",
         "voipc_gk_seals",
         "voipc_gk_self",
+        "voipc_gk_eager",
+        "voipc_gk_exit_asks",
     ] {
         assert_eq!(
             w.rows(&format!("SELECT COUNT(*) FROM {t} WHERE grp = '{CONV}'"))

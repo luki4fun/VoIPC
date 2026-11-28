@@ -17,13 +17,14 @@
   // `.users`, which test-ui.mjs counts as the channel's members.
 
   import { avatarStyle } from "../../avatar.js";
-  import { userId } from "../../stores/connection.js";
+  import { isDeafened, isMuted, userId } from "../../stores/connection.js";
   import { channels, groupStyles, viewingVoice } from "../../stores/channels.js";
   import { lobby, moreLobby, REST_SECTION, searchLobby, watchLobby } from "../../stores/lobby.js";
   import { speakingUsers } from "../../stores/users.js";
   import { blockedMember } from "../../stores/blocks.js";
   import { restrictions } from "../../stores/restrictions.js";
   import { markTitle } from "../../restrict-rules.js";
+  import { shownMarks } from "../../roster-rules.js";
   import { audibleIds } from "../../stores/room.js";
   import {
     displayChannelCreatorId,
@@ -192,6 +193,8 @@
      game's culling are about the people we hear, and nobody else. `inChannel`
      is whether it is the channel on screen's, which is what the crown is about. -->
 {#snippet member(user: UserInfo, inCall: boolean, inChannel: boolean)}
+  <!-- The own row's marks are this device's, not the relay's word (dive 6 F11) -->
+  {@const marks = shownMarks(user, $userId, $isMuted, $isDeafened)}
   <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
   <div
     class="user"
@@ -228,14 +231,14 @@
         <span class="you">(you)</span>
       {/if}
     </span>
-    {#if user.is_muted}
+    {#if marks.muted}
       <span class="status-icon muted" title="Muted"><Icon name="mic-off" size={14} /></span>
     {/if}
     {#if $restrictions.has(user.user_id)}
       {@const held = markTitle($restrictions.get(user.user_id)!, Date.now())}
       <span class="status-icon restricted-mark" role="img" title={held} aria-label={held}><Icon name="hourglass" size={14} /></span>
     {/if}
-    {#if user.is_deafened}
+    {#if marks.deafened}
       <span class="status-icon deafened" title="Deafened"><Icon name="headphones-off" size={14} /></span>
     {/if}
     <!-- Watching is the call's, as in the menu: one click instead of two -->

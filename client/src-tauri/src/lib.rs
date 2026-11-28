@@ -359,6 +359,14 @@ pub fn run() {
                     request_quit(window.app_handle());
                 }
             }
+            // A push-to-talk key held in the window loses its key-up to the
+            // window that takes focus (dive 6 F2, global_keys.rs)
+            #[cfg(not(target_os = "android"))]
+            if let tauri::WindowEvent::Focused(false) = event {
+                if window.label() == "main" {
+                    global_keys::window_lost_focus(window.app_handle());
+                }
+            }
             #[cfg(target_os = "android")]
             let _ = (window, event);
         })

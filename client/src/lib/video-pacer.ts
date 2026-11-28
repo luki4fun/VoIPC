@@ -24,7 +24,10 @@
 // Frames back up in two other ways that are no queue of ours, and on WebTransport each
 // frame's ack shows which: a new QUIC path's slow start (on a 300 ms round trip the first
 // frames' acks take 660-900 ms, the rate they come back at doubling each round trip), and a
-// stall of the path, as Wi-Fi has (no acks for a moment, then all at once).
+// stall of the path, as Wi-Fi has (no acks for a moment, then all at once). And a round trip
+// that rises with no queue of ours at all (a route or radio change, another device's upload,
+// the sharer's downlink) is late frame after frame and delivers evenly: what tells it from a
+// queue of ours is that ours grows, or follows what the share hands (UPLINK_GROW_MS).
 //
 // On the TCP fallback the socket is one queue in send order that no counter here shows; a
 // ping through it waits behind every byte handed before it. The rate it delivers comes from
@@ -75,15 +78,15 @@ export const PROBE_EVERY_MS = 333;
 export const PROBE_LOST_MS = 2000;
 /**
  * The tunnel's delivered rate: one measure per answered ping with video handed since the ping
- * answered before it, those bytes over the time the link was busy with them (from the later of
- * the ping before's pong and when the first of them could have crossed and been answered, the
- * least after it was handed, to this pong); no video between, no measure. A find there needs
- * the measures from the newest one a round trip or more before the newest on, that one no
- * older than this: each of the link at its limit (both its pings waited past the least by
- * UPLINK_MARGIN_MS, and the link took at least 1 / STEADY_GROW of the time the share took to
- * hand the bytes: a slow start's burst, or a link with room, carries them faster), and the
- * newest within STEADY_FALL..STEADY_GROW of the one a round trip before it (a slow start
- * doubles it each round trip; a stall's pongs come late, then in one moment).
+ * answered before it (the share's first: since the share began), those bytes over the time the
+ * link was busy with them (from the later of the ping before's pong and when the first of them
+ * could have crossed and been answered, the least after it was handed, to this pong); no video
+ * between, no measure. A find there needs the newest TUNNEL_MEASURES (and back to a round trip
+ * or more before the newest), the oldest of them no older than this, the newest with both its
+ * pings late past the least by UPLINK_MARGIN_MS, all within TUNNEL_TRACK of one rate (a slow
+ * start doubles it each round trip; a stall's pongs come late, then in one moment), no pongs
+ * in the last TUNNEL_MEASURE_MS closer than their pings at more than that rate, the late ones
+ * of them within STEADY_GROW of each other, and the link setting the pongs' pace (LINK_SLOWER).
  */
 export const TUNNEL_MEASURE_MS = 2000;
 /**
@@ -97,7 +100,10 @@ export const TUNNEL_MEASURE_MS = 2000;
  * as steady). The shortest ever, not the least of late: the keepalive's pings before a share
  * come seconds apart and often late (a busy page), and the share's first frames waited behind
  * one another, so the least of late can be 3-5 times the round trip just as the share starts,
- * and windows that long wait out a small link's queue. The tunnel's pings come too rarely for
+ * and windows that long wait out a small link's queue. Yet not for ever: a path that got longer
+ * is the shortest from when it is learnt (UPLINK_GROW_MS), or once the shortest is in none of
+ * the least windows kept and those done agree within UPLINK_MARGIN_MS (a busy page's pings do
+ * not), else a slow start there passes as steady. The tunnel's pings come too rarely for
  * windows this short (TUNNEL_MEASURE_MS). The gap between acks is the median of those of the
  * last UPLINK_FLOOR_FRAMES acks whose frame left before the ack before it came, once at least
  * STEADY_MIN_GAPS are: a small link acks one frame a gap apart (300 ms for a 13 KB frame at
@@ -131,6 +137,44 @@ export const MIN_RATE_BPS = 200_000;
 export const PROBE_AFTER_MS = 2000;
 export const PROBE_HOLD_MS = 3000;
 export const PROBE_MAX_MS = 8000;
+/**
+ * A queue of ours and a longer path look the same in round trips and in bytes delivered, so
+ * neither "late" nor "delivered evenly" tells them apart: a frame's ack comes a round trip and
+ * a queue after it left either way. What does is how it got late. A queue of ours is built by
+ * the share handing more than the link carries, so on WebTransport (where nothing holds the
+ * encoder while unpaced) it keeps growing: a find needs the floor of the late samples to have
+ * risen UPLINK_GROW_MS past the lowest floor since the uplink went late (frames still out:
+ * PENDING_GROW_MS, a tick's wobble more). Paced, the queue found may stand and drain instead:
+ * then the link delivers more than the pacer lets out, by 1 / LINK_SLOWER (with room, what it
+ * lets out). A path that got longer, a route or radio change or another device's upload on the
+ * same uplink, is a step and then flat; late and flat for two floors' worth of samples and
+ * LEARN_MS, all of it unpaced, it is learnt as the least at once (and the shortest with it),
+ * where the least windows would take 20-30 s (each find meanwhile cut a share the link
+ * carried). A spell that began paced may be a queue of ours standing, never a longer path.
+ */
+export const UPLINK_GROW_MS = 20;
+export const PENDING_GROW_MS = UPLINK_MARGIN_MS;
+export const LEARN_MS = 500;
+/**
+ * On the TCP fallback the sharer's gate holds the encoder while a ping waits, so a queue of ours
+ * stands instead of growing, and the pongs alone cannot tell it from a longer path either. The
+ * link set the pongs' pace when, over the measures a find reads, its rate kept within
+ * TUNNEL_TRACK (return delay that wanders, or pongs released in batches, have no rate of their
+ * own) and either (a) each pong span is past its ping gap by more than LINK_SLOWER would allow
+ * (the queue grew; paced, each short of it: the queue found drains), or (b) behind a queue, the
+ * share handed at rates TUNNEL_HANDED_SPREAD apart or more and the link's rate spread a third
+ * as much at most (the gate thinned the share; the link did not care). With room the pongs
+ * follow the pings, and the link's rate is the share's. Late and flat, the pongs keeping the
+ * pings' pace and the link's rate no steadier than the share's, the path got longer (above).
+ */
+export const LINK_SLOWER = 0.9;
+export const TUNNEL_TRACK = 1.25;
+export const TUNNEL_HANDED_SPREAD = 1.05;
+/**
+ * ...over this many measures at least: two may line up by chance under return delay that
+ * wanders by 200 ms and more. Two do while each pong span is STEADY_GROW times its ping gap.
+ */
+export const TUNNEL_MEASURES = 3;
 /** The least is the least of the last few windows of this long, so a path that got longer is learnt. */
 export const LEAST_WINDOW_MS = 10_000;
 const LEAST_WINDOWS = 3;
@@ -138,6 +182,9 @@ const LEAST_WINDOWS = 3;
 export const UPLINK_KEPT = 64;
 
 type Phase = "free" | "drain" | "paced";
+
+/** A late spell: since when, how many floors, the lowest, and whether unpaced throughout. */
+type Late = { at: number; n: number; min: number; free: boolean };
 
 /**
  * Whether the uplink queues, and the pacer's rate from that (transport.ts feeds it, share.ts
@@ -147,7 +194,7 @@ type Phase = "free" | "drain" | "paced";
 export class UplinkControl {
   /** Least sample of each LEAST_WINDOW_MS, newest last. */
   private leasts: { from: number; least: number }[] = [];
-  /** The shortest sample this link ever gave (ms), for the steady check's windows. */
+  /** The shortest sample this link gave (ms) since its path last got longer, for the steady check's windows. */
   private shortest = Infinity;
   /** The last samples: [ms, at]. */
   private recent: [number, number][] = [];
@@ -164,10 +211,21 @@ export class UplinkControl {
   /** When the last frame was acked, and the gaps the link set between the last acks (NaN: none). */
   private lastAckAt = -Infinity;
   private gaps: number[] = [];
-  /** The tunnel's last answered ping of this share: [pong at, video handed before it, sent at, round trip]... */
-  private answered: [number, number, number, number] | null = null;
-  /** ...and its measures (TUNNEL_MEASURE_MS), newest last. */
-  private measures: { at: number; bps: number; busy: boolean }[] = [];
+  /**
+   * The tunnel's last answered ping of this share: [pong at, video handed before it, sent at,
+   * round trip]; before the first, the share's start (nothing answered, all handed since counts).
+   */
+  private answered: [number, number, number, number] = [-Infinity, 0, -Infinity, Infinity];
+  /**
+   * ...and its measures (TUNNEL_MEASURE_MS), newest last: the link's rate, the rate the share
+   * handed the bytes at, the pong span and the ping gap (ms), and whether both pings waited
+   * past the least by UPLINK_MARGIN_MS.
+   */
+  private measures: { at: number; bps: number; handed: number; span: number; gap: number; late: boolean }[] = [];
+  /** Since when the samples' floor is past the threshold, how many, and the lowest floor since. */
+  private late: Late | null = null;
+  /** The lowest floor of frames out since it went past the pending threshold (NaN: it is not). */
+  private pendingMin = NaN;
   private phase: Phase = "free";
   private rateBps = 0;
   /** The delivered rate when the queue was last found, and the rate to pace at once drained. */
@@ -207,15 +265,21 @@ export class UplinkControl {
     this.steady = steady;
   }
 
-  /** A share starts: unpaced again, its link not judged yet. What the link's least is stays. */
-  reset(): void {
+  /**
+   * A share starts: unpaced again, its link not judged yet. What the link's least is stays.
+   * `handed` (the tunnel's): the video handed to the socket so far, so the share's first pong
+   * measures what went since.
+   */
+  reset(handed = this.lastDelivered): void {
     this.recent = [];
     this.acked = [];
     this.ackedBefore = this.lastDelivered;
     this.lastAckAt = -Infinity;
     this.gaps = [];
-    this.answered = null;
+    this.answered = [-Infinity, handed, -Infinity, Infinity];
     this.measures = [];
+    this.late = null;
+    this.pendingMin = NaN;
     this.pendingAt = -Infinity;
     this.lastSample = NaN;
     this.phase = "free";
@@ -285,7 +349,48 @@ export class UplinkControl {
     this.recent.push([ms, now]);
     if (this.recent.length > this.floorOf) this.recent.shift();
     if (this.recent.length < this.floorOf || now - this.recent[0][1] < UPLINK_SPREAD_MS) return;
-    this.judge(Math.min(...this.recent.map(([m]) => m)), this.threshold(), now, 0);
+    const floor = Math.min(...this.recent.map(([m]) => m));
+    const threshold = this.threshold();
+    if (this.phase === "drain" || floor <= threshold) {
+      this.late = null;
+      this.judge(floor, threshold, now, 0);
+      return;
+    }
+    // A spell that began paced may be a queue of ours standing (the pacer at the link's rate,
+    // frames refused at the cap of frames in flight): never a longer path
+    // Its first floor sets no lowest: a frame that left just before the path got longer and was
+    // acked just after is half the step (measured: 121 ms between 45 and 145), and would make
+    // the step itself read as growth
+    const late = (this.late ??= { at: now, n: 0, min: Infinity, free: this.phase === "free" });
+    late.free &&= this.phase === "free";
+    late.n++;
+    // The tunnel's measures say whether the link set the pace. On WebTransport a queue of ours
+    // grows, or, paced, drains: the link delivers clearly more than the pacer lets out (with room
+    // it delivers what the pacer lets out, however long the path)
+    const draining = this.phase === "paced" && this.steadyBps(now) * LINK_SLOWER >= this.rateBps;
+    if (!this.steady || draining || floor >= late.min + UPLINK_GROW_MS) this.judge(floor, threshold, now, 0);
+    if (late.n > 1) late.min = Math.min(late.min, floor);
+    if (this.late && late.free && this.even(late, floor, now)) {
+      // Late and flat: the path got longer. Learnt at once, the steady check's windows with it
+      this.leasts = [{ from: now, least: late.min }];
+      this.shortest = late.min;
+      this.late = null;
+    }
+  }
+
+  /**
+   * Whether a late spell (begun unpaced) is a longer path: long enough (two floors' worth of
+   * samples, LEARN_MS), no growth since its lowest floor, and on the tunnel every pong span
+   * since it began within LINK_SLOWER of its ping gap and the link's rate no steadier than the
+   * share's (the pongs kept the pings' pace: no queue set it; tunnelBps (b) is the opposite).
+   */
+  private even(late: Late, floor: number, now: number): boolean {
+    if (late.n < 2 * this.floorOf || now - late.at < LEARN_MS || floor >= late.min + UPLINK_GROW_MS) return false;
+    if (this.steady) return true;
+    const w = this.measures.filter((x) => x.at >= late.at);
+    if (w.length < this.floorOf || !w.every((x) => Math.abs(x.span - x.gap) <= (1 - LINK_SLOWER) * x.gap)) return false;
+    const spread = (k: "bps" | "handed") => Math.max(...w.map((x) => x[k])) / Math.min(...w.map((x) => x[k]));
+    return spread("bps") - 1 >= ((spread("handed") - 1) * 2) / 3;
   }
 
   /**
@@ -302,10 +407,19 @@ export class UplinkControl {
     this.pendingAt = now;
     if (gap < 1000) this.pendingGap = gap;
     const n = this.steady ? this.floorOf : 1;
-    if (late || agesOldestFirst.length < n) return;
-    const floor = agesOldestFirst[n - 1];
+    if (late) return;
+    const floor = agesOldestFirst.length < n ? 0 : agesOldestFirst[n - 1];
     const threshold = this.pendingThreshold();
-    if (floor > threshold) this.judge(floor, threshold, now, 1);
+    if (floor <= threshold) {
+      this.pendingMin = NaN;
+      return;
+    }
+    // On WebTransport frames out pile up behind a queue of ours; behind a longer path they do not
+    if (this.steady && !(floor >= this.pendingMin + PENDING_GROW_MS)) {
+      this.pendingMin = Math.min(floor, Number.isNaN(this.pendingMin) ? Infinity : this.pendingMin);
+      return;
+    }
+    this.judge(floor, threshold, now, 1);
   }
 
   /** The pacer held video back at `now`: the encoder wants more than the rate. */
@@ -368,6 +482,8 @@ export class UplinkControl {
     this.rateBps = Math.max(MIN_RATE_BPS, rate * DRAIN_FACTOR);
     this.queuedAt = now;
     this.recent = [];
+    this.late = null;
+    this.pendingMin = NaN;
     this.finds.push([Math.round(now), Math.round(rate), Math.round(rate * CUT_FACTOR), Math.round(this.least()), Math.round(floor), out]);
     if (this.finds.length > UPLINK_KEPT) this.finds.shift();
   }
@@ -426,30 +542,64 @@ export class UplinkControl {
   private measure(ms: number, bytes: number, now: number, firstAt: number): void {
     const prev = this.answered;
     this.answered = [now, bytes, now - ms, ms];
-    if (!prev || bytes <= prev[1] || Number.isNaN(firstAt)) return;
+    if (bytes <= prev[1] || Number.isNaN(firstAt)) return;
     const least = this.least();
-    const span = now - Math.max(prev[0], firstAt + least);
-    if (span <= 0) return;
-    // The link at its limit: both pings waited behind a queue, so it carried these bytes back to
-    // back, and it took about as long as the share took to hand them (not a slow start's burst)
-    const queued = (rtt: number) => rtt > least + UPLINK_MARGIN_MS;
-    const busy = queued(prev[3]) && queued(ms) && span * STEADY_GROW >= now - ms - prev[2];
-    this.measures.push({ at: now, bps: ((bytes - prev[1]) * 8000) / span, busy });
+    // Two pongs at once (span 0: an infinite rate) is no link's pace: a stall, or a batch
+    const span = Math.max(0, now - Math.max(prev[0], firstAt + least));
+    const sent = now - ms;
+    const late = (rtt: number) => rtt > least + UPLINK_MARGIN_MS;
+    const bits = (bytes - prev[1]) * 8000;
+    this.measures.push({
+      at: now,
+      bps: bits / span,
+      // Handed from the first of them to the ping: a share's first keyframe at once
+      handed: bits / Math.max(1, sent - Math.max(prev[2], firstAt)),
+      span,
+      gap: sent - prev[2],
+      late: late(prev[3]) && late(ms),
+    });
     if (this.measures.length > 6) this.measures.shift();
   }
 
-  /** If the tunnel's measures are steady (TUNNEL_MEASURE_MS), the newest; else NaN. */
+  /**
+   * If the tunnel's measures show the link at its limit, steady (TUNNEL_MEASURE_MS), the
+   * newest; else NaN. At its limit: both pings of each waited past the least, and the link,
+   * not the share, set the pongs' pace (LINK_SLOWER, TUNNEL_TRACK).
+   */
   private tunnelBps(now: number): number {
     const m = this.measures;
-    // The newest against the newest a round trip or more before it: a slow start doubles over one
+    // The newest three, and back to a round trip or more before the newest: a slow start doubles
+    // over one. Two will do while the queue grows by half a ping gap and more each (a far link's
+    // pings wait little past the least while the gate holds, so three late in a row come rarely)
     const b = m[m.length - 1];
-    let i = m.length - 2;
+    const fast = m.slice(-2).every((x) => x.span >= STEADY_GROW * x.gap);
+    let i = m.length - (fast ? 2 : TUNNEL_MEASURES);
     while (i > 0 && b.at - m[i].at < this.least()) i--;
     const a = m[i];
     if (!a || b.at - a.at < this.least() || a.at < now - TUNNEL_MEASURE_MS) return NaN;
-    if (!m.slice(i).every((x) => x.busy)) return NaN;
-    if (b.bps > STEADY_GROW * a.bps || b.bps < STEADY_FALL * a.bps) return NaN;
-    return b.bps;
+    const w = m.slice(i);
+    // Not each of them late: the gate holds a queue near PACE_GATE_MS, and a ping sent as it ran
+    // low waits under UPLINK_MARGIN_MS, its pong as much the link's pace as the others
+    if (!b.late) return NaN;
+    const spread = (k: "bps" | "handed", of = w) => Math.max(...of.map((x) => x[k])) / Math.min(...of.map((x) => x[k]));
+    // One rate throughout, the link's: return delay that wanders, or comes in batches, has none.
+    // Nor did pongs come closer than their pings a moment ago, faster than that rate (two at
+    // once, a batch's or a stall's, are an infinite rate): a link delivers no faster than it
+    // does, and a queue of ours drains at that rate. Nor was it faster then behind a queue
+    if (!(spread("bps") <= TUNNEL_TRACK)) return NaN;
+    const lately = m.filter((x) => x.at >= b.at - TUNNEL_MEASURE_MS);
+    const top = TUNNEL_TRACK * Math.max(...w.map((x) => x.bps));
+    if (lately.some((x) => x.span < LINK_SLOWER * x.gap && x.bps > top)) return NaN;
+    if (!(spread("bps", lately.filter((x) => x.late)) <= STEADY_GROW)) return NaN;
+    const grew = w.every((x) => x.span * LINK_SLOWER > x.gap);
+    // Paced, the queue found may still drain: the link carries each ping gap's video in less
+    const drained = this.phase === "paced" && w.every((x) => x.span < LINK_SLOWER * x.gap);
+    // ...and steadier than the share's, behind a queue: with room the pongs follow the pings, and
+    // the two vary alike (a pong not late measures what the share handed, not the link)
+    const queued = w.filter((x) => x.late);
+    const handed = queued.length >= 2 ? spread("handed", queued) : 1;
+    const tracked = handed >= TUNNEL_HANDED_SPREAD && spread("bps", queued) - 1 <= (handed - 1) / 3;
+    return grew || drained || tracked ? b.bps : NaN;
   }
 
   private noteLeast(ms: number, now: number): void {
@@ -458,6 +608,13 @@ export class UplinkControl {
     if (!last || now - last.from >= LEAST_WINDOW_MS) {
       this.leasts.push({ from: now, least: ms });
       if (this.leasts.length > LEAST_WINDOWS) this.leasts.shift();
+      // The shortest is in no window kept, and the windows done agree on a longer path: that is
+      // the path now. A busy page's late pings do not agree (shortest's doc); a longer path does
+      const done = this.leasts.slice(0, -1).map((w) => w.least);
+      const lo = Math.min(...done);
+      if (done.length === LEAST_WINDOWS - 1 && this.least() > this.shortest && Math.max(...done) <= lo + UPLINK_MARGIN_MS) {
+        this.shortest = this.least();
+      }
     } else if (ms < last.least) {
       last.least = ms;
     }

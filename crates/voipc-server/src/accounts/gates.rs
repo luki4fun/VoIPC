@@ -112,12 +112,18 @@ impl Relay {
         }
         let accounts: HashSet<[u8; 16]> = seats.iter().map(|(_, a)| *a).collect();
         let decided = self.decide(accounts).await;
+        // Each log's accounts out at once: one exit asked and one message to its group
+        let mut out: HashMap<usize, Vec<[u8; 16]>> = HashMap::new();
         for (i, account) in seats {
-            let (conv, groups) = &gated[i];
+            let (_, groups) = &gated[i];
             if decided.get(&account).is_some_and(|h| !h.passes(groups)) {
-                if let Err(e) = self.gate_out(conv, &account).await {
-                    warn!("keeping {conv} to its gate: {e:#}");
-                }
+                out.entry(i).or_default().push(account);
+            }
+        }
+        for (i, accounts) in out {
+            let (conv, _) = &gated[i];
+            if let Err(e) = self.gate_out(conv, &accounts).await {
+                warn!("keeping {conv} to its gate: {e:#}");
             }
         }
     }
@@ -136,12 +142,22 @@ impl Relay {
         Ok(held)
     }
 
-    /// `account` out of `conv`'s log and its seats in the conversation's group exit, whichever
-    /// of the two it holds.
-    async fn gate_out(&self, conv: &str, account: &[u8; 16]) -> Result<()> {
-        super::log::unseat(self.store(), conv, account).await?;
-        self.gk_left_log(conv, account, GATE);
-        Ok(())
+    /// `accounts` out of `conv`'s log and their seats in the conversation's group exit,
+    /// whichever of the two each holds. The exit is asked first, so a stop while they are
+    /// taken out still exits them at the group's next start (dive 4 F7), and goes to the group
+    /// as one message, whatever a membership's delete did (the gate is the decision).
+    async fn gate_out(&self, conv: &str, accounts: &[[u8; 16]]) -> Result<()> {
+        let asked = self.gk_ask_exit(conv, accounts, GATE).await;
+        let mut done = Ok(());
+        for a in accounts {
+            if let Err(e) = super::log::unseat(self.store(), conv, a).await {
+                done = done.and(Err(e));
+            }
+        }
+        if let Some(gk) = self.gk() {
+            gk.exit_from_log(conv, accounts.to_vec(), GATE, asked);
+        }
+        done
     }
 
     /// What gates ask of each of `accounts`; those whose reads failed are not in it.
@@ -194,7 +210,7 @@ impl Relay {
             seats.dedup();
         }
         for conv in seats.iter().filter(|s| convs.contains(s)) {
-            self.gate_out(conv, account).await?;
+            self.gate_out(conv, &[*account]).await?;
         }
         Ok(())
     }

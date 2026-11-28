@@ -60,6 +60,9 @@ pub(super) struct Names {
     /// An answer came since a voice room last folded (voice.rs): a fold that waited for its
     /// lists goes again, though no header was taken.
     pub(super) fresh: bool,
+    /// The newest epoch of this generation this device took an open header of: a gate it
+    /// saw go off was told then (member.rs), and a fold from a later start is not told again.
+    open_seen: Option<u32>,
 }
 
 impl Default for Names {
@@ -77,6 +80,7 @@ impl Default for Names {
             answered: false,
             refused: false,
             fresh: false,
+            open_seen: None,
         }
     }
 }
@@ -96,11 +100,20 @@ impl Names {
             self.gone = None;
             self.from_start = false;
             self.refused = false;
+            self.open_seen = None;
         }
         let was_gated = prev.is_some_and(|f| f.gen == hd.gen && f.gated);
-        if hd.gated && hd.kind.opens_epoch() && !was_gated {
+        // A gated opening whose `names_hash` steps from 0³² started its gated period, also
+        // where this device walked to it past an open stretch from a gated floor (dive 1 F5)
+        let starts = hd.gated
+            && hd.kind.opens_epoch()
+            && (!was_gated || names_start(&NamesList::of(hd)) == hd.names_hash);
+        if starts && self.gated_start.is_none_or(|s| s < hd.epoch) {
             self.gated_start = Some(hd.epoch);
             self.refused = false;
+        }
+        if !hd.gated {
+            self.open_seen = Some(self.open_seen.map_or(hd.epoch, |e| e.max(hd.epoch)));
         }
         if hd.gated {
             self.lists.insert((hd.epoch, hd.join), NamesList::of(hd));
@@ -200,22 +213,36 @@ impl Names {
 /// relay signed itself, RV q9-q10:211, r-hostile:211) holds the fold only until an honest
 /// answer puts the head's own list there.
 pub(super) fn names_in(m: &mut Member, pieces: Vec<NamesPiece>) -> Option<gk::InPiece> {
+    let head = m.head.as_ref().map(|h| h.header().clone());
     let n = &mut m.names;
     n.asked = None;
     n.answered = true;
     n.refused = false;
     n.fresh = true;
     let mut joins = Vec::new();
+    let mut lowest: Option<(u32, u32)> = None;
     for p in pieces {
         for l in &p.lists {
             if let Ok(list) = NamesList::try_from(l) {
-                n.lists.insert((list.epoch, list.join), list);
+                let at = (list.epoch, list.join);
+                lowest = Some(lowest.map_or(at, |x| x.min(at)));
+                n.lists.insert(at, list);
             }
         }
         if let Some(step) = p.gone {
             n.gone = Some(NamesStep::from(step));
         }
         joins.extend(p.joins);
+    }
+    // An answer that starts at an opening whose list steps from 0³² to the head's names:
+    // the gated period began there (the relay answers from the newest start, gk/names.rs),
+    // though this device took none of its headers (dive 1 F5)
+    if let (Some((epoch, 0)), Some(hd)) = (lowest, head.as_ref()) {
+        let later = n.gated_start.is_none_or(|s| s < epoch);
+        let start = n.lists.get(&(epoch, 0)).map(names_start);
+        if later && start.is_some_and(|h| n.reaches((epoch, 0), h, hd)) {
+            n.gated_start = Some(epoch);
+        }
     }
     (!joins.is_empty()).then(|| gk::InPiece {
         chain: joins,
@@ -280,6 +307,7 @@ pub(super) fn fold(m: &mut Member, who: &Who, c: &mut GkCtx, out: &mut GkOut) ->
         return Folded::Ok;
     }
     let from = m.names.from(&hd.gen);
+    let floor_before = m.names.floor;
     let after = match from {
         NamesFrom::Floor(f) => Some((f.epoch, f.join)),
         NamesFrom::Gone { step, .. } => Some((step.epoch, step.join)),
@@ -316,6 +344,27 @@ pub(super) fn fold(m: &mut Member, who: &Who, c: &mut GkCtx, out: &mut GkOut) ->
             shown,
             warnings,
         }) => {
+            // A fold from the start that reaches the head from a list after this writer's
+            // gated names floor: `names_hash` begins again only at an opening that turned
+            // the gate on, so the gate was off in between, whatever the relay sends. Said
+            // where this device did not see it go off (dive 1 F4)
+            let first = lists.first().map(|l| (l.epoch, l.join));
+            let opened = matches!(from, NamesFrom::Start)
+                && floor_before.is_some_and(|f| {
+                    f.gen == hd.gen
+                        && f.names_hash != [0; 32]
+                        && first.is_some_and(|at| (f.epoch, f.join) < at)
+                        // An open stretch this device saw is told already only where it
+                        // ends right at this start (review A-P3: an earlier one hides no later)
+                        && m.names.open_seen.is_none_or(|e| first.is_none_or(|at| e.saturating_add(1) < at.0))
+                });
+            if opened {
+                out.events.push(GkEvent::Warning {
+                    channel_id: m.t.channel_id,
+                    kind: Warn::GatedOpened,
+                    n: 0,
+                });
+            }
             moved(m, floor, who, out);
             readers(m, &shown, show, out);
             warn(m, &warnings, out);

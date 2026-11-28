@@ -138,12 +138,28 @@ pub(super) struct Kept {
     taken: VecDeque<GkEpoch>,
     /// Answered with nothing to take.
     none: HashSet<(String, [u8; 16], u32)>,
+    /// Self-rows a kept read wrote this run (`take`).
+    wrote: HashSet<Wrote>,
+    /// Epochs answered with no anchor that wait for a try with one: when the first such answer
+    /// came (ms).
+    anchor_wait: HashMap<(String, [u8; 16], u32), u64>,
     pace: Pace,
 }
+
+/// A self-row by group, generation, seed and seat tags.
+type Wrote = (String, [u8; 16], u32, [u8; 8], [u8; 8]);
 
 fn bad(why: &'static str) -> Refusal {
     Refusal::Form(why)
 }
+
+/// `take`'s refusal on the binding alone where no key of our own opened: one an anchor may.
+const NOT_OURS: &str = "no key of the leaf's version of our own";
+/// How long an epoch answered with no anchor waits for a try with one, from its first such
+/// answer: the live answer brings the anchor within a few round trips, and the account's sync
+/// tries again every few ticks (`GK_PAST_TICKS`). Past it, or with a relay that withholds the
+/// live answer, the epoch is given up as before.
+const ANCHOR_WAIT_MS: u64 = 20_000;
 
 impl Kept {
     /// An `EpochIn` with `past`: never a head, the floor never moves for it. Taken only as
@@ -172,12 +188,56 @@ impl Kept {
         }
         let key = (m.t.group.clone(), past.gen, past.epoch);
         let anchor = owed.and_then(|o| o.anchor);
+        // Keyed by a row with neither a self-row nor a seed welcome: the member secret is not
+        // here yet. A seat seated while its account was away gets it in a new Join's welcome
+        // as it comes back (dive 3 F2), so the epoch is left unanswered: the account's sync
+        // hands it over again a few times (`GK_PAST_TRIES`) before it gives it up
+        let no_secret = p
+            .seat
+            .as_ref()
+            .is_some_and(|k| k.row.is_some() && k.welcome.is_none())
+            && p.seed_welcome.is_none()
+            && p.self_rows.is_empty();
+        // Sent with no anchor while the relay uses the group key (this run held no keyholder
+        // header of the floor yet: a sign-in's catch-up reads before the live answer) and keyed
+        // by what only an anchor lets count, a welcome or a seed welcome with no self-row to
+        // show its `s_m` ours: left unanswered too, for `ANCHOR_WAIT_MS`, so the sync's next
+        // try goes with the anchor. In `none` it was given up for the run (fix review P3-R1)
+        let wants_anchor = anchor.is_none()
+            && who.on
+            && p.seat.as_ref().is_some_and(|k| {
+                k.welcome.is_some() || (k.row.is_some() && p.seed_welcome.is_some())
+            });
+        let now = crate::time::now_millis();
+        let first = self.anchor_wait.remove(&key);
+        let waits = wants_anchor
+            && (first.is_some() || self.anchor_wait.len() < TAKEN_MOST)
+            && first.is_none_or(|t| now < t.saturating_add(ANCHOR_WAIT_MS));
         match take(who, m, p, past, anchor.as_ref()) {
-            Ok(k) => {
+            Ok((k, row)) => {
+                if let Some(r) = row {
+                    if self
+                        .wrote
+                        .insert((r.group.clone(), r.gen, r.seed, r.sk, r.sx))
+                    {
+                        out.self_rows.push(r);
+                    }
+                }
                 self.taken.push_back(k);
                 if self.taken.len() > TAKEN_MOST {
                     self.taken.pop_front();
                 }
+            }
+            Err(why) if no_secret => {
+                tracing::debug!(group = %m.t.group, epoch = past.epoch, ?why, "a past epoch waits for its member secret");
+                self.send(who, m, out);
+                return;
+            }
+            Err(why) if waits && why == bad(NOT_OURS) => {
+                tracing::debug!(group = %m.t.group, epoch = past.epoch, "a past epoch waits for an anchor");
+                self.anchor_wait.insert(key, first.unwrap_or(now));
+                self.send(who, m, out);
+                return;
             }
             Err(why) => {
                 tracing::debug!(group = %m.t.group, epoch = past.epoch, ?why, "a past epoch not taken");
@@ -349,14 +409,15 @@ impl Kept {
 
 /// A past answer's `CK`, by C1's `take_past_at`, as the epoch asked for, walked back from
 /// `anchor` (or on the binding alone): at its opening header, or at a Join of it with the
-/// opening.
+/// opening. With it, the self-row to write where our seat's key came by a welcome's or a seed
+/// welcome's `s_m` no self-row showed ours (`self_row_for`).
 fn take(
     who: &Who,
     m: &Member,
     p: &InPiece,
     past: gk::EpochRef,
     anchor: Option<&SignedHeader>,
-) -> Result<GkEpoch, Refusal> {
+) -> Result<(GkEpoch, Option<SelfRowIn>), Refusal> {
     let group = &m.t.group;
     let form = |h: &gk::HeaderIn| {
         h.check().map_err(|_| bad("a header of the wrong size"))?;
@@ -386,10 +447,10 @@ fn take(
     let g = Group::new(GroupKind::Text, group, past.gen).map_err(|_| bad("group"))?;
     // On the binding alone, only a `BK` the relay could not have chosen
     let anchored = anchors(anchor, &header, opening.as_ref());
-    let (bk, own) = bk_of(who, m, &g, &leaf, p, !anchored).ok_or(bad(if anchored {
+    let (bk, own, seeded) = bk_of(who, m, &g, &leaf, p, !anchored).ok_or(bad(if anchored {
         "no key of the leaf's version"
     } else {
-        "no key of the leaf's version of our own"
+        NOT_OURS
     }))?;
     let bk = if own {
         PastBk::Own(&bk)
@@ -407,12 +468,85 @@ fn take(
     if (pe.group.gen(), pe.epoch.e) != (past.gen, past.epoch) {
         return Err(bad("not the epoch asked for"));
     }
-    Ok(GkEpoch {
-        group: group.clone(),
-        gen: past.gen,
-        epoch: past.epoch,
-        d_e: pe.epoch.d_e,
-        ck: pe.ck,
+    let open = opening.as_ref().unwrap_or(&header);
+    let row = seeded
+        .filter(|_| pe.anchored && m.stored())
+        .and_then(|(seat, s_m)| {
+            // Under a seed no higher than the epoch's (§3.11, as `Member::key_in`): the maker
+            // holds that one, not one it never held, after its removal or above the head
+            // (fix review P3-R1). No floor: a keying under the old seed keys epochs after
+            // the floor rose (a row and its ratchets)
+            let sk = p.seat.as_ref().filter(|sk| sk.s <= open.header().seed)?;
+            let set = epoch_set(anchor, &khs, open)?;
+            self_row_for(who, &g, sk, set, &seat, &s_m)
+        });
+    Ok((
+        GkEpoch {
+            group: group.clone(),
+            gen: past.gen,
+            epoch: past.epoch,
+            d_e: pe.epoch.d_e,
+            ck: pe.ck,
+        },
+        row,
+    ))
+}
+
+/// The keyholder header whose set the past epoch stands on, as `take_past_at`'s walk from the
+/// anchor reached it: the opening itself where it sets keyholders, else the header it names,
+/// the anchor or one of the walk's links.
+fn epoch_set<'a>(
+    anchor: Option<&'a SignedHeader>,
+    khs: &'a [SignedHeader],
+    open: &'a SignedHeader,
+) -> Option<&'a SignedHeader> {
+    if open.header().kind.sets_keyholders() {
+        return Some(open);
+    }
+    let want = open.kh();
+    anchor
+        .filter(|a| a.d() == want)
+        .or_else(|| khs.iter().find(|k| k.d() == want))
+}
+
+/// The self-row for `s_m` of our seat `seat` under the keying's seed, which a seed welcome
+/// gave and a row to the leaf's version opened by, or a welcome to that version (dive 3 P3).
+/// An account seated while no device of it was there, back after a roll, reads the epochs
+/// before it only through that welcome; with no self-row a seat-key rotation's history rows
+/// leave that seed out (§5.11 step 2: they come from self-rows) and the welcome opens only
+/// with the old KEM key, so those epochs were lost at the rotation. Written only as the live
+/// path writes one (`Member::write_self_row`): the take was anchored and passed `confirm`,
+/// the keying's maker is an entry of the set the walk reached, and its seed is no higher than
+/// the epoch's (the caller's bound), so the relay alone, or a bucket-mate who knows `BK`,
+/// cannot have chosen that `s_m`, nor a keyholder of that set under a seed past the ones it
+/// held (one after its removal, or above the head). Under the epoch's own seed it derives
+/// every seat's `s_m` anyway.
+fn self_row_for(
+    who: &Who,
+    g: &Group,
+    sk: &gk::SeatKeying,
+    set: &SignedHeader,
+    seat: &SeatRef,
+    s_m: &[u8; 32],
+) -> Option<SelfRowIn> {
+    let keys = who.seat_keys.as_ref()?;
+    if who.account.is_none() || seat.m.account() != who.account {
+        return None;
+    }
+    let maker: MemberId = sk.from.m.into();
+    let listed = set
+        .header()
+        .keyholders
+        .iter()
+        .any(|e| e.m == maker && e.kx == sk.from.kx);
+    listed.then(|| SelfRowIn {
+        group: g.id().to_string(),
+        gen: g.gen(),
+        seed: sk.s,
+        sk: seat.tag_sk,
+        sx: seat.tag_sx,
+        kind: gk::self_row::SELF_ROW,
+        sealed: self_row(g, sk.s, seat, keys.self_key(), s_m),
     })
 }
 
@@ -422,7 +556,8 @@ fn take(
 /// whom the relay names: it is our own only where its `s_m` is our self-row's (`self_s_m`).
 /// With `own_only` (no anchor reaches the header, §5.10) only our own is given: the key
 /// held this run is not (`Member::key_in` keeps one only once its seal's key passed
-/// `confirm`, so it could be, RV).
+/// `confirm`, so it could be, RV). Last, the seat and `s_m` of a welcome not shown ours, or
+/// of a seed welcome the row opened by (`row_key`).
 fn bk_of(
     who: &Who,
     m: &Member,
@@ -430,10 +565,10 @@ fn bk_of(
     leaf: &Leaf,
     p: &InPiece,
     own_only: bool,
-) -> Option<(Zeroizing<[u8; 32]>, bool)> {
+) -> Option<(Zeroizing<[u8; 32]>, bool, Option<Seeded>)> {
     let same_gen = m.floor.as_ref().is_some_and(|f| f.gen == g.gen()) && !own_only;
     if let Some(bk) = m.bks.get(&(leaf.b, leaf.v)).filter(|_| same_gen) {
-        return Some((bk.clone(), false));
+        return Some((bk.clone(), false, None));
     }
     let sk = p.seat.as_ref().filter(|sk| sk.b == leaf.b)?;
     sk.check().ok()?;
@@ -449,12 +584,16 @@ fn bk_of(
             Some((me.keys.public().seat(me.m), s_m, bk))
         })?;
         let own = self_s_m(who, g, sk.s, &seat, p).is_some_and(|ours| same_secret(&ours, &s_m));
-        (own || !own_only).then_some((bk, own))
+        // Not ours yet (no self-row shows it): its `s_m` for a self-row, as a seed welcome's
+        // (`take`). An eager seat whose bucket was first re-keyed under the next seed reads
+        // the epochs from its Join only by this welcome, which opens only with the KEM key
+        // a rotation deletes (fix review P3-R2)
+        (own || !own_only).then_some((bk, own, (!own).then_some((seat, s_m))))
     });
-    let (mut bk, own) = match (welcomed, &sk.row) {
+    let (mut bk, own, seeded) = match (welcomed, &sk.row) {
         (Some(got), _) => got,
         (None, Some(row)) => row_key(who, &seats, g, sk.s, &from, base, row, p, own_only)?,
-        (None, None) if same_gen => (m.bks.get(&(sk.b, sk.base_v))?.clone(), false),
+        (None, None) if same_gen => (m.bks.get(&(sk.b, sk.base_v))?.clone(), false, None),
         (None, None) => return None,
     };
     let mut v = sk.base_v;
@@ -462,8 +601,11 @@ fn bk_of(
         bk = ratchet(g, step.e, Version { b: sk.b, v }, step.to, &bk);
         v = step.to;
     }
-    (v == leaf.v).then_some((bk, own))
+    (v == leaf.v).then_some((bk, own, seeded))
 }
+
+/// Our seat a welcome or seed welcome went to, and the `s_m` it carried.
+type Seeded = (SeatRef, Zeroizing<[u8; 32]>);
 
 /// `s_m` of our seat `seat` under seed `s` from the account's self-row in the answer, under
 /// the self key or the old one while a rotation keeps it: only the account's devices seal
@@ -508,7 +650,8 @@ fn same_secret(a: &[u8; 32], b: &[u8; 32]) -> bool {
 /// that seat's private parts while this device holds them, or a history row once they are
 /// gone. Rows are under the self key, or the old one while a rotation keeps it. With the
 /// key, whether it is our own: by a self-row or history row it is; by a seed welcome, whose
-/// maker the relay names, it is not, and with `own_only` that one is not tried.
+/// maker the relay names, it is not, and with `own_only` that one is not tried. By a seed
+/// welcome, also the seat it went to and its `s_m`.
 #[allow(clippy::too_many_arguments)]
 fn row_key(
     who: &Who,
@@ -520,22 +663,23 @@ fn row_key(
     row: &[u8],
     p: &InPiece,
     own_only: bool,
-) -> Option<(Zeroizing<[u8; 32]>, bool)> {
+) -> Option<(Zeroizing<[u8; 32]>, bool, Option<Seeded>)> {
     let sw = p
         .seed_welcome
         .as_ref()
         .filter(|w| !own_only && w.s == s && w.check().is_ok());
     if let Some(sw) = sw {
         let maker = Holder::from_raw(sw.from.m.into(), &sw.from.kx).ok()?;
-        let bk = seats.iter().find_map(|me| {
+        let got = seats.iter().find_map(|me| {
             let s_m = open_seed_welcome(g, s, me, &maker, &sw.bytes).ok()?;
-            RowBase::member_side(g, s, me, from, &s_m)
+            let bk = RowBase::member_side(g, s, me, from, &s_m)
                 .ok()?
                 .open_row(base, row)
-                .ok()
+                .ok()?;
+            Some((bk, me.keys.public().seat(me.m), s_m))
         });
-        if let Some(bk) = bk {
-            return Some((bk, false));
+        if let Some((bk, seat, s_m)) = got {
+            return Some((bk, false, Some((seat, s_m))));
         }
     }
     let account = who.account?;
@@ -570,7 +714,7 @@ fn row_key(
                     .map(|e| RowBase::from_secret(g, s, seat.m, e.k, &e.rb))
             };
             if let Some(bk) = rb.and_then(|rb| rb.open_row(base, row).ok()) {
-                return Some((bk, true));
+                return Some((bk, true, None));
             }
         }
     }
@@ -1167,13 +1311,23 @@ mod tests {
             }
             d.keying.past_epoch(TEXT_ID, gen, e);
             d.keying.past_asks();
-            assert_eq!(d.take(p).past_ready.len(), 1);
-            matches!(d.keying.past_epoch(TEXT_ID, gen, e), PastEpoch::Ready(_))
+            let ready = d.take(p).past_ready.len();
+            let got = matches!(d.keying.past_epoch(TEXT_ID, gen, e), PastEpoch::Ready(_));
+            (ready, got)
         };
-        assert!(
-            !read(answer(&c, Vec::new()), true),
-            "the control: no s_m, no key"
+        // The control: a row and no s_m anywhere in the answer. The epoch is left unanswered
+        // (its account's sync asks again: the secret may come in a new Join's welcome, dive
+        // 3 F2), and no key is taken
+        assert_eq!(
+            read(answer(&c, Vec::new()), true),
+            (0, false),
+            "the control: no s_m, no key, and the epoch still asked"
         );
+        let read = |p: gk::InPiece, anchored: bool| {
+            let (ready, got) = read(p, anchored);
+            assert_eq!(ready, 1);
+            got
+        };
         let mut p = answer(&c, Vec::new());
         p.seed_welcome = Some(gk::SeedWelcomeIn {
             s,
@@ -1181,7 +1335,408 @@ mod tests {
             bytes,
         });
         assert!(read(p.clone(), true));
-        assert!(!read(p, false), "on the binding alone, no seed welcome");
+        // On the binding alone, no seed welcome. Sent with no anchor, the epoch is left
+        // unanswered: the sync's next try may go with one (fix review P3-R1)
+        let mut d = Device::new(c.ik, seat_keys::copy(&keys));
+        d.keying.past_epoch(TEXT_ID, gen, e);
+        d.keying.past_asks();
+        assert!(
+            d.take(p).past_ready.is_empty(),
+            "on the binding alone, no seed welcome: the epoch waits for an anchor"
+        );
+        assert!(matches!(
+            d.keying.past_epoch(TEXT_ID, gen, e),
+            PastEpoch::Asked
+        ));
+    }
+
+    /// dive 3 P3: a kept read that opened our row by a seed welcome's `s_m`, anchored and from
+    /// a maker of the epoch's keyholder set, writes the self-row for that `s_m`, once a run: a
+    /// seat-key rotation's history rows come from self-rows (§5.11 step 2), and the seed welcome
+    /// opens only with the old KEM key, so without it the read lasts until the rotation. A row
+    /// from a pair outside the set opens to the true `BK` too (a bucket-mate holds `BK`, the
+    /// relay names the maker and makes its seed welcome, under an `s_m` they chose): it is read,
+    /// but writes no self-row.
+    #[test]
+    fn a_kept_row_opened_by_a_seed_welcome_writes_its_self_row_only_from_a_maker_of_the_set() {
+        use crate::group_key::build::world::Holder;
+        use crate::group_key::open_self_row;
+        let keys = SeatKeys::generate(1, T0);
+        let c = case(&keys);
+        let (s, s_m) = s_m(&c, &keys);
+        let gen = c.w.g.gen();
+        let e = c.past.header.header().epoch;
+        let holder = &c.w.holders[0];
+        let public = keys.pair.public();
+        let to = Them {
+            m: MemberId::Account(A),
+            keys: &public,
+        };
+        let read = |p: gk::InPiece| {
+            let mut d = Device::new(c.ik, seat_keys::copy(&keys));
+            let m = d.keying.groups.get_mut(TEXT_ID).unwrap();
+            m.floor = Some(crate::group_key::Floor::after(None, &c.past.header, T0));
+            m.kh = Some(c.w.kh.clone());
+            d.keying.past_epoch(TEXT_ID, gen, e);
+            d.keying.past_asks();
+            let mut out = d.take(p.clone());
+            // The same epoch answered again (a second ask) writes it no second time
+            d.keying.past_epoch(TEXT_ID, gen, e);
+            d.keying.past_asks();
+            out.self_rows.extend(d.take(p).self_rows);
+            let got = matches!(d.keying.past_epoch(TEXT_ID, gen, e), PastEpoch::Ready(_));
+            (got, out.self_rows)
+        };
+        let mut p = answer(&c, Vec::new());
+        p.seed_welcome = Some(gk::SeedWelcomeIn {
+            s,
+            from: holder.by().into(),
+            bytes: seed_welcome(&c.w.g, s, &holder.me(), &to, &s_m).unwrap(),
+        });
+        let (got, rows) = read(p.clone());
+        assert!(got, "read by the seed welcome");
+        assert_eq!(rows.len(), 1, "one self-row: {rows:?}");
+        let r = &rows[0];
+        assert_eq!(
+            (r.kind, r.gen, r.seed, r.sk, r.sx),
+            (gk::self_row::SELF_ROW, gen, s, c.seat.tag_sk, c.seat.tag_sx)
+        );
+        let kept = open_self_row(&c.w.g, s, &c.seat, keys.self_key(), &r.sealed).unwrap();
+        assert_eq!(*kept, *s_m, "it keeps the seed welcome's s_m");
+
+        // A pair outside the set, named the maker, with a row to our seat under its own s_m
+        let k = p.seat.as_ref().unwrap();
+        let at = Version {
+            b: k.b,
+            v: k.base_v,
+        };
+        let me = Me {
+            m: MemberId::Account(A),
+            keys: &keys.pair,
+        };
+        let bk = RowBase::member_side(&c.w.g, s, &me, &holder.holder(), &s_m)
+            .unwrap()
+            .open_row(at, k.row.as_ref().unwrap())
+            .unwrap();
+        let rogue = Holder::conn(99);
+        let chosen = zeroize::Zeroizing::new([9u8; 32]);
+        let rb = RowBase::keyholder_side(&c.w.g, s, &rogue.me(), &to, &chosen).unwrap();
+        let mut q = p.clone();
+        let k = q.seat.as_mut().unwrap();
+        k.from = rogue.by().into();
+        k.row = Some(rb.row(at, &bk));
+        q.seed_welcome = Some(gk::SeedWelcomeIn {
+            s,
+            from: rogue.by().into(),
+            bytes: seed_welcome(&c.w.g, s, &rogue.me(), &to, &chosen).unwrap(),
+        });
+        let (got, rows) = read(q);
+        assert!(got, "the row opens to the true BK: the epoch is read");
+        assert!(rows.is_empty(), "but its s_m is no self-row: {rows:?}");
+    }
+
+    /// Fix review P3-R1: a kept read writes a self-row only under a seed no higher than the
+    /// epoch's (§3.11, as the live path refuses `sk.s > hd.seed`). A keyholder of the epoch's
+    /// set (with the relay, which names the seed) makes its row and seed welcome under a seed
+    /// it never held, above the head, with an `s_m` of its choosing: the row opens to the true
+    /// `BK`, so the epoch is read, but no self-row is written. Under the epoch's own seed (the
+    /// control) the same maker's chosen `s_m` is written: the seed bound is what refuses it.
+    #[test]
+    fn a_kept_read_writes_no_self_row_under_a_seed_above_the_epochs() {
+        use crate::group_key::open_self_row;
+        let keys = SeatKeys::generate(1, T0);
+        let c = case(&keys);
+        let (s, s_m) = s_m(&c, &keys);
+        let gen = c.w.g.gen();
+        let e = c.past.header.header().epoch;
+        assert_eq!(c.past.header.header().seed, s, "harness: the epoch's seed");
+        let holder = &c.w.holders[0];
+        let public = keys.pair.public();
+        let to = Them {
+            m: MemberId::Account(A),
+            keys: &public,
+        };
+        let read = |p: gk::InPiece| {
+            let mut d = Device::new(c.ik, seat_keys::copy(&keys));
+            let m = d.keying.groups.get_mut(TEXT_ID).unwrap();
+            m.floor = Some(crate::group_key::Floor::after(None, &c.past.header, T0));
+            m.kh = Some(c.w.kh.clone());
+            d.keying.past_epoch(TEXT_ID, gen, e);
+            d.keying.past_asks();
+            let out = d.take(p);
+            let got = matches!(d.keying.past_epoch(TEXT_ID, gen, e), PastEpoch::Ready(_));
+            (got, out.self_rows)
+        };
+        let p = answer(&c, Vec::new());
+        let k = p.seat.as_ref().unwrap();
+        let at = Version {
+            b: k.b,
+            v: k.base_v,
+        };
+        let me = Me {
+            m: MemberId::Account(A),
+            keys: &keys.pair,
+        };
+        // The true BK, as a keyholder of the set holds it
+        let bk = RowBase::member_side(&c.w.g, s, &me, &holder.holder(), &s_m)
+            .unwrap()
+            .open_row(at, k.row.as_ref().unwrap())
+            .unwrap();
+        let chosen = zeroize::Zeroizing::new([9u8; 32]);
+        let under = |seed: u32| {
+            let rb = RowBase::keyholder_side(&c.w.g, seed, &holder.me(), &to, &chosen).unwrap();
+            let mut q = p.clone();
+            let k = q.seat.as_mut().unwrap();
+            k.s = seed;
+            k.row = Some(rb.row(at, &bk));
+            q.seed_welcome = Some(gk::SeedWelcomeIn {
+                s: seed,
+                from: holder.by().into(),
+                bytes: seed_welcome(&c.w.g, seed, &holder.me(), &to, &chosen).unwrap(),
+            });
+            q
+        };
+        let (got, rows) = read(under(s));
+        assert!(got, "the control: read");
+        let planted: Vec<bool> = rows
+            .iter()
+            .map(|r| {
+                open_self_row(&c.w.g, r.seed, &c.seat, keys.self_key(), &r.sealed)
+                    .is_ok_and(|x| *x == *chosen)
+            })
+            .collect();
+        assert_eq!(
+            planted,
+            vec![true],
+            "the control: under the epoch's seed the maker's s_m is written"
+        );
+        let (got, rows) = read(under(s + 5));
+        assert!(got, "the row opens to the true BK: the epoch is read");
+        assert!(
+            rows.is_empty(),
+            "no self-row under a seed above the epoch's: {rows:?}"
+        );
+    }
+
+    /// A past answer for our seat at the Join that seated it (`joined`, under the genesis
+    /// opening `genesis`), keyed by that Join's welcome, with `self_rows`.
+    fn join_answer(
+        w: &World,
+        genesis: &SignedHeader,
+        joined: &Built,
+        seat: &SeatRef,
+        self_rows: Vec<gk::SelfRowIn>,
+    ) -> gk::InPiece {
+        let x = joined
+            .commit
+            .welcomes
+            .iter()
+            .find(|x| x.seat == *seat)
+            .unwrap();
+        let leaves: Vec<Leaf> = w.leaves.iter().map(|l| l.leaf).collect();
+        let i = leaves
+            .iter()
+            .position(|l| (l.b, l.v) == (x.b, x.v))
+            .unwrap();
+        let seal = joined
+            .commit
+            .seals
+            .iter()
+            .find(|s| (s.b, s.v) == (x.b, x.v))
+            .unwrap();
+        gk::InPiece {
+            head: Some(gk::WalkLinkIn {
+                header: header_in(&joined.header),
+                parent: None,
+            }),
+            opening: Some(header_in(genesis)),
+            leaf: Some(leaves[i].into()),
+            path: Some(inclusion_path(&leaves, i).unwrap().try_into().unwrap()),
+            seal: Some(seal.bytes.clone()),
+            seat: Some(gk::SeatKeying {
+                b: x.b,
+                base_v: x.v,
+                s: x.s,
+                from: w.holders[0].by().into(),
+                welcome: Some(x.bytes.clone()),
+                row: None,
+                ratchets: vec![],
+            }),
+            self_rows,
+            past: Some(gk::EpochRef {
+                gen: w.g.gen(),
+                epoch: joined.header.header().epoch,
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Fix review P3-R2: an eager seat whose bucket was first re-keyed under the next seed reads
+    /// the epochs from its Join only by that Join's welcome, which opens only with the KEM key
+    /// a seat-key rotation deletes, and no device wrote its self-row. An anchored kept read keyed
+    /// by it writes the self-row (once a run, the maker an entry of the set), so the rotation's
+    /// history rows cover that seed (§5.11 step 2). With the self-row in the answer the welcome
+    /// is ours and nothing is written; on the binding alone, sent with no anchor, nothing is
+    /// written and the epoch waits for a try with one.
+    #[test]
+    fn a_kept_read_by_a_welcome_no_self_row_showed_ours_writes_its_self_row() {
+        use crate::group_key::open_self_row;
+        let mut w = World::text(true, false);
+        let genesis = w.head.clone();
+        let keys = SeatKeys::generate(1, T0);
+        let ik = IdentityKeyPair::generate(&mut crate::rng());
+        let mine = joiner(&ik, A, &keys);
+        let seat = mine.seat;
+        let due = Due {
+            joiners: vec![mine],
+            ..w.due(DueKind::Join)
+        };
+        let joined = w.build_join(&due, None).unwrap();
+        w.step(&due, &joined);
+        let x = joined
+            .commit
+            .welcomes
+            .iter()
+            .find(|x| x.seat == seat)
+            .unwrap();
+        let gen = w.g.gen();
+        let e = joined.header.header().epoch;
+        let me = Me {
+            m: MemberId::Account(A),
+            keys: &keys.pair,
+        };
+        let at = Version { b: x.b, v: x.v };
+        let (s_m, _) =
+            open_seat_welcome(&w.g, x.s, at, &me, &w.holders[0].holder(), &x.bytes).unwrap();
+        // Whether answered, whether taken, and the self-rows written over two answers
+        let read = |p: gk::InPiece, anchored: bool| {
+            let mut d = Device::new(ik, seat_keys::copy(&keys));
+            if anchored {
+                let m = d.keying.groups.get_mut(TEXT_ID).unwrap();
+                m.floor = Some(crate::group_key::Floor::after(None, &joined.header, T0));
+                m.kh = Some(w.kh.clone());
+            }
+            d.keying.past_epoch(TEXT_ID, gen, e);
+            d.keying.past_asks();
+            let mut out = d.take(p.clone());
+            let answered = out.past_ready.len() == 1;
+            d.keying.past_epoch(TEXT_ID, gen, e);
+            d.keying.past_asks();
+            out.self_rows.extend(d.take(p).self_rows);
+            let got = matches!(d.keying.past_epoch(TEXT_ID, gen, e), PastEpoch::Ready(_));
+            (answered, got, out.self_rows)
+        };
+        let (answered, got, rows) = read(join_answer(&w, &genesis, &joined, &seat, vec![]), true);
+        assert!(answered && got, "read by the welcome");
+        assert_eq!(rows.len(), 1, "one self-row: {rows:?}");
+        let r = &rows[0];
+        assert_eq!(
+            (r.kind, r.gen, r.seed, r.sk, r.sx),
+            (gk::self_row::SELF_ROW, gen, x.s, seat.tag_sk, seat.tag_sx)
+        );
+        let kept = open_self_row(&w.g, x.s, &seat, keys.self_key(), &r.sealed).unwrap();
+        assert_eq!(*kept, *s_m, "it keeps the welcome's s_m");
+        // With the self-row in the answer the welcome is ours: nothing more to write
+        let held = gk::SelfRowIn {
+            group: TEXT_ID.into(),
+            gen,
+            seed: x.s,
+            sk: seat.tag_sk,
+            sx: seat.tag_sx,
+            kind: gk::self_row::SELF_ROW,
+            sealed: self_row(&w.g, x.s, &seat, keys.self_key(), &s_m),
+        };
+        let (_, got, rows) = read(join_answer(&w, &genesis, &joined, &seat, vec![held]), true);
+        assert!(got && rows.is_empty(), "ours already: {rows:?}");
+        // No anchor: not read, nothing written, asked again
+        let (answered, got, rows) = read(join_answer(&w, &genesis, &joined, &seat, vec![]), false);
+        assert!(!answered && !got && rows.is_empty(), "no anchor: {rows:?}");
+    }
+
+    /// Fix review P3-R1: a kept ask sent before this run held the floor's keyholder header (a
+    /// sign-in's catch-up reads before the live answer) is answered on the binding alone, where
+    /// a seed welcome counts for nothing. It was put in `none`, so the run never read that epoch
+    /// again, and an account whose app rotates its seat keys at that sign-in lost those posts
+    /// with the old keys. It waits now, and the next try, with the anchor, reads it by the seed
+    /// welcome and writes the self-row.
+    #[test]
+    fn a_kept_read_sent_with_no_anchor_waits_for_one_to_open_by_a_seed_welcome() {
+        let keys = SeatKeys::generate(1, T0);
+        let c = case(&keys);
+        let (s, s_m) = s_m(&c, &keys);
+        let gen = c.w.g.gen();
+        let e = c.past.header.header().epoch;
+        let holder = &c.w.holders[0];
+        let public = keys.pair.public();
+        let to = Them {
+            m: MemberId::Account(A),
+            keys: &public,
+        };
+        let mut p = answer(&c, Vec::new());
+        p.seed_welcome = Some(gk::SeedWelcomeIn {
+            s,
+            from: holder.by().into(),
+            bytes: seed_welcome(&c.w.g, s, &holder.me(), &to, &s_m).unwrap(),
+        });
+        let mut d = Device::new(c.ik, seat_keys::copy(&keys));
+        d.keying.past_epoch(TEXT_ID, gen, e);
+        let out = d.keying.past_asks();
+        assert!(
+            out.send.iter().any(
+                |m| matches!(m, ClientMessage::EpochFetch { have: None, at, .. } if !at.is_empty())
+            ),
+            "harness: asked with no anchor"
+        );
+        let out = d.take(p.clone());
+        assert!(
+            out.past_ready.is_empty() && out.self_rows.is_empty(),
+            "not answered"
+        );
+        assert!(
+            matches!(d.keying.past_epoch(TEXT_ID, gen, e), PastEpoch::Asked),
+            "asked again, not given up"
+        );
+        // The live answer brought the floor's keyholder header: the next try has the anchor
+        let m = d.keying.groups.get_mut(TEXT_ID).unwrap();
+        m.floor = Some(crate::group_key::Floor::after(None, &c.past.header, T0));
+        m.kh = Some(c.w.kh.clone());
+        let out = d.keying.past_asks();
+        assert!(
+            out.send.iter().any(|m| matches!(m, ClientMessage::EpochFetch { have: Some(_), at, .. } if !at.is_empty())),
+            "the try goes with the anchor"
+        );
+        let out = d.take(p.clone());
+        assert_eq!(out.past_ready, vec![(TEXT_ID.to_string(), gen, e)]);
+        assert!(matches!(
+            d.keying.past_epoch(TEXT_ID, gen, e),
+            PastEpoch::Ready(_)
+        ));
+        assert_eq!(out.self_rows.len(), 1, "and its self-row");
+        assert!(
+            d.keying.kept.anchor_wait.is_empty(),
+            "no wait kept once read"
+        );
+
+        // A relay that withholds the live answer: the epoch waits `ANCHOR_WAIT_MS` from its
+        // first answer at most, then is given up as before
+        let mut d = Device::new(c.ik, seat_keys::copy(&keys));
+        d.keying.past_epoch(TEXT_ID, gen, e);
+        d.keying.past_asks();
+        assert!(d.take(p.clone()).past_ready.is_empty(), "waits");
+        let key = (TEXT_ID.to_string(), gen, e);
+        let first = d.keying.kept.anchor_wait[&key];
+        d.keying
+            .kept
+            .anchor_wait
+            .insert(key.clone(), first - super::ANCHOR_WAIT_MS);
+        d.keying.past_epoch(TEXT_ID, gen, e);
+        d.keying.past_asks();
+        assert_eq!(d.take(p).past_ready, vec![key], "given up past the wait");
+        assert!(matches!(
+            d.keying.past_epoch(TEXT_ID, gen, e),
+            PastEpoch::Unknown
+        ));
+        assert!(d.keying.kept.anchor_wait.is_empty());
     }
 
     /// J9M (a reloaded page's kept read): a floor whose keyholder header this device does not
@@ -1524,25 +2079,37 @@ mod tests {
                 ..Default::default()
             };
         let answer = |opening: Option<&SignedHeader>| answer_with(opening, rows.clone());
+        // Whether the epoch was answered, and the key taken
         let read = |p: gk::InPiece| {
             let mut d = Device::new(ik, seat_keys::copy(&keys));
             d.keying.past_epoch(TEXT_ID, gen, 1);
             d.keying.past_asks();
-            assert_eq!(d.take(p).past_ready.len(), 1);
-            match d.keying.past_epoch(TEXT_ID, gen, 1) {
+            let answered = d.take(p).past_ready.len() == 1;
+            let k = match d.keying.past_epoch(TEXT_ID, gen, 1) {
                 PastEpoch::Ready(k) => Some((k.ck, k.d_e)),
                 _ => None,
-            }
+            };
+            (answered, k)
         };
-        assert!(read(answer(None)).is_none(), "the control: no opening");
+        let read_answered = |p: gk::InPiece| {
+            let (answered, k) = read(p);
+            assert!(answered);
+            k
+        };
         assert!(
-            read(answer(Some(&joined.header))).is_none(),
+            read_answered(answer(None)).is_none(),
+            "the control: no opening"
+        );
+        assert!(
+            read_answered(answer(Some(&joined.header))).is_none(),
             "a Join is no opening"
         );
-        let (ck, d_e) = read(answer(Some(&genesis))).expect("taken");
+        let (ck, d_e) = read_answered(answer(Some(&genesis))).expect("taken");
         assert_eq!((*ck, d_e), (*joined.ck, genesis.d()));
-        assert!(
-            read(answer_with(Some(&genesis), Vec::new())).is_none(),
+        // Sent with no anchor, it waits for one (fix review P3-R1)
+        assert_eq!(
+            read(answer_with(Some(&genesis), Vec::new())),
+            (false, None),
             "on the binding alone, a welcome no self-row shows ours"
         );
     }
@@ -1568,11 +2135,13 @@ mod tests {
         let past = c.past.header.clone();
         let e = past.header().epoch;
         let real = answer(&c, rows);
+        // Answered, or left for a try with an anchor (fix review P3-R1): either way, the key
+        // taken if any
         let read = |p: gk::InPiece| {
             let mut d = Device::new(ik, seat_keys::copy(&keys));
             d.keying.past_epoch(TEXT_ID, gen, e);
             d.keying.past_asks();
-            assert_eq!(d.take(p).past_ready.len(), 1);
+            assert!(d.take(p).past_ready.len() <= 1);
             match d.keying.past_epoch(TEXT_ID, gen, e) {
                 PastEpoch::Ready(k) => Some(*k.ck),
                 _ => None,

@@ -76,6 +76,9 @@ const MAX_REKEYS: u32 = 2;
 const READ_BACK: i64 = 500;
 /// `AccountSync::tick`s without an answer before a read counts as lost.
 const LOST_AFTER_TICKS: u32 = 3;
+/// Ticks of about two seconds a sign-in past the old seat keys' 7 days waits for its
+/// re-seal to end before they go anyway (5 min).
+const OLD_WAIT_TICKS: u32 = 150;
 /// Posts `send_channel_gk` remembers as kept: more than a writer sends in the minute a
 /// resend reaches back (`HOLD_MS`).
 const GK_FILED_MOST: usize = 1024;
@@ -691,6 +694,8 @@ struct GkSeat {
     handover: bool,
     /// When the last rotation was made (unix seconds), while the old keys are kept.
     rotated_at: Option<u64>,
+    /// Ticks this connection waited, past the old keys' 7 days, for its re-seal to end.
+    old_wait: u32,
     /// The relay said every group is re-seated at the current counter.
     reseated: bool,
     /// The kept history's rows are sealed again under the new self key: false while a
@@ -930,6 +935,7 @@ impl AccountSync {
                 unsettled: false,
                 handover: false,
                 rotated_at: None,
+                old_wait: 0,
                 reseated: false,
                 resealed: true,
                 reseal: None,
@@ -3048,16 +3054,22 @@ impl AccountSync {
             Some(k) => {
                 // Dated ahead: at a sign-in only (`seat_keys::dated_ahead`)
                 let (lo, hi) = self.seat_clocks(now);
-                let rotate =
-                    self.gk.rotate_due || seat_keys::due(k, lo) || seat_keys::dated_ahead(k, hi);
-                // Old keys kept past their 7 days go at the first tick anyway
+                // A reset (the host's `seat_keys_rotate_first`) or keys dated ahead rotate before
+                // anything is published, whatever an earlier rotation left (RV q8-q11:598, 257)
+                let first = self.gk.rotate_due || seat_keys::dated_ahead(k, hi);
+                let rotate = first || seat_keys::due(k, lo);
+                // Old keys kept within their 7 days
                 let keeps_old =
                     k.old.is_some() && now < k.made.min(now).saturating_add(OLD_KEYS_SECS);
                 if !rotate {
                     self.seat_keys_settled()
-                } else if !keeps_old {
+                } else if !keeps_old && (first || k.old.is_none()) {
                     self.seat_keys_rotate()
                 } else {
+                    // Keys due by age alone, over old keys of a rotation not finished (past
+                    // their 7 days or not): its re-seal runs first, and the new rotation once
+                    // they go; rotating now would drop the self key its rows are sealed under
+                    // (dive 3 F4)
                     // `SeatKeys::rotate` would drop the old keys: once they go (`gk_tick`)
                     self.gk.rotate_due = true;
                     self.seat_keys_settled()
@@ -3123,12 +3135,33 @@ impl AccountSync {
         }
         out.extend(self.reseal_next());
         // The old keys go once every group is re-seated and the kept rows re-sealed and
-        // stored, and at most 7 days after the rotation (§5.11 step 4)
+        // stored, and at most 7 days after the rotation (§5.11 step 4). Past the 7 days, at
+        // the first sign-in after them, once that sign-in's re-seal has ended: the self-rows
+        // are sealed under the old self key until then, and dropping it first loses every
+        // kept post before the rotation (dive 3 F4). A re-seal a relay never lets end waits
+        // `OLD_WAIT_TICKS` at most
         if let Some(at) = self.gk.rotated_at {
             let stored = self.gk.rows.is_empty() && !self.gk.rows_out && !self.gk.rows_failed;
             let done = self.gk.reseated && self.gk.resealed && stored;
-            if done || now >= at.saturating_add(OLD_KEYS_SECS) {
+            let past = now >= at.saturating_add(OLD_KEYS_SECS);
+            if past {
+                self.gk.old_wait += 1;
+            }
+            let ended = self.gk.resealed && (stored || self.gk.rows_failed);
+            // Kept reads this sign-in still has under way (the log's catch-up, past epochs
+            // asked) may need the old seat's keys: an account seated while away holds its
+            // member secret of an older seed only in a seed welcome to the old seat, which a
+            // sign-in that rotated first opens only as it reads that history, and writes
+            // its self-row then (dive 3 P3, review P3-R1). The old keys stay until those
+            // reads are done, within `OLD_WAIT_TICKS` (about 5 min)
+            let reads = !self.fetching.is_empty() || self.gk_reads.busy();
+            if done && reads && !past {
+                self.gk.old_wait += 1;
+            }
+            let ready = (done || (past && ended)) && !reads;
+            if ready || self.gk.old_wait >= OLD_WAIT_TICKS {
                 self.gk.rotated_at = None;
+                self.gk.old_wait = 0;
                 self.gk.rows_failed = false;
                 if let Some(k) = self.gk.keys.as_mut() {
                     k.drop_old();
@@ -3484,7 +3517,12 @@ impl AccountSync {
     /// a welcome to it opened while a rotation keeps its keys, get history rows too (`Reseal`).
     pub fn gk_self_rows(&mut self, rows: Vec<voipc_protocol::gk::SelfRowIn>) -> Vec<ClientMessage> {
         let mut out = self.reseal_own(&rows);
+        let groups: std::collections::BTreeSet<String> =
+            rows.iter().map(|r| r.group.clone()).collect();
         out.extend(self.queue_self_rows(rows));
+        for g in groups {
+            out.extend(self.gk_secret_in(&g));
+        }
         out
     }
 
@@ -5307,9 +5345,16 @@ mod tests {
         assert_eq!(published(&out).map(|(n, _)| n), Some(3));
         let keys = s.take_seat_keys().unwrap();
         assert_eq!((keys.n, keys.old.as_ref().map(|o| o.n)), (3, Some(2)));
-        // Nobody reports: at 7 days
+        // Nobody reports: at 7 days, once this sign-in's re-seal ended, here (no relay
+        // answers it) after `OLD_WAIT_TICKS` (dive 3 F4)
         s.gk.rotated_at = Some(crate::time::now_millis() / 1000 - OLD_KEYS_SECS);
-        let (out, _) = s.tick();
+        let mut out = vec![];
+        for _ in 0..OLD_WAIT_TICKS {
+            (out, _) = s.tick();
+            if s.gk.rotated_at.is_none() {
+                break;
+            }
+        }
         assert_eq!(put_of(&out).0, ITEM_SEAT_KEM);
         assert!(s.gk.rotated_at.is_none());
     }
@@ -5593,7 +5638,15 @@ mod tests {
                 .iter()
                 .any(|r| matches!(r, AccountRequest::VaultPut { k, .. } if k == ITEM_SEAT_KEM))
         };
-        let mut out = s.gk_tick(later);
+        // Once this sign-in's re-seal ended, here (no relay answers it) after
+        // `OLD_WAIT_TICKS` (dive 3 F4)
+        let mut out = vec![];
+        for _ in 0..OLD_WAIT_TICKS {
+            out = s.gk_tick(later);
+            if s.gk.rotated_at.is_none() {
+                break;
+            }
+        }
         assert!(seat_put(&out), "the old keys go");
         let mut version = 5;
         while published(&out).is_none() && seat_put(&out) {
@@ -5635,10 +5688,12 @@ mod tests {
         assert!(sent(&s.gk_begin(false, now, true), "VaultPut").is_empty());
     }
 
-    /// RV repair (598): keys 30 days old whose rotation's old keys were still kept were
-    /// published and handed over at a sign-in, and rotated only at the first tick. Old keys
-    /// past their 7 days go at that tick anyway, so the keys rotate first; old keys within
-    /// their 7 days are kept, and the rotation waits for them.
+    /// RV repair (598) with dive 3 F4: keys 30 days old whose rotation's old keys are still
+    /// kept, past their 7 days. A rotation now would drop the old self key that the kept
+    /// rows are still sealed under, so this sign-in's re-seal runs first (the keys are
+    /// published as they are meanwhile), the old keys go when it ends, and the rotation
+    /// follows. After a reset, keys rotate first whatever is kept (below, and
+    /// `a_rotation_after_a_reset_comes_before_anything_else`).
     #[test]
     fn keys_due_whose_old_keys_are_past_their_days_rotate_before_anything_else() {
         let me = account(1);
@@ -5649,11 +5704,30 @@ mod tests {
         let items = [(ITEM_SEAT_KEM, 1, keys.to_bytes().to_vec())];
         let (mut s, _) = start_with_items(&me, &items, LogMemory::default());
         let out = s.gk_on(true);
-        assert_eq!(published(&out), None, "the old keys are not published");
-        assert_eq!(put_of(&out).0, ITEM_SEAT_KEM, "a rotation");
-        assert!(s.take_seat_keys().is_none(), "nor handed over");
-        let out = stored(&mut s, ITEM_SEAT_KEM, 2);
-        assert_eq!(published(&out).map(|(n, _)| n), Some(4));
+        assert_eq!(
+            published(&out).map(|(n, _)| n),
+            Some(3),
+            "published as they are while the re-seal runs"
+        );
+        assert!(
+            s.gk.rotate_due && s.gk.rotated_at.is_some(),
+            "the rotation waits"
+        );
+        let mut dropped = false;
+        for _ in 0..=OLD_WAIT_TICKS {
+            s.gk_tick(now);
+            dropped |=
+                s.gk.keys
+                    .as_ref()
+                    .is_some_and(|k| k.old.as_ref().is_none_or(|o| o.n != 2));
+            if dropped {
+                break;
+            }
+        }
+        assert!(
+            dropped,
+            "the old keys of counter 2 go once the re-seal ended (here: its bound)"
+        );
         // Within their days, after a reset: kept, and the keys rotate once they go
         let old = SeatKeys::generate(2, now - 40 * day);
         let keys = SeatKeys::rotate(old, now - day).unwrap();

@@ -2,7 +2,7 @@
 //! group's followers and their ranks, the set the head names with each entry's misses,
 //! who a due goes to, who is promoted and whose removal is proposed.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use voipc_crypto::group_key::commit::{Candidate, HolderRef, Joiner, Pair};
 use voipc_crypto::group_key::timers::{
@@ -121,6 +121,16 @@ pub struct Holders {
     /// Each account's newest seat-key counter and since when (unix ms): an entry below it
     /// for `COUNTER_STALE_SECS` is proposed for removal.
     pub newest: HashMap<[u8; 16], (u32, u64)>,
+    /// Sessions whose entry declines every due here (its clock off, or a browser past its
+    /// seat limit: `CLOCK`, `PLATFORM`): not online for any due, a promotion or a new
+    /// start, until the session ends (dive 2 F2).
+    pub unable: HashSet<UserId>,
+    /// By raw KX: candidates a keyholder declined as such (`CANDIDATE`), not proposed again
+    /// while this set stands: one refused volunteer stops no other due (dive 2 F3).
+    pub refused: HashSet<[u8; 32]>,
+    /// The online entries `seen` last counted: another online entry may take a candidate
+    /// the ones before refused, so `refused` goes when they change (review C-P5).
+    online_last: Vec<[u8; 32]>,
 }
 
 /// An entry's rank where no online volunteer gives it: what was recorded at its promotion,
@@ -159,6 +169,10 @@ impl Holders {
         self.device.retain(|kx, _| set.iter().any(|k| k.kx == *kx));
         self.forced
             .retain(|r| set.iter().any(|k| HolderRef::of(k) == *r));
+        // Another set may take a candidate this one refused
+        if self.set.iter().map(|k| k.kx).ne(set.iter().map(|k| k.kx)) {
+            self.refused.clear();
+        }
         self.set = set;
     }
 
@@ -195,7 +209,7 @@ impl Holders {
     pub fn online<'a>(&self, vols: &'a HashMap<UserId, Volunteer>) -> Vec<&'a Volunteer> {
         let mut on: Vec<&Volunteer> = vols
             .values()
-            .filter(|v| self.entry_of(v).is_some())
+            .filter(|v| !self.unable.contains(&v.sid) && self.entry_of(v).is_some())
             .collect();
         on.sort_by_key(|v| v.sid);
         on
@@ -242,6 +256,20 @@ impl Holders {
     /// Marks who is away from now on (or back).
     pub fn seen(&mut self, vols: &HashMap<UserId, Volunteer>, now: u64) {
         let on: Vec<[u8; 32]> = self.online(vols).iter().map(|v| v.pair.kx()).collect();
+        if on != self.online_last {
+            self.refused.clear();
+            self.online_last = on.clone();
+        }
+        // An entry's pair the relay lost (a stop between a head move and the write of the
+        // entries, dive 4 F5) comes back with the entry's own volunteer: its pair is that
+        // entry's (`entry_of` matched it), which other keyholders need for a `KRK` welcome
+        let lost: Vec<([u8; 32], Pair)> = self
+            .online(vols)
+            .iter()
+            .filter(|v| !self.pairs.contains_key(&v.pair.kx()))
+            .map(|v| (v.pair.kx(), v.pair.clone()))
+            .collect();
+        self.pairs.extend(lost);
         for k in &self.set {
             let s = self.stats.entry(k.kx).or_default();
             if on.contains(&k.kx) {
@@ -399,9 +427,10 @@ impl Holders {
         if self.set.is_empty() {
             return None;
         }
-        let best = allowed(kind, vols, gated, seats)
+        let best = allowed(kind, vols, gated, seats, &self.unable)
             .filter(|v| self.entry_of(v).is_none() && !self.set.iter().any(|k| k.kx == v.pair.kx()))
             .filter(|v| v.entry(kind).is_some())
+            .filter(|v| !self.unable.contains(&v.sid) && !self.refused.contains(&v.pair.kx()))
             .min_by_key(|v| (v.rank(kind), v.sid))?;
         if self.online(vols).len() < KEYHOLDERS_ONLINE_MIN {
             return Some(best);
@@ -414,19 +443,30 @@ impl Holders {
 /// browsers only with no account desktop online and at most 10 000 seats; guests only in
 /// an open group with no account volunteer online. In a voice room every member may (its
 /// volunteers are its members, voice.rs `room_seat`).
-pub fn allowed(
+///
+/// `unable`: sessions that decline every due here (`Holders::unable`). They are not allowed,
+/// and an account desktop among them keeps no browser or guest out (review C-P1: else the
+/// one desktop whose clock is off keeps every other volunteer from starting anew).
+pub fn allowed<'a, 'b>(
     kind: GroupKind,
-    vols: &HashMap<UserId, Volunteer>,
+    vols: &'a HashMap<UserId, Volunteer>,
     gated: bool,
     seats: usize,
-) -> impl Iterator<Item = &Volunteer> {
+    unable: &'b HashSet<UserId>,
+) -> impl Iterator<Item = &'a Volunteer> + 'b
+where
+    'a: 'b,
+{
+    let able = move |v: &&Volunteer| !unable.contains(&v.sid);
     let desktop = vols
         .values()
+        .filter(able)
         .any(|v| !v.m.is_conn() && v.platform == platform::DESKTOP);
     let account = vols
         .values()
+        .filter(able)
         .any(|v| !v.m.is_conn() && v.rank(kind).is_some());
-    vols.values().filter(move |v| {
+    vols.values().filter(able).filter(move |v| {
         kind == GroupKind::Voice
             || (v.rank(kind).is_some()
                 && (!v.browser() || (!desktop && seats <= BROWSER_MAX_SEATS as usize))
@@ -436,12 +476,13 @@ pub fn allowed(
 
 /// The volunteer asked for a Genesis or Regenesis: the best-ranked allowed one with its
 /// own seat at hand.
-pub fn starter(
+pub fn starter<'a>(
     kind: GroupKind,
-    vols: &HashMap<UserId, Volunteer>,
+    vols: &'a HashMap<UserId, Volunteer>,
     gated: bool,
-) -> Option<&Volunteer> {
-    allowed(kind, vols, gated, 0)
+    unable: &HashSet<UserId>,
+) -> Option<&'a Volunteer> {
+    allowed(kind, vols, gated, 0, unable)
         .filter(|v| v.seat.is_some() && v.entry(kind).is_some())
         .min_by_key(|v| (v.rank(kind), v.sid))
 }

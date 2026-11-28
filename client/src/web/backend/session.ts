@@ -14,7 +14,7 @@ import { loadWasm, wasm, type GkOut, type KeptGk, type KeptPins, type KeptSessio
 import { ACCOUNT_STEP_MS, AccountDriver, frameGoesOn, type AccountArgs, type AccountHost } from "./account";
 import { connect as openTransport, openEdgeView, type Transport } from "./transport";
 import { EdgeView } from "./edge-view";
-import { entryAsksHistory, gkVoiceRoom, historyAskSealed, roomAsksBundles, type SessionContext } from "./types";
+import { entryAsksHistory, gkVoiceRoom, historyAskSealed, roomAsksBundles, seatNeedsAsk, type SessionContext } from "./types";
 import type { ChannelInfo } from "../../lib/types";
 import { TOO_LARGE_REASON } from "../../lib/chat-rules";
 import { parseHostPort } from "../../lib/invite";
@@ -28,6 +28,7 @@ import { motionOf } from "./media";
 import { postsMarks } from "./posts-marks";
 import { traceVoice } from "./share-trace";
 import { asksBundles, ChannelListParts, GkPump, gkPathAfter, gkPosts, gkRuns, KeptByAccount, LivePump, ReadyClock, yieldTask, type GkPath } from "./live";
+import { mirrorOf, saveMirror } from "./gk-mirror";
 
 /** Bound for the authentication response (network.rs CONNECT_TIMEOUT). */
 const AUTH_TIMEOUT_MS = 10_000;
@@ -42,6 +43,9 @@ const GK_STEP_MS = 8;
 const GK_STEP_CALL_MS = 2;
 /** How often a keyholder's waiting upload looks at its transport (live.ts `DRAIN_POLL_MS`). */
 const GK_UPLOAD_LOOK_MS = 5;
+/** An account's group-key counters go to this browser's store this long after they moved
+ *  (gk-mirror.ts): one write for a burst of frames. Sooner when the page goes or hides. */
+const GK_MIRROR_MS = 1_000;
 /** Queued chat messages older than this are dropped instead of sent. */
 const PENDING_MESSAGE_TTL_MS = 60_000;
 /** voipc_protocol::voice::VOICE_HEADER_SIZE */
@@ -137,6 +141,15 @@ const keptPins = new KeptByAccount<KeptPins>();
 /** The group key's floors, for the next connection to a relay in this page (plan 3d), by
  *  account ("" for a guest): kept for the page's life, signed in or not. */
 const keptGk = new KeptByAccount<KeptGk>();
+// The page going (a reload, a closed tab) or hidden: each account's counters that moved go to
+// this browser's store now, not at a timer the page may not live to see (dive 1 F1)
+function gkMirrorsNow(): void {
+  for (const s of sessions.values()) s.gkMirrorSave();
+}
+globalThis.addEventListener?.("pagehide", gkMirrorsNow);
+globalThis.document?.addEventListener("visibilitychange", () => {
+  if (globalThis.document?.visibilityState === "hidden") gkMirrorsNow();
+});
 /** The page's one clock for keyholders' uploads, a worker's: a hidden tab clamps its own
  *  timers to a second or more, and a voice keyholder keeps its duty there (plan 3g). */
 let uploadTicks: Worker | undefined;
@@ -252,6 +265,13 @@ export async function disconnect(server: string, keepSessions = false): Promise<
 export function forgetKept(server: string): void {
   keptSessions.forget(server);
   keptPins.forget(server);
+}
+
+/** A device forgotten (commands.ts `forget_device`): the connection to `server` signed in as
+ *  `name` keeps no more of its group-key counters in this browser, and says under which row
+ *  it kept them (gk-mirror.ts), which a sign-in with no device record has too. */
+export function forgetMirrorOf(server: string, name: string): string | null {
+  return sessionOrSigningIn(server)?.gkMirrorForget(name) ?? null;
 }
 
 /** On mobile data or not: a large key job asks first, and fewer sessions open at once. */
@@ -521,6 +541,10 @@ export class Session implements SessionContext, AccountHost {
   /** We are an admin here: names in a room that hides its members are shown to us. */
   private isAdmin = false;
   private gkBuilding = false;
+  /** A signed-in connection's row in this browser's store of group-key counters
+   *  (gk-mirror.ts), and the timer of its next write. */
+  private gkMirrorKey: string | null = null;
+  private gkMirrorTimer: ReturnType<typeof setTimeout> | undefined;
   /** A keyholder's uploads (live.ts). */
   private readonly gkPump = new GkPump({
     nextFrame: (inCall) => this.signal.gkNextFrame(inCall),
@@ -544,11 +568,14 @@ export class Session implements SessionContext, AccountHost {
   private controlTimer: ReturnType<typeof setTimeout> | undefined;
   private ended = false;
   /**
-   * When we last asked this server for a voice seat (Date.now(), 0 = never):
-   * a join, a voice channel's creation, an accepted invite. Only such an ask
-   * lets this server take voice (network.rs `take_voice_ask`).
+   * When we asked this server for a voice seat lately (Date.now()): a join, a
+   * voice channel's creation, an accepted invite. Only such an ask lets this
+   * server take voice, or move the call to another room (network.rs
+   * `take_voice_ask`). Each ask is kept, not only the last: since a move inside
+   * the call needs one too (dive 6 F7), two joins clicked in quick succession
+   * are two seats to pay for.
    */
-  private voiceAskedAt = 0;
+  private voiceAsks: number[] = [];
 
   constructor(
     /** The server id: the address the UI connected with, verbatim. */
@@ -827,6 +854,8 @@ export class Session implements SessionContext, AccountHost {
     if (gkRuns(this.gkPath)) this.gkRun(() => this.signal.gkEnd());
     const floors = this.signedIn ? this.signal.gkKeep() : undefined;
     if (floors) keptGk.put(this.server, this.account?.accountHex() ?? "", floors);
+    this.gkMirrorSave();
+    this.gkMirrorKey = null;
     this.mediaKeys.free();
     // Posts that waited showed as sent. By name: the page has forgotten this connection's ids
     for (const { channel_id, expired } of this.signal.liveEnd()) {
@@ -1023,12 +1052,19 @@ export class Session implements SessionContext, AccountHost {
         this.auth?.resolve();
         break;
       case "GroupKeys": {
+        // The relay's run, for the front end's reconnect: a room is the same room only on the
+        // same run (dive 6 F6, lib/rejoin-rules.ts `rejoinsVoice`). Said whatever the key does
+        this.emit("relay-run", { run: Array.from(b.run as number[], (x) => x.toString(16).padStart(2, "0")).join("") });
         // Right after Authenticated: whether this relay uses the group key (plan 3i)
         if (!gkRuns(this.gkPath)) break;
         const kept = keptGk.take(this.server, this.account?.accountHex() ?? "");
         const help = getConfig().help_hold_keys ?? true;
+        // What this browser kept of the account's counters past its pages, read before the
+        // sign-in (account.ts): a relay that withholds the vault's pages does not take them
+        this.gkMirrorKey = this.account?.mirrorKey() ?? null;
+        const mirror = this.gkMirrorKey ? mirrorOf(this.gkMirrorKey) : undefined;
         this.gkRun(() =>
-          this.signal.gkStart(b.on, Uint8Array.from(b.run), Number(b.clock), help, pageVisible(), this.inCall(), kept),
+          this.signal.gkStart(b.on, Uint8Array.from(b.run), Number(b.clock), help, pageVisible(), this.inCall(), kept, mirror),
         );
         this.gkTrackAll();
         break;
@@ -1221,6 +1257,12 @@ export class Session implements SessionContext, AccountHost {
         }
         break;
       case "ServerShutdown":
+        // The UI shows the call gone at once: so does the capture, without waiting for the
+        // link to close or the reconnect's first step (dive 6 F4)
+        if (voiceOwner === this) {
+          detachVoice();
+          gkPageState();
+        }
         this.emit("connection-lost", { reason: `Server shutdown: ${b.reason}` });
         break;
       case "MovedToChannel":
@@ -1237,6 +1279,16 @@ export class Session implements SessionContext, AccountHost {
         this.emit("channel-deleted", { channel_id: b.channel_id });
         break;
       case "ChannelError":
+        // A leave the relay refused (its join budget, 2 a second) still seats us while the
+        // microphone stays shut for it (dive 6 F10): asked again once a token is back, until
+        // it is taken (review R2)
+        if (this === voiceOwner && audio.leavePending) {
+          setTimeout(() => {
+            if (this === voiceOwner && audio.leavePending) {
+              this.sendControl({ JoinChannel: { channel_id: 0, password: null } });
+            }
+          }, 800);
+        }
         this.emit("channel-error", { reason: b.reason });
         break;
       case "ChannelUpdated":
@@ -1563,7 +1615,44 @@ export class Session implements SessionContext, AccountHost {
       this.emit("media-key-installed", { channel_id: this.channelId, key_id: this.mediaKeys.keyId ?? 0 });
     }
     if (out.build) void this.gkBuild();
+    if (out.kept) this.gkMirrorSoon();
     this.gkPump.wake();
+  }
+
+  /** The account's counters moved: to this browser's store in a moment (`GK_MIRROR_MS`). */
+  private gkMirrorSoon(): void {
+    if (this.gkMirrorTimer !== undefined || !this.gkMirrorKey || this.ended) return;
+    this.gkMirrorTimer = setTimeout(() => this.gkMirrorSave(), GK_MIRROR_MS);
+  }
+
+  /** The account's counters to this browser's store now, where they moved since the last
+   *  (`gkMirror`): sealing and writing them run after this returns, and hold up no frame. */
+  gkMirrorSave(): void {
+    clearTimeout(this.gkMirrorTimer);
+    this.gkMirrorTimer = undefined;
+    const key = this.gkMirrorKey;
+    if (!key) return;
+    let bytes: Uint8Array | undefined;
+    try {
+      bytes = this.signal.gkMirror();
+    } catch (e) {
+      console.warn("the group key's counters:", e);
+      return;
+    }
+    if (bytes) void saveMirror(key, bytes, (stored, ours) => wasm().gkMirrorMerge(stored, ours));
+  }
+
+  /** This connection is `name`'s and its device is forgotten: its counters go to this
+   *  browser's store no more (a write already asked still lands, and `forgetMirror` waits for
+   *  it). The row it wrote them under, or null when it is another's or keeps none. */
+  gkMirrorForget(name: string): string | null {
+    const key = this.gkMirrorKey;
+    // The row is `relay|name`, and a relay's id is hex: what follows the first "|" is the name
+    if (!key || key.slice(key.indexOf("|") + 1) !== name) return null;
+    clearTimeout(this.gkMirrorTimer);
+    this.gkMirrorTimer = undefined;
+    this.gkMirrorKey = null;
+    return key;
   }
 
   /** A keyholder's build, in steps with the page yielded between them (plan 3b). */
@@ -1650,10 +1739,12 @@ export class Session implements SessionContext, AccountHost {
     // A voice seat we did not ask this server for is refused, before anything
     // here changes: taking voice ends the call on whichever server had it and
     // opens the microphone into a room whose members, and so whose media key,
-    // this server chooses. One that already carries our voice may still move
-    // us between its own rooms. Mirrors network.rs handle_server_message.
-    if (channelId !== 0 && voiceOwner !== this && !this.takeVoiceAsk()) {
+    // this server chooses. A move to another room by the server that carries the
+    // call is refused the same way (dive 6 F7, types.ts `seatNeedsAsk`), and the
+    // microphone closes at once rather than at the server's answer to the leave.
+    if (seatNeedsAsk(channelId, voiceOwner === this, this.channelId) && !this.takeVoiceAsk()) {
       console.warn(`${this.server} seated us in voice channel ${channelId} unasked; leaving it`);
+      if (voiceOwner === this) void audio.closeForLeave();
       this.sendControl({ JoinChannel: { channel_id: 0, password: null } });
       this.emit("channel-error", {
         reason: "The server put you in a voice channel you did not join — you were taken out of it again",
@@ -1661,7 +1752,7 @@ export class Session implements SessionContext, AccountHost {
       return;
     }
 
-    // Server-initiated moves (create_channel auto-join, kicks, invites) land here
+    // Moves we asked for (a join, a room we made, an invite we took) and kicks land here
     const oldChannel = this.channelId;
     this.channelId = channelId;
     // Before the move below, so what it does to the media lands on this
@@ -2205,14 +2296,16 @@ export class Session implements SessionContext, AccountHost {
 
   /** We are about to ask this server for a voice seat; before the request, so its answer cannot beat it. */
   askVoice(): void {
-    this.voiceAskedAt = Date.now();
+    this.voiceAsks.push(Date.now());
+    // A handful is all a person clicks in ten seconds
+    if (this.voiceAsks.length > 8) this.voiceAsks.shift();
   }
 
   /** Whether the seat just given was asked for lately; one ask pays for one seat. */
   private takeVoiceAsk(): boolean {
-    const at = this.voiceAskedAt;
-    this.voiceAskedAt = 0;
-    return at !== 0 && Date.now() - at < VOICE_ASK_TTL_MS;
+    const now = Date.now();
+    this.voiceAsks = this.voiceAsks.filter((at) => now - at < VOICE_ASK_TTL_MS);
+    return this.voiceAsks.shift() !== undefined;
   }
 
   watchScreenShare(sharerUserId: number): void {

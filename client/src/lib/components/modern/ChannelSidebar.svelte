@@ -26,8 +26,8 @@
     viewingVoice,
   } from "../../stores/channels.js";
   import { channelRosters } from "../../stores/rosters.js";
-  import { rosterForRow } from "../../roster-rules.js";
-  import { userId, isAdmin, serverAddress, serverKey } from "../../stores/connection.js";
+  import { rosterForRow, shownMarks } from "../../roster-rules.js";
+  import { userId, isAdmin, isDeafened, isMuted, serverAddress, serverKey } from "../../stores/connection.js";
   import { account } from "../../stores/account.js";
   import { blocked, blockedMember } from "../../stores/blocks.js";
   import { isBlocked } from "../../block-rules.js";
@@ -255,6 +255,8 @@
       {#if members.length > 0}
         <div class="nested">
           {#each members as member (member.user_id)}
+            <!-- The own row's marks are this device's, not the relay's word (dive 6 F11) -->
+            {@const marks = shownMarks(member, $userId, $isMuted, $isDeafened)}
             <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
             <div
               class="nested-member"
@@ -269,14 +271,14 @@
               {#if $blockedMember(member)}
                 <span class="blocked-mark" role="img" title="You blocked this person" aria-label="You blocked this person"><Icon name="ban" size={12} /></span>
               {/if}
-              {#if member.is_muted}
+              {#if marks.muted}
                 <span class="status-icon muted" title="Muted"><Icon name="mic-off" size={12} /></span>
               {/if}
               {#if $restrictions.has(member.user_id)}
                 {@const held = markTitle($restrictions.get(member.user_id)!, Date.now())}
                 <span class="status-icon restricted-mark" role="img" title={held} aria-label={held}><Icon name="hourglass" size={12} /></span>
               {/if}
-              {#if member.is_deafened}
+              {#if marks.deafened}
                 <span class="status-icon deafened" title="Deafened"><Icon name="headphones-off" size={12} /></span>
               {/if}
               {#if member.is_screen_sharing}

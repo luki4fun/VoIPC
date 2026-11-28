@@ -210,6 +210,14 @@ impl Joins {
         self.idle_accounts.len() + self.idle_others.len()
     }
 
+    /// Whether `seat` waits as an account's joiner no session waits for (an eager seat):
+    /// seated so, no device of it takes its seat welcome (dive 3 P3).
+    pub fn idle_account(&self, seat: &SeatRef) -> bool {
+        self.at
+            .get(seat)
+            .is_some_and(|i| self.idle_accounts.contains(i))
+    }
+
     fn idle(&mut self, account: Option<[u8; 16]>) -> &mut HashSet<u64> {
         match account {
             Some(_) => &mut self.idle_accounts,
@@ -341,6 +349,9 @@ pub struct DueOut {
     /// Its keyholder entry; a Genesis volunteer's own.
     pub by: HolderRef,
     pub deadline: u64,
+    /// How long it is given: `deadline_ms` of its kind, or the slow one for an exits opening
+    /// that re-keys every version (`GroupState::span`).
+    pub span: u64,
     /// The seats on a seed older than the head's at the ask (every other seated seat held
     /// the head's): rule 13 reads seat state as of the ask.
     pub held: HashMap<SeatRef, u32>,
@@ -350,6 +361,6 @@ pub struct DueOut {
 impl DueOut {
     /// A 60 s due an exit batch does not wait behind (plan 2d).
     pub fn slow(&self) -> bool {
-        deadline_ms(self.due.kind) > deadline_ms(DueKind::Exits) + deadline_ms(DueKind::Join)
+        self.span > deadline_ms(DueKind::Exits) + deadline_ms(DueKind::Join)
     }
 }

@@ -9,6 +9,7 @@
 import { toHex } from "../../lib/hex";
 import { getConfig } from "./config";
 import { cursorStorageKey, findDevice, listDevices, saveDevice, type DeviceRecord } from "./devices";
+import { loadMirrors, mirrorKey } from "./gk-mirror";
 import { freshPage, keepMemory, markReplay, wholeMemory, type PageMemory } from "./log-memory";
 import { loadNamed, namedOf, saveNamed } from "./log-named";
 import { wasm, type AccountActions, type AccountMethod, type AccountSession, type AccountSignIn, type KeptPins, type SignInStep, type SignalClient } from "./wasm";
@@ -166,6 +167,9 @@ export class AccountDriver {
   /** What this browser holds on this server: remembered again, it drops the key its record
    *  named (`AccountSession.setHeldDevice`). */
   private held: DeviceRecord[] = [];
+  /** The relay and account name this signed in to: the row its group-key counters are kept
+   *  under (gk-mirror.ts). */
+  private whose: string | null = null;
 
   private constructor(signIn: AccountSignIn, passwordBased: boolean, password: string | null) {
     this.signIn = signIn;
@@ -175,7 +179,8 @@ export class AccountDriver {
 
   /** Throws why it cannot start (a bad name, no remembered device). */
   static async create(server: string, username: string, args: AccountArgs): Promise<AccountDriver> {
-    await loadNamed();
+    // Both before the sign-in, so what follows it finds them at once
+    await Promise.all([loadNamed(), loadMirrors()]);
     const api = wasm();
     // A provider's answer decides the account
     const name = args.kind === "provider" ? "" : api.normalizeAccountName(username);
@@ -441,6 +446,7 @@ export class AccountDriver {
     const signIn = this.signIn;
     const done = signIn.finish();
     if (relayIds()[host.server] !== toHex(done.relay_id)) setRelayId(host.server, toHex(done.relay_id));
+    this.whose = mirrorKey(done.relay_id, done.name);
     const key = cursorStorageKey(done.relay_id, done.name);
     const memory = pageMemory.get(key) ?? freshPage(readCursors(key), namedOf(key));
     if (memory.named && !namedOf(key)) saveNamed(key, memory.named);
@@ -541,6 +547,12 @@ export class AccountDriver {
     const warned = a.emit.some((e) => e.name === "identity-key-changed");
     this.run(host, a);
     return warned;
+  }
+
+  /** Once signed in: the row this browser keeps the account's group-key counters under
+   *  (gk-mirror.ts `mirrorKey`). */
+  mirrorKey(): string | null {
+    return this.session ? this.whose : null;
   }
 
   /** The account this is, once signed in: what kept sessions go by. */

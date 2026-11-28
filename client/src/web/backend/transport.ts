@@ -684,7 +684,7 @@ function wrapSocket(ws: WebSocket, handlers: TransportHandlers): Transport {
     videoQueuedMs: () => pacer.queuedMs() + socketWaitMs(performance.now()),
     uplinkQueuedAt: () => uplink.queuedAt,
     uplinkReset() {
-      uplink.reset();
+      uplink.reset(sentVideo);
       probesFrom = performance.now();
     },
     uplinkTick() {
